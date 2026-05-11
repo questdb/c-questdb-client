@@ -2968,9 +2968,7 @@ mod tests {
         if view.message.is_null() {
             return Vec::new();
         }
-        unsafe {
-            std::slice::from_raw_parts(view.message as *const u8, view.message_len).to_vec()
-        }
+        unsafe { std::slice::from_raw_parts(view.message as *const u8, view.message_len).to_vec() }
     }
 
     fn read_error_message(err: *const line_sender_error) -> String {
@@ -3389,8 +3387,12 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             upgrade_mock_stream(&mut stream);
             let _ = read_frame(&mut stream).unwrap();
             write_qwp_error_response(
@@ -3418,7 +3420,11 @@ mod tests {
 
             let buffer = line_sender_buffer_new_for_sender(sender);
             assert!(!buffer.is_null());
-            assert!(line_sender_buffer_table(buffer, table_name(b"trades"), &mut err));
+            assert!(line_sender_buffer_table(
+                buffer,
+                table_name(b"trades"),
+                &mut err
+            ));
             assert!(err.is_null());
             assert!(line_sender_buffer_column_i64(
                 buffer,
@@ -3459,7 +3465,11 @@ mod tests {
             assert_parse_halt_diagnostic(view);
             free_err(&mut err);
 
-            assert!(line_sender_buffer_table(buffer, table_name(b"trades"), &mut err));
+            assert!(line_sender_buffer_table(
+                buffer,
+                table_name(b"trades"),
+                &mut err
+            ));
             assert!(err.is_null());
             assert!(line_sender_buffer_column_i64(
                 buffer,

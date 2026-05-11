@@ -180,16 +180,15 @@ impl<'a> TableName<'a> {
         let mut prev = '\0';
         for (byte_idx, c) in name.char_indices() {
             match c {
-                '.' => {
-                    if byte_idx == 0 || byte_idx + c.len_utf8() == name.len() || prev == '.' {
-                        return Err(error::fmt!(
-                            InvalidName,
-                            concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
-                            name,
-                            byte_idx
-                        ));
-                    }
+                '.' if byte_idx == 0 || byte_idx + c.len_utf8() == name.len() || prev == '.' => {
+                    return Err(error::fmt!(
+                        InvalidName,
+                        concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
+                        name,
+                        byte_idx
+                    ));
                 }
+                '.' => {}
                 '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '*' | '%' | '~'
                 | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}'
                 | '\u{0005}' | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}'

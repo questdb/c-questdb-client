@@ -27,7 +27,7 @@
 //! §3 (version negotiation) and §13 (response format).
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -1641,6 +1641,73 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<(Vec<u8>, Ve
 
 // ---------- connect ----------
 
+fn resolve_qwp_ws_addrs(host: &str, port: &str) -> crate::Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| error::fmt!(ConfigError, "Invalid port: {:?}", port))?;
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|io| {
+            error::fmt!(
+                CouldNotResolveAddr,
+                "Could not resolve {}:{}: {}",
+                host,
+                port,
+                io
+            )
+        })?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(error::fmt!(
+            CouldNotResolveAddr,
+            "No address found for {}:{}",
+            host,
+            port
+        ));
+    }
+    Ok(addrs)
+}
+
+fn connect_qwp_ws_tcp(
+    host: &str,
+    port: &str,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> crate::Result<TcpStream> {
+    let addrs = resolve_qwp_ws_addrs(host, port)?;
+    connect_tcp_to_any_addr(host, port, &addrs, connect_timeout, request_timeout)
+}
+
+fn connect_tcp_to_any_addr(
+    host: &str,
+    port: &str,
+    addrs: &[SocketAddr],
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> crate::Result<TcpStream> {
+    let mut failures = Vec::new();
+    for addr in addrs {
+        match TcpStream::connect_timeout(addr, connect_timeout) {
+            Ok(tcp) => {
+                tcp.set_nodelay(true).ok();
+                tcp.set_read_timeout(Some(request_timeout)).ok();
+                tcp.set_write_timeout(Some(request_timeout)).ok();
+                return Ok(tcp);
+            }
+            Err(io) => failures.push(format!("{addr}: {io}")),
+        }
+    }
+    Err(error::fmt!(
+        SocketError,
+        "Could not connect to {}:{}; tried {}",
+        host,
+        port,
+        failures.join(", ")
+    ))
+}
+
 /// Establish a fresh QWP/WebSocket connection: TCP → optional TLS → HTTP
 /// upgrade. Returns the connected stream, the version the server picked, and any
 /// WebSocket bytes read after the HTTP upgrade response.
@@ -1652,41 +1719,10 @@ pub(crate) fn establish_connection(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
 ) -> crate::Result<(WsStream, u8, Vec<u8>)> {
-    use std::net::ToSocketAddrs;
-
     let connect_timeout = *qwp_ws.connect_timeout;
     let request_timeout = *qwp_ws.request_timeout;
 
-    let addr = (
-        host,
-        port.parse::<u16>()
-            .map_err(|_| error::fmt!(ConfigError, "Invalid port: {:?}", port))?,
-    )
-        .to_socket_addrs()
-        .map_err(|io| {
-            error::fmt!(
-                CouldNotResolveAddr,
-                "Could not resolve {}:{}: {}",
-                host,
-                port,
-                io
-            )
-        })?
-        .next()
-        .ok_or_else(|| {
-            error::fmt!(
-                CouldNotResolveAddr,
-                "No address found for {}:{}",
-                host,
-                port
-            )
-        })?;
-
-    let tcp = TcpStream::connect_timeout(&addr, connect_timeout)
-        .map_err(|io| error::fmt!(SocketError, "Could not connect to {}: {}", addr, io))?;
-    tcp.set_nodelay(true).ok();
-    tcp.set_read_timeout(Some(request_timeout)).ok();
-    tcp.set_write_timeout(Some(request_timeout)).ok();
+    let tcp = connect_qwp_ws_tcp(host, port, connect_timeout, request_timeout)?;
 
     let mut stream = if use_tls {
         let tls = tls_settings.ok_or_else(|| {
@@ -2203,6 +2239,29 @@ mod tests {
         let generation = notifier.generation();
 
         assert!(!notifier.wait_for_change(generation, Some(Instant::now())));
+    }
+
+    #[test]
+    fn connect_tcp_to_any_addr_falls_back_after_refused_ipv6() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap());
+        let bad_v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0));
+        let good_v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+
+        let tcp = connect_tcp_to_any_addr(
+            "localhost",
+            &port.to_string(),
+            &[bad_v6, good_v4],
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        drop(tcp);
+        let _ = accepted.join().unwrap();
     }
 
     #[test]

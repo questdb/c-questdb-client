@@ -168,3 +168,7 @@ required-features = ["sync-sender-http", "ndarray", "rust_decimal"]
 [[example]]
 name = "protocol_version"
 required-features = ["sync-sender-http", "ndarray", "bigdecimal"]
+
+[[example]]
+name = "qwp_ws_unified_sfa_bench"
+required-features = ["sync-sender-qwp-ws"]
