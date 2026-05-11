@@ -3164,6 +3164,16 @@ pub unsafe extern "C" fn line_reader_cursor_request_id(cursor: *const line_reade
 
 /// Cumulative bytes of CREDIT this cursor has granted the server. Pulls
 /// through to the underlying reader's connection-level counter.
+///
+/// **Single-thread only.** This getter reads the counter through the
+/// laundered `Cursor<'static>` and is bound by the cursor's one-thread-at-a-time
+/// contract — calling it from a monitoring thread while the cursor's
+/// owning thread is inside `next_batch` / `cancel` / `add_credit` is
+/// undefined behaviour. For cross-thread monitoring (e.g. a stats
+/// dashboard polling from a separate thread), use
+/// `line_reader_credit_granted_total` instead — it reads the same
+/// connection-level counter through the reader's atomic, which is
+/// explicitly cross-thread safe.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_credit_granted_total(
     cursor: *const line_reader_cursor,

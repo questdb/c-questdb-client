@@ -1204,7 +1204,15 @@ bool line_reader_cursor_column_validity(
 /** The cursor's `request_id` (refreshed on failover). */
 LINEREADER_API int64_t line_reader_cursor_request_id(const line_reader_cursor*);
 
-/** Bytes of CREDIT this cursor has granted via the underlying reader. */
+/**
+ * Bytes of CREDIT this cursor has granted via the underlying reader.
+ *
+ * Single-thread only: bound by the cursor's one-thread-at-a-time
+ * contract. Cross-thread monitoring (e.g. a stats dashboard polling
+ * from a separate thread) must use `line_reader_credit_granted_total`
+ * on the reader handle instead — it reads the same connection-level
+ * counter via an atomic and is explicitly cross-thread safe.
+ */
 LINEREADER_API uint64_t line_reader_cursor_credit_granted_total(
     const line_reader_cursor*);
 

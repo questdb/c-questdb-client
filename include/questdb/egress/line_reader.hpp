@@ -1454,7 +1454,14 @@ public:
         ensure_impl();
         return ::line_reader_cursor_request_id(_impl);
     }
-    /** @throws line_reader_error if this cursor has been moved from. */
+    /**
+     * Single-thread only: bound by the cursor's one-thread-at-a-time
+     * contract. For cross-thread monitoring, use
+     * `reader::credit_granted_total()` instead — same counter, served
+     * by an atomic on the reader handle.
+     *
+     * @throws line_reader_error if this cursor has been moved from.
+     */
     uint64_t credit_granted_total() const
     {
         ensure_impl();
