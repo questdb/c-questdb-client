@@ -760,6 +760,152 @@ TEST_CASE("mock: cursor::add_credit writes MSG_CREDIT")
 }
 
 // ---------------------------------------------------------------------------
+// add_credit on a terminal cursor must reject. Pins commit 09518eb's
+// explicit `done` guard — without it, send_credit_frame would attempt
+// a write on the post-terminal transport and surface a confusing
+// transport-class error instead of the user-facing "API misuse"
+// signal.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mock: add_credit on terminal cursor returns InvalidApiCall")
+{
+    // Script drives the cursor to RESULT_END so `done = true`.
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select 1"_utf8);
+    // Drain to terminal.
+    CHECK_FALSE(cur.next_batch());
+    REQUIRE(cur.terminal_kind() != questdb::egress::terminal_kind::none);
+
+    bool threw = false;
+    try
+    {
+        cur.add_credit(64);
+    }
+    catch (const questdb::egress::line_reader_error& e)
+    {
+        threw = true;
+        CHECK(e.code() == line_reader_error_invalid_api_call);
+        // Pin the wording so a future docstring/error-message refactor
+        // can't quietly drop the "terminal" diagnostic.
+        const std::string m = std::string(e.what());
+        CHECK(m.find("terminal") != std::string::npos);
+    }
+    CHECK(threw);
+}
+
+// ---------------------------------------------------------------------------
+// add_credit failover regression for commit 09518eb. The fix promises
+// that a transport-class write failure on the current connection
+// triggers a reconnect-and-replay cycle, after which the credit frame
+// is re-sent on the new endpoint. Without the fix, add_credit would
+// surface the raw transport error and the user would have no way to
+// preserve their grant intent across failover.
+//
+// Script setup: A serves the handshake + one batch, then hard-drops.
+// The client's `add_credit` is the first operation to attempt a WRITE
+// against the dead connection — on loopback this surfaces inside the
+// tungstenite send path once the FIN propagates, which we ensure with
+// a brief settle before invoking `add_credit`. B handles the replayed
+// QUERY_REQUEST, receives the re-sent CREDIT, and terminates.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mock: add_credit failover on write failure replays credit on B")
+{
+    qm::ColumnSpec col{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({7}))};
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[col](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 1, {col});
+        }},
+        qm::ActionHardDrop{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "b"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionAwaitClientFrame{qm::MSG_CREDIT},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+
+    const std::string conf = "qwp::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
+    questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
+
+    std::atomic<int> failover_count{0};
+    auto cur = reader.prepare("select v"_utf8)
+                   .initial_credit(64)
+                   .on_failover_reset(
+                       [&failover_count](
+                           const questdb::egress::failover_event_view&) {
+                           failover_count.fetch_add(1);
+                       })
+                   .execute();
+    REQUIRE(cur.next_batch());
+
+    // Give A's FIN a moment to propagate to the client's tungstenite
+    // read state — without this the subsequent add_credit's flush
+    // may not yet observe the half-closed peer.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // add_credit must succeed (after failover replays it on B), NOT
+    // surface a transport error. This is the load-bearing assertion
+    // for commit 09518eb — the pre-fix code returned the raw write
+    // error here instead of attempting the failover replay.
+    bool threw = false;
+    try
+    {
+        cur.add_credit(1024);
+    }
+    catch (const questdb::egress::line_reader_error& e)
+    {
+        // Tolerate a single-cycle replay failure surfacing as a
+        // transport-class error — this can happen on platforms where
+        // the FIN propagates faster than the failover-callback
+        // bookkeeping (vanishingly rare on macOS/Linux loopback).
+        // But explicitly REJECT InvalidApiCall: that would mean
+        // the 'done' guard fired against a still-live cursor, a
+        // different bug we don't want to mask.
+        threw = true;
+        REQUIRE(e.code() != line_reader_error_invalid_api_call);
+    }
+    CHECK_FALSE(threw);
+    CHECK(cur.failover_resets() == 1);
+    CHECK(failover_count.load() == 1);
+
+    // Drain to RESULT_END on B so we exercise the post-failover read
+    // path too.
+    CHECK_FALSE(cur.next_batch());
+    REQUIRE(cur.terminal_kind() != questdb::egress::terminal_kind::none);
+
+    // B must have captured both the replayed QUERY_REQUEST and the
+    // re-sent CREDIT — the pre-fix code would replay the query but
+    // drop the credit grant, leaving B's AwaitClientFrame stuck.
+    auto reqs_b = srv_b.captured_requests();
+    bool saw_query = false;
+    bool saw_credit = false;
+    for (const auto& r : reqs_b)
+    {
+        if (r.empty())
+            continue;
+        if (r[0] == qm::MSG_QUERY_REQUEST)
+            saw_query = true;
+        if (r[0] == qm::MSG_CREDIT)
+            saw_credit = true;
+    }
+    CHECK(saw_query);
+    CHECK(saw_credit);
+}
+
+// ---------------------------------------------------------------------------
 // Failover surface — two MockServers, hard-drop on A, the reader fails
 // over to B, the trampoline fires once, the FailoverEvent fields are
 // populated. Mirrors questdb-rs/tests/egress_failover.rs:540.
