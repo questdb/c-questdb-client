@@ -1971,7 +1971,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_name(
     out_len: *mut size_t,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    unsafe {
+    panic_guard(|| unsafe {
         let batch = match (*cursor).current_batch.as_ref() {
             Some(b) => b,
             None => {
@@ -2003,7 +2003,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_name(
                 false
             }
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
