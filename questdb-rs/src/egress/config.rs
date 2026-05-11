@@ -471,6 +471,21 @@ impl ReaderConfig {
                     entry
                 )
             })?;
+            // Port 0 is the "ephemeral pick" sentinel for *listeners*;
+            // for an outbound connect target it's meaningless. The
+            // kernel rejects it as `EADDRNOTAVAIL` / `ECONNREFUSED`,
+            // which the egress code would surface as a `SocketError`
+            // — but with a confusing message ("connection refused")
+            // that hides the actual misconfiguration. Reject at parse
+            // so the diagnostic names the real cause.
+            if port == 0 {
+                return Err(fmt!(
+                    ConfigError,
+                    "Port 0 is not a valid connect target in \"addr\" entry {}: {:?}",
+                    i,
+                    entry
+                ));
+            }
             addrs.push(Endpoint { host, port });
         }
         if addrs.is_empty() {
@@ -1160,6 +1175,29 @@ mod tests {
     #[test]
     fn invalid_port_rejected() {
         let err = ReaderConfig::from_conf("qwp::addr=h:notaport").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn port_zero_rejected() {
+        // Port 0 means "let the OS pick" for *listeners*; for an
+        // outbound connect target it's nonsense. Parse-time rejection
+        // gives a precise diagnostic instead of a downstream
+        // EADDRNOTAVAIL / ECONNREFUSED with a misleading message.
+        let err = ReaderConfig::from_conf("qwp::addr=h:0").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("Port 0"),
+            "diagnostic must name the offending value; got: {}",
+            err.msg()
+        );
+        // Reject when port 0 is one of several entries, too —
+        // partial-zero lists shouldn't slip past.
+        let err = ReaderConfig::from_conf("qwp::addr=a:9000,b:0").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        // And in the IPv6-bracketed path (which funnels through the
+        // same `port_str.parse()` site).
+        let err = ReaderConfig::from_conf("qwp::addr=[::1]:0").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
