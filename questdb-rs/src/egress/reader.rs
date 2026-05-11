@@ -56,7 +56,7 @@ use crate::egress::schema::{Schema, SchemaRegistry};
 use crate::egress::decoder::ZstdScratch;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
-use crate::egress::transport::WsTransport;
+use crate::egress::transport::{CLOSE_TIMEOUT, WRITE_TIMEOUT, WsTransport};
 use crate::egress::wire::header::HEADER_LEN;
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
@@ -1443,10 +1443,14 @@ impl<'r> Cursor<'r> {
     /// frame for this request.
     ///
     /// Blocking, but bounded. The CANCEL write inherits the transport's
-    /// `WRITE_TIMEOUT`; the post-CANCEL drain runs with a TCP read
-    /// timeout of [`CANCEL_DRAIN_READ_TIMEOUT`] installed for the
-    /// duration of the loop, so a stuck-but-not-RST'd peer surfaces as
-    /// a `SocketError` rather than hanging the calling thread. If the
+    /// `WRITE_TIMEOUT`; immediately after the CANCEL is accepted by
+    /// the kernel send buffer, the read timeout is tightened to
+    /// [`CANCEL_DRAIN_READ_TIMEOUT`] and the write timeout to
+    /// `CLOSE_TIMEOUT` for the duration of the credit-nudge + drain.
+    /// That bounds the worst-case latency at one `WRITE_TIMEOUT`
+    /// (CANCEL) + `CLOSE_TIMEOUT` (nudge) + `CANCEL_DRAIN_READ_TIMEOUT`
+    /// (drain) — installing the drain bounds before the nudge avoids
+    /// a second `WRITE_TIMEOUT` window on a stuck TLS peer. If the
     /// CANCEL write itself fails, the transport is torn down before
     /// the error is returned so the cursor's flags and the underlying
     /// connection state are left coherent.
@@ -1489,6 +1493,21 @@ impl<'r> Cursor<'r> {
             self.terminate_with_close();
             return Err(e);
         }
+        // Bound the drain reads AND the credit-nudge write before
+        // anything else can block. tungstenite's `read()` is otherwise
+        // a pure blocking syscall, and a stuck-but-not-RST'd TLS peer
+        // whose kernel send buffer is still draining can absorb the
+        // credit-nudge write for the full `WRITE_TIMEOUT` (60 s)
+        // before the drain timeout would otherwise have a chance to
+        // fire. Tightening to `CLOSE_TIMEOUT` here caps the worst-case
+        // cancel() latency at `WRITE_TIMEOUT` (CANCEL) + `CLOSE_TIMEOUT`
+        // (nudge) + `CANCEL_DRAIN_READ_TIMEOUT` (drain) instead of
+        // 2 × `WRITE_TIMEOUT` + drain.
+        if let Some(t) = self.reader.transport.as_mut() {
+            t.set_read_timeout(Some(CANCEL_DRAIN_READ_TIMEOUT));
+            t.set_write_timeout(Some(CLOSE_TIMEOUT));
+        }
+
         // Wake the server in case it's already credit-suspended. The
         // server's `handleCancel` only sets a flag; the cancel takes
         // effect when `streamResults` is next re-entered, which on a
@@ -1513,15 +1532,6 @@ impl<'r> Cursor<'r> {
             let _ = self.send_credit_frame(1);
         }
 
-        // Bound the drain reads. tungstenite's `read()` is otherwise a
-        // pure blocking syscall; only the TCP-level timeout can
-        // interrupt it on a stuck peer. The credit-nudge write above
-        // may have torn the transport down (best-effort `let _ =`),
-        // so guard against `transport == None`.
-        if let Some(t) = self.reader.transport.as_mut() {
-            t.set_read_timeout(Some(CANCEL_DRAIN_READ_TIMEOUT));
-        }
-
         // Drain until any terminal frame (RESULT_END / EXEC_DONE /
         // QUERY_ERROR including STATUS_CANCELLED) — swallow batches
         // between CANCEL and the server's acknowledgement. `done` is
@@ -1542,12 +1552,13 @@ impl<'r> Cursor<'r> {
             }
         }
 
-        // Restore the default (no-op) read timeout. If `next_batch`
-        // hit a non-cancelled error, it has already called
+        // Restore the default timeouts. If `next_batch` hit a
+        // non-cancelled error, it has already called
         // `terminate_with_close` and the transport is `None`; nothing
         // to restore.
         if let Some(t) = self.reader.transport.as_mut() {
             t.set_read_timeout(None);
+            t.set_write_timeout(Some(WRITE_TIMEOUT));
         }
 
         drain_result

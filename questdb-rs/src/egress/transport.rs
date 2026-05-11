@@ -62,13 +62,13 @@ use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 /// Generous enough that realistic large-payload writes (multi-MB binds)
 /// are not affected, tight enough that failover teardown stays
 /// responsive.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Shorter timeout applied right before the WS Close write on
 /// teardown. The connection is being released regardless; a graceful
 /// close-frame ACK is best-effort, so prioritise fast FD release over
 /// peer-friendliness.
-const CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Per-batch wire-size ceiling we accept on the read side.
 ///
@@ -322,6 +322,17 @@ impl WsTransport {
     /// stuck-but-not-RST'd peer cannot hang the cancel forever.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         set_tcp_read_timeout(self.socket.get_mut(), timeout);
+    }
+
+    /// Apply (or clear) a TCP write timeout on the underlying stream.
+    ///
+    /// `Some(t)` caps any subsequent blocking `write()` syscall at `t`,
+    /// surfacing as a transport error if exceeded; `None` reverts to no
+    /// timeout. Used by `Cursor::cancel()` to tighten the post-CANCEL
+    /// credit-nudge write so a stuck peer cannot inflate the worst-case
+    /// cancel latency by an extra `WRITE_TIMEOUT`.
+    pub fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        set_tcp_write_timeout(self.socket.get_mut(), timeout);
     }
 
     /// Best-effort in-place close. Initiates the WS closing handshake
