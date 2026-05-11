@@ -279,12 +279,15 @@ impl Reader {
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
+            let mut annotated =
+                Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
             if let Some(r) = e.upgrade_reject() {
-                annotated.with_upgrade_reject(r.clone())
-            } else {
-                annotated
+                annotated = annotated.with_upgrade_reject(r.clone());
             }
+            if let Some(info) = e.server_info() {
+                annotated = annotated.with_server_info(info.clone());
+            }
+            annotated
         })?;
         let server_info = if transport.server_version() >= 2 {
             Some(read_server_info_frame(
@@ -317,6 +320,15 @@ impl Reader {
                     // identically to a `421+role` response — same
                     // semantics, same data payload, regardless of which
                     // surface the rejection arrived on.
+                    //
+                    // Also attach the full `SERVER_INFO` so callers can
+                    // see the cluster/node identity of the last endpoint
+                    // that refused (wire-egress.md §11.9.3): `epoch`,
+                    // `cluster_id`, `node_id`, `capabilities`,
+                    // `server_wall_ns` — none of which fit on
+                    // `UpgradeReject`. Lets operators distinguish "no
+                    // endpoint matched target=" from "all endpoints
+                    // unreachable".
                     let role = info.role;
                     let role_name = role.as_str();
                     let reject =
@@ -328,7 +340,8 @@ impl Reader {
                             idx, role_name, info.cluster_id, cfg.target,
                         ),
                     )
-                    .with_upgrade_reject(reject));
+                    .with_upgrade_reject(reject)
+                    .with_server_info(info.clone()));
                 }
                 _ => {}
             }

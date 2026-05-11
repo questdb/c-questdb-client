@@ -28,6 +28,8 @@
 
 use std::fmt::{Display, Formatter};
 
+use crate::egress::server_event::ServerInfo;
+
 /// Egress error category.
 ///
 /// `#[non_exhaustive]` so new diagnostic categories can be added without
@@ -161,6 +163,18 @@ pub struct Error {
     /// X-QuestDB-Role`) and target-filter mismatches against
     /// `SERVER_INFO`. `None` for every other error.
     upgrade_reject: Option<UpgradeReject>,
+    /// Set only when the rejection came from a v2 `SERVER_INFO`
+    /// target-filter mismatch — the full server-advertised identity
+    /// (`epoch`, `cluster_id`, `node_id`, `capabilities`, `server_wall_ns`)
+    /// alongside the role/zone already on `upgrade_reject`. Spec
+    /// (wire-egress.md §11.9.3) calls this out so operators can tell
+    /// `target=` filter exhaustion apart from "all endpoints unreachable"
+    /// and identify the cluster/node that last refused.
+    ///
+    /// `None` for every other error path, including the v1-pinned
+    /// `RoleMismatch` (no `SERVER_INFO` to attach) and the `421 +
+    /// X-QuestDB-Role` upgrade reject (only headers; no full `SERVER_INFO`).
+    server_info: Option<ServerInfo>,
 }
 
 impl Error {
@@ -169,6 +183,7 @@ impl Error {
             code,
             msg: msg.into(),
             upgrade_reject: None,
+            server_info: None,
         }
     }
 
@@ -178,6 +193,15 @@ impl Error {
     /// re-parsing the HTTP response.
     pub fn with_upgrade_reject(mut self, reject: UpgradeReject) -> Error {
         self.upgrade_reject = Some(reject);
+        self
+    }
+
+    /// Builder: attach the full last-observed `ServerInfo` to a
+    /// `RoleMismatch` produced from the v2 `SERVER_INFO`-target-mismatch
+    /// path. Lets diagnostics name the cluster/node that refused, on top
+    /// of the role/zone already on `upgrade_reject`.
+    pub fn with_server_info(mut self, info: ServerInfo) -> Error {
+        self.server_info = Some(info);
         self
     }
 
@@ -195,6 +219,17 @@ impl Error {
     /// `None` for all other failure paths.
     pub fn upgrade_reject(&self) -> Option<&UpgradeReject> {
         self.upgrade_reject.as_ref()
+    }
+
+    /// Full last-observed `SERVER_INFO` carried alongside this error.
+    /// `Some` only when the rejection came from the v2
+    /// `SERVER_INFO`-target-mismatch path; `None` everywhere else,
+    /// including v1-pinned `RoleMismatch` and the `421 + X-QuestDB-Role`
+    /// upgrade reject. Lets callers distinguish "no endpoint matched
+    /// `target=`" (this is `Some`) from "all endpoints unreachable"
+    /// (this is `None`).
+    pub fn server_info(&self) -> Option<&ServerInfo> {
+        self.server_info.as_ref()
     }
 }
 
@@ -249,6 +284,27 @@ mod tests {
     #[test]
     fn upgrade_reject_default_is_none() {
         let err = Error::new(ErrorCode::SocketError, "x");
+        assert!(err.upgrade_reject().is_none());
+    }
+
+    #[test]
+    fn server_info_round_trips_and_default_is_none() {
+        use crate::egress::server_event::{ServerInfo, ServerRole};
+        let err_plain = Error::new(ErrorCode::SocketError, "x");
+        assert!(err_plain.server_info().is_none());
+
+        let info = ServerInfo {
+            role: ServerRole::Replica,
+            epoch: 7,
+            capabilities: 0,
+            server_wall_ns: 1_700_000_000_000_000_000,
+            cluster_id: "c-1".into(),
+            node_id: "n-2".into(),
+            zone_id: Some("eu-west-1a".into()),
+        };
+        let err = Error::new(ErrorCode::RoleMismatch, "no match")
+            .with_server_info(info.clone());
+        assert_eq!(err.server_info(), Some(&info));
         assert!(err.upgrade_reject().is_none());
     }
 
