@@ -232,6 +232,13 @@ pub(super) fn validate_upgrade_response(
     expected_accept: &str,
     request_durable_ack: bool,
 ) -> crate::Result<u8> {
+    if parsed.status == 401 || parsed.status == 403 {
+        return Err(error::fmt!(
+            AuthError,
+            "WebSocket upgrade authentication failed: HTTP status {}",
+            parsed.status
+        ));
+    }
     if parsed.status != 101 {
         return Err(error::fmt!(
             ProtocolVersionError,

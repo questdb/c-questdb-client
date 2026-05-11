@@ -160,6 +160,7 @@ pub(crate) fn is_valid_qwp_ws_sender_id(sender_id: &str) -> bool {
 #[derive(Debug, Clone)]
 pub(crate) struct QwpWsConfig {
     pub(crate) connect_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) client_id: ConfigSetting<Option<String>>,
     pub(crate) max_protocol_version: ConfigSetting<u32>,
@@ -196,6 +197,7 @@ impl Default for QwpWsConfig {
     fn default() -> Self {
         Self {
             connect_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
+            auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             client_id: ConfigSetting::new_default(None),
             max_protocol_version: ConfigSetting::new_default(1),

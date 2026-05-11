@@ -26,7 +26,7 @@
 //! framing — no external WebSocket dependency. See QWP_SPECIFICATION §2 (transport),
 //! §3 (version negotiation) and §13 (response format).
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1603,6 +1603,14 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
         )
     })?;
 
+    read_upgrade_response(stream, &key_b64, request_durable_ack)
+}
+
+fn read_upgrade_response<R: Read>(
+    stream: &mut R,
+    key_b64: &str,
+    request_durable_ack: bool,
+) -> crate::Result<(u8, Vec<u8>)> {
     let (header_block, leftover) = read_http_header_block(stream)?;
     let parsed = codec::parse_http_header_block(&header_block)?;
     let expected_accept = codec::compute_accept(&key_b64);
@@ -1640,6 +1648,27 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<(Vec<u8>, Ve
 }
 
 // ---------- connect ----------
+
+fn complete_qwp_ws_tls_handshake(
+    conn: &mut rustls::ClientConnection,
+    tcp: &mut TcpStream,
+    auth_timeout: Duration,
+) -> crate::Result<()> {
+    while conn.wants_write() || conn.is_handshaking() {
+        conn.complete_io(tcp).map_err(|io| {
+            if matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+                error::fmt!(
+                    TlsError,
+                    "Failed to complete TLS handshake: timed out waiting for server response after {:?}.",
+                    auth_timeout
+                )
+            } else {
+                error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io)
+            }
+        })?;
+    }
+    Ok(())
+}
 
 fn resolve_qwp_ws_addrs(host: &str, port: &str) -> crate::Result<Vec<SocketAddr>> {
     use std::net::ToSocketAddrs;
@@ -1720,25 +1749,10 @@ pub(crate) fn establish_connection(
     auth_header: Option<&str>,
 ) -> crate::Result<(WsStream, u8, Vec<u8>)> {
     let connect_timeout = *qwp_ws.connect_timeout;
+    let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
 
-    let tcp = connect_qwp_ws_tcp(host, port, connect_timeout, request_timeout)?;
-
-    let mut stream = if use_tls {
-        let tls = tls_settings.ok_or_else(|| {
-            error::fmt!(ConfigError, "TLS settings missing for QWP/WebSocket Secure")
-        })?;
-        let cfg: Arc<rustls::ClientConfig> = configure_tls(tls)?;
-        let server_name = host
-            .to_string()
-            .try_into()
-            .map_err(|e| error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e))?;
-        let conn = rustls::ClientConnection::new(cfg, server_name)
-            .map_err(|e| error::fmt!(TlsError, "TLS handshake setup failed: {}", e))?;
-        WsStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)))
-    } else {
-        WsStream::Plain(tcp)
-    };
+    let mut tcp = connect_qwp_ws_tcp(host, port, connect_timeout, auth_timeout)?;
 
     let host_header = if (use_tls && port == "443") || (!use_tls && port == "80") {
         host.to_string()
@@ -1750,14 +1764,44 @@ pub(crate) fn establish_connection(
     let client_id = qwp_ws.client_id.as_deref();
     let request_durable_ack = *qwp_ws.request_durable_ack;
 
-    let (negotiated_version, leftover) = perform_upgrade(
-        &mut stream,
-        &host_header,
-        auth_header,
-        max_version,
-        client_id,
-        request_durable_ack,
-    )?;
+    let (stream, negotiated_version, leftover) = if use_tls {
+        let tls = tls_settings.ok_or_else(|| {
+            error::fmt!(ConfigError, "TLS settings missing for QWP/WebSocket Secure")
+        })?;
+        let cfg: Arc<rustls::ClientConfig> = configure_tls(tls)?;
+        let server_name = host
+            .to_string()
+            .try_into()
+            .map_err(|e| error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e))?;
+        let mut conn = rustls::ClientConnection::new(cfg, server_name)
+            .map_err(|e| error::fmt!(TlsError, "TLS handshake setup failed: {}", e))?;
+        complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, auth_timeout)?;
+        let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+        let (negotiated_version, leftover) = perform_upgrade(
+            &mut tls_stream,
+            &host_header,
+            auth_header,
+            max_version,
+            client_id,
+            request_durable_ack,
+        )?;
+        (
+            WsStream::Tls(Box::new(tls_stream)),
+            negotiated_version,
+            leftover,
+        )
+    } else {
+        let mut plain_stream = tcp;
+        let (negotiated_version, leftover) = perform_upgrade(
+            &mut plain_stream,
+            &host_header,
+            auth_header,
+            max_version,
+            client_id,
+            request_durable_ack,
+        )?;
+        (WsStream::Plain(plain_stream), negotiated_version, leftover)
+    };
 
     stream
         .set_timeouts(Some(request_timeout), Some(request_timeout))

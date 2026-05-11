@@ -192,6 +192,11 @@ to resolve. The configuration parameter is:
 
 * `auth_timeout` (milliseconds, default 15 seconds)
 
+For QWP/WebSocket configuration strings, the Java-compatible spelling is also
+accepted:
+
+* `auth_timeout_ms` (milliseconds, default 15 seconds)
+
 ## Encryption on the Wire: TLS
 
 To enable TLS on the QuestDB Enterprise server, refer to the [QuestDB Enterprise

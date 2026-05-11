@@ -77,11 +77,24 @@ turn into documentation decisions rather than code changes.
 
 ### VL-C3 - Add QWP/WebSocket authentication coverage
 
-- Status: [ ]
+- Status: [x]
 - Source area: WebSocket upgrade path and mock or system tests
 - Action: Test that the `Authorization` header is sent and validated for
   QWP/WebSocket.
 - Acceptance: A test fails if auth is missing or malformed on upgrade.
+- Validation: Still valid. Java QWP/WebSocket sends the `Authorization` header
+  on the WebSocket upgrade, parses `auth_timeout_ms` as a WebSocket-only
+  timeout with a 15s default, and classifies HTTP 401/403 upgrade rejections as
+  auth failures. Rust now accepts the same QWP/WebSocket `auth_timeout_ms`
+  spelling, uses it for TCP/TLS/WebSocket upgrade/auth setup, explicitly
+  completes the TLS handshake before sending the HTTP upgrade request, and maps
+  401/403 upgrade responses to `AuthError`.
+- Evidence: `TestQwpWsSender.test_auth_failures_rejected` exercises missing
+  auth and wrong-password auth against a real QuestDB server. The matrix passed
+  with HTTP auth disabled/enabled and TLS disabled/enabled using
+  `/home/jara/devel/oss/questdb-arrays` on JDK 25. Focused Rust validation also
+  passed with
+  `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws,tls-webpki-certs,ring-crypto qwp_ws`.
 
 ### VL-C4 - Add QWP/WebSocket example programs
 

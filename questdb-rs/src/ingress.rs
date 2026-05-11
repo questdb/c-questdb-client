@@ -478,7 +478,7 @@ impl SenderBuilder {
     /// configuration names and settings without a public Rust builder method.
     /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_bytes`,
     /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
-    /// `close_flush_timeout_millis`, `request_durable_ack`,
+    /// `auth_timeout_ms`, `close_flush_timeout_millis`, `request_durable_ack`,
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
     /// `max_background_drainers`, `error_inbox_capacity`, and
     /// `max_schemas_per_connection`.
@@ -564,6 +564,8 @@ impl SenderBuilder {
                 "initial_connect_retry" => {
                     builder.initial_connect_retry(parse_initial_connect_retry_value(val)?)?
                 }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "auth_timeout_ms" => builder.qwp_ws_auth_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "close_flush_timeout_millis" => builder.close_flush_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1272,6 +1274,28 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    fn qwp_ws_auth_timeout_millis(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"auth_timeout_ms\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let millis: i64 = parse_conf_value("auth_timeout_ms", value)?;
+        if millis <= 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "auth_timeout_ms must be > 0: {}",
+                millis
+            ));
+        }
+        qwp_ws
+            .auth_timeout
+            .set_specified("auth_timeout_ms", Duration::from_millis(millis as u64))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     fn close_flush_timeout_millis(mut self, value: &str) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
@@ -1402,11 +1426,23 @@ impl SenderBuilder {
     }
 
     /// Configure how long to wait for messages from the QuestDB server during
-    /// the TLS handshake and authentication process. This only applies to TCP.
-    /// The default is 15 seconds.
+    /// the TLS handshake and authentication process. For QWP/WebSocket this
+    /// applies to the WebSocket upgrade/authentication exchange. The default is
+    /// 15 seconds.
     pub fn auth_timeout(mut self, value: Duration) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("auth_timeout")?;
+        #[cfg(feature = "_sender-qwp-ws")]
+        if let Some(qwp_ws) = &mut self.qwp_ws {
+            if value.is_zero() {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"auth_timeout\" must be greater than 0."
+                ));
+            }
+            qwp_ws.auth_timeout.set_specified("auth_timeout", value)?;
+            return Ok(self);
+        }
         self.auth_timeout.set_specified("auth_timeout", value)?;
         Ok(self)
     }

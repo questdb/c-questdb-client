@@ -150,7 +150,8 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
          sf_max_bytes=64mb;\
          sf_max_total_bytes=4G;\
          sf_durability=memory;\
-         sf_append_deadline_millis=1234;",
+         sf_append_deadline_millis=1234;\
+         auth_timeout_ms=750;",
     )
     .unwrap();
 
@@ -162,6 +163,7 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
     assert_specified_eq(&qwp_ws.sf_max_total_bytes, Some(4 * 1024 * 1024 * 1024_u64));
     assert_specified_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
     assert_specified_eq(&qwp_ws.sf_append_deadline, Duration::from_millis(1234));
+    assert_specified_eq(&qwp_ws.auth_timeout, Duration::from_millis(750));
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -185,6 +187,7 @@ fn qwpws_store_and_forward_defaults_match_java() {
     assert_defaulted_eq(&qwp_ws.sf_max_total_bytes, None);
     assert_defaulted_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
     assert_defaulted_eq(&qwp_ws.sf_append_deadline, Duration::from_secs(30));
+    assert_defaulted_eq(&qwp_ws.auth_timeout, Duration::from_secs(15));
     assert_defaulted_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }
 
@@ -272,6 +275,12 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
     .unwrap();
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=0;").unwrap();
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=2;").unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;auth_timeout_ms=1;").unwrap();
+    let builder = SenderBuilder::new(Protocol::QwpWs, "localhost", 9000)
+        .auth_timeout(Duration::from_millis(750))
+        .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.auth_timeout, Duration::from_millis(750));
 
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;sender_id=bad/id;"),
@@ -315,6 +324,14 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=-1;"),
         "max_background_drainers must be >= 0: -1",
     );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;auth_timeout_ms=0;"),
+        "auth_timeout_ms must be > 0: 0",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;auth_timeout_ms=-1;"),
+        "auth_timeout_ms must be > 0: -1",
+    );
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=on;").unwrap();
     SenderBuilder::from_conf(
         "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
@@ -344,6 +361,10 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
     assert_conf_err(
         SenderBuilder::from_conf("tcp::addr=localhost:9009;close_flush_timeout_millis=5000;"),
         "The \"close_flush_timeout_millis\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;auth_timeout_ms=5000;"),
+        "The \"auth_timeout_ms\" setting is only supported for QWP/WebSocket.",
     );
     assert_conf_err(
         SenderBuilder::from_conf("tcp::addr=localhost:9009;sf_append_deadline_millis=5000;"),

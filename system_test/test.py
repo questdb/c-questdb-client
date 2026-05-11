@@ -1612,7 +1612,13 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
         tls_name = 'tls' if QWP_WS_SMOKE_TLS else 'no_tls'
         return f'{auth_name}_{tls_name}'
 
-    def _sender_conf_for_variant(self, sender_id, sf_dir, include_auth=True):
+    def _sender_conf_for_variant(
+            self,
+            sender_id,
+            sf_dir,
+            include_auth=True,
+            password=None,
+            auth_timeout_ms=None):
         scheme = 'qwpws'
         host = QDB_FIXTURE.host
         port = QDB_FIXTURE.http_server_port
@@ -1620,6 +1626,8 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             'reconnect_max_duration_millis': 30000,
             'close_flush_timeout_millis': 30000,
         }
+        if auth_timeout_ms is not None:
+            settings['auth_timeout_ms'] = auth_timeout_ms
         if QWP_WS_SMOKE_TLS:
             scheme = 'qwpwss'
             host = 'localhost'
@@ -1627,7 +1635,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             settings['tls_roots'] = str(Project().tls_certs_dir / 'server_rootCA.pem')
         if include_auth and getattr(QDB_FIXTURE, 'http_auth', False):
             settings['username'] = HTTP_AUTH['username']
-            settings['password'] = HTTP_AUTH['password']
+            settings['password'] = password or HTTP_AUTH['password']
         return self._sender_conf(
             sender_id,
             sf_dir,
@@ -1636,20 +1644,40 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             host=host,
             **settings)
 
-    def _assert_missing_auth_rejected(self, sender_id, sf_dir):
+    def _assert_auth_rejected(self, sender_id, sf_dir, include_auth, password=None):
         if not getattr(QDB_FIXTURE, 'http_auth', False):
             return
         sender = qls.Sender.from_conf(self._sender_conf_for_variant(
             sender_id,
             sf_dir,
-            include_auth=False))
+            include_auth=include_auth,
+            password=password,
+            auth_timeout_ms=5000))
         try:
-            with self.assertRaisesRegex(
-                    qls.SenderError,
-                    r'(?i)(401|403|unauthor|forbidden|auth)'):
+            with self.assertRaises(qls.SenderError) as ctx:
                 sender.connect()
+            native_error = ctx.exception.__cause__ or ctx.exception
+            self.assertRegex(
+                str(native_error),
+                r'(?i)(401|403|unauthor|forbidden|authentication)')
         finally:
             sender.close(False)
+
+    def _assert_auth_failures_rejected(self, sender_id, sf_dir):
+        self._assert_auth_rejected(
+            sender_id + '-noauth',
+            sf_dir,
+            include_auth=False)
+        self._assert_auth_rejected(
+            sender_id + '-badauth',
+            sf_dir,
+            include_auth=True,
+            password='wrong')
+
+    def test_auth_failures_rejected(self):
+        sender_id = 'auth-' + self._variant_name() + '-' + uuid.uuid4().hex[:8]
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-auth-') as sf_dir:
+            self._assert_auth_failures_rejected(sender_id, sf_dir)
 
     def test_single_batch_round_trip(self):
         table_name = 'qwp_ws_smoke_' + uuid.uuid4().hex[:8]
@@ -1661,8 +1689,6 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
                 sender_id,
                 sf_dir))
             try:
-                if not QWP_WS_SMOKE_TLS:
-                    self._assert_missing_auth_rejected(sender_id + '-noauth', sf_dir)
                 self._write_rows(sender, table_name, 0, self.ROWS)
                 sender.flush()
                 sender.close_drain()
