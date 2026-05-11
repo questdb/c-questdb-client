@@ -708,6 +708,8 @@ type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverEvent) + 'r>;
 /// based on whether a callback is currently installed would be a leaky
 /// abstraction. The `_not_send` marker pins the choice regardless of
 /// callback presence.
+#[must_use = "ReaderQuery does nothing until you call .execute(); dropping it discards \
+              the prepared SQL and any binds without sending a QUERY_REQUEST"]
 pub struct ReaderQuery<'r> {
     reader: &'r mut Reader,
     builder: QueryRequestBuilder,
@@ -1056,6 +1058,9 @@ pub enum Terminal {
 /// callback is currently installed avoids a leaky abstraction whereby
 /// a Cursor that happens not to have a callback would be `Send` and
 /// then suddenly stop being so when one is installed.
+#[must_use = "Cursor must be drained via next_batch() or cancelled via cancel(); \
+              dropping mid-stream sends a best-effort CANCEL and closes the WebSocket, \
+              tearing down the connection for the next query on this Reader"]
 pub struct Cursor<'r> {
     reader: &'r mut Reader,
     request_id: i64,
@@ -1842,6 +1847,8 @@ impl Drop for Cursor<'_> {
 }
 
 /// Borrowed view over the most recently decoded batch.
+#[must_use = "BatchView is a borrowed projection; dropping it without iterating \
+              the rows or calling its accessors throws away the just-decoded batch"]
 pub struct BatchView<'c> {
     decoded: &'c DecodedBatch,
     dict: &'c SymbolDict,
