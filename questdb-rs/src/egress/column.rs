@@ -79,6 +79,7 @@ impl<'a> Validity<'a> {
     /// (see `decode_validity`), so the error is unreachable from
     /// crate-internal callers; the check exists so external callers can't
     /// build a corrupt view and have it silently mis-report NULL rows.
+    #[inline]
     pub fn from_bitmap(bytes: &'a [u8], row_count: usize) -> Result<Self> {
         let needed = row_count.div_ceil(8);
         if bytes.len() < needed {
@@ -93,6 +94,7 @@ impl<'a> Validity<'a> {
         Ok(Validity::Bitmap { bytes, row_count })
     }
 
+    #[inline]
     pub fn has_nulls(&self) -> bool {
         matches!(self, Validity::Bitmap { .. })
     }
@@ -105,6 +107,7 @@ impl<'a> Validity<'a> {
     /// too-short bitmap reports `false` for the missing tail rather
     /// than panicking. Constructor-validated values never trip the
     /// fallback.
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         match self {
             Validity::None => false,
@@ -121,6 +124,7 @@ impl<'a> Validity<'a> {
     }
 
     /// Raw bitmap, when present.
+    #[inline]
     pub fn bytes(&self) -> Option<&'a [u8]> {
         match self {
             Validity::None => None,
@@ -194,6 +198,7 @@ impl<'a, T: FixedWidth> FixedColumn<'a, T> {
     /// out-of-bounds panics from `value()` — exposing it as a safe
     /// `pub fn` would let external callers trip both. The decoder
     /// upholds the invariants by construction.
+    #[inline]
     pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>) -> Self {
         debug_assert_eq!(
             raw.len() % T::SIZE,
@@ -207,23 +212,28 @@ impl<'a, T: FixedWidth> FixedColumn<'a, T> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.raw.len() / T::SIZE
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.validity.is_null(row)
     }
 
     /// Raw little-endian bytes for the entire column. `len() * T::SIZE` long.
+    #[inline]
     pub fn raw(&self) -> &'a [u8] {
         self.raw
     }
@@ -242,6 +252,7 @@ impl<'a, T: FixedWidth> FixedColumn<'a, T> {
     }
 
     /// Iterator yielding `Option<T>` (None for null rows).
+    #[inline]
     pub fn iter(&self) -> FixedIter<'_, 'a, T> {
         FixedIter {
             col: self,
@@ -259,6 +270,7 @@ pub struct FixedIter<'c, 'a, T: FixedWidth> {
 
 impl<'c, 'a, T: FixedWidth> Iterator for FixedIter<'c, 'a, T> {
     type Item = Option<T>;
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.row >= self.len {
             return None;
@@ -287,27 +299,33 @@ pub struct FixedBytesColumn<'a, const N: usize> {
 impl<'a, const N: usize> FixedBytesColumn<'a, N> {
     /// `pub(crate)` for the same reason as [`FixedColumn::new`]: the
     /// `raw.len() % N == 0` invariant is `debug_assert!`-only.
+    #[inline]
     pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>) -> Self {
         debug_assert_eq!(raw.len() % N, 0);
         Self { raw, validity }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.raw.len() / N
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.validity.is_null(row)
     }
 
+    #[inline]
     pub fn raw(&self) -> &'a [u8] {
         self.raw
     }
@@ -353,6 +371,7 @@ impl<'a> SymbolColumn<'a> {
     /// dict-bounds check). A safe `pub fn` would let external callers
     /// build a column where `resolve()` silently returns `None` for
     /// non-null rows — masking wire corruption as SQL NULL.
+    #[inline]
     pub(crate) fn new(codes: &'a [u32], validity: Validity<'a>, dict: &'a SymbolDict) -> Self {
         Self {
             codes,
@@ -361,32 +380,39 @@ impl<'a> SymbolColumn<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.codes.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.codes.is_empty()
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.validity.is_null(row)
     }
 
     /// Dense per-row codes (`0` in null slots — see [`is_null`](Self::is_null)).
+    #[inline]
     pub fn codes(&self) -> &'a [u32] {
         self.codes
     }
 
+    #[inline]
     pub fn dict(&self) -> &'a SymbolDict {
         self.dict
     }
 
     /// Resolve `row` to its UTF-8 string. `None` for null rows or unknown ids.
+    #[inline]
     pub fn resolve(&self, row: usize) -> Option<&'a str> {
         if self.is_null(row) {
             return None;
@@ -411,6 +437,7 @@ pub struct Decimal64Column<'a> {
 impl<'a> Decimal64Column<'a> {
     /// `pub(crate)`: wraps a `FixedColumn<i64>`; same wire-bytes
     /// invariants apply.
+    #[inline]
     pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
         Self {
             values: FixedColumn::new(raw, validity),
@@ -418,26 +445,32 @@ impl<'a> Decimal64Column<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.values.validity()
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.values.is_null(row)
     }
 
+    #[inline]
     pub fn scale(&self) -> i8 {
         self.scale
     }
 
+    #[inline]
     pub fn raw(&self) -> &'a [u8] {
         self.values.raw()
     }
@@ -474,10 +507,12 @@ struct VarlenLayout<'a> {
 }
 
 impl<'a> VarlenLayout<'a> {
+    #[inline]
     fn len(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
 
+    #[inline]
     fn slice(&self, row: usize) -> Option<&'a [u8]> {
         if self.validity.is_null(row) {
             return None;
@@ -519,26 +554,32 @@ impl<'a> VarcharColumn<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.len() == 0
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.inner.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.inner.validity.is_null(row)
     }
 
+    #[inline]
     pub fn offsets(&self) -> &'a [u32] {
         self.inner.offsets
     }
 
+    #[inline]
     pub fn data(&self) -> &'a [u8] {
         self.inner.data
     }
@@ -570,6 +611,7 @@ impl<'a> BinaryColumn<'a> {
     /// `offsets` ending at `data.len()`, with `offsets.len() == row_count + 1`
     /// (or matching the no-null fast path the decoder uses). Out-of-spec
     /// inputs cause `value()` to read garbage or panic.
+    #[inline]
     pub(crate) fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
         Self {
             inner: VarlenLayout {
@@ -580,26 +622,32 @@ impl<'a> BinaryColumn<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.len() == 0
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.inner.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.inner.validity.is_null(row)
     }
 
+    #[inline]
     pub fn offsets(&self) -> &'a [u32] {
         self.inner.offsets
     }
 
+    #[inline]
     pub fn data(&self) -> &'a [u8] {
         self.inner.data
     }
@@ -636,6 +684,7 @@ pub struct GeohashColumn<'a> {
 impl<'a> GeohashColumn<'a> {
     /// `pub(crate)`: the `byte_width` ∈ 1..=8 and `raw.len() % byte_width
     /// == 0` invariants are `debug_assert!`-only.
+    #[inline]
     pub(crate) fn new(
         raw: &'a [u8],
         byte_width: u8,
@@ -652,14 +701,17 @@ impl<'a> GeohashColumn<'a> {
         }
     }
 
+    #[inline]
     pub fn precision_bits(&self) -> u8 {
         self.precision_bits
     }
 
+    #[inline]
     pub fn byte_width(&self) -> u8 {
         self.byte_width
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         if self.byte_width == 0 {
             0
@@ -668,18 +720,22 @@ impl<'a> GeohashColumn<'a> {
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.validity.is_null(row)
     }
 
+    #[inline]
     pub fn raw(&self) -> &'a [u8] {
         self.raw
     }
@@ -689,6 +745,7 @@ impl<'a> GeohashColumn<'a> {
     /// # Panics
     /// Panics if `row >= self.len()`.
     #[track_caller]
+    #[inline]
     pub fn value(&self, row: usize) -> u64 {
         let bw = self.byte_width as usize;
         let s = row * bw;
@@ -714,6 +771,7 @@ pub struct Decimal128Column<'a> {
 impl<'a> Decimal128Column<'a> {
     /// `pub(crate)`: `raw.len() % 16 == 0` invariant is
     /// `debug_assert!`-only.
+    #[inline]
     pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
         debug_assert_eq!(raw.len() % 16, 0);
         Self {
@@ -723,26 +781,32 @@ impl<'a> Decimal128Column<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.raw.len() / 16
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
+    #[inline]
     pub fn scale(&self) -> i8 {
         self.scale
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.validity.is_null(row)
     }
 
+    #[inline]
     pub fn raw(&self) -> &'a [u8] {
         self.raw
     }
@@ -775,6 +839,7 @@ pub struct Decimal256Column<'a> {
 impl<'a> Decimal256Column<'a> {
     /// `pub(crate)`: `raw.len() % 32 == 0` invariant is
     /// `debug_assert!`-only.
+    #[inline]
     pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
         debug_assert_eq!(raw.len() % 32, 0);
         Self {
@@ -784,26 +849,32 @@ impl<'a> Decimal256Column<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.raw.len() / 32
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
+    #[inline]
     pub fn scale(&self) -> i8 {
         self.scale
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.validity.is_null(row)
     }
 
+    #[inline]
     pub fn raw(&self) -> &'a [u8] {
         self.raw
     }
@@ -843,10 +914,12 @@ struct ArrayLayout<'a> {
 }
 
 impl<'a> ArrayLayout<'a> {
+    #[inline]
     fn len(&self) -> usize {
         self.data_offsets.len().saturating_sub(1)
     }
 
+    #[inline]
     fn shape(&self, row: usize) -> Option<&'a [u32]> {
         if self.validity.is_null(row) {
             return None;
@@ -856,6 +929,7 @@ impl<'a> ArrayLayout<'a> {
         self.shapes.get(s..e)
     }
 
+    #[inline]
     fn raw(&self, row: usize) -> Option<&'a [u8]> {
         if self.validity.is_null(row) {
             return None;
@@ -880,6 +954,7 @@ impl<'a> DoubleArrayColumn<'a> {
     /// `data.len()`/`shapes.len()`, and matching the validity bitmap's
     /// row count. Out-of-spec inputs cause `element()` / `shape()` to
     /// return garbage or panic.
+    #[inline]
     pub(crate) fn new(
         data_offsets: &'a [u32],
         data: &'a [u8],
@@ -898,40 +973,48 @@ impl<'a> DoubleArrayColumn<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.len() == 0
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.inner.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.inner.validity.is_null(row)
     }
 
     /// Per-row shape (`None` for null rows).
+    #[inline]
     pub fn shape(&self, row: usize) -> Option<&'a [u32]> {
         self.inner.shape(row)
     }
 
     /// Flat little-endian element bytes for `row` (`None` for null rows).
     /// Decode each 8-byte chunk as `f64::from_le_bytes`.
+    #[inline]
     pub fn raw(&self, row: usize) -> Option<&'a [u8]> {
         self.inner.raw(row)
     }
 
     /// Element count for `row` (product of shape; 0 for null rows).
+    #[inline]
     pub fn element_count(&self, row: usize) -> usize {
         self.raw(row).map(|b| b.len() / 8).unwrap_or(0)
     }
 
     /// Decode element at flat index `idx` of `row`. Caller must respect
     /// shape ordering; this is row-major flat indexing.
+    #[inline]
     pub fn element(&self, row: usize, idx: usize) -> Option<f64> {
         let bytes = self.raw(row)?;
         let s = idx.checked_mul(8)?;
@@ -950,6 +1033,7 @@ pub struct LongArrayColumn<'a> {
 impl<'a> LongArrayColumn<'a> {
     /// `pub(crate)`: see [`DoubleArrayColumn::new`] — same four-buffer
     /// invariants apply.
+    #[inline]
     pub(crate) fn new(
         data_offsets: &'a [u32],
         data: &'a [u8],
@@ -968,34 +1052,42 @@ impl<'a> LongArrayColumn<'a> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.len() == 0
     }
 
+    #[inline]
     pub fn validity(&self) -> Validity<'a> {
         self.inner.validity
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         self.inner.validity.is_null(row)
     }
 
+    #[inline]
     pub fn shape(&self, row: usize) -> Option<&'a [u32]> {
         self.inner.shape(row)
     }
 
+    #[inline]
     pub fn raw(&self, row: usize) -> Option<&'a [u8]> {
         self.inner.raw(row)
     }
 
+    #[inline]
     pub fn element_count(&self, row: usize) -> usize {
         self.raw(row).map(|b| b.len() / 8).unwrap_or(0)
     }
 
+    #[inline]
     pub fn element(&self, row: usize, idx: usize) -> Option<i64> {
         let bytes = self.raw(row)?;
         let s = idx.checked_mul(8)?;
@@ -1048,6 +1140,7 @@ pub enum ColumnView<'a> {
 }
 
 impl ColumnView<'_> {
+    #[inline]
     pub fn kind(&self) -> ColumnKind {
         match self {
             ColumnView::Boolean(_) => ColumnKind::Boolean,
@@ -1076,6 +1169,7 @@ impl ColumnView<'_> {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         match self {
             ColumnView::Boolean(c) => c.len(),
@@ -1104,10 +1198,12 @@ impl ColumnView<'_> {
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[inline]
     pub fn is_null(&self, row: usize) -> bool {
         match self {
             ColumnView::Boolean(c) => c.is_null(row),
@@ -1136,6 +1232,7 @@ impl ColumnView<'_> {
         }
     }
 
+    #[inline]
     pub fn validity<'b>(&'b self) -> Validity<'b> {
         match self {
             ColumnView::Boolean(c) => c.validity(),

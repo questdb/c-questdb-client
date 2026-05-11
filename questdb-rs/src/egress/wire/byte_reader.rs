@@ -38,24 +38,29 @@ pub(crate) struct ByteReader<'a> {
 }
 
 impl<'a> ByteReader<'a> {
+    #[inline]
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
     }
 
     /// Current absolute byte offset into the originally-supplied buffer.
     /// Use with the parent payload `Bytes` to take a zero-copy owned slice.
+    #[inline]
     pub(crate) fn pos(&self) -> usize {
         self.pos
     }
 
+    #[inline]
     pub(crate) fn remaining(&self) -> &'a [u8] {
         &self.bytes[self.pos..]
     }
 
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.pos == self.bytes.len()
     }
 
+    #[inline]
     pub(crate) fn advance(&mut self, n: usize) -> Result<()> {
         let new_pos = self
             .pos
@@ -73,6 +78,7 @@ impl<'a> ByteReader<'a> {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn read_u8(&mut self) -> Result<u8> {
         if self.pos >= self.bytes.len() {
             return Err(fmt!(ProtocolError, "frame truncated reading u8"));
@@ -82,22 +88,27 @@ impl<'a> ByteReader<'a> {
         Ok(v)
     }
 
+    #[inline]
     pub(crate) fn read_u16_le(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.read_bytes(2)?.try_into().unwrap()))
     }
 
+    #[inline]
     pub(crate) fn read_u32_le(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.read_bytes(4)?.try_into().unwrap()))
     }
 
+    #[inline]
     pub(crate) fn read_u64_le(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.read_bytes(8)?.try_into().unwrap()))
     }
 
+    #[inline]
     pub(crate) fn read_i64_le(&mut self) -> Result<i64> {
         Ok(i64::from_le_bytes(self.read_bytes(8)?.try_into().unwrap()))
     }
 
+    #[inline]
     pub(crate) fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self
             .pos
@@ -116,12 +127,14 @@ impl<'a> ByteReader<'a> {
         Ok(s)
     }
 
+    #[inline]
     pub(crate) fn read_varint_u64(&mut self) -> Result<u64> {
         let (v, n) = varint::decode_u64(self.remaining())?;
         self.advance(n)?;
         Ok(v)
     }
 
+    #[inline]
     pub(crate) fn read_varint_usize(&mut self) -> Result<usize> {
         let (v, n) = varint::decode_usize(self.remaining())?;
         self.advance(n)?;

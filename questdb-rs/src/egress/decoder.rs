@@ -209,6 +209,7 @@ impl DecodedBatch {
     /// `dict` should be the connection's [`SymbolDict`] (only consulted for
     /// `Symbol` columns; ignored otherwise but required so the call site is
     /// borrow-correct in the streaming case).
+    #[inline]
     pub fn column_view<'a>(&'a self, idx: usize, dict: &'a SymbolDict) -> Result<ColumnView<'a>> {
         let col = self
             .columns
@@ -333,10 +334,12 @@ impl DecodedBatch {
     }
 }
 
+#[inline]
 fn validity_of<'a>(buf: &'a ColumnBuffer, row_count: usize) -> Result<Validity<'a>> {
     validity_from_opt(&buf.validity, row_count)
 }
 
+#[inline]
 fn validity_from_opt<'a>(validity: &'a Option<Bytes>, row_count: usize) -> Result<Validity<'a>> {
     match validity {
         None => Ok(Validity::None),

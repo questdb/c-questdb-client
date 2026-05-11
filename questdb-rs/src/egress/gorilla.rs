@@ -61,6 +61,7 @@ impl<'a> GorillaDecoder<'a> {
     }
 
     /// Decode the next timestamp.
+    #[inline]
     pub fn decode_next(&mut self) -> Result<i64> {
         let dod = self.decode_dod()?;
         let delta = self.prev_delta.wrapping_add(dod);
@@ -75,6 +76,7 @@ impl<'a> GorillaDecoder<'a> {
         self.reader.bytes_consumed()
     }
 
+    #[inline]
     fn decode_dod(&mut self) -> Result<i64> {
         if self.reader.read_bit()? == 0 {
             return Ok(0);

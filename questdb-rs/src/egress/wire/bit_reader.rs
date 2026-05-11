@@ -68,6 +68,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read one bit (0 or 1).
+    #[inline]
     pub fn read_bit(&mut self) -> Result<u8> {
         if self.bits_read >= self.bits_total {
             return Err(fmt!(ProtocolError, "BitReader: read past end"));
@@ -83,6 +84,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` bits LSB-first as an unsigned integer in the low bits.
+    #[inline]
     pub fn read_bits(&mut self, n: u32) -> Result<u64> {
         if n == 0 {
             return Ok(0);
@@ -130,6 +132,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read `n` bits and sign-extend (two's complement). `n` must be ≤ 64.
+    #[inline]
     pub fn read_signed(&mut self, n: u32) -> Result<i64> {
         let unsigned = self.read_bits(n)?;
         if n == 0 || n == 64 {
@@ -146,6 +149,7 @@ impl<'a> BitReader<'a> {
 
     /// Pull bytes into the window until at least `want` bits are buffered or
     /// the source runs dry. Returns whether the demand was satisfied.
+    #[inline]
     fn ensure_bits(&mut self, want: u32) -> bool {
         while self.bits_in_window < want
             && self.bits_in_window <= 56
