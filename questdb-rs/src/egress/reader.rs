@@ -131,13 +131,6 @@ pub struct Reader {
     /// Diagnostic: nanoseconds spent in `decode_frame()` since connect.
     /// Saturates at `u64::MAX`.
     decode_ns: AtomicU64,
-    /// Per-endpoint auth rejections observed during the initial-connect
-    /// walk before this endpoint accepted us. Stays empty when the
-    /// first endpoint in `cfg.addrs` accepts. Surfaced via
-    /// [`Self::auth_rejections_during_connect`] so operators can
-    /// telemeter heterogeneous-cluster credential drift without having
-    /// to reach for a process-wide logger.
-    auth_rejections_during_connect: Vec<(Endpoint, String)>,
     /// Reusable zstd decompressor + output buffer. Keeps a persistent
     /// `ZSTD_DCtx` across batches (so we don't pay context init per
     /// `RESULT_BATCH`) and a `Vec<u8>` whose allocation is reused as
@@ -239,11 +232,16 @@ impl Reader {
             // pass is only meaningful when classifications have
             // accumulated, which doesn't happen on a fresh tracker.
             false,
-            // AuthError is not in the early-abort set: heterogeneous
-            // clusters can have one endpoint reject auth while another
-            // accepts. The walk accumulates auth rejections per-endpoint
-            // and only surfaces them on exhaustion.
-            &[ErrorCode::ConfigError, ErrorCode::UnsupportedServer],
+            // Spec §6 / §11.9.3 WalkTracker pseudocode: `AuthError`
+            // is terminal — credentials are cluster-wide, retrying
+            // every host floods server logs without recovery. Matches
+            // the Java reference's `connect()` which rethrows on
+            // `QwpAuthFailedException` immediately.
+            &[
+                ErrorCode::ConfigError,
+                ErrorCode::UnsupportedServer,
+                ErrorCode::AuthError,
+            ],
         )?;
         Ok(Reader {
             cfg,
@@ -258,7 +256,6 @@ impl Reader {
             credit_granted_total: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
             decode_ns: AtomicU64::new(0),
-            auth_rejections_during_connect: walk.auth_rejections,
             zstd_scratch: ZstdScratch::new(),
             tracker,
             failover_rng: FailoverRng::new(),
@@ -572,22 +569,6 @@ impl Reader {
     /// mid-query failover.
     pub fn server_version(&self) -> Result<u8> {
         Ok(self.transport_ref()?.server_version())
-    }
-
-    /// Per-endpoint auth rejections observed during the initial connect
-    /// walk before the accepted endpoint took us. Empty when the first
-    /// configured endpoint accepted the credentials, or when no endpoint
-    /// rejected on `AuthError` (`401`/`403`-equivalent).
-    ///
-    /// Surfaces a heterogeneous-cluster credential drift that the walk
-    /// otherwise absorbs silently: a single misconfigured node serving
-    /// `401` while the rest accept the supplied credentials. Operators
-    /// who care about this telemetry can read this slice after a
-    /// successful `from_config` and forward it to whatever logger their
-    /// embedding application uses; the library itself does not emit
-    /// anything (it has no logging dependency).
-    pub fn auth_rejections_during_connect(&self) -> &[(Endpoint, String)] {
-        &self.auth_rejections_during_connect
     }
 
     /// Connection-scoped symbol dictionary.
@@ -1891,10 +1872,6 @@ struct TransportSession {
 /// Result of a successful tracker walk.
 struct WalkOutcome {
     session: TransportSession,
-    /// Per-endpoint auth rejections accumulated by the walk (empty
-    /// when the first picked endpoint succeeded or the walk was
-    /// configured to abort on auth).
-    auth_rejections: Vec<(Endpoint, String)>,
     /// Number of `connect_endpoint` calls the walk made before
     /// landing on a successful endpoint. Includes failed picks before
     /// the success. The `FailoverEvent.attempts` field carries this
@@ -1914,12 +1891,13 @@ struct WalkOutcome {
 /// second pass would be a no-op anyway).
 ///
 /// `terminal_codes`: error codes that abort the walk immediately
-/// rather than being recorded into the tracker. `ConfigError` and
-/// `UnsupportedServer` are always terminal (cluster-wide build /
-/// config mismatch). The reconnect path also passes `AuthError`
-/// (cluster-wide credentials problem per spec §6); the initial-connect
-/// path omits it so heterogeneous-cluster scenarios where one node
-/// rejects while another accepts still succeed.
+/// rather than being recorded into the tracker. Both callers pass
+/// `[ConfigError, UnsupportedServer, AuthError]` — `AuthError` is
+/// cluster-wide (credentials don't differ per host); the others are
+/// build-level (client built without a feature the server requires)
+/// or config-level (bad URL / unresolved name). Retrying every host
+/// against any of these floods server logs without recovery, so the
+/// walk bails on the first occurrence per spec §6 / §11.9.3.
 fn walk_via_tracker(
     tracker: &mut HostHealthTracker,
     cfg: &Arc<ReaderConfig>,
@@ -1933,7 +1911,6 @@ fn walk_via_tracker(
     tracker.begin_round(false);
     let mut last_role_mismatch: Option<Error> = None;
     let mut last_transport_err: Option<Error> = None;
-    let mut auth_rejections: Vec<(Endpoint, String)> = Vec::new();
     let mut retried_after_reset = false;
     let mut dials: u32 = 0;
     loop {
@@ -1963,29 +1940,18 @@ fn walk_via_tracker(
                     tracker.record_zone(idx, info.zone_id.as_deref());
                 }
                 tracker.record_success(idx);
-                return Ok(WalkOutcome {
-                    session,
-                    auth_rejections,
-                    dials,
-                });
+                return Ok(WalkOutcome { session, dials });
             }
             Err(e) => {
                 let code = e.code();
                 if terminal_codes.contains(&code) {
-                    // Hard error (config, unsupported server, optionally
-                    // auth). Bail out before recording into the tracker;
+                    // Hard error (config, unsupported server, auth).
+                    // Bail out before recording into the tracker;
                     // there's no point preserving classifications when
                     // the walk is about to fail outright.
                     return Err(e);
                 }
                 match code {
-                    ErrorCode::AuthError => {
-                        // Accumulated, walked past. The host gets
-                        // recorded as `TransportError` so the next
-                        // pick_next skips it within this round.
-                        tracker.record_transport_error(idx);
-                        auth_rejections.push((cfg.addrs[idx].clone(), e.msg().to_string()));
-                    }
                     ErrorCode::RoleMismatch => {
                         // Pull the role/zone bytes out of `UpgradeReject`
                         // (set by both the SERVER_INFO target-mismatch path
@@ -2008,24 +1974,10 @@ fn walk_via_tracker(
             }
         }
     }
-    // Walk exhausted (and reset pass, if any, exhausted too). Pick the
-    // most diagnostic error. Auth-rejected tells the user *what to fix*
-    // (credentials), so it ranks above a role mismatch (which ranks
-    // above a generic transport flop). Mirrors the priority chain in
-    // the Java reference.
-    if !auth_rejections.is_empty() {
-        let detail = auth_rejections
-            .iter()
-            .map(|(ep, msg)| format!("  - {ep}: {msg}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(fmt!(
-            AuthError,
-            "all {} endpoint(s) rejected the supplied credentials:\n{}",
-            auth_rejections.len(),
-            detail
-        ));
-    }
+    // Walk exhausted (and reset pass, if any, exhausted too). Prefer
+    // surfacing the last RoleMismatch (carries `UpgradeReject` with the
+    // advertised role + zone, useful for diagnosing "no endpoint
+    // matched target=") over a generic transport flop.
     if let Some(e) = last_role_mismatch {
         return Err(e);
     }

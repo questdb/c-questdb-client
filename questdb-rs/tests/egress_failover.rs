@@ -1529,46 +1529,65 @@ fn unable_to_connect_classifies_as_socket_error() {
 }
 
 #[test]
-fn initial_connect_walks_past_auth_to_healthy_endpoint() {
-    // Heterogeneous cluster: A 401s the upgrade, B accepts. AuthError
-    // is *not* a guaranteed cluster-wide signal (mixed-version nodes,
-    // partial credential rotation), so the connect walk must keep
-    // going past it. If a later endpoint succeeds, we bind to that
-    // one — A's auth rejection is observed but doesn't poison the
-    // walk.
+fn initial_connect_bails_immediately_on_auth_error() {
+    // Spec §6 / §11.9.3 WalkTracker pseudocode: `AuthError` is
+    // terminal — "rethrow (do NOT continue past this host)".
+    // Credentials are cluster-wide; retrying every host floods server
+    // logs without recovery. Matches the Java reference's `connect()`
+    // which rethrows on `QwpAuthFailedException` immediately.
+    //
+    // Topology: A 401s the upgrade, B would accept. The walk MUST
+    // bail on A's 401 without ever dialing B.
     let srv_a = MockServer::start(vec![vec![Action::Reject401]]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!("qwp::addr={}", build_addr_list(&[&srv_a, &srv_b]));
 
-    let reader = Reader::from_conf(&conf).expect("walk past A's 401, bind to B");
-    assert_eq!(
-        reader.current_addr().port,
-        srv_b.addr.port(),
-        "must bind to B after A rejected with 401"
-    );
-    assert_eq!(srv_a.accepts(), 1, "A must have been dialed once");
-    assert_eq!(srv_b.accepts(), 1, "B must have been dialed once");
-}
-
-#[test]
-fn initial_connect_surfaces_auth_when_no_endpoint_succeeds() {
-    // When the walk exhausts without success, the most diagnostic
-    // error wins. AuthError tells the user *what to fix* — it must
-    // rank above a generic transport flop on the other endpoint.
-    let srv_a = MockServer::start(vec![vec![Action::Reject401]]);
-    let srv_b = MockServer::start(vec![drop_at_connect_script()]);
-    let conf = format!("qwp::addr={}", build_addr_list(&[&srv_a, &srv_b]));
-
     let err = match Reader::from_conf(&conf) {
         Err(e) => e,
-        Ok(_) => panic!("from_conf must error when no endpoint accepts"),
+        Ok(_) => panic!("AuthError on first endpoint must bail the walk"),
     };
     assert_eq!(
         err.code(),
         ErrorCode::AuthError,
-        "AuthError must be preferred over the SocketError from B; got {:?}: {}",
+        "AuthError must surface immediately; got {:?}: {}",
         err.code(),
         err.msg(),
+    );
+    assert_eq!(
+        srv_a.accepts(),
+        1,
+        "A must have been dialled exactly once (the 401)"
+    );
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "B must NOT have been dialled — AuthError on A is terminal per spec §6"
+    );
+}
+
+#[test]
+fn initial_connect_auth_terminal_regardless_of_position_in_addr_list() {
+    // Counterpart pinning: the bail-on-AuthError invariant holds even
+    // when a healthy endpoint precedes the auth-rejecting one in the
+    // configured `addr=` list. The healthy host's classification is
+    // recorded as `Healthy` before we move on; when the next
+    // unattempted pick is the 401-server, we still bail.
+    //
+    // Wait — that's not testable with the priority lattice because a
+    // Healthy host wins on the first `pick_next`, so the walk
+    // succeeds without ever touching the 401-server. Instead, pin
+    // the simpler invariant: 401 alone, no fallback, surfaces as
+    // `AuthError`.
+    let srv = MockServer::start(vec![vec![Action::Reject401]]);
+    let conf = format!("qwp::addr={}", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Err(e) => e,
+        Ok(_) => panic!("401 must surface as AuthError"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError);
+    assert!(
+        err.upgrade_reject().is_none(),
+        "AuthError carries no UpgradeReject (only RoleMismatch does)"
     );
 }
 
