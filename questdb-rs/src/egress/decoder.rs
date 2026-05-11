@@ -1597,10 +1597,26 @@ fn zstd_decompress_body(compressed: &[u8], scratch: &mut ZstdScratch) -> Result<
 fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
     let full_bytes = row_count >> 3;
     let tail_bits = row_count & 7;
-    let mut nulls: usize = bitmap[..full_bytes]
-        .iter()
-        .map(|b| b.count_ones() as usize)
-        .sum();
+
+    // 8-byte-chunked popcount. One `u64::count_ones` lowers to a
+    // single hardware popcount instruction on every supported target
+    // (POPCNT on x86_64 from SSE4.2, CNT on AArch64), so the chunked
+    // loop processes ~8× as many bits per cycle as the byte-by-byte
+    // loop the codec used to walk.
+    //
+    // Native-endian load (`from_ne_bytes`) is intentional: popcount is
+    // order-invariant on the byte boundaries, so we skip the byte-
+    // swap that `from_le_bytes` would emit on a big-endian target.
+    let body = &bitmap[..full_bytes];
+    let mut chunks = body.chunks_exact(8);
+    let mut nulls: usize = 0;
+    for c in chunks.by_ref() {
+        let w = u64::from_ne_bytes(c.try_into().unwrap());
+        nulls += w.count_ones() as usize;
+    }
+    for b in chunks.remainder() {
+        nulls += b.count_ones() as usize;
+    }
     if tail_bits != 0 {
         let mask = (1u8 << tail_bits) - 1;
         nulls += (bitmap[full_bytes] & mask).count_ones() as usize;
@@ -1629,6 +1645,90 @@ mod tests {
     use crate::egress::error::ErrorCode;
     use crate::egress::schema::{Schema, SchemaColumn, SchemaMode};
     use crate::egress::wire::varint::encode_u64;
+
+    /// Reference implementation kept inline in the test: byte-by-byte
+    /// popcount with the same tail-bit masking rule. We assert the
+    /// chunked production implementation matches this for every
+    /// `row_count` in the windows that exercise the cross-chunk
+    /// boundary, the chunks-remainder boundary (1-7 bytes after the
+    /// last full u64), and the tail-bit boundary (1-7 bits in the
+    /// last byte).
+    fn count_nulls_naive(bitmap: &[u8], row_count: usize) -> usize {
+        let full_bytes = row_count >> 3;
+        let tail_bits = row_count & 7;
+        let mut nulls = 0usize;
+        for b in &bitmap[..full_bytes] {
+            nulls += b.count_ones() as usize;
+        }
+        if tail_bits != 0 {
+            let mask = (1u8 << tail_bits) - 1;
+            nulls += (bitmap[full_bytes] & mask).count_ones() as usize;
+        }
+        nulls
+    }
+
+    #[test]
+    fn count_nulls_chunked_matches_naive_across_boundaries() {
+        // Build a deterministic bitmap that exercises a mix of byte
+        // values (0x00, 0xFF, alternating, low/high nibbles) over
+        // 256 bits — 4 full u64 chunks. Then sample `row_count`
+        // across every boundary that matters:
+        //   - zero rows (empty)
+        //   - 1..=7 tail-only bits
+        //   - exactly 8, 16, ..., 64, 128, 192, 256 (whole bytes / chunks)
+        //   - off-by-one around each chunk boundary (62, 63, 64, 65)
+        //   - exactly one chunk + remainder bytes (72, 80, 88)
+        //   - chunk + remainder + tail bits (73..=79, 81..=87, etc)
+        let mut bitmap = vec![0u8; 32];
+        for (i, b) in bitmap.iter_mut().enumerate() {
+            *b = match i % 4 {
+                0 => 0x00,
+                1 => 0xFF,
+                2 => 0xA5,
+                _ => 0x5A,
+            };
+        }
+        let row_counts: &[usize] = &[
+            0, 1, 2, 3, 4, 5, 6, 7, // tail-only
+            8, 9, 15, 16, 23, 24, // small full-byte cases
+            56, 57, 62, 63, 64, 65, 66, 67, // chunk boundary
+            71, 72, 73, // chunk + 1-byte remainder + tail
+            79, 80, 81, // chunk + 2-byte remainder + tail
+            87, 88, // chunk + 3-byte remainder
+            127, 128, 129, // two-chunk boundary
+            191, 192, 193, // three-chunk boundary
+            255, 256, // bitmap maximum
+        ];
+        for &rc in row_counts {
+            let got = count_nulls(&bitmap, rc);
+            let want = count_nulls_naive(&bitmap, rc);
+            assert_eq!(got, want, "count_nulls mismatch at row_count={}", rc);
+        }
+    }
+
+    /// Sanity: when the bitmap is exactly the size the decoder allocates
+    /// (`row_count.div_ceil(8)`), the chunked path still produces the
+    /// same answer as the naive walk. Belt-and-braces for the case where
+    /// the bitmap has no slack bytes past `full_bytes + (tail_bits != 0)`.
+    #[test]
+    fn count_nulls_tight_buffer_matches_naive() {
+        for row_count in [0usize, 1, 7, 8, 9, 63, 64, 65, 100, 1000] {
+            let bytes_needed = row_count.div_ceil(8);
+            let mut bitmap = vec![0u8; bytes_needed];
+            // Pseudo-random fill: prime-stepped index makes every
+            // byte distinct enough to catch chunked-vs-naive drift.
+            for (i, b) in bitmap.iter_mut().enumerate() {
+                *b = ((i.wrapping_mul(31) ^ 0xA5) & 0xFF) as u8;
+            }
+            let got = count_nulls(&bitmap, row_count);
+            let want = count_nulls_naive(&bitmap, row_count);
+            assert_eq!(
+                got, want,
+                "tight-buffer mismatch at row_count={} ({} bytes)",
+                row_count, bytes_needed
+            );
+        }
+    }
 
     /// Helper builder for a `RESULT_BATCH` payload (post-header bytes).
     struct BatchBuilder {
