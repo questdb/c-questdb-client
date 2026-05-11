@@ -3259,12 +3259,12 @@ mod tests {
         assert_eq!(c.value(2), 30);
     }
 
-    #[test]
-    fn decode_gorilla_temporal_round_trip() {
-        // Encode a synthetic Gorilla bitstream matching the Java encoder
-        // and verify the decoder produces the same timestamps.
-        let timestamps: [i64; 6] = [1_000, 1_100, 1_200, 1_310, 1_405, 1_488];
-        // First two are seed; remaining are DoD-encoded.
+    /// Encode `timestamps` (≥ 2 entries) as a Gorilla bitstream matching
+    /// the Java encoder: two raw i64 seeds, then per-row delta-of-delta
+    /// bits packed LSB-first into bytes. Used by the temporal Gorilla
+    /// round-trip tests below.
+    fn encode_gorilla_temporal_bitstream(timestamps: &[i64]) -> Vec<u8> {
+        assert!(timestamps.len() >= 2, "need at least two seeds");
         let mut prev_delta = timestamps[1] - timestamps[0];
         let mut prev_ts = timestamps[1];
         let mut bytes = Vec::new();
@@ -3314,17 +3314,39 @@ mod tests {
         if bits > 0 {
             bytes.push(cur);
         }
+        bytes
+    }
 
-        // Build the column body: validity (no nulls), disc=0x01, 16-byte seed, bitstream.
-        let mut col = vec![0x00u8]; // null_flag
+    /// Wrap a Gorilla bitstream in the per-column body: 1-byte validity
+    /// (no nulls), 1-byte disc=0x01 (Gorilla), 16 bytes of seeds,
+    /// then the bitstream itself.
+    fn build_gorilla_temporal_column_body(timestamps: &[i64]) -> Vec<u8> {
+        let bitstream = encode_gorilla_temporal_bitstream(timestamps);
+        let mut col = Vec::with_capacity(2 + 16 + bitstream.len());
+        col.push(0x00); // null_flag = no nulls
         col.push(0x01); // gorilla disc
         col.extend_from_slice(&timestamps[0].to_le_bytes());
         col.extend_from_slice(&timestamps[1].to_le_bytes());
-        col.extend_from_slice(&bytes);
+        col.extend_from_slice(&bitstream);
+        col
+    }
 
+    /// Round-trip a Gorilla temporal column through `decode_result_batch`
+    /// for the given column kind, asserting the decoded values match
+    /// the inputs and that the produced `ColumnView` variant is the
+    /// expected one. Wrapping each kind's bespoke `ColumnView`
+    /// destructure in a closure means the body of the loop in
+    /// `decode_gorilla_temporal_round_trip` doesn't have to dispatch
+    /// on kind by hand.
+    fn assert_gorilla_temporal_round_trip(
+        kind: ColumnKind,
+        timestamps: &[i64],
+        view_to_values: fn(ColumnView<'_>) -> Vec<i64>,
+    ) {
+        let body = build_gorilla_temporal_column_body(timestamps);
         let (_, payload) = BatchBuilder::new(timestamps.len())
             .with_flags(flags::GORILLA)
-            .add_column("ts", ColumnKind::TimestampNanos, col)
+            .add_column("ts", kind, body)
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
@@ -3335,13 +3357,58 @@ mod tests {
             &mut reg,
             &mut ZstdScratch::new(),
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("decode failed for {:?}: {}", kind, e));
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::TimestampNanos(c) = view else {
-            panic!()
-        };
-        for (i, &expected) in timestamps.iter().enumerate() {
-            assert_eq!(c.value(i), expected, "row {}", i);
+        let got = view_to_values(view);
+        assert_eq!(
+            got.len(),
+            timestamps.len(),
+            "row count mismatch for {:?}",
+            kind
+        );
+        for (i, (g, e)) in got.iter().zip(timestamps.iter()).enumerate() {
+            assert_eq!(g, e, "{:?} row {} mismatch (got {}, expected {})", kind, i, g, e);
+        }
+    }
+
+    /// Gorilla-encoded temporal columns must decode correctly for
+    /// every column kind that routes through `decode_temporal`:
+    /// `Timestamp` (μs), `TimestampNanos`, and `Date` (ms). The wire
+    /// representation is unit-agnostic — i64 bytes packed with DoD —
+    /// but the dispatch in `decode_column` selects a different
+    /// `DecodedColumn` variant per kind, and consumers downstream
+    /// rely on the matching `ColumnView` variant. The earlier version
+    /// of this test exercised `TimestampNanos` only; a regression in
+    /// the `Timestamp` or `Date` arm would have slipped through.
+    #[test]
+    fn decode_gorilla_temporal_round_trip() {
+        // Values chosen to span every DoD bucket the encoder picks
+        // (1 / 9 / 12 / 36 bits) so the decoder's bit-reader
+        // bookkeeping is exercised: 1100-1000=100 -> dod 100-100=0
+        // (1-bit), then 100-110 -> dod -10 (9-bit), etc.
+        let timestamps: [i64; 6] = [1_000, 1_100, 1_200, 1_310, 1_405, 1_488];
+        let cases: &[(ColumnKind, fn(ColumnView<'_>) -> Vec<i64>)] = &[
+            (ColumnKind::Timestamp, |v| {
+                let ColumnView::Timestamp(c) = v else {
+                    panic!("expected ColumnView::Timestamp")
+                };
+                (0..c.len()).map(|i| c.value(i)).collect()
+            }),
+            (ColumnKind::TimestampNanos, |v| {
+                let ColumnView::TimestampNanos(c) = v else {
+                    panic!("expected ColumnView::TimestampNanos")
+                };
+                (0..c.len()).map(|i| c.value(i)).collect()
+            }),
+            (ColumnKind::Date, |v| {
+                let ColumnView::Date(c) = v else {
+                    panic!("expected ColumnView::Date")
+                };
+                (0..c.len()).map(|i| c.value(i)).collect()
+            }),
+        ];
+        for &(kind, view_to_values) in cases {
+            assert_gorilla_temporal_round_trip(kind, &timestamps, view_to_values);
         }
     }
 
