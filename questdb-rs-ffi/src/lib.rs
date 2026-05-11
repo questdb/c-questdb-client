@@ -3023,6 +3023,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
     const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -3102,6 +3103,30 @@ mod tests {
         assert_eq!(view.from_fsn, 0);
         assert_eq!(view.to_fsn, 0);
         assert_eq!(read_view_message(view), b"ffi bad line");
+    }
+
+    #[derive(Default)]
+    struct CallbackState {
+        calls: AtomicU64,
+        category: AtomicU64,
+        policy: AtomicU64,
+        from_fsn: AtomicU64,
+        to_fsn: AtomicU64,
+    }
+
+    unsafe extern "C" fn record_qwpws_error(
+        user_data: *mut libc::c_void,
+        view: *const line_sender_qwpws_error_view,
+    ) {
+        let state = unsafe { &*(user_data as *const CallbackState) };
+        let view = unsafe { &*view };
+        state.calls.fetch_add(1, Ordering::SeqCst);
+        state.category.store(view.category as u64, Ordering::SeqCst);
+        state
+            .policy
+            .store(view.applied_policy as u64, Ordering::SeqCst);
+        state.from_fsn.store(view.from_fsn, Ordering::SeqCst);
+        state.to_fsn.store(view.to_fsn, Ordering::SeqCst);
     }
 
     fn read_request_until_blank(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -3498,12 +3523,20 @@ mod tests {
 
         unsafe {
             let mut err = ptr::null_mut();
+            let callback_state = CallbackState::default();
             let opts = line_sender_opts_new(
                 line_sender_protocol::line_sender_protocol_qwpws,
                 utf8(b"127.0.0.1"),
                 port,
             );
             assert!(!opts.is_null());
+            assert!(line_sender_opts_qwpws_error_handler(
+                opts,
+                Some(record_qwpws_error),
+                &callback_state as *const CallbackState as *mut libc::c_void,
+                &mut err
+            ));
+            assert!(err.is_null());
             let sender = line_sender_build(opts, &mut err);
             line_sender_opts_free(opts);
             assert!(!sender.is_null());
@@ -3551,6 +3584,17 @@ mod tests {
 
             assert!(!line_sender_flush(sender, buffer, &mut err));
             assert!(!err.is_null());
+            assert_eq!(callback_state.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                callback_state.category.load(Ordering::SeqCst),
+                line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_PARSE_ERROR as u64
+            );
+            assert_eq!(
+                callback_state.policy.load(Ordering::SeqCst),
+                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_HALT as u64
+            );
+            assert_eq!(callback_state.from_fsn.load(Ordering::SeqCst), 0);
+            assert_eq!(callback_state.to_fsn.load(Ordering::SeqCst), 0);
             let mut view = blank_qwpws_error_view();
             assert!(line_sender_error_qwpws_get_view(err, &mut view));
             assert_parse_halt_diagnostic(view);
