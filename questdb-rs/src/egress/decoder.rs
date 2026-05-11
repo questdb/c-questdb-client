@@ -1706,6 +1706,49 @@ mod tests {
         }
     }
 
+    /// FLAG_ZSTD rejection path: when the client was built WITHOUT the
+    /// `compression-zstd` feature, the decoder must surface
+    /// `ErrorCode::UnsupportedServer` rather than silently mis-
+    /// interpret the compressed body as raw wire bytes. The arm is
+    /// uncovered in default test runs because `almost-all-features`
+    /// turns the feature on; this test only compiles when the
+    /// feature is off, so a build configuration `cargo test
+    /// --features sync-reader-ws --no-default-features` (or any CI
+    /// lane that excludes `compression-zstd`) exercises it.
+    #[cfg(not(feature = "compression-zstd"))]
+    #[test]
+    fn zstd_flag_rejected_without_feature() {
+        // Minimal RESULT_BATCH prefix the decoder consumes before
+        // checking flags: msg_kind=0x11, request_id=0 (8 bytes),
+        // batch_seq=0 (1-byte varint). The rejection fires right
+        // after this prefix is parsed — no body bytes are needed.
+        let mut payload = vec![MsgKind::ResultBatch.as_u8()];
+        payload.extend_from_slice(&0i64.to_le_bytes());
+        payload.push(0u8); // varint 0
+        let payload = Bytes::from(payload);
+
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(
+            &payload,
+            flags::ZSTD,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .expect_err(
+            "decoder must reject FLAG_ZSTD when built without compression-zstd",
+        );
+        assert_eq!(err.code(), ErrorCode::UnsupportedServer);
+        // Pin the diagnostic so a future error-message refactor can't
+        // drop the feature-name hint that an operator needs to act on.
+        assert!(
+            err.msg().contains("compression-zstd"),
+            "rejection message should name the missing feature: {}",
+            err.msg()
+        );
+    }
+
     /// Sanity: when the bitmap is exactly the size the decoder allocates
     /// (`row_count.div_ceil(8)`), the chunked path still produces the
     /// same answer as the naive walk. Belt-and-braces for the case where
