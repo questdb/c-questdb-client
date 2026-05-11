@@ -15,7 +15,7 @@ Implemented:
 - a private `ManualDriverQueue` seam used by the manual driver prototype
 - `ManualDriverQueue` implementations for the volatile queue and file-backed SF
   queue
-- driver-level terminal state distinct from queue, storage, and poison state
+- driver-level terminal state distinct from queue and storage state
 - `QwpReceiptStatus::Terminal` and `DeliveryOutcome::Terminal`
 - close-drain outcomes: drained, timeout, terminal
 - retry-budget exhaustion that terminalizes the current sender without
@@ -26,7 +26,7 @@ Implemented:
 
 The important behavioural distinction is that terminal failure belongs to the
 current sender instance. In file-backed SF mode, terminalizing current receipts
-does not append ACK or poison completion records. A newly created sender can
+does not append completion records. A newly created sender can
 recover the still-unresolved SF frames and replay them.
 
 Events are not authoritative state. They are ordered transition notifications
@@ -39,7 +39,7 @@ Not implemented in this slice:
 - auth or upgrade rejection detail
 - write/internal server error classification
 - real-server error taxonomy probing
-- durable poison files
+- durable rejection/dead-letter files
 
 ## Validation checks
 
@@ -50,7 +50,7 @@ Rust unit tests cover:
 - retryable failure resets connection state without completing the receipt
 - terminal failure marks unresolved receipts terminal and rejects future
   submissions on the current driver
-- terminal failure does not poison recovered SF frames; a recreated SF driver can
+- terminal failure does not complete recovered SF frames; a recreated SF driver can
   replay and ACK the still-unresolved frame
 - close drain rejects new submissions, drives existing receipts to drained,
   returns timeout while preserving existing receipt observability, and returns
@@ -63,7 +63,7 @@ Rust unit tests cover:
   newly created sender
 - successful submit queues a `Published` event, while failed submit queues no
   event
-- send, cumulative ACK, poison, reconnect, and terminal events agree with
+- send, cumulative ACK, rejection, reconnect, and terminal events agree with
   `receipt_status()` and `wait()`
 - terminal transition queues one `Terminal` event; sticky terminal progress does
   not duplicate it
@@ -73,8 +73,8 @@ Rust unit tests cover:
   protocol/API error
 - an SF-backed driver reopens and replays from the first unresolved FSN with
   wire sequence `0`
-- an SF-backed driver persists an ordered reject, poison gap, and later ACK
-  across reopen
+- DROP_AND_CONTINUE records a rejection event/error, completes the rejected
+  frame for replay purposes, and does not persist queue-owned rejection state
 
 Targeted validation commands:
 
@@ -101,9 +101,9 @@ Result:
 
   Terminal and closing state are cleaner as driver-layer overlays than as
   durable queue completion records. Event overflow was simpler than expected
-  once direct accessors remained authoritative. The awkward part is still status
-  composition: `receipt_status()` combines queue state with driver lifecycle
-  state, and production code should make that layering explicit.
+  once direct accessors remained authoritative. The useful simplification is
+  that `receipt_status()` no longer carries queue-owned rejection detail:
+  rejection remains an event/error concern.
 
 - Did the API or implementation shape create accidental complexity?
 
@@ -117,17 +117,17 @@ Result:
 - How does this fit into the bigger QWP/WebSocket Store-and-Forward design?
 
   It strengthens the distinction between durable facts and current-driver
-  outcomes. ACK and poison are durable completion facts. Terminal failure,
+  outcomes. ACK and completion are durable queue facts. Terminal failure,
   retry-budget exhaustion, close timeout, and event loss can affect the current
   sender or observability surface without destroying recoverable SF data.
 
 - Did this step strengthen or weaken the core assumptions?
 
   It strengthened them. The same manual driver now exercises volatile and SF
-  queues for poison, close, retry, and event-observation outcomes. The SF queue
-  can survive terminal sender failure or close timeout without being converted
-  into poison or data loss, and receipt state remains valid even when events
-  overflow.
+  queues for rejection, close, retry, and event-observation outcomes. The SF
+  queue can survive terminal sender failure or close timeout without being
+  converted into rejection metadata or data loss, and receipt state remains valid
+  even when events overflow.
 
 - Should the next step proceed, or should the design be adjusted first?
 

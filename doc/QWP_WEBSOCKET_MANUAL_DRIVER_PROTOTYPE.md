@@ -22,16 +22,18 @@ The driver validates:
 - `try_submit()` returns after local queue publication only
 - blocking submit can drive progress only to make local queue capacity
 - `drive_once()` takes `&mut self` and performs at most one progress unit
-- `wait_steps()` drives progress until a receipt is ACKed, poisoned, or times out
+- `wait_steps()` drives progress until a receipt is completed, terminal, or
+  times out
 - cumulative and coalesced ACKs complete covered receipts
 - disconnects and retryable transport failures restart replay from the oldest
   unresolved FSN
-- deterministic ordered rejection ACKs prior frames, poisons the rejected frame,
-  and leaves later frames unresolved
+- deterministic ordered rejection is surfaced through driver event/error state,
+  completes the rejected frame for replay purposes, and leaves later frames
+  unresolved
 
-The queue was extended with an in-memory `Poisoned` receipt state so the fake
-driver can model deterministic server rejection. This is not a durable poison
-policy and does not add poison files.
+The queue now keeps only publication/completion state. The fake driver models
+deterministic server rejection through `DriverEvent::Rejected` and the sender
+error ring rather than through queue-owned rejection receipt state.
 
 ## Validation checks
 
@@ -50,9 +52,11 @@ Rust unit tests cover:
 - coalesced ACK completes multiple receipts
 - disconnect replays from oldest unresolved with wire sequence reset to `0`
 - retryable transport failure does not complete receipts
-- ordered reject ACKs prior frame and leaves later frame unresolved
+- ordered reject after the prior ACK completes the rejected frame and leaves the
+  later frame unresolved
 - later ACK after ordered reject completes the later receipt
-- wait reports poisoned receipt
+- wait reports completed after DROP_AND_CONTINUE; rejection detail is available
+  through event/error polling
 - wait timeout leaves the receipt valid and pending
 - fake response before a connection exists is a protocol error
 
@@ -79,16 +83,16 @@ Result:
 - What was simpler or more awkward than expected?
 
   Reconnect replay was simple because the queue already has `fsn_at_zero` and
-  connection-local wire sequence state. Ordered rejection was more awkward: the
-  queue needs a non-ACK terminal receipt state even before durable poison policy
-  exists, otherwise `wait()` cannot report a rejected receipt cleanly.
+  connection-local wire sequence state. Ordered rejection became simpler once
+  the queue stopped trying to answer whether a completed FSN had been accepted
+  or dropped by the server.
 
 - Did the API or implementation shape create accidental complexity?
 
   The main accidental-complexity risk is overloading one queue error path for
   local capacity, protocol errors, and delivery outcomes. Keeping
-  `SubmitTimedOut`, `DeliveryOutcome::Timeout`, `Poisoned`, and queue protocol
-  errors separate made the tests clearer.
+  `SubmitTimedOut`, `DeliveryOutcome::Timeout`, driver rejection events, and
+  queue protocol errors separate made the tests clearer.
 
 ## Global reflection
 

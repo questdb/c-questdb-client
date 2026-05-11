@@ -105,7 +105,7 @@ fn qwp_ws_publication_driver_submit_waits_and_row_is_queryable() -> TestResult {
         .wait_for(receipt, Duration::from_secs(10))
         .map_err(proto_err)?;
 
-    assert_eq!(outcome, DeliveryOutcome::Acked);
+    assert_eq!(outcome, DeliveryOutcome::Completed);
     let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
     assert_eq!(count, 1);
     assert!(
@@ -195,10 +195,10 @@ fn qwp_ws_publication_driver_reconnect_replays_only_unacked_rows() -> TestResult
         .wait_for(second_receipt, Duration::from_secs(10))
         .map_err(proto_err);
     let proxy_result = proxy.join();
-    assert_eq!(second_outcome?, DeliveryOutcome::Acked);
+    assert_eq!(second_outcome?, DeliveryOutcome::Completed);
     assert_eq!(
         publisher.wait_steps(first_receipt, 0).map_err(proto_err)?,
-        DeliveryOutcome::Acked
+        DeliveryOutcome::Completed
     );
     proxy_result?;
 
@@ -251,8 +251,8 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
     };
     assert_eq!(
         sfa_file_count(&sfa_slot_dir(sf_dir.path()))?,
-        1,
-        "unacknowledged SFA frame must remain recoverable after sender drop"
+        2,
+        "unacknowledged SFA frame and hot spare must remain after sender drop"
     );
 
     let transport = connect_blocking_transport(
@@ -268,7 +268,7 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
         publisher
             .wait_for(receipt, Duration::from_secs(10))
             .map_err(proto_err)?,
-        DeliveryOutcome::Acked
+        DeliveryOutcome::Completed
     );
     assert_eq!(
         publisher.close_drain_steps(0).map_err(proto_err)?,
@@ -428,7 +428,7 @@ fn sfa_options(sf_dir: &Path) -> SfaSlotOptions {
         sf_dir: sf_dir.to_path_buf(),
         sender_id: "default".to_string(),
         segment_size_bytes: 64 * 1024,
-        max_bytes: 64 * 1024,
+        max_bytes: 128 * 1024,
         max_in_flight: 4,
     }
 }

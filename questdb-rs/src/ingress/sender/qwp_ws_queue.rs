@@ -85,8 +85,7 @@ pub(crate) enum QwpReceiptStatus {
     Unknown { fsn: u64 },
     Published { fsn: u64 },
     Sent { fsn: u64, wire_seq: u64 },
-    Acked { fsn: u64 },
-    Rejected { fsn: u64 },
+    Completed { fsn: u64 },
     Terminal { fsn: u64 },
 }
 

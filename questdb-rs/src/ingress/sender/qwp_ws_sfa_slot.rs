@@ -184,10 +184,6 @@ impl PublicationLog for SfaSlotQueue {
         Ok(SfaSlotQueue::close(self)?)
     }
 
-    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
-        Ok(self.queue.reject_fsn(fsn)?)
-    }
-
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         self.queue.receipt_status(receipt)
     }

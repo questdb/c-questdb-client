@@ -144,7 +144,7 @@ count is computed from `sf_max_total_bytes / sf_max_bytes`, floored by
   via `AtomicU8`, cloned cheaply into producer and runner,
 - `terminal_error: Option<Error>` and `terminal_sender_error: Option<QwpWsSenderError>` (latched once set),
 - a bounded `DriverEventRing` of internal events (`Published`, `Sent`,
-  `AckedThrough`, `Rejected`, `Reconnected`, `Terminal`),
+  `CompletedThrough`, `Rejected`, `Reconnected`, `Terminal`),
 - a bounded `SenderErrorRing` of structured server errors with overflow
   counter (`sender_errors_dropped_total`).
 

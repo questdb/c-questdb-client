@@ -328,6 +328,12 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                     self.record_reject_error(fsn, wire_seq, error, policy);
                     return Ok(DriveOutcome::Idle);
                 }
+                if !self.reject_target_can_complete(fsn) {
+                    let err = self.reject_gap_protocol_error(fsn);
+                    self.last_server_error = Some(error.clone());
+                    self.mark_terminal(Some(err));
+                    return Ok(DriveOutcome::Terminal);
+                }
                 if self.durable_ack.is_some() {
                     return self.apply_durable_reject(
                         send_cursor,
@@ -339,23 +345,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                     );
                 }
 
-                let receipt = self.queue.reject_fsn(fsn)?;
-                send_cursor.ack_through(fsn);
-                self.record_rejected_frame(receipt.fsn, wire_seq, error, policy);
-                if effect_wire_seq > 0 {
-                    self.push_event(DriverEvent::AckedThrough {
-                        fsn: receipt.fsn - 1,
-                        wire_seq: effect_wire_seq - 1,
-                    });
-                }
-                self.push_event(DriverEvent::Rejected {
-                    fsn: receipt.fsn,
-                    wire_seq,
-                });
-                Ok(DriveOutcome::Rejected {
-                    fsn: receipt.fsn,
-                    wire_seq,
-                })
+                self.complete_through(send_cursor, fsn, wire_seq)?;
+                self.record_rejected_frame(fsn, wire_seq, error, policy);
+                self.push_event(DriverEvent::Rejected { fsn, wire_seq });
+                Ok(DriveOutcome::Rejected { fsn, wire_seq })
             }
         }
     }
@@ -380,7 +373,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         let Some((fsn, ack_wire_seq)) = send_cursor.ack_fsn_for_wire_seq(wire_seq)? else {
             return Ok(DriveOutcome::Idle);
         };
-        if self.is_rejected_fsn(fsn) {
+        if self
+            .durable_ack
+            .as_ref()
+            .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
+        {
             send_cursor.ack_through(fsn);
             return Ok(DriveOutcome::Idle);
         }
@@ -410,11 +407,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         policy: QwpWsErrorPolicy,
     ) -> Result<DriveOutcome, DriverError> {
         send_cursor.ack_through(fsn);
-        self.record_rejected_frame(fsn, wire_seq, error, policy);
-        self.push_event(DriverEvent::Rejected { fsn, wire_seq });
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
         tracker.enqueue_rejected(effect_wire_seq, fsn);
         self.complete_ready_durable(send_cursor)?;
+        self.record_rejected_frame(fsn, wire_seq, error, policy);
+        self.push_event(DriverEvent::Rejected { fsn, wire_seq });
         Ok(DriveOutcome::Rejected { fsn, wire_seq })
     }
 
@@ -434,8 +431,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                     highest_resolved_wire_seq = Some(completion.wire_seq);
                 }
                 DurableResolvedFrame::Rejected { wire_seq, fsn } => {
-                    self.queue.reject_fsn(fsn)?;
-                    send_cursor.ack_through(fsn);
+                    self.complete_through(send_cursor, fsn, wire_seq)?;
                     highest_resolved_wire_seq = Some(wire_seq);
                 }
             }
@@ -458,7 +454,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         send_cursor.ack_through(fsn);
         let completed_after = self.queue.completed_fsn();
         if completed_after > completed_before {
-            self.push_event(DriverEvent::AckedThrough { fsn, wire_seq });
+            self.push_event(DriverEvent::CompletedThrough { fsn, wire_seq });
         }
         Ok(DriveOutcome::Acked { wire_seq })
     }
@@ -497,9 +493,6 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         receipt: QwpReceipt,
     ) -> QwpReceiptStatus {
         let status = self.queue.receipt_status(receipt);
-        if self.is_rejected_fsn(receipt.fsn) {
-            return QwpReceiptStatus::Rejected { fsn: receipt.fsn };
-        }
         if self.is_terminal() && status.is_pending() {
             return QwpReceiptStatus::Terminal { fsn: receipt.fsn };
         }
@@ -553,19 +546,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.record_storage_cleanup_failure(failure)
     }
 
-    fn is_rejected_fsn(&self, fsn: u64) -> bool {
-        self.rejected_frames
-            .iter()
-            .any(|rejected| rejected.fsn == fsn)
-    }
-
     fn clear_unresolved_rejected_frames(&mut self) {
-        let queue = &self.queue;
+        let completed_fsn = self.queue.completed_fsn();
         self.rejected_frames.retain(|rejected| {
-            matches!(
-                queue.receipt_status(QwpReceipt { fsn: rejected.fsn }),
-                QwpReceiptStatus::Rejected { .. }
-            )
+            completed_fsn.is_some_and(|completed_fsn| rejected.fsn <= completed_fsn)
         });
     }
 
@@ -579,6 +563,12 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.last_server_error = Some(error.clone());
         self.sender_errors
             .push(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
+        if self.sender_errors.capacity == 0 {
+            return;
+        }
+        if self.rejected_frames.len() == self.sender_errors.capacity {
+            self.rejected_frames.pop_front();
+        }
         self.rejected_frames.push_back(QwpRejectedFrame {
             fsn,
             wire_seq,
@@ -599,15 +589,40 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     fn reject_target_already_accounted(&self, fsn: u64) -> bool {
-        self.is_rejected_fsn(fsn)
-            || self
-                .durable_ack
-                .as_ref()
-                .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
+        self.durable_ack
+            .as_ref()
+            .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
             || self
                 .queue
                 .completed_fsn()
                 .is_some_and(|completed_fsn| fsn <= completed_fsn)
+    }
+
+    fn reject_target_can_complete(&self, fsn: u64) -> bool {
+        let Some(oldest) = self.queue.oldest_unresolved_fsn() else {
+            return false;
+        };
+        if fsn == oldest {
+            return true;
+        }
+        self.durable_ack
+            .as_ref()
+            .is_some_and(|tracker| tracker.pending_prefix_covers(oldest, fsn))
+    }
+
+    fn reject_gap_protocol_error(&mut self, fsn: u64) -> Error {
+        let oldest = self.queue.oldest_unresolved_fsn();
+        self.record_protocol_violation(
+            None,
+            match oldest {
+                Some(oldest) => format!(
+                    "QWP/WebSocket reject response for fsn {fsn} skipped unresolved fsn {oldest}"
+                ),
+                None => {
+                    format!("QWP/WebSocket reject response for fsn {fsn} has no unresolved frame")
+                }
+            },
+        )
     }
 
     fn record_presend_reject(
@@ -642,8 +657,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         receipt: QwpReceipt,
     ) -> Result<Option<DeliveryOutcome>, DriverError> {
         match self.receipt_status(send_cursor, receipt) {
-            QwpReceiptStatus::Acked { .. } => Ok(Some(DeliveryOutcome::Acked)),
-            QwpReceiptStatus::Rejected { .. } => Ok(Some(DeliveryOutcome::Rejected)),
+            QwpReceiptStatus::Completed { .. } => Ok(Some(DeliveryOutcome::Completed)),
             QwpReceiptStatus::Terminal { .. } => Ok(Some(DeliveryOutcome::Terminal)),
             QwpReceiptStatus::Published { .. } | QwpReceiptStatus::Sent { .. } => Ok(None),
             QwpReceiptStatus::Unknown { fsn } => Err(DriverError::UnknownReceipt { fsn }),
@@ -1672,7 +1686,6 @@ pub(crate) trait PublicationLog {
     }
     fn oldest_unresolved_fsn(&self) -> Option<u64>;
     fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError>;
-    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError>;
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(())
     }
@@ -2233,7 +2246,7 @@ pub(crate) enum DriveOutcome {
 pub(crate) enum DriverEvent {
     Published { fsn: u64 },
     Sent { fsn: u64, wire_seq: u64 },
-    AckedThrough { fsn: u64, wire_seq: u64 },
+    CompletedThrough { fsn: u64, wire_seq: u64 },
     Rejected { fsn: u64, wire_seq: u64 },
     Reconnected { reason: ReconnectReason },
     Terminal,
@@ -2278,8 +2291,7 @@ pub(crate) enum ReconnectReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryOutcome {
-    Acked,
-    Rejected,
+    Completed,
     Terminal,
     Timeout,
 }
@@ -2445,6 +2457,39 @@ impl DurableAckTracker {
             .iter()
             .find(|entry| entry.fsn() == fsn)
             .map(PendingDurableFrame::wire_seq)
+    }
+
+    fn pending_prefix_covers(&self, start_fsn: u64, end_before_fsn: u64) -> bool {
+        let mut next_fsn = start_fsn;
+        for entry in &self.pending {
+            if next_fsn >= end_before_fsn {
+                return true;
+            }
+            match entry {
+                PendingDurableFrame::Ok { fsn, .. } => {
+                    if *fsn < next_fsn {
+                        continue;
+                    }
+                    next_fsn = match fsn.checked_add(1) {
+                        Some(next_fsn) => next_fsn,
+                        None => return false,
+                    };
+                }
+                PendingDurableFrame::Rejected { fsn, .. } => {
+                    if *fsn < next_fsn {
+                        continue;
+                    }
+                    if *fsn != next_fsn {
+                        return false;
+                    }
+                    next_fsn = match next_fsn.checked_add(1) {
+                        Some(next_fsn) => next_fsn,
+                        None => return false,
+                    };
+                }
+            }
+        }
+        next_fsn >= end_before_fsn
     }
 
     fn pop_ready(&mut self) -> Option<DurableResolvedFrame> {
@@ -3092,7 +3137,7 @@ mod tests {
         ));
         assert_eq!(
             publisher.wait_steps(first_receipt, 2).unwrap(),
-            DeliveryOutcome::Acked
+            DeliveryOutcome::Completed
         );
 
         let third_receipt = publisher
@@ -3119,7 +3164,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 publisher.wait_steps(receipt, 4).unwrap(),
-                DeliveryOutcome::Acked
+                DeliveryOutcome::Completed
             );
         }
 
@@ -3154,7 +3199,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             publisher.wait_steps(receipt, 4).unwrap(),
-            DeliveryOutcome::Acked
+            DeliveryOutcome::Completed
         );
         buffer.clear();
 
@@ -3168,7 +3213,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 publisher.wait_steps(receipt, 4).unwrap(),
-                DeliveryOutcome::Acked
+                DeliveryOutcome::Completed
             );
             buffer.clear();
             published_rows += rows_in_batch;
@@ -3477,7 +3522,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: receipt.fsn }
+            QwpReceiptStatus::Completed { fsn: receipt.fsn }
         );
     }
 
@@ -3500,7 +3545,7 @@ mod tests {
         let receipt = driver.try_submit(b"qwp-payload").unwrap();
         let outcome = driver.wait_steps(receipt, 1024).unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             b"qwp-payload"
@@ -3539,7 +3584,7 @@ mod tests {
             .unwrap();
         let outcome = publisher.wait_steps(receipt, 1024).unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             expected
@@ -3575,10 +3620,10 @@ mod tests {
         let second = driver.try_submit(b"qwp-payload-1").unwrap();
         let outcome = driver.wait_steps(second, 1024).unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -3624,7 +3669,7 @@ mod tests {
         let receipt = driver.try_submit(b"qwp-secure-payload").unwrap();
         let outcome = driver.wait_steps(receipt, 1024).unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             b"qwp-secure-payload"
@@ -3687,7 +3732,7 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
@@ -3723,7 +3768,7 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
@@ -4158,7 +4203,7 @@ mod tests {
         );
         assert!(matches!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         ));
         assert_eq!(driver.send_core.transport.keepalive_attempts, 0);
     }
@@ -4237,7 +4282,7 @@ mod tests {
         assert_eq!(driver.acked_fsn(), Some(0));
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
     }
 
@@ -4278,7 +4323,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
     }
 
@@ -4322,7 +4367,10 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Sent {
+                fsn: 1,
+                wire_seq: 1
+            }
         );
 
         driver
@@ -4337,11 +4385,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
 
         let error = driver.poll_sender_error().unwrap();
@@ -4379,7 +4427,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(driver.poll_sender_error(), None);
 
@@ -4393,7 +4441,7 @@ mod tests {
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
 
         let error = driver.poll_sender_error().unwrap();
@@ -4462,7 +4510,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(driver.poll_sender_error(), None);
     }
@@ -4520,11 +4568,11 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -4567,11 +4615,11 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -4637,11 +4685,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -4672,7 +4720,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
     }
 
@@ -4735,11 +4783,11 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -4827,7 +4875,10 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Sent {
+                fsn: 1,
+                wire_seq: 1
+            }
         );
 
         assert_eq!(
@@ -4891,11 +4942,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(driver.acked_fsn(), Some(1));
     }
@@ -4984,11 +5035,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(driver.acked_fsn(), Some(1));
     }
@@ -5035,7 +5086,10 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Sent {
+                fsn: 1,
+                wire_seq: 1
+            }
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -5085,15 +5139,81 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
-            QwpReceiptStatus::Acked { fsn: 2 }
+            QwpReceiptStatus::Completed { fsn: 2 }
+        );
+    }
+
+    #[test]
+    fn durable_reject_after_cumulative_pending_ok_is_not_a_gap_violation() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+        let third = driver.try_submit(b"third").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 2,
+                error: schema_mismatch_error("schema changed"),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 2,
+                wire_seq: 2
+            }
+        );
+        assert!(!driver.is_terminal());
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.receipt_status(third).is_pending());
+        assert_eq!(
+            driver.poll_sender_error().map(|err| err.applied_policy),
+            Some(QwpWsErrorPolicy::DropAndContinue)
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 2 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Completed { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Completed { fsn: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(third),
+            QwpReceiptStatus::Completed { fsn: 2 }
         );
     }
 
@@ -5166,15 +5286,15 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
-            QwpReceiptStatus::Rejected { fsn: 2 }
+            QwpReceiptStatus::Completed { fsn: 2 }
         );
         assert_eq!(
             driver.receipt_status(fourth),
@@ -5196,7 +5316,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(fourth),
-            QwpReceiptStatus::Acked { fsn: 3 }
+            QwpReceiptStatus::Completed { fsn: 3 }
         );
     }
 
@@ -5224,11 +5344,34 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Rejected { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         let first_error = driver.poll_sender_error().unwrap();
         assert_eq!(first_error.message_sequence, Some(0));
         assert_eq!(first_error.message.as_deref(), Some("schema changed"));
+        assert_eq!(
+            drain_events(&mut driver),
+            vec![
+                DriverEvent::Published { fsn: 0 },
+                DriverEvent::Published { fsn: 1 },
+                DriverEvent::Sent {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+                DriverEvent::Sent {
+                    fsn: 1,
+                    wire_seq: 1,
+                },
+                DriverEvent::CompletedThrough {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+                DriverEvent::Rejected {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+            ]
+        );
 
         driver
             .send_core
@@ -5250,7 +5393,10 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
@@ -5258,11 +5404,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Rejected { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -5290,7 +5436,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Rejected { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         let first_error = driver.poll_sender_error().unwrap();
         assert_eq!(first_error.message_sequence, Some(0));
@@ -5306,7 +5452,7 @@ mod tests {
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Rejected { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         let stale_error = driver.poll_sender_error().unwrap();
         assert_eq!(stale_error.message_sequence, Some(0));
@@ -5332,7 +5478,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -5370,7 +5516,7 @@ mod tests {
         assert_eq!(driver.drive_once(), Ok(DriveOutcome::Acked { wire_seq: 0 }));
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
     }
 
@@ -5390,7 +5536,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Rejected { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(driver.acked_fsn(), Some(0));
 
@@ -5420,7 +5566,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(driver.poll_sender_error(), None);
 
@@ -5435,7 +5581,7 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(driver.acked_fsn(), Some(0));
 
@@ -5453,10 +5599,10 @@ mod tests {
 
         let outcome = driver.wait_steps(receipt, 1).unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
     }
 
@@ -5480,11 +5626,11 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -5500,7 +5646,7 @@ mod tests {
         driver.drive_once().unwrap();
         assert_eq!(
             driver.wait_steps(second, 1).unwrap(),
-            DeliveryOutcome::Acked
+            DeliveryOutcome::Completed
         );
 
         assert_eq!(
@@ -5516,7 +5662,7 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::AckedThrough {
+                DriverEvent::CompletedThrough {
                     fsn: 1,
                     wire_seq: 1,
                 },
@@ -5524,16 +5670,16 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
     #[test]
-    fn stale_ack_response_does_not_emit_ack_progress_event() {
+    fn stale_completion_response_does_not_emit_duplicate_progress_event() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::NoResponse,
             FakeSendResult::AckWire { wire_seq: 1 },
@@ -5568,7 +5714,7 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::AckedThrough {
+                DriverEvent::CompletedThrough {
                     fsn: 1,
                     wire_seq: 1,
                 },
@@ -5576,11 +5722,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 
@@ -5623,7 +5769,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.sent_frames(),
@@ -5672,7 +5818,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
     }
 
@@ -5800,11 +5946,11 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(driver.try_submit(b"third"), Err(DriverError::Closing));
     }
@@ -5842,7 +5988,7 @@ mod tests {
         assert_eq!(driver.try_submit(b"next"), Err(DriverError::Closing));
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             drain_events(&mut driver),
@@ -5852,7 +5998,7 @@ mod tests {
                     fsn: 0,
                     wire_seq: 0,
                 },
-                DriverEvent::AckedThrough {
+                DriverEvent::CompletedThrough {
                     fsn: 0,
                     wire_seq: 0,
                 }
@@ -5913,19 +6059,19 @@ mod tests {
     }
 
     #[test]
-    fn ordered_reject_acks_prior_frame_and_leaves_later_frame_unresolved() {
+    fn reject_after_prior_ack_completes_rejected_frame_and_leaves_later_frame_unresolved() {
         let mut driver = driver(FakeOrderedServer::scripted([
-            FakeSendResult::NoResponse,
+            FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
         ]));
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
         let third = driver.try_submit(b"third").unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Sent(_)
-        ));
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
         assert_eq!(
             driver.drive_once().unwrap(),
             DriveOutcome::Rejected {
@@ -5936,11 +6082,11 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(
             driver
@@ -5955,19 +6101,55 @@ mod tests {
     }
 
     #[test]
-    fn rejection_event_agrees_with_wait_and_receipt_status() {
+    fn reject_gap_terminalizes_without_completing_unresolved_lower_frame() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::NoResponse,
             FakeSendResult::RejectWire { wire_seq: 1 },
         ]));
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Terminal { fsn: 1 }
+        );
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert!(terminal_error.message.as_deref().is_some_and(|message| {
+            message.contains("reject response for fsn 1 skipped unresolved fsn 0")
+        }));
+    }
+
+    #[test]
+    fn rejection_event_agrees_with_completed_receipt_status() {
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::AckWire { wire_seq: 0 },
+            FakeSendResult::RejectWire { wire_seq: 1 },
+        ]));
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
         let third = driver.try_submit(b"third").unwrap();
 
-        driver.drive_once().unwrap();
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
         assert_eq!(
             driver.wait_steps(second, 1).unwrap(),
-            DeliveryOutcome::Rejected
+            DeliveryOutcome::Completed
         );
 
         assert_eq!(
@@ -5980,13 +6162,17 @@ mod tests {
                     fsn: 0,
                     wire_seq: 0,
                 },
+                DriverEvent::CompletedThrough {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
                 DriverEvent::Sent {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::AckedThrough {
-                    fsn: 0,
-                    wire_seq: 0,
+                DriverEvent::CompletedThrough {
+                    fsn: 1,
+                    wire_seq: 1,
                 },
                 DriverEvent::Rejected {
                     fsn: 1,
@@ -5996,11 +6182,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -6011,7 +6197,7 @@ mod tests {
     #[test]
     fn ack_after_ordered_reject_completes_later_receipt() {
         let mut driver = driver(FakeOrderedServer::scripted([
-            FakeSendResult::NoResponse,
+            FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
             FakeSendResult::AckWire { wire_seq: 2 },
         ]));
@@ -6019,10 +6205,10 @@ mod tests {
         let second = driver.try_submit(b"second").unwrap();
         let third = driver.try_submit(b"third").unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Sent(_)
-        ));
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
         assert_eq!(
             driver.drive_once().unwrap(),
             DriveOutcome::Rejected {
@@ -6037,20 +6223,20 @@ mod tests {
 
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Rejected { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
-            QwpReceiptStatus::Acked { fsn: 2 }
+            QwpReceiptStatus::Completed { fsn: 2 }
         );
     }
 
     #[test]
-    fn wait_reports_rejected_receipt() {
+    fn wait_reports_completed_receipt_after_reject_and_continue() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 0,
         }]));
@@ -6058,10 +6244,10 @@ mod tests {
 
         let outcome = driver.wait_steps(receipt, 1).unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Rejected);
+        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Rejected { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
     }
 
@@ -6074,7 +6260,7 @@ mod tests {
 
         assert_eq!(
             driver.wait_steps(receipt, 1).unwrap(),
-            DeliveryOutcome::Rejected
+            DeliveryOutcome::Completed
         );
 
         let error = driver.poll_sender_error().unwrap();
@@ -6214,7 +6400,7 @@ mod tests {
 
         assert_eq!(
             driver.wait_steps(receipt, 0).unwrap(),
-            DeliveryOutcome::Acked
+            DeliveryOutcome::Completed
         );
     }
 
@@ -6226,7 +6412,7 @@ mod tests {
 
         assert_eq!(
             driver.wait_steps(receipt, 1).unwrap(),
-            DeliveryOutcome::Acked
+            DeliveryOutcome::Completed
         );
         assert_eq!(driver.sent_frames().len(), 1);
     }
@@ -6340,10 +6526,13 @@ mod tests {
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
 
-        assert_eq!(driver.wait_steps(first, 1).unwrap(), DeliveryOutcome::Acked);
+        assert_eq!(
+            driver.wait_steps(first, 1).unwrap(),
+            DeliveryOutcome::Completed
+        );
         assert_eq!(
             driver.wait_steps(second, 1).unwrap(),
-            DeliveryOutcome::Acked
+            DeliveryOutcome::Completed
         );
 
         assert_eq!(driver.events_dropped_total(), 4);
@@ -6354,7 +6543,7 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::AckedThrough {
+                DriverEvent::CompletedThrough {
                     fsn: 1,
                     wire_seq: 1,
                 },
@@ -6362,11 +6551,11 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
+            QwpReceiptStatus::Completed { fsn: 1 }
         );
     }
 }

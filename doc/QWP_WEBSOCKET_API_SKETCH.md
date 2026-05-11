@@ -56,12 +56,8 @@ pub enum QwpReceiptStatus {
         fsn: u64,
         wire_seq: Option<u64>,
     },
-    Acked {
+    Completed {
         fsn: u64,
-    },
-    Rejected {
-        fsn: u64,
-        status: QwpStatus,
     },
     Terminal {
         fsn: u64,
@@ -80,12 +76,7 @@ impl QwpReceiptStatus {
 
 #[derive(Debug)]
 pub enum QwpDeliveryOutcome {
-    Acked,
-    Rejected {
-        fsn: u64,
-        status: QwpStatus,
-        message_truncated: bool,
-    },
+    Completed,
     Timeout {
         status: QwpReceiptStatus,
     },
@@ -118,7 +109,7 @@ pub enum QwpCloseOutcome {
 pub enum QwpEvent {
     Published { fsn: u64 },
     Sent { fsn: u64, wire_seq: u64 },
-    AckedThrough { fsn: u64 },
+    CompletedThrough { fsn: u64 },
     DurableAck { details: Option<QwpDurableAckDetails> },
     Retrying { attempt: u32, elapsed: std::time::Duration, error: QwpErrorSummary },
     Reconnected { replay_from_fsn: u64, attempts: u32, elapsed: std::time::Duration },
@@ -132,17 +123,12 @@ pub enum QwpEvent {
 values are deliberately left provisional until real-server error taxonomy and
 durable-ACK probes complete.
 
-`QwpDeliveryOutcome::Rejected` includes the FSN even though the caller already
-has the receipt. That redundancy is intentional for logging and callback
-ergonomics. `QwpCloseOutcome` does not have a separate rejected variant in this
-sketch: server rejection is a receipt completion state. Policy decides whether
-the sender can continue or must halt for the specific server status. In either
-case, close can only report drained after all published receipts are resolved as
-ACKed or rejected.
-
-`server_acked_fsn` and `completed_fsn` are distinct. After a rejection gap,
-`completed_fsn` may advance through ACKed later receipts while
-`server_acked_fsn` remains before the rejected FSN.
+DROP_AND_CONTINUE server rejections are reported through `QwpEvent::Rejected`
+and the sender error channel. Receipt status remains a replay/retention view:
+once the frame is no longer retained, the receipt is `Completed` whether the
+server accepted it or dropped it under policy. `QwpCloseOutcome` does not have a
+separate rejected variant; close can report drained after all published receipts
+are completed or terminal.
 
 ## Rust manual sender
 
@@ -176,12 +162,9 @@ fn manual_submit_and_wait() -> questdb::Result<()> {
     assert!(buffer.is_empty());
 
     match sender.wait(receipt, Duration::from_secs(5))? {
-        QwpDeliveryOutcome::Acked => {}
+        QwpDeliveryOutcome::Completed => {}
         QwpDeliveryOutcome::Timeout { status } => {
-            eprintln!("still waiting for server ACK: {status:?}");
-        }
-        QwpDeliveryOutcome::Rejected { fsn, status, .. } => {
-            eprintln!("server rejected frame {fsn}: {status:?}");
+            eprintln!("still waiting for completion: {status:?}");
         }
         QwpDeliveryOutcome::Terminal { error } => {
             eprintln!("sender is terminal: {error:?}");
@@ -242,8 +225,8 @@ fn threaded_sender() -> questdb::Result<()> {
     let receipt = threaded.submit(&mut buffer)?;
 
     match threaded.wait(receipt, Duration::from_secs(5))? {
-        QwpDeliveryOutcome::Acked => {}
-        other => eprintln!("not acked yet: {other:?}"),
+        QwpDeliveryOutcome::Completed => {}
+        other => eprintln!("not completed yet: {other:?}"),
     }
 
     threaded.close_drain(Duration::from_secs(5))?;
@@ -280,7 +263,7 @@ async fn async_sender() -> questdb::Result<()> {
     let receipt = sender.submit(&mut buffer).await?;
 
     match sender.wait(receipt, Duration::from_secs(5)).await? {
-        QwpDeliveryOutcome::Acked => {}
+        QwpDeliveryOutcome::Completed => {}
         QwpDeliveryOutcome::Timeout { .. } => {}
         other => eprintln!("delivery outcome: {other:?}"),
     }
@@ -325,10 +308,9 @@ typedef struct {
 } line_sender_qwpws_submit_result;
 
 typedef enum {
-    LINE_SENDER_QWPWS_WAIT_ACKED = 0,
+    LINE_SENDER_QWPWS_WAIT_COMPLETED = 0,
     LINE_SENDER_QWPWS_WAIT_TIMEOUT = 1,
-    LINE_SENDER_QWPWS_WAIT_REJECTED = 2,
-    LINE_SENDER_QWPWS_WAIT_TERMINAL = 3
+    LINE_SENDER_QWPWS_WAIT_TERMINAL = 2
 } line_sender_qwpws_wait_status;
 
 typedef struct {
@@ -341,9 +323,8 @@ typedef struct {
 typedef enum {
     LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
     LINE_SENDER_QWPWS_RECEIPT_PENDING = 1,
-    LINE_SENDER_QWPWS_RECEIPT_ACKED = 2,
-    LINE_SENDER_QWPWS_RECEIPT_REJECTED = 3,
-    LINE_SENDER_QWPWS_RECEIPT_TERMINAL = 4
+    LINE_SENDER_QWPWS_RECEIPT_COMPLETED = 2,
+    LINE_SENDER_QWPWS_RECEIPT_TERMINAL = 3
 } line_sender_qwpws_receipt_status_kind;
 
 typedef struct {
@@ -622,7 +603,7 @@ async with await QwpWsSender.from_conf(conf) as sender:
     receipt = await sender.submit(buf)
     outcome = await sender.wait(receipt, timeout=timedelta(seconds=5))
 
-    if outcome.acked:
+    if outcome.completed:
         pass
 ```
 

@@ -216,8 +216,7 @@ pub struct QwpWsSender { /* threadless core */ }
 pub struct QwpWsReceipt { /* value receipt; exposes fsn() */ }
 
 pub enum QwpWsDeliveryOutcome {
-    Acked,
-    Rejected(QwpWsRejection),
+    Completed,
     Timeout,
 }
 
@@ -558,14 +557,14 @@ Core cursors:
 
 ```text
 published_fsn       highest frame published into the engine
-completed_fsn       highest contiguous frame ACKed or server-rejected
+completed_fsn       highest contiguous frame no longer retained for replay
 ```
 
-A frame is *resolved* when its receipt reaches a final delivery state:
-ACKed, server-rejected, or terminal. `completed_fsn` advances through
-contiguous resolved frames. The first ABI does not carry a second
-server-acked-through cursor; it reports ACK and rejection events directly and
-keeps the durable store focused on retained publication payloads.
+A frame is *completed* when it is no longer retained for replay. That can happen
+after a server OK or after a DROP_AND_CONTINUE rejection. `completed_fsn`
+advances through contiguous completed frames. Rejection detail is reported
+through events and the sender error channel; the durable store stays focused on
+retained publication payloads.
 
 Durable state is deliberately smaller than runtime state. The queue stores only
 retained publication data:
@@ -738,9 +737,9 @@ Example:
 ```text
 OK(0), Error(1), OK(2)
 
-receipt 0      ACKed
-receipt 1      Rejected
-receipt 2      ACKed
+receipt 0      Completed
+receipt 1      Completed, with rejection event/error
+receipt 2      Completed
 completed      2
 ```
 
@@ -830,7 +829,7 @@ Events:
 pub enum QwpEvent {
     Published { fsn: u64 },
     Sent { fsn: u64, wire_seq: u64 },
-    AckedThrough { fsn: u64 },
+    CompletedThrough { fsn: u64 },
     DurableAck { /* per-table durable details, if requested */ },
     Retrying { attempt: u32, elapsed: Duration, error: QwpErrorSummary },
     Reconnected { replay_from_fsn: u64, attempts: u32, elapsed: Duration },
@@ -842,15 +841,15 @@ pub enum QwpEvent {
 
 The event ring is preallocated. On overflow, increment `events_dropped_total` and retain the latest terminal/rejection state in direct accessors.
 
-Events are transition notifications, not authoritative state. `receipt_status()`,
-`wait()`, and `close_drain()` remain the state surfaces. Calls that drive
-progress may produce events, but they should not consume them; `poll_event()`
-is the consumer API.
+Events are transition notifications, not authoritative receipt state.
+`receipt_status()`, `wait()`, and `close_drain()` report replay/completion and
+terminal state. Calls that drive progress may produce events, but they should
+not consume them; `poll_event()` is the consumer API.
 
-Message text used by `wait()` and receipt/outcome queries must not depend on the
-event ring. A rejection or terminal event may be dropped or already polled, so
-the core must retain bounded diagnostic details with the affected receipt or
-sender state for as long as that state remains observable.
+Message text for rejection or terminal diagnostics must not depend on the event
+ring. A rejection or terminal event may be dropped or already polled, so the
+core must retain bounded diagnostic details in the sender error channel for as
+long as that state remains observable.
 
 ## Server error classification
 
@@ -860,11 +859,11 @@ Current QWP response statuses include:
 |---|---|---|
 | `OK` | Batch accepted | ACK |
 | `DURABLE_ACK` | Per-table durability notification | Event, not batch completion |
-| `SCHEMA_MISMATCH` | Bad schema/data for table | Drop-and-continue / rejected receipt |
+| `SCHEMA_MISMATCH` | Bad schema/data for table | Drop-and-continue / completed receipt plus rejection event/error |
 | `SECURITY_ERROR` | Auth/authorization | Terminal |
 | `PARSE_ERROR` | Bad payload | Terminal |
 | `INTERNAL_ERROR` | Server internal error | Terminal |
-| `WRITE_ERROR` | Non-critical write failure | Drop-and-continue / rejected receipt |
+| `WRITE_ERROR` | Non-critical write failure | Drop-and-continue / completed receipt plus rejection event/error |
 | unknown | Unknown | Terminal |
 
 The preferred wire contract is stronger:
@@ -894,7 +893,7 @@ Do not add a Rust-only dead-letter file subsystem in v1. Match Java's model:
 
 - preserve raw server status, wire sequence, message, affected FSN span, and
   table attribution when available,
-- expose the rejected frame through receipt status / wait outcome,
+- expose the rejected frame through a bounded pollable error/event path,
 - expose high-level `Sender` rejections through a bounded pollable error/event
   path because `flush()` may already have returned,
 - publish a transition event for observability,
@@ -962,7 +961,7 @@ close_drain(timeout)
 
 - stops accepting new submissions,
 - drives until all published frames are completed or timeout expires,
-- returns whether everything was ACKed or server-rejected,
+- returns whether everything was completed,
 - leaves uncompleted SF frames recoverable.
 
 If `close_drain()` times out, the current sender remains closing: new
@@ -1045,8 +1044,7 @@ typedef struct {
 typedef enum {
     LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
     LINE_SENDER_QWPWS_RECEIPT_PENDING,
-    LINE_SENDER_QWPWS_RECEIPT_ACKED,
-    LINE_SENDER_QWPWS_RECEIPT_REJECTED,
+    LINE_SENDER_QWPWS_RECEIPT_COMPLETED,
     LINE_SENDER_QWPWS_RECEIPT_TERMINAL
 } line_sender_qwpws_receipt_status_kind;
 
@@ -1057,8 +1055,7 @@ typedef struct {
 } line_sender_qwpws_receipt_status;
 
 typedef enum {
-    LINE_SENDER_QWPWS_DELIVERY_ACKED = 0,
-    LINE_SENDER_QWPWS_DELIVERY_REJECTED,
+    LINE_SENDER_QWPWS_DELIVERY_COMPLETED = 0,
     LINE_SENDER_QWPWS_DELIVERY_TIMEOUT,
     LINE_SENDER_QWPWS_DELIVERY_TERMINAL
 } line_sender_qwpws_delivery_kind;

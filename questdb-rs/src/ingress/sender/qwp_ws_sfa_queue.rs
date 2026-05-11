@@ -253,7 +253,6 @@ struct SfaEngine {
     state: Mutex<SfaEngineState>,
     published_upper: AtomicU64,
     completed_upper: AtomicU64,
-    rejected_fsns: Mutex<Vec<u64>>,
 }
 
 #[derive(Debug)]
@@ -349,7 +348,6 @@ impl SfaFrameQueue {
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(first_unresolved),
-            rejected_fsns: Mutex::new(Vec::new()),
         });
         let producer = Some(SfaProducer {
             engine: Arc::clone(&engine),
@@ -413,7 +411,6 @@ impl SfaFrameQueue {
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(next_fsn),
-            rejected_fsns: Mutex::new(Vec::new()),
         });
         let producer = Some(SfaProducer {
             engine: Arc::clone(&engine),
@@ -474,7 +471,6 @@ impl SfaFrameQueue {
             }),
             published_upper: AtomicU64::new(next_fsn),
             completed_upper: AtomicU64::new(first_unresolved),
-            rejected_fsns: Mutex::new(Vec::new()),
         });
 
         Ok(Self {
@@ -502,10 +498,6 @@ impl SfaFrameQueue {
 
     pub(crate) fn complete_through_fsn(&mut self, acked_fsn: u64) -> Result<(), SfaQueueError> {
         self.engine.complete_through_fsn(acked_fsn)
-    }
-
-    pub(crate) fn reject_fsn(&mut self, rejected_fsn: u64) -> Result<QwpReceipt, SfaQueueError> {
-        self.engine.reject_fsn(rejected_fsn)
     }
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -864,32 +856,10 @@ impl SfaEngine {
         Ok(())
     }
 
-    fn reject_fsn(&self, rejected_fsn: u64) -> Result<QwpReceipt, SfaQueueError> {
-        if !self.is_unresolved_fsn(rejected_fsn) {
-            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }.into());
-        }
-        let target_upper = rejected_fsn
-            .checked_add(1)
-            .ok_or(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn })?;
-        {
-            let mut rejected = self.lock_rejected_fsns()?;
-            if !rejected.contains(&rejected_fsn) {
-                rejected.push(rejected_fsn);
-            }
-        }
-        self.completed_upper.store(target_upper, Ordering::Release);
-        Ok(QwpReceipt { fsn: rejected_fsn })
-    }
-
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         let fsn = receipt.fsn;
-        if let Ok(rejected) = self.rejected_fsns.lock()
-            && rejected.contains(&fsn)
-        {
-            return QwpReceiptStatus::Rejected { fsn };
-        }
         if fsn < self.completed_upper.load(Ordering::Acquire) {
-            return QwpReceiptStatus::Acked { fsn };
+            return QwpReceiptStatus::Completed { fsn };
         }
         if fsn >= self.published_upper.load(Ordering::Acquire) {
             return QwpReceiptStatus::Unknown { fsn };
@@ -1133,10 +1103,6 @@ impl SfaEngine {
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, SfaEngineState>, SfaQueueError> {
         self.state.lock().map_err(|_| SfaQueueError::Closed)
     }
-
-    fn lock_rejected_fsns(&self) -> Result<std::sync::MutexGuard<'_, Vec<u64>>, SfaQueueError> {
-        self.rejected_fsns.lock().map_err(|_| SfaQueueError::Closed)
-    }
 }
 
 #[derive(Debug)]
@@ -1274,10 +1240,6 @@ impl PublicationLog for SfaFrameQueue {
 
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaFrameQueue::close(self)?)
-    }
-
-    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
-        Ok(SfaFrameQueue::reject_fsn(self, fsn)?)
     }
 
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -2236,7 +2198,7 @@ mod tests {
 
             assert_eq!(
                 queue.receipt_status(first),
-                QwpReceiptStatus::Acked { fsn: 0 }
+                QwpReceiptStatus::Completed { fsn: 0 }
             );
         }
 
