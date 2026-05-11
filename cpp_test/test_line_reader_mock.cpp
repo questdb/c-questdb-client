@@ -489,7 +489,7 @@ TEST_CASE("mock: bind_i32 + bind_varchar appears verbatim in captured request")
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
-    auto cur = reader.prepare("X"_utf8)
+    auto cur = reader.query("X"_utf8)
                    .bind_i32(7)
                    .bind_varchar("widgets"_utf8)
                    .execute();
@@ -746,7 +746,7 @@ TEST_CASE("mock: cursor::add_credit writes MSG_CREDIT")
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
-    auto cur = reader.prepare("select v"_utf8).initial_credit(64).execute();
+    auto cur = reader.query("select v"_utf8).initial_credit(64).execute();
     REQUIRE(cur.next_batch());
     cur.add_credit(1024);
     while (cur.next_batch()) {}
@@ -841,7 +841,7 @@ TEST_CASE("mock: add_credit failover on write failure replays credit on B")
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
 
     std::atomic<int> failover_count{0};
-    auto cur = reader.prepare("select v"_utf8)
+    auto cur = reader.query("select v"_utf8)
                    .initial_credit(64)
                    .on_failover_reset(
                        [&failover_count](
@@ -946,7 +946,7 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
     };
     auto cap = std::make_shared<Capture>();
 
-    auto cur = reader.prepare("select 1"_utf8)
+    auto cur = reader.query("select 1"_utf8)
                    .on_failover_reset(
                        [cap](const questdb::egress::failover_event_view& ev)
                        {
@@ -995,7 +995,7 @@ TEST_CASE("mock: failover callback NOT invoked on the happy path")
     auto reader = connect_to(srv);
 
     std::atomic<int> count{0};
-    auto cur = reader.prepare("select 1"_utf8)
+    auto cur = reader.query("select 1"_utf8)
                    .on_failover_reset(
                        [&count](const questdb::egress::failover_event_view&)
                        { count.fetch_add(1); })
@@ -1313,7 +1313,7 @@ TEST_CASE("mock: stats and cursor introspection getters return live values")
     const uint64_t d0 = reader.decode_ns();
     (void)r0; (void)d0;
 
-    auto cur = reader.prepare("select v"_utf8).initial_credit(1024).execute();
+    auto cur = reader.query("select v"_utf8).initial_credit(1024).execute();
     REQUIRE(cur.next_batch());
 
     // request_id is non-zero and matches batch_request_id of the batch.
@@ -1379,7 +1379,7 @@ void run_bind_round_trip(Fn&& bind_apply)
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
-    auto q = reader.prepare("X"_utf8);
+    auto q = reader.query("X"_utf8);
     bind_apply(q);
     auto cur = q.execute();
     while (cur.next_batch()) {}
@@ -1402,7 +1402,7 @@ void run_bind_rejection(Fn&& bind_apply)
     };
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
-    auto q = reader.prepare("X"_utf8);
+    auto q = reader.query("X"_utf8);
     bind_apply(q);
     bool threw = false;
     questdb::egress::error_code code{};
@@ -1565,7 +1565,7 @@ TEST_CASE("mock: bind_varchar with invalid UTF-8 surfaces InvalidUtf8 at execute
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
 
-    auto q = reader.prepare("X"_utf8);
+    auto q = reader.query("X"_utf8);
     static const unsigned char bad[] = {0xC3, 0x28};  // invalid 2-byte UTF-8
     line_sender_utf8 v{2, reinterpret_cast<const char*>(bad)};
     line_reader_query_bind_varchar(raw_handle(q), v);
@@ -1593,7 +1593,7 @@ TEST_CASE("mock: bind_varchar deferred error wins over a later valid bind")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
 
-    auto q = reader.prepare("X"_utf8);
+    auto q = reader.query("X"_utf8);
     static const unsigned char bad[] = {0xC3, 0x28};
     line_sender_utf8 v_bad{2, reinterpret_cast<const char*>(bad)};
     line_reader_query_bind_varchar(raw_handle(q), v_bad);
@@ -2154,7 +2154,7 @@ TEST_CASE(
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
 
-    auto q = reader.prepare("X"_utf8);
+    auto q = reader.query("X"_utf8);
     static const unsigned char bad[] = {0xC3, 0x28};
     line_sender_utf8 bad_v{2, reinterpret_cast<const char*>(bad)};
 
@@ -2291,7 +2291,7 @@ TEST_CASE("mock: failover event exposes new_request_id, elapsed_ns, trigger_msg"
     };
     auto cap = std::make_shared<Capture>();
 
-    auto cur = reader.prepare("select 1"_utf8)
+    auto cur = reader.query("select 1"_utf8)
                    .on_failover_reset(
                        [cap](const questdb::egress::failover_event_view& ev)
                        {
@@ -2372,9 +2372,9 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         qm::MockServer srv2({s2});
         auto reader1 = connect_to(srv1);
         auto reader2 = connect_to(srv2);
-        auto q1 = reader1.prepare("X"_utf8);
+        auto q1 = reader1.query("X"_utf8);
         q1.bind_i32(1);
-        auto q2 = reader2.prepare("Y"_utf8);
+        auto q2 = reader2.query("Y"_utf8);
         q2.bind_i32(7);
         q1 = std::move(q2);  // move-assign — frees q1's old impl
         auto cur = q1.execute();
@@ -2401,7 +2401,7 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         };
         qm::MockServer srv({s});
         auto reader = connect_to(srv);
-        auto q_a = reader.prepare("X"_utf8);
+        auto q_a = reader.query("X"_utf8);
         auto q_b = std::move(q_a);   // q_a empty
         q_a = std::move(q_b);        // assign into empty — must not crash
         q_a.bind_i32(7);

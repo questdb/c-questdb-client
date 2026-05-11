@@ -32,8 +32,9 @@ using socket_t = SOCKET;
 using ssize_t = std::intptr_t;
 #define INVALID_SOCKET_VALUE INVALID_SOCKET
 #define close_socket(s) closesocket(s)
-// Winsock spells the bidirectional shutdown constant differently.
+// Winsock spells the shutdown constants differently.
 #define QWP_SHUT_RDWR SD_BOTH
+#define QWP_SHUT_WR   SD_SEND
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -45,6 +46,7 @@ using socket_t = int;
 #define INVALID_SOCKET_VALUE (-1)
 #define close_socket(s) ::close(s)
 #define QWP_SHUT_RDWR SHUT_RDWR
+#define QWP_SHUT_WR   SHUT_WR
 #endif
 
 namespace qwp_mock
@@ -701,6 +703,30 @@ WsFrame ws_read(socket_t fd)
     return f;
 }
 
+// Graceful end-of-script teardown. Sends a single WebSocket Close
+// control frame (opcode 0x88, FIN bit set, zero-length payload) so
+// the client sees a clean protocol-level close, then half-closes the
+// TCP send side (`shutdown(SHUT_WR)`) so the FIN propagates AFTER
+// any buffered RESULT_END / EXEC_DONE bytes are delivered.
+//
+// Why this matters: a bare `close(fd)` on macOS surfaces to the
+// client as a TCP RST when there's unACK'd data in the local send
+// buffer, and the kernel discards still-undelivered data on RST. The
+// failure mode looks like a race — RESULT_END *was* sent, but the
+// client read returns "Connection reset by peer" instead of seeing
+// the frame. Half-close avoids that: the FIN is queued behind the
+// data, so the client drains the recv buffer cleanly and then sees
+// EOF on a subsequent read.
+void graceful_close(socket_t fd)
+{
+    // RFC 6455 §5.5.1 server Close: 0x88 = FIN | OP_CLOSE; payload = 0.
+    static const std::uint8_t ws_close[2] = {0x88, 0x00};
+    (void)send(
+        fd, reinterpret_cast<const char*>(ws_close), sizeof(ws_close), 0);
+    (void)::shutdown(fd, QWP_SHUT_WR);
+    close_socket(fd);
+}
+
 // Write a single (server-side, unmasked) binary WebSocket frame.
 bool ws_write_binary(socket_t fd, const std::vector<uint8_t>& payload)
 {
@@ -952,9 +978,14 @@ struct MockServer::Impl
 #pragma warning(pop)
 #endif
 
-        // Optional clean-close TBD; keep it simple — the reader's wait
-        // for next frame on a closed socket already exits its loop.
-        close_socket(fd);
+        // End of script: graceful close (WS Close frame, then TCP
+        // half-close) so any final RESULT_END / EXEC_DONE bytes
+        // already on the wire reach the client before EOF. A bare
+        // `close(fd)` would race with delivery on macOS, surfacing
+        // as `Connection reset by peer` on the client and tripping
+        // the mid-stream `FailoverWouldDuplicate` guard in tests that
+        // delivered a batch before terminating.
+        graceful_close(fd);
     }
 };
 

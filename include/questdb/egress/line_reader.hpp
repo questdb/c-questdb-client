@@ -544,7 +544,7 @@ public:
 
     /**
      * Execute a SQL statement with no binds and return a streaming cursor.
-     * Convenience for `prepare(sql).execute()`. The cursor borrows from
+     * Convenience for `query(sql).execute()`. The cursor borrows from
      * this reader; this reader MUST outlive the cursor. Only one cursor
      * may be live at a time.
      * @throws line_reader_error on failure.
@@ -556,10 +556,16 @@ public:
      * order, then call `.execute()` to obtain a cursor. The reader MUST
      * outlive the query and the cursor. Validation of the SQL is
      * deferred to `query::execute`.
+     *
+     * Named to match the Rust `Reader::query` and the C `line_reader_query`
+     * — the operation builds a query, the noun-form returns a `query`
+     * builder, and the verb-form is identical across all three language
+     * surfaces.
+     *
      * @throws line_reader_error if a query or cursor is already in flight
      *         on this reader.
      */
-    query prepare(::questdb::ingress::utf8_view sql);
+    query query(::questdb::ingress::utf8_view sql);
 
     /** Cumulative bytes successfully read from the wire.
      *  @throws line_reader_error if this reader has been moved from. */
@@ -1598,16 +1604,25 @@ private:
     friend class query;
 };
 
-inline query reader::prepare(::questdb::ingress::utf8_view sql)
+inline query reader::query(::questdb::ingress::utf8_view sql)
 {
     ensure_impl();
-    return query{line_reader_error::wrapped_call(
+    // `query` (the unqualified name) resolves to the surrounding
+    // member function — same name, distinct scope. The fully qualified
+    // type spelling disambiguates and stays valid even if the class is
+    // later moved or aliased.
+    return ::questdb::egress::query{line_reader_error::wrapped_call(
         ::line_reader_query_new, _impl, to_c_utf8(sql))};
 }
 
 inline cursor reader::execute(::questdb::ingress::utf8_view sql)
 {
-    return prepare(sql).execute();
+    // `query(sql)` resolves to `this->query(sql)` (the member
+    // function), per [basic.lookup.unqual] / [class.member.lookup]:
+    // class-member lookup precedes namespace lookup, so even though
+    // there is also a class named `query` in the enclosing namespace,
+    // the unqualified call here invokes the member.
+    return query(sql).execute();
 }
 
 inline cursor query::execute()

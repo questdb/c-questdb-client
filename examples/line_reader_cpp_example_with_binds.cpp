@@ -10,7 +10,7 @@ int main()
         questdb::egress::reader reader{"qwp::addr=localhost:9000;"_utf8};
 
         auto cur = reader
-                       .prepare(
+                       .query(
                            "SELECT $1::int * x AS scaled, $2 AS label "
                            "FROM long_sequence(3)"_utf8)
                        .bind_i32(7)
