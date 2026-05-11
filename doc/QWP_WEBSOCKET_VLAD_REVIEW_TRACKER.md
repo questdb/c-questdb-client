@@ -54,7 +54,22 @@ turn into documentation decisions rather than code changes.
 
 ### VL-C2 - Add `qwpwss` TLS coverage
 
-- Status: [ ]
+- Status: [x]
+- Validation, 2026-05-11: stale as an open blocker. The current tree already
+  has `qwpwss` coverage beyond config parsing:
+  `TestQwpWsSender._sender_conf_for_variant()` switches the real-server smoke
+  path to `qwpwss`, uses `localhost`, routes through `TlsProxyFixture`, and
+  sets `tls_roots` to `tls_certs/server_rootCA.pem`. The smoke runner executes
+  both TLS and non-TLS variants with HTTP auth disabled and enabled. Rust also
+  has `blocking_real_wss_transport_drives_submit_and_wait`, which performs a
+  TLS handshake against a local WSS server using the test CA, completes the
+  WebSocket upgrade, sends a QWP payload, and waits for ACK completion.
+- Verification, 2026-05-11:
+  `TestQwpWsSender` passed against `/home/jara/devel/oss/questdb-arrays` with
+  JDK 25 across 4 variants: no-auth/plain, no-auth/TLS, HTTP-auth/plain, and
+  HTTP-auth/TLS. Also ran
+  `cargo test --manifest-path questdb-rs/Cargo.toml blocking_real_wss_transport_drives_submit_and_wait --features sync-sender-qwp-ws,tls-webpki-certs,ring-crypto`;
+  1 passed.
 - Source area: Rust tests, C++ tests, and `system_test/`
 - Action: Add TLS coverage for `qwpwss`, including connection, handshake,
   certificate handling, and proxy or fixture wiring.
