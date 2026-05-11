@@ -88,3 +88,18 @@ pub use error::{Error, ErrorCode, Result};
 #[cfg(feature = "sync-reader-ws")]
 pub use reader::{BatchView, Cursor, FailoverEvent, Reader, ReaderQuery, ReaderStats, Terminal};
 pub use server_event::{ServerInfo, ServerRole};
+
+/// Decoder internals re-exported for the in-crate criterion benchmark
+/// at `benches/decoder.rs`. **Not** a public API surface: the names
+/// are prefixed `_` and the module is `#[doc(hidden)]` precisely so
+/// downstream consumers don't reach into it. May be renamed or
+/// removed without notice; everything in here moves on the same
+/// stability footing as `pub(crate)`.
+#[doc(hidden)]
+#[cfg(feature = "sync-reader-ws")]
+pub mod _bench_internals {
+    pub use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
+    pub use crate::egress::schema::SchemaRegistry;
+    pub use crate::egress::symbol_dict::SymbolDict;
+    pub use bytes::Bytes;
+}
