@@ -1413,19 +1413,92 @@ fn decode_decimal64(
 #[cfg(feature = "compression-zstd")]
 const MAX_ZSTD_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
+/// Max recyclable buffers held by [`ZstdBufferPool`]. Two is the
+/// steady-state for typical streaming: one buffer is in-flight as the
+/// caller's current batch, one is being filled for the next batch.
+/// Anything beyond that means the consumer is hoarding `Bytes` clones
+/// — in which case dropping the extra allocations rather than caching
+/// them is the right choice (lets the global allocator reclaim).
+#[cfg(feature = "compression-zstd")]
+const ZSTD_POOL_CAPACITY: usize = 2;
+
+/// Per-connection recycle pool of decompressed-body `Vec<u8>`s. Each
+/// `Bytes` returned by [`zstd_decompress_body`] wraps a `Vec` drawn
+/// from the pool via [`PooledZstdBuffer`]; when the last clone of that
+/// `Bytes` is dropped, the `Drop` impl returns the `Vec` (capacity
+/// preserved) to this pool for the next decompress to claim.
+///
+/// `Arc<Mutex<...>>`-shared between [`ZstdScratch`] (the draw side)
+/// and every live [`PooledZstdBuffer`] (the return side). The `Mutex`
+/// is dead-weight in normal use — every draw and return happens on
+/// the cursor thread that owns the `Reader` — but `Bytes::from_owner`
+/// requires the owner to be `Send + Sync + 'static`, which forces a
+/// thread-safe pool handle. Lock-uncontended overhead is ~tens of ns
+/// per decompress, negligible against the savings from skipping a
+/// multi-MB allocation.
+#[cfg(feature = "compression-zstd")]
+#[derive(Default)]
+struct ZstdBufferPool {
+    buffers: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+/// Owner handed to `Bytes::from_owner` so the decompressed body's
+/// backing `Vec` is returned to the pool on drop instead of being
+/// freed. `AsRef<[u8]>` exposes the full payload; `Bytes` slicing on
+/// top of this is zero-copy by ref-count.
+#[cfg(feature = "compression-zstd")]
+struct PooledZstdBuffer {
+    buf: Vec<u8>,
+    pool: std::sync::Arc<ZstdBufferPool>,
+}
+
+#[cfg(feature = "compression-zstd")]
+impl AsRef<[u8]> for PooledZstdBuffer {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+#[cfg(feature = "compression-zstd")]
+impl Drop for PooledZstdBuffer {
+    fn drop(&mut self) {
+        // Best-effort pool return. A poisoned mutex (would only happen
+        // on a panic in another holder) just lets the buffer be freed
+        // normally — pool reuse is a perf optimisation, never a
+        // correctness invariant.
+        let Ok(mut guard) = self.pool.buffers.lock() else {
+            return;
+        };
+        if guard.len() >= ZSTD_POOL_CAPACITY {
+            return;
+        }
+        // Take the buffer so the `mem::take` leaves an empty Vec
+        // (capacity 0) in `self.buf` for the impending drop. Skip
+        // empty (no-capacity) buffers — they amortise nothing.
+        let buf = std::mem::take(&mut self.buf);
+        if buf.capacity() > 0 {
+            guard.push(buf);
+        }
+    }
+}
+
 /// Per-connection scratch state for zstd batch decompression.
 ///
 /// Holds a persistent `Decompressor` (so the ZSTD_DCtx isn't recreated
-/// per batch) and a reusable output buffer (so we don't allocate a fresh
-/// `Vec<u8>` for every decompressed frame). Always exists so the decode
-/// API doesn't need feature-gated signatures; the fields inside are
-/// only populated when `compression-zstd` is on.
+/// per batch) and a small recycle pool of output buffers. The pool
+/// keeps the multi-MB decompressed-body `Vec` capacity across batches:
+/// each `Bytes` we return wraps a pooled `Vec`, returned to the pool
+/// when the downstream batch (and any column views borrowing into it)
+/// is dropped. Always exists so the decode API doesn't need
+/// feature-gated signatures; the fields inside are only populated when
+/// `compression-zstd` is on.
 #[derive(Default)]
 pub struct ZstdScratch {
     #[cfg(feature = "compression-zstd")]
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
     #[cfg(feature = "compression-zstd")]
-    buffer: Vec<u8>,
+    pool: std::sync::Arc<ZstdBufferPool>,
 }
 
 impl ZstdScratch {
@@ -1482,10 +1555,23 @@ fn zstd_decompress_body(compressed: &[u8], scratch: &mut ZstdScratch) -> Result<
             scratch.decompressor.as_mut().unwrap()
         }
     };
-    scratch.buffer.clear();
-    scratch.buffer.reserve(usize_size);
+
+    // Draw a recycled `Vec<u8>` from the pool if one is available,
+    // otherwise allocate fresh. The pool entries retain capacity from
+    // their prior decompression — for steady-state batch sizes the
+    // `reserve` below is a no-op and there is zero allocation per
+    // batch on the hot path.
+    let mut buf = scratch
+        .pool
+        .buffers
+        .lock()
+        .ok()
+        .and_then(|mut g| g.pop())
+        .unwrap_or_default();
+    buf.clear();
+    buf.reserve(usize_size);
     let written = decompressor
-        .decompress_to_buffer(compressed, &mut scratch.buffer)
+        .decompress_to_buffer(compressed, &mut buf)
         .map_err(|e| fmt!(ProtocolError, "zstd decompress failed: {}", e))?;
     if written != usize_size {
         return Err(fmt!(
@@ -1495,7 +1581,17 @@ fn zstd_decompress_body(compressed: &[u8], scratch: &mut ZstdScratch) -> Result<
             size
         ));
     }
-    Ok(Bytes::copy_from_slice(&scratch.buffer[..usize_size]))
+    // Defensive truncate so the AsRef view exposes exactly the bytes
+    // the decompressor wrote (it should always equal `usize_size` per
+    // the check above, but truncating is cheap insurance against a
+    // future zstd quirk that decompresses-less-than-promised without
+    // erroring).
+    buf.truncate(usize_size);
+    let owner = PooledZstdBuffer {
+        buf,
+        pool: std::sync::Arc::clone(&scratch.pool),
+    };
+    Ok(Bytes::from_owner(owner))
 }
 
 fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
@@ -2562,6 +2658,128 @@ mod tests {
         assert_eq!(c.value(0), 10);
         assert_eq!(c.value(1), 20);
         assert_eq!(c.value(2), 30);
+    }
+
+    /// Pin the `ZstdScratch` recycle pool: the `Vec<u8>` backing the
+    /// first decompressed body is returned to the pool when that
+    /// `Bytes` is dropped, and the next decompression pops it back
+    /// out instead of allocating fresh. Without `Bytes::from_owner` +
+    /// `Drop for PooledZstdBuffer`, the pool would always be empty
+    /// and steady-state throughput would pay one full-body
+    /// allocation+memcpy per batch.
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn zstd_scratch_pool_recycles_buffer_across_batches() {
+        fn build_zstd_payload(seed: i64) -> Bytes {
+            let (_, raw_payload) = BatchBuilder::new(3)
+                .add_column(
+                    "v",
+                    ColumnKind::Long,
+                    col_no_nulls(&le_i64s(&[seed, seed + 1, seed + 2])),
+                )
+                .build();
+            let prefix_len = {
+                let mut r = ByteReader::new(&raw_payload);
+                r.read_u8().unwrap();
+                r.read_i64_le().unwrap();
+                r.read_varint_u64().unwrap();
+                raw_payload.len() - r.remaining().len()
+            };
+            let prefix = &raw_payload[..prefix_len];
+            let body = &raw_payload[prefix_len..];
+            let compressed = zstd::bulk::compress(body, 0).expect("compress");
+            let mut out = Vec::with_capacity(prefix.len() + compressed.len());
+            out.extend_from_slice(prefix);
+            out.extend_from_slice(&compressed);
+            Bytes::from(out)
+        }
+
+        let mut scratch = ZstdScratch::new();
+        // Pool starts empty.
+        assert_eq!(
+            scratch.pool.buffers.lock().unwrap().len(),
+            0,
+            "pool starts empty"
+        );
+
+        // First decompression: allocates a fresh buffer, returns
+        // `Bytes` wrapping it. Pool still empty (the buffer is alive
+        // inside the returned Bytes).
+        let body1 = zstd_decompress_body(
+            {
+                let p = build_zstd_payload(100);
+                // Slice off the uncompressed prefix to match what
+                // `zstd_decompress_body` is invoked with at the call
+                // site (the prefix is consumed by ByteReader first).
+                p.slice(10..)
+            }
+            .as_ref(),
+            &mut scratch,
+        )
+        .expect("decompress 1");
+        assert_eq!(
+            scratch.pool.buffers.lock().unwrap().len(),
+            0,
+            "pool empty while body1 holds the buffer"
+        );
+
+        // Drop the Bytes: PooledZstdBuffer::drop fires and returns
+        // the Vec to the pool.
+        let body1_len = body1.len();
+        drop(body1);
+        let pool_len = scratch.pool.buffers.lock().unwrap().len();
+        assert_eq!(
+            pool_len, 1,
+            "pool should hold the recycled buffer after the first Bytes drops"
+        );
+        let recycled_capacity = scratch.pool.buffers.lock().unwrap()[0].capacity();
+        assert!(
+            recycled_capacity >= body1_len,
+            "recycled buffer retained capacity >= body length ({} >= {})",
+            recycled_capacity,
+            body1_len
+        );
+
+        // Second decompression: must draw from the pool (the pool
+        // pops the recycled buffer and reuses its capacity). After
+        // the call, the pool is empty again because the buffer is
+        // now owned by `body2`.
+        let body2 = zstd_decompress_body(
+            {
+                let p = build_zstd_payload(200);
+                p.slice(10..)
+            }
+            .as_ref(),
+            &mut scratch,
+        )
+        .expect("decompress 2");
+        assert_eq!(
+            scratch.pool.buffers.lock().unwrap().len(),
+            0,
+            "pool emptied by the second decompress drawing from it"
+        );
+        assert_eq!(body2.len(), body1_len, "second body decoded successfully");
+
+        // Pool is bounded: dropping many concurrent Bytes does NOT
+        // grow the pool past `ZSTD_POOL_CAPACITY`. Build a third
+        // body to add to the bucket while body2 is still alive.
+        let body3 = zstd_decompress_body(
+            {
+                let p = build_zstd_payload(300);
+                p.slice(10..)
+            }
+            .as_ref(),
+            &mut scratch,
+        )
+        .expect("decompress 3");
+        drop(body2);
+        drop(body3);
+        let final_pool_len = scratch.pool.buffers.lock().unwrap().len();
+        assert!(
+            final_pool_len <= ZSTD_POOL_CAPACITY,
+            "pool stays bounded by ZSTD_POOL_CAPACITY (got {})",
+            final_pool_len
+        );
     }
 
     #[cfg(feature = "compression-zstd")]
