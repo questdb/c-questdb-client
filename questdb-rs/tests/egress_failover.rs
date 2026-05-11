@@ -792,16 +792,22 @@ fn failover_disabled_surfaces_socket_error() {
 fn attempts_exhausted_surfaces_error() {
     // A is healthy for the initial connect, then drops mid-query. B
     // is broken at connect-time (drops before SERVER_INFO). With
-    // max_attempts=2, the cursor's first failure should burn 3
-    // reconnect attempts (1 initial + 2 retries), all of which fail
-    // because B can't even hand back SERVER_INFO and A only has a
-    // single healthy script in its queue (subsequent accepts replay
-    // its last script — also a connect-time failure).
+    // max_attempts=2, the cursor's first failure should burn 3 outer
+    // reconnect attempts, all of which fail.
     //
-    // Note: the *second* and *third* attempts within reconnect_with_failover
-    // will alternate (A, B, A) starting from "skip the failed one
-    // first". Each individual attempt fails at the SERVER_INFO read,
-    // exhausting the budget.
+    // Dial accounting:
+    //   - Initial connect: 1 dial to A (success).
+    //   - Mid-stream failure on A. `reconnect_with_failover` runs
+    //     `attempts_total = 3` outer attempts. Each outer attempt
+    //     invokes `walk_via_tracker(allow_reset_pass=true)`:
+    //       1. pick B (Unknown < TransportError) → fail
+    //       2. pick A (TransportError) → fail
+    //       3. fall-through reset (both → Unknown)
+    //       4. pick A (lowest-index Unknown) → fail
+    //       5. pick B → fail
+    //     → 4 dials per outer attempt (2 per host).
+    //   - Reconnect total: 3 × 4 = 12 dials, split A=6, B=6.
+    //   - Grand total: 1 + 12 = 13, with A=7, B=6.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         // Subsequent accepts: TCP-level drop so even the connect fails.
@@ -829,17 +835,20 @@ fn attempts_exhausted_surfaces_error() {
         "unexpected code: {:?}",
         err.code()
     );
-    // Exactly 1 initial connect to A + 3 reconnect attempts
-    // (max_attempts + 1) = 4. Tightened from `>= 4` so a regression
-    // that double-counts attempts becomes red.
+    // 1 initial to A + 3 outer reconnects × 4 dials each = 13 total.
+    // A bears the initial + half of each reconnect attempt's 4 dials,
+    // so A=7, B=6.
     let total = srv_a.accepts() + srv_b.accepts();
     assert_eq!(
         total,
-        4,
-        "expected exactly 4 total dial attempts (1 initial + 3 reconnects); got A={}, B={}",
+        13,
+        "expected 13 total dial attempts (1 initial + 3 outer reconnects × 4 dials each); \
+         got A={}, B={}",
         srv_a.accepts(),
         srv_b.accepts()
     );
+    assert_eq!(srv_a.accepts(), 7, "A receives the initial + 2 dials per outer attempt");
+    assert_eq!(srv_b.accepts(), 6, "B receives 2 dials per outer attempt");
 }
 
 #[test]
@@ -1018,12 +1027,25 @@ fn cancelling_cursor_does_not_failover_on_drop() {
 
 #[test]
 fn single_endpoint_failover_exhausts_budget() {
-    // With a single address in the list, the failover rotation
-    // (`(0+1+attempt) % 1`) collapses to the same endpoint. If that
-    // endpoint stays dead, the cursor MUST eventually surface a hard
-    // error rather than retry indefinitely. With max_attempts=2 we
-    // expect 1 initial connect + 3 reconnect attempts = 4 dials,
-    // all of which fail post-handshake.
+    // With a single address in the list, the host-health tracker
+    // walks that single host and (per failover.md §11.9.3) does one
+    // fall-through reset pass per outer reconnect attempt. If the host
+    // stays dead, the cursor MUST eventually surface a hard error
+    // rather than retry indefinitely.
+    //
+    // Dial accounting with `failover_max_attempts=2`:
+    //   - Initial connect: 1 dial (success — serves the query, then drops).
+    //   - Mid-stream failure on the single host triggers
+    //     `reconnect_with_failover`, which runs
+    //     `attempts_total = max_attempts + 1 = 3` outer reconnect attempts.
+    //   - Each outer attempt invokes `walk_via_tracker(allow_reset_pass=true)`:
+    //     pick the host → fail → fall-through reset → re-pick the
+    //     same host → fail. That's 2 dials per outer attempt against
+    //     the single configured endpoint.
+    //   - Reconnect total: 3 × 2 = 6 dials.
+    //   - Grand total: 1 + 6 = 7. `MAX_REPLAY_CYCLES` doesn't extend
+    //     this — reconnect returns Err on exhaustion, the outer cycle
+    //     terminates without writing.
     let srv = MockServer::start(vec![
         // First accept: serve the initial query, then drop mid-stream
         // (so the cursor's first read fails and triggers failover).
@@ -1050,19 +1072,13 @@ fn single_endpoint_failover_exhausts_budget() {
         "unexpected code: {:?}",
         err.code()
     );
-    // Exactly 1 initial connect + (max_attempts + 1) = 3 inner
-    // reconnect attempts = 4 total dials. Tightened from `>= 4` so
-    // a regression that double-counts attempts becomes red — and
-    // for parity with `attempts_exhausted_surfaces_error` which
-    // makes the same assertion. The earlier "M3 retry could add a
-    // 5th" rationale doesn't apply here: every inner attempt fails
-    // at `connect_endpoint` (TCP-level drop), so the outer
-    // `failover_reconnect_and_replay` loop never reaches the
-    // post-reconnect write_message that would arm the M3 cycle.
+    // 1 initial + 3 outer reconnect attempts × 2 dials per attempt
+    // (walk + fall-through reset walk on the single host) = 7.
     assert_eq!(
         srv.accepts(),
-        4,
-        "expected exactly 4 dials against the single endpoint (1 initial + 3 reconnects); got {}",
+        7,
+        "expected exactly 7 dials against the single endpoint \
+         (1 initial + 3 reconnect attempts × 2 dials per attempt); got {}",
         srv.accepts()
     );
 }
@@ -2460,4 +2476,251 @@ fn server_info_target_mismatch_attaches_upgrade_reject() {
     assert_eq!(reject.role_byte, 0x02);
     assert_eq!(reject.role_name, "REPLICA");
     assert!(!reject.is_transient());
+}
+
+// ---------------------------------------------------------------------------
+// HostHealthTracker integration (step 2 of the failover work)
+// ---------------------------------------------------------------------------
+
+/// Failover.md §2 sticky-Healthy: after a successful reconnect lands on
+/// host X, subsequent reconnects MUST prefer X. The pre-tracker
+/// rotation (`(failed_idx + 1 + attempt) % N`) didn't have this
+/// property — it picked by index, not by health history.
+///
+/// Topology: A serves the initial query then drops; B serves the
+/// recovered query then drops; A serves again. Without sticky-Healthy
+/// the second reconnect would go to C (rotation: skip B, skip A,
+/// land on C). With sticky-Healthy and B classified as TransportError
+/// from the previous mid-stream demote, the priority pick is
+/// Healthy(C) vs TransportError(A,B); C should be picked. But there's
+/// a wrinkle: the round attempted bits reset on each reconnect, so
+/// the "stickiness" is preserved only via the HEALTHY state.
+///
+/// Simpler scenario for the test: A drops → reconnect lands on B
+/// (Healthy). Now B is HEALTHY, A is TransportError, C is Unknown.
+/// Mid-stream on B → record_mid_stream_failure(B) demotes B to
+/// TransportError. Next reconnect: every host is TransportError or
+/// Unknown. Priority: Unknown wins over TransportError, so C is
+/// picked. Then A and B are picked only if C fails.
+///
+/// This is more about the **priority lattice** than "sticky-Healthy"
+/// proper (which only meaningfully helps across `begin_round(true)`).
+#[test]
+fn tracker_prefers_unknown_over_transport_error_on_reconnect() {
+    // 3 hosts: A=happy-then-drop, B=connect-fail (so no Unknown→Healthy
+    // for B at initial), C=happy. Tracker should land on A initially,
+    // then on mid-stream failure pick C over B because B is in
+    // TransportError state (from initial walk) while C is Unknown.
+    let srv_a = MockServer::start(vec![drop_after_query_script(
+        ServerRole::Standalone,
+        "a",
+    )]);
+    let srv_b = MockServer::start(vec![drop_at_connect_script()]);
+    let srv_c = MockServer::start(vec![happy_script(ServerRole::Standalone, "c")]);
+    let conf = format!(
+        "qwp::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        // A first so initial walk lands on A (lowest-index Unknown).
+        build_addr_list(&[&srv_a, &srv_b, &srv_c])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
+    assert_eq!(reader.current_addr().port, srv_a.addr.port(), "initial walks to A");
+    // Initial walk dials only A (succeeds first). B and C should not
+    // have been dialled yet.
+    assert_eq!(srv_a.accepts(), 1);
+    assert_eq!(srv_b.accepts(), 0);
+    assert_eq!(srv_c.accepts(), 0);
+
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    assert!(
+        cursor.next_batch().expect("must complete after rotating off A").is_none(),
+        "cursor must complete via reconnect"
+    );
+    drop(cursor);
+
+    // After mid-stream on A: A=TransportError (mid-stream demote),
+    // B=Unknown (never tried), C=Unknown (never tried). pick_next
+    // picks the lowest-index Unknown → B. B fails → record_transport_error(B).
+    // pick_next: C (Unknown). C succeeds → bind to C.
+    assert_eq!(
+        reader.current_addr().port,
+        srv_c.addr.port(),
+        "reconnect must walk past dead B to healthy C (Unknown-state priority)"
+    );
+    // B got one failover dial (Unknown < TransportError on A).
+    // C got one successful dial.
+    assert_eq!(srv_b.accepts(), 1, "B should have been dialled once on reconnect");
+    assert_eq!(srv_c.accepts(), 1, "C should have been dialled once on reconnect");
+}
+
+/// Failover.md §11.9.3 fall-through reset: when the first walk
+/// exhausts because every host has accumulated a non-`Healthy`
+/// classification, the tracker MUST do exactly one
+/// `begin_round(forget=true)` and walk the list again. The retry
+/// gives stale `TopologyReject`/`TransportError` hosts another shot.
+///
+/// Scenario: 2 hosts. First reconnect attempt drives both into
+/// TransportError. Then their server-side scripts flip to healthy.
+/// The fall-through reset gives the next walk a chance to pick them
+/// up — and crucially this happens **within a single
+/// `reconnect_with_failover` outer attempt**, not requiring a second
+/// outer attempt.
+#[test]
+fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
+    // A: happy initial + drops mid-stream + recovers on the 3rd accept.
+    // B: drop_at_connect on accept #1, then recovers.
+    //
+    // With `failover_max_attempts=1` (attempts_total=2), the test
+    // forces the fall-through reset to be the path that recovers.
+    let srv_a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        // 2nd accept: dead, drives A to TransportError on reconnect.
+        drop_at_connect_script(),
+        // 3rd accept: healthy. Picked up after fall-through reset.
+        happy_script(ServerRole::Standalone, "a-recovered"),
+    ]);
+    let srv_b = MockServer::start(vec![
+        // 1st accept (during reconnect): dead.
+        drop_at_connect_script(),
+        // 2nd accept (after fall-through reset): healthy.
+        happy_script(ServerRole::Standalone, "b-recovered"),
+    ]);
+    let conf = format!(
+        "qwp::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    assert!(
+        cursor
+            .next_batch()
+            .expect("fall-through reset rescues the walk")
+            .is_none(),
+        "fall-through reset must let the cursor complete"
+    );
+    drop(cursor);
+
+    // Final endpoint must be either A's recovered slot or B's
+    // recovered slot — whichever was first picked after the reset.
+    // With both hosts Unknown after reset, the lowest-index pick
+    // wins: A.
+    assert_eq!(
+        reader.current_addr().port,
+        srv_a.addr.port(),
+        "after fall-through reset, lowest-index Unknown is A"
+    );
+}
+
+/// Failover.md §11.9.3 fall-through reset budget: only ONE reset
+/// pass per `reconnect_with_failover` outer attempt. After the reset
+/// walks the list and still fails, the outer attempt returns and the
+/// next outer attempt (if budget allows) starts a fresh walk with a
+/// fresh `begin_round(false)`.
+///
+/// This test verifies the upper bound — without the "only one
+/// fall-through reset" invariant, a stale-classification host could
+/// be re-walked indefinitely inside a single outer attempt.
+#[test]
+fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
+    // 1 host, max_attempts=0 (attempts_total=1). Single outer attempt.
+    // Each outer attempt: walk (1 dial) + fall-through reset walk (1
+    // dial) = 2 dials.
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "x"),
+        // Every subsequent accept: TCP drop. Even unlimited resets
+        // wouldn't find a healthy slot.
+        drop_at_connect_script(),
+    ]);
+    let conf = format!(
+        "qwp::addr={};failover_max_attempts=0;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        srv.url()
+    );
+    // `failover_max_attempts=0` is rejected at config parse
+    // (validate() asserts >= 1); use 1 instead and account for that.
+    let conf = conf.replace("failover_max_attempts=0", "failover_max_attempts=1");
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let _ = cursor.next_batch(); // Will fail.
+    drop(cursor);
+    drop(reader);
+
+    // attempts_total=2 outer attempts × 2 dials per attempt = 4
+    // reconnect dials. Plus 1 initial = 5. If the fall-through reset
+    // were not bounded to one pass, this would be unbounded (the
+    // walk would loop forever resetting and re-walking).
+    assert_eq!(
+        srv.accepts(),
+        5,
+        "expected 1 initial + 2 outer reconnect attempts × 2 dials/attempt; got {}",
+        srv.accepts()
+    );
+}
+
+/// Initial connect does NOT use the fall-through reset pass: every
+/// host starts at `Unknown`, so the first walk traverses the full
+/// list and a second reset-pass would be a no-op anyway. This pins
+/// the per-call behaviour split (`allow_reset_pass=false` for initial,
+/// `true` for reconnect) — a regression that flipped it would
+/// double-dial every host on initial connect against a dead cluster.
+#[test]
+fn initial_connect_does_not_run_fall_through_reset() {
+    // 2 dead hosts, no failover (so the cursor never starts).
+    let srv_a = MockServer::start(vec![drop_at_connect_script()]);
+    let srv_b = MockServer::start(vec![drop_at_connect_script()]);
+    let conf = format!(
+        "qwp::addr={};failover=off",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    assert!(
+        Reader::from_conf(&conf).is_err(),
+        "both hosts dead → connect must fail"
+    );
+    // Exactly one dial per host: initial walk visits each Unknown
+    // host once and exits. No reset-then-rewalk.
+    assert_eq!(srv_a.accepts(), 1, "A dialled exactly once during initial walk");
+    assert_eq!(srv_b.accepts(), 1, "B dialled exactly once during initial walk");
+}
+
+/// Failover.md §2.1 invariant: `record_mid_stream_failure` must
+/// demote a Healthy host BEFORE the next `begin_round(true)`.
+/// `reconnect_with_failover` calls `record_mid_stream_failure` first
+/// thing — the test pins that ordering by setting up a scenario where
+/// reversing it would visibly redial the just-failed host first.
+///
+/// Topology: A succeeds initial connect, drops mid-stream. B is
+/// healthy on its first accept. If the demote runs first, the
+/// reconnect's `walk_via_tracker` sees A=TransportError and B=Unknown,
+/// so picks B. If the demote ran AFTER `begin_round(false)`, A would
+/// still be HEALTHY (priority 1) and would be picked first — getting
+/// a redundant dial we'd be able to observe via the accept count.
+#[test]
+fn mid_stream_demote_happens_before_walk_picks_next() {
+    let srv_a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        // 2nd accept: dead. If the demote ordering were wrong and
+        // reconnect picked A first, A would dial here.
+        drop_at_connect_script(),
+    ]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    assert!(cursor.next_batch().expect("must complete").is_none());
+    drop(cursor);
+    assert_eq!(
+        reader.current_addr().port,
+        srv_b.addr.port(),
+        "reconnect must land on B, not A"
+    );
+    // A: 1 dial (initial connect). If demote ran late, A would have
+    // gotten a 2nd dial during reconnect — caught by this assert.
+    assert_eq!(
+        srv_a.accepts(),
+        1,
+        "A must NOT be redialled — demote must run before pick_next"
+    );
+    assert_eq!(srv_b.accepts(), 1, "B picked immediately on reconnect");
 }

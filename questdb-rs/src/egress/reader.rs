@@ -51,6 +51,7 @@ use crate::egress::column::ColumnView;
 use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
+use crate::egress::tracker::HostHealthTracker;
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
 use crate::egress::schema::{Schema, SchemaRegistry};
 use crate::egress::decoder::ZstdScratch;
@@ -142,6 +143,14 @@ pub struct Reader {
     /// `RESULT_BATCH`) and a `Vec<u8>` whose allocation is reused as
     /// successive frames decompress through it.
     zstd_scratch: ZstdScratch,
+    /// Per-client host-health tracker shared across the initial connect
+    /// and every mid-query reconnect. Replaces the old
+    /// `(failed_idx + 1 + attempt) % N` rotation with the
+    /// failover.md §2 priority lattice; see [`HostHealthTracker`].
+    /// Classifications accumulate across Executes; only the
+    /// round-attempted bits reset between walks. Lives on the Reader so
+    /// long-lived clients converge on the healthiest endpoint over time.
+    tracker: HostHealthTracker,
 }
 
 impl Reader {
@@ -166,12 +175,16 @@ impl Reader {
         Self::from_conf(conf)
     }
 
-    /// Walk `cfg.addrs` in order, opening each endpoint and eagerly
-    /// consuming the v2 `SERVER_INFO` frame. Accepts the first endpoint
-    /// whose role matches `cfg.target`. Returns:
+    /// Walk `cfg.addrs` via the per-client [`HostHealthTracker`], opening
+    /// the highest-priority unattempted endpoint and eagerly consuming
+    /// the v2 `SERVER_INFO` frame. Accepts the first endpoint whose role
+    /// matches `cfg.target`. Returns:
     ///
     /// - `RoleMismatch` if every endpoint connected but none advertised
     ///   a matching role (last-seen role surfaced in the message).
+    /// - `AuthError` if at least one endpoint 401/403'd and every other
+    ///   endpoint failed too (per-endpoint accumulation lets the message
+    ///   name every endpoint that rejected credentials).
     /// - `SocketError` if every endpoint failed at the transport layer
     ///   (refused / timed out / TLS error / etc.).
     /// - whatever the last attempt returned otherwise.
@@ -180,6 +193,12 @@ impl Reader {
     /// backoff schedule — it walks every address once and reports back.
     /// Mid-query failover (via [`Cursor::next_batch`]) is what uses
     /// `failover_backoff_*` to space retries.
+    ///
+    /// The tracker is constructed fresh here, so every host starts at
+    /// `Unknown` state and the priority-based pick degenerates to the
+    /// user-supplied `addr=` order. From this Reader onward, the
+    /// tracker accumulates classifications across Executes per the
+    /// failover.md §2 priority lattice.
     pub fn from_config(cfg: &ReaderConfig) -> Result<Self> {
         // Re-run cap and consistency checks. `from_conf` validated at
         // parse time, but `ReaderConfig`'s `pub` fields can be mutated
@@ -193,114 +212,66 @@ impl Reader {
         // reconnect attempt — initial walk, mid-query failover, inner
         // replay cycle — shares the same allocation via `Arc::clone`.
         let cfg = Arc::new(cfg.clone());
-        let mut last_transport_err: Option<Error> = None;
-        let mut last_role_mismatch: Option<Error> = None;
-        // Per-endpoint auth rejections collected across the walk. The
-        // walk treats `AuthError` as soft (heterogeneous-cluster /
-        // partial-credential-rotation scenarios), but a single
-        // misconfigured node serving 401 was previously invisible: the
-        // connection silently succeeded against another endpoint and
-        // the rejection left no trace. Collect them per-endpoint so
-        // that on exhaustion the surfaced error names every endpoint
-        // that rejected auth, and on the success path the count is
-        // available via [`Reader::auth_rejections_during_connect`] for
-        // operators who want to telemeter this.
-        let mut auth_rejections: Vec<(Endpoint, String)> = Vec::new();
-
-        for idx in 0..cfg.addrs.len() {
-            match Self::connect_endpoint(&cfg, idx) {
-                Ok(mut reader) => {
-                    reader.auth_rejections_during_connect = auth_rejections;
-                    return Ok(reader);
-                }
-                Err(e) => match e.code() {
-                    // Keep the most-recent (richest) role-mismatch
-                    // message; keep walking the address list past it
-                    // — another endpoint may match the target.
-                    ErrorCode::RoleMismatch => {
-                        last_role_mismatch = Some(e);
-                    }
-                    // AuthError is *usually* a cluster-wide credentials
-                    // problem, but not always — heterogeneous clusters
-                    // (mixed-version nodes, partial credential rotation)
-                    // can have one endpoint reject auth while another
-                    // accepts. Walk past it but record per-endpoint so
-                    // we can surface every rejection on exhaustion.
-                    ErrorCode::AuthError => {
-                        auth_rejections.push((cfg.addrs[idx].clone(), e.msg().to_string()));
-                    }
-                    // Truly identical-on-every-endpoint failures: bad
-                    // connect-string parse, wholly unsupported server
-                    // build. No point walking — return immediately.
-                    ErrorCode::ConfigError | ErrorCode::UnsupportedServer => {
-                        return Err(e);
-                    }
-                    _ => {
-                        last_transport_err = Some(e);
-                    }
-                },
-            }
-        }
-
-        // Surface the most diagnostic error we saw. Auth-rejected tells
-        // the user *what to fix* (credentials), so it ranks above a
-        // role mismatch (which ranks above a generic transport flop).
-        // Aggregate every auth rejection so the user sees which
-        // endpoints refused them rather than just one.
-        if !auth_rejections.is_empty() {
-            let detail = auth_rejections
-                .iter()
-                .map(|(ep, msg)| format!("  - {ep}: {msg}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(fmt!(
-                AuthError,
-                "all {} endpoint(s) rejected the supplied credentials:\n{}",
-                auth_rejections.len(),
-                detail
-            ));
-        }
-        if let Some(e) = last_role_mismatch {
-            return Err(e);
-        }
-        Err(last_transport_err
-            .unwrap_or_else(|| fmt!(SocketError, "all {} endpoints unreachable", cfg.addrs.len())))
-    }
-
-    /// Open a single endpoint by index. Used by both the initial
-    /// connect walk and mid-query failover. On success, the returned
-    /// reader has consumed the v2 `SERVER_INFO` (when applicable) and
-    /// satisfied the configured `target` role filter. On role
-    /// mismatch, a `RoleMismatch` error carrying the observed role is
-    /// surfaced (so the failover loop can decide to try the next
-    /// endpoint).
-    ///
-    /// `cfg` is taken as `&Arc<ReaderConfig>` so storing it on the
-    /// returned `Reader` is a refcount bump rather than a deep clone
-    /// of the addr list / auth payload.
-    fn connect_endpoint(cfg: &Arc<ReaderConfig>, idx: usize) -> Result<Self> {
-        let transport = WsTransport::connect_to(cfg.as_ref(), idx)?;
-        let mut reader = Reader {
-            cfg: Arc::clone(cfg),
-            addr_idx: idx,
-            transport: Some(transport),
+        // Tracker construction: `client_zone` and `target_primary` are
+        // wired in step 3 of the failover work; for now the tracker
+        // runs zone-blind (every tier collapses to `Same`) and
+        // `target=primary` does not yet collapse zones at the tracker
+        // layer. The `target=` filter itself is still applied by
+        // `connect_endpoint` — what's missing is only the zone-tier
+        // collapse, which is a no-op when no zone is configured.
+        let mut tracker = HostHealthTracker::new(cfg.addrs.len(), None, false);
+        let walk = walk_via_tracker(
+            &mut tracker,
+            &cfg,
+            // Initial connect: no fall-through reset — every host
+            // starts at `Unknown`, so a single pass exhausts the list.
+            // Failover.md §2.2 / spec §11.9.3: the retry-after-reset
+            // pass is only meaningful when classifications have
+            // accumulated, which doesn't happen on a fresh tracker.
+            false,
+            // AuthError is not in the early-abort set: heterogeneous
+            // clusters can have one endpoint reject auth while another
+            // accepts. The walk accumulates auth rejections per-endpoint
+            // and only surfaces them on exhaustion.
+            &[ErrorCode::ConfigError, ErrorCode::UnsupportedServer],
+        )?;
+        Ok(Reader {
+            cfg,
+            addr_idx: walk.session.idx,
+            transport: Some(walk.session.transport),
             dict: SymbolDict::new(),
             registry: SchemaRegistry::new(),
             next_request_id: 1,
             cursor_active: false,
-            server_info: None,
+            server_info: walk.session.server_info,
             bytes_received: AtomicU64::new(0),
             credit_granted_total: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
             decode_ns: AtomicU64::new(0),
-            auth_rejections_during_connect: Vec::new(),
+            auth_rejections_during_connect: walk.auth_rejections,
             zstd_scratch: ZstdScratch::new(),
+            tracker,
+        })
+    }
+
+    /// Open a single endpoint by index. Used by [`walk_via_tracker`] on
+    /// both initial connect and mid-query failover. On success, returns
+    /// a [`TransportSession`] holding the bound socket plus the v2
+    /// `SERVER_INFO` (when applicable); the caller decides whether to
+    /// wrap it in a fresh `Reader` (initial connect) or splice into an
+    /// existing one (reconnect). On role mismatch, a `RoleMismatch`
+    /// error carrying the observed role + zone via `UpgradeReject` is
+    /// surfaced so the tracker can classify identically to a `421`
+    /// upgrade reject.
+    fn connect_endpoint(cfg: &ReaderConfig, idx: usize) -> Result<TransportSession> {
+        let mut transport = WsTransport::connect_to(cfg, idx)?;
+        let server_info = if transport.server_version() >= 2 {
+            Some(read_server_info_frame(&mut transport)?)
+        } else {
+            None
         };
-        if reader.transport_mut()?.server_version() >= 2 {
-            reader.consume_server_info()?;
-        }
         if !matches!(cfg.target, Target::Any) {
-            match reader.server_info.as_ref() {
+            match server_info.as_ref() {
                 None => {
                     // v1 negotiated; per failover.md §5 every host's zone
                     // tier stays `Unknown` and `target=primary|replica`
@@ -318,8 +289,8 @@ impl Reader {
                 Some(info) if !target_matches(cfg.target, info.role) => {
                     // v2 advertised a role that doesn't match `target=`.
                     // Attach `UpgradeReject` carrying the advertised role
-                    // and zone so the future host-health tracker can
-                    // classify identically to a 421+role response — same
+                    // and zone so the host-health tracker classifies
+                    // identically to a `421+role` response — same
                     // semantics, same data payload, regardless of which
                     // surface the rejection arrived on.
                     let role = info.role;
@@ -341,44 +312,40 @@ impl Reader {
                 _ => {}
             }
         }
-        Ok(reader)
+        Ok(TransportSession {
+            idx,
+            transport,
+            server_info,
+        })
     }
 
     /// Reconnect this Reader in place after a mid-query transport
-    /// failure. Tries the address list rotated to skip the failed
-    /// endpoint first (`(failed_idx + 1 + attempt) % N`), with
-    /// exponential backoff between attempts. On success, the old
-    /// transport has been closed, the new transport + `SERVER_INFO`
+    /// failure. Walks the configured endpoint list via the per-client
+    /// [`HostHealthTracker`] (failover.md §2 priority lattice — Healthy
+    /// → Unknown → TransientReject → TransportError → TopologyReject;
+    /// same-zone preferred when zone is configured). On success, the
+    /// old transport has been closed, the new transport + `SERVER_INFO`
     /// are bound, dict / registry are reset to empty, and `addr_idx`
     /// reflects the new endpoint. The caller must re-issue the
     /// `QUERY_REQUEST` with a freshly-allocated `request_id`.
     ///
-    /// The `failed_idx` argument is the address index that just
-    /// failed — typically the value of `self.addr_idx` immediately
-    /// before this call. Pass it explicitly to keep the rotation
-    /// independent of where `self.addr_idx` happens to point.
+    /// The `failed_idx` argument is the address index that just failed
+    /// — `record_mid_stream_failure` demotes it from `Healthy` to
+    /// `TransportError` so the tracker won't reach for it first on the
+    /// next walk.
     fn reconnect_with_failover(&mut self, failed_idx: usize) -> Result<u32> {
-        // Refcount bump (not a deep clone). The local `cfg` lets us
-        // pass `&Arc<ReaderConfig>` to `connect_endpoint` without
-        // borrowing `self.cfg` for the lifetime of the loop, which
-        // would conflict with `self.transport` mutation below.
         let cfg = Arc::clone(&self.cfg);
-        // `cfg.addrs` is non-empty by construction: `from_conf` rejects
-        // an empty list, and the `Arc<ReaderConfig>` is private to the
-        // Reader (the user can't mutate it post-construction even
-        // though `addrs` is `pub` on the struct).
-        let n = cfg.addrs.len();
         let attempts_total = cfg.failover_max_attempts.saturating_add(1);
         let mut backoff_ms = cfg.failover_backoff_initial_ms;
         let mut last_err: Option<Error> = None;
-        // Track role-mismatch separately. RoleMismatch is "soft" for
-        // rotation (we want to keep walking the address list past a
-        // mismatched endpoint), but it carries far more diagnostic
-        // value than a generic transport error — so on budget
-        // exhaustion we prefer to surface a RoleMismatch over a
-        // SocketError, even if the LAST attempt happened to be a
-        // socket error.
-        let mut last_role_mismatch: Option<Error> = None;
+        // Spec invariant (failover.md §2.3): mid-stream demote MUST run
+        // before the next `begin_round(forget=true)` — reversing the
+        // order would let sticky-Healthy preserve the just-failed host
+        // as priority pick. `walk_via_tracker` only calls
+        // `begin_round(true)` on the fall-through reset, never before
+        // the first `pick_next`, but the demote still has to land
+        // before any walk so the first `pick_next` skips the dead host.
+        self.tracker.record_mid_stream_failure(failed_idx);
         // Drop the dead transport entirely **before** sleeping on the
         // backoff. `Drop for WsTransport` already issues a fire-and-
         // forget WS Close, so the explicit `drop(dead)` is what
@@ -389,6 +356,11 @@ impl Reader {
         if let Some(dead) = self.transport.take() {
             drop(dead);
         }
+        // Cumulative dial count across every outer attempt's walk.
+        // `FailoverEvent.attempts` carries this back to the user so
+        // long-running diagnostics see real dial pressure, not just the
+        // cycle index that landed.
+        let mut total_dials: u32 = 0;
         for attempt in 0..attempts_total {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(backoff_ms));
@@ -396,33 +368,38 @@ impl Reader {
                     .saturating_mul(2)
                     .min(cfg.failover_backoff_max_ms);
             }
-            // Rotate "skip the failed one first": try (failed+1), (failed+2),
-            // ... — wrapping past the failed endpoint is fine, the failed
-            // endpoint may have come back up by then.
-            //
-            // Overflow analysis (32-bit usize): `failed_idx < n <= MAX_ADDRS`
-            // (1024); `attempt < attempts_total <= MAX_FAILOVER_MAX_ATTEMPTS + 1`
-            // (1025). Worst-case sum: 1023 + 1 + 1024 = 2048 — well below
-            // `usize::MAX` on every supported target. Both caps are
-            // enforced at config-parse time.
-            let try_idx = (failed_idx + 1 + attempt as usize) % n;
-            match Self::connect_endpoint(&cfg, try_idx) {
-                Ok(new_reader) => {
-                    // Splice the new connection's state into self,
-                    // preserving counters that callers query
+            match walk_via_tracker(
+                &mut self.tracker,
+                &cfg,
+                // Per failover.md §11.9.3, the WalkTracker fall-through
+                // reset pass is for reconnects only — gives stale
+                // `TransientReject` / `TopologyReject` hosts from prior
+                // outages another shot before declaring the walk failed.
+                true,
+                // Spec §6: AuthError is terminal during reconnect
+                // (cluster-wide credentials problem; retrying every
+                // host floods server logs without recovery). Initial
+                // connect accumulates instead — see `from_config`.
+                &[
+                    ErrorCode::ConfigError,
+                    ErrorCode::UnsupportedServer,
+                    ErrorCode::AuthError,
+                ],
+            ) {
+                Ok(walk) => {
+                    total_dials = total_dials.saturating_add(walk.dials);
+                    // Splice the new transport state into self, keeping
+                    // the counters callers query
                     // (`bytes_received`, `credit_granted_total`,
                     // `read_ns`, `decode_ns`, `next_request_id`).
-                    self.transport = new_reader.transport;
-                    self.server_info = new_reader.server_info;
-                    self.dict = new_reader.dict;
-                    self.registry = new_reader.registry;
-                    self.addr_idx = try_idx;
-                    return Ok(attempt + 1);
+                    self.transport = Some(walk.session.transport);
+                    self.server_info = walk.session.server_info;
+                    self.dict = SymbolDict::new();
+                    self.registry = SchemaRegistry::new();
+                    self.addr_idx = walk.session.idx;
+                    return Ok(total_dials);
                 }
                 Err(e) => match e.code() {
-                    ErrorCode::RoleMismatch => {
-                        last_role_mismatch = Some(e);
-                    }
                     code if !is_failover_eligible(code) => {
                         // Hard error (auth, config, unsupported server,
                         // etc.). Don't keep bouncing — these will fail
@@ -435,7 +412,7 @@ impl Reader {
                 },
             }
         }
-        Err(last_role_mismatch.or(last_err).unwrap_or_else(|| {
+        Err(last_err.unwrap_or_else(|| {
             fmt!(
                 SocketError,
                 "failover exhausted after {} attempts",
@@ -523,32 +500,6 @@ impl Reader {
         self.decode_ns.store(0, Ordering::Relaxed);
     }
 
-    /// Read one frame and expect it to be `SERVER_INFO`; store it.
-    fn consume_server_info(&mut self) -> Result<()> {
-        let (header, payload) = self.transport_mut()?.read_frame()?;
-        self.bytes_received.fetch_add(
-            HEADER_LEN as u64 + header.payload_length as u64,
-            Ordering::Relaxed,
-        );
-        let event = decode_frame(
-            header,
-            &payload,
-            &mut self.dict,
-            &mut self.registry,
-            &mut self.zstd_scratch,
-        )?;
-        match event {
-            ServerEvent::ServerInfo(info) => {
-                self.server_info = Some(info);
-                Ok(())
-            }
-            other => Err(fmt!(
-                ProtocolError,
-                "expected SERVER_INFO as first v2 frame, got {:?}",
-                std::mem::discriminant(&other)
-            )),
-        }
-    }
 
     /// `SERVER_INFO` (`0x18`) captured at connect time, when negotiated
     /// version >= 2. `None` for v1 servers.
@@ -1804,6 +1755,183 @@ fn target_matches(target: Target, role: ServerRole) -> bool {
             ServerRole::Primary | ServerRole::PrimaryCatchup | ServerRole::Standalone
         ),
         Target::Replica => matches!(role, ServerRole::Replica),
+    }
+}
+
+/// Bound socket + decoded `SERVER_INFO` for one endpoint. Internal
+/// intermediate produced by [`Reader::connect_endpoint`] and consumed
+/// by [`walk_via_tracker`] / [`Reader::from_config`] /
+/// [`Reader::reconnect_with_failover`].
+struct TransportSession {
+    idx: usize,
+    transport: WsTransport,
+    server_info: Option<ServerInfo>,
+}
+
+/// Result of a successful tracker walk.
+struct WalkOutcome {
+    session: TransportSession,
+    /// Per-endpoint auth rejections accumulated by the walk (empty
+    /// when the first picked endpoint succeeded or the walk was
+    /// configured to abort on auth).
+    auth_rejections: Vec<(Endpoint, String)>,
+    /// Number of `connect_endpoint` calls the walk made before
+    /// landing on a successful endpoint. Includes failed picks before
+    /// the success. The `FailoverEvent.attempts` field carries this
+    /// value back to the user (cumulative across outer reconnect
+    /// cycles).
+    dials: u32,
+}
+
+/// Walk the tracker until either an endpoint accepts or the round is
+/// exhausted. Shared between [`Reader::from_config`] (initial connect)
+/// and [`Reader::reconnect_with_failover`] (mid-query failover).
+///
+/// `allow_reset_pass`: when `true`, on exhaustion call
+/// `tracker.begin_round(forget=true)` once and walk the list one more
+/// time (failover.md §11.9.3). Initial connect passes `false` (the
+/// tracker is fresh — every host already starts at `Unknown` and a
+/// second pass would be a no-op anyway).
+///
+/// `terminal_codes`: error codes that abort the walk immediately
+/// rather than being recorded into the tracker. `ConfigError` and
+/// `UnsupportedServer` are always terminal (cluster-wide build /
+/// config mismatch). The reconnect path also passes `AuthError`
+/// (cluster-wide credentials problem per spec §6); the initial-connect
+/// path omits it so heterogeneous-cluster scenarios where one node
+/// rejects while another accepts still succeed.
+fn walk_via_tracker(
+    tracker: &mut HostHealthTracker,
+    cfg: &Arc<ReaderConfig>,
+    allow_reset_pass: bool,
+    terminal_codes: &[ErrorCode],
+) -> Result<WalkOutcome> {
+    // Reset the within-round attempted bits. Topology classifications
+    // accumulated by prior Executes are preserved (the within-outage
+    // reset per failover.md §11.9.2). The fall-through pass below is
+    // what re-evaluates stale classifications.
+    tracker.begin_round(false);
+    let mut last_role_mismatch: Option<Error> = None;
+    let mut last_transport_err: Option<Error> = None;
+    let mut auth_rejections: Vec<(Endpoint, String)> = Vec::new();
+    let mut retried_after_reset = false;
+    let mut dials: u32 = 0;
+    loop {
+        let idx = match tracker.pick_next() {
+            Some(i) => i,
+            None => {
+                if allow_reset_pass && !retried_after_reset {
+                    // Failover.md §11.9.3 fall-through reset: give
+                    // stale `TransientReject` / `TopologyReject` hosts
+                    // from prior outages another shot before declaring
+                    // the entire walk failed. Only one reset, then fail.
+                    tracker.begin_round(true);
+                    retried_after_reset = true;
+                    continue;
+                }
+                break;
+            }
+        };
+        dials = dials.saturating_add(1);
+        match Reader::connect_endpoint(cfg.as_ref(), idx) {
+            Ok(session) => {
+                // Update zone tier from `SERVER_INFO.zone_id` when the
+                // server advertised one (gated by `CAP_ZONE`). `record_zone`
+                // with `None`/empty is a no-op, so passing the field
+                // unconditionally is safe even on v1 or CAP_ZONE=0.
+                if let Some(info) = session.server_info.as_ref() {
+                    tracker.record_zone(idx, info.zone_id.as_deref());
+                }
+                tracker.record_success(idx);
+                return Ok(WalkOutcome {
+                    session,
+                    auth_rejections,
+                    dials,
+                });
+            }
+            Err(e) => {
+                let code = e.code();
+                if terminal_codes.contains(&code) {
+                    // Hard error (config, unsupported server, optionally
+                    // auth). Bail out before recording into the tracker;
+                    // there's no point preserving classifications when
+                    // the walk is about to fail outright.
+                    return Err(e);
+                }
+                match code {
+                    ErrorCode::AuthError => {
+                        // Accumulated, walked past. The host gets
+                        // recorded as `TransportError` so the next
+                        // pick_next skips it within this round.
+                        tracker.record_transport_error(idx);
+                        auth_rejections.push((cfg.addrs[idx].clone(), e.msg().to_string()));
+                    }
+                    ErrorCode::RoleMismatch => {
+                        // Pull the role/zone bytes out of `UpgradeReject`
+                        // (set by both the SERVER_INFO target-mismatch path
+                        // and the `421 + X-QuestDB-Role` upgrade-reject path
+                        // in transport.rs). v1-pinned mismatches have no
+                        // `UpgradeReject`; default to topological.
+                        let reject = e.upgrade_reject();
+                        let transient = reject.is_some_and(|r| r.is_transient());
+                        if let Some(r) = reject {
+                            tracker.record_zone(idx, r.zone.as_deref());
+                        }
+                        tracker.record_role_reject(idx, transient);
+                        last_role_mismatch = Some(e);
+                    }
+                    _ => {
+                        tracker.record_transport_error(idx);
+                        last_transport_err = Some(e);
+                    }
+                }
+            }
+        }
+    }
+    // Walk exhausted (and reset pass, if any, exhausted too). Pick the
+    // most diagnostic error. Auth-rejected tells the user *what to fix*
+    // (credentials), so it ranks above a role mismatch (which ranks
+    // above a generic transport flop). Mirrors the priority chain in
+    // the Java reference.
+    if !auth_rejections.is_empty() {
+        let detail = auth_rejections
+            .iter()
+            .map(|(ep, msg)| format!("  - {ep}: {msg}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(fmt!(
+            AuthError,
+            "all {} endpoint(s) rejected the supplied credentials:\n{}",
+            auth_rejections.len(),
+            detail
+        ));
+    }
+    if let Some(e) = last_role_mismatch {
+        return Err(e);
+    }
+    Err(last_transport_err
+        .unwrap_or_else(|| fmt!(SocketError, "all {} endpoints unreachable", cfg.addrs.len())))
+}
+
+/// Read one frame off a fresh transport and expect `SERVER_INFO`.
+/// Called once per successful upgrade on a v2+ connection. Uses
+/// throwaway dict / registry / zstd scratch since `SERVER_INFO` itself
+/// never carries symbols, schemas, or compressed payload — those state
+/// machines only kick in once the Reader is assembled and starts
+/// pulling `RESULT_BATCH` frames.
+fn read_server_info_frame(transport: &mut WsTransport) -> Result<ServerInfo> {
+    let (header, payload) = transport.read_frame()?;
+    let mut dict = SymbolDict::new();
+    let mut registry = SchemaRegistry::new();
+    let mut zstd_scratch = ZstdScratch::new();
+    let event = decode_frame(header, &payload, &mut dict, &mut registry, &mut zstd_scratch)?;
+    match event {
+        ServerEvent::ServerInfo(info) => Ok(info),
+        other => Err(fmt!(
+            ProtocolError,
+            "expected SERVER_INFO as first v2 frame, got {:?}",
+            std::mem::discriminant(&other)
+        )),
     }
 }
 
