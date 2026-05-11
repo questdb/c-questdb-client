@@ -638,8 +638,8 @@ impl DeadEndpoint {
                         // `socket2::SockRef` because `TcpStream`'s
                         // own `set_linger` only landed recently and
                         // the rest of the file is on the older API.
-                        let _ = socket2::SockRef::from(&sock)
-                            .set_linger(Some(Duration::from_secs(0)));
+                        let _ =
+                            socket2::SockRef::from(&sock).set_linger(Some(Duration::from_secs(0)));
                         drop(sock);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

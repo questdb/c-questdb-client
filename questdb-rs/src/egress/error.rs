@@ -312,8 +312,7 @@ mod tests {
             node_id: "n-2".into(),
             zone_id: Some("eu-west-1a".into()),
         };
-        let err = Error::new(ErrorCode::RoleMismatch, "no match")
-            .with_server_info(info.clone());
+        let err = Error::new(ErrorCode::RoleMismatch, "no match").with_server_info(info.clone());
         assert_eq!(err.server_info(), Some(&info));
         assert!(err.upgrade_reject().is_none());
     }

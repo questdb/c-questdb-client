@@ -458,7 +458,10 @@ fn qwps_handshake_fails_against_unknown_ca_with_webpki_and_os_roots() {
 #[test]
 fn qwps_unsafe_off_skips_verification_against_untrusted_cert() {
     let srv = TlsMockServer::start();
-    let conf = format!("qwps::addr={};tls_verify=unsafe_off;failover=off", srv.url());
+    let conf = format!(
+        "qwps::addr={};tls_verify=unsafe_off;failover=off",
+        srv.url()
+    );
     let mut reader = Reader::from_conf(&conf).expect(
         "tls_verify=unsafe_off must accept any cert; if this errored, the \
          NoCertificateVerification verifier was not wired in",
@@ -469,10 +472,7 @@ fn qwps_unsafe_off_skips_verification_against_untrusted_cert() {
             .execute()
             .expect("execute over unsafe_off TLS");
         let batch = cursor.next_batch().expect("next_batch over unsafe_off TLS");
-        assert!(
-            batch.is_none(),
-            "RESULT_END terminal returns no batch view"
-        );
+        assert!(batch.is_none(), "RESULT_END terminal returns no batch view");
         assert!(cursor.terminal().is_some());
     }
     drop(reader);

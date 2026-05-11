@@ -293,8 +293,7 @@ impl Reader {
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let mut annotated =
-                Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
+            let mut annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
             if let Some(r) = e.upgrade_reject() {
                 annotated = annotated.with_upgrade_reject(r.clone());
             }
@@ -1111,7 +1110,10 @@ impl<'r> Cursor<'r> {
     /// callers holding the cursor's mutable borrow on the reader can
     /// still observe the connection-level CREDIT-bytes counter.
     pub fn credit_granted_total(&self) -> u64 {
-        self.reader.stats.credit_granted_total.load(Ordering::Relaxed)
+        self.reader
+            .stats
+            .credit_granted_total
+            .load(Ordering::Relaxed)
     }
 
     /// Advance the cursor by one batch. Returns `Ok(None)` when the stream

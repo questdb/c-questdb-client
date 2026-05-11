@@ -1736,9 +1736,7 @@ mod tests {
             &mut reg,
             &mut ZstdScratch::new(),
         )
-        .expect_err(
-            "decoder must reject FLAG_ZSTD when built without compression-zstd",
-        );
+        .expect_err("decoder must reject FLAG_ZSTD when built without compression-zstd");
         assert_eq!(err.code(), ErrorCode::UnsupportedServer);
         // Pin the diagnostic so a future error-message refactor can't
         // drop the feature-name hint that an operator needs to act on.
@@ -3367,7 +3365,11 @@ mod tests {
             kind
         );
         for (i, (g, e)) in got.iter().zip(timestamps.iter()).enumerate() {
-            assert_eq!(g, e, "{:?} row {} mismatch (got {}, expected {})", kind, i, g, e);
+            assert_eq!(
+                g, e,
+                "{:?} row {} mismatch (got {}, expected {})",
+                kind, i, g, e
+            );
         }
     }
 

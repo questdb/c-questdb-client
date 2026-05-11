@@ -98,9 +98,7 @@ fn live_basic_auth_handshake_and_query() {
     // means a single auth attempt; any error surfaces directly from
     // that endpoint instead of being wrapped in a multi-endpoint
     // aggregation. Useful when the operator is debugging credentials.
-    let conf = format!(
-        "qwp::addr={addr};username={user};password={pass};failover=off"
-    );
+    let conf = format!("qwp::addr={addr};username={user};password={pass};failover=off");
     eprintln!("live auth smoke: connecting to {addr} as {user:?}");
 
     let mut reader = match Reader::from_conf(&conf) {
@@ -123,10 +121,7 @@ fn live_basic_auth_handshake_and_query() {
     // an auth bug that lets the handshake through but corrupts a
     // later frame would otherwise slip past.
     let mut batches = 0usize;
-    while let Some(_view) = cursor
-        .next_batch()
-        .expect("next_batch under basic auth")
-    {
+    while let Some(_view) = cursor.next_batch().expect("next_batch under basic auth") {
         batches += 1;
         if batches > 16 {
             panic!("`select 1` produced too many batches; broker likely misconfigured");
@@ -155,9 +150,7 @@ fn live_basic_auth_rejects_wrong_password() {
     }
     let addr = env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let bad_pass = "definitely-not-the-real-password-xyzzy-9c1f";
-    let conf = format!(
-        "qwp::addr={addr};username={user};password={bad_pass};failover=off"
-    );
+    let conf = format!("qwp::addr={addr};username={user};password={bad_pass};failover=off");
     match Reader::from_conf(&conf) {
         Ok(_) => panic!(
             "live broker at {addr} accepted clearly-wrong password for user {user:?}; \
@@ -172,10 +165,7 @@ fn live_basic_auth_rejects_wrong_password() {
             // transport/handshake family disproves "silently accepted."
             use questdb::egress::ErrorCode;
             assert!(
-                matches!(
-                    e.code(),
-                    ErrorCode::AuthError | ErrorCode::HandshakeError
-                ),
+                matches!(e.code(), ErrorCode::AuthError | ErrorCode::HandshakeError),
                 "wrong-password rejection should surface as AuthError or HandshakeError; \
                  got {:?}: {}",
                 e.code(),

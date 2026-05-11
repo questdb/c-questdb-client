@@ -67,10 +67,10 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use questdb::egress::ColumnKind;
 use questdb::egress::_bench_internals::{
     Bytes, SchemaRegistry, SymbolDict, ZstdScratch, decode_result_batch,
 };
+use questdb::egress::ColumnKind;
 
 // ---------------------------------------------------------------------------
 // Wire-format helpers. Replicate the minimum of what the decoder's tests
@@ -286,9 +286,7 @@ fn build_workload(row_count: usize) -> Bytes {
         ColSpec {
             name: "duration_us",
             kind: ColumnKind::Long,
-            body: fixed_le_bytes(row_count, |i| {
-                ((i as i64).wrapping_mul(17)).to_le_bytes()
-            }),
+            body: fixed_le_bytes(row_count, |i| ((i as i64).wrapping_mul(17)).to_le_bytes()),
         },
         ColSpec {
             name: "duration_s",
@@ -391,14 +389,9 @@ fn bench_decoder(c: &mut Criterion) {
                 let mut dict = SymbolDict::new();
                 let mut reg = SchemaRegistry::new();
                 let mut scratch = ZstdScratch::new();
-                let batch = decode_result_batch(
-                    black_box(&payload),
-                    0,
-                    &mut dict,
-                    &mut reg,
-                    &mut scratch,
-                )
-                .expect("decode");
+                let batch =
+                    decode_result_batch(black_box(&payload), 0, &mut dict, &mut reg, &mut scratch)
+                        .expect("decode");
                 black_box(batch);
             });
         },
