@@ -170,6 +170,21 @@ impl WsTransport {
                 ));
             }
         };
+        // Bound the WS upgrade-response read with `auth_timeout_ms` per
+        // failover.md §1.1. This catches the "TCP accepts but server
+        // never replies" blackhole that the OS connect timeout misses —
+        // a stuck peer would otherwise hang the calling thread for the
+        // process default (often minutes). The timeout applies to
+        // tungstenite's read of the 101-Switching-Protocols response;
+        // it is cleared post-upgrade so subsequent batch reads run
+        // without artificial deadlines.
+        //
+        // Failures here are swallowed (best-effort): if the platform's
+        // socket layer rejects the timeout (vanishingly rare on the
+        // supported targets), the upgrade still proceeds with the OS
+        // default. Surfacing the SetTimeout error as a connect failure
+        // would be more obstructive than helpful.
+        let _ = tcp.set_read_timeout(Some(Duration::from_millis(config.auth_timeout_ms)));
         let connector = build_client_config(config)?.map(Connector::Rustls);
         // Pin tungstenite's per-message size ceiling explicitly. Without
         // this we inherit the library default (currently 64 MiB but
@@ -212,6 +227,13 @@ impl WsTransport {
         // backoff schedule, and making `Cursor::cancel()` look like
         // it's hung on a network blip. See `WRITE_TIMEOUT`.
         set_tcp_write_timeout(transport.socket.get_mut(), Some(WRITE_TIMEOUT));
+        // Clear the per-upgrade read deadline now that the handshake
+        // is done. The post-upgrade read path is driven by `Cursor`
+        // and `Cursor::cancel()` toggles its own timeout via
+        // `set_read_timeout`; leaving the `auth_timeout_ms` value in
+        // place would mean every batch-read would silently fault after
+        // that interval of server silence (legitimate on slow queries).
+        set_tcp_read_timeout(transport.socket.get_mut(), None);
         if server_version > config.max_version {
             // Drop runs the graceful Close (set_tcp_write_timeout above
             // ensures we don't block forever on a misbehaving peer).

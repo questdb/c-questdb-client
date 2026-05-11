@@ -212,14 +212,17 @@ impl Reader {
         // reconnect attempt — initial walk, mid-query failover, inner
         // replay cycle — shares the same allocation via `Arc::clone`.
         let cfg = Arc::new(cfg.clone());
-        // Tracker construction: `client_zone` and `target_primary` are
-        // wired in step 3 of the failover work; for now the tracker
-        // runs zone-blind (every tier collapses to `Same`) and
-        // `target=primary` does not yet collapse zones at the tracker
-        // layer. The `target=` filter itself is still applied by
-        // `connect_endpoint` — what's missing is only the zone-tier
-        // collapse, which is a no-op when no zone is configured.
-        let mut tracker = HostHealthTracker::new(cfg.addrs.len(), None, false);
+        // Wire the `zone=` knob and the `target=primary` flag into the
+        // tracker. Per failover.md §2, `target=primary` collapses every
+        // host's zone tier to `Same` regardless of `zone=` — writers
+        // must be followed across zones — so we pass the bool through.
+        // Comparison against `SERVER_INFO.zone_id` / `X-QuestDB-Zone`
+        // is case-insensitive and lives inside `HostHealthTracker`.
+        let mut tracker = HostHealthTracker::new(
+            cfg.addrs.len(),
+            cfg.zone.as_deref(),
+            matches!(cfg.target, Target::Primary),
+        );
         let walk = walk_via_tracker(
             &mut tracker,
             &cfg,

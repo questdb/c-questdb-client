@@ -191,6 +191,27 @@ pub const MAX_ADDRS: usize = 1024;
 /// circuit breaking, not transport-level retry.
 pub const MAX_FAILOVER_BACKOFF_MAX_MS: u64 = 60 * 60 * 1_000;
 
+/// Default per-host upper bound on the **HTTP upgrade response read**
+/// during connect, in milliseconds. Failover.md §1.1 default. Catches
+/// the "TCP accepts but the server never replies" blackhole that the
+/// OS connect timeout misses. Does NOT cover TCP connect or TLS
+/// handshake (those use the OS default).
+pub const DEFAULT_AUTH_TIMEOUT_MS: u64 = 15_000;
+
+/// Hard upper bound on `auth_timeout_ms`. One hour is far past any
+/// realistic upgrade-response wait; beyond it the user is using the
+/// knob for something other than its documented purpose.
+pub const MAX_AUTH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
+/// Default wall-clock budget per `Execute()`-driven failover round,
+/// in milliseconds. Failover.md §11.9.1 / §7. `0` means unbounded.
+pub const DEFAULT_FAILOVER_MAX_DURATION_MS: u64 = 30_000;
+
+/// Hard upper bound on `failover_max_duration_ms`. Same hour cap as
+/// `failover_backoff_max_ms` — beyond it the user wants application
+/// circuit breaking, not transport retry.
+pub const MAX_FAILOVER_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
+
 /// TLS verification policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -249,6 +270,30 @@ pub struct ReaderConfig {
     /// Maximum (capped) backoff between failover attempts, in milliseconds.
     /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_backoff_max_ms: u64,
+    /// Wall-clock budget per `Execute()` once failover has been triggered,
+    /// in milliseconds. `0` means unbounded. Bounds failover eligibility,
+    /// not total Execute wall-clock — a single `WalkTracker` round can run
+    /// up to `host_count × auth_timeout_ms` after the deadline check
+    /// passes. Failover.md §11.9.1 / §7.
+    ///
+    /// Ignored when [`failover`](Self::failover) is `false`.
+    pub failover_max_duration_ms: u64,
+    /// Per-host upper bound on the WS upgrade-response read, in
+    /// milliseconds. Bounds the "TCP accepts but server never replies"
+    /// blackhole that the OS connect timeout misses. Does NOT cover TCP
+    /// connect, TLS handshake, or the post-upgrade `SERVER_INFO` frame
+    /// read (those use the OS default / hardcoded defaults). Failover.md
+    /// §1.1.
+    pub auth_timeout_ms: u64,
+    /// Client's zone identifier — opaque case-insensitive string (e.g.
+    /// `eu-west-1a`, `dc-amsterdam`). When set, the host-health tracker
+    /// prefers endpoints whose server-advertised `zone_id` matches
+    /// (`SERVER_INFO.zone_id` gated on `CAP_ZONE`, or `X-QuestDB-Zone`
+    /// header on a `421` reject). `None` collapses every host's zone tier
+    /// to `Same` (zone-blind selection). `target=primary` likewise
+    /// collapses tiers to `Same` regardless of this value — writers
+    /// follow the master across zones. Failover.md §1.1 / §2.
+    pub zone: Option<String>,
     pub auth: AuthMode,
     pub tls_verify: TlsVerify,
     pub tls_ca: CertificateAuthority,
@@ -381,6 +426,9 @@ impl ReaderConfig {
         let mut failover_max_attempts: u32 = DEFAULT_FAILOVER_MAX_ATTEMPTS;
         let mut failover_backoff_initial_ms: u64 = DEFAULT_FAILOVER_BACKOFF_INITIAL_MS;
         let mut failover_backoff_max_ms: u64 = DEFAULT_FAILOVER_BACKOFF_MAX_MS;
+        let mut failover_max_duration_ms: u64 = DEFAULT_FAILOVER_MAX_DURATION_MS;
+        let mut auth_timeout_ms: u64 = DEFAULT_AUTH_TIMEOUT_MS;
+        let mut zone: Option<String> = None;
         let mut tls_verify = TlsVerify::On;
         let mut tls_ca = default_tls_ca();
         let mut tls_ca_explicit = false;
@@ -506,6 +554,27 @@ impl ReaderConfig {
                 "failover_backoff_max_ms" => {
                     failover_backoff_max_ms = parse_value("failover_backoff_max_ms", val)?;
                 }
+                "failover_max_duration_ms" => {
+                    failover_max_duration_ms = parse_value("failover_max_duration_ms", val)?;
+                }
+                "auth_timeout_ms" => {
+                    auth_timeout_ms = parse_value("auth_timeout_ms", val)?;
+                }
+                "zone" => {
+                    // Empty / whitespace-only is treated as unset
+                    // (zone-blind). Reject CR/LF — these are headers /
+                    // log values and embedding control bytes risks
+                    // injection downstream.
+                    if val.contains('\n') || val.contains('\r') {
+                        return Err(fmt!(ConfigError, "\"zone\" must not contain CR or LF"));
+                    }
+                    let trimmed = val.trim();
+                    zone = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
 
                 other => {
                     return Err(fmt!(ConfigError, "Unknown config key \"{}\"", other));
@@ -583,6 +652,9 @@ impl ReaderConfig {
             failover_max_attempts,
             failover_backoff_initial_ms,
             failover_backoff_max_ms,
+            failover_max_duration_ms,
+            auth_timeout_ms,
+            zone,
             auth,
             tls_verify,
             tls_ca,
@@ -656,6 +728,33 @@ impl ReaderConfig {
                 "\"failover_backoff_max_ms\" {} exceeds the hard cap of {} (1 hour)",
                 self.failover_backoff_max_ms,
                 MAX_FAILOVER_BACKOFF_MAX_MS
+            ));
+        }
+        // `failover_max_duration_ms = 0` is the documented "unbounded"
+        // sentinel — don't reject it. Cap the upper bound the same way
+        // we cap `failover_backoff_max_ms` so a misconfigured value can't
+        // pin a thread waiting on failover for days.
+        if self.failover_max_duration_ms > MAX_FAILOVER_MAX_DURATION_MS {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_max_duration_ms\" {} exceeds the hard cap of {} (1 hour)",
+                self.failover_max_duration_ms,
+                MAX_FAILOVER_MAX_DURATION_MS
+            ));
+        }
+        if self.auth_timeout_ms == 0 {
+            return Err(fmt!(
+                ConfigError,
+                "\"auth_timeout_ms\" must be > 0 (no sentinel for \"unbounded\" — \
+                 set a value high enough for your slowest peer's upgrade response)"
+            ));
+        }
+        if self.auth_timeout_ms > MAX_AUTH_TIMEOUT_MS {
+            return Err(fmt!(
+                ConfigError,
+                "\"auth_timeout_ms\" {} exceeds the hard cap of {} (1 hour)",
+                self.auth_timeout_ms,
+                MAX_AUTH_TIMEOUT_MS
             ));
         }
         Ok(())
@@ -1126,6 +1225,118 @@ mod tests {
         );
         let c = ReaderConfig::from_conf(&conf).unwrap();
         assert_eq!(c.failover_backoff_max_ms, MAX_FAILOVER_BACKOFF_MAX_MS);
+    }
+
+    // --- zone / auth_timeout_ms / failover_max_duration_ms (failover.md §1.1, §11.9.1) ---
+
+    #[test]
+    fn zone_unset_is_none_by_default() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        assert_eq!(c.zone, None);
+    }
+
+    #[test]
+    fn zone_parses() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=eu-west-1a").unwrap();
+        assert_eq!(c.zone.as_deref(), Some("eu-west-1a"));
+    }
+
+    #[test]
+    fn zone_empty_or_whitespace_normalises_to_none() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=").unwrap();
+        assert_eq!(c.zone, None, "empty value collapses to unset");
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=   ").unwrap();
+        assert_eq!(c.zone, None, "whitespace-only collapses to unset");
+    }
+
+    #[test]
+    fn zone_trims_value() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=  eu-west-1a  ").unwrap();
+        assert_eq!(c.zone.as_deref(), Some("eu-west-1a"));
+    }
+
+    #[test]
+    fn zone_rejects_cr_lf() {
+        // CRLF in a zone value would smuggle into log lines and any
+        // header that re-serialises it. Reject up front.
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;zone=eu\nwest").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;zone=eu\rwest").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn auth_timeout_defaults_to_15s() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        assert_eq!(c.auth_timeout_ms, DEFAULT_AUTH_TIMEOUT_MS);
+        assert_eq!(DEFAULT_AUTH_TIMEOUT_MS, 15_000);
+    }
+
+    #[test]
+    fn auth_timeout_parses() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;auth_timeout_ms=3000").unwrap();
+        assert_eq!(c.auth_timeout_ms, 3_000);
+    }
+
+    #[test]
+    fn auth_timeout_zero_rejected() {
+        // No "unbounded" sentinel — 0 is misconfiguration. Pinning a
+        // thread waiting on a single peer indefinitely is what we're
+        // trying to *avoid* with this knob.
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;auth_timeout_ms=0").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("auth_timeout_ms"), "msg: {}", err.msg());
+    }
+
+    #[test]
+    fn auth_timeout_above_cap_rejected() {
+        let conf = format!(
+            "qwp::addr=h:1;auth_timeout_ms={}",
+            MAX_AUTH_TIMEOUT_MS + 1
+        );
+        let err = ReaderConfig::from_conf(&conf).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("exceeds the hard cap"));
+    }
+
+    #[test]
+    fn auth_timeout_at_cap_accepted() {
+        let conf = format!("qwp::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS);
+        let c = ReaderConfig::from_conf(&conf).unwrap();
+        assert_eq!(c.auth_timeout_ms, MAX_AUTH_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn failover_max_duration_defaults_to_30s() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        assert_eq!(c.failover_max_duration_ms, DEFAULT_FAILOVER_MAX_DURATION_MS);
+        assert_eq!(DEFAULT_FAILOVER_MAX_DURATION_MS, 30_000);
+    }
+
+    #[test]
+    fn failover_max_duration_parses() {
+        let c =
+            ReaderConfig::from_conf("qwp::addr=h:1;failover_max_duration_ms=60000").unwrap();
+        assert_eq!(c.failover_max_duration_ms, 60_000);
+    }
+
+    #[test]
+    fn failover_max_duration_zero_is_unbounded() {
+        // `0` is the documented sentinel for "no wall-clock cap" per
+        // wire-egress.md §11.9.1. Must not be rejected.
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_duration_ms=0").unwrap();
+        assert_eq!(c.failover_max_duration_ms, 0);
+    }
+
+    #[test]
+    fn failover_max_duration_above_cap_rejected() {
+        let conf = format!(
+            "qwp::addr=h:1;failover_max_duration_ms={}",
+            MAX_FAILOVER_MAX_DURATION_MS + 1
+        );
+        let err = ReaderConfig::from_conf(&conf).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("exceeds the hard cap"));
     }
 
     #[test]

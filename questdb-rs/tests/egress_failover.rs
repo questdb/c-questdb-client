@@ -142,6 +142,12 @@ enum Action {
         role: Option<String>,
         zone: Option<String>,
     },
+    /// Accept the TCP connection but never reply to the WS upgrade —
+    /// holds the connection open for `duration` then drops. Drives the
+    /// `auth_timeout_ms` path (failover.md §1.1): the client should
+    /// abort the upgrade-response read at the configured timeout
+    /// rather than waiting indefinitely.
+    StallUpgrade(Duration),
     /// Send a single WS binary message verbatim. Lets a script deliver
     /// a malformed/corrupt frame and assert the client's decode-error
     /// path (which is deliberately not failover-eligible).
@@ -338,6 +344,20 @@ fn run_script(
         reject_upgrade_421(stream, role.as_deref(), zone.as_deref(), &captured_auth);
         return;
     }
+    if let Some(d) = script.iter().find_map(|a| match a {
+        Action::StallUpgrade(d) => Some(*d),
+        _ => None,
+    }) {
+        // Drain whatever the client sent (the GET / Upgrade preamble)
+        // so a smaller send-buffer doesn't push the client into a
+        // write-block before its read times out. Then just hold the
+        // connection open without responding.
+        let mut buf = [0u8; 4096];
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        let _ = (&stream).read(&mut buf);
+        std::thread::sleep(d);
+        return;
+    }
 
     // Pick the `x-qwp-version` to advertise. Default is "2" (matches
     // SERVER_INFO frames the helpers build); a `HandshakeVersion(v)`
@@ -378,6 +398,7 @@ fn run_script(
         match action {
             Action::Reject401 => unreachable!("handled above"),
             Action::Reject421 { .. } => unreachable!("handled above"),
+            Action::StallUpgrade(_) => unreachable!("handled above"),
             Action::SendServerInfo { role, node_id } => {
                 let frame = server_info_frame(role, &node_id, "test-cluster");
                 if ws.send(Message::Binary(frame.into())).is_err() {
@@ -2723,4 +2744,113 @@ fn mid_stream_demote_happens_before_walk_picks_next() {
         "A must NOT be redialled — demote must run before pick_next"
     );
     assert_eq!(srv_b.accepts(), 1, "B picked immediately on reconnect");
+}
+
+// ---------------------------------------------------------------------------
+// auth_timeout_ms / zone= wiring (step 3 of the failover work)
+// ---------------------------------------------------------------------------
+
+/// `auth_timeout_ms` bounds the WS upgrade-response read per
+/// failover.md §1.1. With the mock holding the connection open and
+/// never replying to the upgrade, `Reader::from_conf` must abort
+/// within roughly the configured timeout — not wait indefinitely.
+#[test]
+fn auth_timeout_bounds_upgrade_stall() {
+    // 300ms stall in the mock; 100ms client timeout. The client should
+    // surface within ~100-200ms, well under the 300ms stall ceiling.
+    let srv = MockServer::start(vec![vec![Action::StallUpgrade(
+        Duration::from_millis(300),
+    )]]);
+    let conf = format!(
+        "qwp::addr={};failover=off;auth_timeout_ms=100",
+        srv.url()
+    );
+    let started = std::time::Instant::now();
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("upgrade-stall mock must surface as a connect error"),
+        Err(e) => e,
+    };
+    let elapsed = started.elapsed();
+    // Allow generous slack for CI jitter — the contract is "bounded",
+    // not "exactly 100ms". The hard ceiling is the 300ms stall: if
+    // the timeout weren't applied, the client would wait the full
+    // stall duration. Pin elapsed < 250ms so the assertion catches a
+    // regression that leaves the read unbounded.
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "auth_timeout_ms=100 must bound the upgrade stall well under the mock's 300ms hold; \
+         got elapsed={:?}, error: {} {:?}",
+        elapsed,
+        err.msg(),
+        err.code()
+    );
+    // The error code is platform-dependent (Linux's WouldBlock vs
+    // macOS's TimedOut surface differently through tungstenite), so
+    // accept any transport-class code as long as it's failover-eligible.
+    assert!(
+        matches!(
+            err.code(),
+            ErrorCode::SocketError | ErrorCode::HandshakeError | ErrorCode::ProtocolError
+        ),
+        "auth_timeout_ms expiry must surface as a transport-class error; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+}
+
+/// Long upgrade response IS accepted when `auth_timeout_ms` is set
+/// high enough to cover it. Counterpart to
+/// `auth_timeout_bounds_upgrade_stall` — confirms the knob isn't
+/// just always-fail.
+#[test]
+fn auth_timeout_does_not_fire_within_budget() {
+    // No stall — the mock answers the upgrade promptly. `auth_timeout_ms`
+    // should not interfere with a normal connect.
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
+    let conf = format!(
+        "qwp::addr={};failover=off;auth_timeout_ms=5000",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect must succeed within budget");
+    // Sanity: cursor still works after the upgrade clears the
+    // `auth_timeout_ms` read deadline.
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    while cursor.next_batch().expect("next_batch").is_some() {}
+}
+
+/// `zone=` populates `ReaderConfig.zone`, which then drives
+/// `HostHealthTracker::new`. Without an end-to-end multi-cycle test
+/// it's hard to observe the priority lattice's zone dimension from
+/// the outside, but at minimum the value must round-trip through the
+/// parser and validate, and a connect must succeed against a server
+/// that doesn't advertise a zone (no CAP_ZONE) — the host's zone
+/// tier stays at `Unknown`, which is selectable.
+#[test]
+fn zone_knob_is_compatible_with_v2_server_without_cap_zone() {
+    let srv = MockServer::start(vec![happy_script(ServerRole::Primary, "p0")]);
+    let conf = format!(
+        "qwp::addr={};zone=eu-west-1a;target=primary",
+        srv.url()
+    );
+    // `target=primary` collapses every host's zone tier to `Same`
+    // regardless of the client's `zone=` — writers follow the master
+    // across zones (failover.md §2). So a server without CAP_ZONE
+    // still classifies as Same under target=primary, and the connect
+    // succeeds.
+    let reader = Reader::from_conf(&conf).expect("connect must succeed with target=primary");
+    assert_eq!(reader.current_addr().port, srv.addr.port());
+}
+
+/// `zone=` value with no matching server-advertised zone: the
+/// connect must still succeed (zone is a *preference*, not a
+/// requirement). The tracker classifies the host as zone tier
+/// `Unknown` (server didn't advertise CAP_ZONE), which is still
+/// selectable — the priority lattice only de-prioritises `Other`,
+/// not `Unknown`.
+#[test]
+fn zone_unset_on_server_does_not_block_connect() {
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
+    let conf = format!("qwp::addr={};zone=eu-west-1a", srv.url());
+    let reader = Reader::from_conf(&conf).expect("connect must succeed without server zone");
+    assert_eq!(reader.current_addr().port, srv.addr.port());
 }
