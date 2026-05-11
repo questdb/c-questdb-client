@@ -1562,7 +1562,7 @@ pub unsafe extern "C" fn line_reader_query_bind_uuid(
     unsafe {
         let mut buf = [0u8; 16];
         buf.copy_from_slice(slice::from_raw_parts(value, 16));
-        mutate_query(query, |q| q.bind_uuid_bytes(buf));
+        mutate_query(query, |q| q.bind_uuid(buf));
     }
 }
 
