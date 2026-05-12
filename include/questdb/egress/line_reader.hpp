@@ -565,7 +565,14 @@ public:
      * @throws line_reader_error if a query or cursor is already in flight
      *         on this reader.
      */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wchanges-meaning"
+#endif
     query query(::questdb::ingress::utf8_view sql);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
     /** Cumulative bytes successfully read from the wire.
      *  @throws line_reader_error if this reader has been moved from. */
