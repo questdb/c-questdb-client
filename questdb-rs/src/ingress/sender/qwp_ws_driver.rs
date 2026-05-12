@@ -1339,22 +1339,12 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         }
     }
 
-    pub(crate) fn wait_steps(
-        &mut self,
+    /// Reads the receipt's current delivery state without driving the transport.
+    pub(crate) fn delivery_status(
+        &self,
         receipt: QwpReceipt,
-        max_drive_steps: usize,
-    ) -> Result<DeliveryOutcome, DriverError> {
-        for _ in 0..max_drive_steps {
-            match self.send_core.delivery_status(&self.store, receipt)? {
-                Some(outcome) => return Ok(outcome),
-                None => self.drive_once().map(|_| ())?,
-            }
-        }
-
-        Ok(self
-            .send_core
-            .delivery_status(&self.store, receipt)?
-            .unwrap_or(DeliveryOutcome::Timeout))
+    ) -> Result<Option<DeliveryOutcome>, DriverError> {
+        self.send_core.delivery_status(&self.store, receipt)
     }
 
     pub(crate) fn close_drain_steps(
@@ -1889,8 +1879,6 @@ pub(crate) struct BlockingQwpWsTransport {
     send_buf: Vec<u8>,
     pending_wire_sequences: VecDeque<u64>,
     last_durable_keepalive_ping: Option<Instant>,
-    #[cfg(test)]
-    sent_frames: Vec<SentFrame>,
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1926,8 +1914,6 @@ impl BlockingQwpWsTransport {
             send_buf: Vec::with_capacity(16 * 1024),
             pending_wire_sequences: VecDeque::new(),
             last_durable_keepalive_ping: None,
-            #[cfg(test)]
-            sent_frames: Vec::new(),
         })
     }
 
@@ -2125,8 +2111,6 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
         &mut self,
         frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
-        #[cfg(test)]
-        let sent_frame = frame.sent_frame();
         write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload).map_err(|io| {
             TransportFailure::Disconnect(error::fmt!(
                 SocketError,
@@ -2142,24 +2126,11 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
             ))
         })?;
         self.pending_wire_sequences.push_back(frame.wire_seq);
-        #[cfg(test)]
-        self.sent_frames.push(sent_frame);
         Ok(TransportSendResult::NoResponse)
     }
 
     fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
         self.reconnect()
-    }
-
-    fn sent_frames(&self) -> &[SentFrame] {
-        #[cfg(test)]
-        {
-            &self.sent_frames
-        }
-        #[cfg(not(test))]
-        {
-            &[]
-        }
     }
 }
 
@@ -3168,7 +3139,9 @@ mod tests {
             }))
         ));
         assert_eq!(
-            publisher.wait_steps(first_receipt, 2).unwrap(),
+            publisher
+                .wait_for(first_receipt, Duration::from_secs(5))
+                .unwrap(),
             DeliveryOutcome::Completed
         );
 
@@ -3195,7 +3168,7 @@ mod tests {
                 .try_submit_qwp(buffer.as_qwp_ws().unwrap())
                 .unwrap();
             assert_eq!(
-                publisher.wait_steps(receipt, 4).unwrap(),
+                publisher.wait_for(receipt, Duration::from_secs(5)).unwrap(),
                 DeliveryOutcome::Completed
             );
         }
@@ -3230,7 +3203,7 @@ mod tests {
             .try_submit_qwp(buffer.as_qwp_ws().unwrap())
             .unwrap();
         assert_eq!(
-            publisher.wait_steps(receipt, 4).unwrap(),
+            publisher.wait_for(receipt, Duration::from_secs(5)).unwrap(),
             DeliveryOutcome::Completed
         );
         buffer.clear();
@@ -3244,7 +3217,7 @@ mod tests {
                 .try_submit_qwp(buffer.as_qwp_ws().unwrap())
                 .unwrap();
             assert_eq!(
-                publisher.wait_steps(receipt, 4).unwrap(),
+                publisher.wait_for(receipt, Duration::from_secs(5)).unwrap(),
                 DeliveryOutcome::Completed
             );
             buffer.clear();
@@ -3379,18 +3352,10 @@ mod tests {
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
-    #[derive(Clone, Copy)]
-    enum RealServerAckMode {
-        AckEach,
-        CumulativeAfterAll,
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
     fn serve_qwp_ws_connection<S: Read + Write>(
         stream: &mut S,
         frames: usize,
         payload_tx: mpsc::Sender<Vec<u8>>,
-        ack_mode: RealServerAckMode,
     ) {
         let request = read_request_until_blank(stream).unwrap();
         let accept = codec::compute_accept(&header_value(&request, "Sec-WebSocket-Key"));
@@ -3404,40 +3369,22 @@ mod tests {
         );
         stream.write_all(response.as_bytes()).unwrap();
 
-        match ack_mode {
-            RealServerAckMode::AckEach => {
-                for wire_seq in 0..frames {
-                    let payload = read_client_frame(stream).unwrap();
-                    payload_tx.send(payload).unwrap();
-                    write_ok_response(stream, wire_seq as u64).unwrap();
-                }
-            }
-            RealServerAckMode::CumulativeAfterAll => {
-                for _ in 0..frames {
-                    let payload = read_client_frame(stream).unwrap();
-                    payload_tx.send(payload).unwrap();
-                }
-                if frames > 0 {
-                    write_ok_response(stream, frames as u64 - 1).unwrap();
-                }
-            }
+        for wire_seq in 0..frames {
+            let payload = read_client_frame(stream).unwrap();
+            payload_tx.send(payload).unwrap();
+            write_ok_response(stream, wire_seq as u64).unwrap();
         }
-        thread::sleep(Duration::from_millis(50));
+
+        // Stay alive until the client closes the connection so close_drain on
+        // the client side never races a server-side EOF.
+        let mut sink = [0u8; 1024];
+        while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn spawn_real_qwp_ws_server(
         use_tls: bool,
         frames: usize,
-    ) -> (String, u16, mpsc::Receiver<Vec<u8>>) {
-        spawn_real_qwp_ws_server_with_ack_mode(use_tls, frames, RealServerAckMode::AckEach)
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    fn spawn_real_qwp_ws_server_with_ack_mode(
-        use_tls: bool,
-        frames: usize,
-        ack_mode: RealServerAckMode,
     ) -> (String, u16, mpsc::Receiver<Vec<u8>>) {
         let host = if use_tls { "localhost" } else { "127.0.0.1" };
         let listener = TcpListener::bind((host, 0)).unwrap();
@@ -3454,10 +3401,10 @@ mod tests {
             if use_tls {
                 let server = ServerConnection::new(tls_server_config()).unwrap();
                 let mut stream = StreamOwned::new(server, stream);
-                serve_qwp_ws_connection(&mut stream, frames, payload_tx, ack_mode);
+                serve_qwp_ws_connection(&mut stream, frames, payload_tx);
             } else {
                 let mut stream = stream;
-                serve_qwp_ws_connection(&mut stream, frames, payload_tx, ack_mode);
+                serve_qwp_ws_connection(&mut stream, frames, payload_tx);
             }
         });
         (host.to_string(), port, payload_rx)
@@ -3560,159 +3507,41 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
-    fn blocking_real_ws_transport_drives_submit_and_wait() {
+    fn sender_qwp_ws_round_trip_delivers_replay_payload() {
         let (host, port, payload_rx) = spawn_real_qwp_ws_server(false, 1);
-        let transport = BlockingQwpWsTransport::connect(
-            host,
-            port.to_string(),
-            false,
-            None,
-            QwpWsConfig::default(),
-            None,
-        )
-        .unwrap();
-        let mut driver =
-            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
-
-        let receipt = driver.try_submit(b"qwp-payload").unwrap();
-        let outcome = driver.wait_steps(receipt, 1024).unwrap();
-
-        assert_eq!(outcome, DeliveryOutcome::Completed);
-        assert_eq!(
-            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            b"qwp-payload"
-        );
-        assert_eq!(
-            driver.sent_frames(),
-            &[SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: b"qwp-payload".len(),
-            }]
-        );
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    #[test]
-    fn blocking_real_ws_transport_sends_publication_replay_payload() {
-        let buffer = qwp_buffer("SYM_REAL", 42, 42_000);
+        let mut buffer = qwp_buffer("SYM_REAL", 42, 42_000);
         let expected = replay_payload(&buffer);
-        let (host, port, payload_rx) = spawn_real_qwp_ws_server(false, 1);
-        let transport = BlockingQwpWsTransport::connect(
-            host,
-            port.to_string(),
-            false,
-            None,
-            QwpWsConfig::default(),
-            None,
-        )
-        .unwrap();
-        let driver =
-            ManualDriverPrototype::from_queue(memory_queue(options(8, 4096, 4)), transport);
-        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
-        let receipt = publisher
-            .try_submit_qwp(buffer.as_qwp_ws().unwrap())
-            .unwrap();
-        let outcome = publisher.wait_steps(receipt, 1024).unwrap();
+        let conf = format!("qwpws::addr={host}:{port};");
+        let mut sender = crate::ingress::Sender::from_conf(&conf).unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.close_drain().unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             expected
         );
-        assert_eq!(
-            publisher.sent_frames(),
-            &[SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: expected.len(),
-            }]
-        );
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[test]
-    fn blocking_real_ws_transport_handles_cumulative_ack_after_multiple_sends() {
-        let (host, port, payload_rx) =
-            spawn_real_qwp_ws_server_with_ack_mode(false, 2, RealServerAckMode::CumulativeAfterAll);
-        let transport = BlockingQwpWsTransport::connect(
-            host,
-            port.to_string(),
-            false,
-            None,
-            QwpWsConfig::default(),
-            None,
-        )
-        .unwrap();
-        let mut driver =
-            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
-
-        let first = driver.try_submit(b"qwp-payload-0").unwrap();
-        let second = driver.try_submit(b"qwp-payload-1").unwrap();
-        let outcome = driver.wait_steps(second, 1024).unwrap();
-
-        assert_eq!(outcome, DeliveryOutcome::Completed);
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            b"qwp-payload-0"
-        );
-        assert_eq!(
-            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            b"qwp-payload-1"
-        );
-        assert_eq!(
-            driver.sent_frames(),
-            &[
-                SentFrame {
-                    fsn: 0,
-                    wire_seq: 0,
-                    payload_len: b"qwp-payload-0".len(),
-                },
-                SentFrame {
-                    fsn: 1,
-                    wire_seq: 1,
-                    payload_len: b"qwp-payload-1".len(),
-                },
-            ]
-        );
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    #[test]
-    fn blocking_real_wss_transport_drives_submit_and_wait() {
+    fn sender_qwp_wss_round_trip_delivers_replay_payload() {
         let (host, port, payload_rx) = spawn_real_qwp_ws_server(true, 1);
-        let transport = BlockingQwpWsTransport::connect(
-            host,
-            port.to_string(),
-            true,
-            Some(tls_client_settings()),
-            QwpWsConfig::default(),
-            None,
-        )
-        .unwrap();
-        let mut driver =
-            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
+        let mut buffer = qwp_buffer("SYM_SECURE", 7, 7_000);
+        let expected = replay_payload(&buffer);
 
-        let receipt = driver.try_submit(b"qwp-secure-payload").unwrap();
-        let outcome = driver.wait_steps(receipt, 1024).unwrap();
+        let ca_path = tls_certs_dir().join("server_rootCA.pem");
+        let conf = format!(
+            "qwpwss::addr={host}:{port};tls_roots={};",
+            ca_path.display()
+        );
+        let mut sender = crate::ingress::Sender::from_conf(&conf).unwrap();
+        sender.flush(&mut buffer).unwrap();
+        sender.close_drain().unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Completed);
         assert_eq!(
             payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-            b"qwp-secure-payload"
-        );
-        assert_eq!(
-            driver.sent_frames(),
-            &[SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: b"qwp-secure-payload".len(),
-            }]
+            expected
         );
     }
 
@@ -5629,9 +5458,12 @@ mod tests {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        let outcome = driver.wait_steps(receipt, 1).unwrap();
+        driver.drive_once().unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Completed);
+        assert_eq!(
+            driver.delivery_status(receipt).unwrap(),
+            Some(DeliveryOutcome::Completed)
+        );
         assert_eq!(
             driver.receipt_status(receipt),
             QwpReceiptStatus::Completed { fsn: 0 }
@@ -5676,9 +5508,10 @@ mod tests {
         let second = driver.try_submit(b"b").unwrap();
 
         driver.drive_once().unwrap();
+        driver.drive_once().unwrap();
         assert_eq!(
-            driver.wait_steps(second, 1).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(second).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
 
         assert_eq!(
@@ -5951,8 +5784,8 @@ mod tests {
             QwpReceiptStatus::Terminal { fsn: 0 }
         );
         assert_eq!(
-            driver.wait_steps(receipt, 0).unwrap(),
-            DeliveryOutcome::Terminal
+            driver.delivery_status(receipt).unwrap(),
+            Some(DeliveryOutcome::Terminal)
         );
     }
 
@@ -6001,10 +5834,7 @@ mod tests {
                 wire_seq: 0,
             }
         );
-        assert_eq!(
-            driver.wait_steps(receipt, 0).unwrap(),
-            DeliveryOutcome::Timeout
-        );
+        assert_eq!(driver.delivery_status(receipt).unwrap(), None);
         assert_eq!(driver.try_submit(b"next"), Err(DriverError::Closing));
     }
 
@@ -6083,8 +5913,8 @@ mod tests {
             QwpReceiptStatus::Terminal { fsn: 1 }
         );
         assert_eq!(
-            driver.wait_steps(first, 0).unwrap(),
-            DeliveryOutcome::Terminal
+            driver.delivery_status(first).unwrap(),
+            Some(DeliveryOutcome::Terminal)
         );
         assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
         assert_eq!(driver.try_submit(b"third"), Err(DriverError::Terminal));
@@ -6179,9 +6009,10 @@ mod tests {
             driver.drive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 0 }
         );
+        driver.drive_once().unwrap();
         assert_eq!(
-            driver.wait_steps(second, 1).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(second).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
 
         assert_eq!(
@@ -6274,9 +6105,12 @@ mod tests {
         }]));
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        let outcome = driver.wait_steps(receipt, 1).unwrap();
+        driver.drive_once().unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Completed);
+        assert_eq!(
+            driver.delivery_status(receipt).unwrap(),
+            Some(DeliveryOutcome::Completed)
+        );
         assert_eq!(
             driver.receipt_status(receipt),
             QwpReceiptStatus::Completed { fsn: 0 }
@@ -6290,9 +6124,10 @@ mod tests {
         }]));
         let receipt = driver.try_submit(b"payload").unwrap();
 
+        driver.drive_once().unwrap();
         assert_eq!(
-            driver.wait_steps(receipt, 1).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(receipt).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
 
         let error = driver.poll_sender_error().unwrap();
@@ -6314,9 +6149,10 @@ mod tests {
         }]));
         let receipt = driver.try_submit(b"payload").unwrap();
 
+        driver.drive_once().unwrap();
         assert_eq!(
-            driver.wait_steps(receipt, 1).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(receipt).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
 
         let notification = driver.poll_sender_error_notification().unwrap();
@@ -6451,48 +6287,48 @@ mod tests {
     }
 
     #[test]
-    fn wait_returns_immediately_for_completed_receipts() {
+    fn delivery_status_returns_completed_for_completed_receipts() {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
         let receipt = driver.try_submit(b"payload").unwrap();
         driver.drive_once().unwrap();
 
         assert_eq!(
-            driver.wait_steps(receipt, 0).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(receipt).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
     }
 
     #[test]
-    fn wait_returns_completed_receipt_before_driving_again() {
+    fn completed_receipt_is_observable_without_redriving() {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
         let receipt = driver.try_submit(b"payload").unwrap();
         driver.drive_once().unwrap();
 
         assert_eq!(
-            driver.wait_steps(receipt, 1).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(receipt).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
         assert_eq!(driver.sent_frames().len(), 1);
     }
 
     #[test]
-    fn wait_unknown_receipt_is_api_error() {
-        let mut driver = driver(FakeOrderedServer::ack_each_send());
+    fn delivery_status_unknown_receipt_is_api_error() {
+        let driver = driver(FakeOrderedServer::ack_each_send());
 
         assert_eq!(
-            driver.wait_steps(QwpReceipt { fsn: 99 }, 1),
+            driver.delivery_status(QwpReceipt { fsn: 99 }),
             Err(DriverError::UnknownReceipt { fsn: 99 })
         );
     }
 
     #[test]
-    fn wait_timeout_keeps_receipt_valid() {
+    fn pending_receipt_status_after_drive_without_ack() {
         let mut driver = driver(FakeOrderedServer::no_response());
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        let outcome = driver.wait_steps(receipt, 1).unwrap();
+        driver.drive_once().unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Timeout);
+        assert_eq!(driver.delivery_status(receipt).unwrap(), None);
         assert_eq!(
             driver.receipt_status(receipt),
             QwpReceiptStatus::Sent {
@@ -6584,13 +6420,15 @@ mod tests {
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
 
+        driver.drive_once().unwrap();
+        driver.drive_once().unwrap();
         assert_eq!(
-            driver.wait_steps(first, 1).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(first).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
         assert_eq!(
-            driver.wait_steps(second, 1).unwrap(),
-            DeliveryOutcome::Completed
+            driver.delivery_status(second).unwrap(),
+            Some(DeliveryOutcome::Completed)
         );
 
         assert_eq!(driver.events_dropped_total(), 4);

@@ -168,12 +168,11 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
     }
 
     #[cfg(test)]
-    pub(crate) fn wait_steps(
-        &mut self,
+    pub(crate) fn delivery_status(
+        &self,
         receipt: QwpReceipt,
-        max_drive_steps: usize,
-    ) -> Result<DeliveryOutcome, DriverError> {
-        self.driver.wait_steps(receipt, max_drive_steps)
+    ) -> Result<Option<DeliveryOutcome>, DriverError> {
+        self.driver.delivery_status(receipt)
     }
 
     #[cfg(test)]
@@ -184,19 +183,15 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
     ) -> Result<DeliveryOutcome, DriverError> {
         let deadline = Instant::now() + timeout;
         loop {
-            let outcome = self.driver.wait_steps(receipt, 0)?;
-            if !matches!(outcome, DeliveryOutcome::Timeout) {
+            if let Some(outcome) = self.driver.delivery_status(receipt)? {
                 return Ok(outcome);
             }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Ok(DeliveryOutcome::Timeout);
             }
-            if self.driver.drive_ready_once()? == DriveOutcome::Idle {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Ok(DeliveryOutcome::Timeout);
-                }
-                std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+            if self.driver.drive_once()? == DriveOutcome::Idle {
+                std::thread::sleep(remaining.min(Duration::from_micros(100)));
             }
         }
     }

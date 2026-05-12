@@ -197,8 +197,10 @@ fn qwp_ws_publication_driver_reconnect_replays_only_unacked_rows() -> TestResult
     let proxy_result = proxy.join();
     assert_eq!(second_outcome?, DeliveryOutcome::Completed);
     assert_eq!(
-        publisher.wait_steps(first_receipt, 0).map_err(proto_err)?,
-        DeliveryOutcome::Completed
+        publisher
+            .delivery_status(first_receipt)
+            .map_err(proto_err)?,
+        Some(DeliveryOutcome::Completed)
     );
     proxy_result?;
 

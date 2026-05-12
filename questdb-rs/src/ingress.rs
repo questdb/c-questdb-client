@@ -41,10 +41,7 @@ use std::str::FromStr;
 mod tls;
 
 #[cfg(all(feature = "_sender-tcp", feature = "aws-lc-crypto"))]
-use aws_lc_rs::{
-    rand::SystemRandom,
-    signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
-};
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
 
 #[cfg(all(feature = "_sender-tcp", feature = "ring-crypto"))]
 use ring::{
