@@ -1331,9 +1331,9 @@ fn single_endpoint_failover_exhausts_budget() {
     //     same host → fail. That's 2 dials per outer attempt against
     //     the single configured endpoint.
     //   - Reconnect total: 3 × 2 = 6 dials.
-    //   - Grand total: 1 + 6 = 7. `MAX_REPLAY_CYCLES` doesn't extend
-    //     this — reconnect returns Err on exhaustion, the outer cycle
-    //     terminates without writing.
+    //   - Grand total: 1 + 6 = 7. The single per-Execute reconnect
+    //     walk returns Err on exhaustion; no outer replay-cycle
+    //     wrapper rearms it.
     let srv = MockServer::start(vec![
         // First accept: serve the initial query, then drop mid-stream
         // (so the cursor's first read fails and triggers failover).
@@ -1372,18 +1372,33 @@ fn single_endpoint_failover_exhausts_budget() {
 }
 
 #[test]
-fn write_fails_on_freshly_reconnected_socket_retries_once() {
+fn write_fail_after_reconnect_terminates_or_recovers_via_outer_loop() {
     // A: serves the initial query, then drops mid-stream → triggers
     // failover. B: accepts the WS upgrade and sends SERVER_INFO (so
-    // connect_endpoint returns Ok), then drops before the client's
-    // QUERY_REQUEST write lands → write_message fails on a "freshly
-    // connected" socket. The cursor should NOT give up here: it
-    // should rotate to the next endpoint (back to A's repeat slot)
-    // and try once more. C: healthy, completes the query.
+    // `connect_endpoint` returns Ok), then drops before the client's
+    // QUERY_REQUEST write lands. Two paths are possible depending on
+    // when the kernel surfaces B's TCP drop to tungstenite's buffered
+    // send:
+    //   (a) `write_message(QUERY_REQUEST)` to B fails synchronously —
+    //       `failover_reconnect_and_replay` tears the transport down
+    //       and surfaces the write error. No in-call retry: the per-
+    //       Execute `failover_max_duration_ms` budget already burned
+    //       once inside `reconnect_with_failover`, and dialing again
+    //       from here would compound it (this matches the Java
+    //       reference client `QwpQueryClient.executeImpl`, which owns
+    //       one deadline per Execute).
+    //   (b) tungstenite buffers the send and reports `Ok` — the
+    //       cursor returns from the first failover (1 reset callback);
+    //       the next `next_batch` reads from B, sees the close, and
+    //       the per-batch failover loop triggers a *second* outer
+    //       failover that lands on A's recovered slot (2nd callback).
+    // Both outcomes are correct: a single in-call write failure no
+    // longer earns a free second budget, but the per-batch loop's
+    // existing failover machinery still recovers from a delayed read
+    // failure.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
-        // After the first failover lands on A again (via rotation),
-        // serve cleanly so the cursor has somewhere to land.
+        // If the test takes path (b), the second failover lands here.
         happy_script(ServerRole::Standalone, "a-recovered"),
     ]);
     let srv_b = MockServer::start(vec![drop_after_server_info_script(
@@ -1411,52 +1426,52 @@ fn write_fails_on_freshly_reconnected_socket_retries_once() {
         .execute()
         .expect("execute");
 
-    // The cursor must recover. Two paths can land here depending on
-    // when the kernel surfaces B's dropped TCP to tungstenite's
-    // buffered send:
-    //   (a) `write_message(QUERY_REQUEST)` to B fails synchronously —
-    //       the M3 in-call retry kicks in, reconnects to A's recovered
-    //       slot, and fires the callback exactly once;
-    //   (b) tungstenite buffers the send and reports `Ok` — the
-    //       cursor returns from the first failover, then `next_batch`
-    //       reads from B, sees the close, and triggers a second
-    //       outer failover that lands on A. Two callbacks.
-    // Either outcome matches the contract: the cursor completes
-    // and the user sees at least one reset event.
-    assert!(cursor.next_batch().expect("must complete").is_none());
+    let outcome = match cursor.next_batch() {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => panic!("unexpected RESULT_BATCH delivery"),
+        Err(e) => Err((e.code(), e.msg().to_string())),
+    };
     let r = *resets.lock().unwrap();
-    assert!(
-        (1..=2).contains(&r),
-        "expected 1 or 2 failover resets, got {}",
-        r
-    );
-    // The recovered cursor must end up on A's recovered slot.
     drop(cursor);
-    assert_eq!(
-        reader.current_addr().port,
-        srv_a.addr.port(),
-        "recovered cursor must end up bound to A's recovered slot"
-    );
+
+    match outcome {
+        Ok(()) => {
+            // Path (b): cursor recovered through the outer loop after
+            // the first failover landed on B and the read tripped.
+            assert_eq!(
+                r, 2,
+                "path (b) (buffered write to B) must produce exactly 2 reset events"
+            );
+            assert_eq!(
+                reader.current_addr().port,
+                srv_a.addr.port(),
+                "recovered cursor must end up bound to A's recovered slot"
+            );
+        }
+        Err((code, msg)) => {
+            // Path (a): synchronous write fail on B; no callback
+            // fired because we never reached the success branch.
+            // Cursor must surface a transport-class error.
+            assert_eq!(r, 0, "path (a) must not fire a reset callback");
+            assert!(
+                matches!(code, ErrorCode::SocketError | ErrorCode::ProtocolError),
+                "path (a) error must be transport-class; got {:?}: {}",
+                code,
+                msg,
+            );
+        }
+    }
 }
 
 #[test]
 fn failover_event_attempts_is_cumulative_across_rotations() {
-    // M3 regression guard: `FailoverEvent.attempts` must be the
-    // cumulative reconnect count, not just the count of the cycle
-    // that landed. Force the rotation to skip past one dead endpoint
-    // before landing — the first reconnect attempt fails (B is dead),
-    // the second succeeds (A's recovered slot). The callback must
-    // see `attempts >= 2`.
-    //
-    // Pre-fix, `reconnect_with_failover` returned its local
-    // `attempt + 1`, which counts only the rotation steps inside
-    // its own call — and `failover_reconnect_and_replay` reported
-    // that verbatim. With multiple rotation steps in a single cycle
-    // both old and new code agree (the value comes back as 2 from
-    // the inner function), but the doc claim "cumulative" was a lie
-    // when MAX_REPLAY_CYCLES kicked in. This test pins the rotation
-    // path; `write_fails_on_freshly_reconnected_socket_retries_once`
-    // exercises the cycle-2 path indirectly.
+    // `FailoverEvent.attempts` must be the cumulative reconnect count
+    // across every dial inside the single `reconnect_with_failover`
+    // walk that landed — not just the index of the dial that finally
+    // succeeded. Force the rotation to skip past one dead endpoint
+    // before landing: the first reconnect attempt fails (B is dead),
+    // the second succeeds (A's recovered slot). The callback must see
+    // `attempts >= 2`.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         happy_script(ServerRole::Standalone, "a-recovered"),
