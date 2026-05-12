@@ -3296,6 +3296,17 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     let conf_multi = "qwpws::addr=localhost:9000, localhost:9001;addr=localhost:9002;";
     SenderBuilder::from_conf(conf_multi).unwrap();
 
+    let zone_ignored = "qwpws::addr=localhost:9000;zone=dc-amsterdam;";
+    SenderBuilder::from_conf(zone_ignored).unwrap();
+
+    let tcp_zone = "tcp::addr=localhost:9009;zone=dc-amsterdam;";
+    SenderBuilder::from_conf(tcp_zone).unwrap();
+
+    // Java Sender ignores unknown keys; this is parser compatibility, not
+    // target-selection support.
+    let target_ignored = "qwpws::addr=localhost:9000;target=primary;";
+    SenderBuilder::from_conf(target_ignored).unwrap();
+
     let duplicate = "qwpws::addr=localhost:9000,localhost:9000;";
     let err = SenderBuilder::from_conf(duplicate).unwrap_err();
     assert!(err.msg().contains("duplicate"), "got: {}", err.msg());

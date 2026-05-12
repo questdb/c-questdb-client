@@ -437,6 +437,14 @@ Full failover compliance requires the v2 behavior described in `failover.md`.
 This is the second implementation slice. It must remain implementable, but it
 should not be mixed into the first v1 multi-host failover slice.
 
+Current validation outcome for Rust ingress: the checked failover spec says
+ingress is zone-blind and pinned to v1, and Java `Sender` does not expose an
+ingress `target=` setting. Rust should therefore keep `max_protocol_version=1`,
+accept `zone=` as an ignored QWP/WebSocket compatibility key, and leave
+`target=` as ordinary unknown-key parser compatibility rather than adding target
+selection or a `SERVER_INFO` read to the ingress sender. Revisit this slice only
+if the ingress spec or Java `Sender` grows v2 target/zone behavior.
+
 Implement slice 2 in this order:
 
 1. Validate the public ingress config key for target selection against the
@@ -588,7 +596,7 @@ connection callback in the builder.
    v1 target rejection, `421 + X-QuestDB-Zone`, and v2 `SERVER_INFO.zone_id`.
 
 Slice 1 is required to close the observable v1 multi-host failover gap. Slice 2
-is required for full v2 failover compliance.
+is required only if Rust ingress later becomes a v2 target/zone-aware client.
 
 ## Tests
 
