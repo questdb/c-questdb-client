@@ -1490,8 +1490,7 @@ impl<'r> Cursor<'r> {
         // and gigabytes of churn per failure event.
         let new_rid = self.reader.alloc_request_id();
         self.request_id = new_rid;
-        self.encoded_request =
-            patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
+        self.encoded_request = patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
         match self
             .reader
             .transport_mut()

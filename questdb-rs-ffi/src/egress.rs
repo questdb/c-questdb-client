@@ -1499,8 +1499,8 @@ pub unsafe extern "C" fn line_reader_execute(
         // pattern as `_prepare` and `_query_execute`. Active flag is
         // kept claimed on success (transferred to the cursor) and
         // released on the error arm.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match r.execute(sql_str) {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r.execute(sql_str) {
                 Ok(cursor) => {
                     let cursor_static: Cursor<'static> = std::mem::transmute(cursor);
                     Box::into_raw(Box::new(line_reader_cursor {
@@ -1515,8 +1515,7 @@ pub unsafe extern "C" fn line_reader_execute(
                     write_err_box(err_out, e);
                     ptr::null_mut()
                 }
-            }
-        }));
+            }));
         match result {
             Ok(p) => p,
             Err(_) => std::process::abort(),

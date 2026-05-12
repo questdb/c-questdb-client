@@ -1224,8 +1224,8 @@ mod tests {
     #[cfg(feature = "compression-zstd")]
     #[test]
     fn compression_level_parses_and_is_emitted() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd;compression_level=9")
-            .unwrap();
+        let c =
+            ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd;compression_level=9").unwrap();
         assert_eq!(c.compression_level, 9);
         let headers = c.upgrade_headers();
         let accept = headers
@@ -1238,8 +1238,8 @@ mod tests {
     #[cfg(feature = "compression-zstd")]
     #[test]
     fn compression_level_emitted_for_auto() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=auto;compression_level=7")
-            .unwrap();
+        let c =
+            ReaderConfig::from_conf("qwp::addr=h:1;compression=auto;compression_level=7").unwrap();
         let headers = c.upgrade_headers();
         let accept = headers
             .iter()
@@ -1254,8 +1254,7 @@ mod tests {
         // Setting `compression_level` against `compression=raw` is harmless
         // (the spec says `level=N` only applies to zstd). The header value
         // collapses to the bare `raw` token.
-        let c =
-            ReaderConfig::from_conf("qwp::addr=h:1;compression_level=15").unwrap();
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression_level=15").unwrap();
         let headers = c.upgrade_headers();
         let accept = headers
             .iter()
@@ -1267,11 +1266,8 @@ mod tests {
     #[test]
     fn compression_level_out_of_range_rejected() {
         for bad in ["0", "23", "100"] {
-            let err = ReaderConfig::from_conf(format!(
-                "qwp::addr=h:1;compression_level={}",
-                bad
-            ))
-            .unwrap_err();
+            let err = ReaderConfig::from_conf(format!("qwp::addr=h:1;compression_level={}", bad))
+                .unwrap_err();
             assert_eq!(
                 err.code(),
                 ErrorCode::ConfigError,
@@ -1288,9 +1284,8 @@ mod tests {
             DEFAULT_COMPRESSION_LEVEL,
             MAX_COMPRESSION_LEVEL,
         ] {
-            let c =
-                ReaderConfig::from_conf(format!("qwp::addr=h:1;compression_level={}", ok))
-                    .expect("level in-range");
+            let c = ReaderConfig::from_conf(format!("qwp::addr=h:1;compression_level={}", ok))
+                .expect("level in-range");
             assert_eq!(c.compression_level, ok);
         }
     }

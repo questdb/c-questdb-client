@@ -2785,7 +2785,10 @@ fn dropping_live_cursor_closes_connection() {
     // will (or already has) emit RESULT_BATCH + RESULT_END for this
     // request_id; the cursor's Drop must close the underlying WS so
     // those frames cannot poison a future cursor on the same Reader.
-    let cur1 = reader.prepare("select 1 as v").execute().expect("execute 1");
+    let cur1 = reader
+        .prepare("select 1 as v")
+        .execute()
+        .expect("execute 1");
     drop(cur1);
 
     // The WS is now closed. A new query must surface a transport
@@ -2823,12 +2826,18 @@ fn cancel_then_drop_allows_reuse() {
     let srv = server();
     let mut reader = make_reader(srv);
 
-    let mut cur1 = reader.prepare("select 1 as v").execute().expect("execute 1");
+    let mut cur1 = reader
+        .prepare("select 1 as v")
+        .execute()
+        .expect("execute 1");
     cur1.cancel().expect("cancel drains to terminal");
     drop(cur1);
 
     // Reader is clean — query 2 should succeed end-to-end.
-    let mut cur2 = reader.prepare("select 2 as v").execute().expect("execute 2");
+    let mut cur2 = reader
+        .prepare("select 2 as v")
+        .execute()
+        .expect("execute 2");
     let view = cur2.next_batch().expect("next_batch").expect("Some batch");
     assert_eq!(view.row_count(), 1);
     let v = match view.column(0).unwrap() {
