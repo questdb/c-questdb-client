@@ -95,6 +95,8 @@ pub struct Error {
     qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_role_reject: Option<crate::ingress::QwpWsRoleReject>,
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws_upgrade_version_mismatch: bool,
 }
 
 impl Error {
@@ -107,6 +109,8 @@ impl Error {
             qwp_ws_rejection: None,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_role_reject: None,
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws_upgrade_version_mismatch: false,
         }
     }
 
@@ -124,6 +128,12 @@ impl Error {
         role_reject: crate::ingress::QwpWsRoleReject,
     ) -> Self {
         self.qwp_ws_role_reject = Some(role_reject);
+        self
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn with_qwp_ws_upgrade_version_mismatch(mut self) -> Self {
+        self.qwp_ws_upgrade_version_mismatch = true;
         self
     }
 
@@ -172,6 +182,11 @@ impl Error {
     #[cfg(feature = "_sender-qwp-ws")]
     pub(crate) fn qwp_ws_role_reject(&self) -> Option<&crate::ingress::QwpWsRoleReject> {
         self.qwp_ws_role_reject.as_ref()
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn qwp_ws_upgrade_version_mismatch(&self) -> bool {
+        self.qwp_ws_upgrade_version_mismatch
     }
 }
 

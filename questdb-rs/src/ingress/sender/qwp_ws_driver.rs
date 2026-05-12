@@ -1612,10 +1612,11 @@ fn reconnect_attempt_error(err: DriverError) -> Result<Error, DriverError> {
 }
 
 pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
-    matches!(
-        err.code(),
-        ErrorCode::AuthError | ErrorCode::ProtocolVersionError
-    )
+    match err.code() {
+        ErrorCode::AuthError => true,
+        ErrorCode::ProtocolVersionError => !err.qwp_ws_upgrade_version_mismatch(),
+        _ => false,
+    }
 }
 
 fn is_qwp_ws_role_reject_error(err: &Error) -> bool {
@@ -2089,7 +2090,7 @@ fn decode_transport_response(
                 error: server_error,
             }))
         }
-        Err(err) => Err(TransportFailure::Terminal(err)),
+        Err(err) => Err(TransportFailure::Retryable(err)),
     }
 }
 
@@ -2120,7 +2121,7 @@ fn decode_durable_transport_response(
                 error: server_error,
             }))
         }
-        Err(err) => Err(TransportFailure::Terminal(err)),
+        Err(err) => Err(TransportFailure::Retryable(err)),
     }
 }
 
@@ -3903,6 +3904,20 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_terminal_classification_keeps_upgrade_version_mismatch_retryable() {
+        let version_mismatch =
+            Error::new(ErrorCode::ProtocolVersionError, "unsupported X-QWP-Version")
+                .with_qwp_ws_upgrade_version_mismatch();
+        assert!(!reconnect_error_is_terminal(&version_mismatch));
+
+        let durable_ack_mismatch = Error::new(
+            ErrorCode::ProtocolVersionError,
+            "server did not enable durable ACK",
+        );
+        assert!(reconnect_error_is_terminal(&durable_ack_mismatch));
+    }
+
+    #[test]
     fn transport_write_failure_does_not_commit_sent_receipt() {
         let transport = TestTransport::scripted([Err(TransportFailure::Disconnect(
             fake_transport_error("write failed"),
@@ -4038,6 +4053,27 @@ mod tests {
                 table_seq_txns: table_seq_txns(&[("table_a", 42), ("table_b", 99)])
             })
         );
+    }
+
+    #[test]
+    fn malformed_qwp_response_frames_are_retryable_failures() {
+        let failure = decode_transport_response(&[codec::WS_STATUS_OK]).unwrap_err();
+        assert_retryable_transport_failure(failure, "QWP OK response truncated");
+
+        let failure =
+            decode_durable_transport_response(&[codec::WS_STATUS_DURABLE_ACK]).unwrap_err();
+        assert_retryable_transport_failure(failure, "QWP durable ACK response truncated");
+    }
+
+    fn assert_retryable_transport_failure(failure: TransportFailure, expected_message: &str) {
+        match failure {
+            TransportFailure::Retryable(error) => assert!(
+                error.msg().contains(expected_message),
+                "expected error message containing {expected_message:?}, got {:?}",
+                error.msg()
+            ),
+            other => panic!("expected retryable transport failure, got {other:?}"),
+        }
     }
 
     #[test]

@@ -2268,7 +2268,9 @@ pub(super) fn connect_qwp_ws_endpoint_round(
             }
             Err(err) => {
                 tracker.record_transport_error(idx);
-                if err.code() == crate::ErrorCode::ProtocolVersionError {
+                if err.code() == crate::ErrorCode::ProtocolVersionError
+                    && !err.qwp_ws_upgrade_version_mismatch()
+                {
                     latched_typed_error = Some(err.clone());
                 }
                 last_error = Some(err);

@@ -765,6 +765,40 @@ fn spawn_role_reject_upgrade_server(
     (port, handle)
 }
 
+fn spawn_unsupported_version_upgrade_server(
+    done: Arc<AtomicBool>,
+    version: u8,
+) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_thread = Arc::clone(&attempts);
+
+    let handle = thread::spawn(move || {
+        while !done.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts_thread.fetch_add(1, Ordering::AcqRel);
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = upgrade_mock_stream_with_version(&mut stream, version);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("unsupported-version listener failed: {err}"),
+            }
+        }
+    });
+
+    (port, attempts, handle)
+}
+
 fn slot_has_sfa_file(slot_dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(slot_dir) else {
         return false;
@@ -2987,6 +3021,50 @@ fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
 
     let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_sync_initial_retry_unsupported_version_retries_after_round_exhaustion() {
+    let done = Arc::new(AtomicBool::new(false));
+    let (first_port, first_attempts, first_handle) =
+        spawn_unsupported_version_upgrade_server(Arc::clone(&done), 2);
+    let (second_port, second_attempts, second_handle) =
+        spawn_unsupported_version_upgrade_server(Arc::clone(&done), 2);
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=10;\
+         reconnect_max_duration_millis=120;"
+    );
+    let result = SenderBuilder::from_conf(&conf).unwrap().build();
+
+    done.store(true, Ordering::Release);
+    first_handle.join().unwrap();
+    second_handle.join().unwrap();
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(
+        err.msg().contains("unsupported X-QWP-Version"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(
+        first_attempts.load(Ordering::Acquire) >= 2,
+        "first endpoint was not retried"
+    );
+    assert!(
+        second_attempts.load(Ordering::Acquire) >= 2,
+        "second endpoint was not retried"
+    );
 }
 
 #[test]

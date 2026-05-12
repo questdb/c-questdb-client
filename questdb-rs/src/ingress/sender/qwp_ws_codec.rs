@@ -332,6 +332,7 @@ pub(super) fn validate_upgrade_response(
                 "Server returned invalid X-QWP-Version: {:?}",
                 v
             )
+            .with_qwp_ws_upgrade_version_mismatch()
         })?,
         None => 1,
     };
@@ -339,7 +340,8 @@ pub(super) fn validate_upgrade_response(
         return Err(error::fmt!(
             ProtocolVersionError,
             "Server returned invalid X-QWP-Version: 0"
-        ));
+        )
+        .with_qwp_ws_upgrade_version_mismatch());
     }
     if u32::from(version) > max_version {
         return Err(error::fmt!(
@@ -347,7 +349,8 @@ pub(super) fn validate_upgrade_response(
             "Server returned unsupported X-QWP-Version: {} [max_supported={}]",
             version,
             max_version
-        ));
+        )
+        .with_qwp_ws_upgrade_version_mismatch());
     }
     Ok(version)
 }
@@ -611,6 +614,7 @@ mod tests {
             "got: {}",
             err.msg()
         );
+        assert!(!err.qwp_ws_upgrade_version_mismatch());
 
         parsed
             .headers
@@ -666,6 +670,7 @@ mod tests {
         let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
         assert!(err.msg().contains("unsupported X-QWP-Version"));
+        assert!(err.qwp_ws_upgrade_version_mismatch());
     }
 
     #[test]
