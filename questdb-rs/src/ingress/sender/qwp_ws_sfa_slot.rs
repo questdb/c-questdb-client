@@ -313,7 +313,7 @@ fn write_pid(pid_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingress::sender::qwp_ws_sfa_segment::initial_segment_path;
+    use crate::ingress::sender::qwp_ws_sfa_segment::spare_segment_path;
     use tempfile::TempDir;
 
     fn options(sf_dir: &Path, sender_id: &str) -> SfaSlotOptions {
@@ -349,7 +349,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn open_creates_java_slot_layout_and_lock_file() {
+    fn open_creates_slot_layout_and_lock_file() {
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
 
@@ -360,7 +360,7 @@ mod tests {
         assert!(slot_dir.is_dir());
         assert!(slot_dir.join(LOCK_FILE_NAME).exists());
         assert!(slot_dir.join(LOCK_PID_FILE_NAME).exists());
-        assert!(initial_segment_path(&slot_dir).exists());
+        assert!(spare_segment_path(&slot_dir, 0).exists());
     }
 
     #[cfg(unix)]

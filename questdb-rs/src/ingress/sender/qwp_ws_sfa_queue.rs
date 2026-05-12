@@ -32,12 +32,14 @@
 //! model after an unclean shutdown.
 
 use std::collections::VecDeque;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use memmap2::{MmapMut, MmapOptions};
 
 use crate::error;
 
@@ -47,8 +49,12 @@ use super::qwp_ws_queue::{
 };
 use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaSegment, SfaSegmentError,
-    initial_segment_path, scan_file_metadata, spare_segment_path,
+    scan_file_metadata, spare_segment_path,
 };
+
+const ACK_WATERMARK_FILE_NAME: &str = ".ack-watermark";
+const ACK_WATERMARK_MAGIC: u32 = 0x3157_4b41; // 'AKW1' in little-endian bytes.
+const ACK_WATERMARK_SIZE: u64 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaQueueOptions {
@@ -232,6 +238,7 @@ pub(crate) struct SfaFrameQueue {
     engine: Arc<SfaEngine>,
     producer: Option<SfaProducer>,
     send_cursor: Option<SfaSendCursor>,
+    ack_watermark: Option<SfaAckWatermark>,
 }
 
 #[derive(Debug)]
@@ -287,9 +294,10 @@ impl SfaFrameQueue {
                         options.segment_size_bytes,
                         options.max_bytes,
                     )?;
-                    let active_path = initial_segment_path(&options.slot_dir);
+                    let mut next_generation = scan_next_generation(&options.slot_dir)?;
+                    let active_path = next_segment_path(&options.slot_dir, &mut next_generation)?;
                     (
-                        SfaSegment::create(
+                        SfaSegment::create_new(
                             &active_path,
                             0,
                             options.segment_size_bytes,
@@ -297,7 +305,7 @@ impl SfaFrameQueue {
                         )?,
                         VecDeque::new(),
                         0,
-                        scan_next_generation(&options.slot_dir)?,
+                        next_generation,
                         options.segment_size_bytes,
                     )
                 }
@@ -329,6 +337,8 @@ impl SfaFrameQueue {
 
         let first_unresolved =
             first_unresolved_fsn_from_segments(&sealed_segments, &active).unwrap_or(next_fsn);
+        let recovered_completion =
+            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn);
         let active_append_offset = active.published_offset();
         let active_frame_count = active.published_frame_count();
         let engine = Arc::new(SfaEngine {
@@ -347,7 +357,7 @@ impl SfaFrameQueue {
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
-            completed_upper: AtomicU64::new(first_unresolved),
+            completed_upper: AtomicU64::new(recovered_completion.completed_upper),
         });
         let producer = Some(SfaProducer {
             engine: Arc::clone(&engine),
@@ -361,6 +371,7 @@ impl SfaFrameQueue {
             engine,
             producer,
             send_cursor: None,
+            ack_watermark: recovered_completion.ack_watermark,
         })
     }
 
@@ -424,6 +435,7 @@ impl SfaFrameQueue {
             engine,
             producer,
             send_cursor: None,
+            ack_watermark: None,
         })
     }
 
@@ -454,6 +466,8 @@ impl SfaFrameQueue {
         let first_unresolved =
             first_unresolved_fsn_from_optional_segments(&sealed_segments, active.as_ref())
                 .unwrap_or(next_fsn);
+        let recovered_completion =
+            recover_completed_upper(Some(&options.slot_dir), first_unresolved, next_fsn);
         let engine = Arc::new(SfaEngine {
             slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
@@ -470,18 +484,20 @@ impl SfaFrameQueue {
                 closed: false,
             }),
             published_upper: AtomicU64::new(next_fsn),
-            completed_upper: AtomicU64::new(first_unresolved),
+            completed_upper: AtomicU64::new(recovered_completion.completed_upper),
         });
 
         Ok(Self {
             engine,
             producer: None,
             send_cursor: None,
+            ack_watermark: recovered_completion.ack_watermark,
         })
     }
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         self.producer.take();
+        self.ack_watermark.take();
         self.engine.close()
     }
 
@@ -497,7 +513,15 @@ impl SfaFrameQueue {
     }
 
     pub(crate) fn complete_through_fsn(&mut self, acked_fsn: u64) -> Result<(), SfaQueueError> {
-        self.engine.complete_through_fsn(acked_fsn)
+        let before = self.engine.completed_upper.load(Ordering::Acquire);
+        self.engine.complete_through_fsn(acked_fsn)?;
+        let after = self.engine.completed_upper.load(Ordering::Acquire);
+        if after > before
+            && let Some(ack_watermark) = self.ack_watermark.as_mut()
+        {
+            ack_watermark.persist_completed_fsn(acked_fsn);
+        }
+        Ok(())
     }
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -1339,6 +1363,160 @@ struct SfaSendCursor {
 }
 
 #[derive(Debug)]
+struct RecoveredCompletion {
+    completed_upper: u64,
+    ack_watermark: Option<SfaAckWatermark>,
+}
+
+struct SfaAckWatermark {
+    _file: File,
+    mmap: MmapMut,
+    valid: bool,
+}
+
+impl std::fmt::Debug for SfaAckWatermark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SfaAckWatermark").finish_non_exhaustive()
+    }
+}
+
+impl SfaAckWatermark {
+    fn open(slot_dir: &Path) -> Option<Self> {
+        let path = ack_watermark_path(slot_dir);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .ok()?;
+        if file.metadata().ok()?.len() < ACK_WATERMARK_SIZE
+            && file.set_len(ACK_WATERMARK_SIZE).is_err()
+        {
+            return None;
+        }
+        // SAFETY: the SFA slot lock gives this process exclusive write access
+        // to the slot. The queue reads and writes only the first fixed-size
+        // watermark record.
+        let mmap = unsafe {
+            MmapOptions::new()
+                .len(ACK_WATERMARK_SIZE as usize)
+                .map_mut(&file)
+                .ok()?
+        };
+        let valid = decode_ack_watermark(&mmap).is_some();
+        Some(Self {
+            _file: file,
+            mmap,
+            valid,
+        })
+    }
+
+    fn recovered_fsn(&self) -> Option<u64> {
+        decode_ack_watermark(&self.mmap)
+    }
+
+    fn invalidate(&mut self) {
+        self.store_u32(0, 0);
+        self.valid = false;
+    }
+
+    fn persist_completed_fsn(&mut self, fsn: u64) {
+        let Ok(fsn) = i64::try_from(fsn) else {
+            return;
+        };
+        self.store_fsn(fsn);
+        if !self.valid {
+            self.store_u32(4, 0);
+            self.store_u32(0, ACK_WATERMARK_MAGIC);
+            self.valid = true;
+        }
+    }
+
+    fn store_fsn(&mut self, fsn: i64) {
+        let ptr = unsafe { self.mmap.as_mut_ptr().add(8).cast::<i64>() };
+        debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicI64>(), 0);
+        // SAFETY: the mmap covers at least ACK_WATERMARK_SIZE bytes, offset 8
+        // is 8-byte aligned because mmap mappings are page-aligned, and slot
+        // locking gives this process exclusive write access.
+        unsafe { AtomicI64::from_ptr(ptr).store(fsn.to_le(), Ordering::Relaxed) };
+    }
+
+    fn store_u32(&mut self, offset: usize, value: u32) {
+        let ptr = unsafe { self.mmap.as_mut_ptr().add(offset).cast::<u32>() };
+        debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
+        // SAFETY: callers pass fixed 4-byte-aligned offsets within the
+        // watermark record, and slot locking gives exclusive write access.
+        unsafe { AtomicU32::from_ptr(ptr).store(value.to_le(), Ordering::Release) };
+    }
+}
+
+fn recover_completed_upper(
+    slot_dir: Option<&Path>,
+    segment_completed_upper: u64,
+    published_upper: u64,
+) -> RecoveredCompletion {
+    let Some(slot_dir) = slot_dir else {
+        return RecoveredCompletion {
+            completed_upper: segment_completed_upper,
+            ack_watermark: None,
+        };
+    };
+    let mut ack_watermark = SfaAckWatermark::open(slot_dir);
+    let completed_upper = if let Some(ack_watermark) = ack_watermark.as_mut() {
+        match ack_watermark.recovered_fsn() {
+            Some(acked_fsn) => match ack_watermark_completed_upper(acked_fsn, published_upper) {
+                Some(upper) => segment_completed_upper.max(upper),
+                None => {
+                    ack_watermark.invalidate();
+                    segment_completed_upper
+                }
+            },
+            None => segment_completed_upper,
+        }
+    } else {
+        segment_completed_upper
+    };
+    RecoveredCompletion {
+        completed_upper,
+        ack_watermark,
+    }
+}
+
+fn decode_ack_watermark(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < ACK_WATERMARK_SIZE as usize {
+        return None;
+    }
+    let magic = read_ack_u32(bytes, 0);
+    let reserved = read_ack_u32(bytes, 4);
+    let fsn = read_ack_i64(bytes, 8);
+    if magic != ACK_WATERMARK_MAGIC || reserved != 0 || fsn < 0 {
+        return None;
+    }
+    Some(fsn as u64)
+}
+
+fn ack_watermark_completed_upper(acked_fsn: u64, published_upper: u64) -> Option<u64> {
+    let published_fsn = published_upper.checked_sub(1)?;
+    if acked_fsn > published_fsn {
+        return None;
+    }
+    acked_fsn.checked_add(1)
+}
+
+fn read_ack_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_ack_i64(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn ack_watermark_path(slot_dir: &Path) -> PathBuf {
+    slot_dir.join(ACK_WATERMARK_FILE_NAME)
+}
+
+#[derive(Debug)]
 struct RecoveredSegment {
     path: PathBuf,
     base_seq: u64,
@@ -1576,6 +1754,7 @@ fn record_all_sfa_cleanup(
     slot_dir: &Path,
     diagnostics: &mut Vec<SfaRecoveryDiagnostic>,
 ) -> Result<(), SfaQueueError> {
+    let mut cleanup_failed = false;
     for entry in fs::read_dir(slot_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -1585,13 +1764,30 @@ fn record_all_sfa_cleanup(
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
-                path,
-                error: err.to_string(),
-            }),
+            Err(err) => {
+                cleanup_failed = true;
+                diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+                    path,
+                    error: err.to_string(),
+                });
+            }
         }
     }
+    if !cleanup_failed {
+        record_cleanup_remove_file(ack_watermark_path(slot_dir), diagnostics);
+    }
     Ok(())
+}
+
+fn record_cleanup_remove_file(path: PathBuf, diagnostics: &mut Vec<SfaRecoveryDiagnostic>) {
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => diagnostics.push(SfaRecoveryDiagnostic::CleanupFailed {
+            path,
+            error: err.to_string(),
+        }),
+    }
 }
 
 fn unix_time_micros() -> u64 {
@@ -1636,7 +1832,7 @@ mod tests {
     use super::super::qwp_ws_driver::{
         CloseOutcome, DriveOutcome, FakeOrderedServer, ManualDriverPrototype,
     };
-    use super::super::qwp_ws_sfa_segment::{scan_file, spare_segment_path};
+    use super::super::qwp_ws_sfa_segment::{initial_segment_path, scan_file, spare_segment_path};
     use super::*;
 
     const JAVA_TWO_FRAME_FIXTURE_HEX: &str =
@@ -1720,6 +1916,23 @@ mod tests {
         let mut bytes = vec![0u8; 64];
         bytes[..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
         fs::write(path, bytes).unwrap();
+    }
+
+    fn write_ack_watermark(dir: &Path, fsn: i64) {
+        write_ack_watermark_raw(dir, ACK_WATERMARK_MAGIC, 0, fsn);
+    }
+
+    fn write_ack_watermark_raw(dir: &Path, magic: u32, reserved: u32, fsn: i64) {
+        let mut bytes = [0u8; ACK_WATERMARK_SIZE as usize];
+        bytes[0..4].copy_from_slice(&magic.to_le_bytes());
+        bytes[4..8].copy_from_slice(&reserved.to_le_bytes());
+        bytes[8..16].copy_from_slice(&fsn.to_le_bytes());
+        fs::write(ack_watermark_path(dir), bytes).unwrap();
+    }
+
+    fn recovered_ack_watermark_fsn(dir: &Path) -> Option<u64> {
+        let bytes = fs::read(ack_watermark_path(dir)).unwrap();
+        decode_ack_watermark(&bytes)
     }
 
     #[test]
@@ -1934,15 +2147,19 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_initial_segment_and_publishes_after_durable_append() {
+    fn fresh_disk_queue_uses_generation_zero_segment_name() {
         let dir = TempDir::new().unwrap();
         let mut queue = open(&dir);
+
+        let generation_zero = spare_segment_path(dir.path(), 0);
+        assert!(generation_zero.exists());
+        assert!(!initial_segment_path(dir.path()).exists());
 
         assert_eq!(queue.try_submit(b"first").unwrap(), QwpReceipt { fsn: 0 });
         assert_eq!(queue.try_submit(b"second").unwrap(), QwpReceipt { fsn: 1 });
         assert_eq!(queue.published_fsn(), Some(1));
 
-        let scan = scan_file(initial_segment_path(dir.path())).unwrap();
+        let scan = scan_file(generation_zero).unwrap();
         assert_eq!(scan.header.base_seq, 0);
         assert_eq!(scan.frames[0].payload, b"first");
         assert_eq!(scan.frames[1].payload, b"second");
@@ -1962,7 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_replays_payloads_from_committed_java_sfa_fixture() {
+    fn java_current_initial_segment_still_recovers() {
         let dir = TempDir::new().unwrap();
         fs::write(
             initial_segment_path(dir.path()),
@@ -2028,9 +2245,9 @@ mod tests {
         let queue = open(&dir);
 
         assert_eq!(queue.len(), 0);
-        assert!(initial_path.exists());
+        assert!(!initial_path.exists());
         assert!(corrupt_path.exists());
-        let active_scan = scan_file(&initial_path).unwrap();
+        let active_scan = scan_file(spare_segment_path(dir.path(), 0)).unwrap();
         assert!(active_scan.frames.is_empty());
         assert_eq!(active_scan.torn_tail_bytes, 0);
         let corrupt_scan = scan_file(&corrupt_path).unwrap();
@@ -2141,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn close_removes_empty_initial_segment() {
+    fn close_removes_empty_generation_segments() {
         let dir = TempDir::new().unwrap();
         let mut queue = open(&dir);
 
@@ -2181,13 +2398,39 @@ mod tests {
         queue.try_submit(b"first").unwrap();
         queue.complete_through_fsn(0).unwrap();
 
+        assert!(ack_watermark_path(dir.path()).exists());
         queue.close().unwrap();
 
         assert_eq!(sfa_file_count(dir.path()), 0);
+        assert!(!ack_watermark_path(dir.path()).exists());
     }
 
     #[test]
-    fn sent_and_ack_state_are_not_durable_after_reopen() {
+    fn close_keeps_ack_watermark_when_sfa_cleanup_is_partial() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = open(&dir);
+        queue.try_submit(b"first").unwrap();
+        queue.complete_through_fsn(0).unwrap();
+        let undeletable = dir.path().join("undeletable.sfa");
+        fs::create_dir(&undeletable).unwrap();
+
+        queue.close().unwrap();
+
+        assert!(ack_watermark_path(dir.path()).exists());
+        assert!(undeletable.exists());
+        assert!(
+            queue
+                .recovery_diagnostics()
+                .iter()
+                .any(|diagnostic| matches!(
+                    diagnostic,
+                    SfaRecoveryDiagnostic::CleanupFailed { path, .. } if path == &undeletable
+                ))
+        );
+    }
+
+    #[test]
+    fn ack_watermark_skips_completed_frames_after_restart() {
         let dir = TempDir::new().unwrap();
         let first;
         {
@@ -2206,11 +2449,164 @@ mod tests {
 
         assert_eq!(
             recovered.receipt_status(first),
+            QwpReceiptStatus::Completed { fsn: 0 }
+        );
+        assert_eq!(recovered.oldest_unresolved_fsn(), Some(1));
+        assert_eq!(recovered.completed_fsn(), Some(0));
+        assert_eq!(
+            recovered.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
+    }
+
+    #[test]
+    fn ack_watermark_bounds_are_safe() {
+        let future_dir = TempDir::new().unwrap();
+        write_segment_with_one_frame(&spare_segment_path(future_dir.path(), 0), 0, b"first");
+        write_ack_watermark(future_dir.path(), 10);
+
+        let future = open(&future_dir);
+
+        assert_eq!(future.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(future.completed_fsn(), None);
+        assert_eq!(
+            future.payload_vec_for_fsn(0).as_deref(),
+            Some(&b"first"[..])
+        );
+
+        let stale_dir = TempDir::new().unwrap();
+        write_segment_with_one_frame(&spare_segment_path(stale_dir.path(), 0), 5, b"survivor");
+        write_ack_watermark(stale_dir.path(), 3);
+
+        let stale = open(&stale_dir);
+
+        assert_eq!(stale.oldest_unresolved_fsn(), Some(5));
+        assert_eq!(stale.completed_fsn(), Some(4));
+        assert_eq!(
+            stale.payload_vec_for_fsn(5).as_deref(),
+            Some(&b"survivor"[..])
+        );
+    }
+
+    #[test]
+    fn future_ack_watermark_is_invalidated_before_new_publish() {
+        let dir = TempDir::new().unwrap();
+        write_ack_watermark(dir.path(), 0);
+
+        {
+            let mut queue = open(&dir);
+            assert_eq!(queue.completed_fsn(), None);
+            queue.try_submit(b"first").unwrap();
+        }
+
+        assert_eq!(recovered_ack_watermark_fsn(dir.path()), None);
+        let mut recovered = open(&dir);
+
+        assert_eq!(recovered.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(recovered.completed_fsn(), None);
+        assert_eq!(
+            recovered.receipt_status(QwpReceipt { fsn: 0 }),
             QwpReceiptStatus::Published { fsn: 0 }
         );
         assert_eq!(
             recovered.payload_vec_for_fsn(0).as_deref(),
             Some(&b"first"[..])
+        );
+        recovered.complete_through_fsn(0).unwrap();
+        drop(recovered);
+        assert_eq!(recovered_ack_watermark_fsn(dir.path()), Some(0));
+    }
+
+    #[test]
+    fn ack_watermark_unavailable_is_ignored_for_recovery() {
+        let dir = TempDir::new().unwrap();
+        write_segment_with_one_frame(&spare_segment_path(dir.path(), 0), 0, b"first");
+        fs::create_dir(ack_watermark_path(dir.path())).unwrap();
+
+        let queue = open(&dir);
+
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(queue.completed_fsn(), None);
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+    }
+
+    #[test]
+    fn ack_watermark_invalid_contents_are_ignored_and_repaired() {
+        for (name, magic, reserved) in [
+            ("bad magic", 0xdead_beefu32, 0u32),
+            ("bad reserved", ACK_WATERMARK_MAGIC, 7u32),
+        ] {
+            let dir = TempDir::new().unwrap();
+            write_segment_with_one_frame(&spare_segment_path(dir.path(), 0), 0, b"first");
+            write_segment_with_one_frame(&spare_segment_path(dir.path(), 1), 1, b"second");
+            write_ack_watermark_raw(dir.path(), magic, reserved, 1);
+
+            {
+                let mut queue = open(&dir);
+                assert_eq!(
+                    queue.oldest_unresolved_fsn(),
+                    Some(0),
+                    "{name} should fall back to segment recovery"
+                );
+                queue.complete_through_fsn(0).unwrap();
+            }
+
+            assert_eq!(recovered_ack_watermark_fsn(dir.path()), Some(0));
+            let recovered = open(&dir);
+            assert_eq!(
+                recovered.oldest_unresolved_fsn(),
+                Some(1),
+                "{name} should be repaired by the next completion"
+            );
+            assert_eq!(
+                recovered.payload_vec_for_fsn(1).as_deref(),
+                Some(&b"second"[..])
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ack_watermark_applies_to_replay_only_orphan_open() {
+        use super::super::qwp_ws_sfa_slot::SfaSlotQueue;
+
+        let dir = TempDir::new().unwrap();
+        let slot_dir = dir.path().join("orphan");
+        fs::create_dir(&slot_dir).unwrap();
+        write_segment_with_one_frame(&spare_segment_path(&slot_dir, 0), 0, b"first");
+        write_segment_with_one_frame(&spare_segment_path(&slot_dir, 1), 1, b"second");
+        write_ack_watermark(&slot_dir, 0);
+
+        let queue = SfaSlotQueue::open_replay_only_existing(SfaQueueOptions {
+            slot_dir,
+            segment_size_bytes: 256,
+            max_bytes: 1024,
+            max_in_flight: 4,
+        })
+        .unwrap();
+        let server = FakeOrderedServer::ack_each_send();
+        let mut driver = ManualDriverPrototype::from_queue(queue, server);
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(driver.sent_frames()[0].fsn, 1);
+    }
+
+    #[test]
+    fn missing_ack_watermark_keeps_legacy_recovery() {
+        let dir = TempDir::new().unwrap();
+        write_segment_with_one_frame(&initial_segment_path(dir.path()), 3, b"legacy");
+        assert!(!ack_watermark_path(dir.path()).exists());
+
+        let queue = open(&dir);
+
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(3));
+        assert_eq!(queue.completed_fsn(), Some(2));
+        assert_eq!(
+            queue.payload_vec_for_fsn(3).as_deref(),
+            Some(&b"legacy"[..])
         );
     }
 
@@ -2357,7 +2753,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_uses_java_segment_names_and_recovers_in_fsn_order() {
+    fn rotation_after_generation_zero_uses_generation_one() {
         let dir = TempDir::new().unwrap();
         {
             let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
@@ -2365,12 +2761,14 @@ mod tests {
             assert_eq!(queue.try_submit(b"second").unwrap(), QwpReceipt { fsn: 1 });
         }
 
-        let first_path = initial_segment_path(dir.path());
-        let second_path = spare_segment_path(dir.path(), 0);
+        let first_path = spare_segment_path(dir.path(), 0);
+        let second_path = spare_segment_path(dir.path(), 1);
         assert!(first_path.exists());
         assert!(second_path.exists());
         assert_eq!(scan_file(&first_path).unwrap().header.base_seq, 0);
-        assert_eq!(scan_file(&second_path).unwrap().header.base_seq, 1);
+        let second_scan = scan_file(&second_path).unwrap();
+        assert_eq!(second_scan.header.base_seq, 1);
+        assert_eq!(second_scan.frames[0].payload, b"second");
 
         let recovered = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
         assert_eq!(
@@ -2575,8 +2973,8 @@ mod tests {
     #[test]
     fn cumulative_ack_trims_fully_acked_sealed_segments_but_keeps_active() {
         let dir = TempDir::new().unwrap();
-        let first_path = initial_segment_path(dir.path());
-        let second_path = spare_segment_path(dir.path(), 0);
+        let first_path = spare_segment_path(dir.path(), 0);
+        let second_path = spare_segment_path(dir.path(), 1);
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
@@ -2592,7 +2990,7 @@ mod tests {
     #[test]
     fn drained_trim_keeps_existing_mapped_payload_alive() {
         let dir = TempDir::new().unwrap();
-        let first_path = initial_segment_path(dir.path());
+        let first_path = spare_segment_path(dir.path(), 0);
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
@@ -2615,7 +3013,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().unwrap();
-        let first_path = initial_segment_path(dir.path());
+        let first_path = spare_segment_path(dir.path(), 0);
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 76, 4)).unwrap();
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
