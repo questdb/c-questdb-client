@@ -781,17 +781,22 @@ class FailoverTest(unittest.TestCase):
                 f'See helper FAIL line in stderr.\n'
                 f'STDOUT:\n{stdout}\nSTDERR:\n{stderr}')
 
-        # Beyond exit code, also verify the recorded error codes are
-        # transport-class (SocketError / ProtocolError) rather than
-        # something semantically wrong like ConfigError or AuthError.
-        # Mirrors the Rust assertion `matches!(err.code(),
-        # SocketError | ProtocolError)`.
-        expected = {'SocketError', 'ProtocolError'}
+        # Beyond exit code, also verify the recorded exhaustion code
+        # is one of the documented outcomes. The Rust unit test sees
+        # `SocketError | ProtocolError` because its cursor fails before
+        # any batch is delivered. The Python helper deliberately drains
+        # one batch first (for harness sync), so when failover is
+        # attempted in Phase 3 the `would_silently_duplicate` safety net
+        # kicks in and surfaces `FailoverWouldDuplicate` (no
+        # `on_failover_reset` callback is installed). All three codes
+        # are correct semantic outcomes — neither is a config/auth-class
+        # mismatch.
+        expected = {'SocketError', 'ProtocolError', 'FailoverWouldDuplicate'}
 
         exhausted = self._extract_field(stderr, 'exhausted_code')
         self.assertIn(
             exhausted, expected,
-            f'exhaustion error code is not transport-class: {exhausted!r}.\n'
+            f'unexpected exhaustion error code: {exhausted!r}.\n'
             f'STDERR:\n{stderr}')
 
         sv_code = self._extract_field(stderr, 'poisoned_server_version_code')
@@ -872,15 +877,18 @@ class FailoverTest(unittest.TestCase):
                 f'STDOUT:\n{stdout}\nSTDERR:\n{stderr}')
 
         # Same expected codes as the multi-endpoint exhaustion test:
-        # exhaustion is transport-class; the two poisoned-reader probes
-        # are pinned to SocketError per `Reader::server_version`'s
-        # documented contract.
-        expected = {'SocketError', 'ProtocolError'}
+        # transport-class or the `FailoverWouldDuplicate` safety net
+        # (which fires here because the helper drains one batch before
+        # triggering failover, and no `on_failover_reset` callback is
+        # installed). The two poisoned-reader probes are pinned to
+        # SocketError per `Reader::server_version`'s documented
+        # contract.
+        expected = {'SocketError', 'ProtocolError', 'FailoverWouldDuplicate'}
 
         exhausted = self._extract_field(stderr, 'exhausted_code')
         self.assertIn(
             exhausted, expected,
-            f'single-endpoint exhaustion code is not transport-class: '
+            f'unexpected single-endpoint exhaustion code: '
             f'{exhausted!r}.\nSTDERR:\n{stderr}')
 
         sv_code = self._extract_field(stderr, 'poisoned_server_version_code')
