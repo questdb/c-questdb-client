@@ -93,6 +93,8 @@ pub struct Error {
     msg: String,
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws_role_reject: Option<crate::ingress::QwpWsRoleReject>,
 }
 
 impl Error {
@@ -103,6 +105,8 @@ impl Error {
             msg: msg.into(),
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_rejection: None,
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws_role_reject: None,
         }
     }
 
@@ -110,6 +114,16 @@ impl Error {
     #[cfg(feature = "_sender-qwp-ws")]
     pub fn with_qwp_ws_rejection(mut self, rejection: crate::ingress::QwpWsSenderError) -> Self {
         self.qwp_ws_rejection = Some(Box::new(rejection));
+        self
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[allow(dead_code)]
+    pub(crate) fn with_qwp_ws_role_reject(
+        mut self,
+        role_reject: crate::ingress::QwpWsRoleReject,
+    ) -> Self {
+        self.qwp_ws_role_reject = Some(role_reject);
         self
     }
 
@@ -153,6 +167,11 @@ impl Error {
     #[cfg(feature = "_sender-qwp-ws")]
     pub fn qwp_ws_rejection(&self) -> Option<&crate::ingress::QwpWsSenderError> {
         self.qwp_ws_rejection.as_deref()
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn qwp_ws_role_reject(&self) -> Option<&crate::ingress::QwpWsRoleReject> {
+        self.qwp_ws_role_reject.as_ref()
     }
 }
 

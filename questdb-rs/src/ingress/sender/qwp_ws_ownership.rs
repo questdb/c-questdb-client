@@ -172,3 +172,24 @@ pub enum QwpWsErrorPolicy {
     /// Latch the error as terminal. The sender must be closed and rebuilt.
     Halt,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QwpWsRoleReject {
+    pub(crate) role: String,
+    pub(crate) zone: Option<String>,
+}
+
+impl QwpWsRoleReject {
+    #[allow(dead_code)]
+    pub(crate) fn new(role: &str, zone: Option<&str>) -> Self {
+        Self {
+            role: role.to_string(),
+            zone: zone.map(str::to_string),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_transient(&self) -> bool {
+        self.role.eq_ignore_ascii_case("PRIMARY_CATCHUP")
+    }
+}

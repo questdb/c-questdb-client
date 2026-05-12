@@ -42,6 +42,7 @@ observable, a behavioral fixture or real QuestDB server.
 | R4 | done | high | Runner architecture | Decouple high-level publication from blocking transport/reconnect progress. | Re-read Java `CursorSendEngine.appendBlocking`, `CursorWebSocketSendLoop`, and Rust `SyncQwpWsRunner`; decide the smallest globally coherent step toward an explicit store/runner split, not a larger manual-driver detach API. | `Sender::flush()` can publish locally while the runner is reconnecting or doing blocking I/O, subject only to local capacity/backpressure and terminal error checks. |
 | R5 | todo | high | Shutdown / close | Make runner shutdown and close/drain behavior explicit and Java-compatible. | Compare Java `close()` / `drainOnClose()` with Rust `Drop`, manual `close_drain`, and rejected `close_flush_timeout_millis`. | Background runner stop is not hostage to the full reconnect budget; explicit close-drain can report timeout/terminal errors before `close_flush_timeout_millis` is accepted. |
 | R6 | todo | low | Docs | Remove stale wording and sync docs after each code slice. | Search docs and Rust comments for old async/Tokio/manual-driver wording. | Docs describe current behavior, known gaps, and rejected config values without promising unimplemented features. |
+| R7 | todo | medium | Feature gates | Split or re-gate QWP/WebSocket codec modules so unreachable upgrade validation is not compiled in `_sender-qwp-ws`-only builds. | Inspect `Cargo.toml` feature relationships and current `sender.rs` cfg gates; verify which helpers are frame/status codec versus sync transport upgrade code. | `cargo check --no-default-features --features _sender-qwp-ws,ring-crypto,tls-webpki-certs --lib` does not need local `allow(dead_code)` for sync-only upgrade helpers, and the cfg boundary matches actual reachability. |
 
 ## Slice Notes
 
@@ -214,3 +215,28 @@ Known stale areas:
 
 Docs should be updated in the same slice as behavior changes, not batched far
 behind the code.
+
+### R7: QWP/WebSocket Feature Gates
+
+Current feature split:
+
+- `qwp_ws_codec` is compiled under `_sender-qwp-ws`.
+- the sync WebSocket sender module `qwp_ws`, which calls HTTP upgrade
+  validation, is compiled only under `sync-sender-qwp-ws`.
+- `sync-sender-qwp-ws` implies `_sender-qwp-ws`, but `_sender-qwp-ws` alone does
+  not imply `sync-sender-qwp-ws`.
+
+That means `_sender-qwp-ws`-only builds compile shared codec code but not the
+sync transport caller, making HTTP upgrade validation unreachable in that build
+matrix. The current local dead-code suppressions around structured role-reject
+helpers are a stopgap, not the final boundary.
+
+Preferred design direction:
+
+- keep pure QWP frame/status parsing under `_sender-qwp-ws`;
+- move or `cfg(feature = "sync-sender-qwp-ws")` HTTP upgrade request/response
+  helpers that are only used by the sync transport;
+- avoid broad `allow(dead_code)` annotations for helpers that are unreachable
+  only because of feature-gating shape;
+- validate with the `_sender-qwp-ws` no-default feature check and the full
+  `sync-sender-qwp-ws` QWP/WebSocket test filter.

@@ -28,6 +28,7 @@
 //! coupling them to a particular runtime.
 
 use crate::error;
+use crate::ingress::QwpWsRoleReject;
 
 pub(super) const SEC_WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 pub(super) const WS_PATH: &str = "/api/v4/write";
@@ -230,6 +231,7 @@ pub(super) fn parse_http_header_block(block: &[u8]) -> crate::Result<ParsedHttpH
 pub(super) fn validate_upgrade_response(
     parsed: &ParsedHttpHeaders,
     expected_accept: &str,
+    max_version: u32,
     request_durable_ack: bool,
 ) -> crate::Result<u8> {
     if parsed.status == 401 || parsed.status == 403 {
@@ -239,9 +241,37 @@ pub(super) fn validate_upgrade_response(
             parsed.status
         ));
     }
+    if parsed.status == 421
+        && let Some((_, role)) = parsed
+            .headers
+            .iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case("x-questdb-role") && !v.trim().is_empty())
+    {
+        let zone = parsed
+            .headers
+            .iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case("x-questdb-zone") && !v.trim().is_empty())
+            .map(|(_, v)| v.trim());
+        let role = role.trim();
+        let role_reject = QwpWsRoleReject::new(role, zone);
+        let err = match zone {
+            Some(zone) => error::fmt!(
+                SocketError,
+                "QWP/WebSocket upgrade rejected by role={} zone={}",
+                role,
+                zone
+            ),
+            None => error::fmt!(
+                SocketError,
+                "QWP/WebSocket upgrade rejected by role={}",
+                role
+            ),
+        };
+        return Err(err.with_qwp_ws_role_reject(role_reject));
+    }
     if parsed.status != 101 {
         return Err(error::fmt!(
-            ProtocolVersionError,
+            SocketError,
             "WebSocket upgrade failed: HTTP status {}",
             parsed.status
         ));
@@ -309,6 +339,14 @@ pub(super) fn validate_upgrade_response(
         return Err(error::fmt!(
             ProtocolVersionError,
             "Server returned invalid X-QWP-Version: 0"
+        ));
+    }
+    if u32::from(version) > max_version {
+        return Err(error::fmt!(
+            ProtocolVersionError,
+            "Server returned unsupported X-QWP-Version: {} [max_supported={}]",
+            version,
+            max_version
         ));
     }
     Ok(version)
@@ -566,8 +604,8 @@ mod tests {
         let expected_accept = "accept";
         let mut parsed = valid_upgrade_headers(expected_accept);
 
-        validate_upgrade_response(&parsed, expected_accept, false).unwrap();
-        let err = validate_upgrade_response(&parsed, expected_accept, true).unwrap_err();
+        validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap();
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap_err();
         assert!(
             err.msg().contains("server did not enable durable ACK"),
             "got: {}",
@@ -577,7 +615,57 @@ mod tests {
         parsed
             .headers
             .push(("X-QWP-Durable-Ack".to_string(), "enabled".to_string()));
-        validate_upgrade_response(&parsed, expected_accept, true).unwrap();
+        validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap();
+    }
+
+    #[test]
+    fn upgrade_response_classifies_role_reject_and_retryable_status() {
+        let expected_accept = "accept";
+        let mut parsed = valid_upgrade_headers(expected_accept);
+
+        parsed.status = 421;
+        parsed
+            .headers
+            .push(("X-QuestDB-Role".to_string(), "PRIMARY_CATCHUP".to_string()));
+        parsed
+            .headers
+            .push(("X-QuestDB-Zone".to_string(), "az-a".to_string()));
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("role=PRIMARY_CATCHUP"));
+        let role_reject = err.qwp_ws_role_reject().unwrap();
+        assert_eq!(role_reject.role, "PRIMARY_CATCHUP");
+        assert_eq!(role_reject.zone.as_deref(), Some("az-a"));
+        assert!(role_reject.is_transient());
+
+        parsed
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("x-questdb-role"));
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.qwp_ws_role_reject().is_none());
+        assert!(err.msg().contains("HTTP status 421"));
+
+        parsed.status = 500;
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("HTTP status 500"));
+    }
+
+    #[test]
+    fn upgrade_response_rejects_version_above_configured_max() {
+        let expected_accept = "accept";
+        let mut parsed = valid_upgrade_headers(expected_accept);
+        parsed
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-qwp-version"))
+            .unwrap()
+            .1 = "2".to_string();
+
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
+        assert!(err.msg().contains("unsupported X-QWP-Version"));
     }
 
     #[test]
@@ -588,7 +676,7 @@ mod tests {
             .headers
             .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
 
-        let err = validate_upgrade_response(&parsed, expected_accept, false).unwrap_err();
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
         assert!(
             err.msg().contains("missing or invalid Connection header"),
             "got: {}",
@@ -598,7 +686,7 @@ mod tests {
         parsed
             .headers
             .push(("Connection".to_string(), "keep-alive".to_string()));
-        let err = validate_upgrade_response(&parsed, expected_accept, false).unwrap_err();
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
         assert!(
             err.msg().contains("missing or invalid Connection header"),
             "got: {}",
@@ -606,7 +694,7 @@ mod tests {
         );
 
         parsed.headers.last_mut().unwrap().1 = "keep-alive, Upgrade".to_string();
-        validate_upgrade_response(&parsed, expected_accept, false).unwrap();
+        validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap();
     }
 
     #[test]

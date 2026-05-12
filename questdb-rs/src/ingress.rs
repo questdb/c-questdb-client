@@ -30,6 +30,8 @@ use crate::error::{self, Result, fmt};
 use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
 use std::collections::HashMap;
+#[cfg(feature = "_sender-qwp-ws")]
+use std::collections::HashSet;
 #[cfg(feature = "_sync-sender")]
 use std::fmt::Write;
 use std::fmt::{Debug, Display, Formatter};
@@ -59,6 +61,8 @@ mod buffer;
 pub use buffer::*;
 
 mod sender;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use sender::QwpWsRoleReject;
 #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
 pub(crate) use sender::qwp_ws_test_support;
 pub use sender::*;
@@ -365,6 +369,147 @@ impl Protocol {
     }
 }
 
+#[cfg(feature = "_sender-qwp-ws")]
+struct QwpWsAddrScan {
+    addr_values: Vec<String>,
+    sanitized_conf: String,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan>> {
+    let Some((service, params)) = conf.split_once("::") else {
+        return Ok(None);
+    };
+    if !matches!(service, "qwpws" | "qwpwss" | "ws" | "wss") {
+        return Ok(None);
+    }
+
+    let mut addr_values = Vec::new();
+    let mut sanitized_conf = String::with_capacity(conf.len());
+    sanitized_conf.push_str(service);
+    sanitized_conf.push_str("::");
+
+    let params_offset = service.len() + 2;
+    let mut pos = 0usize;
+    while pos < params.len() {
+        let param_start = pos;
+        let Some(eq_rel) = params[pos..].find('=') else {
+            return Ok(None);
+        };
+        let key_start = pos;
+        let key_end = pos + eq_rel;
+        let key = &params[key_start..key_end];
+        pos = key_end + 1;
+
+        let mut value = String::new();
+        while pos < params.len() {
+            let rest = &params[pos..];
+            let mut chars = rest.char_indices();
+            let (_, ch) = chars.next().expect("pos is within params");
+            if ch == ';' {
+                let next_pos = pos + ch.len_utf8();
+                if params[next_pos..].starts_with(';') {
+                    value.push(';');
+                    pos = next_pos + 1;
+                    continue;
+                }
+                pos = next_pos;
+                break;
+            }
+            value.push(ch);
+            pos += ch.len_utf8();
+        }
+
+        let param_end = pos;
+        if key.eq_ignore_ascii_case("addr") {
+            if addr_values.is_empty() {
+                sanitized_conf
+                    .push_str(&conf[params_offset + param_start..params_offset + param_end]);
+            }
+            addr_values.push(value);
+        } else {
+            sanitized_conf.push_str(&conf[params_offset + param_start..params_offset + param_end]);
+        }
+    }
+
+    Ok(Some(QwpWsAddrScan {
+        addr_values,
+        sanitized_conf,
+    }))
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn parse_qwp_ws_endpoints(
+    addr_values: &[String],
+    default_port: &str,
+) -> Result<Vec<conf::QwpWsEndpoint>> {
+    let mut endpoints = Vec::new();
+    let mut seen = HashSet::new();
+    for addr in addr_values {
+        for raw_entry in addr.split(',') {
+            let entry = raw_entry.trim();
+            if entry.is_empty() {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "invalid QWP/WebSocket addr list: empty entry"
+                ));
+            }
+            let (host, port) = match entry.split_once(':') {
+                Some((host, port)) => (host.trim(), port.trim()),
+                None => (entry, default_port),
+            };
+            if host.is_empty() {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "invalid QWP/WebSocket addr entry {:?}: empty host",
+                    entry
+                ));
+            }
+            if port.is_empty() {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "invalid QWP/WebSocket addr entry {:?}: empty port",
+                    entry
+                ));
+            }
+            let parsed_port = port.parse::<u16>().map_err(|_| {
+                error::fmt!(
+                    ConfigError,
+                    "invalid QWP/WebSocket addr entry {:?}: invalid port {:?}",
+                    entry,
+                    port
+                )
+            })?;
+            if parsed_port == 0 {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "invalid QWP/WebSocket addr entry {:?}: invalid port {:?}",
+                    entry,
+                    port
+                ));
+            }
+            let normalized_port = parsed_port.to_string();
+            let key = (host.to_string(), normalized_port.clone());
+            if !seen.insert(key.clone()) {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "duplicate QWP/WebSocket addr endpoint {}:{}",
+                    host,
+                    normalized_port
+                ));
+            }
+            endpoints.push(conf::QwpWsEndpoint::new(key.0, key.1));
+        }
+    }
+    if endpoints.is_empty() {
+        return Err(error::fmt!(
+            ConfigError,
+            "Missing \"addr\" parameter in config string"
+        ));
+    }
+    Ok(endpoints)
+}
+
 /// Accumulates parameters for a new `Sender` instance.
 ///
 /// You can also create the builder from a config string.
@@ -491,7 +636,17 @@ impl SenderBuilder {
     /// that are already set in the config string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf = conf.as_ref();
-        let conf = questdb_confstr::parse_conf_str(conf)
+        #[cfg(feature = "_sender-qwp-ws")]
+        let qwp_ws_addr_scan = scan_qwp_ws_addr_params(conf)?;
+        #[cfg(feature = "_sender-qwp-ws")]
+        let conf_to_parse = qwp_ws_addr_scan
+            .as_ref()
+            .map(|scan| scan.sanitized_conf.as_str())
+            .unwrap_or(conf);
+        #[cfg(not(feature = "_sender-qwp-ws"))]
+        let conf_to_parse = conf;
+
+        let conf = questdb_confstr::parse_conf_str(conf_to_parse)
             .map_err(|e| error::fmt!(ConfigError, "Config parse error: {}", e))?;
         let service = conf.service();
         let params = conf.params();
@@ -504,11 +659,46 @@ impl SenderBuilder {
                 "Missing \"addr\" parameter in config string"
             ));
         };
-        let (host, port) = match addr.split_once(':') {
-            Some((h, p)) => (h, p),
-            None => (addr.as_str(), protocol.default_port()),
+        #[cfg(feature = "_sender-qwp-ws")]
+        let qwp_ws_endpoints = if protocol.is_qwp_ws() {
+            let addr_values = qwp_ws_addr_scan
+                .as_ref()
+                .map(|scan| scan.addr_values.as_slice())
+                .unwrap_or_else(|| std::slice::from_ref(addr));
+            Some(parse_qwp_ws_endpoints(
+                addr_values,
+                protocol.default_port(),
+            )?)
+        } else {
+            None
+        };
+        let (host, port) = {
+            #[cfg(feature = "_sender-qwp-ws")]
+            if let Some(endpoints) = qwp_ws_endpoints.as_ref() {
+                let first = endpoints.first().ok_or_else(|| {
+                    error::fmt!(ConfigError, "Missing \"addr\" parameter in config string")
+                })?;
+                (first.host.as_str(), first.port.as_str())
+            } else {
+                match addr.split_once(':') {
+                    Some((h, p)) => (h, p),
+                    None => (addr.as_str(), protocol.default_port()),
+                }
+            }
+
+            #[cfg(not(feature = "_sender-qwp-ws"))]
+            {
+                match addr.split_once(':') {
+                    Some((h, p)) => (h, p),
+                    None => (addr.as_str(), protocol.default_port()),
+                }
+            }
         };
         let mut builder = SenderBuilder::new(protocol, host, port);
+        #[cfg(feature = "_sender-qwp-ws")]
+        if let Some(endpoints) = qwp_ws_endpoints {
+            builder = builder.qwp_ws_endpoints(endpoints)?;
+        }
 
         validate_auto_flush_params(params)?;
 
@@ -562,7 +752,7 @@ impl SenderBuilder {
                     .reconnect_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "initial_connect_retry" => {
-                    builder.initial_connect_retry(parse_initial_connect_retry_value(val)?)?
+                    builder.qwp_ws_initial_connect_mode(parse_initial_connect_retry_value(val)?)?
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
                 "auth_timeout_ms" => builder.qwp_ws_auth_timeout_millis(val)?,
@@ -1276,8 +1466,19 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Retry the initial connection using the reconnect policy. Default false.
-    pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
+    fn qwp_ws_endpoints(mut self, endpoints: Vec<conf::QwpWsEndpoint>) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "QWP/WebSocket endpoint lists are only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws.endpoints.set_specified("addr", endpoints)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn qwp_ws_initial_connect_mode(mut self, mode: conf::QwpWsInitialConnectMode) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
@@ -1286,7 +1487,27 @@ impl SenderBuilder {
         };
         qwp_ws
             .initial_connect_retry
-            .set_specified("initial_connect_retry", value)?;
+            .set_specified("initial_connect_retry", mode)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Retry the initial connection using the reconnect policy. Default false.
+    pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"initial_connect_retry\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws.initial_connect_retry.set_specified(
+            "initial_connect_retry",
+            if value {
+                conf::QwpWsInitialConnectMode::Sync
+            } else {
+                conf::QwpWsInitialConnectMode::Off
+            },
+        )?;
         Ok(self)
     }
 
@@ -1878,6 +2099,12 @@ impl SenderBuilder {
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
+                    if *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "initial_connect_retry=async requires QWP/WebSocket background progress; use qwp_ws_progress=background or initial_connect_retry=sync"
+                        ));
+                    }
                     SyncProtocolHandler::ManualQwpWs(Box::new(open_manual_qwp_ws(
                         self.host.as_str(),
                         self.port.as_str(),
@@ -2015,25 +2242,22 @@ where
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn parse_initial_connect_retry_value(str_value: &str) -> Result<bool> {
+fn parse_initial_connect_retry_value(str_value: &str) -> Result<conf::QwpWsInitialConnectMode> {
     if str_value.eq_ignore_ascii_case("on") || str_value.eq_ignore_ascii_case("true") {
-        return Ok(true);
+        return Ok(conf::QwpWsInitialConnectMode::Sync);
     }
     if str_value.eq_ignore_ascii_case("sync") {
-        return Ok(true);
+        return Ok(conf::QwpWsInitialConnectMode::Sync);
     }
     if str_value.eq_ignore_ascii_case("off") || str_value.eq_ignore_ascii_case("false") {
-        return Ok(false);
+        return Ok(conf::QwpWsInitialConnectMode::Off);
     }
     if str_value.eq_ignore_ascii_case("async") {
-        return Err(error::fmt!(
-            ConfigError,
-            "initial_connect_retry=async is not supported by the Rust QWP/WebSocket sender yet; use initial_connect_retry=sync for blocking startup retry"
-        ));
+        return Ok(conf::QwpWsInitialConnectMode::Async);
     }
     Err(error::fmt!(
         ConfigError,
-        "invalid initial_connect_retry [value={str_value}, allowed-values=[on, off, true, false, sync], unsupported-values=[async]]"
+        "invalid initial_connect_retry [value={str_value}, allowed-values=[on, off, true, false, sync, async]]"
     ))
 }
 

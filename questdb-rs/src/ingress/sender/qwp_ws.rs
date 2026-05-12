@@ -38,7 +38,7 @@ use rand::RngCore;
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::QwpWsColumnarBuffer;
-use crate::ingress::conf::{QwpWsConfig, SfDurability};
+use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 
 use super::qwp_ws_codec::{
@@ -46,11 +46,12 @@ use super::qwp_ws_codec::{
     WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
 };
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
-    ManualDriverTransport, PublicationLifecycle, PublicationLog, PublicationState,
-    QwpWsPublicationStore, QwpWsReconnectProgress, QwpWsSendCore, QwpWsSendProgress,
-    QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll,
-    reconnect_error_is_terminal,
+    BlockingQwpWsTransport, CloseOutcome, DEFAULT_EVENT_CAPACITY, DriveOutcome, DriverError,
+    ManualDriverPrototype, ManualDriverTransport, PublicationLifecycle, PublicationLog,
+    PublicationState, QwpWsPublicationStore, QwpWsReconnectProgress, QwpWsSendCore,
+    QwpWsSendProgress, QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason,
+    TransportFailure, TransportPoll, reconnect_error_is_terminal, reconnect_sleep_duration,
+    retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
@@ -189,6 +190,25 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     lifecycle: PublicationLifecycle,
 }
 
+struct SyncQwpWsPendingRunnerCore {
+    connected: Option<SyncQwpWsRunnerCore<BlockingQwpWsTransport>>,
+    pending_connect: QwpWsPendingConnect,
+    backpressure: Arc<BackpressureNotifier>,
+    lifecycle: PublicationLifecycle,
+}
+
+#[derive(Clone)]
+struct QwpWsPendingConnect {
+    host: String,
+    port: String,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: QwpWsConfig,
+    auth_header: Option<String>,
+    reconnect_policy: ReconnectPolicy,
+    max_in_flight: usize,
+}
+
 #[derive(Debug)]
 struct BackpressureNotifier {
     lock: Mutex<()>,
@@ -232,6 +252,50 @@ where
         let thread = thread::spawn(move || {
             let mut core = SyncQwpWsRunnerCore {
                 send_core,
+                backpressure: thread_backpressure,
+                lifecycle: thread_lifecycle,
+            };
+            while !thread_stop.load(Ordering::Acquire) {
+                match core.drive_step(&thread_shared, &thread_stop) {
+                    RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                    RunnerStep::Continue => {}
+                    RunnerStep::Stop => break,
+                };
+            }
+        });
+
+        Self {
+            shared,
+            producer,
+            lifecycle,
+            backpressure,
+            append_deadline,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn start_pending_connect(
+        queue: Q,
+        pending_connect: QwpWsPendingConnect,
+        durable_ack: bool,
+        append_deadline: Duration,
+    ) -> Self {
+        let mut store =
+            QwpWsPublicationStore::new_with_durable_ack(queue, DEFAULT_EVENT_CAPACITY, durable_ack);
+        let lifecycle = store.lifecycle();
+        let producer = store.take_producer();
+        let shared = Arc::new(Mutex::new(store));
+        let backpressure = Arc::new(BackpressureNotifier::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_shared = Arc::clone(&shared);
+        let thread_backpressure = Arc::clone(&backpressure);
+        let thread_stop = Arc::clone(&stop);
+        let thread_lifecycle = lifecycle.clone();
+        let thread = thread::spawn(move || {
+            let mut core = SyncQwpWsPendingRunnerCore {
+                connected: None,
+                pending_connect,
                 backpressure: thread_backpressure,
                 lifecycle: thread_lifecycle,
             };
@@ -463,6 +527,145 @@ impl BackpressureNotifier {
         match self.lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl QwpWsPendingConnect {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        host: &str,
+        port: &str,
+        use_tls: bool,
+        tls_settings: Option<TlsSettings>,
+        qwp_ws: &QwpWsConfig,
+        auth_header: Option<String>,
+        max_in_flight: usize,
+    ) -> Self {
+        Self {
+            host: host.to_string(),
+            port: port.to_string(),
+            use_tls,
+            tls_settings,
+            qwp_ws: qwp_ws.clone(),
+            auth_header,
+            reconnect_policy: ReconnectPolicy::bounded(
+                *qwp_ws.reconnect_max_duration,
+                *qwp_ws.reconnect_initial_backoff,
+                *qwp_ws.reconnect_max_backoff,
+            ),
+            max_in_flight,
+        }
+    }
+
+    fn connect_with_retry(
+        &self,
+        stop: &AtomicBool,
+    ) -> Result<Option<BlockingQwpWsTransport>, crate::Error> {
+        let started = Instant::now();
+        let deadline = started.checked_add(self.reconnect_policy.max_duration());
+        let endpoints = qwp_ws_configured_endpoints(&self.host, &self.port, &self.qwp_ws);
+        let mut tracker = QwpWsHostHealthTracker::new(endpoints.len());
+        let mut previous_idx = None;
+        let mut backoff = self.reconnect_policy.initial_backoff();
+        let mut attempts = 0usize;
+        let mut last_error = None;
+
+        while !stop.load(Ordering::Acquire)
+            && deadline.is_none_or(|deadline| Instant::now() < deadline)
+        {
+            attempts += 1;
+            match connect_qwp_ws_endpoint_round(
+                &endpoints,
+                &mut tracker,
+                &mut previous_idx,
+                self.use_tls,
+                self.tls_settings.clone(),
+                &self.qwp_ws,
+                self.auth_header.as_deref(),
+            ) {
+                Ok(connected) => {
+                    return Ok(Some(BlockingQwpWsTransport::from_connected(
+                        Arc::clone(&endpoints),
+                        tracker,
+                        self.use_tls,
+                        self.tls_settings.clone(),
+                        self.qwp_ws.clone(),
+                        self.auth_header.clone(),
+                        connected,
+                    )));
+                }
+                Err(err) if reconnect_error_is_terminal(&err) => return Err(err),
+                Err(err) => {
+                    let role_reject = is_qwp_ws_role_reject_error(&err);
+                    last_error = Some(err);
+                    let sleep_for = reconnect_sleep_duration(
+                        role_reject,
+                        self.reconnect_policy.initial_backoff(),
+                        backoff,
+                    );
+                    if !sleep_before_runner_reconnect(deadline, sleep_for, stop) {
+                        break;
+                    }
+                    backoff = if role_reject {
+                        self.reconnect_policy.initial_backoff()
+                    } else {
+                        double_duration(backoff).min(self.reconnect_policy.max_backoff())
+                    };
+                }
+            }
+        }
+
+        if stop.load(Ordering::Acquire) {
+            Ok(None)
+        } else {
+            Err(retry_budget_exhausted_error(
+                "QWP/WebSocket async initial connect",
+                attempts,
+                started,
+                last_error,
+            ))
+        }
+    }
+}
+
+impl SyncQwpWsPendingRunnerCore {
+    fn drive_step<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        stop: &AtomicBool,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        if let Some(connected) = self.connected.as_mut() {
+            return connected.drive_step(shared, stop);
+        }
+
+        match self.pending_connect.connect_with_retry(stop) {
+            Ok(Some(transport)) => {
+                let send_core = QwpWsSendCore::new(
+                    transport,
+                    self.pending_connect.max_in_flight,
+                    self.pending_connect.reconnect_policy,
+                );
+                self.connected = Some(SyncQwpWsRunnerCore {
+                    send_core,
+                    backpressure: Arc::clone(&self.backpressure),
+                    lifecycle: self.lifecycle.clone(),
+                });
+                RunnerStep::Continue
+            }
+            Ok(None) => RunnerStep::Stop,
+            Err(err) => {
+                let mut store = match shared.lock() {
+                    Ok(store) => store,
+                    Err(_) => return RunnerStep::Stop,
+                };
+                store.mark_terminal(Some(err));
+                self.backpressure.notify_all();
+                RunnerStep::Stop
+            }
         }
     }
 }
@@ -1608,19 +1811,24 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
         )
     })?;
 
-    read_upgrade_response(stream, &key_b64, request_durable_ack)
+    read_upgrade_response(stream, &key_b64, max_version, request_durable_ack)
 }
 
 fn read_upgrade_response<R: Read>(
     stream: &mut R,
     key_b64: &str,
+    max_version: u32,
     request_durable_ack: bool,
 ) -> crate::Result<(u8, Vec<u8>)> {
     let (header_block, leftover) = read_http_header_block(stream)?;
     let parsed = codec::parse_http_header_block(&header_block)?;
     let expected_accept = codec::compute_accept(key_b64);
-    let negotiated_version =
-        codec::validate_upgrade_response(&parsed, &expected_accept, request_durable_ack)?;
+    let negotiated_version = codec::validate_upgrade_response(
+        &parsed,
+        &expected_accept,
+        max_version,
+        request_durable_ack,
+    )?;
     Ok((negotiated_version, leftover))
 }
 
@@ -1742,6 +1950,188 @@ fn connect_tcp_to_any_addr(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QwpWsHostState {
+    Healthy,
+    HealthUnknown,
+    TransientReject,
+    FailedThisRound,
+    RoleRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QwpWsZoneTier {
+    Same,
+    Unknown,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QwpWsHostHealthTracker {
+    states: Vec<QwpWsHostState>,
+    attempted_this_round: Vec<bool>,
+    zone_tiers: Vec<QwpWsZoneTier>,
+    last_success_epoch: Vec<u64>,
+    success_epoch: u64,
+}
+
+impl QwpWsHostHealthTracker {
+    pub(super) fn new(host_count: usize) -> Self {
+        assert!(host_count > 0, "host_count must be > 0");
+        Self {
+            states: vec![QwpWsHostState::HealthUnknown; host_count],
+            attempted_this_round: vec![false; host_count],
+            zone_tiers: vec![QwpWsZoneTier::Same; host_count],
+            last_success_epoch: vec![0; host_count],
+            success_epoch: 0,
+        }
+    }
+
+    pub(super) fn begin_round(&mut self, forget_classifications: bool) {
+        let mut sticky_idx = None;
+        if forget_classifications {
+            let mut best_epoch = 0;
+            for idx in 0..self.states.len() {
+                if self.states[idx] == QwpWsHostState::Healthy
+                    && self.zone_tiers[idx] == QwpWsZoneTier::Same
+                    && self.last_success_epoch[idx] > best_epoch
+                {
+                    best_epoch = self.last_success_epoch[idx];
+                    sticky_idx = Some(idx);
+                }
+            }
+        }
+
+        self.attempted_this_round.fill(false);
+        if forget_classifications {
+            for idx in 0..self.states.len() {
+                if Some(idx) != sticky_idx {
+                    self.states[idx] = QwpWsHostState::HealthUnknown;
+                }
+            }
+        }
+    }
+
+    pub(super) fn is_round_exhausted(&self) -> bool {
+        self.attempted_this_round.iter().all(|attempted| *attempted)
+    }
+
+    pub(super) fn pick_next(&self) -> Option<usize> {
+        const STATE_ORDER: [QwpWsHostState; 5] = [
+            QwpWsHostState::Healthy,
+            QwpWsHostState::HealthUnknown,
+            QwpWsHostState::TransientReject,
+            QwpWsHostState::FailedThisRound,
+            QwpWsHostState::RoleRejected,
+        ];
+        const ZONE_ORDER: [QwpWsZoneTier; 3] = [
+            QwpWsZoneTier::Same,
+            QwpWsZoneTier::Unknown,
+            QwpWsZoneTier::Other,
+        ];
+        for state in STATE_ORDER {
+            for zone in ZONE_ORDER {
+                for idx in 0..self.states.len() {
+                    if !self.attempted_this_round[idx]
+                        && self.states[idx] == state
+                        && self.zone_tiers[idx] == zone
+                    {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn record_success(&mut self, idx: usize) {
+        self.states[idx] = QwpWsHostState::Healthy;
+        self.attempted_this_round[idx] = true;
+        self.success_epoch = self.success_epoch.saturating_add(1);
+        self.last_success_epoch[idx] = self.success_epoch;
+    }
+
+    pub(super) fn record_transport_error(&mut self, idx: usize) {
+        self.states[idx] = QwpWsHostState::FailedThisRound;
+        self.attempted_this_round[idx] = true;
+    }
+
+    pub(super) fn record_role_reject(&mut self, idx: usize, transient: bool) {
+        self.states[idx] = if transient {
+            QwpWsHostState::TransientReject
+        } else {
+            QwpWsHostState::RoleRejected
+        };
+        self.attempted_this_round[idx] = true;
+    }
+
+    pub(super) fn record_mid_stream_failure(&mut self, idx: usize) {
+        if self.states[idx] == QwpWsHostState::Healthy {
+            self.states[idx] = QwpWsHostState::FailedThisRound;
+        }
+    }
+
+    pub(super) fn record_zone(&mut self, _idx: usize, _zone: Option<&str>) {
+        // Rust is still client-zone-blind, which matches the spec's zone-unset
+        // path: every endpoint remains in the Same tier.
+    }
+}
+
+pub(super) struct QwpWsConnectRoundSuccess {
+    pub(super) endpoint_idx: usize,
+    pub(super) stream: WsStream,
+    pub(super) negotiated_version: u8,
+    pub(super) leftover: Vec<u8>,
+}
+
+pub(super) fn qwp_ws_configured_endpoints(
+    host: &str,
+    port: &str,
+    qwp_ws: &QwpWsConfig,
+) -> Arc<[QwpWsEndpoint]> {
+    if qwp_ws.endpoints.is_empty() {
+        Arc::from([QwpWsEndpoint::new(host.to_string(), port.to_string())])
+    } else {
+        Arc::from(qwp_ws.endpoints.to_vec())
+    }
+}
+
+pub(crate) fn is_qwp_ws_role_reject_error(err: &crate::Error) -> bool {
+    err.qwp_ws_role_reject().is_some()
+}
+
+fn qwp_ws_role_reject_is_transient(err: &crate::Error) -> bool {
+    err.qwp_ws_role_reject()
+        .is_some_and(|role_reject| role_reject.is_transient())
+}
+
+fn qwp_ws_role_reject_zone(err: &crate::Error) -> Option<&str> {
+    err.qwp_ws_role_reject()
+        .and_then(|role_reject| role_reject.zone.as_deref())
+}
+
+fn qwp_ws_all_endpoints_unreachable_error(
+    endpoints: &[QwpWsEndpoint],
+    last_endpoint_idx: Option<usize>,
+    last_error: Option<crate::Error>,
+) -> crate::Error {
+    match (last_endpoint_idx, last_error) {
+        (Some(idx), Some(err)) => error::fmt!(
+            SocketError,
+            "QWP/WebSocket all endpoints unreachable; last endpoint {}:{} failed: {}",
+            endpoints[idx].host,
+            endpoints[idx].port,
+            err
+        ),
+        (_, Some(err)) => error::fmt!(
+            SocketError,
+            "QWP/WebSocket all endpoints unreachable; last error: {}",
+            err
+        ),
+        _ => error::fmt!(SocketError, "QWP/WebSocket all endpoints unreachable"),
+    }
+}
+
 /// Establish a fresh QWP/WebSocket connection: TCP → optional TLS → HTTP
 /// upgrade. Returns the connected stream, the version the server picked, and any
 /// WebSocket bytes read after the HTTP upgrade response.
@@ -1815,6 +2205,103 @@ pub(crate) fn establish_connection(
     Ok((stream, negotiated_version, leftover))
 }
 
+pub(super) fn connect_qwp_ws_endpoint_round(
+    endpoints: &Arc<[QwpWsEndpoint]>,
+    tracker: &mut QwpWsHostHealthTracker,
+    previous_idx: &mut Option<usize>,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<&str>,
+) -> crate::Result<QwpWsConnectRoundSuccess> {
+    if let Some(idx) = previous_idx.take() {
+        tracker.record_mid_stream_failure(idx);
+    }
+    if tracker.is_round_exhausted() {
+        tracker.begin_round(true);
+    }
+
+    let mut last_endpoint_idx = None;
+    let mut last_error = None;
+    let mut role_reject_error = None;
+    let mut role_reject_count = 0usize;
+    let mut latched_typed_error = None;
+
+    while let Some(idx) = tracker.pick_next() {
+        last_endpoint_idx = Some(idx);
+        let endpoint = &endpoints[idx];
+        match establish_connection(
+            &endpoint.host,
+            &endpoint.port,
+            use_tls,
+            tls_settings.clone(),
+            qwp_ws,
+            auth_header,
+        ) {
+            Ok((stream, negotiated_version, leftover)) => {
+                tracker.record_success(idx);
+                *previous_idx = Some(idx);
+                return Ok(QwpWsConnectRoundSuccess {
+                    endpoint_idx: idx,
+                    stream,
+                    negotiated_version,
+                    leftover,
+                });
+            }
+            Err(err) if err.code() == crate::ErrorCode::AuthError => return Err(err),
+            Err(err) if is_qwp_ws_role_reject_error(&err) => {
+                role_reject_count += 1;
+                let role_reject = err.qwp_ws_role_reject().cloned();
+                tracker.record_zone(idx, qwp_ws_role_reject_zone(&err));
+                tracker.record_role_reject(idx, qwp_ws_role_reject_is_transient(&err));
+                let mut err = error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket role mismatch at {}:{}: {}",
+                    endpoint.host,
+                    endpoint.port,
+                    err
+                );
+                if let Some(role_reject) = role_reject {
+                    err = err.with_qwp_ws_role_reject(role_reject);
+                }
+                role_reject_error = Some(err);
+            }
+            Err(err) => {
+                tracker.record_transport_error(idx);
+                if err.code() == crate::ErrorCode::ProtocolVersionError {
+                    latched_typed_error = Some(err.clone());
+                }
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if let Some(err) = latched_typed_error {
+        return Err(err);
+    }
+    if *qwp_ws.request_durable_ack && role_reject_count == endpoints.len() {
+        let role_reject = role_reject_error
+            .as_ref()
+            .and_then(|err| err.qwp_ws_role_reject().cloned());
+        let mut err = error::fmt!(
+            ProtocolVersionError,
+            "WebSocket upgrade failed: server did not enable durable ACK; all endpoints rejected by role"
+        );
+        if let Some(role_reject) = role_reject {
+            err = err.with_qwp_ws_role_reject(role_reject);
+        }
+        return Err(err);
+    }
+    if let Some(err) = role_reject_error {
+        return Err(err);
+    }
+    Err(qwp_ws_all_endpoints_unreachable_error(
+        endpoints,
+        last_endpoint_idx,
+        last_error,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_qwp_ws(
     host: &str,
@@ -1832,9 +2319,36 @@ pub(crate) fn connect_qwp_ws(
         qwp_ws,
         auth_header.clone(),
     );
-    let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
-    let negotiated_version = publisher.version();
-    let runner = SyncQwpWsRunner::start_with_append_deadline(publisher, *qwp_ws.sf_append_deadline);
+    let (runner, negotiated_version) =
+        if *qwp_ws.initial_connect_retry == QwpWsInitialConnectMode::Async {
+            let queue = open_configured_qwp_ws_queue(qwp_ws)?;
+            let pending_connect = QwpWsPendingConnect::new(
+                host,
+                port,
+                use_tls,
+                tls_settings,
+                qwp_ws,
+                auth_header,
+                queue.max_in_flight(),
+            );
+            (
+                SyncQwpWsRunner::start_pending_connect(
+                    queue,
+                    pending_connect,
+                    *qwp_ws.request_durable_ack,
+                    *qwp_ws.sf_append_deadline,
+                ),
+                1,
+            )
+        } else {
+            let publisher =
+                open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+            let negotiated_version = publisher.version();
+            (
+                SyncQwpWsRunner::start_with_append_deadline(publisher, *qwp_ws.sf_append_deadline),
+                negotiated_version,
+            )
+        };
     let orphan_candidates = orphan_candidates(qwp_ws);
     let orphan_pool = OrphanDrainerPool::start(
         orphan_candidates,
@@ -1928,24 +2442,25 @@ fn connect_blocking_transport(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<BlockingQwpWsTransport> {
-    if *qwp_ws.initial_connect_retry {
-        connect_blocking_transport_with_retry(
-            host,
-            port,
-            use_tls,
-            tls_settings,
-            qwp_ws,
-            auth_header,
-        )
-    } else {
-        BlockingQwpWsTransport::connect(
+    match *qwp_ws.initial_connect_retry {
+        QwpWsInitialConnectMode::Off => BlockingQwpWsTransport::connect(
             host,
             port,
             use_tls,
             tls_settings,
             qwp_ws.clone(),
             auth_header,
-        )
+        ),
+        QwpWsInitialConnectMode::Sync | QwpWsInitialConnectMode::Async => {
+            connect_blocking_transport_with_retry(
+                host,
+                port,
+                use_tls,
+                tls_settings,
+                qwp_ws,
+                auth_header,
+            )
+        }
     }
 }
 
@@ -1957,45 +2472,76 @@ fn connect_blocking_transport_with_retry(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<BlockingQwpWsTransport> {
-    let deadline = Instant::now().checked_add(*qwp_ws.reconnect_max_duration);
+    let started = Instant::now();
+    let deadline = started.checked_add(*qwp_ws.reconnect_max_duration);
+    let endpoints = qwp_ws_configured_endpoints(host, port, qwp_ws);
+    let mut tracker = QwpWsHostHealthTracker::new(endpoints.len());
+    let mut previous_idx = None;
     let mut attempts = 0usize;
     let mut backoff = *qwp_ws.reconnect_initial_backoff;
     let mut last_error = None;
 
     while deadline.is_none_or(|deadline| Instant::now() < deadline) {
         attempts += 1;
-        match BlockingQwpWsTransport::connect(
-            host,
-            port,
+        match connect_qwp_ws_endpoint_round(
+            &endpoints,
+            &mut tracker,
+            &mut previous_idx,
             use_tls,
             tls_settings.clone(),
-            qwp_ws.clone(),
-            auth_header.clone(),
+            qwp_ws,
+            auth_header.as_deref(),
         ) {
-            Ok(transport) => return Ok(transport),
+            Ok(connected) => {
+                return Ok(BlockingQwpWsTransport::from_connected(
+                    Arc::clone(&endpoints),
+                    tracker,
+                    use_tls,
+                    tls_settings,
+                    qwp_ws.clone(),
+                    auth_header,
+                    connected,
+                ));
+            }
             Err(err) if reconnect_error_is_terminal(&err) => return Err(err),
-            Err(err) => last_error = Some(err),
-        }
+            Err(err) => {
+                let role_reject = is_qwp_ws_role_reject_error(&err);
+                last_error = Some(err);
 
-        let Some(deadline) = deadline else {
-            thread::sleep(backoff);
-            backoff = double_duration(backoff).min(*qwp_ws.reconnect_max_backoff);
-            continue;
-        };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+                let sleep_for = reconnect_sleep_duration(
+                    role_reject,
+                    *qwp_ws.reconnect_initial_backoff,
+                    backoff,
+                );
+                let Some(deadline) = deadline else {
+                    thread::sleep(sleep_for);
+                    backoff = if role_reject {
+                        *qwp_ws.reconnect_initial_backoff
+                    } else {
+                        double_duration(backoff).min(*qwp_ws.reconnect_max_backoff)
+                    };
+                    continue;
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                thread::sleep(sleep_for.min(remaining));
+                backoff = if role_reject {
+                    *qwp_ws.reconnect_initial_backoff
+                } else {
+                    double_duration(backoff).min(*qwp_ws.reconnect_max_backoff)
+                };
+            }
         }
-        thread::sleep(backoff.min(remaining));
-        backoff = double_duration(backoff).min(*qwp_ws.reconnect_max_backoff);
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        error::fmt!(
-            SocketError,
-            "QWP/WebSocket initial connect retry budget exhausted after {attempts} attempts"
-        )
-    }))
+    Err(retry_budget_exhausted_error(
+        "QWP/WebSocket initial connect",
+        attempts,
+        started,
+        last_error,
+    ))
 }
 
 // ---------- send / receive ----------
@@ -2282,6 +2828,71 @@ mod tests {
             max_in_flight,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn host_tracker_picks_by_state_zone_then_configured_order() {
+        let mut tracker = QwpWsHostHealthTracker::new(3);
+        tracker.zone_tiers[0] = QwpWsZoneTier::Other;
+        tracker.zone_tiers[1] = QwpWsZoneTier::Same;
+        tracker.zone_tiers[2] = QwpWsZoneTier::Unknown;
+
+        assert_eq!(tracker.pick_next(), Some(1));
+        tracker.record_transport_error(1);
+        assert_eq!(tracker.pick_next(), Some(2));
+        tracker.record_transport_error(2);
+        assert_eq!(tracker.pick_next(), Some(0));
+    }
+
+    #[test]
+    fn host_tracker_demotes_midstream_failure_without_marking_attempted() {
+        let mut tracker = QwpWsHostHealthTracker::new(2);
+        tracker.record_success(0);
+        tracker.begin_round(true);
+
+        tracker.record_mid_stream_failure(0);
+
+        assert_eq!(tracker.states[0], QwpWsHostState::FailedThisRound);
+        assert!(!tracker.attempted_this_round[0]);
+        assert_eq!(tracker.pick_next(), Some(1));
+    }
+
+    #[test]
+    fn host_tracker_round_reset_preserves_only_latest_same_zone_healthy_state() {
+        let mut tracker = QwpWsHostHealthTracker::new(4);
+        tracker.record_success(0);
+        tracker.record_success(2);
+        tracker.record_success(1);
+        tracker.zone_tiers[1] = QwpWsZoneTier::Other;
+        tracker.record_role_reject(3, false);
+
+        tracker.begin_round(true);
+
+        assert_eq!(tracker.states[0], QwpWsHostState::HealthUnknown);
+        assert_eq!(tracker.states[1], QwpWsHostState::HealthUnknown);
+        assert_eq!(tracker.states[2], QwpWsHostState::Healthy);
+        assert_eq!(tracker.states[3], QwpWsHostState::HealthUnknown);
+        assert_eq!(tracker.pick_next(), Some(2));
+    }
+
+    #[test]
+    fn role_reject_helpers_use_structured_error_not_message_prefix() {
+        let string_only = crate::Error::new(
+            crate::ErrorCode::SocketError,
+            "QWP/WebSocket upgrade rejected by role=PRIMARY_CATCHUP zone=az-a",
+        );
+        assert!(!is_qwp_ws_role_reject_error(&string_only));
+        assert!(!qwp_ws_role_reject_is_transient(&string_only));
+        assert_eq!(qwp_ws_role_reject_zone(&string_only), None);
+
+        let structured = crate::Error::new(crate::ErrorCode::SocketError, "unrelated message")
+            .with_qwp_ws_role_reject(crate::ingress::QwpWsRoleReject::new(
+                "primary_catchup",
+                Some("az-a"),
+            ));
+        assert!(is_qwp_ws_role_reject_error(&structured));
+        assert!(qwp_ws_role_reject_is_transient(&structured));
+        assert_eq!(qwp_ws_role_reject_zone(&structured), Some("az-a"));
     }
 
     #[test]

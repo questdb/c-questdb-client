@@ -157,8 +157,31 @@ pub(crate) fn is_valid_qwp_ws_sender_id(sender_id: &str) -> bool {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QwpWsEndpoint {
+    pub(crate) host: String,
+    pub(crate) port: String,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsEndpoint {
+    pub(crate) fn new(host: String, port: String) -> Self {
+        Self { host, port }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwpWsInitialConnectMode {
+    Off,
+    Sync,
+    Async,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone)]
 pub(crate) struct QwpWsConfig {
+    pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
     pub(crate) connect_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
@@ -176,9 +199,9 @@ pub(crate) struct QwpWsConfig {
     pub(crate) reconnect_initial_backoff: ConfigSetting<std::time::Duration>,
     /// Cap on the per-attempt reconnect delay.
     pub(crate) reconnect_max_backoff: ConfigSetting<std::time::Duration>,
-    /// Whether the initial connect should use the reconnect policy. Default
-    /// false, matching Java's fail-fast startup behavior.
-    pub(crate) initial_connect_retry: ConfigSetting<bool>,
+    /// Initial-connect retry mode. Default is fail-fast after one endpoint
+    /// round, matching Java's startup behavior.
+    pub(crate) initial_connect_retry: ConfigSetting<QwpWsInitialConnectMode>,
     /// Bounded wait used by Sender::close_drain().
     pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
@@ -196,6 +219,7 @@ pub(crate) struct QwpWsConfig {
 impl Default for QwpWsConfig {
     fn default() -> Self {
         Self {
+            endpoints: ConfigSetting::new_default(Vec::new()),
             connect_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
             auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
@@ -211,7 +235,7 @@ impl Default for QwpWsConfig {
                 std::time::Duration::from_millis(100),
             ),
             reconnect_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
-            initial_connect_retry: ConfigSetting::new_default(false),
+            initial_connect_retry: ConfigSetting::new_default(QwpWsInitialConnectMode::Off),
             close_flush_timeout: ConfigSetting::new_default(QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT),
             sf_dir: ConfigSetting::new_default(None),
             sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),

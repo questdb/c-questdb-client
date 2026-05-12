@@ -29,6 +29,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -304,6 +306,28 @@ fn upgrade_mock_stream_with_durable_ack(
          Sec-WebSocket-Accept: {accept}\r\n\
          X-QWP-Version: 1\r\n\
          {durable_ack_header}\
+         \r\n"
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+    request_lines
+}
+
+fn upgrade_mock_stream_with_version(stream: &mut TcpStream, version: u8) -> Vec<String> {
+    let req_bytes = read_request_until_blank(stream).unwrap();
+    let req = String::from_utf8_lossy(&req_bytes).to_string();
+    let request_lines: Vec<String> = req
+        .split("\r\n")
+        .take_while(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
+    let accept = compute_accept(&key);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         X-QWP-Version: {version}\r\n\
          \r\n"
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -698,6 +722,49 @@ fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8
     (port, rx, release_tx)
 }
 
+fn spawn_role_reject_upgrade_server(
+    expected_attempts: usize,
+    role: &'static str,
+) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        let mut attempts = 0usize;
+        while attempts < expected_attempts && started.elapsed() < Duration::from_secs(5) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = read_request_until_blank(&mut stream).unwrap();
+                    let response = format!(
+                        "HTTP/1.1 421 Misdirected Request\r\n\
+                         Connection: close\r\n\
+                         Content-Length: 0\r\n\
+                         X-QuestDB-Role: {role}\r\n\
+                         \r\n"
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("role-reject listener failed: {err}"),
+            }
+        }
+        attempts
+    });
+
+    (port, handle)
+}
+
 fn slot_has_sfa_file(slot_dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(slot_dir) else {
         return false;
@@ -709,6 +776,32 @@ fn slot_has_sfa_file(slot_dir: &Path) -> bool {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with(".sfa"))
     })
+}
+
+fn seed_orphan_slot(sf_dir: &Path) {
+    let seed_port = spawn_upgrade_only_server();
+    let seed_conf = format!(
+        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.display()
+    );
+    let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut seed_buf = seed_sender.new_buffer();
+    seed_buf
+        .table("orphaned")
+        .unwrap()
+        .symbol("src", "old")
+        .unwrap()
+        .column_i64("value", 42)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    seed_sender.flush(&mut seed_buf).unwrap();
+    drop(seed_sender);
 }
 
 // ---------- tests ----------
@@ -1427,6 +1520,81 @@ fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     assert!(!slot_has_sfa_file(&orphan_slot));
     assert!(!sf_dir.path().join("primary").join(".failed").exists());
     assert!(!orphan_slot.join(".failed").exists());
+}
+
+#[test]
+fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bad_port = bad_listener.local_addr().unwrap().port();
+    drop(bad_listener);
+    let (port, rx) = spawn_manual_orphan_drain_server();
+    let drain_conf = format!(
+        "qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut orphan_payload = None;
+    for _ in 0..20 {
+        let _ = sender.drive_once().unwrap();
+        if let Ok(payload) = rx.try_recv() {
+            orphan_payload = Some(payload);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        !orphan_payload
+            .expect("orphan payload was not replayed")
+            .is_empty()
+    );
+    assert!(!sf_dir.path().join("orphan").join(".failed").exists());
+}
+
+#[test]
+fn qwp_ws_manual_orphan_drainer_role_reject_tries_next_endpoint() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let (reject_port, reject_handle) = spawn_role_reject_upgrade_server(2, "REPLICA");
+    let (port, rx) = spawn_manual_orphan_drain_server();
+    let drain_conf = format!(
+        "qwpws::addr=127.0.0.1:{reject_port},127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut orphan_payload = None;
+    for _ in 0..20 {
+        let _ = sender.drive_once().unwrap();
+        if let Ok(payload) = rx.try_recv() {
+            orphan_payload = Some(payload);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        !orphan_payload
+            .expect("orphan payload was not replayed")
+            .is_empty()
+    );
+    assert_eq!(reject_handle.join().unwrap(), 2);
+    assert!(!sf_dir.path().join("orphan").join(".failed").exists());
 }
 
 #[test]
@@ -2418,6 +2586,57 @@ fn qwp_ws_sync_reconnects_and_replays() {
 }
 
 #[test]
+fn qwp_ws_midstream_failure_reconnects_to_next_endpoint() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let first_tx = tx.clone();
+    thread::spawn(move || {
+        let (mut stream, _) = first_listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        first_tx.send(payload).unwrap();
+        drop(stream);
+    });
+
+    thread::spawn(move || {
+        let (mut stream, _) = second_listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        tx.send(payload).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;\
+         reconnect_max_duration_millis=5000;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame1 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame1[0..4], b"QWP1");
+    assert_eq!(frame1, frame2);
+}
+
+#[test]
 fn qwp_ws_sync_reconnect_retries_failed_attempt() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -2579,6 +2798,478 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
 }
 
 #[test]
+fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
+    let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bad_port = bad_listener.local_addr().unwrap().port();
+    drop(bad_listener);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let good_port = listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        payload_tx.send(payload).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!("qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{good_port};");
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_initial_connect_role_reject_tries_next_endpoint() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = first_listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = read_request_until_blank(&mut stream).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 421 Misdirected Request\r\n\
+                  Connection: close\r\n\
+                  Content-Length: 0\r\n\
+                  X-QuestDB-Role: PRIMARY_CATCHUP\r\n\
+                  \r\n",
+            )
+            .unwrap();
+    });
+
+    thread::spawn(move || {
+        let (mut stream, _) = second_listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        payload_tx.send(payload).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_initial_connect_retryable_status_tries_next_endpoint() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = first_listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = read_request_until_blank(&mut stream).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\n\
+                  Connection: close\r\n\
+                  Content-Length: 0\r\n\
+                  \r\n",
+            )
+            .unwrap();
+    });
+
+    thread::spawn(move || {
+        let (mut stream, _) = second_listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        payload_tx.send(payload).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = first_listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = upgrade_mock_stream_with_version(&mut stream, 2);
+    });
+
+    thread::spawn(move || {
+        let (mut stream, _) = second_listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        payload_tx.send(payload).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!("qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};");
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_initial_connect_durable_ack_mismatch_tries_next_endpoint() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = first_listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = upgrade_mock_stream_with_durable_ack(&mut stream, false);
+    });
+
+    thread::spawn(move || {
+        let (mut stream, _) = second_listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = upgrade_mock_stream_with_durable_ack(&mut stream, true);
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        payload_tx.send(payload).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        write_qwp_durable_ack_response(&mut stream, &[]).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         request_durable_ack=on;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_terminalize() {
+    let (first_port, first_handle) = spawn_role_reject_upgrade_server(1, "REPLICA");
+    let (second_port, second_handle) = spawn_role_reject_upgrade_server(1, "REPLICA");
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         request_durable_ack=on;\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=100;\
+         reconnect_max_backoff_millis=100;\
+         reconnect_max_duration_millis=500;"
+    );
+    let err = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.code(), ErrorCode::ProtocolVersionError);
+    assert!(
+        err.msg().contains("server did not enable durable ACK"),
+        "got: {}",
+        err.msg()
+    );
+    assert_eq!(first_handle.join().unwrap(), 1);
+    assert_eq!(second_handle.join().unwrap(), 1);
+}
+
+#[test]
+fn qwp_ws_sync_initial_retry_budget_exhaustion_reports_context() {
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=10;\
+         reconnect_max_duration_millis=1;"
+    );
+    let err = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(err.msg().contains("attempts=1"), "got: {}", err.msg());
+    assert!(err.msg().contains("elapsed_ms="), "got: {}", err.msg());
+    assert!(
+        err.msg()
+            .contains("last_error=QWP/WebSocket all endpoints unreachable"),
+        "got: {}",
+        err.msg()
+    );
+}
+
+#[test]
+fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    first_listener.set_nonblocking(true).unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    second_listener.set_nonblocking(true).unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+
+    let first_attempts = Arc::new(AtomicUsize::new(0));
+    let second_attempts = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let (payload_tx, payload_rx) = mpsc::channel();
+    let first_attempts_thread = Arc::clone(&first_attempts);
+    let done_first_thread = Arc::clone(&done);
+    let first_thread = thread::spawn(move || {
+        while !done_first_thread.load(Ordering::Acquire) {
+            match first_listener.accept() {
+                Ok((mut stream, _)) => {
+                    let attempt = first_attempts_thread.fetch_add(1, Ordering::AcqRel) + 1;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    if attempt == 1 {
+                        let _ = read_request_until_blank(&mut stream).unwrap();
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 421 Misdirected Request\r\n\
+                                  Connection: close\r\n\
+                                  Content-Length: 0\r\n\
+                                  X-QuestDB-Role: REPLICA\r\n\
+                                  \r\n",
+                            )
+                            .unwrap();
+                    } else {
+                        perform_server_upgrade(&mut stream).unwrap();
+                        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+                        payload_tx.send(payload).unwrap();
+                        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+                        thread::sleep(Duration::from_millis(50));
+                        done_first_thread.store(true, Ordering::Release);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("first listener failed: {err}"),
+            }
+        }
+    });
+
+    let second_attempts_thread = Arc::clone(&second_attempts);
+    let done_second_thread = Arc::clone(&done);
+    let second_thread = thread::spawn(move || {
+        while !done_second_thread.load(Ordering::Acquire) {
+            match second_listener.accept() {
+                Ok((mut stream, _)) => {
+                    second_attempts_thread.fetch_add(1, Ordering::AcqRel);
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = read_request_until_blank(&mut stream).unwrap();
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\n\
+                              Connection: close\r\n\
+                              Content-Length: 0\r\n\
+                              \r\n",
+                        )
+                        .unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("second listener failed: {err}"),
+            }
+        }
+    });
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=100;\
+         reconnect_max_backoff_millis=100;\
+         reconnect_max_duration_millis=5000;"
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+    done.store(true, Ordering::Release);
+    first_thread.join().unwrap();
+    second_thread.join().unwrap();
+    assert_eq!(first_attempts.load(Ordering::Acquire), 2);
+    assert_eq!(second_attempts.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn qwp_ws_async_initial_connect_background_can_flush() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+        payload_tx.send(payload).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let conf = format!("qwpws::addr=127.0.0.1:{port};initial_connect_retry=async;");
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_async_initial_connect_rejects_manual_progress() {
+    let conf = "qwpws::addr=127.0.0.1:1;\
+                initial_connect_retry=async;\
+                qwp_ws_progress=manual;";
+    let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
+    assert!(
+        err.msg().contains("initial_connect_retry=async")
+            && err.msg().contains("background progress"),
+        "got: {}",
+        err.msg()
+    );
+}
+
+#[test]
 fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     // Just exercises the parser surface: every new key is accepted. Building
     // would also work but isn't necessary for parser coverage.
@@ -2602,13 +3293,47 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     let conf_false = "qwpws::addr=localhost:9000;initial_connect_retry=false;";
     SenderBuilder::from_conf(conf_false).unwrap();
 
-    let unsupported = "qwpws::addr=localhost:9000;initial_connect_retry=async;";
-    let err = SenderBuilder::from_conf(unsupported).unwrap_err();
+    let conf_multi = "qwpws::addr=localhost:9000, localhost:9001;addr=localhost:9002;";
+    SenderBuilder::from_conf(conf_multi).unwrap();
+
+    let duplicate = "qwpws::addr=localhost:9000,localhost:9000;";
+    let err = SenderBuilder::from_conf(duplicate).unwrap_err();
+    assert!(err.msg().contains("duplicate"), "got: {}", err.msg());
+
+    let duplicate_effective_port = "qwpws::addr=localhost:9000,localhost:09000;";
+    let err = SenderBuilder::from_conf(duplicate_effective_port).unwrap_err();
     assert!(
-        err.msg().contains("initial_connect_retry=async") && err.msg().contains("not supported"),
+        err.msg().contains("duplicate") && err.msg().contains("localhost:9000"),
         "got: {}",
         err.msg()
     );
+
+    let empty_entry = "qwpws::addr=localhost:9000,,localhost:9001;";
+    let err = SenderBuilder::from_conf(empty_entry).unwrap_err();
+    assert!(err.msg().contains("empty entry"), "got: {}", err.msg());
+
+    let empty_host = "qwpws::addr=:9000;";
+    let err = SenderBuilder::from_conf(empty_host).unwrap_err();
+    assert!(err.msg().contains("empty host"), "got: {}", err.msg());
+
+    let invalid_port = "qwpws::addr=localhost:notaport;";
+    let err = SenderBuilder::from_conf(invalid_port).unwrap_err();
+    assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
+
+    let zero_port = "qwpws::addr=localhost:0;";
+    let err = SenderBuilder::from_conf(zero_port).unwrap_err();
+    assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
+
+    let repeated_tcp_addr = "tcp::addr=localhost:9009;addr=localhost:9010;";
+    let err = SenderBuilder::from_conf(repeated_tcp_addr).unwrap_err();
+    assert!(
+        err.msg().contains("DuplicateKey") || err.msg().contains("duplicate"),
+        "got: {}",
+        err.msg()
+    );
+
+    let conf_async = "qwpws::addr=localhost:9000;initial_connect_retry=async;";
+    SenderBuilder::from_conf(conf_async).unwrap();
 
     let bad = "qwpws::addr=localhost:9000;initial_connect_retry=maybe;";
     let err = SenderBuilder::from_conf(bad).unwrap_err();

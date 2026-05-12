@@ -64,6 +64,8 @@ mod qwp_ws_sfa_queue;
 mod qwp_ws_sfa_slot;
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
+#[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;
 
 #[cfg(all(test, feature = "sync-sender-qwp-ws"))]

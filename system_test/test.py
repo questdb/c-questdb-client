@@ -1457,11 +1457,23 @@ class QwpWsTestSupport:
             'DEDUP UPSERT KEYS(ts, id)')
 
     @staticmethod
-    def _sender_conf(sender_id, sf_dir, port=None, scheme='qwpws', host=None, **settings):
+    def _sender_conf(
+            sender_id,
+            sf_dir,
+            port=None,
+            scheme='qwpws',
+            host=None,
+            endpoints=None,
+            **settings):
         host = QDB_FIXTURE.host if host is None else host
         port = QDB_FIXTURE.http_server_port if port is None else port
+        if endpoints is None:
+            endpoints = [(host, port)]
+        addr = ','.join(
+            f'{endpoint_host}:{endpoint_port}'
+            for endpoint_host, endpoint_port in endpoints)
         conf = [
-            f'{scheme}::addr={host}:{port};',
+            f'{scheme}::addr={addr};',
             f'sender_id={sender_id};',
             f'sf_dir={sf_dir};']
         for key, value in settings.items():
@@ -1511,6 +1523,12 @@ class QwpWsTestSupport:
 
     def _write_row(self, sender, table_name, row_id):
         self._write_rows(sender, table_name, row_id, 1)
+
+    @staticmethod
+    def _unused_tcp_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            return sock.getsockname()[1]
 
     @staticmethod
     def _sfa_file_count(sf_dir, sender_id):
@@ -1739,7 +1757,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
         if QDB_FIXTURE.http:
             self.skipTest('QWP/WebSocket protocol tests run outside the HTTP ILP matrix')
 
-    def _connect_protocol_sender(self, sender_id, sf_dir, **settings):
+    def _connect_protocol_sender(self, sender_id, sf_dir, endpoints=None, **settings):
         conf_settings = {
             'reconnect_max_duration_millis': 30000,
             'close_flush_timeout_millis': 30000,
@@ -1748,7 +1766,45 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
         return self._connect_sender(self._sender_conf(
             sender_id,
             sf_dir,
+            endpoints=endpoints,
             **conf_settings))
+
+    def test_initial_connect_skips_dead_endpoint_and_ack_progresses(self):
+        table_name = 'qwp_ws_failover_' + uuid.uuid4().hex[:8]
+        self._create_qwp_ws_table(table_name)
+        sender_id = 'proto-failover-' + uuid.uuid4().hex[:8]
+        dead_port = self._unused_tcp_port()
+        endpoints = [
+            (QDB_FIXTURE.host, dead_port),
+            (QDB_FIXTURE.host, QDB_FIXTURE.http_server_port),
+        ]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-failover-') as sf_dir:
+            sender = self._connect_protocol_sender(
+                sender_id,
+                sf_dir,
+                endpoints=endpoints)
+            try:
+                self._write_row(sender, table_name, 0)
+                fsn = sender.flush_and_get_fsn()
+                self.assertEqual(fsn, 0)
+                self.assertTrue(sender.await_acked_fsn(fsn, 30000))
+                self.assertEqual(sender.acked_fsn(), fsn)
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+            self.assertEqual(
+                self._sfa_file_count(sf_dir, sender_id),
+                0,
+                'close-drained failover sender left SFA frame files behind')
+
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=1,
+            expected_distinct_id=1,
+            expected_min_id=0,
+            expected_max_id=0)
 
     def test_schema_evolution_across_batches(self):
         table_name = 'qwp_ws_schema_' + uuid.uuid4().hex[:8]

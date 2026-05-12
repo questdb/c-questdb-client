@@ -37,16 +37,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+use rand::Rng;
+
 use crate::error;
 #[cfg(feature = "sync-sender-qwp-ws")]
-use crate::ingress::conf::QwpWsConfig;
+use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::tls::TlsSettings;
 use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws::{
-    WsFrameRead, WsFrameReader, WsStream, establish_connection, write_binary_frame,
+    QwpWsConnectRoundSuccess, QwpWsHostHealthTracker, WsFrameRead, WsFrameReader, WsStream,
+    connect_qwp_ws_endpoint_round, qwp_ws_configured_endpoints, write_binary_frame,
     write_ping_frame,
 };
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -62,7 +66,7 @@ use super::qwp_ws_sfa_queue::{
     SfaStorageResult, SfaStorageStep,
 };
 
-const DEFAULT_EVENT_CAPACITY: usize = 1024;
+pub(crate) const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReconnectPolicy {
@@ -231,7 +235,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         Self::new_with_durable_ack(queue, event_capacity, false)
     }
 
-    fn new_with_durable_ack(queue: Q, event_capacity: usize, durable_ack: bool) -> Self {
+    pub(crate) fn new_with_durable_ack(queue: Q, event_capacity: usize, durable_ack: bool) -> Self {
         Self {
             queue,
             events: DriverEventRing::new(event_capacity),
@@ -248,6 +252,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     pub(crate) fn lifecycle(&self) -> PublicationLifecycle {
         self.lifecycle.clone()
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.queue.max_in_flight()
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
@@ -897,23 +905,24 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
         mut sleep_before_retry: impl FnMut(Option<Instant>, Duration) -> bool,
     ) -> Result<QwpWsReconnectProgress, DriverError> {
         let policy = self.reconnect_policy;
-        let deadline = Instant::now().checked_add(policy.max_duration);
+        let started = Instant::now();
+        let deadline = started.checked_add(policy.max_duration);
         if reconnect_deadline_expired(deadline) {
-            return Ok(QwpWsReconnectProgress::Terminal(initial_error));
+            return Ok(QwpWsReconnectProgress::Terminal(
+                retry_budget_exhausted_error(
+                    "QWP/WebSocket reconnect",
+                    0,
+                    started,
+                    Some(initial_error),
+                ),
+            ));
         }
 
-        let mut attempts = 0usize;
         let mut backoff = policy.initial_backoff;
         let mut last_error = initial_error;
+        let mut attempts = 0usize;
 
         while !should_stop() && !reconnect_deadline_expired(deadline) {
-            if attempts > 0 {
-                if !sleep_before_retry(deadline, backoff) {
-                    break;
-                }
-                backoff = double_duration(backoff).min(policy.max_backoff);
-            }
-
             attempts += 1;
             match self.transport.restart_connection(reason) {
                 Ok(()) => return Ok(QwpWsReconnectProgress::Reconnected { reason }),
@@ -921,7 +930,20 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
                     Ok(err) if reconnect_error_is_terminal(&err) => {
                         return Ok(QwpWsReconnectProgress::Terminal(err));
                     }
-                    Ok(err) => last_error = err,
+                    Ok(err) => {
+                        let role_reject = is_qwp_ws_role_reject_error(&err);
+                        last_error = err;
+                        let sleep_for =
+                            reconnect_sleep_duration(role_reject, policy.initial_backoff, backoff);
+                        if !sleep_before_retry(deadline, sleep_for) {
+                            break;
+                        }
+                        backoff = if role_reject {
+                            policy.initial_backoff
+                        } else {
+                            double_duration(backoff).min(policy.max_backoff)
+                        };
+                    }
                     Err(err) => return Err(err),
                 },
             }
@@ -930,7 +952,14 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
         if should_stop() {
             Ok(QwpWsReconnectProgress::Stopped)
         } else {
-            Ok(QwpWsReconnectProgress::Terminal(last_error))
+            Ok(QwpWsReconnectProgress::Terminal(
+                retry_budget_exhausted_error(
+                    "QWP/WebSocket reconnect",
+                    attempts,
+                    started,
+                    Some(last_error),
+                ),
+            ))
         }
     }
 
@@ -1589,6 +1618,10 @@ pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     )
 }
 
+fn is_qwp_ws_role_reject_error(err: &Error) -> bool {
+    err.qwp_ws_role_reject().is_some()
+}
+
 fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
@@ -1654,6 +1687,68 @@ fn sleep_before_reconnect_controlled(
 
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn equal_jitter_duration(base: Duration) -> Duration {
+    let base_nanos = base.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if base_nanos == 0 {
+        return base;
+    }
+    let extra = rand::rng().random_range(0..base_nanos);
+    base.saturating_add(Duration::from_nanos(extra))
+}
+
+#[cfg(not(feature = "sync-sender-qwp-ws"))]
+fn equal_jitter_duration(base: Duration) -> Duration {
+    base
+}
+
+pub(super) fn reconnect_sleep_duration(
+    role_reject: bool,
+    initial_backoff: Duration,
+    backoff: Duration,
+) -> Duration {
+    if role_reject {
+        initial_backoff
+    } else {
+        equal_jitter_duration(backoff)
+    }
+}
+
+pub(super) fn retry_budget_exhausted_error(
+    context: &str,
+    attempts: usize,
+    started: Instant,
+    last_error: Option<Error>,
+) -> Error {
+    let elapsed_ms = started.elapsed().as_millis();
+    let code = last_error
+        .as_ref()
+        .map_or(ErrorCode::SocketError, |err| err.code());
+    let last_error_msg = last_error
+        .as_ref()
+        .map_or_else(|| "none".to_string(), |err| err.msg().to_string());
+    let qwp_ws_rejection = last_error
+        .as_ref()
+        .and_then(|err| err.qwp_ws_rejection().cloned());
+    let qwp_ws_role_reject = last_error
+        .as_ref()
+        .and_then(|err| err.qwp_ws_role_reject().cloned());
+
+    let mut err = Error::new(
+        code,
+        format!(
+            "{context} retry budget exhausted [attempts={attempts}, elapsed_ms={elapsed_ms}, last_error={last_error_msg}]"
+        ),
+    );
+    if let Some(rejection) = qwp_ws_rejection {
+        err = err.with_qwp_ws_rejection(rejection);
+    }
+    if let Some(role_reject) = qwp_ws_role_reject {
+        err = err.with_qwp_ws_role_reject(role_reject);
+    }
+    err
 }
 
 pub(crate) trait PublicationLog {
@@ -1867,8 +1962,9 @@ pub(crate) trait ManualDriverTransport {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct BlockingQwpWsTransport {
-    host: String,
-    port: String,
+    endpoints: Arc<[QwpWsEndpoint]>,
+    previous_idx: Option<usize>,
+    tracker: QwpWsHostHealthTracker,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
     qwp_ws: QwpWsConfig,
@@ -1893,28 +1989,53 @@ impl BlockingQwpWsTransport {
     ) -> crate::Result<Self> {
         let host = host.into();
         let port = port.into();
-        let (stream, negotiated_version, leftover) = establish_connection(
-            &host,
-            &port,
+        let endpoints = qwp_ws_configured_endpoints(&host, &port, &qwp_ws);
+        let mut tracker = QwpWsHostHealthTracker::new(endpoints.len());
+        let mut previous_idx = None;
+        let connected = connect_qwp_ws_endpoint_round(
+            &endpoints,
+            &mut tracker,
+            &mut previous_idx,
             use_tls,
             tls_settings.clone(),
             &qwp_ws,
             auth_header.as_deref(),
         )?;
-        Ok(Self {
-            host,
-            port,
+        Ok(Self::from_connected(
+            endpoints,
+            tracker,
             use_tls,
             tls_settings,
             qwp_ws,
             auth_header,
-            negotiated_version,
-            stream,
-            reader: WsFrameReader::with_initial_input(leftover),
+            connected,
+        ))
+    }
+
+    pub(super) fn from_connected(
+        endpoints: Arc<[QwpWsEndpoint]>,
+        tracker: QwpWsHostHealthTracker,
+        use_tls: bool,
+        tls_settings: Option<TlsSettings>,
+        qwp_ws: QwpWsConfig,
+        auth_header: Option<String>,
+        connected: QwpWsConnectRoundSuccess,
+    ) -> Self {
+        Self {
+            endpoints,
+            previous_idx: Some(connected.endpoint_idx),
+            tracker,
+            use_tls,
+            tls_settings,
+            qwp_ws,
+            auth_header,
+            negotiated_version: connected.negotiated_version,
+            stream: connected.stream,
+            reader: WsFrameReader::with_initial_input(connected.leftover),
             send_buf: Vec::with_capacity(16 * 1024),
             pending_wire_sequences: VecDeque::new(),
             last_durable_keepalive_ping: None,
-        })
+        }
     }
 
     pub(crate) fn negotiated_version(&self) -> u8 {
@@ -1922,18 +2043,20 @@ impl BlockingQwpWsTransport {
     }
 
     fn reconnect(&mut self) -> Result<(), DriverError> {
-        let (stream, negotiated_version, leftover) = establish_connection(
-            &self.host,
-            &self.port,
+        let connected = connect_qwp_ws_endpoint_round(
+            &self.endpoints,
+            &mut self.tracker,
+            &mut self.previous_idx,
             self.use_tls,
             self.tls_settings.clone(),
             &self.qwp_ws,
             self.auth_header.as_deref(),
         )
         .map_err(DriverError::Transport)?;
-        self.stream = stream;
-        self.negotiated_version = negotiated_version;
-        self.reader = WsFrameReader::with_initial_input(leftover);
+        self.previous_idx = Some(connected.endpoint_idx);
+        self.stream = connected.stream;
+        self.negotiated_version = connected.negotiated_version;
+        self.reader = WsFrameReader::with_initial_input(connected.leftover);
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
         self.last_durable_keepalive_ping = None;
@@ -3764,6 +3887,18 @@ mod tests {
                     reason: ReconnectReason::Disconnect,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn role_reject_reconnect_sleep_uses_fixed_initial_backoff() {
+        let initial = Duration::from_millis(100);
+        let current = Duration::from_millis(400);
+
+        assert_eq!(reconnect_sleep_duration(true, initial, current), initial);
+        assert_eq!(
+            reconnect_sleep_duration(false, initial, Duration::ZERO),
+            Duration::ZERO
         );
     }
 
@@ -5743,9 +5878,16 @@ mod tests {
 
         assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
         assert_eq!(driver.send_core.transport.restart_attempts, 1);
-        assert_eq!(
-            driver.terminal_error().map(Error::msg),
-            Some("reconnect failed once")
+        let terminal_msg = driver.terminal_error().unwrap().msg();
+        assert!(
+            terminal_msg.contains("QWP/WebSocket reconnect retry budget exhausted"),
+            "got: {terminal_msg}"
+        );
+        assert!(terminal_msg.contains("attempts=1"), "got: {terminal_msg}");
+        assert!(terminal_msg.contains("elapsed_ms="), "got: {terminal_msg}");
+        assert!(
+            terminal_msg.contains("last_error=reconnect failed once"),
+            "got: {terminal_msg}"
         );
         assert_eq!(
             driver.receipt_status(first),
