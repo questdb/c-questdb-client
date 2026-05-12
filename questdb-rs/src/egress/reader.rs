@@ -486,6 +486,7 @@ impl Reader {
                         return Err(e);
                     }
                     _ => {
+                        warn_on_protocol_error_failover(&e, "reconnect walk");
                         last_err = Some(e);
                     }
                 },
@@ -1238,6 +1239,7 @@ impl<'r> Cursor<'r> {
                         self.terminate_with_close();
                         return Err(err);
                     }
+                    warn_on_protocol_error_failover(&e, "mid-query frame read");
                     self.failover_reconnect_and_replay(e)?;
                     continue;
                 }
@@ -1565,6 +1567,7 @@ impl<'r> Cursor<'r> {
                         self.done = true;
                         return Err(e);
                     }
+                    warn_on_protocol_error_failover(&e, "replay write");
                     trigger = e;
                 }
             }
@@ -1733,6 +1736,7 @@ impl<'r> Cursor<'r> {
             self.terminate_with_close();
             return Err(first_err);
         }
+        warn_on_protocol_error_failover(&first_err, "add_credit write");
         self.failover_reconnect_and_replay(first_err)?;
         // Replay succeeded; the user's grant intent applies to the new
         // request now in flight. Re-send on the new connection. If
@@ -1926,6 +1930,30 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
             // if the budget exhausts entirely on mismatching nodes.
             | ErrorCode::RoleMismatch
     )
+}
+
+/// `ProtocolError` is failover-eligible because it most often signals
+/// transient wire-frame corruption (truncated WS frame, malformed
+/// varint mid-stream) that a fresh connection will recover from. The
+/// same code, however, also fires on deterministic protocol bugs
+/// (unknown `MsgKind`, mismatched lengths) — and the silent-duplicate
+/// guard in [`Cursor::next_batch`] only blocks replay when *no*
+/// `on_failover_reset` callback is installed. With a callback set,
+/// replay proceeds even for deterministic violations.
+///
+/// Emit a stderr warning whenever a `ProtocolError` actually triggers
+/// failover so operators can spot masked corruption in logs.
+fn warn_on_protocol_error_failover(err: &Error, context: &str) {
+    if err.code() == ErrorCode::ProtocolError {
+        eprintln!(
+            "questdb-rs: warning: ProtocolError triggered failover ({}): {} — \
+             reconnecting may mask transient wire-frame corruption \
+             (truncated frames, malformed varints) or a deterministic \
+             protocol violation; check server logs if this recurs.",
+            context,
+            err.msg()
+        );
+    }
 }
 
 /// Errors that carry more diagnostic value than a generic transport
