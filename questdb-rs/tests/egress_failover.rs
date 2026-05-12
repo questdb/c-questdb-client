@@ -943,6 +943,161 @@ fn pre_batch_failover_without_callback_still_replays() {
     );
 }
 
+/// Regression coverage for the silent-duplicate guard wired into
+/// `Cursor::add_credit` (C1 in the PR review).
+///
+/// `add_credit`'s failover policy must mirror `next_batch`'s: when a
+/// transport-class write failure fires AND data has already been
+/// delivered AND no `on_failover_reset` callback is installed, the
+/// cursor must return `FailoverWouldDuplicate` rather than silently
+/// replaying. The bulk of this contract is unit-tested by
+/// `would_silently_duplicate_truth_table` in `src/egress/reader.rs`.
+/// Integration coverage for `add_credit` specifically is constrained
+/// by TCP semantics: a write to a freshly-RST'd peer does not always
+/// fail synchronously (the kernel may buffer the frame before the
+/// RST lands), so we cannot deterministically force the failover
+/// branch from a scripted close. The data-delivered branch is even
+/// less reachable from the Rust mock — it has no helper to emit a
+/// synthetic RESULT_BATCH (only the C++ mock does), so the
+/// guard-fires-after-batch-delivered combination is out of integration
+/// scope on the Rust side.
+///
+/// What this test does pin down: if `add_credit` DOES drive a
+/// failover (the race resolves with a synchronous write failure), the
+/// replay reaches server B and the user-supplied callback fires
+/// exactly once. The pattern matches `cancel_write_failure_does_not_trigger_failover`
+/// — both possible race outcomes are valid; we assert the
+/// post-conditions are consistent regardless of which one wins.
+#[test]
+fn add_credit_failover_post_conditions_are_consistent() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::AbortiveRst,
+    ]]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    assert_eq!(reader.current_addr().port, srv_a.addr.port());
+
+    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed);
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(move |ev: &FailoverEvent| {
+            observed_clone.lock().unwrap().push(ev.clone());
+        })
+        .execute()
+        .expect("execute");
+
+    // Give the kernel time to observe A's RST on the client side.
+    // Matches the 100ms used by `cancel_write_failure_does_not_trigger_failover`.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let credit_result = cursor.add_credit(64);
+    let resets = cursor.failover_resets();
+    let event_count = observed.lock().unwrap().len();
+
+    // Two valid race outcomes:
+    //
+    // (a) The write hit the kernel send buffer before A's RST was
+    //     observed → add_credit returned Ok, no failover was needed.
+    // (b) The write failed synchronously → failover engaged, replayed
+    //     to B, second send_credit_frame on B succeeded → add_credit
+    //     returned Ok via the replay path.
+    //
+    // The credit-write-fails-AFTER-replay-too case (terminates the
+    // cursor with an error) requires both servers to drop and isn't
+    // exercised here.
+    match (credit_result.as_ref(), resets) {
+        (Ok(()), 0) => {
+            // Branch (a): write succeeded before RST landed.
+            assert_eq!(event_count, 0, "no callback when no failover happened");
+        }
+        (Ok(()), 1) => {
+            // Branch (b): write failed, failover replayed cleanly.
+            assert_eq!(event_count, 1, "callback must fire exactly once on replay");
+            let events = observed.lock().unwrap();
+            assert_eq!(events[0].failed_addr.port, srv_a.addr.port());
+            assert_eq!(events[0].new_addr.port, srv_b.addr.port());
+            // Cursor must read cleanly from B after the replay.
+            assert!(
+                cursor.next_batch().expect("next after replay").is_none(),
+                "replayed cursor must terminate via RESULT_END"
+            );
+        }
+        (Ok(()), n) => panic!(
+            "unexpected reset count {n} for Ok(add_credit); expected 0 or 1"
+        ),
+        (Err(e), _) => panic!(
+            "add_credit should not surface an error when a failover target is \
+             available; got {:?}: {}",
+            e.code(),
+            e.msg()
+        ),
+    }
+}
+
+/// Companion: with `failover=off`, an `add_credit` write failure must
+/// surface the original transport error immediately, NOT silently
+/// retry. Pins the failover-eligibility gate at the top of `add_credit`
+/// (`reader.cfg.failover` check).
+///
+/// Like the test above, the TCP race means add_credit's write may
+/// return Ok even after the peer's RST. The race-tolerant invariant
+/// asserted here: `srv_b.accepts() == 0` (no failover dial ever, since
+/// failover is disabled — regardless of how the race resolves), and
+/// IF add_credit returns Err, the error is a transport-class one (not
+/// some other code that would suggest a different code path fired).
+#[test]
+fn add_credit_with_failover_disabled_never_dials_b() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::AbortiveRst,
+    ]]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "qwp::addr={};failover=off",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    if let Err(err) = cursor.add_credit(64) {
+        assert!(
+            matches!(err.code(), ErrorCode::SocketError | ErrorCode::ProtocolError),
+            "expected transport-class error with failover disabled; got {:?}: {}",
+            err.code(),
+            err.msg()
+        );
+    }
+    // Drain anything else without recursing into failover.
+    while let Ok(Some(_)) = cursor.next_batch() {}
+
+    assert_eq!(cursor.failover_resets(), 0, "no failover with failover=off");
+    drop(cursor);
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "B must not be dialed when failover is disabled; got {}",
+        srv_b.accepts()
+    );
+}
+
 #[test]
 fn failover_disabled_surfaces_socket_error() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
