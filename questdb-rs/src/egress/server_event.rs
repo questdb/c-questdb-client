@@ -35,6 +35,7 @@ use crate::egress::wire::cache_reset::{resets_dict, resets_schemas};
 use crate::egress::wire::capabilities::has_zone;
 use crate::egress::wire::header::FrameHeader;
 use crate::egress::wire::msg_kind::{MsgKind, StatusCode};
+use crate::egress::wire::roles;
 use bytes::Bytes;
 
 // ---------------------------------------------------------------------------
@@ -60,10 +61,10 @@ pub enum ServerRole {
 impl ServerRole {
     pub fn from_u8(byte: u8) -> Self {
         match byte {
-            0x00 => ServerRole::Standalone,
-            0x01 => ServerRole::Primary,
-            0x02 => ServerRole::Replica,
-            0x03 => ServerRole::PrimaryCatchup,
+            roles::STANDALONE => ServerRole::Standalone,
+            roles::PRIMARY => ServerRole::Primary,
+            roles::REPLICA => ServerRole::Replica,
+            roles::PRIMARY_CATCHUP => ServerRole::PrimaryCatchup,
             other => ServerRole::Other(other),
         }
     }
@@ -74,10 +75,10 @@ impl ServerRole {
     /// recoverable from a log line.
     pub fn as_str(self) -> String {
         match self {
-            ServerRole::Standalone => "STANDALONE".to_string(),
-            ServerRole::Primary => "PRIMARY".to_string(),
-            ServerRole::Replica => "REPLICA".to_string(),
-            ServerRole::PrimaryCatchup => "PRIMARY_CATCHUP".to_string(),
+            ServerRole::Standalone => roles::NAME_STANDALONE.to_string(),
+            ServerRole::Primary => roles::NAME_PRIMARY.to_string(),
+            ServerRole::Replica => roles::NAME_REPLICA.to_string(),
+            ServerRole::PrimaryCatchup => roles::NAME_PRIMARY_CATCHUP.to_string(),
             ServerRole::Other(b) => format!("UNKNOWN({})", b),
         }
     }
@@ -86,10 +87,10 @@ impl ServerRole {
     /// (round-trip-safe, including `Other(_)`).
     pub fn as_u8(self) -> u8 {
         match self {
-            ServerRole::Standalone => 0x00,
-            ServerRole::Primary => 0x01,
-            ServerRole::Replica => 0x02,
-            ServerRole::PrimaryCatchup => 0x03,
+            ServerRole::Standalone => roles::STANDALONE,
+            ServerRole::Primary => roles::PRIMARY,
+            ServerRole::Replica => roles::REPLICA,
+            ServerRole::PrimaryCatchup => roles::PRIMARY_CATCHUP,
             ServerRole::Other(b) => b,
         }
     }

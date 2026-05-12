@@ -30,6 +30,7 @@ pub mod cache_reset;
 pub mod capabilities;
 pub mod header;
 pub mod msg_kind;
+pub mod roles;
 pub mod varint;
 
 pub(crate) use byte_reader::ByteReader;

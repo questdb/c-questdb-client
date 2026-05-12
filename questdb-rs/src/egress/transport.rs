@@ -54,6 +54,7 @@ use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
 use crate::egress::tls::build_client_config;
 use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
+use crate::egress::wire::roles;
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
 /// successful handshake. Caps any single `write()` syscall — including
@@ -702,18 +703,12 @@ fn parse_upgrade_reject(headers: &tungstenite::http::HeaderMap) -> Option<Upgrad
         return None;
     }
     let role_name = role_trimmed.to_ascii_uppercase();
-    let role_byte = match role_name.as_str() {
-        "STANDALONE" => 0x00,
-        "PRIMARY" => 0x01,
-        "REPLICA" => 0x02,
-        "PRIMARY_CATCHUP" => 0x03,
-        // Unrecognised token: keep the wire bytes (uppercased) so the
-        // operator can see exactly what the server said. The `role_byte`
-        // is set to `0xFF` as a sentinel for "byte is unknown"; the
-        // tracker still classifies via `is_transient()`, which inspects
-        // the case-insensitive name. See failover.md §5.
-        _ => 0xFF,
-    };
+    // Unrecognised token: keep the wire bytes (uppercased) so the operator
+    // can see exactly what the server said; the byte falls back to
+    // `roles::UNKNOWN_NAME` as a sentinel for "byte is unknown" and the
+    // tracker still classifies via `is_transient()`, which inspects the
+    // case-insensitive name. See failover.md §5.
+    let role_byte = roles::byte_for_name(&role_name).unwrap_or(roles::UNKNOWN_NAME);
     let zone = lookup_header(headers, HDR_ZONE).and_then(|v| {
         let trimmed = v.trim();
         if trimmed.is_empty() {

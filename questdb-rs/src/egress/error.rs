@@ -29,6 +29,7 @@
 use std::fmt::{Display, Formatter};
 
 use crate::egress::server_event::ServerInfo;
+use crate::egress::wire::roles;
 
 /// Egress error category.
 ///
@@ -174,7 +175,10 @@ impl UpgradeReject {
     /// than `PRIMARY_CATCHUP` is conservatively treated as topological,
     /// including unrecognised tokens.
     pub fn is_transient(&self) -> bool {
-        self.role_byte == 0x03 || self.role_name.eq_ignore_ascii_case("PRIMARY_CATCHUP")
+        self.role_byte == roles::PRIMARY_CATCHUP
+            || self
+                .role_name
+                .eq_ignore_ascii_case(roles::NAME_PRIMARY_CATCHUP)
     }
 }
 
@@ -318,7 +322,11 @@ mod tests {
 
     #[test]
     fn upgrade_reject_round_trips() {
-        let r = UpgradeReject::new(0x03, "PRIMARY_CATCHUP", Some("eu-west-1a".into()));
+        let r = UpgradeReject::new(
+            roles::PRIMARY_CATCHUP,
+            roles::NAME_PRIMARY_CATCHUP,
+            Some("eu-west-1a".into()),
+        );
         let err = Error::new(ErrorCode::RoleMismatch, "rejected").with_upgrade_reject(r.clone());
         assert_eq!(err.code(), ErrorCode::RoleMismatch);
         assert_eq!(err.upgrade_reject(), Some(&r));
@@ -357,9 +365,9 @@ mod tests {
         // topological (won't recover without topology change). The header
         // parser matches PRIMARY_CATCHUP case-insensitively per spec §5.
         for (byte, name) in [
-            (0x00, "STANDALONE"),
-            (0x01, "PRIMARY"),
-            (0x02, "REPLICA"),
+            (roles::STANDALONE, roles::NAME_STANDALONE),
+            (roles::PRIMARY, roles::NAME_PRIMARY),
+            (roles::REPLICA, roles::NAME_REPLICA),
             (0x99, "FUTURE_ROLE"),
         ] {
             let r = UpgradeReject::new(byte, name, None);
