@@ -1033,9 +1033,7 @@ fn add_credit_failover_post_conditions_are_consistent() {
                 "replayed cursor must terminate via RESULT_END"
             );
         }
-        (Ok(()), n) => panic!(
-            "unexpected reset count {n} for Ok(add_credit); expected 0 or 1"
-        ),
+        (Ok(()), n) => panic!("unexpected reset count {n} for Ok(add_credit); expected 0 or 1"),
         (Err(e), _) => panic!(
             "add_credit should not surface an error when a failover target is \
              available; got {:?}: {}",
@@ -1079,7 +1077,10 @@ fn add_credit_with_failover_disabled_never_dials_b() {
 
     if let Err(err) = cursor.add_credit(64) {
         assert!(
-            matches!(err.code(), ErrorCode::SocketError | ErrorCode::ProtocolError),
+            matches!(
+                err.code(),
+                ErrorCode::SocketError | ErrorCode::ProtocolError
+            ),
             "expected transport-class error with failover disabled; got {:?}: {}",
             err.code(),
             err.msg()
