@@ -1697,6 +1697,24 @@ impl<'r> Cursor<'r> {
             self.terminate_with_close();
             return Err(first_err);
         }
+        // Mirrors the silent-duplicate guard in `next_batch`. Once data
+        // has been delivered to the caller without an
+        // `on_failover_reset` callback, a reconnect-and-replay would
+        // re-deliver those rows with no signal — violating the
+        // exact-once contract. The trigger error is preserved in the
+        // message so the caller still learns why the cursor died.
+        if would_silently_duplicate(self.data_delivered, self.on_failover_reset.is_some()) {
+            let err = fmt!(
+                FailoverWouldDuplicate,
+                "mid-query failover would replay rows already delivered to the caller \
+                 (no on_failover_reset callback installed); cursor terminated. \
+                 Trigger: {} ({:?})",
+                first_err.msg(),
+                first_err.code()
+            );
+            self.terminate_with_close();
+            return Err(err);
+        }
         warn_on_protocol_error_failover(&first_err, "add_credit write");
         self.failover_reconnect_and_replay(first_err)?;
         // Replay succeeded; the user's grant intent applies to the new
