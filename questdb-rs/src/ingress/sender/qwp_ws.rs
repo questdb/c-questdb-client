@@ -1618,7 +1618,7 @@ fn read_upgrade_response<R: Read>(
 ) -> crate::Result<(u8, Vec<u8>)> {
     let (header_block, leftover) = read_http_header_block(stream)?;
     let parsed = codec::parse_http_header_block(&header_block)?;
-    let expected_accept = codec::compute_accept(&key_b64);
+    let expected_accept = codec::compute_accept(key_b64);
     let negotiated_version =
         codec::validate_upgrade_response(&parsed, &expected_accept, request_durable_ack)?;
     Ok((negotiated_version, leftover))

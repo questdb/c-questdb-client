@@ -1657,6 +1657,13 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             with self.assertRaises(qls.SenderError) as ctx:
                 sender.connect()
             native_error = ctx.exception.__cause__ or ctx.exception
+            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
+            if (
+                    root_dir is not None and
+                    root_dir.name != 'repo' and
+                    self._is_unsupported_qwp_ws_fixture_error(native_error)):
+                self.skipTest(
+                    f'QWP/WebSocket is not supported by this QuestDB fixture: {native_error}')
             self.assertRegex(
                 str(native_error),
                 r'(?i)(401|403|unauthor|forbidden|authentication)')
