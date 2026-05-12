@@ -39,6 +39,7 @@
 //! | `path`             | endpoint path (`/read/v1`)                               |
 //! | `max_version`      | QWP version to advertise (`2`)                           |
 //! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
+//! | `compression_level`| `zstd` level advertised in `X-QWP-Accept-Encoding` as `zstd;level=N`; `[1,22]`, default `3` (server clamps to `[1,9]`); ignored when `compression=raw` |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
 //! | `client_id`        | optional; sent only when set                             |
 //! | `target`           | `any`/`primary`/`replica` (default `any`)                |
@@ -113,7 +114,23 @@ pub enum Compression {
 }
 
 impl Compression {
-    /// Wire token for the `X-QWP-Accept-Encoding` header.
+    /// Wire value for the `X-QWP-Accept-Encoding` header. Wire-egress.md
+    /// §3: `zstd` carries an optional `level=N` hint that the server
+    /// clamps to `[1, 9]`; `raw` has no parameters. `Auto` advertises
+    /// `zstd;level=N,raw` (first match wins, per spec). `level` is
+    /// ignored for `Raw`.
+    pub fn accept_encoding(self, level: u8) -> String {
+        match self {
+            Compression::Raw => "raw".to_string(),
+            Compression::Zstd => format!("zstd;level={}", level),
+            Compression::Auto => format!("zstd;level={},raw", level),
+        }
+    }
+
+    /// Bare codec token without the `level=` parameter — useful for
+    /// diagnostics and the (now-rare) callers that want to log just
+    /// "raw" / "zstd" / "zstd,raw". The on-wire value the client
+    /// actually advertises is built by [`Self::accept_encoding`].
     pub fn header_token(self) -> &'static str {
         match self {
             Compression::Raw => "raw",
@@ -300,6 +317,24 @@ pub const DEFAULT_FAILOVER_MAX_DURATION_MS: u64 = 30_000;
 /// circuit breaking, not transport retry.
 pub const MAX_FAILOVER_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 
+/// Default `zstd` compression level advertised in `X-QWP-Accept-Encoding`
+/// as `zstd;level=N`. Wire-egress.md §3 fixes the server default at `3`
+/// and clamps any advertised value to `[1, 9]`; we match the Java
+/// reference (`compression_level=N`, default 3) so a connect string ports
+/// across clients.
+pub const DEFAULT_COMPRESSION_LEVEL: u8 = 3;
+
+/// Minimum accepted `compression_level`. Matches zstd's documented range
+/// and the Java reference. `0` is rejected because the spec uses absence
+/// (not zero) to mean "server default".
+pub const MIN_COMPRESSION_LEVEL: u8 = 1;
+
+/// Maximum accepted `compression_level`. zstd's documented maximum and
+/// the Java reference upper bound. The server still clamps to `[1, 9]`
+/// per wire-egress.md §3 — anything higher is a user-side hint that the
+/// server is free to ignore.
+pub const MAX_COMPRESSION_LEVEL: u8 = 22;
+
 /// TLS verification policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -355,6 +390,12 @@ pub struct ReaderConfig {
     pub path: String,
     pub max_version: u8,
     pub compression: Compression,
+    /// `zstd;level=N` hint advertised in `X-QWP-Accept-Encoding` when
+    /// [`compression`](Self::compression) is `Zstd` or `Auto`. Ignored
+    /// for `Raw`. Range `[MIN_COMPRESSION_LEVEL, MAX_COMPRESSION_LEVEL]`;
+    /// the server clamps to `[1, 9]` per wire-egress.md §3. Default
+    /// [`DEFAULT_COMPRESSION_LEVEL`] (= 3).
+    pub compression_level: u8,
     pub max_batch_rows: u64,
     pub client_id: Option<String>,
     pub target: Target,
@@ -555,6 +596,7 @@ impl ReaderConfig {
         let mut path: String = DEFAULT_PATH.to_string();
         let mut max_version: u8 = HIGHEST_KNOWN_VERSION;
         let mut compression = Compression::Raw;
+        let mut compression_level: u8 = DEFAULT_COMPRESSION_LEVEL;
         let mut max_batch_rows: u64 = 0;
         let mut client_id: Option<String> = None;
         let mut target = Target::Any;
@@ -616,6 +658,19 @@ impl ReaderConfig {
                             ));
                         }
                     };
+                }
+                "compression_level" => {
+                    let v: u8 = parse_value("compression_level", val)?;
+                    if !(MIN_COMPRESSION_LEVEL..=MAX_COMPRESSION_LEVEL).contains(&v) {
+                        return Err(fmt!(
+                            ConfigError,
+                            "\"compression_level\" must be in {}..={} (got {})",
+                            MIN_COMPRESSION_LEVEL,
+                            MAX_COMPRESSION_LEVEL,
+                            v
+                        ));
+                    }
+                    compression_level = v;
                 }
                 "max_batch_rows" => {
                     max_batch_rows = parse_value("max_batch_rows", val)?;
@@ -778,6 +833,7 @@ impl ReaderConfig {
             path,
             max_version,
             compression,
+            compression_level,
             max_batch_rows,
             client_id,
             target,
@@ -825,6 +881,15 @@ impl ReaderConfig {
                 "\"max_version\" must be in 1..={} (got {})",
                 HIGHEST_KNOWN_VERSION,
                 self.max_version
+            ));
+        }
+        if !(MIN_COMPRESSION_LEVEL..=MAX_COMPRESSION_LEVEL).contains(&self.compression_level) {
+            return Err(fmt!(
+                ConfigError,
+                "\"compression_level\" must be in {}..={} (got {})",
+                MIN_COMPRESSION_LEVEL,
+                MAX_COMPRESSION_LEVEL,
+                self.compression_level
             ));
         }
         if self.failover_max_attempts == 0 {
@@ -950,10 +1015,12 @@ impl ReaderConfig {
             headers.push(("X-QWP-Client-Id", id.clone()));
         }
         // Always emit accept-encoding so the server knows what we'll handle;
-        // raw-only today still benefits from being explicit.
+        // raw-only today still benefits from being explicit. `level=N` is
+        // only meaningful for zstd/auto; `Compression::accept_encoding`
+        // drops it for `Raw`.
         headers.push((
             "X-QWP-Accept-Encoding",
-            self.compression.header_token().to_string(),
+            self.compression.accept_encoding(self.compression_level),
         ));
         if self.max_batch_rows > 0 {
             headers.push(("X-QWP-Max-Batch-Rows", self.max_batch_rows.to_string()));
@@ -1145,6 +1212,87 @@ mod tests {
     fn invalid_compression_value() {
         let err = ReaderConfig::from_conf("qwp::addr=h:1;compression=xyz").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn compression_level_default_is_three() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        assert_eq!(c.compression_level, DEFAULT_COMPRESSION_LEVEL);
+        assert_eq!(c.compression_level, 3);
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn compression_level_parses_and_is_emitted() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd;compression_level=9")
+            .unwrap();
+        assert_eq!(c.compression_level, 9);
+        let headers = c.upgrade_headers();
+        let accept = headers
+            .iter()
+            .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
+            .expect("accept-encoding header present");
+        assert_eq!(accept.1, "zstd;level=9");
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn compression_level_emitted_for_auto() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=auto;compression_level=7")
+            .unwrap();
+        let headers = c.upgrade_headers();
+        let accept = headers
+            .iter()
+            .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
+            .expect("accept-encoding header present");
+        // First match wins per wire-egress.md §3 — zstd before raw.
+        assert_eq!(accept.1, "zstd;level=7,raw");
+    }
+
+    #[test]
+    fn compression_level_ignored_for_raw() {
+        // Setting `compression_level` against `compression=raw` is harmless
+        // (the spec says `level=N` only applies to zstd). The header value
+        // collapses to the bare `raw` token.
+        let c =
+            ReaderConfig::from_conf("qwp::addr=h:1;compression_level=15").unwrap();
+        let headers = c.upgrade_headers();
+        let accept = headers
+            .iter()
+            .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
+            .expect("accept-encoding header present");
+        assert_eq!(accept.1, "raw");
+    }
+
+    #[test]
+    fn compression_level_out_of_range_rejected() {
+        for bad in ["0", "23", "100"] {
+            let err = ReaderConfig::from_conf(format!(
+                "qwp::addr=h:1;compression_level={}",
+                bad
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::ConfigError,
+                "compression_level={} must be rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn compression_level_accepts_full_range() {
+        for ok in [
+            MIN_COMPRESSION_LEVEL,
+            DEFAULT_COMPRESSION_LEVEL,
+            MAX_COMPRESSION_LEVEL,
+        ] {
+            let c =
+                ReaderConfig::from_conf(format!("qwp::addr=h:1;compression_level={}", ok))
+                    .expect("level in-range");
+            assert_eq!(c.compression_level, ok);
+        }
     }
 
     #[test]
