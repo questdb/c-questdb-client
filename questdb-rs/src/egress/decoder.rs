@@ -1604,9 +1604,19 @@ fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
     // loop processes ~8× as many bits per cycle as the byte-by-byte
     // loop the codec used to walk.
     //
-    // Native-endian load (`from_ne_bytes`) is intentional: popcount is
-    // order-invariant on the byte boundaries, so we skip the byte-
-    // swap that `from_le_bytes` would emit on a big-endian target.
+    // `from_ne_bytes` on a wire byte stream looks wrong at first
+    // glance, but is correct here and intentional: we only call
+    // `count_ones` on the resulting `u64`, which counts set bits
+    // independent of byte order. The decoded *value* of the `u64` is
+    // never used, so the endianness mismatch a `from_le_bytes` would
+    // fix doesn't exist — both endiannesses see the same set-bit
+    // population. Using `from_ne_bytes` skips the byte-swap
+    // `from_le_bytes` would emit on a big-endian target (no-op on
+    // little-endian).
+    //
+    // If this code ever starts reading the `u64` as a number (e.g.
+    // bit-scan to find the *position* of a null), switch to
+    // `from_le_bytes` — positions are endian-sensitive.
     let body = &bitmap[..full_bytes];
     let mut chunks = body.chunks_exact(8);
     let mut nulls: usize = 0;

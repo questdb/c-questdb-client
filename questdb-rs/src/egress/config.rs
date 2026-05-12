@@ -316,6 +316,30 @@ pub enum TlsVerify {
 /// be more — the failover/auth/TLS surfaces are still maturing) can
 /// be added without breaking downstream code that pattern-matches
 /// or struct-literals this type. Construct via [`Self::from_conf`].
+///
+/// # Validate-before-use contract
+///
+/// The non-`addrs` fields are deliberately `pub` so callers can tweak a
+/// parsed config before handing it to
+/// [`Reader::from_config`](crate::egress::Reader::from_config) (e.g. raise
+/// `failover_max_attempts` for a slow-network test, swap in a different
+/// `client_id`). `#[non_exhaustive]` blocks struct-literal construction
+/// outside this crate but **does not** block field mutation, so a caller
+/// can set `failover_backoff_max_ms = u64::MAX` after parse and bypass
+/// the parse-time hard caps.
+///
+/// The invariant is therefore: **every code path that reads these fields
+/// must run against a `ReaderConfig` that has passed [`Self::validate`]
+/// since its last mutation.** `Reader::from_config` calls `validate` once,
+/// defensively, before opening any socket — relying on that is the
+/// supported path. If you mutate fields after `Reader::from_config` has
+/// returned (or share an `&mut ReaderConfig` across threads in a way
+/// that's hard to reason about), call `validate()` again yourself before
+/// re-using the config.
+///
+/// `addrs` is `pub(crate)` to keep external code from mutating the
+/// address list once a `Reader` is built around an `Arc<ReaderConfig>`
+/// snapshot; read-only access is via [`Self::addrs`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ReaderConfig {
@@ -776,14 +800,13 @@ impl ReaderConfig {
 
     /// Re-run the cap and consistency checks that `from_conf` enforces.
     ///
-    /// `ReaderConfig`'s knobs are `pub` for ergonomics — callers can
-    /// build one programmatically or tweak a parsed config before
-    /// handing it to [`Reader::from_config`](crate::egress::Reader::from_config).
-    /// `#[non_exhaustive]` blocks struct-literal construction but does
-    /// not block field-mutation, so a malicious or careless caller could
-    /// otherwise set `failover_backoff_max_ms = u64::MAX` after parse
-    /// and bypass the parse-time hard cap. `Reader::from_config` calls
-    /// this defensively before opening any socket.
+    /// This is the enforcement half of the validate-before-use contract
+    /// documented on [`ReaderConfig`] itself: `pub` fields keep the
+    /// config ergonomic to tweak post-parse, and `validate()` is what
+    /// any reader of those fields can rely on to have run since the
+    /// last mutation. `Reader::from_config` calls this defensively
+    /// before opening any socket; call it explicitly after mutating
+    /// a config you intend to re-use through another entry point.
     pub fn validate(&self) -> Result<()> {
         if self.addrs.is_empty() {
             return Err(fmt!(ConfigError, "\"addr\" parameter is empty"));
