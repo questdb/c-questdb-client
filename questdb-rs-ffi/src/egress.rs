@@ -3813,7 +3813,7 @@ mod tests {
     #[test]
     fn cursor_current_addr_host_null_handle_zeroes_out() {
         unsafe {
-            let mut buf: *const c_char = 0x1usize as *const c_char; // poison
+            let mut buf: *const c_char = ptr::dangling::<c_char>(); // poison
             let mut len: size_t = 0xDEADBEEF;
             line_reader_cursor_current_addr_host(ptr::null(), &mut buf, &mut len);
             assert!(buf.is_null());
