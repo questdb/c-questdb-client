@@ -968,7 +968,24 @@ fn pre_batch_failover_without_callback_still_replays() {
 /// exactly once. The pattern matches `cancel_write_failure_does_not_trigger_failover`
 /// — both possible race outcomes are valid; we assert the
 /// post-conditions are consistent regardless of which one wins.
+///
+/// Skipped on Windows: WinSock `send()` against a peer that has just
+/// sent RST can block for the full `SO_SNDTIMEO` window (the transport
+/// pins it to `WRITE_TIMEOUT` = 60 s) before either succeeding or
+/// failing with `WSAECONNRESET`. Neither of the two valid race outcomes
+/// completes in time, so the test wedges until CI's step timeout kills
+/// the whole job. The unit-tested truth table in
+/// `would_silently_duplicate_truth_table` already covers the contract;
+/// this integration variant only catches a regression on platforms
+/// where the write resolves quickly. See
+/// `add_credit_with_failover_disabled_never_dials_b` for the same
+/// guard on the disabled-failover path.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "WinSock send() to a peer that has RST'd can block for the full \
+              WRITE_TIMEOUT (60 s) before resolving — see fn comment"
+)]
 fn add_credit_failover_post_conditions_are_consistent() {
     let srv_a = MockServer::start(vec![vec![
         Action::SendServerInfo {
@@ -1054,7 +1071,17 @@ fn add_credit_failover_post_conditions_are_consistent() {
 /// failover is disabled — regardless of how the race resolves), and
 /// IF add_credit returns Err, the error is a transport-class one (not
 /// some other code that would suggest a different code path fired).
+///
+/// Skipped on Windows for the same reason as
+/// `add_credit_failover_post_conditions_are_consistent`: WinSock
+/// `send()` after peer RST can block for the full `WRITE_TIMEOUT`.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "WinSock send() to a peer that has RST'd can block for the full \
+              WRITE_TIMEOUT (60 s) before resolving — see \
+              add_credit_failover_post_conditions_are_consistent for details"
+)]
 fn add_credit_with_failover_disabled_never_dials_b() {
     let srv_a = MockServer::start(vec![vec![
         Action::SendServerInfo {
