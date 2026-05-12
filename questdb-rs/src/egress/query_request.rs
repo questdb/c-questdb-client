@@ -58,6 +58,21 @@ pub struct QueryRequest {
     binds: Vec<Bind>,
 }
 
+/// Byte offset of the 8-byte little-endian `request_id` field inside
+/// the payload produced by [`QueryRequest::encode`]. The id occupies
+/// `[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]`.
+///
+/// Lives next to `encode` so any refactor of the wire layout naturally
+/// touches both. `Cursor::failover_reconnect_and_replay` uses this to
+/// patch a fresh request_id into a stashed buffer on every replay
+/// instead of re-encoding the builder + binds (multi-MB bind payloads
+/// stay in their original allocation across reconnects).
+///
+/// The `request_id_offset_matches_encoding` test below asserts the
+/// constant against an actual encoded buffer — drift between layout
+/// and constant fails at `cargo test` time, not at runtime.
+pub const REQUEST_ID_OFFSET: usize = 1;
+
 impl QueryRequest {
     /// Start building a request for the given SQL.
     pub fn builder<S: Into<String>>(sql: S) -> QueryRequestBuilder {
@@ -75,6 +90,9 @@ impl QueryRequest {
 
     /// Serialize this request as a bare QWP client→server payload (no
     /// 12-byte QWP1 header; only server→client frames carry it).
+    ///
+    /// If you change this layout, update [`REQUEST_ID_OFFSET`] (and the
+    /// matching test) so mid-query failover patches the right bytes.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         out.push(MsgKind::QueryRequest.as_u8());
         out.extend_from_slice(&self.request_id.to_le_bytes());
@@ -241,6 +259,34 @@ impl QueryRequestBuilder {
 mod tests {
     use super::*;
     use crate::egress::error::ErrorCode;
+
+    /// Locks the `REQUEST_ID_OFFSET` constant to the actual byte
+    /// position the encoder emits. If `encode` ever shifts the
+    /// request_id (length-prefix, version byte, extra header field),
+    /// this test fails before any failover code patches the wrong
+    /// bytes at runtime.
+    #[test]
+    fn request_id_offset_matches_encoding() {
+        const SENTINEL: i64 = 0x0123_4567_89AB_CDEF;
+        let req = QueryRequest::builder("S")
+            .request_id(SENTINEL)
+            .build()
+            .unwrap();
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        assert!(buf.len() >= REQUEST_ID_OFFSET + 8);
+        let patched = i64::from_le_bytes(
+            buf[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            patched, SENTINEL,
+            "REQUEST_ID_OFFSET ({}) no longer points at the request_id field — \
+             update the constant alongside the encoder layout",
+            REQUEST_ID_OFFSET,
+        );
+    }
 
     #[test]
     fn no_binds_byte_exact() {

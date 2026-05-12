@@ -52,7 +52,7 @@ use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::decoder::ZstdScratch;
 use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
-use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
+use crate::egress::query_request::{QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET};
 use crate::egress::schema::{Schema, SchemaRegistry};
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
@@ -985,14 +985,6 @@ impl<'r> ReaderQuery<'r> {
         })
     }
 }
-
-/// Byte offset of the `request_id` field inside the encoded
-/// `QUERY_REQUEST` payload produced by [`QueryRequest::encode`].
-/// The 8-byte little-endian id occupies `[REQUEST_ID_OFFSET..
-/// REQUEST_ID_OFFSET + 8]`. Used by [`Cursor::failover_reconnect_and_replay`]
-/// to patch the request_id on a stashed buffer instead of re-cloning
-/// and re-encoding the entire builder + binds.
-const REQUEST_ID_OFFSET: usize = 1;
 
 /// Patch the request_id span of a stashed `QUERY_REQUEST` payload in
 /// place and return it as fresh `Bytes`.
