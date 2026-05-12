@@ -625,9 +625,10 @@ impl Reader {
         &self.registry
     }
 
-    /// Begin building a query. The returned `ReaderQuery` exclusively
-    /// borrows the reader; only one in-flight cursor at a time.
-    pub fn query<S: Into<String>>(&mut self, sql: S) -> ReaderQuery<'_> {
+    /// Begin building a parametrised query. The returned `ReaderQuery`
+    /// exclusively borrows the reader; only one in-flight cursor at a
+    /// time. Append binds in placeholder order, then call `.execute()`.
+    pub fn prepare<S: Into<String>>(&mut self, sql: S) -> ReaderQuery<'_> {
         ReaderQuery {
             reader: self,
             builder: QueryRequest::builder(sql),
@@ -635,6 +636,12 @@ impl Reader {
             on_failover_reset: None,
             _not_send: std::marker::PhantomData,
         }
+    }
+
+    /// Execute a SQL statement with no binds and return a streaming
+    /// cursor. Convenience for `self.prepare(sql).execute()`.
+    pub fn execute<S: Into<String>>(&mut self, sql: S) -> Result<Cursor<'_>> {
+        self.prepare(sql).execute()
     }
 }
 
@@ -795,7 +802,7 @@ impl<'r> ReaderQuery<'r> {
     /// let rows: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
     /// let rows_for_cb = Arc::clone(&rows);
     /// let mut cursor = reader
-    ///     .query("select x from t order by ts")
+    ///     .prepare("select x from t order by ts")
     ///     .on_failover_reset(move |ev: &FailoverEvent| {
     ///         eprintln!(
     ///             "failover: {} → {} after {} attempt(s) ({:?}, trigger={:?}: {})",
@@ -1264,7 +1271,7 @@ impl<'r> Cursor<'r> {
                     // Tear the WS down: the server is still streaming
                     // RESULT_BATCH frames for this `request_id`, and
                     // leaving the transport open would let a subsequent
-                    // `Reader::query()` on this Reader read those stale
+                    // `Reader::prepare()` on this Reader read those stale
                     // frames and trip the cursor's `request_id` check.
                     self.terminate_with_close();
                     return Err(e);
@@ -1775,7 +1782,7 @@ impl<'r> Cursor<'r> {
     /// `next_batch` so the cursor's `cursor_active` / `done` flags
     /// and the transport are always left coherent — no half-cooked
     /// cursors that rely on `Drop` to clean up, and no stale frames
-    /// left buffered for a follow-up `Reader::query()` to pick up.
+    /// left buffered for a follow-up `Reader::prepare()` to pick up.
     ///
     /// `take()` + explicit `drop` matches `reconnect_with_failover`'s
     /// pattern: `close_in_place` issues the WS Close frame but leaves

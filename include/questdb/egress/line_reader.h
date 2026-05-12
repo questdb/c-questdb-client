@@ -522,17 +522,14 @@ LINEREADER_API const line_reader_server_info* line_reader_failover_event_server_
 /////////// Query builder.
 
 /**
- * Opaque query builder. Created by `line_reader_query_new`, consumed by
+ * Opaque query builder. Created by `line_reader_prepare`, consumed by
  * `line_reader_query_execute` (which produces a cursor) or released by
  * `line_reader_query_free`. The originating reader MUST outlive the query.
  *
- * (The `_new` suffix is a C-language artifact, not a verb difference
- * from Rust's `Reader::query` / C++'s `reader::query`. C requires it
- * because the opaque type `line_reader_query` shares an identifier
- * namespace with ordinary functions, so a constructor cannot be
- * spelled just `line_reader_query`. The verb is "query" across all
- * three surfaces; only the C constructor adds `_new` per the same
- * convention used by `line_sender_buffer_new` / `line_sender_opts_new`.)
+ * The verb is "prepare" across all three language surfaces: Rust
+ * `Reader::prepare`, C `line_reader_prepare`, C++ `reader::prepare`.
+ * The noun (builder type) is "query" — `ReaderQuery`,
+ * `line_reader_query`, and `query` respectively.
  *
  * The `line_reader_query` type is forward-declared above.
  */
@@ -549,7 +546,7 @@ LINEREADER_API const line_reader_server_info* line_reader_failover_event_server_
  * @return Query handle, or NULL on error.
  */
 LINEREADER_API
-line_reader_query* line_reader_query_new(
+line_reader_query* line_reader_prepare(
     line_reader* reader,
     line_sender_utf8 sql,
     line_reader_error** err_out);
@@ -581,6 +578,24 @@ void line_reader_query_free(line_reader_query* query);
 LINEREADER_API
 line_reader_cursor* line_reader_query_execute(
     line_reader_query** query_inout,
+    line_reader_error** err_out);
+
+/**
+ * Convenience: prepare + execute in one call, for SQL with no binds.
+ * Equivalent to `line_reader_prepare` followed immediately by
+ * `line_reader_query_execute`; no query handle is exposed to the
+ * caller. The originating reader MUST outlive the returned cursor.
+ *
+ * Returns NULL and sets `*err_out` if `reader` is NULL, `sql` carries
+ * invalid UTF-8 (`line_reader_error_invalid_utf8`), another query or
+ * cursor is already in flight on this reader
+ * (`line_reader_error_invalid_api_call`), or the server rejects the
+ * statement.
+ */
+LINEREADER_API
+line_reader_cursor* line_reader_execute(
+    line_reader* reader,
+    line_sender_utf8 sql,
     line_reader_error** err_out);
 
 /* Bind parameters. All `line_reader_query_bind_*` functions append a bind

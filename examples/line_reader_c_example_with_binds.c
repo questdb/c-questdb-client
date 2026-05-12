@@ -23,7 +23,7 @@ int main(int argc, const char* argv[])
     line_sender_utf8 sql = QDB_UTF8_LITERAL(
         "SELECT $1::int * x AS scaled, $2 AS label FROM long_sequence(3)");
 
-    query = line_reader_query_new(reader, sql, &err);
+    query = line_reader_prepare(reader, sql, &err);
     if (!query)
         goto on_error;
 

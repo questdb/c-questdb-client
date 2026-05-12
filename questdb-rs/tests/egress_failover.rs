@@ -727,7 +727,7 @@ fn happy_path_no_failover() {
     let callback_fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cb_clone = std::sync::Arc::clone(&callback_fires);
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |_| {
             cb_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
@@ -768,7 +768,7 @@ fn cache_reset_mid_stream_does_not_break_cursor() {
     ]]);
     let conf = format!("qwp::addr={}", srv.url());
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     // The CacheReset events must not surface as Err or as a phantom
     // batch — the cursor should drive straight through to the
     // RESULT_END terminal.
@@ -801,7 +801,7 @@ fn mid_query_close_triggers_failover() {
     let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_clone = Arc::clone(&observed);
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |ev: &FailoverEvent| {
             observed_clone.lock().unwrap().push(ev.clone());
         })
@@ -919,7 +919,7 @@ fn pre_batch_failover_without_callback_still_replays() {
 
     // NO on_failover_reset callback. With data not yet delivered, the
     // guard must not fire and failover must replay against B as before.
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
 
     let outcome = cursor.next_batch();
     assert!(
@@ -952,7 +952,7 @@ fn failover_disabled_surfaces_socket_error() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail"),
@@ -1003,7 +1003,7 @@ fn attempts_exhausted_surfaces_error() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail eventually"),
@@ -1060,7 +1060,7 @@ fn reader_poisoned_after_failover_exhaustion_returns_err_not_panic() {
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
     {
-        let mut cursor = reader.query("select 1").execute().expect("execute");
+        let mut cursor = reader.prepare("select 1").execute().expect("execute");
         let err = match cursor.next_batch() {
             Err(e) => e,
             Ok(_) => panic!("budget exhausts and surfaces an error"),
@@ -1084,7 +1084,7 @@ fn reader_poisoned_after_failover_exhaustion_returns_err_not_panic() {
     assert_eq!(err.code(), ErrorCode::SocketError);
 
     // A fresh query.execute() must surface SocketError, not panic.
-    let err = match reader.query("select 2").execute() {
+    let err = match reader.prepare("select 2").execute() {
         Err(e) => e,
         Ok(_) => panic!("execute on a poisoned Reader must error"),
     };
@@ -1104,7 +1104,7 @@ fn mid_query_auth_failure_not_retried() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail with auth"),
@@ -1133,7 +1133,7 @@ fn initial_connect_walks_all_endpoints() {
         srv_b.addr.port(),
         "walked past the unreachable endpoint to B"
     );
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     assert!(cursor.next_batch().expect("ok").is_none());
 }
 
@@ -1162,7 +1162,7 @@ fn backoff_bounded_by_jitter_ceiling() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
@@ -1205,7 +1205,7 @@ fn cancelling_cursor_does_not_failover_on_drop() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
 
     // cancel() writes CANCEL (succeeds while A is sleeping), sets
     // cancelling=true, drains via next_batch. When A drops, the read
@@ -1272,7 +1272,7 @@ fn failover_suppressed_when_drop_arrives_during_cancel_drain() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
 
     let cancel_result = cursor.cancel();
 
@@ -1347,7 +1347,7 @@ fn single_endpoint_failover_exhausts_budget() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail eventually"),
@@ -1419,7 +1419,7 @@ fn write_fail_after_reconnect_terminates_or_recovers_via_outer_loop() {
     let resets = std::sync::Arc::new(std::sync::Mutex::new(0u32));
     let resets_clone = std::sync::Arc::clone(&resets);
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |_| {
             *resets_clone.lock().unwrap() += 1;
         })
@@ -1489,7 +1489,7 @@ fn failover_event_attempts_is_cumulative_across_rotations() {
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed_clone = std::sync::Arc::clone(&observed);
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |ev| {
             observed_clone.lock().unwrap().push(ev.attempts);
         })
@@ -1529,7 +1529,7 @@ fn backoff_caps_at_max_ms() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
@@ -1578,7 +1578,7 @@ fn role_filter_propagates_through_failover() {
         "initial picks B (the only primary)"
     );
 
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail — no other primary"),
@@ -1611,7 +1611,7 @@ fn decode_error_does_not_trigger_failover_and_closes_transport() {
     // Additionally, the regression we're guarding against is C1 from
     // the review: on a decode error, the cursor used to leave the WS
     // open while the server kept streaming frames for the dead
-    // request_id. A subsequent `Reader::query()` on the same Reader
+    // request_id. A subsequent `Reader::prepare()` on the same Reader
     // would then read those stale frames and trip the cursor's
     // request_id check. We assert here that a follow-up query on the
     // same Reader fails at the transport layer (the WS was torn down)
@@ -1636,7 +1636,7 @@ fn decode_error_does_not_trigger_failover_and_closes_transport() {
     let callback_fires = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cb_clone = Arc::clone(&callback_fires);
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |_| {
             cb_clone.fetch_add(1, Ordering::SeqCst);
         })
@@ -1679,7 +1679,7 @@ fn decode_error_does_not_trigger_failover_and_closes_transport() {
     // now seen our Close (or the half-closed TCP) and stopped its
     // script, so any frames the server might have queued are gone.
     let result = reader
-        .query("select 1")
+        .prepare("select 1")
         .execute()
         .and_then(|mut c| c.next_batch().map(|_| ()));
     match result {
@@ -1744,7 +1744,7 @@ fn cancel_write_failure_does_not_trigger_failover() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
 
     // Give the kernel time to observe A's RST on the client side. 100ms
     // is well over the loopback round-trip; flake risk is low.
@@ -1892,7 +1892,7 @@ fn replay_preserves_payload_and_changes_request_id() {
     // encoding (not just SQL string identity). Mix integer + string
     // to cover both fixed-width and length-prefixed Bind variants.
     let mut cursor = reader
-        .query("select * from t where i = $1 and s = $2")
+        .prepare("select * from t where i = $1 and s = $2")
         .bind_i64(42)
         .bind_varchar("hello world")
         .execute()
@@ -2009,7 +2009,7 @@ fn failover_resets_counter_after_success_then_exhaustion() {
     let resets = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let resets_clone = Arc::clone(&resets);
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |_| {
             resets_clone.fetch_add(1, Ordering::SeqCst);
         })
@@ -2098,7 +2098,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     let observed_in_cb_clone = Arc::clone(&observed_in_cb);
 
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |ev: &FailoverEvent| {
             // The callback receives the new endpoint via the event.
             // Record it; the test verifies `cursor.current_addr()`
@@ -2194,7 +2194,7 @@ fn failover_callback_runs_before_replayed_read() {
     let cb_started_clone = Arc::clone(&cb_started_at);
 
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |_ev: &FailoverEvent| {
             *cb_started_clone.lock().unwrap() = Some(Instant::now());
             std::thread::sleep(parked_for);
@@ -2284,7 +2284,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
         "initial connect must land on the only-healthy endpoint S3 (idx 3)"
     );
 
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     assert!(
         cursor
             .next_batch()
@@ -2344,7 +2344,7 @@ fn on_failover_reset_callback_replacement() {
     let second_clone = Arc::clone(&second_fires);
 
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         // First callback — should be replaced by the call below.
         .on_failover_reset(move |_| {
             first_clone.fetch_add(1, Ordering::SeqCst);
@@ -2422,7 +2422,7 @@ fn all_role_mismatch_endpoints_during_failover_surfaces_role_mismatch() {
     let cb_fires = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cb_clone = Arc::clone(&cb_fires);
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .on_failover_reset(move |_| {
             cb_clone.fetch_add(1, Ordering::SeqCst);
         })
@@ -2589,7 +2589,7 @@ fn capture_auth_header_for_conf(conf_suffix: &str) -> Option<String> {
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
     let conf = format!("qwp::addr={};{}", srv.url(), conf_suffix);
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     // Drain to terminal so the test only returns once the upgrade
     // request has definitely been seen by the mock.
     while cursor.next_batch().expect("next_batch").is_some() {}
@@ -2638,7 +2638,7 @@ fn no_auth_means_no_authorization_header() {
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
     let conf = format!("qwp::addr={}", srv.url());
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     while cursor.next_batch().expect("next_batch").is_some() {}
     drop(cursor);
     drop(reader);
@@ -2860,7 +2860,7 @@ fn tracker_prefers_unknown_over_transport_error_on_reconnect() {
     assert_eq!(srv_b.accepts(), 0);
     assert_eq!(srv_c.accepts(), 0);
 
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     assert!(
         cursor
             .next_batch()
@@ -2931,7 +2931,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
     );
 
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     assert!(
         cursor
             .next_batch()
@@ -2980,7 +2980,7 @@ fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
     // (validate() asserts >= 1); use 1 instead and account for that.
     let conf = conf.replace("failover_max_attempts=0", "failover_max_attempts=1");
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let _ = cursor.next_batch(); // Will fail.
     drop(cursor);
     drop(reader);
@@ -3056,7 +3056,7 @@ fn mid_stream_demote_happens_before_walk_picks_next() {
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     assert!(cursor.next_batch().expect("must complete").is_none());
     drop(cursor);
     assert_eq!(
@@ -3148,7 +3148,7 @@ fn auth_timeout_does_not_fire_within_budget() {
     let mut reader = Reader::from_conf(&conf).expect("connect must succeed within budget");
     // Sanity: cursor still works after the upgrade clears the
     // `auth_timeout_ms` read deadline.
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     while cursor.next_batch().expect("next_batch").is_some() {}
 }
 
@@ -3232,7 +3232,7 @@ fn server_info_timeout_does_not_fire_within_budget() {
     // deadline — `read_server_info_frame` clears the deadline on the
     // way out, so subsequent batch reads can legitimately block for
     // as long as the query takes to execute.
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     while cursor.next_batch().expect("next_batch").is_some() {}
 }
 
@@ -3292,7 +3292,7 @@ fn failover_max_duration_caps_total_wall_clock() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let start = Instant::now();
     let err = match cursor.next_batch() {
         Err(e) => e,
@@ -3341,7 +3341,7 @@ fn failover_max_duration_zero_means_unbounded() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail — server dies and reconnect can't recover"),
@@ -3375,7 +3375,7 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let err = match cursor.next_batch() {
         Err(e) => e,
         Ok(_) => panic!("must fail"),

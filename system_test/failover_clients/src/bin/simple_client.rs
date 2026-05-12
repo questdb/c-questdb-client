@@ -34,7 +34,7 @@ fn main() {
         reader.server_info().map(|i| i.role)
     );
 
-    let mut cursor = reader.query(&sql).execute().expect("execute");
+    let mut cursor = reader.prepare(&sql).execute().expect("execute");
     let mut total_batches = 0u64;
     let mut total_rows = 0u64;
     while let Some(batch) = cursor.next_batch().expect("next") {

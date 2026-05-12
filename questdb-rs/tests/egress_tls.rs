@@ -311,7 +311,7 @@ fn qwps_handshake_succeeds_with_pem_root() {
     let mut reader = Reader::from_conf(&conf).expect("TLS connect");
     {
         let mut cursor = reader
-            .query("select 1")
+            .prepare("select 1")
             .execute()
             .expect("execute over TLS");
         let batch = cursor.next_batch().expect("next_batch over TLS");
@@ -468,7 +468,7 @@ fn qwps_unsafe_off_skips_verification_against_untrusted_cert() {
     );
     {
         let mut cursor = reader
-            .query("select 1")
+            .prepare("select 1")
             .execute()
             .expect("execute over unsafe_off TLS");
         let batch = cursor.next_batch().expect("next_batch over unsafe_off TLS");

@@ -299,7 +299,7 @@ TEST_CASE("bind: i32 + varchar")
     // LONG depending on its widening rules).
     auto cur =
         reader
-            .query("select ($1::int * x)::long as scaled, "
+            .prepare("select ($1::int * x)::long as scaled, "
                      "$2 as label from long_sequence(3)"_utf8)
             .bind_i32(7)
             .bind_varchar("widgets"_utf8)
@@ -328,7 +328,7 @@ TEST_CASE("bind: f64 round-trip")
     REQUIRE_LIVE_BROKER();
 
     auto reader = make_reader();
-    auto cur = reader.query("select $1::double as v"_utf8)
+    auto cur = reader.prepare("select $1::double as v"_utf8)
                    .bind_f64(3.14159)
                    .execute();
 
@@ -392,7 +392,7 @@ TEST_CASE("bind: typed null")
     REQUIRE_LIVE_BROKER();
 
     auto reader = make_reader();
-    auto cur = reader.query("select $1::long as v"_utf8)
+    auto cur = reader.prepare("select $1::long as v"_utf8)
                    .bind_null(questdb::egress::column_kind::long_)
                    .execute();
 
@@ -412,7 +412,7 @@ TEST_CASE("bind: decimal128 sign-extension round-trip")
     // the server rejects the cast, this test fails (rather than skipping
     // silently, which would mask a real bind regression).
     auto reader = make_reader();
-    auto cur = reader.query("select $1::decimal(38, 0) as v"_utf8)
+    auto cur = reader.prepare("select $1::decimal(38, 0) as v"_utf8)
                    .bind_decimal128(
                        static_cast<uint64_t>(-1LL),
                        -1,
@@ -479,7 +479,7 @@ TEST_CASE("query_new + bind without execute releases the reader")
 
     auto reader = make_reader();
     {
-        auto q = reader.query("select 1"_utf8);
+        auto q = reader.prepare("select 1"_utf8);
         q.bind_i32(42); // never executed; q's dtor frees the query.
     }
     // Reader is unencumbered; another query should work.

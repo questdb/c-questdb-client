@@ -65,7 +65,7 @@ fn main() {
 
 /// Run the query and discard every batch + the terminal frame.
 fn drain(reader: &mut Reader, sql: &str) {
-    let mut cur = reader.query(sql).execute().expect("execute");
+    let mut cur = reader.prepare(sql).execute().expect("execute");
     while cur.next_batch().expect("next_batch").is_some() {}
 }
 

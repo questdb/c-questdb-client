@@ -93,7 +93,7 @@ fn wait_for_rows(srv: &QuestDbServer, table: &str, expected: usize) {
     while std::time::Instant::now() < deadline {
         let conf = srv.qwp_conf();
         if let Ok(mut r) = Reader::from_conf(&conf) {
-            if let Ok(mut cur) = r.query(&sql).execute() {
+            if let Ok(mut cur) = r.prepare(&sql).execute() {
                 if let Ok(Some(view)) = cur.next_batch() {
                     if let Ok(c) = view.column(0) {
                         let n = match c {
@@ -121,7 +121,7 @@ fn select_one_batch<F: FnOnce(&questdb::egress::reader::BatchView<'_>)>(
     check: F,
 ) {
     let mut reader = make_reader(srv);
-    let mut cursor = reader.query(sql).execute().expect("execute");
+    let mut cursor = reader.prepare(sql).execute().expect("execute");
     let view = cursor
         .next_batch()
         .expect("next_batch")
@@ -950,7 +950,7 @@ fn symbol_dict_persists_across_queries() {
     // First query: dict gets populated.
     {
         let mut cur = reader
-            .query(&format!("select s from \"{}\" order by ts", table))
+            .prepare(&format!("select s from \"{}\" order by ts", table))
             .execute()
             .expect("execute");
         let view = cur.next_batch().expect("next").expect("Some");
@@ -973,7 +973,7 @@ fn symbol_dict_persists_across_queries() {
     // shouldn't retransmit "alpha"/"beta"/"gamma").
     {
         let mut cur = reader
-            .query(&format!("select s from \"{}\" order by ts", table))
+            .prepare(&format!("select s from \"{}\" order by ts", table))
             .execute()
             .expect("execute");
         let view = cur.next_batch().expect("next").expect("Some");
@@ -1020,7 +1020,7 @@ fn schema_reference_after_full() {
     // First query populates schema registry.
     {
         let mut cur = reader
-            .query(&format!("select v from \"{}\"", table))
+            .prepare(&format!("select v from \"{}\"", table))
             .execute()
             .expect("execute");
         while cur.next_batch().expect("drain").is_some() {}
@@ -1032,7 +1032,7 @@ fn schema_reference_after_full() {
     // registry size should not grow.
     {
         let mut cur = reader
-            .query(&format!("select v from \"{}\"", table))
+            .prepare(&format!("select v from \"{}\"", table))
             .execute()
             .expect("execute");
         while cur.next_batch().expect("drain").is_some() {}
@@ -1049,7 +1049,7 @@ fn query_error_for_bad_sql() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("SELECT bogus FROM nonexistent_table_zzz")
+        .prepare("SELECT bogus FROM nonexistent_table_zzz")
         .execute()
         .expect("execute");
     match cur.next_batch() {
@@ -1080,7 +1080,7 @@ fn bind_long_literal_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::long as v")
+        .prepare("select $1::long as v")
         .bind_i64(0x0102_0304_0506_0708)
         .execute()
         .expect("execute");
@@ -1096,7 +1096,7 @@ fn bind_varchar_literal_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::varchar as v")
+        .prepare("select $1::varchar as v")
         .bind_varchar("café")
         .execute()
         .expect("execute");
@@ -1112,7 +1112,7 @@ fn bind_double_literal_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::double as v")
+        .prepare("select $1::double as v")
         .bind_f64(2.718281828)
         .execute()
         .expect("execute");
@@ -1128,7 +1128,7 @@ fn bind_timestamp_micros_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::timestamp as v")
+        .prepare("select $1::timestamp as v")
         .bind_timestamp_micros(1_700_000_000_123_456)
         .execute()
         .expect("execute");
@@ -1174,7 +1174,7 @@ fn bind_symbol_via_varchar_cast() {
 
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query(&format!(
+        .prepare(&format!(
             "select s, v from \"{}\" where s = cast($1 as symbol) order by ts",
             table
         ))
@@ -1200,7 +1200,7 @@ fn bind_timestamp_nanos_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::timestamp_ns as v")
+        .prepare("select $1::timestamp_ns as v")
         .bind_timestamp_nanos(1_700_000_000_123_456_789)
         .execute()
         .expect("execute");
@@ -1220,7 +1220,7 @@ fn bind_decimal64_passthrough() {
     let mut reader = make_reader(srv);
     // Bind value is stored as scale=2 decimal: 12345 / 100 = 123.45.
     let mut cur = reader
-        .query("select $1::decimal(18,2) as v")
+        .prepare("select $1::decimal(18,2) as v")
         .bind_decimal64(12345, 2)
         .execute()
         .expect("execute");
@@ -1240,7 +1240,7 @@ fn bind_multiple_binds_in_one_query() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::long as a, $2::varchar as b, $3::double as c")
+        .prepare("select $1::long as a, $2::varchar as b, $3::double as c")
         .bind_i64(42)
         .bind_varchar("hello")
         .bind_f64(3.5)
@@ -1288,7 +1288,7 @@ fn bind_in_where_clause_filters_rows() {
 
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query(&format!(
+        .prepare(&format!(
             "select id from \"{}\" where id >= $1 and id < $2 order by id",
             table
         ))
@@ -1313,7 +1313,7 @@ fn bind_typed_null_long() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::long as v")
+        .prepare("select $1::long as v")
         .bind_null(SimpleNullKind::Long)
         .execute()
         .expect("execute");
@@ -1334,7 +1334,7 @@ fn bind_byte_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::byte as v")
+        .prepare("select $1::byte as v")
         .bind_i8(-7)
         .execute()
         .expect("execute");
@@ -1350,7 +1350,7 @@ fn bind_short_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::short as v")
+        .prepare("select $1::short as v")
         .bind_i16(-30000)
         .execute()
         .expect("execute");
@@ -1366,7 +1366,7 @@ fn bind_int_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::int as v")
+        .prepare("select $1::int as v")
         .bind_i32(0x0102_0304)
         .execute()
         .expect("execute");
@@ -1385,7 +1385,7 @@ fn bind_float_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::float as v")
+        .prepare("select $1::float as v")
         .bind_f32(2.5f32)
         .execute()
         .expect("execute");
@@ -1409,7 +1409,7 @@ fn bind_ipv4_rejected_client_side() {
     let srv = server();
     let mut reader = make_reader(srv);
     match reader
-        .query("select 1")
+        .prepare("select 1")
         .bind_ipv4(Ipv4Addr::new(127, 0, 0, 1))
         .execute()
     {
@@ -1429,7 +1429,7 @@ fn bind_uuid_passthrough() {
         0x00,
     ];
     let mut cur = reader
-        .query("select $1::uuid as v")
+        .prepare("select $1::uuid as v")
         .bind_uuid(bytes)
         .execute()
         .expect("execute");
@@ -1446,7 +1446,7 @@ fn bind_long256_passthrough() {
     let mut reader = make_reader(srv);
     let bytes: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
     let mut cur = reader
-        .query("select $1::long256 as v")
+        .prepare("select $1::long256 as v")
         .bind_long256(bytes)
         .execute()
         .expect("execute");
@@ -1465,7 +1465,7 @@ fn bind_char_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::char as v")
+        .prepare("select $1::char as v")
         .bind_char(b'Q' as u16)
         .execute()
         .expect("execute");
@@ -1483,7 +1483,7 @@ fn bind_binary_rejected_client_side() {
     let srv = server();
     let mut reader = make_reader(srv);
     match reader
-        .query("select 1")
+        .prepare("select 1")
         .bind_binary(vec![0xDE, 0xAD])
         .execute()
     {
@@ -1499,7 +1499,7 @@ fn bind_decimal128_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::decimal(38,4) as v")
+        .prepare("select $1::decimal(38,4) as v")
         .bind_decimal128(123_4567i128, 4) // 123.4567 with scale=4 -> mantissa 1234567
         .execute()
         .expect("execute");
@@ -1522,7 +1522,7 @@ fn bind_decimal256_passthrough() {
     let mut bytes = [0u8; 32];
     bytes[..8].copy_from_slice(&999_888_777i64.to_le_bytes());
     let mut cur = reader
-        .query("select $1::decimal(60,6) as v")
+        .prepare("select $1::decimal(60,6) as v")
         .bind_decimal256(bytes, 6)
         .execute()
         .expect("execute");
@@ -1550,7 +1550,7 @@ fn bind_geohash_passthrough() {
     // 5 bytes (ceil(40/8)) on the wire.
     let value: u64 = 0xAA_BB_CC_DD_EE;
     let mut cur = reader
-        .query("select cast($1 as geohash(8c)) v")
+        .prepare("select cast($1 as geohash(8c)) v")
         .bind_geohash(value, 40)
         .execute()
         .expect("execute");
@@ -1573,7 +1573,7 @@ fn bind_null_varchar_emits_null_row() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::varchar as v")
+        .prepare("select $1::varchar as v")
         .bind_null_varchar()
         .execute()
         .expect("execute");
@@ -1589,7 +1589,7 @@ fn bind_null_varchar_emits_null_row() {
 fn bind_null_binary_rejected_client_side() {
     let srv = server();
     let mut reader = make_reader(srv);
-    match reader.query("select 1").bind_null_binary().execute() {
+    match reader.prepare("select 1").bind_null_binary().execute() {
         Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
         Ok(_) => panic!("expected client-side rejection"),
     }
@@ -1600,7 +1600,7 @@ fn bind_null_decimal64_with_scale() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::decimal(18,2) as v")
+        .prepare("select $1::decimal(18,2) as v")
         .bind_null_decimal64(2)
         .execute()
         .expect("execute");
@@ -1616,7 +1616,7 @@ fn bind_null_decimal128_with_scale() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::decimal(38,4) as v")
+        .prepare("select $1::decimal(38,4) as v")
         .bind_null_decimal128(4)
         .execute()
         .expect("execute");
@@ -1632,7 +1632,7 @@ fn bind_null_decimal256_with_scale() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select $1::decimal(60,6) as v")
+        .prepare("select $1::decimal(60,6) as v")
         .bind_null_decimal256(6)
         .execute()
         .expect("execute");
@@ -1648,7 +1648,7 @@ fn bind_null_geohash_with_precision() {
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query("select cast($1 as geohash(8c)) v")
+        .prepare("select cast($1 as geohash(8c)) v")
         .bind_null_geohash(40)
         .execute()
         .expect("execute");
@@ -2191,7 +2191,7 @@ fn target_primary_accepts_standalone() {
     let info = reader.server_info().expect("server_info");
     assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
     // Connection works for queries.
-    let mut cur = reader.query("select 1").execute().expect("execute");
+    let mut cur = reader.prepare("select 1").execute().expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     assert_eq!(view.row_count(), 1);
 }
@@ -2225,7 +2225,7 @@ fn multi_addr_walks_past_unreachable_endpoint() {
     let info = reader.server_info().expect("server_info");
     assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
     // Connection actually works.
-    let mut cur = reader.query("select 1").execute().expect("execute");
+    let mut cur = reader.prepare("select 1").execute().expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     assert_eq!(view.row_count(), 1);
 }
@@ -2272,7 +2272,7 @@ fn credit_flow_control_keeps_server_streaming() {
     let conf = format!("{};max_batch_rows=500", srv.qwp_conf());
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .query(&format!("select i, d from \"{}\" order by ts", table))
+        .prepare(&format!("select i, d from \"{}\" order by ts", table))
         .initial_credit(4 * 1024) // 4 KiB; smaller than a single batch
         .execute()
         .expect("execute");
@@ -2303,7 +2303,7 @@ fn exec_done_for_ddl_and_insert() {
     // 1) CREATE TABLE -> EXEC_DONE (DDL: rows_affected = 0).
     {
         let mut cur = reader
-            .query(&format!(
+            .prepare(&format!(
                 "create table \"{}\" (v long, ts timestamp) timestamp(ts) partition by day wal",
                 table
             ))
@@ -2328,7 +2328,7 @@ fn exec_done_for_ddl_and_insert() {
     // 2) INSERT INTO ... VALUES -> EXEC_DONE with rows_affected = N.
     {
         let mut cur = reader
-            .query(&format!(
+            .prepare(&format!(
                 "insert into \"{}\" values \
                  (10, '2026-01-01T00:00:00.000Z'), \
                  (20, '2026-01-01T00:00:01.000Z'), \
@@ -2355,7 +2355,7 @@ fn exec_done_for_ddl_and_insert() {
     wait_for_rows(srv, &table, 3);
     {
         let mut cur = reader
-            .query(&format!("select v from \"{}\" order by ts", table))
+            .prepare(&format!("select v from \"{}\" order by ts", table))
             .execute()
             .expect("execute select");
         let view = cur.next_batch().expect("next select").expect("Some batch");
@@ -2372,7 +2372,7 @@ fn exec_done_for_ddl_and_insert() {
     // 4) DROP TABLE -> EXEC_DONE.
     {
         let mut cur = reader
-            .query(&format!("drop table \"{}\"", table))
+            .prepare(&format!("drop table \"{}\"", table))
             .execute()
             .expect("execute drop");
         assert!(cur.next_batch().expect("next drop").is_none());
@@ -2401,7 +2401,7 @@ fn cursor_terminal_after_select() {
 
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .query(&format!("select v from \"{}\"", table))
+        .prepare(&format!("select v from \"{}\"", table))
         .execute()
         .expect("execute");
     while cur.next_batch().expect("next").is_some() {}
@@ -2445,7 +2445,7 @@ fn multi_batch_streaming() {
     let conf = format!("{};max_batch_rows={}", srv.qwp_conf(), PER_BATCH);
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .query(&format!("select i, d from \"{}\" order by ts", table))
+        .prepare(&format!("select i, d from \"{}\" order by ts", table))
         .execute()
         .expect("execute");
 
@@ -2562,7 +2562,7 @@ fn multi_batch_with_mixed_nulls_and_symbols() {
     let conf = format!("{};max_batch_rows={}", srv.qwp_conf(), PER_BATCH);
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .query(&format!("select s, v from \"{}\" order by ts", table))
+        .prepare(&format!("select s, v from \"{}\" order by ts", table))
         .execute()
         .expect("execute");
 
@@ -2711,7 +2711,7 @@ fn zstd_compressed_multi_batch() {
     );
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .query(&format!("select i, d from \"{}\" order by ts", table))
+        .prepare(&format!("select i, d from \"{}\" order by ts", table))
         .execute()
         .expect("execute");
 
@@ -2785,13 +2785,13 @@ fn dropping_live_cursor_closes_connection() {
     // will (or already has) emit RESULT_BATCH + RESULT_END for this
     // request_id; the cursor's Drop must close the underlying WS so
     // those frames cannot poison a future cursor on the same Reader.
-    let cur1 = reader.query("select 1 as v").execute().expect("execute 1");
+    let cur1 = reader.prepare("select 1 as v").execute().expect("execute 1");
     drop(cur1);
 
     // The WS is now closed. A new query must surface a transport
     // error — either when QUERY_REQUEST is written or when the first
     // frame is read — and must never yield a usable batch.
-    match reader.query("select 2 as v").execute() {
+    match reader.prepare("select 2 as v").execute() {
         Err(e) => assert_eq!(
             e.code(),
             questdb::egress::ErrorCode::SocketError,
@@ -2823,12 +2823,12 @@ fn cancel_then_drop_allows_reuse() {
     let srv = server();
     let mut reader = make_reader(srv);
 
-    let mut cur1 = reader.query("select 1 as v").execute().expect("execute 1");
+    let mut cur1 = reader.prepare("select 1 as v").execute().expect("execute 1");
     cur1.cancel().expect("cancel drains to terminal");
     drop(cur1);
 
     // Reader is clean — query 2 should succeed end-to-end.
-    let mut cur2 = reader.query("select 2 as v").execute().expect("execute 2");
+    let mut cur2 = reader.prepare("select 2 as v").execute().expect("execute 2");
     let view = cur2.next_batch().expect("next_batch").expect("Some batch");
     assert_eq!(view.row_count(), 1);
     let v = match view.column(0).unwrap() {
@@ -2893,7 +2893,7 @@ fn cancel_does_not_replenish_credit_window() {
     let conf = format!("{};max_batch_rows=500", srv.qwp_conf());
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .query(&format!("select i from \"{}\" order by ts", table))
+        .prepare(&format!("select i from \"{}\" order by ts", table))
         .initial_credit(CREDIT)
         .execute()
         .expect("execute");
@@ -3010,7 +3010,7 @@ fn cursor_short_circuits_after_query_error() {
     {
         let mut reader = make_reader(srv);
         let mut cur = reader
-            .query("SELECT bogus FROM nonexistent_table_zzz")
+            .prepare("SELECT bogus FROM nonexistent_table_zzz")
             .execute()
             .expect("execute");
         let err = cur
@@ -3047,7 +3047,7 @@ fn cursor_short_circuits_after_query_error() {
     // itself finished afterwards.
     {
         let mut reader = make_reader(srv);
-        let mut cur = reader.query("select 1 as v").execute().expect("execute");
+        let mut cur = reader.prepare("select 1 as v").execute().expect("execute");
         cur.cancel().expect("cancel returns Ok");
 
         let post_cancel =

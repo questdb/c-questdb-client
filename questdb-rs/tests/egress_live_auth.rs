@@ -113,7 +113,7 @@ fn live_basic_auth_handshake_and_query() {
     };
 
     let mut cursor = reader
-        .query("select 1")
+        .prepare("select 1")
         .execute()
         .expect("execute `select 1` under basic auth");
 

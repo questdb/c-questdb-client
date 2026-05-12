@@ -50,7 +50,7 @@ fn main() {
     let rows_for_cb = Arc::clone(&rows_received);
 
     let mut cursor = reader
-        .query(&sql)
+        .prepare(&sql)
         .on_failover_reset(move |ev: &FailoverEvent| {
             // `ev.trigger` carries the full error of the previous
             // connection's death — code (for routing/metrics) and

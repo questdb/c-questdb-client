@@ -56,7 +56,7 @@ fn main() {
     let rows_for_cb = Arc::clone(&rows_received);
 
     let mut cursor = reader
-        .query(&sql)
+        .prepare(&sql)
         .initial_credit(INITIAL_CREDIT_BYTES)
         .on_failover_reset(move |ev: &FailoverEvent| {
             eprintln!(

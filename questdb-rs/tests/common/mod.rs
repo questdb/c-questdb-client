@@ -134,7 +134,7 @@ fn http_status(host: &str, port: u16, path: &str) -> u16 {
 /// DDL / setup queries; result body is not parsed.
 pub fn http_exec(host: &str, port: u16, sql: &str) -> u16 {
     let url = format!("http://{}:{}/exec", host, port);
-    match ureq::get(&url).query("query", sql).call() {
+    match ureq::get(&url).prepare("query", sql).call() {
         Ok(resp) => resp.status().as_u16(),
         Err(ureq::Error::StatusCode(code)) => code,
         Err(e) => {

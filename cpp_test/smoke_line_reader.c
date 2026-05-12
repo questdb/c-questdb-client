@@ -118,7 +118,7 @@ static int live_lifecycle_phase(const char* addr)
         goto fail;
 
     line_sender_utf8 sql = QDB_UTF8_LITERAL("select 1");
-    query = line_reader_query_new(reader, sql, &err);
+    query = line_reader_prepare(reader, sql, &err);
     if (!query)
         goto fail;
 

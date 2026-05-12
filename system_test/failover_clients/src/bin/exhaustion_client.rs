@@ -14,7 +14,7 @@
 //!   5. Drop the cursor; the Reader is now "poisoned" (transport=None).
 //!   6. Call `reader.server_version()` — must return SocketError, not
 //!      panic.
-//!   7. Call `reader.query("select 2").execute()` — must return
+//!   7. Call `reader.prepare("select 2").execute()` — must return
 //!      SocketError, not panic.
 //!
 //! Each phase prints its observed `ErrorCode` to stderr on its own
@@ -60,7 +60,7 @@ fn main() {
     // reader — same shape as the Rust test.
     let exhausted_code = {
         let mut cursor = reader
-            .query(&sql)
+            .prepare(&sql)
             .initial_credit(INITIAL_CREDIT_BYTES)
             .execute()
             .expect("execute");
@@ -132,7 +132,7 @@ fn main() {
 
     // Phase 5: a fresh query.execute() on a poisoned Reader must also
     // surface a transport-layer error, not panic.
-    match reader.query("select 2").execute() {
+    match reader.prepare("select 2").execute() {
         Ok(_) => die(
             "execute",
             14,

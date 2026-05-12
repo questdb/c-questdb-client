@@ -22,7 +22,7 @@ int main(int argc, const char* argv[])
 
     line_sender_utf8 sql = QDB_UTF8_LITERAL(
         "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
-    query = line_reader_query_new(reader, sql, &err);
+    query = line_reader_prepare(reader, sql, &err);
     if (!query)
         goto on_error;
     cursor = line_reader_query_execute(&query, &err);

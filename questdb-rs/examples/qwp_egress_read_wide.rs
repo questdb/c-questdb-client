@@ -91,7 +91,7 @@ fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
         "SELECT ts, id, price, sym, note, d1, d2, d3, d4, d5, s1, s2, s3, s4, s5 FROM {TABLE}"
     );
     let start = Instant::now();
-    let mut cursor = reader.query(&sql).execute().expect("execute");
+    let mut cursor = reader.prepare(&sql).execute().expect("execute");
     loop {
         let next = cursor.next_batch().expect("next_batch");
         let Some(view) = next else { break };

@@ -1214,7 +1214,7 @@ pub struct line_reader_query {
 /// `line_reader_query_execute` (which produces a cursor) or released with
 /// `line_reader_query_free`. The reader MUST outlive the query/cursor.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_query_new(
+pub unsafe extern "C" fn line_reader_prepare(
     reader: *mut line_reader,
     sql: line_sender_utf8,
     err_out: *mut *mut line_reader_error,
@@ -1229,7 +1229,7 @@ pub unsafe extern "C" fn line_reader_query_new(
             set_reader_err(
                 err_out,
                 ErrorCode::InvalidApiCall,
-                "line_reader_query_new: NULL reader handle",
+                "line_reader_prepare: NULL reader handle",
             );
             return ptr::null_mut();
         }
@@ -1285,9 +1285,9 @@ pub unsafe extern "C" fn line_reader_query_new(
         // Going through the cell's raw pointer tags this borrow as
         // `SharedReadWrite`, compatible with those temporary `&Reader`s.
         let r: &mut Reader = &mut *(*reader).0.get();
-        // Defense-in-depth: catch any unwind out of `r.query(sql_str)`
+        // Defense-in-depth: catch any unwind out of `r.prepare(sql_str)`
         // AND the wrapper allocation that publishes the result, then
-        // abort. Upstream `Reader::query` is in practice infallible
+        // abort. Upstream `Reader::prepare` is in practice infallible
         // (it just builds a small `ReaderQuery` struct), and the
         // default Rust allocator aborts on OOM rather than unwinds —
         // but a future change, a custom unwinding allocator, or a
@@ -1312,7 +1312,7 @@ pub unsafe extern "C" fn line_reader_query_new(
         // flag prevents a second laundered borrow from being taken while
         // this one is alive.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let q = r.query(sql_str);
+            let q = r.prepare(sql_str);
             let q_static: ReaderQuery<'static> = std::mem::transmute(q);
             Box::into_raw(Box::new(line_reader_query {
                 inner: ManuallyDrop::new(q_static),
@@ -1439,6 +1439,79 @@ pub unsafe extern "C" fn line_reader_query_execute(
                     if !reader.is_null() {
                         (*reader).1.store(false, Ordering::Release);
                     }
+                    write_err_box(err_out, e);
+                    ptr::null_mut()
+                }
+            }
+        }));
+        match result {
+            Ok(p) => p,
+            Err(_) => std::process::abort(),
+        }
+    }
+}
+
+/// Convenience: prepare + execute in one call, for SQL with no binds.
+/// Equivalent to `line_reader_prepare` followed immediately by
+/// `line_reader_query_execute` — no query handle is exposed to the
+/// caller. Returns NULL and sets `*err_out` on failure (including NULL
+/// reader, invalid UTF-8 in `sql`, another query/cursor already in
+/// flight, or server-side execution failure).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_execute(
+    reader: *mut line_reader,
+    sql: line_sender_utf8,
+    err_out: *mut *mut line_reader_error,
+) -> *mut line_reader_cursor {
+    unsafe {
+        if reader.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_execute: NULL reader handle",
+            );
+            return ptr::null_mut();
+        }
+        if (*reader)
+            .1
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "another query or cursor is already in flight on this reader \
+                 (only one at a time)",
+            );
+            return ptr::null_mut();
+        }
+        let sql_str = match validated_utf8(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                (*reader).1.store(false, Ordering::Release);
+                write_err_box(err_out, e);
+                return ptr::null_mut();
+            }
+        };
+        let r: &mut Reader = &mut *(*reader).0.get();
+        // Single guarded closure covers `r.execute(...)`, the lifetime
+        // launder, and both success/error Box allocations — same
+        // pattern as `_prepare` and `_query_execute`. Active flag is
+        // kept claimed on success (transferred to the cursor) and
+        // released on the error arm.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match r.execute(sql_str) {
+                Ok(cursor) => {
+                    let cursor_static: Cursor<'static> = std::mem::transmute(cursor);
+                    Box::into_raw(Box::new(line_reader_cursor {
+                        cursor: ManuallyDrop::new(cursor_static),
+                        current_batch: None,
+                        column_view_cache: UnsafeCell::new(Vec::new()),
+                        reader,
+                    }))
+                }
+                Err(e) => {
+                    (*reader).1.store(false, Ordering::Release);
                     write_err_box(err_out, e);
                     ptr::null_mut()
                 }

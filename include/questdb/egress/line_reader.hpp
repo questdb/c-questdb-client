@@ -557,22 +557,10 @@ public:
      * outlive the query and the cursor. Validation of the SQL is
      * deferred to `query::execute`.
      *
-     * Named to match the Rust `Reader::query` and the C `line_reader_query`
-     * — the operation builds a query, the noun-form returns a `query`
-     * builder, and the verb-form is identical across all three language
-     * surfaces.
-     *
      * @throws line_reader_error if a query or cursor is already in flight
      *         on this reader.
      */
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wchanges-meaning"
-#endif
-    query query(::questdb::ingress::utf8_view sql);
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
+    query prepare(::questdb::ingress::utf8_view sql);
 
     /** Cumulative bytes successfully read from the wire.
      *  @throws line_reader_error if this reader has been moved from. */
@@ -1611,25 +1599,18 @@ private:
     friend class query;
 };
 
-inline query reader::query(::questdb::ingress::utf8_view sql)
+inline query reader::prepare(::questdb::ingress::utf8_view sql)
 {
     ensure_impl();
-    // `query` (the unqualified name) resolves to the surrounding
-    // member function — same name, distinct scope. The fully qualified
-    // type spelling disambiguates and stays valid even if the class is
-    // later moved or aliased.
-    return ::questdb::egress::query{line_reader_error::wrapped_call(
-        ::line_reader_query_new, _impl, to_c_utf8(sql))};
+    return query{line_reader_error::wrapped_call(
+        ::line_reader_prepare, _impl, to_c_utf8(sql))};
 }
 
 inline cursor reader::execute(::questdb::ingress::utf8_view sql)
 {
-    // `query(sql)` resolves to `this->query(sql)` (the member
-    // function), per [basic.lookup.unqual] / [class.member.lookup]:
-    // class-member lookup precedes namespace lookup, so even though
-    // there is also a class named `query` in the enclosing namespace,
-    // the unqualified call here invokes the member.
-    return query(sql).execute();
+    ensure_impl();
+    return cursor{line_reader_error::wrapped_call(
+        ::line_reader_execute, _impl, to_c_utf8(sql))};
 }
 
 inline cursor query::execute()
