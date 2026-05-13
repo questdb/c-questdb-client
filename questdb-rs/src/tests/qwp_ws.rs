@@ -3147,6 +3147,74 @@ fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
 }
 
 #[test]
+fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
+    let done = Arc::new(AtomicBool::new(false));
+    let (role_port, role_attempts, role_handle) =
+        spawn_retrying_failing_upgrade_server(Arc::clone(&done), |stream| {
+            let _ = read_request_until_blank(stream).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 421 Misdirected Request\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 0\r\n\
+                      X-QuestDB-Role: PRIMARY_CATCHUP\r\n\
+                      \r\n",
+                )
+                .unwrap();
+        });
+    let (status_port, status_attempts, status_handle) =
+        spawn_retrying_failing_upgrade_server(Arc::clone(&done), |stream| {
+            let _ = read_request_until_blank(stream).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 0\r\n\
+                      \r\n",
+                )
+                .unwrap();
+        });
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=10;\
+         reconnect_max_duration_millis=120;"
+    );
+    let result = SenderBuilder::from_conf(&conf).unwrap().build();
+
+    done.store(true, Ordering::Release);
+    role_handle.join().unwrap();
+    status_handle.join().unwrap();
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket all endpoints unreachable"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(err.msg().contains("HTTP status 500"), "got: {}", err.msg());
+    assert!(!err.msg().contains("role mismatch"), "got: {}", err.msg());
+    assert!(
+        role_attempts.load(Ordering::Acquire) >= 2,
+        "role endpoint was not retried"
+    );
+    assert!(
+        status_attempts.load(Ordering::Acquire) >= 2,
+        "status endpoint was not retried"
+    );
+}
+
+#[test]
 fn qwp_ws_initial_connect_durable_ack_mismatch_tries_next_endpoint() {
     let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();

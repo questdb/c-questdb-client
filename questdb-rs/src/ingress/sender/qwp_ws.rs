@@ -2267,7 +2267,6 @@ pub(super) fn connect_qwp_ws_endpoint_round(
 
     let mut last_endpoint_idx = None;
     let mut last_error = None;
-    let mut role_reject_error = None;
     let mut role_reject_count = 0usize;
     let mut latched_typed_error = None;
 
@@ -2308,7 +2307,7 @@ pub(super) fn connect_qwp_ws_endpoint_round(
                 if let Some(role_reject) = role_reject {
                     err = err.with_qwp_ws_role_reject(role_reject);
                 }
-                role_reject_error = Some(err);
+                last_error = Some(err);
             }
             Err(err) => {
                 tracker.record_transport_error(idx);
@@ -2324,7 +2323,7 @@ pub(super) fn connect_qwp_ws_endpoint_round(
         return Err(err);
     }
     if *qwp_ws.request_durable_ack && role_reject_count == endpoints.len() {
-        let role_reject = role_reject_error
+        let role_reject = last_error
             .as_ref()
             .and_then(|err| err.qwp_ws_role_reject().cloned());
         let mut err = error::fmt!(
@@ -2336,13 +2335,20 @@ pub(super) fn connect_qwp_ws_endpoint_round(
         }
         return Err(err);
     }
-    if let Some(err) = role_reject_error {
-        return Err(err);
+    if let Some(err) = last_error {
+        if is_qwp_ws_role_reject_error(&err) {
+            return Err(err);
+        }
+        return Err(qwp_ws_all_endpoints_unreachable_error(
+            endpoints,
+            last_endpoint_idx,
+            Some(err),
+        ));
     }
     Err(qwp_ws_all_endpoints_unreachable_error(
         endpoints,
         last_endpoint_idx,
-        last_error,
+        None,
     ))
 }
 
