@@ -3463,10 +3463,6 @@ mod tests {
             self.sent_frames.push(sent_frame);
             Ok(TransportSendResult::NoResponse)
         }
-
-        fn sent_frames(&self) -> &[SentFrame] {
-            &self.sent_frames
-        }
     }
 
     #[test]
@@ -3589,10 +3585,6 @@ mod tests {
                 .unwrap();
             Ok(())
         }
-
-        fn sent_frames(&self) -> &[SentFrame] {
-            &self.sent_frames
-        }
     }
 
     #[test]
@@ -3676,10 +3668,6 @@ mod tests {
             self.sent_frames.push(sent_frame);
             self.sent_frame.send(sent_frame).unwrap();
             Ok(TransportSendResult::NoResponse)
-        }
-
-        fn sent_frames(&self) -> &[SentFrame] {
-            &self.sent_frames
         }
     }
 
@@ -3837,10 +3825,6 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap();
             Ok(())
-        }
-
-        fn sent_frames(&self) -> &[SentFrame] {
-            &self.sent_frames
         }
     }
 

@@ -99,12 +99,12 @@ Related local docs:
 | ID | Status | Priority | Area | Recommendation | Why now |
 | --- | --- | --- | --- | --- | --- |
 | S1 | done | high | Payload model | Inline `PendingPayload` into `OutboundFrame`. | Smallest deletion; removes a wrapper that no longer abstracts anything. |
-| S2 | todo | high | Test surface | Move fake transports behind `#[cfg(test)]` and remove fake defaults from production generics. | Keeps production driver shape honest and Java-like. |
-| S3 | todo | high | Test surface | Remove the test-only `sent_frames()` hook from the production transport trait. | Prevents test inspection from becoming production API. |
+| S2 | done | high | Test surface | Move fake transports behind `#[cfg(test)]` and remove fake defaults from production generics. | Keeps production driver shape honest and Java-like. |
+| S3 | done | high | Test surface | Remove the test-only `sent_frames()` hook from the production transport trait. | Prevents test inspection from becoming production API. |
 | S4 | todo | medium | Queue diagnostics | Delete or cfg-test misleading queue counters, especially constant-zero `bytes_used()`. | Avoids stale diagnostics and broad `allow(dead_code)`. |
 | S5 | todo | medium | Feature hygiene | Replace file-level `#![allow(dead_code)]` with targeted cfgs/removals after S1-S4. | Makes stale Rust-only surface visible again. |
 | C1 | todo | high | Upgrade classification | Validate `X-QWP-Version` before durable-ACK echo. | Spec/Java alignment; avoids misclassifying future-version peers. |
-| C2 | todo | high | Connect/retry | Unify connect/retry plumbing, including orphan initial connect. | Spec/Java alignment; removes duplicated retry policy. |
+| C2 | todo | high | Connect/retry | Unify connect/retry plumbing, including orphan initial connect. | Spec alignment; current Java only partially shares this orphan behavior. |
 | C3 | todo | low | Windows coverage | Broaden orphan locked-slot tests to Windows. | Verifies the already-implemented cross-platform lock contract. |
 
 `S*` items are simplification-only. `C*` items are correctness/spec-alignment
@@ -167,25 +167,124 @@ Validation:
 
 ## S2/S3: Gate Fake Transports And Test Inspection
 
-Current shape:
+Intent:
+
+Remove fake transport machinery from the production driver shape while keeping
+the deterministic tests that make the driver state machine cheap to exercise.
+This is a production-surface cleanup, not a test-quality downgrade.
+
+Status:
+
+Implemented. The remaining fake transport fixture is test-only.
+
+Previous shape:
 
 - `ManualDriverPrototype<Q = SfaFrameQueue, T = FakeOrderedServer>` and
   `QwpWsSendCore<T = FakeOrderedServer>` default production generic parameters
   to a fake transport.
-- `FakeOrderedServer`, `DelayedPollAckServer`, `FakeSendResult`, and similar
-  helpers live in the production module.
+- `qwp_ws_driver` is compiled by `_sender-qwp-ws`, so these fakes are
+  production-compiled when QWP/WebSocket support is enabled.
+- `FakeServerResponse`, `FakeOrderedServer`, `FakeSendResult`,
+  `DelayedPollAckServer`, `fake_transport_error()`, and similar helpers live in
+  the production module instead of behind `#[cfg(test)]`.
 - `ManualDriverTransport` exposes `sent_frames()` even though only tests need
   it.
 - Driver wrappers forward `sent_frames()` through production-visible methods.
+- `QwpWsPublicationDriver::sent_frames()` is already `#[cfg(test)]`, but it
+  still depends on the production driver hook.
 
-Target shape:
+Previous production code points:
 
-- Put fake transports and fake send-result enums under `#[cfg(test)]`.
-- Remove fake default type parameters from production structs, or make them
-  available only in test cfg.
-- Remove `sent_frames()` from `ManualDriverTransport`.
-- If tests still need frame inspection, inspect the fake transport directly or
-  use a test-only extension/helper.
+- [qwp_ws_driver.rs](../questdb-rs/src/ingress/sender/qwp_ws_driver.rs)
+  contains the default fake generic parameters, `ManualDriverTransport`,
+  fake server types, and driver-level `sent_frames()` forwarding.
+- [qwp_ws_publisher.rs](../questdb-rs/src/ingress/sender/qwp_ws_publisher.rs)
+  exposes a test-only publication-driver `sent_frames()` wrapper that still
+  relies on the production hook below it.
+- [qwp_ws_sfa_queue.rs](../questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs)
+  has sibling tests that import `FakeOrderedServer`.
+- [qwp_ws.rs](../questdb-rs/src/ingress/sender/qwp_ws.rs)
+  has runner tests with custom in-memory transports that currently implement
+  `sent_frames()` only because the production trait offers it.
+
+Validated scope:
+
+- The dependency is concentrated. Most uses are in `qwp_ws_driver` tests, with
+  small sibling-test use from `qwp_ws_sfa_queue` and `qwp_ws`.
+- No FFI/C++/Python code depends on these fake driver helpers; those tests use
+  public QWP/WebSocket APIs or loopback/mock servers.
+- The deterministic fake transport is useful for driver state-machine tests:
+  ACK/reject ordering, durable-ACK interleavings, event rings, receipt
+  accounting, reconnect outcomes, and backpressure.
+- The fake transport should not shape production generics, production trait
+  methods, or production constructors.
+
+Java comparison:
+
+- Java production `Sender` exposes real transports only; QWP/WebSocket creates a
+  real `WebSocketClient` through the factory, then connects and upgrades.
+- Java QWP/WebSocket connect/retry/failover tests primarily use loopback fake
+  servers and raw socket fixtures, not a production-exposed in-memory fake
+  transport.
+- Java still has targeted test hooks and stub factories where unit tests are
+  cheaper, so deleting every Rust unit fake would be overcorrection.
+- Java memory mode is production queue backing, not fake transport. Do not treat
+  Rust memory SFA queues as test fake infrastructure.
+
+Implemented boundary:
+
+Production-visible:
+
+- `ManualDriverTransport` describes only what the real driver needs from a
+  transport: poll, optional durable-ACK keepalive, synchronous frame send, and
+  reconnect.
+- `QwpWsSendCore<T>` and `ManualDriverPrototype<Q, T>` require their transport
+  type explicitly. No production type default names a fake.
+- Real production constructors still take a generic `T:
+  ManualDriverTransport` because Rust tests and internal runners use that
+  extension point, but the default type and trait contract are
+  real-transport-shaped.
+
+Test-only:
+
+- `FakeOrderedServer`, `FakeSendResult`, `FakeServerResponse`, and fake
+  transport errors.
+- `DelayedPollAckServer` is local to `qwp_ws_driver` tests.
+- Any retained sent-frame log used to prove a fake observed a frame.
+- Any helper constructor that creates a memory queue plus `FakeOrderedServer`.
+
+Implemented shape:
+
+- Fake transports and fake send-result enums are under `#[cfg(test)]`.
+- Fake default type parameters are removed from production structs.
+- `sent_frames()` is removed from `ManualDriverTransport`.
+- `sent_frames()` forwarding is removed from `QwpWsSendCore`,
+  `ManualDriverPrototype`, and `QwpWsPublicationDriver`.
+- Deterministic driver tests remain, but test inspection is test-owned:
+  - prefer `DriveOutcome::Sent(SentFrame)` when the drive operation already
+    returns the sent frame;
+  - prefer `DriverEvent::Sent { fsn, wire_seq }` for cross-module tests that
+    only need FSN/wire-sequence evidence;
+  - use direct fake/test-transport inspection only inside local driver tests
+    when outcome/event assertions do not express the behavior, and only through
+    test-owned helpers.
+- Avoid adding a broad test-only inspection trait unless implementation churn
+  becomes materially worse without it.
+
+Test migration rules:
+
+- If the test only needs to prove a send happened, assert
+  `DriveOutcome::Sent(SentFrame { .. })`.
+- If the test needs to prove the driver published an observable notification,
+  assert `DriverEvent::Sent { fsn, wire_seq }`.
+- If the test needs to prove a receipt moved, assert `receipt_status()`,
+  `acked_fsn()`, `published_fsn()`, or the relevant sender error.
+- If the test needs frame payload bytes, prefer a loopback/WebSocket-level test
+  unless the behavior is purely driver-internal.
+- Do not add a production `SentFrameRecorder`, `TransportObserver`, or
+  inspection side channel for this slice.
+- Do not move public sender, FFI, TLS, auth, handshake, close-frame, or timeout
+  behavior onto in-memory fakes. Those belong in loopback/system tests.
 
 Rationale:
 
@@ -194,12 +293,87 @@ its real transport contract. Rust should keep the same boundary: production
 driver code sends frames and handles responses; tests own their fake server
 state.
 
+The goal is not to remove deterministic unit tests. It is to stop fake
+transports from being a production default, production trait obligation, or
+production constructor shape.
+
 Tradeoff:
 
 This may touch many tests because existing tests rely on default generic
 inference and `driver.sent_frames()`. The change is still worth doing because it
 removes test machinery from the production surface without altering sender
 behavior.
+
+Reflection after implementation:
+
+The first S2/S3 slice is a real simplification, but mostly at the API boundary:
+production types no longer default to `FakeOrderedServer`, and
+`ManualDriverTransport` no longer requires a test inspection hook. It is not a
+large code-size reduction because deterministic driver tests still need a cheap
+in-memory transport.
+
+Keeping `FakeOrderedServer` as a module-level `#[cfg(test)]` fixture is the
+right compromise for now. It is used by local driver tests and small sibling
+tests that need deterministic ACK/reject/reconnect behavior without sockets.
+Moving it into production again would be wrong; deleting it outright would cause
+test churn without making the production contract simpler.
+
+Possible later simplification:
+
+- If S4/S5 expose more stale test-only surface, consider replacing
+  `FakeOrderedServer` with a smaller local `TestTransport` inside
+  `qwp_ws_driver` tests and moving sibling tests fully to `DriveOutcome` /
+  `DriverEvent` assertions.
+- Do this only if it removes meaningful duplication. Do not add a new
+  `SentFrameRecorder`, observer trait, or shared test-inspection abstraction to
+  replace `FakeOrderedServer`; that would recreate the leak in a different
+  shape.
+
+Risk controls:
+
+- Keep the first implementation slice mechanical. Do not change ACK/reject,
+  durable-ACK, reconnect, SFA completion, or close-drain behavior.
+- Prefer changing one assertion style at a time. The easiest sequence is:
+  compile after removing fake defaults, then compile after removing
+  `sent_frames()`, then move fake types behind `#[cfg(test)]`.
+- If a test becomes hard to express without `sent_frames()`, classify it before
+  adding new helpers:
+  - driver state-machine test: use `DriveOutcome` or `DriverEvent`;
+  - transport/framing test: move to loopback;
+  - payload-byte test: keep only if it is proving queue/storage replay, and use
+    an existing queue payload accessor where possible.
+- A small local helper inside `#[cfg(test)] mod tests` is acceptable. A new
+  production trait method or generic observer is not.
+
+Implemented order:
+
+1. Remove fake default type parameters from `ManualDriverPrototype` and
+   `QwpWsSendCore`; make test helper return types explicit where needed.
+2. Replace `driver.sent_frames()` assertions with `DriveOutcome::Sent`,
+   `DriverEvent::Sent`, or direct local fake inspection.
+3. Remove `sent_frames()` from `ManualDriverTransport`, `QwpWsSendCore`,
+   `ManualDriverPrototype`, and `QwpWsPublicationDriver`.
+4. Move `FakeOrderedServer`, `FakeSendResult`, `FakeServerResponse`, and
+   fake-only helpers behind `#[cfg(test)]` at module scope. Keep them outside
+   `mod tests` if sibling test modules still need to import them.
+5. Move `DelayedPollAckServer` directly into `qwp_ws_driver` tests.
+6. Keep `from_queue_with_reconnect_policy` production-visible because real
+   background/manual open paths and orphan drainers use it.
+
+Expected non-changes:
+
+- `ManualDriverTransport` remains the internal driver transport trait.
+- `DriveOutcome::Sent` and `DriverEvent::Sent` remain production-visible inside
+  the crate because they are normal driver outputs, not test inspection hooks.
+- Memory SFA queues remain production-capable queue backing. They should not be
+  cfg-tested as fake infrastructure.
+- Loopback tests remain responsible for protocol-visible behavior.
+
+Prefer loopback tests over fake-driver tests for public sender behavior,
+WebSocket framing/control frames, handshake, role/auth headers, TLS, socket
+timeouts, close/reconnect timing, FFI behavior, and benchmarks. Existing
+loopback tests already cover much of that surface; do not migrate deterministic
+driver state-machine cases to sockets just for purity.
 
 Validation:
 
@@ -286,6 +460,10 @@ Target shape:
   `request_durable_ack=true`.
 - Keep durable-ACK mismatch terminal for a compatible 101 response that simply
   did not enable requested durable ACK.
+- Preserve the current Rust classification split: invalid or unsupported
+  `X-QWP-Version` stays on the transport/transient path (`SocketError` today),
+  while missing durable-ACK echo after a compatible 101 remains the terminal
+  durable-ACK mismatch path (`ProtocolVersionError` today).
 - Rename any test that currently implies this is a generic protocol-version
   path if it is really durable-ACK mismatch-specific.
 
@@ -298,7 +476,7 @@ Validation:
 
 - Add/update codec tests for future-version plus missing durable-ACK echo.
 - Ensure future-version remains a version/transport-classified failure, not a
-  durable-ACK mismatch.
+  durable-ACK mismatch and not a terminal protocol-version error.
 - Run QWP/WebSocket codec and driver tests.
 
 ## C2: Unify Connect/Retry Plumbing
@@ -319,6 +497,11 @@ Spec/Java context:
   async initial connect.
 - Java's `QwpWebSocketSender.buildAndConnect(...)` centralizes endpoint walking
   and upgrade classification.
+- Java orphan drainers reuse the sender connection factory, but current
+  `BackgroundDrainer` only retries durable-ACK mismatch during orphan initial
+  connect. Other initial-connect exceptions still mark the slot `.failed`.
+  Therefore broad orphan transient-connect retry is a spec-alignment target, not
+  current Java orphan-drainer parity.
 
 Target shape:
 
@@ -331,19 +514,27 @@ Target shape:
     callers.
 - Preserve caller-owned `previousIdx` / active-endpoint context for mid-stream
   reconnect.
-- Reuse the helper for orphan drainers so a transient first connect failure does
-  not immediately mark an orphan slot as permanently failed.
+- Decide explicitly whether Rust is matching current Java or advancing to the
+  broader spec target:
+  - Java-parity scope: retry durable-ACK mismatch specially for orphan initial
+    connect, but keep other orphan initial-connect errors terminal for the
+    drainer.
+  - Spec-alignment scope: reuse the helper for orphan drainers so a transient
+    first connect failure consumes the configured outage budget before the slot
+    is marked `.failed`.
 
 Rationale:
 
 This removes duplicated retry policy and makes it harder for future failover
-fixes to land in one path but not another.
+fixes to land in one path but not another. For orphan initial connect, be clear
+whether the implementation is matching current Java's narrower behavior or
+intentionally moving Rust to the broader spec-aligned retry contract.
 
 Tradeoff:
 
-This is the largest item in this document. Do not combine it with S1-S5. Start
-with a failing or behavior-pinning test around orphan transient connect failure
-before refactoring.
+This is the largest item in this document. Do not combine it with S1-S5. If the
+chosen scope is broad orphan retry, start with a failing or behavior-pinning
+test around orphan transient connect failure before refactoring.
 
 Validation:
 
@@ -439,8 +630,8 @@ with storage-position state. That is not Java-like and is not simpler.
 
 Recommended order:
 
-1. S4: remove or cfg-test dead/misleading queue counters.
-2. S2/S3: gate fake transports and remove production `sent_frames()`.
+1. S2/S3: gate fake transports and remove production `sent_frames()`.
+2. S4: remove or cfg-test dead/misleading queue counters.
 3. S5: remove broad dead-code suppressions exposed by the previous steps.
 4. C1: fix upgrade validation ordering.
 5. C3: broaden orphan lock tests.

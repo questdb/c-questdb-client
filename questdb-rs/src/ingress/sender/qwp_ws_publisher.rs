@@ -44,8 +44,6 @@ use super::qwp_ws_driver::{
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_queue::QwpReceipt;
-#[cfg(test)]
-use super::qwp_ws_queue::SentFrame;
 
 pub(crate) struct QwpWsPublicationDriver<Q, T> {
     driver: ManualDriverPrototype<Q, T>,
@@ -210,11 +208,6 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
 
     pub(crate) fn begin_close(&mut self) {
         self.driver.set_closing();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sent_frames(&self) -> &[SentFrame] {
-        self.driver.sent_frames()
     }
 
     pub(crate) fn terminal_error(&self) -> Option<&crate::Error> {

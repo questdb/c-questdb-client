@@ -1828,7 +1828,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::qwp_ws_driver::{
-        CloseOutcome, DriveOutcome, FakeOrderedServer, ManualDriverPrototype,
+        CloseOutcome, DriveOutcome, DriverEvent, FakeOrderedServer, ManualDriverPrototype,
     };
     use super::super::qwp_ws_sfa_segment::{initial_segment_path, scan_file, spare_segment_path};
     use super::*;
@@ -2589,7 +2589,13 @@ mod tests {
             driver.drive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 0 }
         );
-        assert_eq!(driver.sent_frames()[0].fsn, 1);
+        assert_eq!(
+            driver.poll_event(),
+            Some(DriverEvent::Sent {
+                fsn: 1,
+                wire_seq: 0
+            })
+        );
     }
 
     #[test]
@@ -3091,7 +3097,12 @@ mod tests {
             driver.drive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 1 }
         );
-        assert_eq!(driver.sent_frames()[0].fsn, 42);
-        assert_eq!(driver.sent_frames()[1].fsn, 43);
+        let mut sent_fsns = Vec::new();
+        while let Some(event) = driver.poll_event() {
+            if let DriverEvent::Sent { fsn, .. } = event {
+                sent_fsns.push(fsn);
+            }
+        }
+        assert_eq!(sent_fsns, vec![42, 43]);
     }
 }

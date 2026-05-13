@@ -60,9 +60,11 @@ use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderE
 use super::qwp_ws_queue::{
     OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
 };
+#[cfg(test)]
+use super::qwp_ws_sfa_queue::SfaMemoryQueueOptions;
 use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaStorageFinish,
-    SfaStorageResult, SfaStorageStep,
+    SfaCleanupFailure, SfaFrameQueue, SfaProducer, SfaStorageFinish, SfaStorageResult,
+    SfaStorageStep,
 };
 
 pub(crate) const DEFAULT_EVENT_CAPACITY: usize = 1024;
@@ -109,7 +111,7 @@ impl ReconnectPolicy {
 }
 
 #[derive(Debug)]
-pub(crate) struct ManualDriverPrototype<Q = SfaFrameQueue, T = FakeOrderedServer> {
+pub(crate) struct ManualDriverPrototype<Q, T> {
     store: QwpWsPublicationStore<Q>,
     send_core: QwpWsSendCore<T>,
 }
@@ -117,7 +119,7 @@ pub(crate) struct ManualDriverPrototype<Q = SfaFrameQueue, T = FakeOrderedServer
 // Connection-local send-loop state shared by the manual driver and threaded
 // runner. It owns transport and cursor state, but never owns publication state.
 #[derive(Debug)]
-pub(crate) struct QwpWsSendCore<T = FakeOrderedServer> {
+pub(crate) struct QwpWsSendCore<T> {
     transport: T,
     send_cursor: SendCursor,
     reconnect_policy: ReconnectPolicy,
@@ -969,13 +971,10 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
     ) -> DriveOutcome {
         store.finish_reconnect_success(&mut self.send_cursor, reason)
     }
-
-    pub(crate) fn sent_frames(&self) -> &[SentFrame] {
-        self.transport.sent_frames()
-    }
 }
 
-impl ManualDriverPrototype<SfaFrameQueue> {
+#[cfg(test)]
+impl ManualDriverPrototype<SfaFrameQueue, FakeOrderedServer> {
     pub(crate) fn new(
         options: SfaMemoryQueueOptions,
         server: FakeOrderedServer,
@@ -1481,10 +1480,6 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         self.send_core.receipt_status(&self.store, receipt)
     }
 
-    pub(crate) fn sent_frames(&self) -> &[SentFrame] {
-        self.send_core.sent_frames()
-    }
-
     pub(crate) fn poll_event(&mut self) -> Option<DriverEvent> {
         self.store.poll_event()
     }
@@ -1937,10 +1932,6 @@ pub(crate) trait ManualDriverTransport {
     fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
         Ok(())
     }
-
-    fn sent_frames(&self) -> &[SentFrame] {
-        &[]
-    }
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -2336,6 +2327,7 @@ fn server_rejection_error(error: Error, sender_error: QwpWsSenderError) -> Error
         .with_qwp_ws_rejection(sender_error)
 }
 
+#[cfg(test)]
 fn fake_transport_error(message: &'static str) -> Error {
     Error::new(ErrorCode::SocketError, message)
 }
@@ -2464,6 +2456,7 @@ pub(crate) enum TransportResponse {
     },
 }
 
+#[cfg(test)]
 pub(crate) type FakeServerResponse = TransportResponse;
 
 #[derive(Debug)]
@@ -2709,6 +2702,7 @@ impl DriverEventRing {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct FakeOrderedServer {
     send_results: VecDeque<FakeSendResult>,
@@ -2717,6 +2711,7 @@ pub(crate) struct FakeOrderedServer {
     sent_frames: Vec<SentFrame>,
 }
 
+#[cfg(test)]
 impl FakeOrderedServer {
     pub(crate) fn no_response() -> Self {
         Self::with_default(FakeSendResult::NoResponse)
@@ -2750,6 +2745,7 @@ impl FakeOrderedServer {
     }
 }
 
+#[cfg(test)]
 impl ManualDriverTransport for FakeOrderedServer {
     fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
         Ok(self
@@ -2798,57 +2794,9 @@ impl ManualDriverTransport for FakeOrderedServer {
             ),
         })
     }
-
-    fn sent_frames(&self) -> &[SentFrame] {
-        &self.sent_frames
-    }
 }
 
-#[derive(Debug)]
-struct DelayedPollAckServer {
-    polls_before_ack: usize,
-    ack_sent: bool,
-    sent_frames: Vec<SentFrame>,
-}
-
-impl DelayedPollAckServer {
-    fn new(polls_before_ack: usize) -> Self {
-        Self {
-            polls_before_ack,
-            ack_sent: false,
-            sent_frames: Vec::new(),
-        }
-    }
-}
-
-impl ManualDriverTransport for DelayedPollAckServer {
-    fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
-        if self.sent_frames.is_empty() || self.ack_sent {
-            return Ok(TransportPoll::Idle);
-        }
-        if self.polls_before_ack > 0 {
-            self.polls_before_ack -= 1;
-            return Ok(TransportPoll::Idle);
-        }
-        self.ack_sent = true;
-        Ok(TransportPoll::Response(TransportResponse::Ack {
-            wire_seq: self.sent_frames[0].wire_seq,
-        }))
-    }
-
-    fn send_frame(
-        &mut self,
-        frame: OutboundFrameView<'_>,
-    ) -> Result<TransportSendResult, TransportFailure> {
-        self.sent_frames.push(frame.sent_frame());
-        Ok(TransportSendResult::NoResponse)
-    }
-
-    fn sent_frames(&self) -> &[SentFrame] {
-        &self.sent_frames
-    }
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FakeSendResult {
     NoResponse,
@@ -2887,6 +2835,47 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
+    #[derive(Debug)]
+    struct DelayedPollAckServer {
+        polls_before_ack: usize,
+        ack_sent: bool,
+        sent_frames: Vec<SentFrame>,
+    }
+
+    impl DelayedPollAckServer {
+        fn new(polls_before_ack: usize) -> Self {
+            Self {
+                polls_before_ack,
+                ack_sent: false,
+                sent_frames: Vec::new(),
+            }
+        }
+    }
+
+    impl ManualDriverTransport for DelayedPollAckServer {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            if self.sent_frames.is_empty() || self.ack_sent {
+                return Ok(TransportPoll::Idle);
+            }
+            if self.polls_before_ack > 0 {
+                self.polls_before_ack -= 1;
+                return Ok(TransportPoll::Idle);
+            }
+            self.ack_sent = true;
+            Ok(TransportPoll::Response(TransportResponse::Ack {
+                wire_seq: self.sent_frames[0].wire_seq,
+            }))
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.sent_frames.push(frame.sent_frame());
+            Ok(TransportSendResult::NoResponse)
+        }
+    }
+
     fn options(
         _max_frames: usize,
         max_bytes: usize,
@@ -2903,11 +2892,13 @@ mod tests {
         SfaFrameQueue::open_memory(options).unwrap()
     }
 
-    fn driver(server: FakeOrderedServer) -> ManualDriverPrototype {
+    type FakeDriver = ManualDriverPrototype<SfaFrameQueue, FakeOrderedServer>;
+
+    fn driver(server: FakeOrderedServer) -> FakeDriver {
         ManualDriverPrototype::new(options(8, 1024, 4), server).unwrap()
     }
 
-    fn durable_driver(server: FakeOrderedServer) -> ManualDriverPrototype {
+    fn durable_driver(server: FakeOrderedServer) -> FakeDriver {
         ManualDriverPrototype::from_queue_with_durable_ack(
             memory_queue(options(8, 1024, 4)),
             server,
@@ -2917,14 +2908,11 @@ mod tests {
     fn durable_driver_with_options(
         options: SfaMemoryQueueOptions,
         server: FakeOrderedServer,
-    ) -> ManualDriverPrototype {
+    ) -> FakeDriver {
         ManualDriverPrototype::from_queue_with_durable_ack(memory_queue(options), server)
     }
 
-    fn driver_with_event_capacity(
-        server: FakeOrderedServer,
-        event_capacity: usize,
-    ) -> ManualDriverPrototype {
+    fn driver_with_event_capacity(server: FakeOrderedServer, event_capacity: usize) -> FakeDriver {
         ManualDriverPrototype::from_queue_with_event_capacity(
             memory_queue(options(8, 1024, 4)),
             server,
@@ -3160,10 +3148,6 @@ mod tests {
             self.restart_attempts += 1;
             self.restart_results.pop_front().unwrap_or(Ok(()))
         }
-
-        fn sent_frames(&self) -> &[SentFrame] {
-            &self.sent_frames
-        }
     }
 
     #[test]
@@ -3214,7 +3198,6 @@ mod tests {
             }
             QwpWsPublicationError::Driver(err) => panic!("unexpected driver error: {err:?}"),
         }
-        assert!(publisher.sent_frames().is_empty());
         let driver = publisher.into_driver();
         assert!(driver.send_core.transport.sent_payloads.is_empty());
     }
@@ -3526,7 +3509,10 @@ mod tests {
             driver.receipt_status(receipt),
             QwpReceiptStatus::Published { fsn: 0 }
         );
-        assert!(driver.sent_frames().is_empty());
+        assert_eq!(
+            drain_events(&mut driver),
+            vec![DriverEvent::Published { fsn: 0 }]
+        );
     }
 
     #[test]
@@ -3575,7 +3561,7 @@ mod tests {
             }
         );
         assert_eq!(
-            driver.sent_frames(),
+            driver.send_core.transport.sent_frames.as_slice(),
             &[
                 SentFrame {
                     fsn: first.fsn,
@@ -3682,7 +3668,7 @@ mod tests {
             driver.try_submit(b""),
             Err(DriverError::Queue(QueueError::EmptyPayload))
         );
-        assert!(driver.sent_frames().is_empty());
+        assert_eq!(driver.poll_event(), None);
 
         let receipt = driver.try_submit(b"payload").unwrap();
         assert_eq!(receipt, QwpReceipt { fsn: 0 });
@@ -3705,7 +3691,7 @@ mod tests {
             driver.receipt_status(second),
             QwpReceiptStatus::Published { fsn: 1 }
         );
-        assert_eq!(driver.sent_frames().len(), 1);
+        assert_eq!(driver.send_core.transport.sent_frames().len(), 1);
     }
 
     #[test]
@@ -3741,7 +3727,7 @@ mod tests {
             driver.receipt_status(second),
             QwpReceiptStatus::Published { fsn: 1 }
         );
-        assert_eq!(driver.sent_frames().len(), 1);
+        assert_eq!(driver.send_core.transport.sent_frames.len(), 1);
     }
 
     #[test]
@@ -3757,7 +3743,7 @@ mod tests {
                 backpressure: Some(QueueError::MaxInFlightReached { max_in_flight: 1 })
             })
         );
-        assert!(driver.sent_frames().is_empty());
+        assert!(driver.send_core.transport.sent_frames().is_empty());
     }
 
     #[test]
@@ -5791,7 +5777,7 @@ mod tests {
             QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
-            driver.sent_frames(),
+            driver.send_core.transport.sent_frames(),
             &[
                 SentFrame {
                     fsn: 0,
@@ -6469,7 +6455,7 @@ mod tests {
             driver.delivery_status(receipt).unwrap(),
             Some(DeliveryOutcome::Completed)
         );
-        assert_eq!(driver.sent_frames().len(), 1);
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Idle);
     }
 
     #[test]
