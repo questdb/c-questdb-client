@@ -1945,6 +1945,14 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
         self._require_qwp_ws_protocol()
         if not isinstance(QDB_FIXTURE, QuestDbFixture):
             self.skipTest('QWP/WebSocket restart tests require a managed QuestDB fixture')
+        root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
+        # QWP/WebSocket restart coverage currently requires a repo-built
+        # QuestDB because the fixed release matrix still uses 9.2.0, which
+        # does not expose the QWP/WebSocket endpoint. After QWP/WebSocket
+        # server support is released, replace this repo-only guard with a
+        # capability or version gate so release fixtures run these tests too.
+        if root_dir is not None and root_dir.name != 'repo':
+            self.skipTest('QWP/WebSocket restart tests require a QuestDB repo fixture')
         if QDB_FIXTURE.auth:
             self.skipTest('QWP/WebSocket restart tests run without auth')
         if getattr(QDB_FIXTURE, 'http_auth', False):
