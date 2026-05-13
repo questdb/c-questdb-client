@@ -1,8 +1,10 @@
 # QWP/WebSocket self-review TODOs
 
-Date: 2026-04-30
+Date: 2026-05-13
 
-Status: active TODO ledger from the latest Rust QWP/WebSocket self-review.
+Status: current review ledger. Items R1-R5 have been revalidated against the
+current Rust code, the Java client/server code, and `docs/qwp/sf-client.md`.
+Only R6 and R7 remain active TODOs.
 
 Parent context:
 
@@ -28,19 +30,24 @@ observable, a behavioral fixture or real QuestDB server.
 - Do not add durable dead-letter, quarantine, dictionary rollback, or receipt
   sidecar formats unless a fresh Java comparison shows equivalent product
   semantics.
-- Keep `sf_durability=flush|append`, `sf_append_deadline_millis`,
-  `close_flush_timeout_millis`, and `initial_connect_retry=async` rejected until
-  the corresponding behavior exists.
+- Keep `sf_durability=flush|append` rejected. The Java spec still reserves
+  those modes and both Java and Rust fail fast instead of silently downgrading to
+  memory durability.
+- Do not treat `sf_append_deadline_millis`, `close_flush_timeout_millis`, or
+  `initial_connect_retry=async` as blanket rejected keys. Current Rust parses and
+  wires those settings. `initial_connect_retry=async` is valid for background
+  QWP/WebSocket progress and is rejected only with manual progress, where there
+  is no background runner to own the pending connect lifecycle.
 
 ## TODO Tracker
 
 | ID | Status | Priority | Area | TODO | First validation | Completion signal |
 | --- | --- | --- | --- | --- | --- | --- |
-| R1 | todo | high | Protocol parser | Make Rust QWP/WebSocket response parsing match Java/server framing. | Re-read Java `WebSocketResponse.java`; re-read Rust `qwp_ws_codec.rs`; confirm real server emits `tableCount` for OK and durable ACK frames. | Rust rejects truncated/trailing-garbage OK, durable ACK, and error frames; mock-server helpers emit realistic frames; tests show malformed responses do not advance ACK state. |
-| R2 | todo | medium | Rejection observability | Bound rejection state and avoid queue-owned rejection history. | Re-read Java `SenderErrorDispatcher`; inspect which Rust APIs need post-resolution rejection details. | Rejection details live in a bounded driver/event surface; volatile and SFA queues only own publication, retention, completion, and trim state. |
-| R3 | todo | medium | ACK/NACK defense | Align ACK/NACK beyond highest sent with Java clamping unless validation finds a stronger Rust reason to fail fast. | Re-read Java `CursorWebSocketSendLoop` ACK/NACK clamp; inspect current Rust error paths and tests. | A too-large ACK/NACK cannot complete unsent frames; behavior matches Java or the divergence is documented with a concrete reason. |
+| R1 | done | high | Protocol parser | Make Rust QWP/WebSocket response parsing match Java/server framing. | Re-read Java `WebSocketResponse.java`; re-read Rust `qwp_ws_codec.rs`; confirm real server emits `tableCount` for OK and durable ACK frames. | Rust now rejects truncated/trailing-garbage OK, durable ACK, and error frames. Decode failures are retryable transport failures per the spec; they do not advance ACK state. |
+| R2 | done | medium | Rejection observability | Bound rejection state and avoid queue-owned rejection history. | Re-read Java `SenderErrorDispatcher`; inspect which Rust APIs need post-resolution rejection details. | Rejection details live in bounded driver/event surfaces. Volatile and SFA queues own publication, retention, completion, and trim state, not rejection history. |
+| R3 | done | medium | ACK/NACK defense | Align ACK/NACK beyond highest sent with Java clamping unless validation finds a stronger Rust reason to fail fast. | Re-read Java `CursorWebSocketSendLoop` ACK/NACK clamp; inspect current Rust error paths and tests. | Too-large ACK/NACK responses are clamped to the highest sent wire sequence and cannot complete unsent frames. |
 | R4 | done | high | Runner architecture | Decouple high-level publication from blocking transport/reconnect progress. | Re-read Java `CursorSendEngine.appendBlocking`, `CursorWebSocketSendLoop`, and Rust `SyncQwpWsRunner`; decide the smallest globally coherent step toward an explicit store/runner split, not a larger manual-driver detach API. | `Sender::flush()` can publish locally while the runner is reconnecting or doing blocking I/O, subject only to local capacity/backpressure and terminal error checks. |
-| R5 | todo | high | Shutdown / close | Make runner shutdown and close/drain behavior explicit and Java-compatible. | Compare Java `close()` / `drainOnClose()` with Rust `Drop`, manual `close_drain`, and rejected `close_flush_timeout_millis`. | Background runner stop is not hostage to the full reconnect budget; explicit close-drain can report timeout/terminal errors before `close_flush_timeout_millis` is accepted. |
+| R5 | done | high | Shutdown / close | Make runner shutdown and close/drain behavior explicit and Java-compatible for the Rust public API shape. | Compare Java `close()` / `drainOnClose()` with Rust `Drop`, manual `close_drain`, and `close_flush_timeout_millis`. | Rust exposes explicit fallible `Sender::close_drain()` bounded by `close_flush_timeout_millis`; zero and negative timeout values skip the wait. `Drop` remains best-effort. |
 | R6 | todo | low | Docs | Remove stale wording and sync docs after each code slice. | Search docs and Rust comments for old async/Tokio/manual-driver wording. | Docs describe current behavior, known gaps, and rejected config values without promising unimplemented features. |
 | R7 | todo | medium | Feature gates | Split or re-gate QWP/WebSocket codec modules so unreachable upgrade validation is not compiled in `_sender-qwp-ws`-only builds. | Inspect `Cargo.toml` feature relationships and current `sender.rs` cfg gates; verify which helpers are frame/status codec versus sync transport upgrade code. | `cargo check --no-default-features --features _sender-qwp-ws,ring-crypto,tls-webpki-certs --lib` does not need local `allow(dead_code)` for sync-only upgrade helpers, and the cfg boundary matches actual reachability. |
 
@@ -48,91 +55,74 @@ observable, a behavioral fixture or real QuestDB server.
 
 ### R1: Response Parser Parity
 
-Current Rust parser accepts short response frames that Java rejects. This is a
-small correctness fix and should be first.
+Current state: done.
 
-Expected behavior:
+Validated source:
 
-- `OK` requires `status + sequence + tableCount + table entries`.
-- `DURABLE_ACK` requires `status + tableCount + table entries`.
-- Error responses require exactly `status + sequence + msgLen + msg`.
-- Table entries can be parsed and ignored for now, but structure must be
-  validated.
-- A malformed response is terminal protocol failure and must not advance ACK
-  state.
+- Java `WebSocketResponse.isStructurallyValid()` rejects short OK,
+  durable-ACK, and error frames, validates table entries, and requires exact
+  error-frame length.
+- The QuestDB server writes `tableCount` for OK frames at payload offset 9 and
+  durable ACK frames at payload offset 1.
+- The spec defines generic frame-decode errors as transient/retry-budget
+  failures, not immediate terminal failures.
+- Rust `qwp_ws_codec` now validates table-entry structure and rejects trailing
+  bytes for OK, durable ACK, and error frames.
+- Rust driver decode wraps parser failures as retryable transport failures, so
+  malformed responses do not advance ACK state.
 
-Test shape:
+Validation already covered:
 
-- codec unit tests for minimum valid and malformed OK/durable/error responses,
-- one driver or public mock-server test proving truncated OK does not ACK a
-  receipt,
-- update mock helpers to write tableCount `0` for success frames.
+- codec unit tests for minimum valid and malformed OK/durable/error responses;
+- driver tests that parser failures are retryable and do not resolve receipts;
+- mock helpers that emit success frames with realistic `tableCount` fields.
 
 ### R2: Bounded Rejection State
 
-The current queues remember rejected FSNs, and the driver remembers full rejected
-frames. That duplicates responsibility and can grow without bound.
+Current state: done.
 
-Preferred design direction:
+Validated source:
 
-- queues expose `reject_fsn()` as "complete/drop through rejected FSN";
-- queues do not retain rejection history;
-- driver/event layer owns bounded rejection details;
-- receipt status overlays recent rejection details from the driver, like `Sent`
-  is already overlaid from `SendCursor`;
-- old rejection details can age out after the bounded observer capacity is
-  exceeded.
+- Java `SenderErrorDispatcher.offer()` is bounded and drops with a counter when
+  its inbox is full.
+- Rust `QwpWsPublicationStore` owns bounded event and sender-error rings plus a
+  bounded `rejected_frames` side surface.
+- `record_rejected_frame()` pushes sender errors and drops the oldest rejected
+  frame when bounded observer capacity is exceeded.
+- The volatile and SFA queue APIs do not own durable rejection history; they own
+  publication, completion, and trim state.
 
-Open decision: how much rejection history does the manual receipt API promise?
-If it needs indefinite post-resolution lookup, that is a new storage contract and
-should be challenged before implementation.
+The manual receipt API exposes recent rejection details through bounded driver
+state. It does not promise indefinite post-resolution lookup.
 
 ### R3: ACK/NACK Clamp
 
-Java clamps malformed high sequence responses to the highest sent wire sequence.
-Rust currently treats the same condition as protocol error.
+Current state: done.
 
-Preferred design direction:
+Validated source:
 
-- clamp ACK beyond highest sent to highest sent;
-- clamp NACK beyond highest sent to highest sent;
-- ignore ACK before any send;
-- preserve monotonic completion and never mark unsent frames resolved.
+- The Java client clamps ACK and NACK wire sequences above the highest sent
+  sequence and ignores pre-send ACK/rejection watermark advancement.
+- Rust `SendCursor` now applies the same clamp for ACK and rejection mapping.
+- Regression tests cover future ACK and future rejection responses.
 
 This is defensive parity, not a new feature.
 
 ### R4: Runner Decoupling
 
-The high-level runner is useful but still transitional. It is implemented by
-layering a background runner around the manual driver, while the Java design has
-a cleaner split between `CursorSendEngine` and `CursorWebSocketSendLoop`.
-Ordinary socket send/receive I/O and reconnect/backoff now run outside the
-publication mutex on the high-level runner path.
+Current state: done.
 
-First slice completed: replay encoding and symbol dictionary state were moved
-out of the runner-owned publisher for the high-level sync sender. Foreground
-`flush()` now builds the replay payload before it enters the runner mutex, while
-the manual sender keeps the same one-object publication driver for explicit
-drive/wait use.
+Current Rust structure:
 
-Second slice completed: outbound frames now carry a shared payload handle instead
-of borrowing payload bytes from the publication log. This does not by itself
-release the high-level runner mutex around socket I/O, but it removes the payload
-lifetime blocker for doing so.
-
-Third slice completed: the high-level runner now detaches a send-ready frame or
-receive-ready transport from the publication driver, performs the transport
-`send_frame()` / `try_poll_response()` call outside the publication mutex, and
-reattaches the transport to commit the result. A focused runner test proves a
-second local publication can be accepted while the first transport send is
-blocked.
-
-Fourth slice completed: detached transport failures now return an owned
-reconnect action to the runner. The runner sleeps, retries, and calls
-`restart_connection()` outside the publication mutex, then briefly re-enters the
-driver to reset wire state on reconnect success or latch terminal failure on
-budget exhaustion. A behavioral runner test proves a second local publication
-can be accepted while reconnect is blocked.
+- `QwpWsPublicationStore` owns publication, lifecycle, completion, events,
+  bounded sender errors, durable ACK state, and bounded rejection details.
+- `QwpWsSendCore` owns connection-local transport, `SendCursor`, and reconnect
+  policy. It does not own publication state.
+- The threaded runner takes short store locks to publish, select outbound work,
+  and commit outcomes. Socket send/receive and reconnect/backoff progress run
+  outside those locks.
+- There are no remaining `detach_*` / `finish_detached_*` helper operations in
+  the current QWP/WebSocket Rust sources.
 
 Current Java primitive findings, validated against current
 `java-questdb-client` source:
@@ -148,39 +138,6 @@ Current Java primitive findings, validated against current
   volatile publication cursors and also uses narrow `synchronized` sections for
   sealed-segment snapshots, hot-spare install, close, and manager registration.
 
-Global architecture decision: do not let the high-level threaded path accumulate
-a permanent family of `detach_*` operations on the manual driver. The manual
-driver can stay monolithic because it is an explicit `&mut self` progress owner.
-The product `Sender` runner should converge on Java's ownership model: short
-publication-store critical sections, plus runner-owned transport,
-wire-sequence mapping, reconnect/backoff, and replay cursor.
-
-Remaining architectural debt: the high-level runner still uses private
-`detach_*` / `finish_detached_*` operations on the manual driver. That is an
-acceptable transition after R4 because the observable publication boundary is in
-place, but it should not become the final architecture. The next runner work
-should either make close/backpressure behavior explicit or replace the
-transitional detach surface with a clearer store/runner split.
-
-Design candidates to validate:
-
-- extract or introduce a high-level runner core whose owned fields are
-  transport, `SendCursor`, reconnect policy, and replay cursor state;
-- keep queue/SFA publication, ACK/rejection application, segment trim, and
-  terminal observation behind short synchronized store access;
-- run reconnect sleep and `restart_connection()` outside the store lock, with
-  stop-aware sleeps matching Java's `running` checks;
-- commit reconnect success with a short store lock: restore transport, reset
-  wire mapping from the first unresolved FSN, and publish `Reconnected`;
-- commit reconnect exhaustion or terminal upgrade/auth failure with a short
-  store lock: latch terminal error and mark currently published unresolved
-  receipts terminal;
-- treat a lock-free or lock-light producer publication path as a real target,
-  but validate each primitive against Rust ownership, memory ordering, and SFA
-  durability before copying Java internals mechanically;
-- make append/backpressure wait on local capacity, not on transport progress
-  critical sections.
-
 Completion should be judged by observable behavior: `flush()` returns after local
 publication, pipelines before ACK, and only blocks for local capacity, terminal
 error checks, or documented close/shutdown coordination. In particular, a blocked
@@ -189,15 +146,26 @@ remains.
 
 ### R5: Shutdown And Close
 
-Rust `Drop` cannot report errors, so Java's `close()` behavior should not be
-copied blindly. The product needs an explicit close/drain path before accepting
-Java's `close_flush_timeout_millis` key.
+Current state: done for the Rust public API shape.
 
-Design pressure:
+Validated source:
+
+- The Java spec makes `close_flush_timeout_millis` a bounded close wait, with
+  `0` and `-1` skipping the server-ACK wait.
+- Rust now exposes explicit fallible `Sender::close_drain()` for QWP/WebSocket
+  senders.
+- The background runner close path begins closing, wakes blocked publishers, and
+  waits only until the configured close-drain timeout expires.
+- The manual close path drives ready work until all published receipts resolve,
+  terminal failure is observed, or the configured timeout expires.
+- `close_flush_timeout_millis` is parsed, stored, and passed to both background
+  and manual close-drain paths. Tests cover `-1` skipping the wait.
+
+Design decision:
 
 - `Drop` should be best-effort and should not wait out a long reconnect budget.
-- Manual `close_drain` already has a result shape; the high-level `Sender` needs
-  an explicit surface before close-drain config is accepted.
+- `close_drain()` is the explicit surface that reports timeout and terminal
+  errors.
 - Terminal errors observed by the runner should be latched and surfaced by later
   public operations.
 - SF users can recover unACKed frames by reopening the same slot; memory users
@@ -207,14 +175,23 @@ Design pressure:
 
 Known stale areas:
 
-- Rust comments that still say "async QWP/WebSocket" for the sync sender path,
-- `flush().await` wording under sync config,
-- docs that imply local-publication backpressure or close-drain config is already
-  implemented,
+- docs that still say `initial_connect_retry=async` is unsupported or rejected;
+- docs that still say `sf_append_deadline_millis` is recognized and rejected
+  instead of accepted and wired into append/backpressure waiting;
+- docs that still say `close_flush_timeout_millis` is rejected instead of
+  accepted and wired into `Sender::close_drain()`;
+- docs that imply local-publication backpressure or close-drain config is not yet
+  implemented;
 - docs that mention removed Tokio sender behavior as if it were still live.
 
 Docs should be updated in the same slice as behavior changes, not batched far
 behind the code.
+
+Current examples found stale during the 2026-05-13 review:
+
+- `doc/QWP_WEBSOCKET_PIPELINED_FFI.md`
+- `doc/QWP_WEBSOCKET_HANDOVER.md`
+- `doc/QWP_WEBSOCKET_JAVA_PARITY_FOLLOWUP_PLAN.md`
 
 ### R7: QWP/WebSocket Feature Gates
 
@@ -228,8 +205,9 @@ Current feature split:
 
 That means `_sender-qwp-ws`-only builds compile shared codec code but not the
 sync transport caller, making HTTP upgrade validation unreachable in that build
-matrix. The current local dead-code suppressions around structured role-reject
-helpers are a stopgap, not the final boundary.
+matrix. The 2026-05-13 `_sender-qwp-ws`-only check passed, but still emitted 69
+dead-code warnings, including sync-only HTTP upgrade helpers that are compiled
+through `qwp_ws_codec`.
 
 Preferred design direction:
 

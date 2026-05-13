@@ -26,44 +26,23 @@
 
 //! Shared QWP/WebSocket publication receipt and outbound-frame types.
 
-use std::sync::Arc;
-
 use super::qwp_ws_sfa_segment::SfaMappedPayload;
 
 pub(crate) struct PendingPayload {
-    storage: PendingPayloadStorage,
-}
-
-enum PendingPayloadStorage {
-    Owned(Arc<[u8]>),
-    SfaMapped(SfaMappedPayload),
+    payload: SfaMappedPayload,
 }
 
 impl PendingPayload {
-    pub(crate) fn owned(payload: Arc<[u8]>) -> Self {
-        Self {
-            storage: PendingPayloadStorage::Owned(payload),
-        }
-    }
-
     pub(crate) fn sfa_mapped(payload: SfaMappedPayload) -> Self {
-        Self {
-            storage: PendingPayloadStorage::SfaMapped(payload),
-        }
+        Self { payload }
     }
 
     pub(crate) fn len(&self) -> usize {
-        match &self.storage {
-            PendingPayloadStorage::Owned(payload) => payload.len(),
-            PendingPayloadStorage::SfaMapped(payload) => payload.len(),
-        }
+        self.payload.len()
     }
 
     pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        match &self.storage {
-            PendingPayloadStorage::Owned(payload) => f(payload.as_ref()),
-            PendingPayloadStorage::SfaMapped(payload) => payload.with_bytes(f),
-        }
+        self.payload.with_bytes(f)
     }
 }
 

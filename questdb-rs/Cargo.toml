@@ -46,7 +46,12 @@ crc32c = "0.6"
 memmap2 = "0.9"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.9", features = ["ws2def"] }
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [build-dependencies]
 serde_json = { version = "1.0.108" }

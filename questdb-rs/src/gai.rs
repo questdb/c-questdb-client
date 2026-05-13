@@ -34,11 +34,16 @@ use libc::SOCK_DGRAM;
 use libc::SOCK_STREAM;
 
 #[cfg(windows)]
-use winapi::shared::ws2def::AF_INET;
+use windows_sys::Win32::Networking::WinSock::AF_INET;
 #[cfg(all(windows, feature = "sync-sender-qwp-udp"))]
-use winapi::shared::ws2def::SOCK_DGRAM;
+use windows_sys::Win32::Networking::WinSock::SOCK_DGRAM;
 #[cfg(all(windows, feature = "sync-sender-tcp"))]
-use winapi::shared::ws2def::SOCK_STREAM;
+use windows_sys::Win32::Networking::WinSock::SOCK_STREAM;
+
+#[cfg(unix)]
+const ADDR_FAMILY_INET: i32 = AF_INET;
+#[cfg(windows)]
+const ADDR_FAMILY_INET: i32 = AF_INET as i32;
 
 fn map_getaddrinfo_result(
     dest: &str,
@@ -91,7 +96,7 @@ pub(super) fn resolve_host_udp(host: &str) -> super::Result<SockAddr> {
 fn resolve_host_with_socktype(host: &str, socktype: i32) -> super::Result<SockAddr> {
     let hints = AddrInfoHints {
         socktype,
-        address: AF_INET,
+        address: ADDR_FAMILY_INET,
         ..AddrInfoHints::default()
     };
     map_getaddrinfo_result(host, dns_lookup::getaddrinfo(Some(host), None, Some(hints)))
@@ -114,7 +119,7 @@ fn resolve_host_port_with_socktype(
 ) -> super::Result<SockAddr> {
     let hints = AddrInfoHints {
         socktype,
-        address: AF_INET,
+        address: ADDR_FAMILY_INET,
         ..AddrInfoHints::default()
     };
     let host_port = format!("{host}:{port}");

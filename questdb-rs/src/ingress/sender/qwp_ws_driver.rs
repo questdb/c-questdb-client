@@ -58,8 +58,7 @@ use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 use super::qwp_ws_queue::{
-    OutboundFrame, OutboundFrameView, PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus,
-    SentFrame,
+    OutboundFrame, OutboundFrameView, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
 };
 use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaStorageFinish,
@@ -1759,23 +1758,7 @@ pub(crate) trait PublicationLog {
     fn next_outbound_frame(
         &mut self,
         send_cursor: &mut SendCursor,
-    ) -> Result<Option<OutboundFrame>, DriverError>
-    where
-        Self: Sized,
-    {
-        let Some((fsn, wire_seq)) = send_cursor.peek_next_frame(self)? else {
-            return Ok(None);
-        };
-        let Some(payload) = self.pending_payload_for_fsn(fsn)? else {
-            return Ok(None);
-        };
-        Ok(Some(OutboundFrame {
-            fsn,
-            wire_seq,
-            payload,
-        }))
-    }
-    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError>;
+    ) -> Result<Option<OutboundFrame>, DriverError>;
     fn restart_send_cursor(&mut self) {}
     fn take_storage_maintenance_step(
         &mut self,

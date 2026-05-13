@@ -48,8 +48,8 @@ use super::qwp_ws_queue::{
     OutboundFrame, PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus,
 };
 use super::qwp_ws_sfa_segment::{
-    FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaSegment, SfaSegmentError,
-    scan_file_metadata, spare_segment_path,
+    FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaMappedPayload, SfaSegment,
+    SfaSegmentError, scan_file_metadata, spare_segment_path,
 };
 
 const ACK_WATERMARK_FILE_NAME: &str = ".ack-watermark";
@@ -528,16 +528,11 @@ impl SfaFrameQueue {
         self.engine.receipt_status(receipt)
     }
 
-    pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
+    #[cfg(test)]
+    fn payload_vec_for_fsn(&self, fsn: u64) -> Option<Vec<u8>> {
         self.engine
             .segment_for_fsn(fsn)
             .and_then(|segment| segment.payload_for_fsn(fsn))
-            .map(PendingPayload::sfa_mapped)
-    }
-
-    #[cfg(test)]
-    fn payload_vec_for_fsn(&self, fsn: u64) -> Option<Vec<u8>> {
-        self.pending_payload_for_fsn(fsn)
             .map(|payload| payload.with_bytes(|bytes| bytes.to_vec()))
     }
 
@@ -633,7 +628,7 @@ impl SfaFrameQueue {
         &mut self,
         fsn: u64,
     ) -> Result<Option<PendingPayload>, SfaQueueError> {
-        let Some(cursor) = self
+        let Some(mut cursor) = self
             .reusable_send_cursor(fsn)
             .or_else(|| self.position_send_cursor_for_fsn(fsn))
         else {
@@ -641,13 +636,20 @@ impl SfaFrameQueue {
             return Ok(None);
         };
 
-        let (payload, segment_append_offset) = {
-            let segment = Arc::clone(&cursor.segment);
-            let Some(payload) = segment.mapped_payload_at_offset(cursor.offset) else {
+        let (payload, segment_append_offset) = match payload_at_send_cursor(&cursor) {
+            Some(payload) => payload,
+            None => {
                 self.send_cursor = None;
-                return Ok(None);
-            };
-            (payload, segment.published_offset())
+                let Some(repositioned) = self.position_send_cursor_for_fsn(fsn) else {
+                    return Ok(None);
+                };
+                cursor = repositioned;
+                let Some(payload) = payload_at_send_cursor(&cursor) else {
+                    self.send_cursor = None;
+                    return Ok(None);
+                };
+                payload
+            }
         };
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
         let next_offset = cursor
@@ -1172,7 +1174,7 @@ impl SfaSharedSegment {
         Ok(())
     }
 
-    fn payload_for_fsn(&self, fsn: u64) -> Option<super::qwp_ws_sfa_segment::SfaMappedPayload> {
+    fn payload_for_fsn(&self, fsn: u64) -> Option<SfaMappedPayload> {
         let published_offset = self.published_offset();
         let frame_count = self.published_frame_count_after_offset();
         let offset =
@@ -1182,10 +1184,7 @@ impl SfaSharedSegment {
             .mapped_payload_at_offset_with_limit(offset, published_offset)
     }
 
-    fn mapped_payload_at_offset(
-        &self,
-        offset: u64,
-    ) -> Option<super::qwp_ws_sfa_segment::SfaMappedPayload> {
+    fn mapped_payload_at_offset(&self, offset: u64) -> Option<SfaMappedPayload> {
         let published_offset = self.published_offset();
         self.segment
             .mapped_payload_at_offset_with_limit(offset, published_offset)
@@ -1244,10 +1243,6 @@ impl PublicationLog for SfaFrameQueue {
         send_cursor: &mut SendCursor,
     ) -> Result<Option<OutboundFrame>, DriverError> {
         SfaFrameQueue::next_outbound_frame(self, send_cursor)
-    }
-
-    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
-        Ok(SfaFrameQueue::pending_payload_for_fsn(self, fsn))
     }
 
     fn restart_send_cursor(&mut self) {
@@ -1821,6 +1816,11 @@ fn first_unresolved_fsn_from_optional_segments(
             active
                 .and_then(|active| (active.published_frame_count() > 0).then(|| active.base_seq()))
         })
+}
+
+fn payload_at_send_cursor(cursor: &SfaSendCursor) -> Option<(SfaMappedPayload, u64)> {
+    let payload = cursor.segment.mapped_payload_at_offset(cursor.offset)?;
+    Some((payload, cursor.segment.published_offset()))
 }
 
 #[cfg(test)]
@@ -2565,7 +2565,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn ack_watermark_applies_to_replay_only_orphan_open() {
         use super::super::qwp_ws_sfa_slot::SfaSlotQueue;
@@ -2661,6 +2661,24 @@ mod tests {
         assert_eq!(
             pending_payload_vec(queue.next_cursor_payload_for_fsn(3).unwrap().unwrap()),
             b"for"
+        );
+    }
+
+    #[test]
+    fn send_cursor_repositions_after_delayed_rotation() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(38, 38 * 8, 4)).unwrap();
+        submit_with_storage_maintenance(&mut queue, b"one");
+
+        assert_eq!(
+            pending_payload_vec(queue.next_cursor_payload_for_fsn(0).unwrap().unwrap()),
+            b"one"
+        );
+
+        submit_with_storage_maintenance(&mut queue, b"two");
+
+        assert_eq!(
+            pending_payload_vec(queue.next_cursor_payload_for_fsn(1).unwrap().unwrap()),
+            b"two"
         );
     }
 
@@ -2985,26 +3003,6 @@ mod tests {
         assert!(!first_path.exists());
         assert!(second_path.exists());
         assert_eq!(queue.completed_fsn(), Some(1));
-    }
-
-    #[test]
-    fn drained_trim_keeps_existing_mapped_payload_alive() {
-        let dir = TempDir::new().unwrap();
-        let first_path = spare_segment_path(dir.path(), 0);
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
-        queue.try_submit(b"first").unwrap();
-        queue.try_submit(b"second").unwrap();
-        let payload = queue.pending_payload_for_fsn(0).unwrap();
-
-        queue.complete_through_fsn(1).unwrap();
-        let step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
-        assert!(step.changes_queue_before_io());
-        let result = step.perform().unwrap();
-        let finish = queue.finish_storage_maintenance(result, true).unwrap();
-
-        assert!(!first_path.exists());
-        assert!(!finish.did_change());
-        payload.with_bytes(|bytes| assert_eq!(bytes, b"first"));
     }
 
     #[cfg(unix)]

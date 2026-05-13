@@ -33,16 +33,27 @@
 //! diagnostic holder PID.
 
 use std::fs;
-#[cfg(unix)]
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
-use super::qwp_ws_queue::{OutboundFrame, PendingPayload, QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_queue::{OutboundFrame, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaQueueError,
     SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
@@ -51,7 +62,6 @@ use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
 pub(crate) const DEFAULT_SENDER_ID: &str = QWP_WS_DEFAULT_SENDER_ID;
 const LOCK_FILE_NAME: &str = ".lock";
-#[cfg(unix)]
 const LOCK_PID_FILE_NAME: &str = ".lock.pid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +118,7 @@ impl SfaSlotQueue {
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         let result = self.queue.close();
-        self.lock.take();
+        drop(self.lock.take());
         result
     }
 
@@ -136,11 +146,7 @@ impl PublicationLog for SfaSlotQueue {
         &mut self,
         send_cursor: &mut SendCursor,
     ) -> Result<Option<OutboundFrame>, DriverError> {
-        PublicationLog::next_outbound_frame(&mut self.queue, send_cursor)
-    }
-
-    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
-        Ok(self.queue.pending_payload_for_fsn(fsn))
+        self.queue.next_outbound_frame(send_cursor)
     }
 
     fn restart_send_cursor(&mut self) {
@@ -204,7 +210,6 @@ impl PublicationLog for SfaSlotQueue {
 #[derive(Debug)]
 struct SlotLock {
     slot_dir: PathBuf,
-    #[cfg(unix)]
     file: File,
 }
 
@@ -231,18 +236,12 @@ impl SlotLock {
         &self.slot_dir
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn lock_file(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
         let lock_path = slot_dir.join(LOCK_FILE_NAME);
         let pid_path = slot_dir.join(LOCK_PID_FILE_NAME);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
+        let file = open_lock_file(&lock_path)?;
+        if !try_lock_file(&file) {
             let holder = read_lock_holder(&pid_path);
             return Err(SfaQueueError::SlotInUse { slot_dir, holder });
         }
@@ -250,7 +249,7 @@ impl SlotLock {
         Ok(Self { slot_dir, file })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn lock_file(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
         let _ = slot_dir;
         Err(SfaQueueError::SlotLockUnsupported)
@@ -288,7 +287,6 @@ fn ensure_dir(path: &Path) -> Result<(), io::Error> {
     }
 }
 
-#[cfg(unix)]
 fn read_lock_holder(pid_path: &Path) -> String {
     match fs::read(pid_path) {
         Ok(bytes) if !bytes.is_empty() => {
@@ -304,10 +302,50 @@ fn read_lock_holder(pid_path: &Path) -> String {
     }
 }
 
-#[cfg(unix)]
 fn write_pid(pid_path: &Path) {
     let payload = format!("{}\n", std::process::id());
     let _ = fs::write(pid_path, payload);
+}
+
+#[cfg(unix)]
+fn open_lock_file(lock_path: &Path) -> Result<File, io::Error> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> bool {
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) == 0
+}
+
+#[cfg(windows)]
+fn open_lock_file(lock_path: &Path) -> Result<File, io::Error> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(lock_path)
+}
+
+#[cfg(windows)]
+fn try_lock_file(file: &File) -> bool {
+    let mut overlapped = OVERLAPPED::default();
+    unsafe {
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        ) != 0
+    }
 }
 
 #[cfg(test)]
@@ -347,7 +385,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn open_creates_slot_layout_and_lock_file() {
         let temp = TempDir::new().unwrap();
@@ -363,7 +401,7 @@ mod tests {
         assert!(spare_segment_path(&slot_dir, 0).exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn replay_only_existing_open_does_not_create_missing_slot() {
         let temp = TempDir::new().unwrap();
@@ -376,7 +414,7 @@ mod tests {
         assert!(!slot_dir.exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn second_open_on_same_slot_fails_fast_before_interleaving_segments() {
         let temp = TempDir::new().unwrap();
@@ -397,7 +435,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn distinct_sender_ids_are_independent_slots() {
         let temp = TempDir::new().unwrap();
@@ -410,7 +448,7 @@ mod tests {
         assert_eq!(b.slot_dir(), Some(sf_dir.join("b").as_path()));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn close_releases_lock_but_leaves_lock_file_for_reuse() {
         let temp = TempDir::new().unwrap();
@@ -428,5 +466,141 @@ mod tests {
             second.slot_dir(),
             Some(sf_dir.join(DEFAULT_SENDER_ID).as_path())
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn subprocess_holder_releases_slot_lock_on_exit() {
+        use std::time::Duration;
+
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let ready_path = temp.path().join("holder-ready");
+        let release_path = temp.path().join("holder-release");
+        let mut holder = slot_lock_helper_command("hold", &sf_dir, DEFAULT_SENDER_ID)
+            .env("QDB_SFA_SLOT_CHILD_READY", &ready_path)
+            .env("QDB_SFA_SLOT_CHILD_RELEASE", &release_path)
+            .spawn()
+            .unwrap();
+
+        wait_for_path(&ready_path, Duration::from_secs(5));
+
+        let mut contender = slot_lock_helper_command("contend", &sf_dir, DEFAULT_SENDER_ID)
+            .env("QDB_SFA_SLOT_CHILD_HOLDER_PID", holder.id().to_string())
+            .spawn()
+            .unwrap();
+        wait_for_child(&mut contender, Duration::from_secs(5));
+
+        fs::write(&release_path, b"release\n").unwrap();
+        wait_for_child(&mut holder, Duration::from_secs(5));
+
+        let mut acquirer = slot_lock_helper_command("acquire", &sf_dir, DEFAULT_SENDER_ID)
+            .spawn()
+            .unwrap();
+        wait_for_child(&mut acquirer, Duration::from_secs(5));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore = "helper for subprocess_holder_releases_slot_lock_on_exit"]
+    fn qwp_ws_sfa_slot_child_process_lock_helper() {
+        let Ok(mode) = std::env::var("QDB_SFA_SLOT_CHILD_MODE") else {
+            return;
+        };
+        let sf_dir = PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_SF_DIR").unwrap());
+        let sender_id = std::env::var("QDB_SFA_SLOT_CHILD_SENDER_ID").unwrap();
+
+        match mode.as_str() {
+            "hold" => {
+                use std::time::Duration;
+
+                let ready_path =
+                    PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_READY").unwrap());
+                let release_path =
+                    PathBuf::from(std::env::var_os("QDB_SFA_SLOT_CHILD_RELEASE").unwrap());
+                let _queue = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap();
+                fs::write(&ready_path, b"ready\n").unwrap();
+                wait_for_path(&release_path, Duration::from_secs(30));
+            }
+            "contend" => {
+                let holder_pid = std::env::var("QDB_SFA_SLOT_CHILD_HOLDER_PID").unwrap();
+                let err = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap_err();
+                assert!(matches!(
+                    err,
+                    SfaQueueError::SlotInUse {
+                        slot_dir,
+                        holder
+                    } if slot_dir == sf_dir.join(&sender_id)
+                        && holder == format!("pid={holder_pid}")
+                ));
+            }
+            "acquire" => {
+                let queue = SfaSlotQueue::open(options(&sf_dir, &sender_id)).unwrap();
+                assert_eq!(queue.slot_dir(), Some(sf_dir.join(&sender_id).as_path()));
+            }
+            mode => panic!("unknown slot lock helper mode: {mode}"),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn slot_lock_helper_command(
+        mode: &str,
+        sf_dir: &Path,
+        sender_id: &str,
+    ) -> std::process::Command {
+        const HELPER_TEST: &str =
+            "ingress::sender::qwp_ws_sfa_slot::tests::qwp_ws_sfa_slot_child_process_lock_helper";
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg(HELPER_TEST)
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("QDB_SFA_SLOT_CHILD_MODE", mode)
+            .env("QDB_SFA_SLOT_CHILD_SF_DIR", sf_dir)
+            .env("QDB_SFA_SLOT_CHILD_SENDER_ID", sender_id);
+        command
+    }
+
+    #[cfg(any(unix, windows))]
+    fn wait_for_path(path: &Path, timeout: std::time::Duration) {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[cfg(any(unix, windows))]
+    fn wait_for_child(child: &mut std::process::Child, timeout: std::time::Duration) {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "child exited with {status}");
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        panic!("timed out waiting for child process");
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn slot_lock_is_unsupported_on_other_platforms() {
+        let temp = TempDir::new().unwrap();
+        let err = SlotLock::lock_file(temp.path().join("slot")).unwrap_err();
+
+        assert!(matches!(err, SfaQueueError::SlotLockUnsupported));
     }
 }
