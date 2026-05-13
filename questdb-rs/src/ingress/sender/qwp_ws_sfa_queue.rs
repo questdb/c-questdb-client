@@ -598,12 +598,9 @@ impl SfaFrameQueue {
         self.engine.oldest_unresolved_fsn()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.engine.len()
-    }
-
-    pub(crate) fn bytes_used(&self) -> usize {
-        0
     }
 
     pub(crate) fn published_fsn(&self) -> Option<u64> {
@@ -1026,6 +1023,7 @@ impl SfaEngine {
         (completed < published).then_some(completed)
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         let completed = self.completed_upper.load(Ordering::Acquire);
         let published = self.published_upper.load(Ordering::Acquire);

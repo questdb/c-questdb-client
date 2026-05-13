@@ -101,7 +101,7 @@ Related local docs:
 | S1 | done | high | Payload model | Inline `PendingPayload` into `OutboundFrame`. | Smallest deletion; removes a wrapper that no longer abstracts anything. |
 | S2 | done | high | Test surface | Move fake transports behind `#[cfg(test)]` and remove fake defaults from production generics. | Keeps production driver shape honest and Java-like. |
 | S3 | done | high | Test surface | Remove the test-only `sent_frames()` hook from the production transport trait. | Prevents test inspection from becoming production API. |
-| S4 | todo | medium | Queue diagnostics | Delete or cfg-test misleading queue counters, especially constant-zero `bytes_used()`. | Avoids stale diagnostics and broad `allow(dead_code)`. |
+| S4 | done | medium | Queue diagnostics | Delete or cfg-test misleading queue counters, especially constant-zero `bytes_used()`. | Avoids stale diagnostics and broad `allow(dead_code)`. |
 | S5 | todo | medium | Feature hygiene | Replace file-level `#![allow(dead_code)]` with targeted cfgs/removals after S1-S4. | Makes stale Rust-only surface visible again. |
 | C1 | todo | high | Upgrade classification | Validate `X-QWP-Version` before durable-ACK echo. | Spec/Java alignment; avoids misclassifying future-version peers. |
 | C2 | todo | high | Connect/retry | Unify connect/retry plumbing, including orphan initial connect. | Spec alignment; current Java only partially shares this orphan behavior. |
@@ -386,17 +386,25 @@ Validation:
 
 ## S4: Remove Misleading Queue Counters
 
-Current shape:
+Status:
+
+Implemented. `bytes_used()` was deleted, and unresolved-frame `len()` is now
+test-only.
+
+Previous shape:
 
 - `SfaFrameQueue::len()` is production-visible but appears test-oriented.
 - `SfaFrameQueue::bytes_used()` returns a constant zero.
 
-Target shape:
+Implemented shape:
 
-- Delete `bytes_used()` unless production diagnostics need it now.
-- If diagnostics do need it, implement the real value instead of keeping a
-  placeholder.
-- Move `len()` behind `#[cfg(test)]` if it is only used by tests.
+- Deleted `SfaFrameQueue::bytes_used()`; there was no production diagnostic
+  caller and the constant-zero value was misleading.
+- Moved `SfaFrameQueue::len()` and the underlying `SfaEngine::len()` behind
+  `#[cfg(test)]`; current callers are recovery/unit tests only.
+- Did not add a replacement public byte metric. Java's comparable SFA byte
+  accounting is internal segment-cap accounting, while production-visible
+  sender accessors are operational cursors such as published/acked FSN.
 
 Rationale:
 
