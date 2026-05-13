@@ -626,7 +626,10 @@ fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> ProxyResult
     let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
-            Ok((stream, _addr)) => return Ok(stream),
+            Ok((stream, _addr)) => {
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
             Err(err) if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }

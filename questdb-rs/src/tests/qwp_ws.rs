@@ -752,6 +752,7 @@ fn spawn_role_reject_upgrade_server(
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -815,6 +816,7 @@ where
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     attempts_thread.fetch_add(1, Ordering::AcqRel);
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -3353,6 +3355,7 @@ fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
             match first_listener.accept() {
                 Ok((mut stream, _)) => {
                     let attempt = first_attempts_thread.fetch_add(1, Ordering::AcqRel) + 1;
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -3394,6 +3397,7 @@ fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
             match second_listener.accept() {
                 Ok((mut stream, _)) => {
                     second_attempts_thread.fetch_add(1, Ordering::AcqRel);
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
