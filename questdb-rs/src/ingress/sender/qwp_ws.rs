@@ -1781,6 +1781,7 @@ fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::
 
 // ---------- HTTP/1.1 upgrade ----------
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_upgrade<S: Read + Write>(
     stream: &mut S,

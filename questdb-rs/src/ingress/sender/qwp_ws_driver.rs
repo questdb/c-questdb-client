@@ -1612,10 +1612,10 @@ fn reconnect_attempt_error(err: DriverError) -> Result<Error, DriverError> {
 }
 
 pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
-    match err.code() {
-        ErrorCode::AuthError | ErrorCode::ProtocolVersionError => true,
-        _ => false,
-    }
+    matches!(
+        err.code(),
+        ErrorCode::AuthError | ErrorCode::ProtocolVersionError
+    )
 }
 
 fn is_qwp_ws_role_reject_error(err: &Error) -> bool {
