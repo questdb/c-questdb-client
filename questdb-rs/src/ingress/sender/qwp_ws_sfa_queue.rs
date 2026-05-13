@@ -44,9 +44,7 @@ use memmap2::{MmapMut, MmapOptions};
 use crate::error;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
-use super::qwp_ws_queue::{
-    OutboundFrame, PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus,
-};
+use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaMappedPayload, SfaSegment,
     SfaSegmentError, scan_file_metadata, spare_segment_path,
@@ -627,7 +625,7 @@ impl SfaFrameQueue {
     fn next_cursor_payload_for_fsn(
         &mut self,
         fsn: u64,
-    ) -> Result<Option<PendingPayload>, SfaQueueError> {
+    ) -> Result<Option<SfaMappedPayload>, SfaQueueError> {
         let Some(mut cursor) = self
             .reusable_send_cursor(fsn)
             .or_else(|| self.position_send_cursor_for_fsn(fsn))
@@ -659,7 +657,7 @@ impl SfaFrameQueue {
             .ok_or(QueueError::SequenceOverflow)?;
         self.send_cursor =
             Some(self.advance_send_cursor(cursor, next_fsn, next_offset, segment_append_offset));
-        Ok(Some(PendingPayload::sfa_mapped(payload)))
+        Ok(Some(payload))
     }
 
     fn reusable_send_cursor(&self, fsn: u64) -> Option<SfaSendCursor> {
@@ -1888,7 +1886,7 @@ mod tests {
         SfaFrameQueue::open_memory(memory_options(48, 144, 4)).unwrap()
     }
 
-    fn pending_payload_vec(payload: PendingPayload) -> Vec<u8> {
+    fn pending_payload_vec(payload: SfaMappedPayload) -> Vec<u8> {
         payload.with_bytes(|bytes| bytes.to_vec())
     }
 

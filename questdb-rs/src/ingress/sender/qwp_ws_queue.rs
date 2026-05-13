@@ -28,32 +28,6 @@
 
 use super::qwp_ws_sfa_segment::SfaMappedPayload;
 
-pub(crate) struct PendingPayload {
-    payload: SfaMappedPayload,
-}
-
-impl PendingPayload {
-    pub(crate) fn sfa_mapped(payload: SfaMappedPayload) -> Self {
-        Self { payload }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.payload.len()
-    }
-
-    pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        self.payload.with_bytes(f)
-    }
-}
-
-impl std::fmt::Debug for PendingPayload {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingPayload")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwpReceipt {
     pub(crate) fsn: u64,
@@ -88,7 +62,7 @@ pub(crate) struct SentFrame {
 pub(crate) struct OutboundFrame {
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
-    pub(crate) payload: PendingPayload,
+    pub(crate) payload: SfaMappedPayload,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -77,19 +77,19 @@ Current segment storage:
 - Keep the lock held by owning the lock file handle for the `SlotLock` lifetime.
 - Keep `SlotLockUnsupported` for platforms that are neither Unix nor Windows.
 - Keep Windows cleanup simple by avoiding long-lived mapped payload handles on
-  Windows replay reads.
+  any API that returns replay payloads beyond a synchronous send call.
 
 ## Chosen Scope
 
-The first implementation slice should enable Windows slot locking, return owned
-payloads for Windows SFA replay reads, and run the existing SFA segment/queue
-tests on Windows.
+The first implementation slice should enable Windows slot locking and run the
+existing SFA segment/queue tests on Windows.
 
-Keep Unix replay reads zero-copy via `SfaMappedPayload`. On Windows, convert the
-mapped bytes to `PendingPayload::Owned` before returning a payload from the SFA
-queue. That preserves the existing `PendingPayload` abstraction and avoids a
-delete-later queue for segments whose mapping is still held by an outbound
-frame.
+Keep the production synchronous send path zero-copy via `SfaMappedPayload` on
+every platform. Windows needs owned bytes only for a future API that returns
+replay payload objects which can outlive a synchronous send call or storage
+maintenance step. Do not add a delete-later queue for segments whose mapping is
+still held by a long-lived returned payload; make that future retained payload
+owned on Windows instead.
 
 ## Non-Goals
 
@@ -253,29 +253,32 @@ fn write_pid(pid_path: &Path) {
 The write remains best effort. A stale or missing `.lock.pid` is allowed by the
 spec and produces `holder=unknown`.
 
-### 5. Return Owned Replay Payloads On Windows
+### 5. Keep Synchronous Send Payloads Mapped
 
-Keep Unix replay reads as mapped payloads. On Windows, convert mapped SFA bytes
-to an owned payload before returning them from the queue:
+The current production SFA send path returns a short-lived `OutboundFrame`, sends
+it synchronously, and drops it before storage maintenance runs file cleanup.
+That path should keep borrowing mapped bytes on every platform, including
+Windows. Do not add a Windows-only payload copy to this hot path.
+
+If a future API returns replay payload objects that can outlive the synchronous
+send call or storage-maintenance step, then that long-lived API needs an owned
+Windows representation:
 
 ```rust
 #[cfg(unix)]
-return Some(PendingPayload::sfa_mapped(payload));
+return RetainedReplayPayload::Mapped(payload);
 
 #[cfg(windows)]
 {
     let owned = payload.with_bytes(|bytes| Arc::<[u8]>::from(bytes));
-    return Some(PendingPayload::owned(owned));
+    return RetainedReplayPayload::Owned(owned);
 }
 ```
 
-Apply this at the SFA queue boundary where `SfaMappedPayload` currently becomes
-`PendingPayload`. Do not add a delete-later list, tombstone state, or a
-Windows-only cleanup scheduler.
-
-This keeps the existing public queue shape: callers still hold a
-`PendingPayload`, but Windows payloads do not keep the mapped segment alive
-after trim.
+Do not apply that conversion to the current `OutboundFrame` path. Apply it only
+if Rust reintroduces a retained replay-payload contract. Even then, prefer an
+owned payload for that specific retained API over a delete-later list, tombstone
+state, or Windows-only cleanup scheduler.
 
 ### 6. Keep Unsupported Fallback For Other Platforms
 
@@ -303,8 +306,9 @@ Important lifecycle rules to validate on Windows:
 
 - Cleanup must not silently assume POSIX unlink semantics. The current
   `SfaStorageCleanup::perform` drops its owned segment before `remove_file`; on
-  Windows, returned replay payloads must be owned so they do not keep an
-  additional mapping alive after trim.
+  Windows, any returned payload object that can outlive the synchronous send call
+  must be owned so it does not keep an additional mapping alive after trim. The
+  current short-lived `OutboundFrame` send path may remain mapped.
 - Quarantine rename is best effort. The current queue removes a stale
   `.corrupt` target before `rename`, which is already the right Windows shape.
 - Closing a `SlotLock` must close the `.lock` file handle after all segment
@@ -350,9 +354,12 @@ Add or keep coverage for:
   with the parent's PID text, then a fresh child can acquire after the parent
   holder exits. This validates kernel cleanup on process exit, not only
   same-process drops.
-- `drained_trim_keeps_existing_mapped_payload_alive` or an equivalent Windows
-  queue test. On Windows, the payload should remain readable because it is owned,
-  and the retired segment file should be removable immediately.
+- a trim-after-send Windows queue test. The current synchronous send path should
+  keep mapped payloads readable only for the duration of `send_frame()`, then
+  drop them before storage cleanup removes the retired segment file.
+- if a future retained replay-payload API is added, add a separate Windows test
+  proving that returned retained payloads are owned and do not keep retired
+  segment files from being removed.
 
 Run on Linux/macOS:
 
@@ -389,11 +396,12 @@ cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws --features sync-sender-q
 
 1. Replace `winapi` with `windows-sys` for Windows constants and locking.
 2. Add the Windows lock helpers and platform-neutral PID helper.
-3. Return owned SFA replay payloads on Windows.
+3. Keep synchronous SFA send payloads mapped on Windows and avoid any hot-path
+   owned payload copy.
 4. Enable slot-lock tests on Windows.
 5. Run focused SFA tests locally on Unix.
-6. Push and validate focused SFA tests on Windows CI, including the owned
-   payload cleanup case.
+6. Push and validate focused SFA tests on Windows CI, including trim-after-send
+   cleanup behavior.
 7. Only after Windows CI passes, consider enabling broader QWP/WebSocket
    Windows coverage that currently avoids `sf_dir`.
 
