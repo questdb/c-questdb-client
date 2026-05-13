@@ -1788,6 +1788,26 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     client_id: Option<&str>,
     request_durable_ack: bool,
 ) -> crate::Result<(u8, Vec<u8>)> {
+    let key_b64 = write_upgrade_request(
+        stream,
+        host_header,
+        auth_header,
+        max_version,
+        client_id,
+        request_durable_ack,
+    )?;
+    read_upgrade_response(stream, &key_b64, max_version, request_durable_ack)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_upgrade_request<W: Write>(
+    stream: &mut W,
+    host_header: &str,
+    auth_header: Option<&str>,
+    max_version: u32,
+    client_id: Option<&str>,
+    request_durable_ack: bool,
+) -> crate::Result<String> {
     // RFC 6455 only requires a 16-byte random nonce that the client base64-
     // encodes. It is not a security boundary.
     let mut key_bytes = [0u8; 16];
@@ -1811,7 +1831,7 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
         )
     })?;
 
-    read_upgrade_response(stream, &key_b64, max_version, request_durable_ack)
+    Ok(key_b64)
 }
 
 fn read_upgrade_response<R: Read>(
@@ -1865,7 +1885,7 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<(Vec<u8>, Ve
 fn complete_qwp_ws_tls_handshake(
     conn: &mut rustls::ClientConnection,
     tcp: &mut TcpStream,
-    auth_timeout: Duration,
+    tls_timeout: Duration,
 ) -> crate::Result<()> {
     while conn.wants_write() || conn.is_handshaking() {
         conn.complete_io(tcp).map_err(|io| {
@@ -1873,7 +1893,7 @@ fn complete_qwp_ws_tls_handshake(
                 error::fmt!(
                     TlsError,
                     "Failed to complete TLS handshake: timed out waiting for server response after {:?}.",
-                    auth_timeout
+                    tls_timeout
                 )
             } else {
                 error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io)
@@ -2147,7 +2167,7 @@ pub(crate) fn establish_connection(
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
 
-    let mut tcp = connect_qwp_ws_tcp(host, port, connect_timeout, auth_timeout)?;
+    let mut tcp = connect_qwp_ws_tcp(host, port, connect_timeout, request_timeout)?;
 
     let host_header = if (use_tls && port == "443") || (!use_tls && port == "80") {
         host.to_string()
@@ -2170,9 +2190,9 @@ pub(crate) fn establish_connection(
             .map_err(|e| error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e))?;
         let mut conn = rustls::ClientConnection::new(cfg, server_name)
             .map_err(|e| error::fmt!(TlsError, "TLS handshake setup failed: {}", e))?;
-        complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, auth_timeout)?;
+        complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, request_timeout)?;
         let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
-        let (negotiated_version, leftover) = perform_upgrade(
+        let key_b64 = write_upgrade_request(
             &mut tls_stream,
             &host_header,
             auth_header,
@@ -2180,6 +2200,12 @@ pub(crate) fn establish_connection(
             client_id,
             request_durable_ack,
         )?;
+        tls_stream
+            .get_ref()
+            .set_read_timeout(Some(auth_timeout))
+            .ok();
+        let (negotiated_version, leftover) =
+            read_upgrade_response(&mut tls_stream, &key_b64, max_version, request_durable_ack)?;
         (
             WsStream::Tls(Box::new(tls_stream)),
             negotiated_version,
@@ -2187,12 +2213,19 @@ pub(crate) fn establish_connection(
         )
     } else {
         let mut plain_stream = tcp;
-        let (negotiated_version, leftover) = perform_upgrade(
+        let key_b64 = write_upgrade_request(
             &mut plain_stream,
             &host_header,
             auth_header,
             max_version,
             client_id,
+            request_durable_ack,
+        )?;
+        plain_stream.set_read_timeout(Some(auth_timeout)).ok();
+        let (negotiated_version, leftover) = read_upgrade_response(
+            &mut plain_stream,
+            &key_b64,
+            max_version,
             request_durable_ack,
         )?;
         (WsStream::Plain(plain_stream), negotiated_version, leftover)
@@ -2934,6 +2967,29 @@ mod tests {
         )
         .unwrap();
 
+        drop(tcp);
+        let _ = accepted.join().unwrap();
+    }
+
+    #[test]
+    fn connect_tcp_sets_post_connect_io_timeout() {
+        use std::net::{Ipv4Addr, TcpListener};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap());
+        let io_timeout = Duration::from_millis(250);
+
+        let tcp = connect_qwp_ws_tcp(
+            "127.0.0.1",
+            &port.to_string(),
+            Duration::from_secs(1),
+            io_timeout,
+        )
+        .unwrap();
+
+        assert_eq!(tcp.read_timeout().unwrap(), Some(io_timeout));
+        assert_eq!(tcp.write_timeout().unwrap(), Some(io_timeout));
         drop(tcp);
         let _ = accepted.join().unwrap();
     }

@@ -1665,8 +1665,7 @@ impl SenderBuilder {
 
     /// Configure how long to wait for messages from the QuestDB server during
     /// the TLS handshake and authentication process. For QWP/WebSocket this
-    /// applies to the WebSocket upgrade/authentication exchange. The default is
-    /// 15 seconds.
+    /// bounds only the HTTP upgrade response read. The default is 15 seconds.
     pub fn auth_timeout(mut self, value: Duration) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("auth_timeout")?;
