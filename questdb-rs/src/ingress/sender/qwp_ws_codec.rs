@@ -309,17 +309,6 @@ pub(super) fn validate_upgrade_response(
             "WebSocket upgrade failed: invalid Sec-WebSocket-Accept"
         ));
     }
-    if request_durable_ack {
-        let durable_ack_enabled = parsed.headers.iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case("x-qwp-durable-ack") && v.eq_ignore_ascii_case("enabled")
-        });
-        if !durable_ack_enabled {
-            return Err(error::fmt!(
-                ProtocolVersionError,
-                "WebSocket upgrade failed: server did not enable durable ACK"
-            ));
-        }
-    }
     let version_str = parsed
         .headers
         .iter()
@@ -348,6 +337,17 @@ pub(super) fn validate_upgrade_response(
             version,
             max_version
         ));
+    }
+    if request_durable_ack {
+        let durable_ack_enabled = parsed.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("x-qwp-durable-ack") && v.eq_ignore_ascii_case("enabled")
+        });
+        if !durable_ack_enabled {
+            return Err(error::fmt!(
+                ProtocolVersionError,
+                "WebSocket upgrade failed: server did not enable durable ACK"
+            ));
+        }
     }
     Ok(version)
 }
@@ -617,6 +617,27 @@ mod tests {
             .headers
             .push(("X-QWP-Durable-Ack".to_string(), "enabled".to_string()));
         validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap();
+    }
+
+    #[test]
+    fn upgrade_response_validates_qwp_version_before_durable_ack_echo() {
+        let expected_accept = "accept";
+        let mut parsed = valid_upgrade_headers(expected_accept);
+        parsed
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-qwp-version"))
+            .unwrap()
+            .1 = "2".to_string();
+
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg().contains("unsupported X-QWP-Version"),
+            "got: {}",
+            err.msg()
+        );
     }
 
     #[test]

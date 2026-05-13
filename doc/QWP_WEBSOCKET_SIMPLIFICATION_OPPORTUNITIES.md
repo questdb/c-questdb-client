@@ -102,8 +102,8 @@ Related local docs:
 | S2 | done | high | Test surface | Move fake transports behind `#[cfg(test)]` and remove fake defaults from production generics. | Keeps production driver shape honest and Java-like. |
 | S3 | done | high | Test surface | Remove the test-only `sent_frames()` hook from the production transport trait. | Prevents test inspection from becoming production API. |
 | S4 | done | medium | Queue diagnostics | Delete or cfg-test misleading queue counters, especially constant-zero `bytes_used()`. | Avoids stale diagnostics and broad `allow(dead_code)`. |
-| S5 | todo | medium | Feature hygiene | Replace file-level `#![allow(dead_code)]` with targeted cfgs/removals after S1-S4. | Makes stale Rust-only surface visible again. |
-| C1 | todo | high | Upgrade classification | Validate `X-QWP-Version` before durable-ACK echo. | Spec/Java alignment; avoids misclassifying future-version peers. |
+| S5 | todo | medium | Feature hygiene | Replace broad `#![allow(dead_code)]` only where the replacement is real cfg/test separation or a narrow documented local allow. | Makes stale Rust-only surface visible without turning cleanup into a lint chase. |
+| C1 | done | high | Upgrade classification | Validate `X-QWP-Version` before durable-ACK echo. | Spec/Java alignment; avoids misclassifying future-version peers. |
 | C2 | todo | high | Connect/retry | Unify connect/retry plumbing, including orphan initial connect. | Spec alignment; current Java only partially shares this orphan behavior. |
 | C3 | todo | low | Windows coverage | Broaden orphan locked-slot tests to Windows. | Verifies the already-implemented cross-platform lock contract. |
 
@@ -418,7 +418,7 @@ Validation:
 - Prefer deleting dead call sites over replacing them with another wrapper.
 - Run SFA queue tests after the cleanup.
 
-## S5: Remove Broad Dead-Code Suppression
+## S5: Scoped Dead-Code Surface Audit
 
 Current shape:
 
@@ -427,24 +427,75 @@ including driver, queue, SFA queue, SFA slot, and SFA segment modules.
 
 Target shape:
 
-- After S1-S4, remove file-level `allow(dead_code)`.
+- Do not implement S5 as a mechanical removal of every file-level
+  `allow(dead_code)`.
+- Remove file-level `allow(dead_code)` only in modules where the exposed warnings
+  can be classified into real boundaries: delete genuinely dead items, move
+  test-only helpers behind `#[cfg(test)]`, add feature cfgs for feature-only
+  paths, or leave a small documented local `allow(dead_code)` for intentional
+  diagnostic/state payloads.
 - Use targeted `#[cfg(test)]`, feature cfg, or local `allow(dead_code)` only
   where the item is intentionally compiled but not always reachable.
-- Treat newly exposed warnings as a cleanup queue, not as noise to suppress.
+- Treat newly exposed warnings as a cleanup queue, not as a mandate to churn all
+  QWP/WebSocket modules in one patch.
+
+First S5 slice:
+
+- Start with `qwp_ws_sfa_segment.rs`.
+- Remove that file's broad `#![allow(dead_code)]`.
+- Gate full payload scan / golden-fixture helpers behind `#[cfg(test)]` if
+  current call sites are tests only:
+  - `SfaFrame`;
+  - `SfaSegmentScan`;
+  - `scan_file()`;
+  - `scan_segment_bytes()`.
+- Keep metadata-only scan surface production-visible when recovery uses it.
+
+Explicit non-goals for the first slice:
+
+- Do not decide `qwp_ws_driver.rs` API surface wholesale. The driver mixes
+  manual APIs, runner internals, feature-gated transports, tests, events, and
+  status queries.
+- Do not test-gate `SfaFrameQueue::recovery_diagnostics()` mechanically. Decide
+  first whether it is intended production diagnostic surface or test-only
+  recovery evidence.
+- Do not remove enum payload fields or stored diagnostic fields merely because
+  only `Debug` currently reads them.
 
 Rationale:
 
 Broad suppression hides the exact Rust-only surface we are trying to remove. It
-also makes feature-gating mistakes harder to see.
+also makes feature-gating mistakes harder to see. The fix is targeted surface
+classification, not fake reads or cross-module churn just to satisfy the
+dead-code lint.
+
+Ordering note:
+
+C1 was completed before the first S5 slice. Continue with the scoped S5a shape
+below; do not reopen broad dead-code cleanup while doing unrelated correctness
+items.
 
 Validation:
 
+- For the first S5 slice:
+  `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib qwp_ws_sfa_segment`
+- Also run sibling SFA queue tests because they import segment helpers:
+  `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib qwp_ws_sfa_queue`
 - `cargo check --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib`
 - `cargo check --manifest-path questdb-rs/Cargo.toml --no-default-features --features _sender-qwp-ws,ring-crypto,tls-webpki-certs`
 
 ## C1: Validate QWP Version Before Durable-ACK Echo
 
-Current Rust risk:
+Status:
+
+Implemented. `validate_upgrade_response()` now parses and validates
+`X-QWP-Version` before checking the durable-ACK echo. Unsupported or invalid
+versions keep the transport/transient `SocketError` classification, while a
+compatible 101 response that omits `X-QWP-Durable-Ack: enabled` after
+`request_durable_ack=true` still returns the durable-ACK mismatch
+`ProtocolVersionError`.
+
+Previous Rust risk:
 
 `validate_upgrade_response()` checks the durable-ACK echo before parsing and
 validating `X-QWP-Version`. If a future-version server does not echo durable
@@ -461,31 +512,31 @@ Spec/Java context:
   upgraded successfully.
 - Java's `QwpVersionMismatchException` documents the version-mismatch category.
 
-Target shape:
+Implemented shape:
 
 - Parse and validate `X-QWP-Version` first.
 - Only after the version is compatible, require durable-ACK echo when
   `request_durable_ack=true`.
 - Keep durable-ACK mismatch terminal for a compatible 101 response that simply
   did not enable requested durable ACK.
-- Preserve the current Rust classification split: invalid or unsupported
-  `X-QWP-Version` stays on the transport/transient path (`SocketError` today),
-  while missing durable-ACK echo after a compatible 101 remains the terminal
-  durable-ACK mismatch path (`ProtocolVersionError` today).
-- Rename any test that currently implies this is a generic protocol-version
-  path if it is really durable-ACK mismatch-specific.
+- Added a codec regression for future-version plus missing durable-ACK echo, so
+  this path stays version/transport-classified instead of durable-ACK-mismatch
+  classified.
 
 Rationale:
 
 This is not just cleanup. It is a small ordering fix that keeps Rust's upgrade
 classification aligned with the spec and Java's connect behavior.
 
-Validation:
+Validation performed:
 
-- Add/update codec tests for future-version plus missing durable-ACK echo.
-- Ensure future-version remains a version/transport-classified failure, not a
-  durable-ACK mismatch and not a terminal protocol-version error.
-- Run QWP/WebSocket codec and driver tests.
+- `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib qwp_ws_codec`
+- `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib qwp_ws_driver`
+- `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib qwp_ws`
+- `cargo fmt --check --manifest-path questdb-rs/Cargo.toml`
+- `cargo check --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib`
+- `cargo check --manifest-path questdb-rs/Cargo.toml --no-default-features --features _sender-qwp-ws,ring-crypto,tls-webpki-certs`
+- `git diff --check`
 
 ## C2: Unify Connect/Retry Plumbing
 
@@ -638,12 +689,12 @@ with storage-position state. That is not Java-like and is not simpler.
 
 Recommended order:
 
-1. S2/S3: gate fake transports and remove production `sent_frames()`.
-2. S4: remove or cfg-test dead/misleading queue counters.
-3. S5: remove broad dead-code suppressions exposed by the previous steps.
-4. C1: fix upgrade validation ordering.
-5. C3: broaden orphan lock tests.
-6. C2: unify connect/retry plumbing as its own slice.
+1. S5a: remove broad dead-code suppression from `qwp_ws_sfa_segment.rs` only and
+   cfg-test full scan helpers.
+2. C3: broaden orphan lock tests.
+3. S5 follow-ups: decide queue diagnostics and driver API surface in separate
+   small slices.
+4. C2: unify connect/retry plumbing as its own slice.
 
 Do not combine C2 with the smaller deletion cleanups. The connect/retry helper
 is a policy refactor and deserves its own tests and review.
