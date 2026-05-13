@@ -66,6 +66,8 @@ use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
 type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
+const QWP_WS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub(crate) enum WsStream {
     Plain(TcpStream),
     Tls(Box<TlsStream>),
@@ -1935,23 +1937,21 @@ fn resolve_qwp_ws_addrs(host: &str, port: &str) -> crate::Result<Vec<SocketAddr>
 fn connect_qwp_ws_tcp(
     host: &str,
     port: &str,
-    connect_timeout: Duration,
     request_timeout: Duration,
 ) -> crate::Result<TcpStream> {
     let addrs = resolve_qwp_ws_addrs(host, port)?;
-    connect_tcp_to_any_addr(host, port, &addrs, connect_timeout, request_timeout)
+    connect_tcp_to_any_addr(host, port, &addrs, request_timeout)
 }
 
 fn connect_tcp_to_any_addr(
     host: &str,
     port: &str,
     addrs: &[SocketAddr],
-    connect_timeout: Duration,
     request_timeout: Duration,
 ) -> crate::Result<TcpStream> {
     let mut failures = Vec::new();
     for addr in addrs {
-        match TcpStream::connect_timeout(addr, connect_timeout) {
+        match TcpStream::connect(addr) {
             Ok(tcp) => {
                 tcp.set_nodelay(true).ok();
                 tcp.set_read_timeout(Some(request_timeout)).ok();
@@ -2163,11 +2163,10 @@ pub(crate) fn establish_connection(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
 ) -> crate::Result<(WsStream, u8, Vec<u8>)> {
-    let connect_timeout = *qwp_ws.connect_timeout;
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
 
-    let mut tcp = connect_qwp_ws_tcp(host, port, connect_timeout, request_timeout)?;
+    let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout)?;
 
     let host_header = if (use_tls && port == "443") || (!use_tls && port == "80") {
         host.to_string()
@@ -2190,8 +2189,20 @@ pub(crate) fn establish_connection(
             .map_err(|e| error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e))?;
         let mut conn = rustls::ClientConnection::new(cfg, server_name)
             .map_err(|e| error::fmt!(TlsError, "TLS handshake setup failed: {}", e))?;
-        complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, request_timeout)?;
+        tcp.set_read_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
+            .ok();
+        tcp.set_write_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
+            .ok();
+        complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, QWP_WS_TLS_HANDSHAKE_TIMEOUT)?;
         let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+        tls_stream
+            .get_ref()
+            .set_read_timeout(Some(request_timeout))
+            .ok();
+        tls_stream
+            .get_ref()
+            .set_write_timeout(Some(request_timeout))
+            .ok();
         let key_b64 = write_upgrade_request(
             &mut tls_stream,
             &host_header,
@@ -2301,9 +2312,7 @@ pub(super) fn connect_qwp_ws_endpoint_round(
             }
             Err(err) => {
                 tracker.record_transport_error(idx);
-                if err.code() == crate::ErrorCode::ProtocolVersionError
-                    && !err.qwp_ws_upgrade_version_mismatch()
-                {
+                if err.code() == crate::ErrorCode::ProtocolVersionError {
                     latched_typed_error = Some(err.clone());
                 }
                 last_error = Some(err);
@@ -2962,7 +2971,6 @@ mod tests {
             "localhost",
             &port.to_string(),
             &[bad_v6, good_v4],
-            Duration::from_millis(100),
             Duration::from_secs(1),
         )
         .unwrap();
@@ -2980,13 +2988,7 @@ mod tests {
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let io_timeout = Duration::from_millis(250);
 
-        let tcp = connect_qwp_ws_tcp(
-            "127.0.0.1",
-            &port.to_string(),
-            Duration::from_secs(1),
-            io_timeout,
-        )
-        .unwrap();
+        let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout).unwrap();
 
         assert_eq!(tcp.read_timeout().unwrap(), Some(io_timeout));
         assert_eq!(tcp.write_timeout().unwrap(), Some(io_timeout));

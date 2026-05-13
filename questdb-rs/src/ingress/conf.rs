@@ -182,7 +182,6 @@ pub(crate) enum QwpWsInitialConnectMode {
 #[derive(Debug, Clone)]
 pub(crate) struct QwpWsConfig {
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
-    pub(crate) connect_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) client_id: ConfigSetting<Option<String>>,
@@ -220,7 +219,6 @@ impl Default for QwpWsConfig {
     fn default() -> Self {
         Self {
             endpoints: ConfigSetting::new_default(Vec::new()),
-            connect_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
             auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             client_id: ConfigSetting::new_default(None),

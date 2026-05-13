@@ -334,6 +334,21 @@ fn upgrade_mock_stream_with_version(stream: &mut TcpStream, version: u8) -> Vec<
     request_lines
 }
 
+fn upgrade_mock_stream_without_upgrade_header(stream: &mut TcpStream) {
+    let req_bytes = read_request_until_blank(stream).unwrap();
+    let req = String::from_utf8_lossy(&req_bytes).to_string();
+    let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
+    let accept = compute_accept(&key);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         X-QWP-Version: 1\r\n\
+         \r\n"
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
 // Mirror of the production SHA-1 used by the sender, reproduced here to
 // validate the upgrade handshake from the server side without poking at
 // internals. ~50 lines is cheaper than another dependency.
@@ -769,6 +784,26 @@ fn spawn_unsupported_version_upgrade_server(
     done: Arc<AtomicBool>,
     version: u8,
 ) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    spawn_retrying_failing_upgrade_server(done, move |stream| {
+        let _ = upgrade_mock_stream_with_version(stream, version);
+    })
+}
+
+fn spawn_malformed_101_upgrade_server(
+    done: Arc<AtomicBool>,
+) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    spawn_retrying_failing_upgrade_server(done, |stream| {
+        upgrade_mock_stream_without_upgrade_header(stream);
+    })
+}
+
+fn spawn_retrying_failing_upgrade_server<F>(
+    done: Arc<AtomicBool>,
+    respond: F,
+) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>)
+where
+    F: Fn(&mut TcpStream) + Send + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -786,12 +821,12 @@ fn spawn_unsupported_version_upgrade_server(
                     stream
                         .set_write_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
-                    let _ = upgrade_mock_stream_with_version(&mut stream, version);
+                    respond(&mut stream);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
                 }
-                Err(err) => panic!("unsupported-version listener failed: {err}"),
+                Err(err) => panic!("failing-upgrade listener failed: {err}"),
             }
         }
     });
@@ -3054,6 +3089,50 @@ fn qwp_ws_sync_initial_retry_unsupported_version_retries_after_round_exhaustion(
     );
     assert!(
         err.msg().contains("unsupported X-QWP-Version"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(
+        first_attempts.load(Ordering::Acquire) >= 2,
+        "first endpoint was not retried"
+    );
+    assert!(
+        second_attempts.load(Ordering::Acquire) >= 2,
+        "second endpoint was not retried"
+    );
+}
+
+#[test]
+fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
+    let done = Arc::new(AtomicBool::new(false));
+    let (first_port, first_attempts, first_handle) =
+        spawn_malformed_101_upgrade_server(Arc::clone(&done));
+    let (second_port, second_attempts, second_handle) =
+        spawn_malformed_101_upgrade_server(Arc::clone(&done));
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
+         initial_connect_retry=sync;\
+         reconnect_initial_backoff_millis=10;\
+         reconnect_max_backoff_millis=10;\
+         reconnect_max_duration_millis=120;"
+    );
+    let result = SenderBuilder::from_conf(&conf).unwrap().build();
+
+    done.store(true, Ordering::Release);
+    first_handle.join().unwrap();
+    second_handle.join().unwrap();
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(
+        err.msg().contains("missing or invalid Upgrade header"),
         "got: {}",
         err.msg()
     );

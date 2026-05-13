@@ -1613,8 +1613,7 @@ fn reconnect_attempt_error(err: DriverError) -> Result<Error, DriverError> {
 
 pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
     match err.code() {
-        ErrorCode::AuthError => true,
-        ErrorCode::ProtocolVersionError => !err.qwp_ws_upgrade_version_mismatch(),
+        ErrorCode::AuthError | ErrorCode::ProtocolVersionError => true,
         _ => false,
     }
 }
@@ -3904,17 +3903,18 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_terminal_classification_keeps_upgrade_version_mismatch_retryable() {
-        let version_mismatch =
-            Error::new(ErrorCode::ProtocolVersionError, "unsupported X-QWP-Version")
-                .with_qwp_ws_upgrade_version_mismatch();
-        assert!(!reconnect_error_is_terminal(&version_mismatch));
-
+    fn reconnect_terminal_classification_keeps_protocol_version_errors_terminal() {
         let durable_ack_mismatch = Error::new(
             ErrorCode::ProtocolVersionError,
             "server did not enable durable ACK",
         );
         assert!(reconnect_error_is_terminal(&durable_ack_mismatch));
+
+        let retryable_upgrade_version_error =
+            Error::new(ErrorCode::SocketError, "unsupported X-QWP-Version");
+        assert!(!reconnect_error_is_terminal(
+            &retryable_upgrade_version_error
+        ));
     }
 
     #[test]

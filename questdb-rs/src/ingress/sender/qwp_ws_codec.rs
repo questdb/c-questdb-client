@@ -282,7 +282,7 @@ pub(super) fn validate_upgrade_response(
         .any(|(k, v)| k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket"));
     if !upgrade_ok {
         return Err(error::fmt!(
-            ProtocolVersionError,
+            SocketError,
             "WebSocket upgrade failed: missing or invalid Upgrade header"
         ));
     }
@@ -293,7 +293,7 @@ pub(super) fn validate_upgrade_response(
     });
     if !connection_upgrade {
         return Err(error::fmt!(
-            ProtocolVersionError,
+            SocketError,
             "WebSocket upgrade failed: missing or invalid Connection header"
         ));
     }
@@ -305,7 +305,7 @@ pub(super) fn validate_upgrade_response(
         .unwrap_or(false);
     if !accept_ok {
         return Err(error::fmt!(
-            ProtocolVersionError,
+            SocketError,
             "WebSocket upgrade failed: invalid Sec-WebSocket-Accept"
         ));
     }
@@ -328,29 +328,26 @@ pub(super) fn validate_upgrade_response(
     let version: u8 = match version_str {
         Some(v) => v.parse().map_err(|_| {
             error::fmt!(
-                ProtocolVersionError,
+                SocketError,
                 "Server returned invalid X-QWP-Version: {:?}",
                 v
             )
-            .with_qwp_ws_upgrade_version_mismatch()
         })?,
         None => 1,
     };
     if version == 0 {
         return Err(error::fmt!(
-            ProtocolVersionError,
+            SocketError,
             "Server returned invalid X-QWP-Version: 0"
-        )
-        .with_qwp_ws_upgrade_version_mismatch());
+        ));
     }
     if u32::from(version) > max_version {
         return Err(error::fmt!(
-            ProtocolVersionError,
+            SocketError,
             "Server returned unsupported X-QWP-Version: {} [max_supported={}]",
             version,
             max_version
-        )
-        .with_qwp_ws_upgrade_version_mismatch());
+        ));
     }
     Ok(version)
 }
@@ -609,12 +606,12 @@ mod tests {
 
         validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap();
         let err = validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
         assert!(
             err.msg().contains("server did not enable durable ACK"),
             "got: {}",
             err.msg()
         );
-        assert!(!err.qwp_ws_upgrade_version_mismatch());
 
         parsed
             .headers
@@ -657,20 +654,25 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_response_rejects_version_above_configured_max() {
+    fn upgrade_response_rejects_invalid_or_unsupported_versions_as_socket_errors() {
         let expected_accept = "accept";
-        let mut parsed = valid_upgrade_headers(expected_accept);
-        parsed
-            .headers
-            .iter_mut()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-qwp-version"))
-            .unwrap()
-            .1 = "2".to_string();
+        for (version, expected_msg) in [
+            ("not-a-version", "invalid X-QWP-Version"),
+            ("0", "invalid X-QWP-Version"),
+            ("2", "unsupported X-QWP-Version"),
+        ] {
+            let mut parsed = valid_upgrade_headers(expected_accept);
+            parsed
+                .headers
+                .iter_mut()
+                .find(|(name, _)| name.eq_ignore_ascii_case("x-qwp-version"))
+                .unwrap()
+                .1 = version.to_string();
 
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
-        assert!(err.msg().contains("unsupported X-QWP-Version"));
-        assert!(err.qwp_ws_upgrade_version_mismatch());
+            let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.msg().contains(expected_msg), "got: {}", err.msg());
+        }
     }
 
     #[test]
@@ -682,6 +684,7 @@ mod tests {
             .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
 
         let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("missing or invalid Connection header"),
             "got: {}",
@@ -692,6 +695,7 @@ mod tests {
             .headers
             .push(("Connection".to_string(), "keep-alive".to_string()));
         let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("missing or invalid Connection header"),
             "got: {}",
@@ -700,6 +704,31 @@ mod tests {
 
         parsed.headers.last_mut().unwrap().1 = "keep-alive, Upgrade".to_string();
         validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap();
+    }
+
+    #[test]
+    fn malformed_101_upgrade_headers_are_socket_errors() {
+        let expected_accept = "accept";
+        let mut parsed = valid_upgrade_headers(expected_accept);
+        parsed
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("upgrade"));
+
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("missing or invalid Upgrade header"));
+
+        let mut parsed = valid_upgrade_headers(expected_accept);
+        parsed
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-accept"))
+            .unwrap()
+            .1 = "wrong".to_string();
+
+        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("invalid Sec-WebSocket-Accept"));
     }
 
     #[test]
