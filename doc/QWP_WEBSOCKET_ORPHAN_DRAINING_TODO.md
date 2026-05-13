@@ -1,7 +1,8 @@
 # QWP/WebSocket Orphan Draining Notes
 
-Status: first Rust runtime slice implemented. Keep this file as the handoff for
-remaining orphan-draining follow-ups and Java-parity caveats.
+Status: first Rust runtime slice implemented. Source rechecked against the Java
+client and `docs/qwp/sf-client.md` on 2026-05-13. Keep this file as the handoff
+for remaining orphan-draining follow-ups and Java-parity caveats.
 
 This document tracks `drain_orphans=on` in the Rust QWP/WebSocket sender. It is
 separate from `QWP_WEBSOCKET_DURABLE_SF_STORAGE.md` because orphan draining
@@ -27,15 +28,22 @@ Implemented:
 - Already-drained orphan slots close without networking.
 - Background mode starts a bounded drainer pool after the foreground sender has
   opened successfully.
+- Background close waits briefly for drainers to finish naturally, requests stop,
+  waits a short stop grace, and then detaches any remaining worker threads so
+  foreground close stays bounded.
 - Manual mode exposes orphan progress through the same application-owned
   `drive_once()` pump. Publication does not secretly run orphan maintenance.
 
 Still incomplete or intentionally different:
 
-- There is no Java-style operator logging for scanner/drainer lifecycle events
-  yet. `.failed` is currently the only durable operator-visible artifact.
-- Background worker shutdown is best-effort. Rust sets a stop flag and does not
-  block foreground close waiting for a stale orphan connection attempt.
+- There is no Java-style operator logging, drainer counter API, or
+  `BackgroundDrainerListener` equivalent yet. `.failed` is currently the only
+  durable operator-visible artifact.
+- Rust orphan replay currently trims on ordinary OK even when the WebSocket
+  connection requested durable ACK. Java and `sf-client.md` require
+  durable-ACK-driven trim when `request_durable_ack=on`; this is a parity gap.
+- Background worker shutdown is bounded and best-effort. Rust waits briefly,
+  requests stop, waits a short stop grace, and then detaches remaining workers.
 - Rust has manual orphan driving; Java only has automatic background drainers.
 - Windows slot locking is still unsupported because the shared SFA slot lock is
   Unix-only today.
@@ -70,17 +78,25 @@ Reference behavior lives in the Java client under:
   - opens a fresh WebSocket connection, separate from the foreground sender;
   - drains until the recovered `ackedFsn` reaches the startup snapshot of
     `publishedFsn`;
+  - retries initial connect briefly on whole-cluster durable-ACK unavailability
+    and writes `.failed` only after the durable-ACK mismatch budget is exhausted;
   - writes `.failed` on terminal setup, connect, reconnect, recovery, or wire
     failure.
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/CursorWebSocketSendLoop.java`
-  - the constructor used by `BackgroundDrainer` sets `durableAckMode=false`;
-  - orphan trim is therefore OK-driven even when the WebSocket connection
-    factory requested durable ACKs.
+  - the constructor used by `BackgroundDrainer` receives the foreground
+    `requestDurableAck` flag;
+  - orphan trim is OK-driven only when durable ACK was not requested;
+  - when durable ACK was requested, OK frames are queued and trim advances only
+    from `STATUS_DURABLE_ACK`, matching `sf-client.md`.
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/BackgroundDrainerPool.java`
   - bounded pool, one pool per foreground sender;
   - concurrent execution capped by `max_background_drainers`;
   - excess candidates queue inside the pool;
-  - close requests active drainers to stop and waits briefly.
+  - close first waits briefly for natural drain completion, then requests active
+    drainers to stop and waits a short stop grace;
+  - exposes active, succeeded, and failed drainer counters;
+  - supports a pool-level `BackgroundDrainerListener` for per-drainer
+    observation.
 
 ## Rust Semantics
 
@@ -104,9 +120,10 @@ Reference behavior lives in the Java client under:
   application frames or create storage.
 - The target is the recovered `published_fsn` snapshot captured at drainer
   startup. A drainer succeeds when recovered `acked_fsn >= target_fsn`.
-- Orphan replay uses ordinary OK-driven trim, matching Java's
-  `BackgroundDrainer` send-loop constructor. The connection setup still uses
-  the foreground QWP/WebSocket config, including durable-ACK upgrade opt-in.
+- Current Rust orphan replay uses ordinary OK-driven trim even when the
+  connection setup uses the foreground durable-ACK upgrade opt-in. This is not
+  Java/spec parity: with `request_durable_ack=on`, orphan trim must be driven by
+  `STATUS_DURABLE_ACK`, and OK frames must not advance the trim watermark.
 - On terminal setup, recovery, initial connect, reconnect-budget, auth, or wire
   failure, write a `.failed` sentinel in the orphan slot before exiting.
 - `.failed` is an operator-visible stop sign. Future scans skip the slot until
@@ -114,8 +131,9 @@ Reference behavior lives in the Java client under:
 - `max_background_drainers=0` disables launching drainers even when
   `drain_orphans=on`.
 - Closing the foreground sender requests active background drainers to stop.
-  Stopping due to foreground close should release locks and must not write
-  `.failed` by itself.
+  Close first gives them a bounded natural-drain window, then a bounded stop
+  window. Stopping due to foreground close should release locks and must not
+  write `.failed` by itself.
 
 ## Design Constraints
 
@@ -140,18 +158,27 @@ Reference behavior lives in the Java client under:
 
 ## Remaining Work
 
-1. Add Java-style diagnostics:
+1. Fix durable-ACK parity for orphan drainers:
+   - when `request_durable_ack=on`, trim orphan slots only on
+     `STATUS_DURABLE_ACK`;
+   - preserve OK-driven trim when durable ACK is off;
+   - handle durable-ACK-unavailable initial connect/reconnect in a way that
+     matches the Java/spec failure policy;
+   - add integration coverage that proves OK alone does not delete orphan data
+     in durable-ACK mode.
+2. Add Java-style observability:
    - candidates found;
    - slots skipped because locked;
    - successful drain with target and acknowledged FSN;
    - `.failed` reason;
-   - background close stop/timeout behavior.
-2. Add background-mode integration coverage with real orphan payload replay over
-   a separate WebSocket connection.
-3. Add explicit background-pool tests for concurrency capping and shutdown
-   races.
-4. Decide whether Rust should add a bounded wait on background drainer close.
-   The current implementation deliberately does not block foreground close.
+   - background close stop/timeout behavior;
+   - active, succeeded, and failed background-drainer counters;
+   - listener or callback surface for durable-ACK mismatch and terminal drainer
+     outcomes.
+3. Add background-mode integration coverage that proves a recovered orphan slot
+   drains to cleanup over a separate WebSocket connection, not only that a
+   background drainer can replay the payload before foreground close.
+4. Add explicit background-pool tests for concurrency capping.
 5. Implement Windows slot locking in the shared SFA slot layer.
 
 ## Required Tests
@@ -186,12 +213,17 @@ Covered by the first runtime slice:
 
 Still needed:
 
-- Background-mode recovered orphan frames replayed over a separate connection.
-- Durable-ACK opt-in interaction covered by an integration test.
+- Background-mode recovered orphan frames replayed to completion and cleaned up
+  over a separate connection.
+- Durable-ACK opt-in interaction covered by an integration test, including the
+  negative case that OK frames alone do not trim in durable-ACK mode.
 - Initial connect failure writes `.failed`.
 - Terminal reconnect/auth/wire failure writes `.failed`.
-- Foreground close stops active drainers without writing `.failed`.
+- Foreground close stops active drainers without writing `.failed` in the
+  durable-ACK/reconnect cases, beyond the existing stalled-background close
+  coverage.
 - Background concurrency capped by `max_background_drainers`.
+- Java-style drainer counters/listener behavior.
 - `.failed` orphan remains untouched until the sentinel is removed.
 
 ## Non-Goals
