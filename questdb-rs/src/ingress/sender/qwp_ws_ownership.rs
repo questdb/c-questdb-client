@@ -180,7 +180,6 @@ pub(crate) struct QwpWsRoleReject {
 }
 
 impl QwpWsRoleReject {
-    #[allow(dead_code)]
     pub(crate) fn new(role: &str, zone: Option<&str>) -> Self {
         Self {
             role: role.to_string(),
@@ -188,7 +187,6 @@ impl QwpWsRoleReject {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_transient(&self) -> bool {
         self.role.eq_ignore_ascii_case("PRIMARY_CATCHUP")
     }

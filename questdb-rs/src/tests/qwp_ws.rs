@@ -89,7 +89,6 @@ fn build_qwp_ws_sender(progress: ProgressCase, port: u16) -> crate::ingress::Sen
 
 // ---------- mock server ----------
 
-#[allow(dead_code)]
 struct MockResult {
     request_lines: Vec<String>,
     received_frames: Vec<Vec<u8>>,

@@ -3801,13 +3801,6 @@ impl SymbolGlobalDict {
         self.next_id
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn reset(&mut self) {
-        self.map.clear();
-        self.entries.clear();
-        self.next_id = 0;
-    }
-
     pub(crate) fn mark(&self) -> SymbolGlobalDictMark {
         SymbolGlobalDictMark {
             entries_len: self.entries.len(),
@@ -3824,7 +3817,6 @@ impl SymbolGlobalDict {
         self.next_id = mark.next_id;
     }
 
-    #[allow(dead_code)]
     fn entry(&self, id: u64) -> Option<&[u8]> {
         let index = usize::try_from(id).ok()?;
         self.entries.get(index).map(Vec::as_slice)
@@ -3895,7 +3887,6 @@ pub(crate) struct SchemaRegistry {
 
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
 impl SchemaRegistry {
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
             map: std::collections::HashMap::new(),
@@ -3903,16 +3894,9 @@ impl SchemaRegistry {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn reset(&mut self) {
-        self.map.clear();
-        self.next_id = 0;
-    }
-
     /// Returns `(schema_id, is_new)`. When `is_new` is true the caller must
     /// emit full-mode (column definitions inline) so the server registers the
     /// id; otherwise it should emit reference-mode (just the id).
-    #[allow(dead_code)]
     fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
         if let Some(&id) = self.map.get(signature) {
             return (id, false);
@@ -4094,7 +4078,7 @@ impl QwpBuffer {
     /// This is the Java-style v1 replay shape: every frame carries the dense
     /// global symbol dictionary prefix from id 0 through the highest symbol id
     /// referenced by this frame, and every table block carries its full schema.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn encode_ws_replay_message(
         &self,
         scratch: &mut QwpWsEncodeScratch,
@@ -4248,7 +4232,7 @@ fn checked_qwp_u16(value: usize, what: &'static str) -> crate::Result<u16> {
     Ok(value as u16)
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
 fn encode_symbol_column_delta_dict(
     col: &ColumnStats,
     row_count: usize,

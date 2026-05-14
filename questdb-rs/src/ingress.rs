@@ -77,7 +77,6 @@ pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
-#[allow(dead_code)]
 pub const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;
 
 /// Transport-scoped protocol version identifier used by the ingestion APIs.

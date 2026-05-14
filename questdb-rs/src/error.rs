@@ -118,7 +118,6 @@ impl Error {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    #[allow(dead_code)]
     pub(crate) fn with_qwp_ws_role_reject(
         mut self,
         role_reject: crate::ingress::QwpWsRoleReject,
