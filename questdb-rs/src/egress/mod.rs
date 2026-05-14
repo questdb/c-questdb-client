@@ -65,6 +65,8 @@ pub(crate) mod tracker;
 #[cfg(feature = "sync-reader-ws")]
 pub(crate) mod transport;
 pub mod wire;
+#[cfg(feature = "sync-reader-ws")]
+pub(crate) mod ws;
 
 // Top-level public surface. Anything not listed here is either
 // reachable only through a `pub mod` sub-path (the navigable
