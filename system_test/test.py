@@ -65,7 +65,7 @@ SUITE_MATRIX = 'matrix'
 SUITE_QWP_WS_SMOKE = 'qwp_ws_smoke'
 SUITE_QWP_WS_PROTOCOL = 'qwp_ws_protocol'
 SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
-QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
+QWP_WS_STATUS_WRITE_ERROR = 0x09
 
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
@@ -1859,7 +1859,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 ['r3', None, 'three'],
             ])
 
-    def test_schema_rejection_drops_and_sender_continues(self):
+    def test_write_rejection_drops_and_sender_continues(self):
         table_name = 'qwp_ws_reject_' + uuid.uuid4().hex[:8]
         sql_query(
             f'CREATE TABLE "{table_name}" '
@@ -1894,9 +1894,9 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 self.assertEqual((first_fsn, rejected_fsn, final_fsn), (0, 1, 2))
                 self.assertTrue(sender.await_acked_fsn(final_fsn, 30000))
                 diagnostic = self._retry_poll_qwp_ws_error(sender)
-                self.assertEqual(diagnostic.category, qls.QwpWsErrorCategory.SCHEMA_MISMATCH)
+                self.assertEqual(diagnostic.category, qls.QwpWsErrorCategory.WRITE_ERROR)
                 self.assertEqual(diagnostic.applied_policy, qls.QwpWsErrorPolicy.DROP_AND_CONTINUE)
-                self.assertEqual(diagnostic.status, QWP_WS_STATUS_SCHEMA_MISMATCH)
+                self.assertEqual(diagnostic.status, QWP_WS_STATUS_WRITE_ERROR)
                 self.assertEqual(diagnostic.from_fsn, rejected_fsn)
                 self.assertEqual(diagnostic.to_fsn, rejected_fsn)
                 self.assertIsNone(sender.poll_qwp_ws_error())

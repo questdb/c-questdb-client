@@ -52,8 +52,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
-use super::qwp_ws_queue::{OutboundFrame, QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_driver::{DriverError, PublicationLog};
+use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_queue::{
     SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaQueueError,
     SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
@@ -142,15 +142,8 @@ impl PublicationLog for SfaSlotQueue {
         self.queue.take_producer()
     }
 
-    fn next_outbound_frame(
-        &mut self,
-        send_cursor: &mut SendCursor,
-    ) -> Result<Option<OutboundFrame>, DriverError> {
-        self.queue.next_outbound_frame(send_cursor)
-    }
-
-    fn restart_send_cursor(&mut self) {
-        self.queue.restart_send_cursor();
+    fn progress_view(&self) -> super::qwp_ws_sfa_queue::SfaProgressView {
+        self.queue.progress_view()
     }
 
     fn take_storage_maintenance_step(
@@ -182,8 +175,8 @@ impl PublicationLog for SfaSlotQueue {
         self.queue.oldest_unresolved_fsn()
     }
 
-    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
-        Ok(self.queue.complete_through_fsn(fsn)?)
+    fn persist_completed_fsn(&mut self, fsn: u64) {
+        self.queue.persist_completed_fsn(fsn);
     }
 
     fn close(&mut self) -> Result<(), DriverError> {

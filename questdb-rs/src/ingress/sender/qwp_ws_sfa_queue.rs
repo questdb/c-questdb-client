@@ -235,7 +235,6 @@ impl SfaStorageCleanup {
 pub(crate) struct SfaFrameQueue {
     engine: Arc<SfaEngine>,
     producer: Option<SfaProducer>,
-    send_cursor: Option<SfaSendCursor>,
     ack_watermark: Option<SfaAckWatermark>,
 }
 
@@ -246,6 +245,11 @@ pub(crate) struct SfaProducer {
     active_append_offset: u64,
     active_frame_count: u64,
     next_fsn: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SfaProgressView {
+    engine: Arc<SfaEngine>,
 }
 
 #[derive(Debug)]
@@ -368,7 +372,6 @@ impl SfaFrameQueue {
         Ok(Self {
             engine,
             producer,
-            send_cursor: None,
             ack_watermark: recovered_completion.ack_watermark,
         })
     }
@@ -432,7 +435,6 @@ impl SfaFrameQueue {
         Ok(Self {
             engine,
             producer,
-            send_cursor: None,
             ack_watermark: None,
         })
     }
@@ -488,7 +490,6 @@ impl SfaFrameQueue {
         Ok(Self {
             engine,
             producer: None,
-            send_cursor: None,
             ack_watermark: recovered_completion.ack_watermark,
         })
     }
@@ -510,6 +511,12 @@ impl SfaFrameQueue {
         self.producer.take()
     }
 
+    pub(crate) fn progress_view(&self) -> SfaProgressView {
+        SfaProgressView {
+            engine: Arc::clone(&self.engine),
+        }
+    }
+
     pub(crate) fn complete_through_fsn(&mut self, acked_fsn: u64) -> Result<(), SfaQueueError> {
         let before = self.engine.completed_upper.load(Ordering::Acquire);
         self.engine.complete_through_fsn(acked_fsn)?;
@@ -522,6 +529,12 @@ impl SfaFrameQueue {
         Ok(())
     }
 
+    pub(crate) fn persist_completed_fsn(&mut self, fsn: u64) {
+        if let Some(ack_watermark) = self.ack_watermark.as_mut() {
+            ack_watermark.persist_completed_fsn(fsn);
+        }
+    }
+
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         self.engine.receipt_status(receipt)
     }
@@ -532,30 +545,6 @@ impl SfaFrameQueue {
             .segment_for_fsn(fsn)
             .and_then(|segment| segment.payload_for_fsn(fsn))
             .map(|payload| payload.with_bytes(|bytes| bytes.to_vec()))
-    }
-
-    pub(crate) fn next_outbound_frame(
-        &mut self,
-        send_cursor: &mut SendCursor,
-    ) -> Result<Option<OutboundFrame>, DriverError> {
-        let Some((fsn, wire_seq)) = send_cursor.peek_next_frame(&*self)? else {
-            return Ok(None);
-        };
-        let Some(payload) = self
-            .next_cursor_payload_for_fsn(fsn)
-            .map_err(DriverError::from)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(OutboundFrame {
-            fsn,
-            wire_seq,
-            payload,
-        }))
-    }
-
-    pub(crate) fn restart_send_cursor(&mut self) {
-        self.send_cursor = None;
     }
 
     pub(crate) fn maintain_storage(&mut self) -> Result<bool, SfaQueueError> {
@@ -620,27 +609,91 @@ impl SfaFrameQueue {
     }
 
     fn next_cursor_payload_for_fsn(
-        &mut self,
+        &self,
+        send_cursor: &mut Option<SfaSendCursor>,
         fsn: u64,
     ) -> Result<Option<SfaMappedPayload>, SfaQueueError> {
-        let Some(mut cursor) = self
-            .reusable_send_cursor(fsn)
+        self.progress_view()
+            .next_cursor_payload_for_fsn(send_cursor, fsn)
+    }
+
+    #[cfg(test)]
+    fn sealed_segment_count(&self) -> usize {
+        self.engine.segments_snapshot().sealed_segments.len()
+    }
+
+    #[cfg(test)]
+    fn allocated_segment_bytes(&self) -> u64 {
+        self.engine
+            .with_state(|state| state.allocated_segment_bytes)
+    }
+
+    #[cfg(test)]
+    fn hot_spare_installed(&self) -> bool {
+        self.engine.with_state(|state| state.hot_spare.is_some())
+    }
+}
+
+impl SfaProgressView {
+    pub(crate) fn next_outbound_frame(
+        &self,
+        send_cursor: &mut SendCursor,
+    ) -> Result<Option<OutboundFrame>, DriverError> {
+        let Some((fsn, wire_seq)) =
+            send_cursor.peek_next_frame_from_oldest(self.oldest_unresolved_fsn())?
+        else {
+            return Ok(None);
+        };
+        let Some(payload) = self
+            .next_cursor_payload_for_fsn(send_cursor.sfa_cursor_mut(), fsn)
+            .map_err(DriverError::from)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(OutboundFrame {
+            fsn,
+            wire_seq,
+            payload,
+        }))
+    }
+
+    pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        self.engine.oldest_unresolved_fsn()
+    }
+
+    pub(crate) fn completed_fsn(&self) -> Option<u64> {
+        self.engine.completed_fsn()
+    }
+
+    pub(crate) fn complete_through_fsn(&self, acked_fsn: u64) -> Result<bool, SfaQueueError> {
+        let before = self.engine.completed_upper.load(Ordering::Acquire);
+        self.engine.complete_through_fsn(acked_fsn)?;
+        let after = self.engine.completed_upper.load(Ordering::Acquire);
+        Ok(after > before)
+    }
+
+    fn next_cursor_payload_for_fsn(
+        &self,
+        send_cursor: &mut Option<SfaSendCursor>,
+        fsn: u64,
+    ) -> Result<Option<SfaMappedPayload>, SfaQueueError> {
+        let Some(mut cursor) = Self::reusable_send_cursor(send_cursor, fsn)
             .or_else(|| self.position_send_cursor_for_fsn(fsn))
         else {
-            self.send_cursor = None;
+            *send_cursor = None;
             return Ok(None);
         };
 
         let (payload, segment_append_offset) = match payload_at_send_cursor(&cursor) {
             Some(payload) => payload,
             None => {
-                self.send_cursor = None;
+                *send_cursor = None;
                 let Some(repositioned) = self.position_send_cursor_for_fsn(fsn) else {
                     return Ok(None);
                 };
                 cursor = repositioned;
                 let Some(payload) = payload_at_send_cursor(&cursor) else {
-                    self.send_cursor = None;
+                    *send_cursor = None;
                     return Ok(None);
                 };
                 payload
@@ -652,13 +705,16 @@ impl SfaFrameQueue {
             .checked_add(FRAME_HEADER_SIZE as u64)
             .and_then(|offset| offset.checked_add(payload.len() as u64))
             .ok_or(QueueError::SequenceOverflow)?;
-        self.send_cursor =
+        *send_cursor =
             Some(self.advance_send_cursor(cursor, next_fsn, next_offset, segment_append_offset));
         Ok(Some(payload))
     }
 
-    fn reusable_send_cursor(&self, fsn: u64) -> Option<SfaSendCursor> {
-        let cursor = self.send_cursor.clone()?;
+    fn reusable_send_cursor(
+        send_cursor: &Option<SfaSendCursor>,
+        fsn: u64,
+    ) -> Option<SfaSendCursor> {
+        let cursor = send_cursor.clone()?;
         if cursor.fsn != fsn {
             return None;
         }
@@ -707,29 +763,6 @@ impl SfaFrameQueue {
             ..cursor
         }
     }
-
-    #[cfg(test)]
-    fn sealed_segment_count(&self) -> usize {
-        self.engine.segments_snapshot().sealed_segments.len()
-    }
-
-    #[cfg(test)]
-    fn allocated_segment_bytes(&self) -> u64 {
-        self.engine
-            .with_state(|state| state.allocated_segment_bytes)
-    }
-
-    #[cfg(test)]
-    fn hot_spare_installed(&self) -> bool {
-        self.engine.with_state(|state| state.hot_spare.is_some())
-    }
-
-    #[cfg(test)]
-    fn send_cursor_segment_base_seq(&self) -> Option<u64> {
-        self.send_cursor
-            .as_ref()
-            .map(|cursor| cursor.segment.base_seq())
-    }
 }
 
 impl SfaProducer {
@@ -753,6 +786,14 @@ impl SfaProducer {
             }
             .into())
         }
+    }
+
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.engine.published_fsn()
+    }
+
+    pub(crate) fn completed_fsn(&self) -> Option<u64> {
+        self.engine.completed_fsn()
     }
 
     fn append_to_active(&mut self, payload: &[u8]) -> Result<bool, SfaQueueError> {
@@ -1234,23 +1275,16 @@ impl PublicationLog for SfaFrameQueue {
         SfaFrameQueue::take_producer(self)
     }
 
-    fn next_outbound_frame(
-        &mut self,
-        send_cursor: &mut SendCursor,
-    ) -> Result<Option<OutboundFrame>, DriverError> {
-        SfaFrameQueue::next_outbound_frame(self, send_cursor)
-    }
-
-    fn restart_send_cursor(&mut self) {
-        SfaFrameQueue::restart_send_cursor(self);
+    fn progress_view(&self) -> SfaProgressView {
+        SfaFrameQueue::progress_view(self)
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
         SfaFrameQueue::oldest_unresolved_fsn(self)
     }
 
-    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
-        Ok(SfaFrameQueue::complete_through_fsn(self, fsn)?)
+    fn persist_completed_fsn(&mut self, fsn: u64) {
+        SfaFrameQueue::persist_completed_fsn(self, fsn);
     }
 
     fn close(&mut self) -> Result<(), DriverError> {
@@ -1347,7 +1381,7 @@ pub(crate) enum SfaRecoveryDiagnostic {
 }
 
 #[derive(Debug, Clone)]
-struct SfaSendCursor {
+pub(crate) struct SfaSendCursor {
     fsn: u64,
     offset: u64,
     segment: Arc<SfaSharedSegment>,
@@ -1826,7 +1860,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::qwp_ws_driver::{
-        CloseOutcome, DriveOutcome, DriverEvent, FakeOrderedServer, ManualDriverPrototype,
+        CloseOutcome, DriveOutcome, DriverEvent, FakeOrderedServer, QwpWsCoreTestHarness,
     };
     use super::super::qwp_ws_sfa_segment::{initial_segment_path, scan_file, spare_segment_path};
     use super::*;
@@ -1886,6 +1920,23 @@ mod tests {
 
     fn pending_payload_vec(payload: SfaMappedPayload) -> Vec<u8> {
         payload.with_bytes(|bytes| bytes.to_vec())
+    }
+
+    fn next_cursor_payload_vec(
+        queue: &SfaFrameQueue,
+        cursor: &mut Option<SfaSendCursor>,
+        fsn: u64,
+    ) -> Vec<u8> {
+        pending_payload_vec(
+            queue
+                .next_cursor_payload_for_fsn(cursor, fsn)
+                .unwrap()
+                .unwrap(),
+        )
+    }
+
+    fn send_cursor_segment_base_seq(cursor: &Option<SfaSendCursor>) -> Option<u64> {
+        cursor.as_ref().map(|cursor| cursor.segment.base_seq())
     }
 
     fn sfa_file_count(dir: &Path) -> usize {
@@ -2581,7 +2632,7 @@ mod tests {
         })
         .unwrap();
         let server = FakeOrderedServer::ack_each_send();
-        let mut driver = ManualDriverPrototype::from_queue(queue, server);
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, server);
 
         assert_eq!(
             driver.drive_once().unwrap(),
@@ -2644,44 +2695,28 @@ mod tests {
         submit_with_storage_maintenance(&mut queue, b"for");
 
         assert_eq!(queue.sealed_segment_count(), 3);
+        let mut send_cursor = None;
 
-        assert_eq!(
-            pending_payload_vec(queue.next_cursor_payload_for_fsn(0).unwrap().unwrap()),
-            b"one"
-        );
-        assert_eq!(queue.send_cursor_segment_base_seq().unwrap(), 1);
-        assert_eq!(
-            pending_payload_vec(queue.next_cursor_payload_for_fsn(1).unwrap().unwrap()),
-            b"two"
-        );
-        assert_eq!(queue.send_cursor_segment_base_seq().unwrap(), 2);
-        assert_eq!(
-            pending_payload_vec(queue.next_cursor_payload_for_fsn(2).unwrap().unwrap()),
-            b"tri"
-        );
-        assert_eq!(queue.send_cursor_segment_base_seq().unwrap(), 3);
-        assert_eq!(
-            pending_payload_vec(queue.next_cursor_payload_for_fsn(3).unwrap().unwrap()),
-            b"for"
-        );
+        assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 0), b"one");
+        assert_eq!(send_cursor_segment_base_seq(&send_cursor).unwrap(), 1);
+        assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 1), b"two");
+        assert_eq!(send_cursor_segment_base_seq(&send_cursor).unwrap(), 2);
+        assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 2), b"tri");
+        assert_eq!(send_cursor_segment_base_seq(&send_cursor).unwrap(), 3);
+        assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 3), b"for");
     }
 
     #[test]
     fn send_cursor_repositions_after_delayed_rotation() {
         let mut queue = SfaFrameQueue::open_memory(memory_options(38, 38 * 8, 4)).unwrap();
         submit_with_storage_maintenance(&mut queue, b"one");
+        let mut send_cursor = None;
 
-        assert_eq!(
-            pending_payload_vec(queue.next_cursor_payload_for_fsn(0).unwrap().unwrap()),
-            b"one"
-        );
+        assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 0), b"one");
 
         submit_with_storage_maintenance(&mut queue, b"two");
 
-        assert_eq!(
-            pending_payload_vec(queue.next_cursor_payload_for_fsn(1).unwrap().unwrap()),
-            b"two"
-        );
+        assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 1), b"two");
     }
 
     /// Run with:
@@ -2746,14 +2781,15 @@ mod tests {
         submit_with_storage_maintenance(&mut queue, b"tri");
         submit_with_storage_maintenance(&mut queue, b"for");
         assert_eq!(queue.sealed_segment_count(), 3);
+        let mut send_cursor = None;
 
-        assert_eq!(
-            pending_payload_vec(queue.next_cursor_payload_for_fsn(0).unwrap().unwrap()),
-            b"one"
-        );
+        assert_eq!(next_cursor_payload_vec(&queue, &mut send_cursor, 0), b"one");
 
         alloc_counter::start_counting();
-        let second = queue.next_cursor_payload_for_fsn(1).unwrap().unwrap();
+        let second = queue
+            .next_cursor_payload_for_fsn(&mut send_cursor, 1)
+            .unwrap()
+            .unwrap();
         let sealed_alloc_count = alloc_counter::stop_counting();
         assert_eq!(
             sealed_alloc_count, 0,
@@ -2762,14 +2798,17 @@ mod tests {
         assert_eq!(pending_payload_vec(second), b"two");
 
         alloc_counter::start_counting();
-        let third = queue.next_cursor_payload_for_fsn(2).unwrap().unwrap();
+        let third = queue
+            .next_cursor_payload_for_fsn(&mut send_cursor, 2)
+            .unwrap()
+            .unwrap();
         let transition_alloc_count = alloc_counter::stop_counting();
         assert_eq!(
             transition_alloc_count, 0,
             "Expected zero allocations when advancing from sealed to active segment, got {transition_alloc_count}"
         );
         assert_eq!(pending_payload_vec(third), b"tri");
-        assert_eq!(queue.send_cursor_segment_base_seq(), Some(3));
+        assert_eq!(send_cursor_segment_base_seq(&send_cursor), Some(3));
     }
 
     #[test]
@@ -3047,7 +3086,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let queue = open(&dir);
         let server = FakeOrderedServer::ack_each_send();
-        let mut driver = ManualDriverPrototype::from_queue(queue, server);
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, server);
         driver.try_submit(b"first").unwrap();
 
         assert_eq!(driver.close_drain_steps(4).unwrap(), CloseOutcome::Drained);
@@ -3061,7 +3100,7 @@ mod tests {
         {
             let queue = open(&dir);
             let server = FakeOrderedServer::no_response();
-            let mut driver = ManualDriverPrototype::from_queue(queue, server);
+            let mut driver = QwpWsCoreTestHarness::from_queue(queue, server);
             driver.try_submit(b"first").unwrap();
 
             assert_eq!(driver.close_drain_steps(0).unwrap(), CloseOutcome::Timeout);
@@ -3085,7 +3124,7 @@ mod tests {
         .unwrap();
         let queue = open(&dir);
         let server = FakeOrderedServer::ack_each_send();
-        let mut driver = ManualDriverPrototype::from_queue(queue, server);
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, server);
 
         assert_eq!(
             driver.drive_once().unwrap(),

@@ -184,17 +184,17 @@ frames are bounded by `max_in_flight`.
   per-frame rejection details);
 - a bounded `DriverEventRing` of internal events: `Published`, `Sent`,
   `CompletedThrough`, `Rejected`, `Reconnected`, `Progress`, `Terminal`;
-- two bounded `SenderErrorRing`s — one drained by `poll_qwp_ws_error()`,
-  one consumed internally by the optional error-handler callback — each with
-  a dropped-counter for overflow accounting;
+- a bounded sender-error diagnostic log with independent cursors for
+  `poll_qwp_ws_error()` and optional error-handler callback delivery, plus one
+  unified dropped-counter for overflow accounting;
 - an optional `DurableAckTracker` when `request_durable_ack=on`.
 
 The store mutex is the main synchronization point between the user thread and
 the runner thread for publication state: completion watermarks, lifecycle
-checks, queued events, and sender-error rings. Producers take an `SfaProducer`
-handle once at startup (`store.take_producer()`) and submit through it without
-holding the publication mutex; transport, cursor, reconnect, backpressure, and
-thread-stop state are synchronized separately by the runner.
+checks, queued events, and sender-error diagnostic state. Producers take an
+`SfaProducer` handle once at startup (`store.take_producer()`) and submit
+through it without holding the publication mutex; transport, cursor, reconnect,
+backpressure, and thread-stop state are synchronized separately by the runner.
 
 ### 3.5 SendCursor
 
@@ -440,9 +440,12 @@ Users observe errors through:
 
 - `Sender::flush*` — synchronous return paths surface immediate errors.
 - `Sender::poll_qwp_ws_error()` — drains one structured `QwpWsSenderError`
-  per call from the bounded sender-error ring. Remains usable after the
-  sender has halted.
-- `Sender::qwp_ws_errors_dropped()` — overflow counter for the ring.
+  per call from the bounded sender-error diagnostic log's poll cursor. Remains
+  usable after the sender has halted.
+- `Sender::qwp_ws_errors_dropped()` — overflow counter for the unified
+  diagnostic log. Because poll and callback delivery use independent cursors,
+  either lagging cursor can keep entries live long enough for later diagnostics
+  to overwrite them.
 - `Sender::qwp_ws_terminal_error()` (doc-hidden) — non-consuming view of the
   latched terminal `QwpWsSenderError`.
 - Optional handler callback installed via `SenderBuilder::qwp_ws_error_handler`
@@ -553,8 +556,9 @@ isolation:
   reconnect replays from the oldest unresolved FSN as `wire_seq=0`, so the
   server side handles dedupe. The `.ack-watermark` sidecar makes the
   cumulative completion watermark durable across process restarts.
-- **Bounded everything.** Frames, segments, in-flight window, events, and
-  sender-error rings are all bounded with explicit overflow accounting.
+- **Bounded everything.** Frames, segments, in-flight window, events, and the
+  sender-error diagnostic log are all bounded with explicit overflow
+  accounting.
 - **Java parity is a design goal.** Sender lifecycle, SFA file format,
   error categorization, default behaviors, and the durable-ACK protocol
   mirror the Java client where possible. Known gaps and intentional

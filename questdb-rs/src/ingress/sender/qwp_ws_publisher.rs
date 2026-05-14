@@ -22,33 +22,10 @@
  *
  ******************************************************************************/
 
-//! Replay-publication shell for the pipelined QWP/WebSocket sender.
-//!
-//! The manual driver is intentionally payload-opaque. This module sits one level
-//! above it: the replay encoder turns a QWP buffer into a self-sufficient replay
-//! payload, and the publication driver publishes those bytes to the driver's
-//! queue.
-
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
+//! Replay encoder for the pipelined QWP/WebSocket sender.
 
 use crate::error;
 use crate::ingress::buffer::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
-
-#[cfg(test)]
-use super::qwp_ws_driver::DeliveryOutcome;
-use super::qwp_ws_driver::{
-    CloseOutcome, DriveOutcome, DriverError, ManualDriverPrototype, ManualDriverTransport,
-    PublicationLog, QwpWsPublicationStore, QwpWsSendCore,
-};
-use super::qwp_ws_ownership::QwpWsSenderError;
-use super::qwp_ws_queue::QwpReceipt;
-
-pub(crate) struct QwpWsPublicationDriver<Q, T> {
-    driver: ManualDriverPrototype<Q, T>,
-    encoder: QwpWsReplayEncoder,
-}
 
 pub(crate) struct QwpWsReplayEncoder {
     scratch: QwpWsEncodeScratch,
@@ -63,10 +40,6 @@ impl QwpWsReplayEncoder {
             global_dict: SymbolGlobalDict::new(),
             version,
         }
-    }
-
-    pub(crate) fn version(&self) -> u8 {
-        self.version
     }
 
     fn encode_to_scratch(&mut self, buffer: &QwpWsColumnarBuffer) -> crate::Result<()> {
@@ -115,153 +88,6 @@ pub(crate) fn qwp_ws_encoded_message_size_error(
         encoded_len,
         max_buf_size
     )
-}
-
-impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
-    pub(crate) fn new(driver: ManualDriverPrototype<Q, T>, version: u8) -> Self {
-        Self {
-            driver,
-            encoder: QwpWsReplayEncoder::new(version),
-        }
-    }
-
-    pub(crate) fn version(&self) -> u8 {
-        self.encoder.version()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn try_submit_qwp(
-        &mut self,
-        buffer: &QwpWsColumnarBuffer,
-    ) -> Result<QwpReceipt, QwpWsPublicationError> {
-        let payload = self
-            .encoder
-            .encode(buffer)
-            .map_err(QwpWsPublicationError::Encode)?;
-        Ok(self.driver.try_submit(payload)?)
-    }
-
-    pub(crate) fn submit_qwp_with_append_deadline(
-        &mut self,
-        buffer: &QwpWsColumnarBuffer,
-        append_deadline: Duration,
-        max_buf_size: usize,
-    ) -> Result<QwpReceipt, QwpWsPublicationError> {
-        let payload = self
-            .encoder
-            .encode_with_max_size(buffer, max_buf_size)
-            .map_err(QwpWsPublicationError::Encode)?;
-        Ok(self
-            .driver
-            .submit_with_drive_deadline(payload, append_deadline)?)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn drive_once(&mut self) -> Result<DriveOutcome, DriverError> {
-        self.driver.drive_once()
-    }
-
-    pub(crate) fn drive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
-        self.driver.drive_ready_once()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn delivery_status(
-        &self,
-        receipt: QwpReceipt,
-    ) -> Result<Option<DeliveryOutcome>, DriverError> {
-        self.driver.delivery_status(receipt)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn wait_for(
-        &mut self,
-        receipt: QwpReceipt,
-        timeout: Duration,
-    ) -> Result<DeliveryOutcome, DriverError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(outcome) = self.driver.delivery_status(receipt)? {
-                return Ok(outcome);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(DeliveryOutcome::Timeout);
-            }
-            if self.driver.drive_once()? == DriveOutcome::Idle {
-                std::thread::sleep(remaining.min(Duration::from_micros(100)));
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn close_drain_steps(
-        &mut self,
-        max_drive_steps: usize,
-    ) -> Result<CloseOutcome, DriverError> {
-        self.driver.close_drain_steps(max_drive_steps)
-    }
-
-    pub(crate) fn close_drain_ready_once(&mut self) -> Result<CloseOutcome, DriverError> {
-        self.driver.close_drain_ready_once()
-    }
-
-    pub(crate) fn begin_close(&mut self) {
-        self.driver.set_closing();
-    }
-
-    pub(crate) fn terminal_error(&self) -> Option<&crate::Error> {
-        self.driver.terminal_error()
-    }
-
-    pub(crate) fn terminal_sender_error(&self) -> Option<&QwpWsSenderError> {
-        self.driver.terminal_sender_error()
-    }
-
-    pub(crate) fn is_terminal(&self) -> bool {
-        self.driver.is_terminal()
-    }
-
-    pub(crate) fn published_fsn(&self) -> Option<u64> {
-        self.driver.published_fsn()
-    }
-
-    pub(crate) fn acked_fsn(&self) -> Option<u64> {
-        self.driver.acked_fsn()
-    }
-
-    pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
-        self.driver.poll_sender_error()
-    }
-
-    pub(crate) fn poll_sender_error_notification(&mut self) -> Option<QwpWsSenderError> {
-        self.driver.poll_sender_error_notification()
-    }
-
-    pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
-        self.driver.sender_errors_dropped_total()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_driver(self) -> ManualDriverPrototype<Q, T> {
-        self.driver
-    }
-
-    pub(crate) fn into_runner_parts(self) -> (QwpWsPublicationStore<Q>, QwpWsSendCore<T>) {
-        self.driver.into_parts()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum QwpWsPublicationError {
-    Encode(crate::Error),
-    Driver(DriverError),
-}
-
-impl From<DriverError> for QwpWsPublicationError {
-    fn from(value: DriverError) -> Self {
-        Self::Driver(value)
-    }
 }
 
 #[cfg(test)]

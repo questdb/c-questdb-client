@@ -1648,7 +1648,12 @@ public:
 
     /**
      * Return how many QWP/WebSocket diagnostics were dropped because the
-     * bounded diagnostic ring was full.
+     * unified bounded diagnostic log was full.
+     *
+     * The same log feeds poll_qwp_ws_error() and error-handler notification
+     * delivery through independent cursors. A lagging cursor can keep entries
+     * live long enough for later diagnostics to overwrite them and increment
+     * this count.
      */
     uint64_t qwp_ws_errors_dropped() const
     {

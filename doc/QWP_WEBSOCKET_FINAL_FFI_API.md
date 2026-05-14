@@ -329,6 +329,10 @@ Rules:
   the ordinary error object and is valid until `line_sender_error_free()`. Copy
   exactly `message_len` bytes from `view.message` before freeing the ordinary
   error.
+- `line_sender_qwpws_errors_dropped()` reports drops from the unified bounded
+  diagnostic log. Polling and error-handler notification delivery consume that
+  log through independent cursors, so either lagging cursor can affect
+  retention and overflow accounting.
 
 The owned diagnostic object is intentional. A caller-provided message buffer
 would be adequate for C, but it is awkward for Cython and other language

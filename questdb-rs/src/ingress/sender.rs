@@ -68,31 +68,6 @@ pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
 #[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;
 
-#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
-pub(crate) mod qwp_ws_test_support {
-    pub(crate) use super::qwp_ws_driver::{
-        BlockingQwpWsTransport, CloseOutcome, DeliveryOutcome, ManualDriverPrototype,
-    };
-    pub(crate) use super::qwp_ws_publisher::QwpWsPublicationDriver;
-    pub(crate) use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaMemoryQueueOptions};
-    pub(crate) use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
-
-    pub(crate) fn connect_blocking_transport(
-        host: impl Into<String>,
-        port: impl Into<String>,
-        auth_header: Option<String>,
-    ) -> crate::Result<BlockingQwpWsTransport> {
-        BlockingQwpWsTransport::connect(
-            host,
-            port,
-            false,
-            None,
-            crate::ingress::conf::QwpWsConfig::default(),
-            auth_header,
-        )
-    }
-}
-
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws;
 
@@ -663,8 +638,14 @@ impl Sender {
         }
     }
 
-    /// Return how many QWP/WebSocket structured server errors were dropped
-    /// because the sender's bounded diagnostic ring was full.
+    /// Return how many QWP/WebSocket structured diagnostics were dropped
+    /// because the sender's unified bounded diagnostic log was full.
+    ///
+    /// The same log feeds [`Sender::poll_qwp_ws_error`] and
+    /// `QwpWsErrorHandler` notification delivery through independent cursors.
+    /// A diagnostic is retained until both cursors have consumed it, so a
+    /// lagging cursor can cause later diagnostics to overwrite unread entries
+    /// and increment this count.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn qwp_ws_errors_dropped(&self) -> Result<u64> {
         match &self.handler {

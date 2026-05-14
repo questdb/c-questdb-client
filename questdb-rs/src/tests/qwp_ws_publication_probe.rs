@@ -24,8 +24,8 @@
 
 //! Ignored real-server probes for the Step 12 publication path.
 //!
-//! These exercise the prototype product path against a real QuestDB server:
-//! `Buffer -> replay payload -> frame queue -> manual driver -> real WebSocket
+//! These exercise the public product path against a real QuestDB server:
+//! `Buffer -> replay payload -> frame queue -> QWP/WebSocket progress -> real WebSocket
 //! transport -> queryable row`.
 
 use std::fs;
@@ -35,10 +35,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ingress::qwp_ws_test_support::{
-    CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaFrameQueue,
-    SfaMemoryQueueOptions, SfaSlotOptions, SfaSlotQueue, connect_blocking_transport,
-};
 use crate::ingress::{Buffer, QwpWsProgress, SenderBuilder, TimestampNanos};
 use tempfile::TempDir;
 
@@ -47,73 +43,12 @@ use super::{TestError, TestResult};
 type ProbeResult<T> = std::result::Result<T, TestError>;
 type ProxyResult<T> = std::io::Result<T>;
 
-const QWP_STATUS_OK: u8 = 0x00;
-const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
-
-fn memory_queue() -> ProbeResult<SfaFrameQueue> {
-    SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
-        segment_size_bytes: 64 * 1024,
-        max_bytes: 128 * 1024,
-        max_in_flight: 4,
-    })
-    .map_err(proto_err)
-}
-
 #[derive(Clone, Debug)]
 struct ProbeConfig {
     host: String,
     qwp_ws_port: u16,
     http_port: u16,
     auth_header: Option<String>,
-}
-
-#[test]
-#[ignore = "requires a real QuestDB server and QDB_QWP_WS_PUBLICATION_PROBE=1"]
-fn qwp_ws_publication_driver_submit_waits_and_row_is_queryable() -> TestResult {
-    if std::env::var("QDB_QWP_WS_PUBLICATION_PROBE").as_deref() != Ok("1") {
-        eprintln!("set QDB_QWP_WS_PUBLICATION_PROBE=1 to run the real-server publication probe");
-        return Ok(());
-    }
-
-    let config = ProbeConfig::from_env()?;
-    let table = unique_table_name("qwp_publication_probe");
-    eprintln!("QuestDB build: {}", query_build(&config)?);
-    eprintln!("probe table: {table}");
-    let _cleanup = TableCleanup::new(config.clone(), table.clone());
-
-    let transport = connect_blocking_transport(
-        config.host.clone(),
-        config.qwp_ws_port.to_string(),
-        config.auth_header.clone(),
-    )?;
-    let queue = memory_queue()?;
-    let driver = ManualDriverPrototype::from_queue(queue, transport);
-    let mut publisher = QwpWsPublicationDriver::new(driver, 1);
-
-    let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
-    buffer
-        .table(table.as_str())?
-        .symbol("sym", "SYM_PUBLICATION")?
-        .column_i64("qty", 42)?
-        .column_f64("px", 123.5)?
-        .at(TimestampNanos::new(1_700_000_000_000_000_042))?;
-
-    let receipt = publisher
-        .try_submit_qwp(buffer.as_qwp_ws().unwrap())
-        .map_err(proto_err)?;
-    let outcome = publisher
-        .wait_for(receipt, Duration::from_secs(10))
-        .map_err(proto_err)?;
-
-    assert_eq!(outcome, DeliveryOutcome::Completed);
-    let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
-    assert_eq!(count, 1);
-    assert!(
-        has_publication_row(&config, &table)?,
-        "expected row with sym=SYM_PUBLICATION, qty=42, px=123.5"
-    );
-
-    Ok(())
 }
 
 #[test]
@@ -154,137 +89,6 @@ fn qwp_ws_public_manual_sender_submit_waits_and_row_is_queryable() -> TestResult
     let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
     assert_eq!(count, 1);
     assert!(has_row(&config, &table, "SYM_PUBLIC_MANUAL", 33, 333.5)?);
-
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires a real QuestDB server and QDB_QWP_WS_RECONNECT_PROBE=1"]
-fn qwp_ws_publication_driver_reconnect_replays_only_unacked_rows() -> TestResult {
-    if std::env::var("QDB_QWP_WS_RECONNECT_PROBE").as_deref() != Ok("1") {
-        eprintln!("set QDB_QWP_WS_RECONNECT_PROBE=1 to run the real-server reconnect probe");
-        return Ok(());
-    }
-
-    let config = ProbeConfig::from_env()?;
-    let table = unique_table_name("qwp_reconnect_probe");
-    eprintln!("QuestDB build: {}", query_build(&config)?);
-    eprintln!("probe table: {table}");
-    let _cleanup = TableCleanup::new(config.clone(), table.clone());
-    let proxy = FaultProxy::spawn(&config)?;
-
-    let transport = connect_blocking_transport(
-        "127.0.0.1",
-        proxy.port.to_string(),
-        config.auth_header.clone(),
-    )?;
-    let queue = memory_queue()?;
-    let driver = ManualDriverPrototype::from_queue(queue, transport);
-    let mut publisher = QwpWsPublicationDriver::new(driver, 1);
-
-    let first = build_row(&table, "SYM_RECONNECT_ACKED", 10, 100.5, 10)?;
-    let second = build_row(&table, "SYM_RECONNECT_REPLAYED", 20, 200.5, 20)?;
-    let first_receipt = publisher
-        .try_submit_qwp(first.as_qwp_ws().unwrap())
-        .map_err(proto_err)?;
-    let second_receipt = publisher
-        .try_submit_qwp(second.as_qwp_ws().unwrap())
-        .map_err(proto_err)?;
-
-    let second_outcome = publisher
-        .wait_for(second_receipt, Duration::from_secs(10))
-        .map_err(proto_err);
-    let proxy_result = proxy.join();
-    assert_eq!(second_outcome?, DeliveryOutcome::Completed);
-    assert_eq!(
-        publisher
-            .delivery_status(first_receipt)
-            .map_err(proto_err)?,
-        Some(DeliveryOutcome::Completed)
-    );
-    proxy_result?;
-
-    let count = wait_for_count(&config, &table, 2, Duration::from_secs(10))?;
-    assert_eq!(
-        count, 2,
-        "reconnect replay should not duplicate the already-ACKed first row"
-    );
-    assert!(has_row(&config, &table, "SYM_RECONNECT_ACKED", 10, 100.5)?);
-    assert!(has_row(
-        &config,
-        &table,
-        "SYM_RECONNECT_REPLAYED",
-        20,
-        200.5
-    )?);
-
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires a real QuestDB server and QDB_QWP_WS_SFA_PROBE=1"]
-fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
-    if std::env::var("QDB_QWP_WS_SFA_PROBE").as_deref() != Ok("1") {
-        eprintln!("set QDB_QWP_WS_SFA_PROBE=1 to run the real-server SFA replay probe");
-        return Ok(());
-    }
-
-    let config = ProbeConfig::from_env()?;
-    let table = unique_table_name("qwp_sfa_probe");
-    eprintln!("QuestDB build: {}", query_build(&config)?);
-    eprintln!("probe table: {table}");
-    let _cleanup = TableCleanup::new(config.clone(), table.clone());
-    let sf_dir = TempDir::new()?;
-
-    let receipt = {
-        let transport = connect_blocking_transport(
-            config.host.clone(),
-            config.qwp_ws_port.to_string(),
-            config.auth_header.clone(),
-        )?;
-        let queue = SfaSlotQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
-        let driver = ManualDriverPrototype::from_queue(queue, transport);
-        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
-        let row = build_row(&table, "SYM_SFA_REPLAYED", 77, 777.5, 77)?;
-
-        publisher
-            .try_submit_qwp(row.as_qwp_ws().unwrap())
-            .map_err(proto_err)?
-    };
-    assert_eq!(
-        sfa_file_count(&sfa_slot_dir(sf_dir.path()))?,
-        2,
-        "unacknowledged SFA frame and hot spare must remain after sender drop"
-    );
-
-    let transport = connect_blocking_transport(
-        config.host.clone(),
-        config.qwp_ws_port.to_string(),
-        config.auth_header.clone(),
-    )?;
-    let queue = SfaSlotQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
-    let driver = ManualDriverPrototype::from_queue(queue, transport);
-    let mut publisher = QwpWsPublicationDriver::new(driver, 1);
-
-    assert_eq!(
-        publisher
-            .wait_for(receipt, Duration::from_secs(10))
-            .map_err(proto_err)?,
-        DeliveryOutcome::Completed
-    );
-    assert_eq!(
-        publisher.close_drain_steps(0).map_err(proto_err)?,
-        CloseOutcome::Drained
-    );
-    assert_eq!(
-        sfa_file_count(&sfa_slot_dir(sf_dir.path()))?,
-        0,
-        "cleanly ACKed SFA frames must not replay on the next sender"
-    );
-
-    let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
-    assert_eq!(count, 1);
-    assert!(has_row(&config, &table, "SYM_SFA_REPLAYED", 77, 777.5)?);
 
     Ok(())
 }
@@ -383,12 +187,6 @@ fn qwp_ws_public_sender_sfa_recovers_after_unacked_disconnect() -> TestResult {
     Ok(())
 }
 
-fn build_row(table: &str, sym: &str, qty: i64, px: f64, ts_offset: i64) -> ProbeResult<Buffer> {
-    let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
-    write_row(&mut buffer, table, sym, qty, px, ts_offset)?;
-    Ok(buffer)
-}
-
 fn write_row(
     buffer: &mut Buffer,
     table: &str,
@@ -423,20 +221,6 @@ fn public_sfa_conf(
         );
     }
     conf
-}
-
-fn sfa_options(sf_dir: &Path) -> SfaSlotOptions {
-    SfaSlotOptions {
-        sf_dir: sf_dir.to_path_buf(),
-        sender_id: "default".to_string(),
-        segment_size_bytes: 64 * 1024,
-        max_bytes: 128 * 1024,
-        max_in_flight: 4,
-    }
-}
-
-fn sfa_slot_dir(sf_dir: &Path) -> std::path::PathBuf {
-    sfa_slot_dir_for_sender(sf_dir, "default")
 }
 
 fn sfa_slot_dir_for_sender(sf_dir: &Path, sender_id: &str) -> PathBuf {
@@ -505,32 +289,6 @@ impl ProbeConfig {
     }
 }
 
-struct FaultProxy {
-    port: u16,
-    handle: thread::JoinHandle<ProxyResult<()>>,
-}
-
-impl FaultProxy {
-    fn spawn(config: &ProbeConfig) -> ProbeResult<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
-        listener.set_nonblocking(true)?;
-        let port = listener.local_addr()?.port();
-        let target_host = config.host.clone();
-        let target_port = config.qwp_ws_port;
-        let handle =
-            thread::spawn(move || run_reconnect_fault_proxy(listener, target_host, target_port));
-        Ok(Self { port, handle })
-    }
-
-    fn join(self) -> ProbeResult<()> {
-        match self.handle.join() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(Box::new(err)),
-            Err(_) => Err(Box::new(IoError::other("fault proxy thread panicked"))),
-        }
-    }
-}
-
 struct DropUnackedFrameProxy {
     port: u16,
     handle: thread::JoinHandle<ProxyResult<()>>,
@@ -557,42 +315,6 @@ impl DropUnackedFrameProxy {
             ))),
         }
     }
-}
-
-fn run_reconnect_fault_proxy(
-    listener: TcpListener,
-    target_host: String,
-    target_port: u16,
-) -> ProxyResult<()> {
-    let target = format!("{target_host}:{target_port}");
-
-    let mut client = accept_with_timeout(&listener, Duration::from_secs(10))?;
-    let mut upstream = TcpStream::connect(&target)?;
-    configure_stream(&mut client)?;
-    configure_stream(&mut upstream)?;
-    proxy_handshake(&mut client, &mut upstream)?;
-
-    let first_frame = read_ws_frame_raw(&mut client)?;
-    upstream.write_all(&first_frame.raw)?;
-    upstream.flush()?;
-    forward_until_ok(&mut upstream, &mut client, 0)?;
-
-    let _dropped_unacked_frame = read_ws_frame_raw(&mut client)?;
-    drop(client);
-    drop(upstream);
-
-    let mut client = accept_with_timeout(&listener, Duration::from_secs(10))?;
-    let mut upstream = TcpStream::connect(&target)?;
-    configure_stream(&mut client)?;
-    configure_stream(&mut upstream)?;
-    proxy_handshake(&mut client, &mut upstream)?;
-
-    let replayed_frame = read_ws_frame_raw(&mut client)?;
-    upstream.write_all(&replayed_frame.raw)?;
-    upstream.flush()?;
-    forward_until_ok(&mut upstream, &mut client, 0)?;
-
-    Ok(())
 }
 
 fn run_drop_unacked_frame_proxy(
@@ -681,27 +403,23 @@ fn read_until_http_header_end(stream: &mut TcpStream) -> ProxyResult<Vec<u8>> {
 }
 
 struct RawWsFrame {
-    raw: Vec<u8>,
     payload: Vec<u8>,
 }
 
 fn read_ws_frame_raw(stream: &mut TcpStream) -> ProxyResult<RawWsFrame> {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header)?;
-    let mut raw = header.to_vec();
     let masked = header[1] & 0x80 != 0;
     let len_short = header[1] & 0x7f;
     let payload_len = match len_short {
         126 => {
             let mut bytes = [0u8; 2];
             stream.read_exact(&mut bytes)?;
-            raw.extend_from_slice(&bytes);
             u16::from_be_bytes(bytes) as usize
         }
         127 => {
             let mut bytes = [0u8; 8];
             stream.read_exact(&mut bytes)?;
-            raw.extend_from_slice(&bytes);
             u64::from_be_bytes(bytes) as usize
         }
         len => len as usize,
@@ -709,72 +427,15 @@ fn read_ws_frame_raw(stream: &mut TcpStream) -> ProxyResult<RawWsFrame> {
     let mut mask = [0u8; 4];
     if masked {
         stream.read_exact(&mut mask)?;
-        raw.extend_from_slice(&mask);
     }
     let mut payload = vec![0u8; payload_len];
     stream.read_exact(&mut payload)?;
-    raw.extend_from_slice(&payload);
     if masked {
         for (index, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[index & 3];
         }
     }
-    Ok(RawWsFrame { raw, payload })
-}
-
-fn forward_until_ok(
-    upstream: &mut TcpStream,
-    client: &mut TcpStream,
-    target_sequence: u64,
-) -> ProxyResult<()> {
-    loop {
-        let frame = read_ws_frame_raw(upstream)?;
-        client.write_all(&frame.raw)?;
-        client.flush()?;
-        match qwp_response_kind(&frame.payload)? {
-            QwpResponseKind::Ok { sequence } if sequence == target_sequence => return Ok(()),
-            QwpResponseKind::Ok { sequence } => {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    format!("expected OK sequence {target_sequence}, got {sequence}"),
-                ));
-            }
-            QwpResponseKind::DurableAck => {}
-            QwpResponseKind::Other(status) => {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    format!("unexpected QWP response status 0x{status:02x}"),
-                ));
-            }
-        }
-    }
-}
-
-enum QwpResponseKind {
-    Ok { sequence: u64 },
-    DurableAck,
-    Other(u8),
-}
-
-fn qwp_response_kind(payload: &[u8]) -> ProxyResult<QwpResponseKind> {
-    let status = *payload
-        .first()
-        .ok_or_else(|| IoError::new(ErrorKind::UnexpectedEof, "empty QWP response"))?;
-    match status {
-        QWP_STATUS_OK => {
-            if payload.len() < 9 {
-                return Err(IoError::new(
-                    ErrorKind::UnexpectedEof,
-                    "QWP OK response missing sequence",
-                ));
-            }
-            Ok(QwpResponseKind::Ok {
-                sequence: u64::from_le_bytes(payload[1..9].try_into().unwrap()),
-            })
-        }
-        QWP_STATUS_DURABLE_ACK => Ok(QwpResponseKind::DurableAck),
-        other => Ok(QwpResponseKind::Other(other)),
-    }
+    Ok(RawWsFrame { payload })
 }
 
 fn parse_port(name: &str, default: u16) -> ProbeResult<u16> {
@@ -827,10 +488,6 @@ fn wait_for_count(
         ErrorKind::TimedOut,
         format!("timed out waiting for {expected} rows in {table}; last count {last_count}"),
     )))
-}
-
-fn has_publication_row(config: &ProbeConfig, table: &str) -> ProbeResult<bool> {
-    has_row(config, table, "SYM_PUBLICATION", 42, 123.5)
 }
 
 fn has_row(
@@ -909,8 +566,4 @@ fn url_encode(input: &str) -> String {
         }
     }
     out
-}
-
-fn proto_err(err: impl std::fmt::Debug) -> TestError {
-    Box::new(IoError::other(format!("{err:?}")))
 }

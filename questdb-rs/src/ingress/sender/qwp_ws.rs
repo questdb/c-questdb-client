@@ -26,10 +26,11 @@
 //! framing — no external WebSocket dependency. See QWP_SPECIFICATION §2 (transport),
 //! §3 (version negotiation) and §13 (response format).
 
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,21 +46,23 @@ use super::qwp_ws_codec::{
     self as codec, MAX_INBOUND_FRAME_BYTES, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
     WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
 };
+#[cfg(test)]
+use super::qwp_ws_driver::QwpWsCoreTestHarness;
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseOutcome, DEFAULT_EVENT_CAPACITY, DriveOutcome, DriverError,
-    ManualDriverPrototype, ManualDriverTransport, PublicationLifecycle, PublicationLog,
-    PublicationState, QwpWsPublicationStore, QwpWsReconnectProgress, QwpWsSendCore,
-    QwpWsSendProgress, QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason,
-    TransportFailure, TransportPoll, reconnect_error_is_terminal, reconnect_sleep_duration,
+    DriverEvent, PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport,
+    QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore, QwpWsReconnectStep,
+    QwpWsSendCore, QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure,
+    TransportPoll, TransportResponse, reconnect_error_is_terminal, reconnect_sleep_duration,
     retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
-use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
+use super::qwp_ws_publisher::QwpWsReplayEncoder;
 use super::qwp_ws_queue::OutboundFrame;
-use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer};
+use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
 // ---------- transport ----------
@@ -157,7 +160,11 @@ impl Write for WsStream {
 
 // ---------- handler state ----------
 
-pub(crate) type SyncQwpWsPublisher = QwpWsPublicationDriver<SfaSlotQueue, BlockingQwpWsTransport>;
+struct QwpWsConnectedParts {
+    encoder: QwpWsReplayEncoder,
+    store: QwpWsPublicationStore<SfaSlotQueue>,
+    send_core: QwpWsSendCore<BlockingQwpWsTransport>,
+}
 
 pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
@@ -167,7 +174,9 @@ pub(crate) struct SyncQwpWsHandlerState {
 }
 
 pub(crate) struct ManualQwpWsHandlerState {
-    publisher: SyncQwpWsPublisher,
+    encoder: QwpWsReplayEncoder,
+    store: QwpWsPublicationStore<SfaSlotQueue>,
+    send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -183,11 +192,10 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     thread: Option<thread::JoinHandle<()>>,
 }
 
-// Only the publication store is shared with producers. Transport ownership,
-// cursor state, reconnect, and backoff stay in the background loop so blocking
-// I/O cannot hold the publication mutex.
 struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     send_core: QwpWsSendCore<T>,
+    progress: SfaProgressView,
+    cold_effects: VecDeque<RunnerColdEffect>,
     backpressure: Arc<BackpressureNotifier>,
     lifecycle: PublicationLifecycle,
 }
@@ -195,6 +203,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
 struct SyncQwpWsPendingRunnerCore {
     connected: Option<SyncQwpWsRunnerCore<BlockingQwpWsTransport>>,
     pending_connect: QwpWsPendingConnect,
+    progress: SfaProgressView,
     backpressure: Arc<BackpressureNotifier>,
     lifecycle: PublicationLifecycle,
 }
@@ -209,6 +218,13 @@ struct QwpWsPendingConnect {
     auth_header: Option<String>,
     reconnect_policy: ReconnectPolicy,
     max_in_flight: usize,
+    durable_ack: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RunnerColdEffect {
+    Event(DriverEvent),
+    CompletedThrough { fsn: u64, wire_seq: u64 },
 }
 
 #[derive(Debug)]
@@ -227,22 +243,35 @@ where
     Q: PublicationLog + Send + 'static,
 {
     #[cfg(test)]
-    fn start<T>(publisher: QwpWsPublicationDriver<Q, T>) -> Self
+    fn start<T>(driver: QwpWsCoreTestHarness<Q, T>) -> Self
     where
-        T: ManualDriverTransport + Send + 'static,
+        T: QwpWsCoreTransport + Send + 'static,
     {
-        Self::start_with_append_deadline(publisher, DEFAULT_APPEND_DEADLINE)
+        Self::start_driver_with_append_deadline(driver, DEFAULT_APPEND_DEADLINE)
     }
 
-    fn start_with_append_deadline<T>(
-        publisher: QwpWsPublicationDriver<Q, T>,
+    #[cfg(test)]
+    fn start_driver_with_append_deadline<T>(
+        driver: QwpWsCoreTestHarness<Q, T>,
         append_deadline: Duration,
     ) -> Self
     where
-        T: ManualDriverTransport + Send + 'static,
+        T: QwpWsCoreTransport + Send + 'static,
     {
-        let (mut store, send_core) = publisher.into_runner_parts();
+        let (store, send_core) = driver.into_parts();
+        Self::start_with_append_deadline(store, send_core, append_deadline)
+    }
+
+    fn start_with_append_deadline<T>(
+        mut store: QwpWsPublicationStore<Q>,
+        send_core: QwpWsSendCore<T>,
+        append_deadline: Duration,
+    ) -> Self
+    where
+        T: QwpWsCoreTransport + Send + 'static,
+    {
         let lifecycle = store.lifecycle();
+        let progress = store.progress_view();
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
@@ -254,6 +283,8 @@ where
         let thread = thread::spawn(move || {
             let mut core = SyncQwpWsRunnerCore {
                 send_core,
+                progress,
+                cold_effects: VecDeque::new(),
                 backpressure: thread_backpressure,
                 lifecycle: thread_lifecycle,
             };
@@ -280,12 +311,11 @@ where
     fn start_pending_connect(
         queue: Q,
         pending_connect: QwpWsPendingConnect,
-        durable_ack: bool,
         append_deadline: Duration,
     ) -> Self {
-        let mut store =
-            QwpWsPublicationStore::new_with_durable_ack(queue, DEFAULT_EVENT_CAPACITY, durable_ack);
+        let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let lifecycle = store.lifecycle();
+        let progress = store.progress_view();
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
@@ -298,6 +328,7 @@ where
             let mut core = SyncQwpWsPendingRunnerCore {
                 connected: None,
                 pending_connect,
+                progress,
                 backpressure: thread_backpressure,
                 lifecycle: thread_lifecycle,
             };
@@ -396,12 +427,22 @@ where
     }
 
     fn published_fsn(&self) -> crate::Result<Option<u64>> {
+        self.check_error()?;
+        if let Some(producer) = self.producer.as_ref() {
+            return Ok(producer.published_fsn());
+        }
+
         let store = self.lock_shared()?;
         check_store_error(&store)?;
         Ok(store.published_fsn())
     }
 
     fn acked_fsn(&self) -> crate::Result<Option<u64>> {
+        self.check_error()?;
+        if let Some(producer) = self.producer.as_ref() {
+            return Ok(producer.completed_fsn());
+        }
+
         let store = self.lock_shared()?;
         check_store_error(&store)?;
         Ok(store.completed_fsn())
@@ -543,6 +584,7 @@ impl QwpWsPendingConnect {
         qwp_ws: &QwpWsConfig,
         auth_header: Option<String>,
         max_in_flight: usize,
+        durable_ack: bool,
     ) -> Self {
         Self {
             host: host.to_string(),
@@ -557,6 +599,7 @@ impl QwpWsPendingConnect {
                 *qwp_ws.reconnect_max_backoff,
             ),
             max_in_flight,
+            durable_ack,
         }
     }
 
@@ -646,13 +689,16 @@ impl SyncQwpWsPendingRunnerCore {
 
         match self.pending_connect.connect_with_retry(stop) {
             Ok(Some(transport)) => {
-                let send_core = QwpWsSendCore::new(
+                let send_core = QwpWsSendCore::new_with_durable_ack(
                     transport,
                     self.pending_connect.max_in_flight,
                     self.pending_connect.reconnect_policy,
+                    self.pending_connect.durable_ack,
                 );
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
+                    progress: self.progress.clone(),
+                    cold_effects: VecDeque::new(),
                     backpressure: Arc::clone(&self.backpressure),
                     lifecycle: self.lifecycle.clone(),
                 });
@@ -674,7 +720,7 @@ impl SyncQwpWsPendingRunnerCore {
 
 impl<T> SyncQwpWsRunnerCore<T>
 where
-    T: ManualDriverTransport,
+    T: QwpWsCoreTransport,
 {
     fn drive_step<Q>(
         &mut self,
@@ -684,18 +730,21 @@ where
     where
         Q: PublicationLog,
     {
-        let outbound = {
-            let mut store = match shared.lock() {
-                Ok(store) => store,
-                Err(_) => return self.handle_poisoned_lock(),
-            };
-            if store.is_terminal() {
-                return RunnerStep::Stop;
-            }
-            match self.send_core.next_outbound_frame(&mut store) {
-                Ok(outbound) => outbound,
-                Err(err) => return self.store_driver_error(&mut store, err),
-            }
+        if stop.load(Ordering::Acquire) {
+            return RunnerStep::Stop;
+        }
+
+        if self.lifecycle.is_terminal() {
+            return RunnerStep::Stop;
+        }
+
+        if self.flush_cold_effects(shared) == RunnerStep::Stop {
+            return RunnerStep::Stop;
+        }
+
+        let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
+            Ok(outbound) => outbound,
+            Err(err) => return self.store_shared_driver_error(shared, err),
         };
 
         let send_step = match outbound {
@@ -737,27 +786,41 @@ where
     {
         let (frame, send_result) = self.send_core.send_frame(outbound);
         match send_result {
-            Ok(send_result) => {
-                let mut store = match shared.lock() {
-                    Ok(store) => store,
-                    Err(_) => return self.handle_poisoned_lock(),
-                };
-                match self
-                    .send_core
-                    .finish_send_result(&mut store, frame, send_result)
-                {
-                    Ok(QwpWsSendProgress::Outcome(outcome)) => {
-                        let step = step_from_drive_outcome(outcome);
-                        self.backpressure.notify_all();
-                        step
+            Ok(send_result) => match self.send_core.finish_send_result_hot(frame, send_result) {
+                Ok(QwpWsHotSendProgress::NoResponse { frame }) => {
+                    self.cold_effects
+                        .push_back(RunnerColdEffect::Event(DriverEvent::Sent {
+                            fsn: frame.fsn,
+                            wire_seq: frame.wire_seq,
+                        }));
+                    if self.flush_cold_effects(shared) == RunnerStep::Stop {
+                        return RunnerStep::Stop;
                     }
-                    Ok(QwpWsSendProgress::TransportFailure(failure)) => {
-                        drop(store);
-                        self.apply_transport_failure(shared, stop, failure)
-                    }
-                    Err(err) => self.store_driver_error(&mut store, err),
+                    let step = step_from_drive_outcome(DriveOutcome::Sent(frame));
+                    self.backpressure.notify_all();
+                    step
                 }
-            }
+                Ok(QwpWsHotSendProgress::Response { frame, response }) => {
+                    self.cold_effects
+                        .push_back(RunnerColdEffect::Event(DriverEvent::Sent {
+                            fsn: frame.fsn,
+                            wire_seq: frame.wire_seq,
+                        }));
+                    self.finish_response(shared, stop, response)
+                }
+                Ok(QwpWsHotSendProgress::TransportFailure { frame, failure }) => {
+                    self.cold_effects
+                        .push_back(RunnerColdEffect::Event(DriverEvent::Sent {
+                            fsn: frame.fsn,
+                            wire_seq: frame.wire_seq,
+                        }));
+                    if self.flush_cold_effects(shared) == RunnerStep::Stop {
+                        return RunnerStep::Stop;
+                    }
+                    self.apply_transport_failure(shared, stop, failure)
+                }
+                Err(err) => self.store_shared_driver_error(shared, err),
+            },
             Err(failure) => self.apply_transport_failure(shared, stop, failure),
         }
     }
@@ -771,11 +834,60 @@ where
         Q: PublicationLog,
     {
         match self.send_core.try_poll_response() {
-            Ok(TransportPoll::Response(response)) => {
+            Ok(TransportPoll::Response(response)) => self.finish_response(shared, stop, response),
+            Ok(TransportPoll::Progress) => RunnerStep::Continue,
+            Ok(TransportPoll::Idle) => RunnerStep::Idle,
+            Err(failure) => self.apply_transport_failure(shared, stop, failure),
+        }
+    }
+
+    fn finish_response<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        _stop: &AtomicBool,
+        response: TransportResponse,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        match response {
+            TransportResponse::Ack { wire_seq } => {
+                match self
+                    .send_core
+                    .finish_ack_response_sfa(&self.progress, wire_seq)
+                {
+                    Ok(progress) => self.finish_hot_response_progress(shared, progress),
+                    Err(err) => self.store_shared_driver_error(shared, err),
+                }
+            }
+            TransportResponse::DurableOk {
+                wire_seq,
+                table_seq_txns,
+            } => {
+                match self.send_core.finish_durable_ok_response_sfa(
+                    &self.progress,
+                    wire_seq,
+                    table_seq_txns,
+                ) {
+                    Ok(progress) => self.finish_hot_response_progress(shared, progress),
+                    Err(err) => self.store_shared_driver_error(shared, err),
+                }
+            }
+            TransportResponse::DurableAck { table_seq_txns } => {
+                match self
+                    .send_core
+                    .finish_durable_ack_response_sfa(&self.progress, table_seq_txns)
+                {
+                    Ok(progress) => self.finish_hot_response_progress(shared, progress),
+                    Err(err) => self.store_shared_driver_error(shared, err),
+                }
+            }
+            response @ TransportResponse::Reject { .. } => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
                     Err(_) => return self.handle_poisoned_lock(),
                 };
+                self.flush_cold_effects_locked(&mut store);
                 match self.send_core.finish_response(&mut store, response) {
                     Ok(outcome) => {
                         let step = if outcome == DriveOutcome::Idle {
@@ -789,9 +901,39 @@ where
                     Err(err) => self.store_driver_error(&mut store, err),
                 }
             }
-            Ok(TransportPoll::Progress) => RunnerStep::Continue,
-            Ok(TransportPoll::Idle) => RunnerStep::Idle,
-            Err(failure) => self.apply_transport_failure(shared, stop, failure),
+        }
+    }
+
+    fn finish_hot_response_progress<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        progress: QwpWsHotResponseProgress,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        self.enqueue_hot_response_events(progress.events);
+        if self.flush_cold_effects(shared) == RunnerStep::Stop {
+            return RunnerStep::Stop;
+        }
+        let step = if progress.outcome == DriveOutcome::Idle {
+            RunnerStep::Continue
+        } else {
+            step_from_drive_outcome(progress.outcome)
+        };
+        self.backpressure.notify_all();
+        step
+    }
+
+    fn enqueue_hot_response_events(&mut self, events: Vec<DriverEvent>) {
+        for event in events {
+            match event {
+                DriverEvent::CompletedThrough { fsn, wire_seq } => {
+                    self.cold_effects
+                        .push_back(RunnerColdEffect::CompletedThrough { fsn, wire_seq });
+                }
+                event => self.cold_effects.push_back(RunnerColdEffect::Event(event)),
+            }
         }
     }
 
@@ -821,16 +963,10 @@ where
     where
         Q: PublicationLog,
     {
-        let durable_ack_pending = {
-            let store = match shared.lock() {
-                Ok(store) => store,
-                Err(_) => return self.handle_poisoned_lock(),
-            };
-            if store.is_terminal() {
-                return RunnerStep::Stop;
-            }
-            store.has_pending_durable_ack()
-        };
+        if self.lifecycle.is_terminal() {
+            return RunnerStep::Stop;
+        }
+        let durable_ack_pending = self.send_core.has_pending_durable_ack();
         match self
             .send_core
             .send_durable_ack_keepalive_if_due(durable_ack_pending)
@@ -853,6 +989,7 @@ where
                 Ok(store) => store,
                 Err(_) => return self.handle_poisoned_lock(),
             };
+            self.flush_cold_effects_locked(&mut store);
             if store.is_terminal() {
                 return RunnerStep::Stop;
             }
@@ -886,6 +1023,7 @@ where
                 Ok(store) => store,
                 Err(_) => return self.handle_poisoned_lock(),
             };
+            self.flush_cold_effects_locked(&mut store);
             match store.finish_storage_maintenance(result) {
                 Ok(finish) => {
                     let terminal = store.is_terminal();
@@ -934,6 +1072,7 @@ where
                 Ok(store) => store,
                 Err(_) => return self.handle_poisoned_lock(),
             };
+            self.flush_cold_effects_locked(&mut store);
             self.send_core.transport_failure_action(&mut store, failure)
         };
         match action {
@@ -958,30 +1097,42 @@ where
     where
         Q: PublicationLog,
     {
-        let reconnect_result = self.send_core.reconnect_transport_with_policy(
-            reason,
-            initial_error,
-            || stop.load(Ordering::Acquire),
-            |deadline, backoff| sleep_before_runner_reconnect(deadline, backoff, stop),
-        );
-        match reconnect_result {
-            Ok(QwpWsReconnectProgress::Reconnected { reason }) => {
-                let mut store = match shared.lock() {
-                    Ok(store) => store,
-                    Err(_) => return self.handle_poisoned_lock(),
-                };
-                let outcome = self.send_core.finish_reconnect_success(&mut store, reason);
-                step_from_drive_outcome(outcome)
+        let mut reconnect =
+            self.send_core
+                .begin_reconnect("QWP/WebSocket reconnect", reason, initial_error);
+        while !stop.load(Ordering::Acquire) {
+            match self.send_core.reconnect_once(&mut reconnect) {
+                Ok(QwpWsReconnectStep::Reconnected { reason }) => {
+                    let mut store = match shared.lock() {
+                        Ok(store) => store,
+                        Err(_) => return self.handle_poisoned_lock(),
+                    };
+                    self.flush_cold_effects_locked(&mut store);
+                    let outcome = self.send_core.finish_reconnect_success(&mut store, reason);
+                    return step_from_drive_outcome(outcome);
+                }
+                Ok(QwpWsReconnectStep::RetryAfter { sleep_for }) => {
+                    if !sleep_before_runner_reconnect(reconnect.deadline(), sleep_for, stop) {
+                        break;
+                    }
+                }
+                Ok(QwpWsReconnectStep::Terminal(err)) => {
+                    return self.mark_store_terminal(shared, err);
+                }
+                Err(err) => {
+                    let mut store = match shared.lock() {
+                        Ok(store) => store,
+                        Err(_) => return self.handle_poisoned_lock(),
+                    };
+                    return self.store_driver_error(&mut store, err);
+                }
             }
-            Ok(QwpWsReconnectProgress::Terminal(error)) => self.mark_store_terminal(shared, error),
-            Ok(QwpWsReconnectProgress::Stopped) => RunnerStep::Stop,
-            Err(err) => {
-                let mut store = match shared.lock() {
-                    Ok(store) => store,
-                    Err(_) => return self.handle_poisoned_lock(),
-                };
-                self.store_driver_error(&mut store, err)
-            }
+        }
+
+        if stop.load(Ordering::Acquire) {
+            RunnerStep::Stop
+        } else {
+            self.mark_store_terminal(shared, reconnect.retry_budget_exhausted_error())
         }
     }
 
@@ -997,6 +1148,52 @@ where
         store.mark_terminal(Some(err));
         self.backpressure.notify_all();
         RunnerStep::Stop
+    }
+
+    fn flush_cold_effects<Q>(&mut self, shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        if self.cold_effects.is_empty() {
+            return RunnerStep::Idle;
+        }
+        match shared.try_lock() {
+            Ok(mut store) => {
+                self.flush_cold_effects_locked(&mut store);
+                RunnerStep::Continue
+            }
+            Err(TryLockError::WouldBlock) => RunnerStep::Idle,
+            Err(TryLockError::Poisoned(_)) => self.handle_poisoned_lock(),
+        }
+    }
+
+    fn flush_cold_effects_locked<Q>(&mut self, store: &mut QwpWsPublicationStore<Q>)
+    where
+        Q: PublicationLog,
+    {
+        while let Some(effect) = self.cold_effects.pop_front() {
+            match effect {
+                RunnerColdEffect::Event(event) => store.record_driver_event(event),
+                RunnerColdEffect::CompletedThrough { fsn, wire_seq } => {
+                    store.record_completed_through_event(fsn, wire_seq);
+                }
+            }
+        }
+    }
+
+    fn store_shared_driver_error<Q>(
+        &self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        err: DriverError,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        let mut store = match shared.lock() {
+            Ok(store) => store,
+            Err(_) => return self.handle_poisoned_lock(),
+        };
+        self.store_driver_error(&mut store, err)
     }
 
     fn mark_store_terminal<Q>(
@@ -1018,13 +1215,12 @@ where
 
     /// Handle a poisoned shared-store lock.
     ///
-    /// Reaches the same observable end-state as `mark_store_terminal` without
-    /// re-entering the poisoned mutex: flips the lifecycle to `Terminal` via
-    /// its own atomic, and wakes condvar waiters so any `publish_replay_payload`
-    /// blocked on append-deadline backpressure observes the terminal state on
-    /// its next loop iteration instead of timing out per submit. The store's
-    /// `terminal_error` is left unset; publishers see a generic terminal error
-    /// rather than a runner-specific one, but they fail fast.
+    /// Flips the lifecycle to `Terminal` via its own atomic, and wakes condvar
+    /// waiters so any `publish_replay_payload` blocked on append-deadline
+    /// backpressure observes the terminal state on its next loop iteration
+    /// instead of timing out per submit. The store's `terminal_error` is left
+    /// unset; publishers see a generic terminal error rather than a
+    /// runner-specific one, but they fail fast.
     fn handle_poisoned_lock(&self) -> RunnerStep {
         self.lifecycle.terminalize();
         self.backpressure.notify_all();
@@ -1047,6 +1243,7 @@ fn step_from_drive_outcome(outcome: DriveOutcome) -> RunnerStep {
         | DriveOutcome::Acked { .. }
         | DriveOutcome::Rejected { .. }
         | DriveOutcome::Reconnected { .. }
+        | DriveOutcome::ReconnectDelay { .. }
         | DriveOutcome::Progress => RunnerStep::Continue,
     }
 }
@@ -2370,36 +2567,37 @@ pub(crate) fn connect_qwp_ws(
         qwp_ws,
         auth_header.clone(),
     );
-    let (runner, negotiated_version) =
-        if *qwp_ws.initial_connect_retry == QwpWsInitialConnectMode::Async {
-            let queue = open_configured_qwp_ws_queue(qwp_ws)?;
-            let pending_connect = QwpWsPendingConnect::new(
-                host,
-                port,
-                use_tls,
-                tls_settings,
-                qwp_ws,
-                auth_header,
-                queue.max_in_flight(),
-            );
-            (
-                SyncQwpWsRunner::start_pending_connect(
-                    queue,
-                    pending_connect,
-                    *qwp_ws.request_durable_ack,
-                    *qwp_ws.sf_append_deadline,
-                ),
-                1,
-            )
-        } else {
-            let publisher =
-                open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
-            let negotiated_version = publisher.version();
-            (
-                SyncQwpWsRunner::start_with_append_deadline(publisher, *qwp_ws.sf_append_deadline),
-                negotiated_version,
-            )
-        };
+    let (runner, encoder) = if *qwp_ws.initial_connect_retry == QwpWsInitialConnectMode::Async {
+        let queue = open_configured_qwp_ws_queue(qwp_ws)?;
+        let pending_connect = QwpWsPendingConnect::new(
+            host,
+            port,
+            use_tls,
+            tls_settings,
+            qwp_ws,
+            auth_header,
+            queue.max_in_flight(),
+            *qwp_ws.request_durable_ack,
+        );
+        (
+            SyncQwpWsRunner::start_pending_connect(
+                queue,
+                pending_connect,
+                *qwp_ws.sf_append_deadline,
+            ),
+            QwpWsReplayEncoder::new(1),
+        )
+    } else {
+        let parts = open_qwp_ws_parts(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+        (
+            SyncQwpWsRunner::start_with_append_deadline(
+                parts.store,
+                parts.send_core,
+                *qwp_ws.sf_append_deadline,
+            ),
+            parts.encoder,
+        )
+    };
     let orphan_candidates = orphan_candidates(qwp_ws);
     let orphan_pool = OrphanDrainerPool::start(
         orphan_candidates,
@@ -2409,7 +2607,7 @@ pub(crate) fn connect_qwp_ws(
 
     Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
         SyncQwpWsHandlerState {
-            encoder: QwpWsReplayEncoder::new(negotiated_version),
+            encoder,
             runner,
             orphan_pool,
             close_drain_timeout: *qwp_ws.close_flush_timeout,
@@ -2444,14 +2642,16 @@ pub(crate) fn open_manual_qwp_ws(
         qwp_ws,
         auth_header.clone(),
     );
-    let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    let parts = open_qwp_ws_parts(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
     let orphan_drainers = ManualOrphanDrainers::new(
         orphan_candidates(qwp_ws),
         *qwp_ws.max_background_drainers,
         orphan_config,
     );
     Ok(ManualQwpWsHandlerState {
-        publisher,
+        encoder: parts.encoder,
+        store: parts.store,
+        send_core: parts.send_core,
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
@@ -2459,21 +2659,23 @@ pub(crate) fn open_manual_qwp_ws(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn open_qwp_ws_publisher(
+fn open_qwp_ws_parts(
     host: &str,
     port: &str,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
-) -> crate::Result<SyncQwpWsPublisher> {
+) -> crate::Result<QwpWsConnectedParts> {
     let queue = open_configured_qwp_ws_queue(qwp_ws)?;
     let transport =
         connect_blocking_transport(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
     let negotiated_version = transport.negotiated_version();
-    let driver = ManualDriverPrototype::from_queue_with_reconnect_policy(
-        queue,
+    let max_in_flight = queue.max_in_flight();
+    let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+    let send_core = QwpWsSendCore::new_with_durable_ack(
         transport,
+        max_in_flight,
         ReconnectPolicy::bounded(
             *qwp_ws.reconnect_max_duration,
             *qwp_ws.reconnect_initial_backoff,
@@ -2482,7 +2684,11 @@ pub(crate) fn open_qwp_ws_publisher(
         *qwp_ws.request_durable_ack,
     );
 
-    Ok(QwpWsPublicationDriver::new(driver, negotiated_version))
+    Ok(QwpWsConnectedParts {
+        encoder: QwpWsReplayEncoder::new(negotiated_version),
+        store,
+        send_core,
+    })
 }
 
 fn connect_blocking_transport(
@@ -2604,8 +2810,11 @@ pub(crate) fn flush_qwp_ws(
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
-    let payload = state.encoder.encode_with_max_size(buffer, max_buf_size)?;
-    state.runner.publish_replay_payload(payload).map(Some)
+    let encoder = &mut state.encoder;
+    let runner = &mut state.runner;
+    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
+        runner.publish_replay_payload(payload)
+    })
 }
 
 pub(crate) fn flush_qwp_ws_manual(
@@ -2613,20 +2822,40 @@ pub(crate) fn flush_qwp_ws_manual(
     buffer: &QwpWsColumnarBuffer,
     max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
-    let receipt = state
-        .publisher
-        .submit_qwp_with_append_deadline(buffer, state.append_deadline, max_buf_size)
-        .map_err(|err| match err {
-            QwpWsPublicationError::Encode(err) => err,
-            QwpWsPublicationError::Driver(err) => driver_error_to_error(&state.publisher, err),
-        })?;
-    Ok(Some(receipt.fsn))
+    let encoder = &mut state.encoder;
+    let store = &mut state.store;
+    let send_core = &mut state.send_core;
+    let append_deadline = state.append_deadline;
+    publish_qwp_ws_buffer(encoder, buffer, max_buf_size, |payload| {
+        match manual_submit_with_drive_deadline(store, send_core, payload, append_deadline) {
+            Ok(fsn) => Ok(fsn),
+            Err(err) => Err(driver_error_to_error_from_store(store, err)),
+        }
+    })
+}
+
+fn publish_qwp_ws_buffer(
+    encoder: &mut QwpWsReplayEncoder,
+    buffer: &QwpWsColumnarBuffer,
+    max_buf_size: usize,
+    mut publish: impl FnMut(&[u8]) -> crate::Result<u64>,
+) -> crate::Result<Option<u64>> {
+    let payload = encoder.encode_with_max_size(buffer, max_buf_size)?;
+    publish(payload).map(Some)
 }
 
 pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
-    let foreground_progress = match state.publisher.drive_ready_once() {
+    let outcome = state.send_core.drive_once(&mut state.store);
+    let foreground_progress = match outcome {
         Ok(DriveOutcome::Idle) => Ok(false),
         Ok(DriveOutcome::Terminal) => qwp_ws_manual_terminal_error(state),
+        Ok(DriveOutcome::ReconnectDelay {
+            sleep_for,
+            deadline,
+        }) => {
+            sleep_before_manual_reconnect(deadline, sleep_for, None);
+            Ok(true)
+        }
         Ok(
             DriveOutcome::Sent(_)
             | DriveOutcome::Acked { .. }
@@ -2634,7 +2863,7 @@ pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::R
             | DriveOutcome::Reconnected { .. }
             | DriveOutcome::Progress,
         ) => Ok(true),
-        Err(err) => Err(driver_error_to_error(&state.publisher, err)),
+        Err(err) => Err(driver_error_to_error_from_store(&state.store, err)),
     }?;
     let orphan_progress = state
         .orphan_drainers
@@ -2658,15 +2887,15 @@ pub(crate) fn qwp_ws_acked_fsn_background(
 pub(crate) fn qwp_ws_published_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
-    check_manual_publisher_error(state)?;
-    Ok(state.publisher.published_fsn())
+    check_manual_driver_error(state)?;
+    Ok(state.store.published_fsn())
 }
 
 pub(crate) fn qwp_ws_acked_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
-    check_manual_publisher_error(state)?;
-    Ok(state.publisher.acked_fsn())
+    check_manual_driver_error(state)?;
+    Ok(state.store.completed_fsn())
 }
 
 pub(crate) fn qwp_ws_check_error_background(state: &SyncQwpWsHandlerState) -> crate::Result<()> {
@@ -2674,7 +2903,7 @@ pub(crate) fn qwp_ws_check_error_background(state: &SyncQwpWsHandlerState) -> cr
 }
 
 pub(crate) fn qwp_ws_check_error_manual(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
-    check_manual_publisher_error(state)
+    check_manual_driver_error(state)
 }
 
 pub(crate) fn qwp_ws_poll_sender_error_background(
@@ -2692,13 +2921,13 @@ pub(crate) fn qwp_ws_poll_sender_error_notification_background(
 pub(crate) fn qwp_ws_poll_sender_error_manual(
     state: &mut ManualQwpWsHandlerState,
 ) -> crate::Result<Option<QwpWsSenderError>> {
-    Ok(state.publisher.poll_sender_error())
+    Ok(state.store.poll_sender_error())
 }
 
 pub(crate) fn qwp_ws_poll_sender_error_notification_manual(
     state: &mut ManualQwpWsHandlerState,
 ) -> crate::Result<Option<QwpWsSenderError>> {
-    Ok(state.publisher.poll_sender_error_notification())
+    Ok(state.store.poll_sender_error_notification())
 }
 
 pub(crate) fn qwp_ws_terminal_sender_error_background(
@@ -2710,7 +2939,7 @@ pub(crate) fn qwp_ws_terminal_sender_error_background(
 pub(crate) fn qwp_ws_terminal_sender_error_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<QwpWsSenderError>> {
-    Ok(state.publisher.terminal_sender_error().cloned())
+    Ok(state.store.terminal_sender_error().cloned())
 }
 
 pub(crate) fn qwp_ws_sender_errors_dropped_background(
@@ -2722,7 +2951,7 @@ pub(crate) fn qwp_ws_sender_errors_dropped_background(
 pub(crate) fn qwp_ws_sender_errors_dropped_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<u64> {
-    Ok(state.publisher.sender_errors_dropped_total())
+    Ok(state.store.sender_errors_dropped_total())
 }
 
 pub(crate) fn qwp_ws_close_drain_background(
@@ -2737,14 +2966,20 @@ pub(crate) fn qwp_ws_close_drain_background(
 
 pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> crate::Result<()> {
     if state.close_drain_timeout.is_zero() {
-        state.publisher.begin_close();
+        state.store.set_closing();
         return Ok(());
     }
     let deadline = Instant::now().checked_add(state.close_drain_timeout);
     loop {
-        match state.publisher.close_drain_ready_once() {
+        match state.send_core.close_drain_ready_once(&mut state.store) {
             Ok(CloseOutcome::Drained) => return Ok(()),
             Ok(CloseOutcome::Terminal) => return qwp_ws_manual_terminal_error(state),
+            Ok(CloseOutcome::Waiting {
+                sleep_for,
+                deadline: reconnect_deadline,
+            }) => {
+                sleep_before_manual_reconnect(reconnect_deadline, sleep_for, deadline);
+            }
             Ok(CloseOutcome::Timeout) => {
                 if backpressure_deadline_expired(deadline) {
                     return Err(error::fmt!(
@@ -2754,16 +2989,92 @@ pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> 
                 }
                 thread::sleep(BACKPRESSURE_PARK);
             }
-            Err(err) => return Err(driver_error_to_error(&state.publisher, err)),
+            Err(err) => return Err(driver_error_to_error_from_store(&state.store, err)),
         }
     }
 }
 
-fn check_manual_publisher_error(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
-    if let Some(err) = state.publisher.terminal_error() {
+fn manual_submit_with_drive_deadline<Q, T>(
+    store: &mut QwpWsPublicationStore<Q>,
+    send_core: &mut QwpWsSendCore<T>,
+    payload: &[u8],
+    append_deadline: Duration,
+) -> Result<u64, DriverError>
+where
+    Q: PublicationLog,
+    T: QwpWsCoreTransport,
+{
+    let deadline = Instant::now().checked_add(append_deadline);
+    loop {
+        if store.is_terminal() {
+            return Err(DriverError::Terminal);
+        }
+        match store.try_submit(payload) {
+            Ok(receipt) => return Ok(receipt.fsn),
+            Err(err) => {
+                let Some(backpressure) = driver_error_backpressure_queue(&err) else {
+                    return Err(err);
+                };
+                if backpressure_deadline_expired(deadline) {
+                    return Err(DriverError::SubmitTimedOut {
+                        backpressure: Some(backpressure),
+                    });
+                }
+                match send_core.drive_once(store)? {
+                    DriveOutcome::Idle => sleep_until_backpressure_deadline(deadline),
+                    DriveOutcome::ReconnectDelay {
+                        sleep_for,
+                        deadline: reconnect_deadline,
+                    } => sleep_before_manual_reconnect(reconnect_deadline, sleep_for, deadline),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn sleep_until_backpressure_deadline(deadline: Option<Instant>) {
+    let sleep_for = match deadline {
+        Some(deadline) => deadline
+            .saturating_duration_since(Instant::now())
+            .min(BACKPRESSURE_PARK),
+        None => BACKPRESSURE_PARK,
+    };
+    if !sleep_for.is_zero() {
+        thread::sleep(sleep_for);
+    }
+}
+
+fn sleep_before_manual_reconnect(
+    reconnect_deadline: Option<Instant>,
+    sleep_for: Duration,
+    outer_deadline: Option<Instant>,
+) {
+    let mut sleep_for = sleep_for;
+    if let Some(deadline) = reconnect_deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        sleep_for = sleep_for.min(remaining);
+    }
+    if let Some(deadline) = outer_deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        sleep_for = sleep_for.min(remaining);
+    }
+    if !sleep_for.is_zero() {
+        thread::sleep(sleep_for);
+    }
+}
+
+fn check_manual_driver_error(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
+    if let Some(err) = state.store.terminal_error() {
         return Err(err.clone());
     }
-    if state.publisher.is_terminal() {
+    if state.store.is_terminal() {
         return Err(error::fmt!(SocketError, "QWP/WebSocket sender is terminal"));
     }
     Ok(())
@@ -2771,7 +3082,7 @@ fn check_manual_publisher_error(state: &ManualQwpWsHandlerState) -> crate::Resul
 
 fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Result<T> {
     Err(state
-        .publisher
+        .store
         .terminal_error()
         .cloned()
         .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")))
@@ -2779,23 +3090,6 @@ fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Re
 
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
-}
-
-pub(crate) fn driver_error_to_error<Q, T>(
-    publisher: &QwpWsPublicationDriver<Q, T>,
-    err: DriverError,
-) -> crate::Error
-where
-    Q: PublicationLog,
-    T: ManualDriverTransport,
-{
-    match err {
-        DriverError::Terminal => publisher
-            .terminal_error()
-            .cloned()
-            .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")),
-        err => driver_error_to_error_without_state(err),
-    }
 }
 
 fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
@@ -2863,8 +3157,8 @@ fn submit_timeout_error(backpressure: Option<super::qwp_ws_queue::QueueError>) -
 #[cfg(test)]
 mod tests {
     use super::super::qwp_ws_driver::{
-        DriverError, DriverEvent, FakeOrderedServer, ReconnectReason, TransportFailure,
-        TransportResponse, TransportSendResult,
+        DriverError, DriverEvent, FakeOrderedServer, ReconnectReason, TableSeqTxn,
+        TransportFailure, TransportPoll, TransportResponse, TransportSendResult,
     };
     use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame};
     use super::super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaMemoryQueueOptions, SfaQueueOptions};
@@ -3443,7 +3737,7 @@ mod tests {
         sent_frames: Vec<SentFrame>,
     }
 
-    impl ManualDriverTransport for BlockingFirstSendTransport {
+    impl QwpWsCoreTransport for BlockingFirstSendTransport {
         fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
             Ok(TransportPoll::Idle)
         }
@@ -3465,6 +3759,72 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AckWhenReadyTransport {
+        ack_ready: Arc<AtomicBool>,
+        sent_frames: Vec<SentFrame>,
+    }
+
+    impl QwpWsCoreTransport for AckWhenReadyTransport {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            if self.ack_ready.swap(false, Ordering::AcqRel) {
+                Ok(TransportPoll::Response(TransportResponse::Ack {
+                    wire_seq: 0,
+                }))
+            } else {
+                Ok(TransportPoll::Idle)
+            }
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.sent_frames.push(frame.sent_frame());
+            Ok(TransportSendResult::NoResponse)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DurableAckWhenReadyTransport {
+        ack_ready: Arc<AtomicBool>,
+        sent_frames: Vec<SentFrame>,
+    }
+
+    impl DurableAckWhenReadyTransport {
+        fn table_seq_txns() -> Vec<TableSeqTxn> {
+            vec![TableSeqTxn {
+                table: "trades".to_string(),
+                seq_txn: 10,
+            }]
+        }
+    }
+
+    impl QwpWsCoreTransport for DurableAckWhenReadyTransport {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            if self.ack_ready.swap(false, Ordering::AcqRel) {
+                Ok(TransportPoll::Response(TransportResponse::DurableAck {
+                    table_seq_txns: Self::table_seq_txns(),
+                }))
+            } else {
+                Ok(TransportPoll::Idle)
+            }
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.sent_frames.push(frame.sent_frame());
+            Ok(TransportSendResult::Response(
+                TransportResponse::DurableOk {
+                    wire_seq: 0,
+                    table_seq_txns: Self::table_seq_txns(),
+                },
+            ))
+        }
+    }
+
     #[test]
     fn threaded_runner_accepts_publication_while_transport_send_is_blocked() {
         let (send_started_tx, send_started_rx) = mpsc::channel();
@@ -3476,9 +3836,8 @@ mod tests {
             should_block_send: true,
             sent_frames: Vec::new(),
         };
-        let driver = ManualDriverPrototype::from_queue(queue, transport);
-        let publisher = QwpWsPublicationDriver::new(driver, 1);
-        let mut runner = SyncQwpWsRunner::start(publisher);
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let mut runner = SyncQwpWsRunner::start(driver);
 
         runner.publish_replay_payload(b"first").unwrap();
         send_started_rx
@@ -3519,10 +3878,9 @@ mod tests {
             max_in_flight: 1,
         })
         .unwrap();
-        let driver = ManualDriverPrototype::from_queue(queue, FakeOrderedServer::no_response());
-        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
         let mut runner =
-            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_secs(5));
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
         let shared = Arc::clone(&runner.shared);
         let guard = shared.lock().unwrap();
 
@@ -3548,6 +3906,217 @@ mod tests {
         drop(runner);
     }
 
+    #[test]
+    fn threaded_sfa_send_progress_does_not_take_shared_store_mutex() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let (send_started_tx, send_started_rx) = mpsc::channel();
+        let (release_send_tx, release_send_rx) = mpsc::channel();
+        let transport = BlockingFirstSendTransport {
+            send_started: send_started_tx,
+            release_send: release_send_rx,
+            should_block_send: true,
+            sent_frames: Vec::new(),
+        };
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let receipt = driver.try_submit(b"sfa-first").unwrap();
+        assert_eq!(receipt.fsn, 0);
+        let (store, send_core) = driver.into_parts();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let mut guard = Some(shared.lock().unwrap());
+        let backpressure = Arc::new(BackpressureNotifier::new());
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress,
+            cold_effects: VecDeque::new(),
+            backpressure,
+            lifecycle,
+        };
+        let stop = AtomicBool::new(false);
+        let shared_for_step = Arc::clone(&shared);
+
+        std::thread::scope(|scope| {
+            let step_thread = scope.spawn(|| core.drive_step(&shared_for_step, &stop));
+            match send_started_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(()) => {}
+                Err(err) => {
+                    drop(guard.take());
+                    let _ = send_started_rx.recv_timeout(Duration::from_secs(2));
+                    let _ = release_send_tx.send(());
+                    step_thread.join().unwrap();
+                    panic!("send progress waited for shared-store mutex: {err:?}");
+                }
+            }
+            release_send_tx.send(()).unwrap();
+            drop(guard.take());
+            assert_eq!(step_thread.join().unwrap(), RunnerStep::Continue);
+        });
+    }
+
+    #[test]
+    fn threaded_sfa_ack_progress_does_not_take_shared_store_mutex() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let ack_ready = Arc::new(AtomicBool::new(false));
+        let transport = AckWhenReadyTransport {
+            ack_ready: Arc::clone(&ack_ready),
+            sent_frames: Vec::new(),
+        };
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let receipt = driver.try_submit(b"sfa-first").unwrap();
+        assert_eq!(receipt.fsn, 0);
+        let (store, send_core) = driver.into_parts();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let backpressure = Arc::new(BackpressureNotifier::new());
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress: progress.clone(),
+            cold_effects: VecDeque::new(),
+            backpressure,
+            lifecycle,
+        };
+        let stop = AtomicBool::new(false);
+
+        assert_eq!(core.drive_step(&shared, &stop), RunnerStep::Continue);
+        assert_eq!(progress.completed_fsn(), None);
+
+        let mut guard = Some(shared.lock().unwrap());
+        ack_ready.store(true, Ordering::Release);
+        let shared_for_step = Arc::clone(&shared);
+        std::thread::scope(|scope| {
+            let step_thread = scope.spawn(|| core.drive_step(&shared_for_step, &stop));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if progress.completed_fsn() == Some(0) {
+                    drop(guard.take());
+                    assert_eq!(step_thread.join().unwrap(), RunnerStep::Continue);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(guard.take());
+            let _ = step_thread.join();
+            panic!("ACK progress waited for shared-store mutex");
+        });
+    }
+
+    #[test]
+    fn threaded_sfa_durable_ack_progress_does_not_take_shared_store_mutex() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let ack_ready = Arc::new(AtomicBool::new(false));
+        let transport = DurableAckWhenReadyTransport {
+            ack_ready: Arc::clone(&ack_ready),
+            sent_frames: Vec::new(),
+        };
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            queue,
+            transport,
+            ReconnectPolicy::bounded(Duration::MAX, Duration::ZERO, Duration::ZERO),
+            true,
+        );
+        let receipt = driver.try_submit(b"sfa-first").unwrap();
+        assert_eq!(receipt.fsn, 0);
+        let (store, send_core) = driver.into_parts();
+        let progress = store.progress_view();
+        let lifecycle = store.lifecycle();
+        let shared = Arc::new(Mutex::new(store));
+        let backpressure = Arc::new(BackpressureNotifier::new());
+        let mut core = SyncQwpWsRunnerCore {
+            send_core,
+            progress: progress.clone(),
+            cold_effects: VecDeque::new(),
+            backpressure,
+            lifecycle,
+        };
+        let stop = AtomicBool::new(false);
+
+        assert_eq!(core.drive_step(&shared, &stop), RunnerStep::Continue);
+        assert_eq!(progress.completed_fsn(), None);
+
+        let mut guard = Some(shared.lock().unwrap());
+        ack_ready.store(true, Ordering::Release);
+        let shared_for_step = Arc::clone(&shared);
+        std::thread::scope(|scope| {
+            let step_thread = scope.spawn(|| core.drive_step(&shared_for_step, &stop));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if progress.completed_fsn() == Some(0) {
+                    drop(guard.take());
+                    assert_eq!(step_thread.join().unwrap(), RunnerStep::Continue);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(guard.take());
+            let _ = step_thread.join();
+            panic!("durable ACK progress waited for shared-store mutex");
+        });
+    }
+
+    #[test]
+    fn threaded_sfa_watermark_reads_do_not_take_shared_store_mutex() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let mut runner =
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
+        let fsn = runner.publish_replay_payload(b"sfa-first").unwrap();
+
+        let shared = Arc::clone(&runner.shared);
+        let mut guard = Some(shared.lock().unwrap());
+        std::thread::scope(|scope| {
+            let (watermarks_tx, watermarks_rx) = mpsc::channel();
+            let runner = &runner;
+            scope.spawn(move || {
+                let result = (runner.published_fsn(), runner.acked_fsn());
+                let _ = watermarks_tx.send(result);
+            });
+
+            let (published, acked) = match watermarks_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(result) => result,
+                Err(err) => {
+                    drop(guard.take());
+                    let _ = watermarks_rx.recv_timeout(Duration::from_secs(2));
+                    panic!("watermark read waited for shared-store mutex: {err:?}");
+                }
+            };
+            assert_eq!(published.unwrap(), Some(fsn));
+            assert_eq!(acked.unwrap(), None);
+        });
+
+        drop(guard);
+        drop(runner);
+    }
+
     #[derive(Debug)]
     struct BlockingReconnectTransport {
         send_started: mpsc::Sender<()>,
@@ -3557,7 +4126,7 @@ mod tests {
         sent_frames: Vec<SentFrame>,
     }
 
-    impl ManualDriverTransport for BlockingReconnectTransport {
+    impl QwpWsCoreTransport for BlockingReconnectTransport {
         fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
             Ok(TransportPoll::Idle)
         }
@@ -3600,9 +4169,8 @@ mod tests {
             should_fail_send: true,
             sent_frames: Vec::new(),
         };
-        let driver = ManualDriverPrototype::from_queue(queue, transport);
-        let publisher = QwpWsPublicationDriver::new(driver, 1);
-        let mut runner = SyncQwpWsRunner::start(publisher);
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let mut runner = SyncQwpWsRunner::start(driver);
 
         runner.publish_replay_payload(b"first").unwrap();
         send_started_rx
@@ -3644,7 +4212,7 @@ mod tests {
         sent_frames: Vec<SentFrame>,
     }
 
-    impl ManualDriverTransport for SignalResponseTransport {
+    impl QwpWsCoreTransport for SignalResponseTransport {
         fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
             if self.terminal.try_recv().is_ok() {
                 return Err(TransportFailure::Terminal(crate::Error::new(
@@ -3683,10 +4251,9 @@ mod tests {
             terminal: terminal_rx,
             sent_frames: Vec::new(),
         };
-        let driver = ManualDriverPrototype::from_queue(queue, transport);
-        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
         let mut runner =
-            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_secs(5));
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
 
         runner.publish_replay_payload(b"first").unwrap();
         assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 0);
@@ -3725,10 +4292,9 @@ mod tests {
             terminal: terminal_rx,
             sent_frames: Vec::new(),
         };
-        let driver = ManualDriverPrototype::from_queue(queue, transport);
-        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
         let mut runner =
-            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_millis(20));
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_millis(20));
 
         runner.publish_replay_payload(b"first").unwrap();
         assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 0);
@@ -3755,10 +4321,9 @@ mod tests {
             terminal: terminal_rx,
             sent_frames: Vec::new(),
         };
-        let driver = ManualDriverPrototype::from_queue(queue, transport);
-        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
         let mut runner =
-            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_secs(5));
+            SyncQwpWsRunner::start_driver_with_append_deadline(driver, Duration::from_secs(5));
 
         runner.publish_replay_payload(b"first").unwrap();
         assert_eq!(sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn, 0);
@@ -3799,7 +4364,7 @@ mod tests {
         sent_frames: Vec<SentFrame>,
     }
 
-    impl ManualDriverTransport for ImmediateFailureReconnectTransport {
+    impl QwpWsCoreTransport for ImmediateFailureReconnectTransport {
         fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
             Ok(TransportPoll::Idle)
         }
@@ -3829,7 +4394,7 @@ mod tests {
     }
 
     #[test]
-    fn threaded_runner_records_immediate_transport_failure_as_sent_before_reconnect() {
+    fn threaded_runner_records_immediate_transport_failure_as_sent() {
         let (reconnect_started_tx, reconnect_started_rx) = mpsc::channel();
         let (release_reconnect_tx, release_reconnect_rx) = mpsc::channel();
         let queue = memory_queue(1024, 2);
@@ -3839,14 +4404,14 @@ mod tests {
             should_fail_send: true,
             sent_frames: Vec::new(),
         };
-        let driver = ManualDriverPrototype::from_queue(queue, transport);
-        let publisher = QwpWsPublicationDriver::new(driver, 1);
-        let mut runner = SyncQwpWsRunner::start(publisher);
+        let driver = QwpWsCoreTestHarness::from_queue(queue, transport);
+        let mut runner = SyncQwpWsRunner::start(driver);
 
         runner.publish_replay_payload(b"first").unwrap();
         reconnect_started_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
+        release_reconnect_tx.send(()).unwrap();
 
         let events = {
             let mut store = runner.lock_shared().unwrap();
@@ -3857,14 +4422,21 @@ mod tests {
             events
         };
         assert_eq!(
-            events,
-            vec![DriverEvent::Sent {
+            events.first(),
+            Some(&DriverEvent::Sent {
                 fsn: 0,
                 wire_seq: 0,
-            }]
+            })
         );
-
-        release_reconnect_tx.send(()).unwrap();
+        if let Some(reconnect_idx) = events
+            .iter()
+            .position(|event| matches!(event, DriverEvent::Reconnected { .. }))
+        {
+            assert!(
+                reconnect_idx > 0,
+                "immediate transport failure was not recorded as sent before reconnect: {events:?}"
+            );
+        }
         drop(runner);
     }
 }

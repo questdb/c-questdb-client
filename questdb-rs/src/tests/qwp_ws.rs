@@ -51,6 +51,42 @@ const QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS: usize = 20_000_000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE: usize = 1000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT: usize = 128;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressCase {
+    Background,
+    Manual,
+}
+
+impl ProgressCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Background => "background",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+fn build_qwp_ws_sender_from_builder(
+    progress: ProgressCase,
+    builder: SenderBuilder,
+) -> crate::ingress::Sender {
+    match progress {
+        ProgressCase::Background => builder.build().unwrap(),
+        ProgressCase::Manual => builder
+            .qwp_ws_progress(QwpWsProgress::Manual)
+            .unwrap()
+            .build()
+            .unwrap(),
+    }
+}
+
+fn build_qwp_ws_sender(progress: ProgressCase, port: u16) -> crate::ingress::Sender {
+    build_qwp_ws_sender_from_builder(
+        progress,
+        SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port),
+    )
+}
+
 // ---------- mock server ----------
 
 #[allow(dead_code)]
@@ -437,6 +473,104 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
     });
 
     (port, rx)
+}
+
+fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
+
+        let mut received_frames = Vec::new();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        received_frames.push(payload);
+        write_mock_qwp_response(&mut stream, response).unwrap();
+
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+#[derive(Clone, Copy)]
+enum MockQwpResponse {
+    Ok {
+        wire_seq: u64,
+    },
+    Error {
+        status: u8,
+        wire_seq: u64,
+        message: &'static [u8],
+    },
+}
+
+fn write_mock_qwp_response(
+    stream: &mut TcpStream,
+    response: MockQwpResponse,
+) -> std::io::Result<()> {
+    match response {
+        MockQwpResponse::Ok { wire_seq } => write_qwp_ok_response(stream, wire_seq),
+        MockQwpResponse::Error {
+            status,
+            wire_seq,
+            message,
+        } => write_qwp_error_response(stream, status, wire_seq, message),
+    }
+}
+
+fn spawn_two_response_server(
+    first_response: MockQwpResponse,
+    second_response: MockQwpResponse,
+) -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
+
+        let mut received_frames = Vec::new();
+        let (_fin, _opcode, first) = read_frame(&mut stream).unwrap();
+        received_frames.push(first);
+        write_mock_qwp_response(&mut stream, first_response).unwrap();
+
+        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
+        received_frames.push(second);
+        write_mock_qwp_response(&mut stream, second_response).unwrap();
+
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+    });
+
+    (port, frame_rx, release_tx)
 }
 
 fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
@@ -927,63 +1061,310 @@ fn qwp_ws_round_trip_minimal_message() {
 }
 
 #[test]
-fn qwp_ws_max_buf_size_allows_frame_when_encoded_replay_len_fits() {
-    let max = 1024;
-    let (port, rx) = spawn_mock_server();
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .max_buf_size(max)
-        .unwrap()
-        .build()
-        .unwrap();
-    let mut buf = no_symbol_frame_at_local_hint_overcount_boundary(max);
-    let local_hint = buf.len();
-    let encoded_len = qwp_ws_replay_encoded_len(&buf);
-    assert!(local_hint > max, "local_hint={local_hint}, max={max}");
-    assert!(encoded_len <= max, "encoded_len={encoded_len}, max={max}");
+fn qwp_ws_max_buf_size_allows_frame_when_encoded_replay_len_fits_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let max = 1024;
+        let (port, rx) = spawn_mock_server();
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(max)
+            .unwrap();
+        let mut sender = match progress {
+            ProgressCase::Background => builder.build().unwrap(),
+            ProgressCase::Manual => builder
+                .qwp_ws_progress(QwpWsProgress::Manual)
+                .unwrap()
+                .build()
+                .unwrap(),
+        };
+        let mut buf = no_symbol_frame_at_local_hint_overcount_boundary(max);
+        let local_hint = buf.len();
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+        assert!(local_hint > max, "local_hint={local_hint}, max={max}");
+        assert!(encoded_len <= max, "encoded_len={encoded_len}, max={max}");
 
-    sender.flush(&mut buf).unwrap();
+        sender.flush(&mut buf).unwrap();
+        if progress == ProgressCase::Manual {
+            assert!(
+                sender.drive_once().unwrap(),
+                "{} mode did not report foreground progress",
+                progress.name()
+            );
+        }
 
-    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let frame = result.received_frames.first().expect("frame received");
-    assert_eq!(frame.len(), encoded_len);
-    assert!(frame.len() <= max);
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let frame = result.received_frames.first().expect("frame received");
+        assert_eq!(frame.len(), encoded_len, "mode={}", progress.name());
+        assert!(frame.len() <= max, "mode={}", progress.name());
+    }
 }
 
 #[test]
-fn qwp_ws_max_buf_size_rejects_frame_when_replay_schema_ids_make_encoded_len_exceed_limit() {
-    let mut buf = Buffer::qwp_ws_with_max_name_len(127);
-    for idx in 0..131 {
-        buf.table(format!("t{idx}").as_str())
+fn qwp_ws_max_buf_size_rejects_frame_when_replay_schema_ids_make_encoded_len_exceed_limit_in_all_progress_modes()
+ {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+        for idx in 0..131 {
+            buf.table(format!("t{idx}").as_str())
+                .unwrap()
+                .column_i64(format!("c{idx}").as_str(), idx)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+        let local_hint = buf.len();
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+        assert!(local_hint >= 1024, "local_hint={local_hint}");
+        assert!(
+            encoded_len > local_hint,
+            "encoded_len={encoded_len}, local_hint={local_hint}"
+        );
+
+        let port = spawn_upgrade_only_server();
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(local_hint)
+            .unwrap();
+        let mut sender = match progress {
+            ProgressCase::Background => builder.build().unwrap(),
+            ProgressCase::Manual => builder
+                .qwp_ws_progress(QwpWsProgress::Manual)
+                .unwrap()
+                .build()
+                .unwrap(),
+        };
+        let err = sender.flush(&mut buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::InvalidApiCall,
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(
+            err.msg(),
+            format!(
+                "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} exceeds maximum configured allowed size of {local_hint} bytes."
+            ),
+            "mode={}",
+            progress.name()
+        );
+        assert!(!buf.is_empty(), "mode={}", progress.name());
+    }
+}
+
+#[test]
+fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_mock_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
             .unwrap()
-            .column_i64(format!("c{idx}").as_str(), idx)
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 7)
             .unwrap()
             .at_now()
             .unwrap();
-    }
-    let local_hint = buf.len();
-    let encoded_len = qwp_ws_replay_encoded_len(&buf);
-    assert!(local_hint >= 1024, "local_hint={local_hint}");
-    assert!(
-        encoded_len > local_hint,
-        "encoded_len={encoded_len}, local_hint={local_hint}"
-    );
 
-    let port = spawn_upgrade_only_server();
-    let err = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .max_buf_size(local_hint)
-        .unwrap()
-        .build()
-        .unwrap()
-        .flush(&mut buf)
-        .unwrap_err();
-    assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
-    assert_eq!(
-        err.msg(),
-        format!(
-            "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} exceeds maximum configured allowed size of {local_hint} bytes."
-        )
-    );
-    assert!(!buf.is_empty());
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(fsn, 0, "mode={}", progress.name());
+        assert!(buf.is_empty(), "mode={}", progress.name());
+        assert!(
+            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+        assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+        assert_eq!(&result.received_frames[0][0..4], b"QWP1");
+    }
+}
+
+#[test]
+fn qwp_ws_drop_reject_reports_error_and_continues_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_two_response_server(
+            MockQwpResponse::Error {
+                status: QWP_STATUS_SCHEMA_MISMATCH,
+                wire_seq: FIRST_WIRE_SEQUENCE,
+                message: b"bad schema",
+            },
+            MockQwpResponse::Ok {
+                wire_seq: FIRST_WIRE_SEQUENCE + 1,
+            },
+        );
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let first_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let second_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+
+        assert_eq!(first_fsn, 0, "mode={}", progress.name());
+        assert_eq!(second_fsn, 1, "mode={}", progress.name());
+        assert!(
+            sender
+                .await_acked_fsn(second_fsn, Duration::from_secs(5))
+                .unwrap(),
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
+
+        let received = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            received.received_frames.len(),
+            2,
+            "mode={}",
+            progress.name()
+        );
+
+        let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
+        assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(qwp_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
+        assert_eq!(qwp_error.message.as_deref(), Some("bad schema"));
+        assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
+        assert_eq!(qwp_error.from_fsn, first_fsn);
+        assert_eq!(qwp_error.to_fsn, first_fsn);
+        assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
+    }
+}
+
+#[test]
+fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
+            status: QWP_STATUS_PARSE_ERROR,
+            wire_seq: FIRST_WIRE_SEQUENCE,
+            message: b"bad column",
+        });
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(fsn, 0, "mode={}", progress.name());
+
+        let err = sender
+            .await_acked_fsn(fsn, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ServerRejection);
+        assert!(
+            err.msg().contains("bad column"),
+            "mode={}, got: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert_eq!(
+            err.qwp_ws_rejection().map(|error| error.category),
+            Some(QwpWsErrorCategory::ParseError),
+            "mode={}",
+            progress.name()
+        );
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+
+        let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
+        assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
+        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
+        assert_eq!(qwp_error.message.as_deref(), Some("bad column"));
+        assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
+        assert_eq!(qwp_error.from_fsn, fsn);
+        assert_eq!(qwp_error.to_fsn, fsn);
+
+        let mut later = sender.new_buffer();
+        later
+            .table("trades")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let later_err = sender.flush(&mut later).unwrap_err();
+        assert_eq!(later_err.code(), ErrorCode::ServerRejection);
+        assert!(
+            later_err.msg().contains("bad column"),
+            "mode={}, got: {}",
+            progress.name(),
+            later_err.msg()
+        );
+        assert!(!later.is_empty(), "mode={}", progress.name());
+    }
+}
+
+#[test]
+fn qwp_ws_backpressure_timeout_matches_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, frame_rx, release_tx) = spawn_stalled_after_first_frame_server();
+        let conf = format!(
+            "qwpws::addr=127.0.0.1:{port};\
+             qwp_ws_progress={};\
+             max_in_flight=1;\
+             sf_append_deadline_millis=20;",
+            progress.name()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+        let mut first = sender.new_buffer();
+        first
+            .table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let first_fsn = sender.flush_and_get_fsn(&mut first).unwrap().unwrap();
+        assert_eq!(first_fsn, 0, "mode={}", progress.name());
+        if progress == ProgressCase::Manual {
+            assert!(sender.drive_once().unwrap(), "mode={}", progress.name());
+        }
+        assert_eq!(
+            &frame_rx.recv_timeout(Duration::from_secs(5)).unwrap()[0..4],
+            b"QWP1"
+        );
+
+        let mut second = sender.new_buffer();
+        second
+            .table("trades")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let err = sender.flush(&mut second).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert_eq!(
+            err.msg(),
+            "QWP/WebSocket flush timed out waiting for local queue capacity",
+            "mode={}",
+            progress.name()
+        );
+        assert!(!second.is_empty(), "mode={}", progress.name());
+        let _ = release_tx.send(());
+    }
 }
 
 #[test]
@@ -1016,102 +1397,126 @@ fn qwp_ws_durable_ack_requires_upgrade_echo() {
 }
 
 #[test]
-fn qwp_ws_durable_ack_keepalive_ping_completes_pending_ok() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (ping_tx, ping_rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel();
+fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (allow_ack_tx, allow_ack_rx) = mpsc::channel();
+        let (ping_tx, ping_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
 
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request_lines = upgrade_mock_stream_with_durable_ack(&mut stream, true);
+            assert!(
+                request_lines
+                    .iter()
+                    .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+            );
+
+            let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+            assert_eq!(opcode, 0x2);
+            assert_eq!(&payload[0..4], b"QWP1");
+            write_qwp_ok_response_with_table_entries(
+                &mut stream,
+                FIRST_WIRE_SEQUENCE,
+                &[("trades", 10)],
+            )
             .unwrap();
-        let request_lines = upgrade_mock_stream_with_durable_ack(&mut stream, true);
+
+            allow_ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            loop {
+                let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+                if opcode == 0x9 {
+                    write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
+                    write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+                    ping_tx.send(payload).unwrap();
+                    break;
+                }
+            }
+
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let conf = format!(
+            "qwpws::addr=127.0.0.1:{port};\
+             qwp_ws_progress={};\
+             request_durable_ack=on;\
+             durable_ack_keepalive_interval_millis=1;",
+            progress.name()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
         assert!(
-            request_lines
-                .iter()
-                .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+            !sender
+                .await_acked_fsn(fsn, Duration::from_millis(50))
+                .unwrap(),
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            None,
+            "mode={}",
+            progress.name()
         );
 
-        let (_, opcode, payload) = read_frame(&mut stream).unwrap();
-        assert_eq!(opcode, 0x2);
-        assert_eq!(&payload[0..4], b"QWP1");
-        write_qwp_ok_response_with_table_entries(
-            &mut stream,
-            FIRST_WIRE_SEQUENCE,
-            &[("trades", 10)],
-        )
-        .unwrap();
-
-        loop {
-            let (_, opcode, payload) = read_frame(&mut stream).unwrap();
-            if opcode == 0x9 {
-                write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
-                write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
-                ping_tx.send(payload).unwrap();
-                break;
-            }
-        }
-
-        let _ = done_rx.recv_timeout(Duration::from_secs(5));
-    });
-
-    let conf = format!(
-        "qwpws::addr=127.0.0.1:{port};\
-         request_durable_ack=on;\
-         durable_ack_keepalive_interval_millis=1;"
-    );
-    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
-    let mut buf = sender.new_buffer();
-    buf.table("trades")
-        .unwrap()
-        .symbol("sym", "ETH-USD")
-        .unwrap()
-        .column_i64("qty", 7)
-        .unwrap()
-        .at_now()
-        .unwrap();
-
-    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-
-    assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
-    let acked = sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap();
-    let acked_fsn = sender.acked_fsn().unwrap();
-    done_tx.send(()).unwrap();
-    server.join().unwrap();
-    assert!(acked);
-    assert_eq!(acked_fsn, Some(fsn));
+        allow_ack_tx.send(()).unwrap();
+        assert!(
+            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+        assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
 }
 
 #[test]
-fn qwp_ws_sender_fsn_watermarks_and_close_drain_work_in_background_mode() {
-    let (port, rx) = spawn_mock_server();
+fn qwp_ws_sender_fsn_watermarks_and_close_drain_work_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_mock_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+        assert_eq!(sender.published_fsn().unwrap(), None);
+        assert_eq!(sender.acked_fsn().unwrap(), None);
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .build()
-        .unwrap();
-    assert_eq!(sender.published_fsn().unwrap(), None);
-    assert_eq!(sender.acked_fsn().unwrap(), None);
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
 
-    let mut buf = sender.new_buffer();
-    buf.table("trades")
-        .unwrap()
-        .column_i64("qty", 7)
-        .unwrap()
-        .at_now()
-        .unwrap();
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(fsn, 0, "mode={}", progress.name());
+        assert!(buf.is_empty(), "mode={}", progress.name());
+        assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
 
-    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-    assert_eq!(fsn, 0);
-    assert!(buf.is_empty());
-    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+        sender.close_drain().unwrap();
+        assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
 
-    sender.close_drain().unwrap();
-    assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
-
-    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(result.received_frames.len(), 1);
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+    }
 }
 
 #[test]
@@ -2208,16 +2613,6 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
             .await_acked_fsn(second_fsn, Duration::from_secs(5))
             .unwrap()
     );
-    sender.flush(&mut buf).unwrap();
-
-    let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(callback_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        callback_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
-    assert_eq!(callback_error.from_fsn, first_fsn);
-
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
     assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
@@ -2228,6 +2623,15 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     assert_eq!(qwp_error.to_fsn, first_fsn);
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     assert_eq!(sender.qwp_ws_errors_dropped().unwrap(), 0);
+
+    sender.flush(&mut buf).unwrap();
+    let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(callback_error.category, QwpWsErrorCategory::SchemaMismatch);
+    assert_eq!(
+        callback_error.applied_policy,
+        QwpWsErrorPolicy::DropAndContinue
+    );
+    assert_eq!(callback_error.from_fsn, first_fsn);
 }
 
 #[test]
@@ -2620,35 +3024,40 @@ fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Ve
 }
 
 #[test]
-fn qwp_ws_sync_reconnects_and_replays() {
-    let (port, rx) = spawn_dropping_then_recovering_server();
+fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_dropping_then_recovering_server();
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .reconnect_initial_backoff(Duration::from_millis(20))
+            .unwrap()
+            .reconnect_max_backoff(Duration::from_millis(50))
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
 
-    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .reconnect_initial_backoff(Duration::from_millis(20))
-        .unwrap()
-        .reconnect_max_backoff(Duration::from_millis(50))
-        .unwrap()
-        .build()
-        .unwrap();
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
 
-    let mut buf = sender.new_buffer();
-    buf.table("trades")
-        .unwrap()
-        .symbol("sym", "ETH-USD")
-        .unwrap()
-        .column_i64("qty", 7)
-        .unwrap()
-        .at_now()
-        .unwrap();
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert!(
+            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
+            "mode={}",
+            progress.name()
+        );
 
-    sender.flush(&mut buf).unwrap();
-
-    // Both wire dumps should be identical QWP messages — replay re-encodes
-    // against fresh state but with the same row, so the bytes match.
-    let frame1 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let frame2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(&frame1[0..4], b"QWP1");
-    assert_eq!(frame1, frame2);
+        // Both wire dumps should be identical QWP messages — replay re-encodes
+        // against fresh state but with the same row, so the bytes match.
+        let frame1 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let frame2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(&frame1[0..4], b"QWP1");
+        assert_eq!(frame1, frame2, "mode={}", progress.name());
+    }
 }
 
 #[test]

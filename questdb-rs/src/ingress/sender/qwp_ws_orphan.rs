@@ -45,8 +45,8 @@ use crate::ingress::tls::TlsSettings;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, CloseStepOutcome, DriverError, ManualDriverPrototype, PublicationLog,
-    ReconnectPolicy,
+    BlockingQwpWsTransport, CloseStepOutcome, DEFAULT_EVENT_CAPACITY, DriverError, PublicationLog,
+    QwpWsPublicationStore, QwpWsSendCore, ReconnectPolicy,
 };
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_sfa_queue::{SfaQueueError, SfaQueueOptions};
@@ -335,7 +335,8 @@ impl ManualOrphanDrainers {
 #[cfg(feature = "sync-sender-qwp-ws")]
 struct OrphanDrainer {
     slot_dir: PathBuf,
-    driver: ManualDriverPrototype<SfaSlotQueue, BlockingQwpWsTransport>,
+    store: QwpWsPublicationStore<SfaSlotQueue>,
+    send_core: QwpWsSendCore<BlockingQwpWsTransport>,
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -361,7 +362,7 @@ enum OrphanDriveOutcome {
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl OrphanDrainer {
     fn open(slot_dir: PathBuf, config: &OrphanDrainerConfig) -> OrphanOpenOutcome {
-        Self::open_controlled(slot_dir, config, None)
+        Self::open_inner(slot_dir, config, None)
     }
 
     fn open_with_stop(
@@ -369,10 +370,10 @@ impl OrphanDrainer {
         config: &OrphanDrainerConfig,
         stop: &AtomicBool,
     ) -> OrphanOpenOutcome {
-        Self::open_controlled(slot_dir, config, Some(stop))
+        Self::open_inner(slot_dir, config, Some(stop))
     }
 
-    fn open_controlled(
+    fn open_inner(
         slot_dir: PathBuf,
         config: &OrphanDrainerConfig,
         stop: Option<&AtomicBool>,
@@ -422,9 +423,11 @@ impl OrphanDrainer {
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
         }
-        let driver = ManualDriverPrototype::from_queue_with_reconnect_policy(
-            queue,
+        let max_in_flight = queue.max_in_flight();
+        let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+        let send_core = QwpWsSendCore::new_with_durable_ack(
             transport,
+            max_in_flight,
             ReconnectPolicy::bounded(
                 *config.qwp_ws.reconnect_max_duration,
                 *config.qwp_ws.reconnect_initial_backoff,
@@ -434,31 +437,51 @@ impl OrphanDrainer {
             // factory but trim orphan files on ordinary OKs, not durable ACKs.
             false,
         );
-        OrphanOpenOutcome::Drainer(Box::new(Self { slot_dir, driver }))
+        OrphanOpenOutcome::Drainer(Box::new(Self {
+            slot_dir,
+            store,
+            send_core,
+        }))
     }
 
     fn drive_once(&mut self) -> OrphanDriveOutcome {
-        match self.driver.close_drain_ready_step() {
+        match self.send_core.close_drain_ready_step(&mut self.store) {
             Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => {
-                OrphanDriveOutcome::Failed(driver_terminal_message(&self.driver))
+            Ok(CloseStepOutcome::Terminal) => OrphanDriveOutcome::Failed(self.terminal_message()),
+            Ok(CloseStepOutcome::Waiting {
+                sleep_for,
+                deadline,
+            }) => {
+                sleep_before_orphan_reconnect(deadline, sleep_for, None);
+                OrphanDriveOutcome::Progress
             }
             Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
             Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
-            Ok(CloseStepOutcome::Stopped) => OrphanDriveOutcome::Stopped,
             Err(err) => OrphanDriveOutcome::Failed(driver_error_message(err)),
         }
     }
 
     fn drive_once_with_stop(&mut self, stop: &AtomicBool) -> OrphanDriveOutcome {
-        match self.driver.close_drain_ready_step_with_stop(stop) {
+        if stop.load(Ordering::Acquire) {
+            return OrphanDriveOutcome::Stopped;
+        }
+        match self.send_core.close_drain_ready_step(&mut self.store) {
             Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => {
-                OrphanDriveOutcome::Failed(driver_terminal_message(&self.driver))
+            Ok(CloseStepOutcome::Terminal) => OrphanDriveOutcome::Failed(self.terminal_message()),
+            Ok(CloseStepOutcome::Waiting {
+                sleep_for,
+                deadline,
+            }) => {
+                if sleep_before_orphan_reconnect(deadline, sleep_for, Some(stop)) {
+                    OrphanDriveOutcome::Progress
+                } else if stop.load(Ordering::Acquire) {
+                    OrphanDriveOutcome::Stopped
+                } else {
+                    OrphanDriveOutcome::Progress
+                }
             }
             Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
             Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
-            Ok(CloseStepOutcome::Stopped) => OrphanDriveOutcome::Stopped,
             Err(err) => OrphanDriveOutcome::Failed(driver_error_message(err)),
         }
     }
@@ -472,6 +495,57 @@ impl OrphanDrainer {
             self.mark_failed(reason);
         }
     }
+
+    fn terminal_message(&self) -> String {
+        if let Some(err) = self.store.terminal_error() {
+            return err.to_string();
+        }
+        if let Some(err) = self.store.terminal_sender_error() {
+            return format!("{err:?}");
+        }
+        "orphan drainer reached terminal state".to_owned()
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn orphan_reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn sleep_before_orphan_reconnect(
+    deadline: Option<Instant>,
+    backoff: Duration,
+    stop: Option<&AtomicBool>,
+) -> bool {
+    if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+        return false;
+    }
+    if backoff.is_zero() {
+        return stop.is_none_or(|stop| !stop.load(Ordering::Acquire))
+            && !orphan_reconnect_deadline_expired(deadline);
+    }
+
+    let sleep_for = match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            backoff.min(remaining)
+        }
+        None => backoff,
+    };
+    let sleep_start = Instant::now();
+    while stop.is_none_or(|stop| !stop.load(Ordering::Acquire)) {
+        let remaining = sleep_for.saturating_sub(sleep_start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    stop.is_none_or(|stop| !stop.load(Ordering::Acquire))
+        && !orphan_reconnect_deadline_expired(deadline)
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -537,19 +611,6 @@ fn orphan_queue_drained(queue: &SfaSlotQueue) -> bool {
             PublicationLog::completed_fsn(queue).is_some_and(|completed| completed >= published)
         }
     }
-}
-
-#[cfg(feature = "sync-sender-qwp-ws")]
-fn driver_terminal_message(
-    driver: &ManualDriverPrototype<SfaSlotQueue, BlockingQwpWsTransport>,
-) -> String {
-    if let Some(err) = driver.terminal_error() {
-        return err.to_string();
-    }
-    if let Some(err) = driver.terminal_sender_error() {
-        return format!("{err:?}");
-    }
-    "orphan drainer reached terminal state".to_owned()
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -681,6 +742,29 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .unwrap();
         release_tx.send(()).unwrap();
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn orphan_reconnect_sleep_observes_stop_request() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            worker_stop.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        assert!(!sleep_before_orphan_reconnect(
+            None,
+            Duration::from_secs(5),
+            Some(&stop)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "orphan reconnect sleep ignored stop request"
+        );
+        stopper.join().unwrap();
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]

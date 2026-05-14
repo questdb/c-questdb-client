@@ -1,7 +1,6 @@
 # QWP/WebSocket Progress Convergence Design
 
-Status: proposal, not implemented. This document replaces the earlier
-background-mode lock-free redesign proposal.
+Status: proposal, not implemented.
 
 This document captures the simplification direction for QWP/WebSocket progress:
 make background progress and manual progress use the same concurrency
@@ -54,13 +53,13 @@ Rust vocabulary:
 
 - `QwpWsReplayEncoder` and `SfaProducer` publish encoded payloads;
 - `QwpWsSendCore` owns transport progress, resend cursors, durable
-  acknowledgments, reconnect behavior, and server response handling;
+  acknowledgments, reconnect state, and server response handling;
 - `QwpWsPublicationStore`, `SfaFrameQueue`, and `SfaEngine` connect publication
   and progress with explicit ownership and ordering rules;
-- background mode runs `QwpWsSendCore` through `SyncQwpWsRunner` on a
+- background mode schedules `QwpWsSendCore` through `SyncQwpWsRunner` on a
   library-owned thread;
-- manual mode lets caller code own progress and call the same
-  `QwpWsSendCore`-based progress path explicitly.
+- manual mode lets caller code own scheduling and call the same
+  `QwpWsSendCore` mechanics explicitly.
 
 In this model, manual mode is no longer special because it is single-threaded.
 It is special only because the application supplies the progress executor.
@@ -79,10 +78,10 @@ Rust names this mode `QwpWsProgress::Background`, and the configuration spelling
 is `background`. This document uses "background" consistently; it does not
 propose a third public mode or a config rename.
 
-Manual mode may still use the same internal `QwpWsSendCore`-based progress
-implementation as background mode. The constraint is scheduler
-ownership: in manual mode, the library must not call `thread::spawn` or
-otherwise create a client-owned progress thread for that sender.
+Manual mode may still use the same internal `QwpWsSendCore` mechanics as
+background mode. The constraint is scheduler ownership: in manual mode, the
+library must not call `thread::spawn` or otherwise create a client-owned
+progress thread for that sender.
 
 If a future manual API exposes a separate progress handle, moving that handle to
 a different thread must remain caller-owned. The caller may create that thread;
@@ -176,11 +175,20 @@ The Java paths that still synchronize are not the steady-state target:
 - hot-spare installation coordinates with close;
 - close and recovery/reconnect paths may take locks.
 
+Java also keeps scheduling concerns outside the cursor engine. The send loop owns
+its `running` flag, wakeup, reconnect sleep, and shutdown latch. Background
+drainers own their own stop request and pool grace/detach policy. The cursor
+engine and ring do not carry generic reconnect hooks for those scheduler cases.
+
 Rust should aim for the same boundary after the protocol convergence is done:
 lock-free publication, lock-free progress watermarks, lock-free ACK application,
 and no shared publication mutex in the healthy send/receive loop. Locks should
 remain only where they represent real cold-path ownership or lifecycle
-coordination.
+coordination. This does not require a fully lock-free segment-topology
+implementation: Java's active segment and watermarks are hot, while sealed-list
+mutation, sealed-list lookup, hot-spare install, trim, close, recovery, and
+reconnect positioning are topology/lifecycle boundaries that may synchronize.
+Step 9 translates this Java hot/cold boundary into Rust implementation guidance.
 
 ## Current Divergence
 
@@ -233,6 +241,14 @@ It is not enough for an abstraction to make a local patch look tidy. If the
 choice is between a small direct change using `QwpWsSendCore`,
 `QwpWsPublicationStore`, `SfaProducer`, `SfaFrameQueue`, or `SfaEngine` and a
 new layer whose only job is delegation, use the direct change.
+
+Scheduling policy is not a `QwpWsSendCore` abstraction. Do not add parallel
+`*_with_reconnect_hooks`, generic stop/sleep callback variants, or other
+shadow progress methods just to serve one close or orphan-drain path. If a
+hook-based API is truly needed, it must become the single progress API used by
+all schedulers and must delete more complexity than it adds. Otherwise, keep
+stop flags, sleep interruption, thread ownership, close wait policy, and
+orphan-pool shutdown in the scheduler layer that owns them.
 
 When an implementation detail is uncertain, check the Java client before
 inventing Rust-only behavior. When protocol behavior is uncertain, check the
@@ -492,6 +508,19 @@ structured diagnostics, `QwpWsPublicationStore` should retain diagnostics and
 dropped-notification counters, and `Sender` should remain responsible for
 draining notifications and invoking `QwpWsErrorHandler`.
 
+Target model for sender errors:
+
+- keep one store-owned source of truth for QWP sender diagnostics;
+- keep a terminal sender-error latch only if stable non-consuming terminal lookup
+  needs it;
+- derive `poll_qwp_ws_error` and handler notification delivery from that source
+  of truth;
+- do not keep two cloned bounded rings merely so polling and handler
+  notification can consume independently;
+- if independent delivery is part of the intended public contract, model it as
+  sender/API-layer cursors over one diagnostic log rather than duplicated
+  storage.
+
 No store, core, runner, or progress-thread code should call user callbacks.
 If Rust later adds Java-style asynchronous error dispatch, it should be an
 explicit later API decision, not hidden inside manual mode or this
@@ -521,7 +550,7 @@ for append ownership. It does not own transport state, reconnect state, or
 wire-order durable acknowledgment tracking. It must be possible to run it while
 `QwpWsSendCore` is concurrently making progress.
 
-### QwpWsSendCore Progress
+### QwpWsSendCore Mechanics and Progress
 
 `QwpWsSendCore` progress is owned by exactly one progress executor. It is
 responsible for:
@@ -533,6 +562,22 @@ responsible for:
 - receiving and applying server responses;
 - advancing completed or durably acknowledged frame sequence numbers;
 - recording terminal transport or server errors.
+
+`QwpWsSendCore` should own connection-local mechanics and protocol state. It
+should not own scheduler policy:
+
+- it does not decide whether a background thread exists;
+- it does not own stop flags or cancellation predicates;
+- it does not own idle parking or reconnect-sleep interruption policy;
+- it does not own when a scheduler drops store locks around transport or file
+  I/O;
+- it does not own close timeout loops or orphan-drainer pool grace/detach
+  policy.
+
+The core may expose simple progress primitives and a direct `drive_once` for
+manual use. It should not grow a second family of hook-parameterized progress
+methods for a single scheduler. If reconnect waiting needs to be interruptible,
+that belongs to the scheduler that is doing the waiting.
 
 In background mode, the library owns the progress executor thread.
 
@@ -586,6 +631,26 @@ supporting multiple concurrent user threads submitting through the same sender.
 For one sender instance, there is one `QwpWsSendCore` progress executor.
 Background mode and manual mode differ only in who owns the thread or
 event loop that calls progress methods.
+
+### Scheduler Ownership
+
+Background, manual, and orphan-drainer execution should be schedulers over the
+same core mechanics, not separate protocol implementations.
+
+The background scheduler owns the library thread, stop flag, idle parking,
+stop-aware reconnect sleeps, panic/poison handling if still needed, and the
+lock-split rules needed to keep publication concurrent with transport and file
+I/O.
+
+The manual scheduler calls progress directly from caller-owned code. It must not
+spawn a background thread and it should not require stop hooks for the normal
+manual hot path.
+
+The orphan-drainer scheduler owns best-effort post-drop draining. It may own its
+own core, transport, and store handle, but pool-level shutdown remains an outer
+scheduler concern: give drainers a grace window, request stop, then detach or
+abandon according to the configured policy. Do not push that policy through
+every `QwpWsSendCore` helper as generic hooks.
 
 ### Publish Ordering
 
@@ -795,26 +860,36 @@ Behavior tests should compare outcomes, not implementation shape:
 - same local backpressure timeout category when progress cannot free capacity;
 - same terminal error after `QwpWsPublicationStore` is halted.
 
-### 5. Make QwpWsSendCore Progress Shared
+### 5. Make QwpWsSendCore Mechanics Shared
 
-Make manual `drive_once` and the background runner call the same
-`QwpWsSendCore` progress method.
+Make manual `drive_once` and the background runner use the same
+`QwpWsSendCore` mechanics and state transitions. The goal is one protocol, not
+necessarily one monolithic function that hides scheduler responsibilities.
 
 Target:
 
 ```text
-QwpWsSendCore::drive_once(...) -> DriveOutcome
+manual scheduler -> QwpWsSendCore::drive_once(...) -> DriveOutcome
+background scheduler -> QwpWsSendCore progress primitives -> DriveOutcome
 ```
 
-The background runner loop should only add:
+The background runner loop should add only scheduler-owned behavior:
 
 - stop flag handling;
 - idle parking/sleeping;
+- stop-aware reconnect sleeps;
 - thread lifecycle;
+- store-lock splitting around transport and file I/O;
 - panic/poison handling if still needed.
 
-Manual mode should call the same `QwpWsSendCore` progress path directly and must
-not spawn.
+Manual mode should call the direct `QwpWsSendCore` progress path and must not
+spawn.
+
+Do not replace the old manual/background split with a new split between plain
+progress methods and `_with_reconnect_hooks` methods. A hook-parametric helper
+family is only acceptable if it is the one shared API used by all schedulers and
+it removes existing code. A hook family used by one orphan close path is the
+same accidental complexity in a different form.
 
 Behavior tests should exercise both modes against equivalent fake transport
 scripts:
@@ -828,13 +903,18 @@ scripts:
 These tests should assert visible sender behavior and FSN/ACK outcomes. They
 should not assert that a specific private helper was called.
 
-### 6. Move Runner-Only Cursor State to QwpWsSendCore
+### 6. Treat Cursor Ownership as a Step 9 Boundary
 
-State that is only meaningful to transport progress, such as the SFA send
-cursor, should be owned by `QwpWsSendCore`.
+The old standalone goal was to move runner-only cursor state, such as the SFA
+send cursor, out of queue/store objects. That goal is now part of Step 9's hot
+SFA/log boundary. Do not create a separate "move cursor helpers" slice unless it
+removes a current hot store dependency or deletes real duplication.
 
-Queue and store objects should expose payload lookup and reclamation behavior.
-They should not own runner-local resend policy.
+`QwpWsSendCore` / `SendCursor` should own protocol cursor state and policy:
+wire-sequence mapping, in-flight window accounting, replay reset, ACK/reject
+mapping, and resend decisions. The SFA/log view should own storage-local payload
+lookup and segment/offset cursor positioning needed to satisfy the next-frame
+request.
 
 Durable ACK tracking should also be treated as `QwpWsSendCore` policy. The
 shared store/log should expose enough information to complete or retain frames,
@@ -846,7 +926,9 @@ Acceptance criteria:
 - reconnect resets send cursors without asking the SFA queue to own resend
   policy;
 - ACK and durable ACK application still advance the same completed FSN;
-- queue APIs describe storage/log operations, not wire-progress policy.
+- queue APIs describe storage/log operations, not wire-progress policy;
+- any remaining cursor follow-up is routed through Step 9's hot/cold boundary,
+  not tracked as an independent cursor-cleanup project.
 
 ### 7. Simplify QWP Errors and Preserve Close Semantics
 
@@ -884,6 +966,13 @@ close/drain operation. The shared operation should use store/core facts such as
 published FSN, completed or ACKed FSN, terminal error state, and progress
 availability to decide whether close has drained, timed out, or failed.
 
+Orphan drainers should follow the Java shape: the drainer owns its own
+drain-time core/transport loop, polls completion against the target FSN, and
+lets the pool own graceful shutdown versus stop/detach policy. If an orphan path
+needs a stop-aware retry or reconnect wait, keep that special case in the
+orphan scheduler or reconnect wait call site. Do not make every
+`QwpWsSendCore` progress helper carry orphan-drainer hooks.
+
 ### 8. Keep Manual Progress Caller-Owned
 
 A separate caller-owned progress handle is useful only once the internal split is
@@ -918,8 +1007,195 @@ boundary:
   current ownership shape makes atomic watermarks insufficient.
 
 Locks that remain should be limited to paths analogous to Java's synchronized
-paths: rotation, sealed-list coordination, trim/cleanup, spare installation,
-close, recovery, and reconnect.
+paths: rotation into the sealed list, sealed-list snapshots or next-segment
+lookups, trim/cleanup, spare installation, close, recovery, and reconnect
+positioning. A lock that protects a small SFA topology boundary is acceptable; a
+lock that gates publication visibility, ordinary active-segment send progress,
+ACK application, or non-terminal status reads is not Java-like.
+
+#### Target Boundary
+
+Lock-free parity means matching Java's hot/cold boundary, not deleting every
+lock. The hot path is:
+
+- one producer appends and publishes frames;
+- one `QwpWsSendCore` progress executor reads published frames, sends them,
+  receives responses, applies ACKs, and advances completion;
+- published and completed/acked watermarks are atomic-style visibility
+  boundaries;
+- healthy send/receive progress does not take the shared publication mutex.
+
+Cold-path locks are still acceptable when they represent real lifecycle or
+topology ownership. Do not chase a fully lock-free implementation for sealed-list
+coordination, trim/cleanup, spare installation, close, recovery, reconnect
+positioning, terminal-error materialization, sender-error polling, or slot-lock
+lifetime. The Java-like rule is narrower: locks must not be required for the
+hot facts Java reads through volatile/atomic-style boundaries, namely published
+progress, completed/acked progress, active payload visibility, ACK advancement,
+and non-terminal status.
+
+Do not use raw `shared.lock()` call-site count as the Step 9 success metric.
+Once the runner is split into explicit phases, a higher number of short,
+per-phase lock touches can be better than fewer coarse locks. Judge progress by
+which healthy paths can make forward progress without blocking on the shared
+`QwpWsPublicationStore` mutex: publication, next-frame lookup, send-result
+completion, ACK/durable-response application, and non-terminal status reads.
+Server rejection handling is protocol behavior, but it is an error/diagnostic
+path; it may remain store-backed when it materializes rejected-frame history,
+sender errors, or terminal state. Cold-effect flushing may still touch the store
+in short critical sections, preferably opportunistically, when it only records
+diagnostic events, terminal/error state, or other cold bookkeeping.
+
+#### Current Rust State
+
+The first Step 9 slices have moved the background healthy path away from
+`Arc<Mutex<QwpWsPublicationStore<_>>>` for the operations that determine steady
+send/ACK progress. Background progress now uses `QwpWsSendCore` plus a detached
+SFA/log view for:
+
+- finding the next outbound frame;
+- recording send completion;
+- applying ACK, `DurableOk`, and `DurableAck` progress;
+- reading published/completed progress.
+
+The remaining store-backed response path is server rejection handling. Keep that
+explicitly cold unless a later source-backed change can split completion from
+diagnostic/error materialization without adding another scheduler-facing protocol
+API.
+
+The SFA send-cursor follow-up belongs here. Do not treat it as a standalone
+"move helpers because Java does" cleanup. The useful Java-like split is the one
+that lets `QwpWsSendCore` drive healthy progress through a narrow SFA/log view
+without taking the cold publication-store mutex.
+
+#### First Step 9 Slice
+
+Start Step 9 by carving the hot progress/log boundary.
+
+Target shape:
+
+```text
+QwpWsSendCore + &mut SendCursor + SFA/log view
+  -> next published payload
+  -> transport send
+  -> response classification
+  -> completion/ACK progress
+```
+
+The SFA/log view should expose storage facts, not scheduler or diagnostic state:
+published/completed watermarks, oldest unresolved FSN, and payload lookup by
+FSN/cursor. Prefer a concrete narrow handle over a new generic trait. If a trait
+is necessary, it should replace the old hot `PublicationLog` boundary instead of
+coexisting with it as another layer.
+
+This slice should not expose arbitrary segment internals just to move methods
+around. Keep storage-specific segment lookup, active/sealed/hot-spare topology,
+slot-lock ownership, and segment/offset cursor positioning in the SFA module.
+`QwpWsSendCore` / `SendCursor` should own protocol cursor state and policy:
+FSN-to-wire-sequence mapping, in-flight window accounting, replay reset,
+ACK/reject mapping, and the decision that the protocol is ready to request the
+next frame. The SFA/log view may advance its own storage-local cursor while
+satisfying that request.
+
+Treat detached next-frame lookup as the first milestone, not as Step 9
+completion. Step 9 remains incomplete until these healthy paths no longer depend
+on the shared `QwpWsPublicationStore` mutex:
+
+- next-frame lookup;
+- send-result completion;
+- response classification and ACK/durable-response application;
+- non-terminal published/acked status reads.
+
+ACK-watermark persistence, trim, cleanup, reject diagnostics, and terminal-error
+materialization may move in later sub-slices or remain cold-path work if moving
+them would blur the ownership boundary. Do not leave a temporary next-frame-only
+API in place as the final state; follow with completion, ACK/status, and status
+read splitting.
+
+#### Implementation Direction
+
+Prefer a small phased split over a generic lock-free framework. Refer to these
+follow-ups by label rather than item number; the ordering may change as slices
+land:
+
+1. **Hot/cold state split.** Hot state should expose lifecycle,
+   published/completed watermarks, and SFA/log access. Cold state can keep
+   terminal error payloads, sender-error diagnostics, rejected-frame history,
+   event rings, and other diagnostic material behind ordinary locks.
+2. **Next-frame hot lookup.** Change progress-facing log APIs so healthy
+   next-frame lookup uses an immutable SFA/log view plus `&mut SendCursor`, not
+   mutable access to the whole `QwpWsPublicationStore`. Resolve cursor ownership
+   here only where it removes that hot store dependency; storage-local segment
+   cursor movement can stay inside the SFA view.
+3. **Atomic completion.** Make completion advance atomic-first. Updating the
+   in-memory completed watermark should not require the shared publication mutex.
+   ACK-watermark persistence and cleanup can remain progress-owned cold work.
+4. **Healthy runner lock removal.** Remove the runner's shared-store mutex from
+   healthy `next_outbound_frame`, send-result completion, and ACK/response
+   application.
+5. **Atomic status reads.** Make background `published_fsn()` and `acked_fsn()`
+   use direct atomic reads on the non-terminal path. If lifecycle is terminal,
+   fall back to the cold error state so public `Sender` behavior remains
+   explicit.
+6. **Segment-boundary optimization.** Java reads active payload progress and
+   watermarks lock-free, but it still synchronizes sealed-list transitions and
+   lookups. Optimize Rust segment-boundary lookup only if it blocks healthy
+   progress on a broad store mutex or removes real complexity. It is acceptable
+   for active/sealed/hot-spare topology to keep a small storage-local lock. Do
+   not build a generic lock-free topology layer solely for parity.
+
+Do not introduce a generic MPSC queue, epoch reclamation, callback scheduler, or
+new public progress API unless it deletes existing complexity and preserves this
+Java boundary. The existing one-producer / one-progress-executor model should be
+enough.
+
+#### Invariants
+
+The lock-free work must preserve these invariants:
+
+- one publication producer per sender;
+- one progress executor per sender;
+- payload bytes are fully visible before the published FSN becomes visible;
+- published FSN is monotonic;
+- completed/acked FSN is monotonic and never advances beyond published FSN;
+- `QwpWsSendCore` owns send cursor state, wire-sequence mapping, durable ACK
+  tracking, reconnect mechanics, and server-response application;
+- durable ACK mode does not complete frames on ordinary OK alone; durable
+  completion remains driven by durable ACK readiness;
+- DROP versus HALT classification remains protocol behavior, not scheduler
+  behavior;
+- reject gaps remain terminal/protocol errors unless durable FIFO state proves
+  the prefix is resolved;
+- terminal errors remain observable by public `Sender` APIs; faster atomic reads
+  must not silently bypass terminal state;
+- borrowed outbound payloads must not outlive the progress/send call that
+  created their view;
+- close/drain preserves the same completion condition and resource release
+  behavior;
+- ACK-watermark persistence and trim must not outrun recoverable completion
+  state;
+- SFA slot lock lifetime remains semantic: the slot is held until neither
+  publication nor progress can publish, read, resend, or clean up that slot;
+- locks that remain must correspond to Java-like cold paths, not healthy
+  send/receive progress.
+
+#### Proof Tests
+
+Tests should prove behavior and lock-boundary changes, not private helper shape:
+
+- background publication can proceed while cold publication-store state is held;
+- background send and ACK progress can proceed without the cold store lock on the
+  healthy path;
+- published/acked status reads use the atomic path when non-terminal but still
+  surface terminal errors;
+- background and manual modes still agree for publish+ACK, DROP, HALT,
+  reconnect replay, and durable ACK completion;
+- durable ACK ordering survives reordered OK/ACK responses and reconnect;
+- close succeeds after all published frames are resolved, times out without
+  deleting recoverable SFA state, and releases resources in the same order as
+  before;
+- storage maintenance, recovery, and orphan draining continue to use locks only
+  at the cold boundaries they own.
 
 ## Expected Simplification
 

@@ -1495,7 +1495,12 @@ void line_sender_qwpws_error_free(line_sender_qwpws_error* error);
 
 /**
  * Return how many QWP/WebSocket diagnostics were dropped because the sender's
- * bounded diagnostic ring was full.
+ * unified bounded diagnostic log was full.
+ *
+ * The same log feeds line_sender_qwpws_poll_error() and error-handler
+ * notification delivery through independent cursors. A lagging cursor can keep
+ * entries live long enough for later diagnostics to overwrite them and
+ * increment this count.
  */
 LINESENDER_API
 bool line_sender_qwpws_errors_dropped(
