@@ -105,7 +105,7 @@ Related local docs:
 | S5 | todo | medium | Feature hygiene | Replace broad `#![allow(dead_code)]` only where the replacement is real cfg/test separation or a narrow documented local allow. | Makes stale Rust-only surface visible without turning cleanup into a lint chase. |
 | C1 | done | high | Upgrade classification | Validate `X-QWP-Version` before durable-ACK echo. | Spec/Java alignment; avoids misclassifying future-version peers. |
 | C2 | todo | high | Connect/retry | Unify connect/retry plumbing, including orphan initial connect. | Spec alignment; current Java only partially shares this orphan behavior. |
-| C3 | todo | low | Windows coverage | Broaden orphan locked-slot tests to Windows. | Verifies the already-implemented cross-platform lock contract. |
+| C3 | done | low | Windows coverage | Broaden orphan locked-slot tests to Windows. | Verifies the already-implemented cross-platform lock contract. |
 
 `S*` items are simplification-only. `C*` items are correctness/spec-alignment
 cleanups that also simplify policy placement.
@@ -616,11 +616,11 @@ Validation:
 
 ## C3: Broaden Orphan Lock Tests To Windows
 
-Current shape:
+Previous shape:
 
 - Slot locking has Windows support via `LockFileEx`.
 - Slot-lock tests already use `any(unix, windows)`.
-- Some orphan locked-slot tests remain Unix-only.
+- Some orphan locked-slot tests remained Unix-only.
 
 Spec/Java context:
 
@@ -629,12 +629,14 @@ Spec/Java context:
 - Java's `SlotLock` documents `flock` / `LockFileEx` as the cross-platform slot
   lock model.
 
-Target shape:
+Implemented shape:
 
-- Change orphan locked-slot helper/test cfgs from Unix-only to
+- Changed orphan locked-slot helper/test cfgs from Unix-only to
   `any(unix, windows)` where the helper does not depend on Unix-only APIs.
-- Keep platform-specific implementation details inside the lock helper, not the
-  orphan test.
+- Kept platform-specific implementation details inside the slot-lock helper,
+  not the orphan test.
+- Preserved the contract that a locked orphan slot is skipped without writing
+  `.failed`.
 
 Rationale:
 
@@ -700,10 +702,9 @@ with storage-position state. That is not Java-like and is not simpler.
 
 Recommended order:
 
-1. C3: broaden orphan lock tests.
-2. S5 follow-ups: decide queue diagnostics and driver API surface in separate
+1. S5 follow-ups: decide queue diagnostics and driver API surface in separate
    small slices.
-3. C2: unify connect/retry plumbing as its own slice.
+2. C2: unify connect/retry plumbing as its own slice.
 
 Do not combine C2 with the smaller deletion cleanups. The connect/retry helper
 is a policy refactor and deserves its own tests and review.

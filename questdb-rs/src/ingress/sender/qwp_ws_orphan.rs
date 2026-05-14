@@ -566,7 +566,7 @@ mod tests {
     use crate::ingress::conf::{ConfigSetting, QwpWsConfig};
     #[cfg(feature = "sync-sender-qwp-ws")]
     use crate::ingress::sender::qwp_ws_sfa_segment::initial_segment_path;
-    #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use crate::ingress::sender::qwp_ws_sfa_slot::SfaSlotOptions;
 
     #[test]
@@ -683,7 +683,7 @@ mod tests {
         release_tx.send(()).unwrap();
     }
 
-    #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     fn slot_options(sf_dir: &Path, sender_id: &str) -> SfaSlotOptions {
         SfaSlotOptions {
             sf_dir: sf_dir.to_path_buf(),
@@ -726,13 +726,20 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     #[test]
     fn manual_drainer_skips_locked_slot_without_failed_sentinel() {
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
         let slot_dir = sf_dir.join("locked");
         let _held = SfaSlotQueue::open(slot_options(&sf_dir, "locked")).unwrap();
+        assert!(
+            matches!(
+                OrphanDrainer::open(slot_dir.clone(), &test_config()),
+                OrphanOpenOutcome::Locked
+            ),
+            "held slot must surface as Locked before already-drained handling"
+        );
         let mut drainers =
             ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, test_config()).unwrap();
 
