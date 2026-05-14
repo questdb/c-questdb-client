@@ -169,21 +169,34 @@ macro_rules! generate_array_dims_branches {
 ///   builder after a consuming setter drops it on error — a backup
 ///   copy is still needed.
 macro_rules! upd_opts {
-    ($opts:expr, $err_out:expr, $func:ident $(, $($args:expr),*)?) => {
-        {
+    ($opts:expr, $err_out:expr, $func:ident $(, $($args:expr),*)?) => {{
+        // catch_unwind makes this macro the single FFI panic boundary for the
+        // entire opts-setter family; AssertUnwindSafe is justified by the
+        // clone-then-replace dance above keeping the live builder consistent.
+        match catch_unwind(AssertUnwindSafe(|| {
             let builder_ref: &mut SenderBuilder = &mut (*$opts).0;
-            let new_builder_or_err = builder_ref.clone().$func($($($args),*)?);
-            let new_builder = match new_builder_or_err {
-                Ok(builder) => builder,
+            match builder_ref.clone().$func($($($args),*)?) {
+                Ok(builder) => {
+                    *builder_ref = builder;
+                    true
+                }
                 Err(err) => {
                     set_err_out_from_error($err_out, err);
-                    return false;
+                    false
                 }
-            };
-            *builder_ref = new_builder;
-            true
+            }
+        })) {
+            Ok(v) => v,
+            Err(_) => {
+                set_err_out(
+                    $err_out,
+                    ErrorCode::InvalidApiCall,
+                    concat!(stringify!($func), " panicked").to_string(),
+                );
+                false
+            }
         }
-    };
+    }};
 }
 
 /// An error that occurred when using the line sender.
@@ -1797,25 +1810,15 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_progress(
     progress: line_sender_qwpws_progress,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
-        if opts.is_null() {
-            set_err_out(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "line_sender_opts_qwpws_progress requires non-NULL opts".to_string(),
-            );
-            return false;
+    let progress = match progress {
+        line_sender_qwpws_progress::LINE_SENDER_QWPWS_PROGRESS_BACKGROUND => {
+            RustQwpWsProgress::Background
         }
-        let progress = match progress {
-            line_sender_qwpws_progress::LINE_SENDER_QWPWS_PROGRESS_BACKGROUND => {
-                RustQwpWsProgress::Background
-            }
-            line_sender_qwpws_progress::LINE_SENDER_QWPWS_PROGRESS_MANUAL => {
-                RustQwpWsProgress::Manual
-            }
-        };
-        upd_opts!(opts, err_out, qwp_ws_progress, progress)
-    })
+        line_sender_qwpws_progress::LINE_SENDER_QWPWS_PROGRESS_MANUAL => {
+            RustQwpWsProgress::Manual
+        }
+    };
+    unsafe { upd_opts!(opts, err_out, qwp_ws_progress, progress) }
 }
 
 #[unsafe(no_mangle)]
