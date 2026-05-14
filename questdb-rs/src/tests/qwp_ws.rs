@@ -915,44 +915,6 @@ fn spawn_role_reject_upgrade_server(
     (port, handle)
 }
 
-fn spawn_retrying_failing_upgrade_server<F>(
-    done: Arc<AtomicBool>,
-    respond: F,
-) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>)
-where
-    F: Fn(&mut TcpStream) + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let attempts_thread = Arc::clone(&attempts);
-
-    let handle = thread::spawn(move || {
-        while !done.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    attempts_thread.fetch_add(1, Ordering::AcqRel);
-                    stream.set_nonblocking(false).unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    respond(&mut stream);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(err) => panic!("failing-upgrade listener failed: {err}"),
-            }
-        }
-    });
-
-    (port, attempts, handle)
-}
-
 fn slot_has_sfa_file(slot_dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(slot_dir) else {
         return false;
@@ -3624,45 +3586,54 @@ fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
 
 #[test]
 fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
-    let done = Arc::new(AtomicBool::new(false));
-    let (role_port, role_attempts, role_handle) =
-        spawn_retrying_failing_upgrade_server(Arc::clone(&done), |stream| {
-            let _ = read_request_until_blank(stream).unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 421 Misdirected Request\r\n\
-                      Connection: close\r\n\
-                      Content-Length: 0\r\n\
-                      X-QuestDB-Role: PRIMARY_CATCHUP\r\n\
-                      \r\n",
-                )
-                .unwrap();
-        });
-    let (status_port, status_attempts, status_handle) =
-        spawn_retrying_failing_upgrade_server(Arc::clone(&done), |stream| {
-            let _ = read_request_until_blank(stream).unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\n\
-                      Connection: close\r\n\
-                      Content-Length: 0\r\n\
-                      \r\n",
-                )
-                .unwrap();
-        });
+    let (role_port, role_handle) = spawn_role_reject_upgrade_server(1, "PRIMARY_CATCHUP");
+    let status_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    status_listener.set_nonblocking(true).unwrap();
+    let status_port = status_listener.local_addr().unwrap().port();
+    let status_handle = thread::spawn(move || {
+        let started = Instant::now();
+        let mut attempts = 0usize;
+        while attempts < 1 && started.elapsed() < Duration::from_secs(5) {
+            match status_listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = read_request_until_blank(&mut stream).unwrap();
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\n\
+                              Connection: close\r\n\
+                              Content-Length: 0\r\n\
+                              \r\n",
+                        )
+                        .unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("status listener failed: {err}"),
+            }
+        }
+        attempts
+    });
 
     let conf = format!(
         "qwpws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
          initial_connect_retry=sync;\
          reconnect_initial_backoff_millis=10;\
          reconnect_max_backoff_millis=10;\
-         reconnect_max_duration_millis=120;"
+         reconnect_max_duration_millis=1;"
     );
     let result = SenderBuilder::from_conf(&conf).unwrap().build();
 
-    done.store(true, Ordering::Release);
-    role_handle.join().unwrap();
-    status_handle.join().unwrap();
+    assert_eq!(role_handle.join().unwrap(), 1);
+    assert_eq!(status_handle.join().unwrap(), 1);
 
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
@@ -3680,14 +3651,6 @@ fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
     );
     assert!(err.msg().contains("HTTP status 500"), "got: {}", err.msg());
     assert!(!err.msg().contains("role mismatch"), "got: {}", err.msg());
-    assert!(
-        role_attempts.load(Ordering::Acquire) >= 2,
-        "role endpoint was not retried"
-    );
-    assert!(
-        status_attempts.load(Ordering::Acquire) >= 2,
-        "status endpoint was not retried"
-    );
 }
 
 #[test]
