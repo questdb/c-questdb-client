@@ -22,11 +22,8 @@
  *
  ******************************************************************************/
 
-//! Ignored real-server probe for Step 4 of
-//! `doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`.
-//!
-//! This test intentionally bypasses the sync sender's normal WebSocket encoder:
-//! it builds replay-mode QWP payloads directly, opens a fresh WebSocket
+//! Ignored real-server probe: bypasses the sync sender's normal WebSocket
+//! encoder, builds replay-mode QWP payloads directly, opens a fresh WebSocket
 //! connection for each send, and verifies rows through QuestDB's HTTP query API.
 
 use std::io::{Error as IoError, ErrorKind};

@@ -22,13 +22,10 @@
  *
  ******************************************************************************/
 
-//! Ignored real-server probe for Step 7 of
-//! `doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`.
-//!
-//! This probe validates real QuestDB response ordering with multiple
-//! QWP/WebSocket frames in flight. It uses normal connection-scoped QWP
-//! encoding to isolate ACK/order behavior from replay-frame encoding, which is
-//! covered by the Step 4 replay probe.
+//! Ignored real-server probe: validates real QuestDB response ordering with
+//! multiple QWP/WebSocket frames in flight. It uses normal connection-scoped
+//! QWP encoding to isolate ACK/order behavior from replay-frame encoding,
+//! which is covered by `qwp_ws_replay_probe`.
 
 use std::io::{Error as IoError, ErrorKind, Write};
 use std::net::TcpStream;
