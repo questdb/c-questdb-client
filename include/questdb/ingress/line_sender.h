@@ -42,10 +42,21 @@ extern "C" {
 /**
  * Unless a function's documentation states otherwise, every pointer
  * parameter must be non-NULL. Passing NULL where non-NULL is required
- * is undefined behaviour and will typically crash the process.
+ * is undefined behaviour and will typically crash the process. This
+ * applies to opaque handle types in particular — `line_sender*`,
+ * `line_sender_buffer*`, `line_sender_opts*`, `line_sender_error*`,
+ * `line_sender_qwpws_error*` — and is not re-asserted on each
+ * function. The library does not insert defensive NULL checks for
+ * opaque handles; treat them like `this` in C++.
  *
- * The only pointer consistently documented as optional is `err_out`:
- * callers may pass NULL to discard error information on failure.
+ * Two narrow exceptions:
+ *
+ *   - `err_out` (the trailing `line_sender_error**` on fallible
+ *     functions) is always optional: pass NULL to discard error
+ *     information on failure.
+ *
+ *   - `line_sender_close()` and `line_sender_buffer_free()` accept
+ *     NULL and silently no-op, mirroring `free(3)`.
  */
 
 /////////// Error handling.
