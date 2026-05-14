@@ -21,7 +21,7 @@ All code is under `questdb-rs/src/ingress/sender/`:
 | --- | --- |
 | `qwp_ws.rs` | Public glue: `SyncQwpWsHandlerState` / `ManualQwpWsHandlerState`, `SyncQwpWsRunner` (background thread), queue selection (`open_configured_qwp_ws_queue`), connection setup, WebSocket I/O helpers (`write_binary_frame`, `read_message_with_close`, `WsFrameReader`, `perform_upgrade`). |
 | `qwp_ws_publisher.rs` | Payload-aware shell: `QwpWsPublicationDriver` + `QwpWsReplayEncoder`. Turns a `QwpWsColumnarBuffer` into a self-sufficient replay payload and submits it. |
-| `qwp_ws_driver.rs` | Replay-payload-opaque core: `QwpWsPublicationStore`, `QwpWsSendCore`, `SendCursor`, `ReconnectPolicy`, the `PublicationLog` and `ManualDriverTransport` traits, `BlockingQwpWsTransport`, `FakeOrderedServer` (test). Also QWP response/error categorization. |
+| `qwp_ws_driver.rs` | Replay-payload-opaque core: `QwpWsPublicationStore`, `QwpWsSendCore`, `SendCursor`, `ReconnectPolicy`, the `PublicationLog` and `QwpWsCoreTransport` traits, `BlockingQwpWsTransport`, `FakeOrderedServer` (test). Also QWP response/error categorization. |
 | `qwp_ws_queue.rs` | Shared payload-layer types only: `QwpReceipt`, `QwpReceiptStatus`, `SentFrame`, `OutboundFrame`/`OutboundFrameView`, `QueueError`. No queue implementation lives here. |
 | `qwp_ws_codec.rs` | Pure-bytes WebSocket framing + HTTP/1.1 upgrade builders (`build_upgrade_request`, `validate_upgrade_response`) + QWP pipelined-response decoder. No I/O. |
 | `qwp_ws_ownership.rs` | Public types: `QwpWsProgress`, `QwpWsSenderError`, `QwpWsErrorHandler`, `QwpWsErrorCategory`, `QwpWsErrorPolicy`. |
@@ -68,10 +68,10 @@ durable-ACK coverage, and reconnect policy.
 ┌──────────────────────────┬───────────────────────────────────────┐
 │ QwpWsPublicationStore<Q> │  QwpWsSendCore<T>   (qwp_ws_driver.rs)│
 │   queue + lifecycle +    │    transport +                        │
-│   events + errors +      │    SendCursor (FSN ↔ wire_seq) +      │
-│   optional durable-ACK   │    ReconnectPolicy                    │
+│   events + errors        │    SendCursor (FSN ↔ wire_seq) +      │
+│                          │    DurableAckTracker + ReconnectPolicy│
 └────────────┬─────────────┴─────────────┬─────────────────────────┘
-             │ PublicationLog            │ ManualDriverTransport
+             │ PublicationLog            │ QwpWsCoreTransport
              ▼                           ▼
 ┌──────────────────────────────┐  ┌──────────────────────────────┐
 │ SfaSlotQueue                 │  │ BlockingQwpWsTransport (real)│
@@ -95,8 +95,11 @@ durable-ACK coverage, and reconnect policy.
                                   └──────────────────────────────┘
 ```
 
-The same `QwpWsSendCore<T>` is used by both the background runner and the
-manual driver: the only difference is who calls `drive_step` / `drive_once`.
+The same `QwpWsSendCore<T>` owns connection-local protocol mechanics in both
+modes. Manual mode calls `send_core.drive_once(&mut store)` directly.
+Background mode keeps scheduler concerns in `SyncQwpWsRunnerCore` (store-lock
+splitting, stop flag, reconnect sleep, idle parking) and calls the same
+send-core phase methods around those scheduler boundaries.
 
 ---
 
@@ -152,8 +155,10 @@ hooks. Two implementations exist:
   CRC32C-checked commit marker; recovery scans the tail and discards torn
   appends. Watermarks (`published_upper`, `completed_upper`) live on
   `SfaEngine` as `AtomicU64`. A single-writer `SfaProducer` handle is taken
-  once at startup and given to the producer side; everything else (sending,
-  ACK accounting, recovery) happens under the publication mutex.
+  once at startup and given to the producer side; the runner reads outbound and
+  completion progress through `SfaProgressView` and uses the publication mutex
+  only for store-owned cold state such as events, lifecycle, diagnostics, and
+  storage-task take/finish.
 
 - **`SfaSlotQueue`** — wraps `SfaFrameQueue` with a per-sender directory
   `<sf_dir>/<sender_id>/` and a `.lock`/`.lock.pid` advisory lock
@@ -186,15 +191,15 @@ frames are bounded by `max_in_flight`.
   `CompletedThrough`, `Rejected`, `Reconnected`, `Progress`, `Terminal`;
 - a bounded sender-error diagnostic log with independent cursors for
   `poll_qwp_ws_error()` and optional error-handler callback delivery, plus one
-  unified dropped-counter for overflow accounting;
-- an optional `DurableAckTracker` when `request_durable_ack=on`.
+  unified dropped-counter for overflow accounting.
 
 The store mutex is the main synchronization point between the user thread and
 the runner thread for publication state: completion watermarks, lifecycle
 checks, queued events, and sender-error diagnostic state. Producers take an
 `SfaProducer` handle once at startup (`store.take_producer()`) and submit
 through it without holding the publication mutex; transport, cursor, reconnect,
-backpressure, and thread-stop state are synchronized separately by the runner.
+durable-ACK tracking, backpressure, and thread-stop state are synchronized
+separately by the runner.
 
 ### 3.5 SendCursor
 
@@ -219,7 +224,7 @@ prefix can grow between calls.
 
 ### 3.7 Transport
 
-`ManualDriverTransport` is a small trait — `send_frame(view)`,
+`QwpWsCoreTransport` is a small trait — `send_frame(view)`,
 `try_poll_response`, `send_durable_ack_keepalive_if_due`,
 `restart_connection(reason)`. Two implementations:
 
@@ -250,39 +255,42 @@ There is no async runtime and no external WebSocket crate.
         user thread                       runner thread (one OS thread)
         ───────────                       ──────────────
 flush*()                                  while !stop:
-  encoder.encode(buffer)                    core.drive_step:
-  runner.publish_replay_payload ──────►       lock store
-    producer.try_submit          (SPSC)       next_outbound_frame
-       OR fallback                            unlock store
-       store.try_submit (under mutex)         transport.send_frame  ── I/O
-    park on BackpressureNotifier if full      lock store
-                                              record_sent_frame
-                                              unlock store
-                                              transport.try_poll_response ─ I/O
-                                              lock store
-                                              apply_response
-                                              notify backpressure
-                                              unlock store
+  encoder.encode(buffer)                    flush pending cold effects
+  runner.publish_replay_payload ──────►     send_core.next_outbound_sfa_frame(progress)
+    producer.try_submit          (SPSC)     transport.send_frame  ── I/O
+       OR fallback                          lock store only to publish effects
+       store.try_submit (under mutex)       unlock store
+    park on BackpressureNotifier if full
+                                            transport.try_poll_response ─ I/O
+                                            lock store only to apply effects
+                                            unlock store
+
+                                            lock store, take storage task
+                                            unlock, perform task, relock finish
+                                            stop-aware reconnect sleep / idle park
 ```
 
 Key rules:
 
 - **Producer never holds the publication mutex during I/O.** The runner
-  releases the mutex around every transport call.
+  releases the mutex around every transport call and around storage-task
+  `perform()` work.
+- **The runner can read hot SFA progress without locking the store.**
+  `SfaProgressView` exposes atomic published/completed watermarks; the runner
+  records store-owned cold effects later under the publication mutex.
 - **Producer side owns the `SfaProducer`** (taken once via
   `store.take_producer()` at startup); the runner is the unique consumer/
   completer. Submission is SPSC against the SFA segment ring.
 - **Transport, send cursor, and reconnect state live on the runner.** They
   are never visible to user threads.
 - **Backpressure** is `BackpressureNotifier { Mutex<()>, Condvar, AtomicU64 generation }`
-  in `qwp_ws.rs`. The runner bumps `generation` after every ACK / reject /
-  terminal transition / storage maintenance step; producers park via
+  in `qwp_ws.rs`. The runner bumps `generation` after send completion / ACK /
+  reject / terminal transition / storage maintenance step; producers park via
   `wait_for_change(generation, deadline)`. When the deadline expires, submit
   returns `DriverError::SubmitTimedOut { backpressure: Option<QueueError> }`,
   which `Sender::flush*` translates to a user-facing error.
 
-`SyncQwpWsRunner` joins its background thread on `Drop`
-(`qwp_ws.rs:1115`).
+`SyncQwpWsRunner` sets its stop flag and joins its background thread on `Drop`.
 
 ### 4.2 Manual mode (`QwpWsProgress::Manual`)
 
@@ -339,12 +347,12 @@ Sender::flush(buffer)
   │
   └─ runner thread drives in the background:
         drive_step:
-          ├─ store.next_outbound_frame(&mut send_cursor)
+          ├─ send_core.next_outbound_sfa_frame(progress_view)
           │     → Option<OutboundFrame> (borrowed payload via SfaMappedPayload)
           ├─ transport.send_frame(OutboundFrameView)
           │     → Result<TransportSendResult, TransportFailure>
-          │     on success: store.record_sent_frame(&mut send_cursor,
-          │                   SentFrame { fsn, wire_seq, payload_len })
+          │     on success: send_core.finish_send_result_hot(...)
+          │                 and publish cold Sent event under store lock
           │
           ├─ transport.try_poll_response → TransportPoll
           │     Response(TransportResponse::Ack { wire_seq })
@@ -353,7 +361,7 @@ Sender::flush(buffer)
           │     Response(TransportResponse::Reject { wire_seq, error })
           │     Progress / Idle
           │
-          ├─ store.apply_response
+          ├─ send_core/store apply response
           │     Ack          → complete_through(fsn); bump completed_upper
           │     DurableOk    → release send-window pressure; enqueue frame
           │                     in DurableAckTracker if durable ACK is enabled
@@ -362,6 +370,10 @@ Sender::flush(buffer)
           │     Reject + DropAndContinue → record reject, complete_through(fsn)
           │     Reject + Halt           → latch terminal_sender_error,
           │                                terminalize lifecycle
+          │
+          ├─ store.take_storage_maintenance_step
+          │     → perform storage task outside the store mutex
+          │     → store.finish_storage_maintenance
           │
           └─ notify BackpressureNotifier (producers / close_drain wake)
 ```
@@ -408,20 +420,20 @@ WebSocket `Close` frames map to:
 
 ### 6.2 Reconnect
 
-`reconnect_transport_with_policy` in `QwpWsSendCore` is the single entry
-point. Bounded by `ReconnectPolicy { max_duration, initial_backoff,
-max_backoff }`:
+`QwpWsSendCore` owns reconnect mechanics (`begin_reconnect`, `reconnect_once`,
+`finish_reconnect_success`) and `ReconnectPolicy { max_duration,
+initial_backoff, max_backoff }`. The scheduler owns waiting policy: background
+mode sleeps with the stop flag, while manual mode returns a reconnect-delay
+outcome so the caller remains in control.
 
 ```
-deadline = now + max_duration
-backoff  = initial_backoff
+reconnect = core.begin_reconnect(context, reason, initial_error)
 loop:
-    if attempts > 0: sleep(equal_jitter(backoff))   // role-reject uses initial_backoff
-    transport.restart_connection(reason)
-        Ok       → cursor.restart(log); resume sending
-        Terminal → mark store terminal
-        Other    → backoff = min(backoff*2, max_backoff); continue
-    if deadline expired or stop signaled → break with retry-budget-exhausted error
+    core.reconnect_once(reconnect)
+        Reconnected → core.finish_reconnect_success(store); resume sending
+        RetryAfter  → scheduler waits/sleeps until the next attempt
+        Terminal    → mark store terminal
+    if the background scheduler is stopped → exit without another retry
 ```
 
 `BlockingQwpWsTransport` carries the multi-endpoint list and a
@@ -551,7 +563,8 @@ isolation:
   allocation-free thanks to the segment ring and the reusable encoder
   scratch.
 - **Strict mutex discipline.** The runner releases the publication mutex
-  around every transport call; user threads never touch transport state.
+  around every transport call and around storage-task `perform()` work; user
+  threads never touch transport state.
 - **FSN as the durable identifier.** Wire sequences are connection-local;
   reconnect replays from the oldest unresolved FSN as `wire_seq=0`, so the
   server side handles dedupe. The `.ack-watermark` sidecar makes the
