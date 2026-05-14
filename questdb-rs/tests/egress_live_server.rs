@@ -2381,6 +2381,94 @@ fn exec_done_for_ddl_and_insert() {
 }
 
 #[test]
+fn exec_done_for_bound_multi_row_insert() {
+    // Coverage gap: every other bind_* test binds into a SELECT, so the
+    // "bound non-SELECT" wire path had no live-server regression. This
+    // drives INSERT INTO t VALUES (...) with a $n bind chain and asserts
+    // the statement terminates with EXEC_DONE whose rows_affected matches
+    // the number of bound rows. Each row mixes varchar + i64 + timestamp
+    // because multi-bind encoding has its own quirks (distinct framing
+    // per parameter); a 9-parameter chain exercises them.
+    let srv = server();
+    let table = unique_table("exec_done_bind");
+    srv.http_exec(&format!(
+        "create table \"{}\" (name varchar, v long, ts timestamp) \
+         timestamp(ts) partition by day wal",
+        table
+    ));
+
+    let mut reader = make_reader(srv);
+
+    // INSERT INTO ... VALUES ($1, ...) -> EXEC_DONE with rows_affected = N.
+    {
+        let mut cur = reader
+            .prepare(&format!(
+                "insert into \"{}\" values ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)",
+                table
+            ))
+            .bind_varchar("alpha")
+            .bind_i64(10)
+            .bind_timestamp_micros(1_700_000_000_000_000)
+            .bind_varchar("bravo")
+            .bind_i64(20)
+            .bind_timestamp_micros(1_700_000_000_000_001)
+            .bind_varchar("charlie")
+            .bind_i64(30)
+            .bind_timestamp_micros(1_700_000_000_000_002)
+            .execute()
+            .expect("execute bound insert");
+        assert!(
+            cur.next_batch().expect("next bound insert").is_none(),
+            "bound INSERT should not produce RESULT_BATCH frames"
+        );
+        match cur.terminal() {
+            Some(Terminal::ExecDone {
+                op_type,
+                rows_affected,
+            }) => {
+                assert_eq!(
+                    *rows_affected, 3,
+                    "bound INSERT: rows_affected = bound row count"
+                );
+                eprintln!("[exec_done bound insert] op_type=0x{:02X}", op_type);
+            }
+            other => panic!("expected ExecDone for bound INSERT, got {:?}", other),
+        }
+    }
+
+    // Sanity: the bound values must actually land in the table.
+    wait_for_rows(srv, &table, 3);
+    {
+        let mut cur = reader
+            .prepare(&format!("select name, v, ts from \"{}\" order by ts", table))
+            .execute()
+            .expect("execute select");
+        let view = cur.next_batch().expect("next select").expect("Some batch");
+        assert_eq!(view.row_count(), 3);
+        let ColumnView::Varchar(name) = view.column(0).unwrap() else {
+            panic!("col 0 not varchar")
+        };
+        let ColumnView::Long(v) = view.column(1).unwrap() else {
+            panic!("col 1 not long")
+        };
+        let ColumnView::Timestamp(ts) = view.column(2).unwrap() else {
+            panic!("col 2 not timestamp")
+        };
+        assert_eq!(name.value(0), Some("alpha"));
+        assert_eq!(name.value(1), Some("bravo"));
+        assert_eq!(name.value(2), Some("charlie"));
+        assert_eq!(v.value(0), 10);
+        assert_eq!(v.value(1), 20);
+        assert_eq!(v.value(2), 30);
+        assert_eq!(ts.value(0), 1_700_000_000_000_000);
+        assert_eq!(ts.value(1), 1_700_000_000_000_001);
+        assert_eq!(ts.value(2), 1_700_000_000_000_002);
+        while cur.next_batch().expect("drain").is_some() {}
+        assert!(matches!(cur.terminal(), Some(Terminal::End { .. })));
+    }
+}
+
+#[test]
 fn cursor_terminal_after_select() {
     let srv = server();
     let table = unique_table("term");
