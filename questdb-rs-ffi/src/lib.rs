@@ -974,8 +974,7 @@ pub unsafe extern "C" fn line_sender_buffer_reserve(
                 set_err_out(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    "line_sender_buffer_reserve panicked (likely capacity overflow)"
-                        .to_owned(),
+                    "line_sender_buffer_reserve panicked (likely capacity overflow)".to_owned(),
                 );
             }
             false
@@ -1814,9 +1813,7 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_progress(
         line_sender_qwpws_progress::LINE_SENDER_QWPWS_PROGRESS_BACKGROUND => {
             RustQwpWsProgress::Background
         }
-        line_sender_qwpws_progress::LINE_SENDER_QWPWS_PROGRESS_MANUAL => {
-            RustQwpWsProgress::Manual
-        }
+        line_sender_qwpws_progress::LINE_SENDER_QWPWS_PROGRESS_MANUAL => RustQwpWsProgress::Manual,
     };
     unsafe { upd_opts!(opts, err_out, qwp_ws_progress, progress) }
 }
