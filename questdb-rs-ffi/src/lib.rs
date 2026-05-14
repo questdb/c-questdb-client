@@ -29,6 +29,7 @@ use questdb::ingress::DecimalView;
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
+use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
@@ -1825,7 +1826,7 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_error_handler(
     user_data: *mut c_void,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if opts.is_null() {
             set_err_out(
                 err_out,
@@ -1841,7 +1842,9 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_error_handler(
                 let user_data = user_data as usize;
                 current.qwp_ws_error_handler(move |error| {
                     let view = qwp_ws_sender_error_view(error);
-                    cb(user_data as *mut c_void, &view);
+                    ffi_invoke_c_callback("qwp_ws_error_handler", || {
+                        cb(user_data as *mut c_void, &view);
+                    });
                 })
             }
             None => current.qwp_ws_error_handler(c_default_qwp_ws_error_handler),
@@ -2315,7 +2318,12 @@ impl line_sender_qwpws_fsn {
     }
 }
 
-fn qwpws_catch_bool<F>(err_out: *mut *mut line_sender_error, f: F) -> bool
+/// Outbound FFI panic boundary for bool-returning extern "C" functions.
+///
+/// Wraps the body of a `pub extern "C" fn` so a Rust panic surfaces as
+/// `false` + `err_out = InvalidApiCall` instead of unwinding across the
+/// `extern "C"` boundary (UB on stable rustc, process abort with `panic=abort`).
+fn ffi_catch_bool<F>(err_out: *mut *mut line_sender_error, f: F) -> bool
 where
     F: FnOnce() -> bool,
 {
@@ -2326,11 +2334,29 @@ where
                 set_err_out(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    "QWP/WS FFI call panicked".to_string(),
+                    "FFI call panicked".to_string(),
                 );
             }
             false
         }
+    }
+}
+
+/// Inbound FFI panic boundary for user-supplied callbacks.
+///
+/// Wraps the invocation of a C callback (the `cb(user_data, …)` step inside a
+/// Rust trampoline) so a panic doesn't unwind back across the `extern "C"`
+/// boundary into the user's code. Void-returning callbacks have no err_out
+/// channel; the panic is logged to stderr and swallowed.
+fn ffi_invoke_c_callback<F>(label: &str, f: F)
+where
+    F: FnOnce(),
+{
+    if catch_unwind(AssertUnwindSafe(f)).is_err() {
+        let _ = writeln!(
+            io::stderr(),
+            "[questdb ERROR] {label} C callback panicked; panic swallowed at FFI boundary"
+        );
     }
 }
 
@@ -2586,7 +2612,7 @@ pub unsafe extern "C" fn line_sender_qwpws_flush_and_get_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -2625,7 +2651,7 @@ pub unsafe extern "C" fn line_sender_qwpws_flush_and_keep_and_get_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -2668,7 +2694,7 @@ pub unsafe extern "C" fn line_sender_qwpws_drive_once(
     progressed_out: *mut bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if progressed_out.is_null() {
             set_err_out(
                 err_out,
@@ -2700,7 +2726,7 @@ pub unsafe extern "C" fn line_sender_qwpws_published_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -2733,7 +2759,7 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -2767,7 +2793,7 @@ pub unsafe extern "C" fn line_sender_qwpws_await_acked_fsn(
     reached_out: *mut bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if reached_out.is_null() {
             set_err_out(
                 err_out,
@@ -2800,7 +2826,7 @@ pub unsafe extern "C" fn line_sender_qwpws_poll_error(
     error_out: *mut *mut line_sender_qwpws_error,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if error_out.is_null() {
             set_err_out(
                 err_out,
@@ -2881,7 +2907,7 @@ pub unsafe extern "C" fn line_sender_qwpws_errors_dropped(
     dropped_out: *mut u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         if dropped_out.is_null() {
             set_err_out(
                 err_out,
@@ -2913,7 +2939,7 @@ pub unsafe extern "C" fn line_sender_qwpws_close_drain(
     sender: *mut line_sender,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    qwpws_catch_bool(err_out, || unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         let Some(sender) = qwpws_line_sender_mut(sender, err_out, "line_sender_qwpws_close_drain")
         else {
             return false;
@@ -2965,7 +2991,7 @@ pub unsafe extern "C" fn line_sender_flush(
     buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         let sender = unwrap_sender_mut(sender);
         let buffer = unwrap_buffer_mut(buffer);
         match sender.flush(buffer) {
@@ -2975,7 +3001,7 @@ pub unsafe extern "C" fn line_sender_flush(
                 false
             }
         }
-    }
+    })
 }
 
 /// Send the given buffer of rows to the QuestDB server.
@@ -2993,7 +3019,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
     buffer: *const line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         let sender = unwrap_sender_mut(sender);
         let buffer = unwrap_buffer(buffer);
         match sender.flush_and_keep(buffer) {
@@ -3003,7 +3029,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
                 false
             }
         }
-    }
+    })
 }
 
 /// Send the batch of rows in the buffer to the QuestDB server, and, if the parameter
@@ -3030,7 +3056,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep_with_flags(
     transactional: bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
+    ffi_catch_bool(err_out, || unsafe {
         let sender = unwrap_sender_mut(sender);
         let buffer = unwrap_buffer(buffer);
         match sender.flush_and_keep_with_flags(buffer, transactional) {
@@ -3040,7 +3066,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep_with_flags(
                 false
             }
         }
-    }
+    })
 }
 
 /// Get the current time in nanoseconds since the Unix epoch (UTC).
