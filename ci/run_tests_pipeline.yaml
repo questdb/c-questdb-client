@@ -136,7 +136,7 @@ stages:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME_25_X64)"
-              options: "-DskipTests -Pbuild-web-console,local-client"
+              options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             env:
