@@ -2627,6 +2627,46 @@ TEST_CASE("line_sender c api qwpudp decimal rejects signed overflow")
     CHECK(::line_sender_buffer_row_count(buffer) == 1);
 }
 
+TEST_CASE("line_sender_buffer_reserve surfaces capacity overflow as error")
+{
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    ::line_sender_buffer* buffer =
+        ::line_sender_buffer_new(::line_sender_protocol_version_2);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    // SIZE_MAX makes Vec::reserve overflow capacity and panic. The FFI must
+    // catch the panic and report it via err_out instead of aborting the
+    // process.
+    CHECK_FALSE(::line_sender_buffer_reserve(buffer, SIZE_MAX, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        ::line_sender_error_get_code(err) ==
+        ::line_sender_error_invalid_api_call);
+}
+
+TEST_CASE("line_sender_buffer_clone rejects NULL input via err_out")
+{
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    // NULL input must be reported as an invalid API call rather than segfault.
+    ::line_sender_buffer* cloned = ::line_sender_buffer_clone(nullptr, &err);
+    CHECK(cloned == nullptr);
+    REQUIRE(err != nullptr);
+    CHECK(
+        ::line_sender_error_get_code(err) ==
+        ::line_sender_error_invalid_api_call);
+}
+
 TEST_CASE("line_sender c api qwpudp max name len and peek")
 {
     ::line_sender_error* err = nullptr;
@@ -2665,7 +2705,7 @@ TEST_CASE("line_sender c api qwpudp max name len and peek")
     CHECK(peek.len == 0);
     CHECK(peek.buf == nullptr);
 
-    ::line_sender_buffer* cloned = ::line_sender_buffer_clone(buffer);
+    ::line_sender_buffer* cloned = ::line_sender_buffer_clone(buffer, &err);
     REQUIRE(cloned != nullptr);
     on_scope_exit cloned_free_guard{[&] { ::line_sender_buffer_free(cloned); }};
     peek = ::line_sender_buffer_peek(cloned);

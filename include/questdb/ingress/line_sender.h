@@ -85,9 +85,6 @@ typedef enum line_sender_error_code
     /** Error sent back from the server during flush. */
     line_sender_error_server_flush_error,
 
-    /** QWP/WebSocket server rejection or terminal protocol violation. */
-    line_sender_error_server_rejection,
-
     /** Bad configuration. */
     line_sender_error_config_error,
 
@@ -99,6 +96,9 @@ typedef enum line_sender_error_code
 
     /** The supplied decimal is invalid. */
     line_sender_error_invalid_decimal,
+
+    /** QWP/WebSocket server rejection or terminal protocol violation. */
+    line_sender_error_server_rejection,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -396,9 +396,15 @@ line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
 LINESENDER_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
 
-/** Create a new copy of the buffer. */
+/**
+ * Create a new copy of the buffer.
+ *
+ * Returns NULL and populates `err_out` if `buffer` is NULL or if the
+ * underlying clone panics (e.g. allocation failure).
+ */
 LINESENDER_API
-line_sender_buffer* line_sender_buffer_clone(const line_sender_buffer* buffer);
+line_sender_buffer* line_sender_buffer_clone(
+    const line_sender_buffer* buffer, line_sender_error** err_out);
 
 /**
  * Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -407,10 +413,16 @@ line_sender_buffer* line_sender_buffer_clone(const line_sender_buffer* buffer);
  *
  * For ILP buffers this is expressed in bytes. For QWP buffers this is only a
  * best-effort hint and may be ignored.
+ *
+ * Returns true on success. Returns false and populates `err_out` if `buffer`
+ * is NULL or if the underlying allocator panics (e.g. capacity overflow).
  * See: `capacity`.
  */
 LINESENDER_API
-void line_sender_buffer_reserve(line_sender_buffer* buffer, size_t additional);
+bool line_sender_buffer_reserve(
+    line_sender_buffer* buffer,
+    size_t additional,
+    line_sender_error** err_out);
 
 /**
  * Get the current buffer capacity.

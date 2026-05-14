@@ -79,11 +79,20 @@ public:
      */
     static line_sender_buffer qwp_udp(
         size_t init_buf_size = 64 * 1024,
-        size_t max_name_len = 127) noexcept
+        size_t max_name_len = 127)
     {
         auto* raw_buffer =
             ::line_sender_buffer_new_qwp_with_max_name_len(max_name_len);
-        ::line_sender_buffer_reserve(raw_buffer, init_buf_size);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
         return line_sender_buffer{
             raw_buffer,
             protocol_version::v1,
@@ -92,9 +101,12 @@ public:
             true};
     }
 
-    line_sender_buffer(const line_sender_buffer& other) noexcept
+    line_sender_buffer(const line_sender_buffer& other)
         : _impl{
-              other._impl ? ::line_sender_buffer_clone(other._impl) : nullptr}
+              other._impl
+                  ? line_sender_error::wrapped_call(
+                        ::line_sender_buffer_clone, other._impl)
+                  : nullptr}
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
@@ -114,15 +126,19 @@ public:
         other._impl = nullptr;
     }
 
-    line_sender_buffer& operator=(const line_sender_buffer& other) noexcept
+    line_sender_buffer& operator=(const line_sender_buffer& other)
     {
         if (this != &other)
         {
+            // Clone before freeing the old buffer so a clone failure leaves
+            // *this unchanged (strong exception guarantee).
+            ::line_sender_buffer* new_impl =
+                other._impl
+                    ? line_sender_error::wrapped_call(
+                          ::line_sender_buffer_clone, other._impl)
+                    : nullptr;
             ::line_sender_buffer_free(_impl);
-            if (other._impl)
-                _impl = ::line_sender_buffer_clone(other._impl);
-            else
-                _impl = nullptr;
+            _impl = new_impl;
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
@@ -159,7 +175,8 @@ public:
     void reserve(size_t additional)
     {
         may_init();
-        ::line_sender_buffer_reserve(_impl, additional);
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_reserve, _impl, additional);
     }
 
     /**
@@ -791,20 +808,30 @@ private:
     {
         if (!_impl)
         {
+            ::line_sender_buffer* tmp = nullptr;
             if (_is_qwp)
             {
-                _impl =
-                    ::line_sender_buffer_new_qwp_with_max_name_len(
-                        _max_name_len);
+                tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
+                    _max_name_len);
             }
             else
             {
-                _impl = ::line_sender_buffer_with_max_name_len(
+                tmp = ::line_sender_buffer_with_max_name_len(
                     static_cast<::line_sender_protocol_version>(
                         static_cast<int>(_protocol_version)),
                     _max_name_len);
             }
-            ::line_sender_buffer_reserve(_impl, _init_buf_size);
+            try
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_reserve, tmp, _init_buf_size);
+            }
+            catch (...)
+            {
+                ::line_sender_buffer_free(tmp);
+                throw;
+            }
+            _impl = tmp;
         }
     }
 
@@ -1398,7 +1425,16 @@ public:
             sender_protocol == protocol::qwpws ||
             sender_protocol == protocol::qwpwss;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
-        ::line_sender_buffer_reserve(raw_buffer, init_buf_size);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
         return line_sender_buffer{
             raw_buffer,
             version,

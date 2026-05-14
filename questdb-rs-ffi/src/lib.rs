@@ -226,9 +226,6 @@ pub enum line_sender_error_code {
     /// Error sent back from the server during flush.
     line_sender_error_server_flush_error,
 
-    /// QWP/WebSocket server rejection or terminal protocol violation.
-    line_sender_error_server_rejection,
-
     /// Bad configuration.
     line_sender_error_config_error,
 
@@ -240,6 +237,9 @@ pub enum line_sender_error_code {
 
     /// The supplied decimal is invalid.
     line_sender_error_invalid_decimal,
+
+    /// QWP/WebSocket server rejection or terminal protocol violation.
+    line_sender_error_server_rejection,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -884,17 +884,43 @@ unsafe fn unwrap_buffer_mut<'a>(buffer: *mut line_sender_buffer) -> &'a mut Buff
 }
 
 /// Create a new copy of the buffer.
+///
+/// Returns NULL and populates `err_out` if `buffer` is NULL or if the
+/// underlying clone panics (e.g. allocation failure).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_clone(
     buffer: *const line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_buffer {
-    unsafe {
-        let buffer = &*buffer;
-        let new_buffer = buffer.buffer.clone();
+    if buffer.is_null() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_buffer_clone requires a non-NULL buffer".to_owned(),
+            );
+        }
+        return ptr::null_mut();
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let src = &*buffer;
         Box::into_raw(Box::new(line_sender_buffer {
-            buffer: new_buffer,
-            empty_peek_buf_is_null: buffer.empty_peek_buf_is_null,
+            buffer: src.buffer.clone(),
+            empty_peek_buf_is_null: src.empty_peek_buf_is_null,
         }))
+    }));
+    match result {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            unsafe {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_sender_buffer_clone panicked".to_owned(),
+                );
+            }
+            ptr::null_mut()
+        }
     }
 }
 
@@ -905,15 +931,42 @@ pub unsafe extern "C" fn line_sender_buffer_clone(
 /// For ILP buffers this is expressed in bytes. For QWP buffers this is only a
 /// best-effort hint and may be ignored.
 ///
+/// Returns true on success. Returns false and populates `err_out` if `buffer`
+/// is NULL or if the underlying allocator panics (e.g. capacity overflow).
+///
 /// See: `capacity`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_reserve(
     buffer: *mut line_sender_buffer,
     additional: size_t,
-) {
-    unsafe {
-        let buffer = unwrap_buffer_mut(buffer);
-        buffer.reserve(additional);
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if buffer.is_null() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_buffer_reserve requires a non-NULL buffer".to_owned(),
+            );
+        }
+        return false;
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        unwrap_buffer_mut(buffer).reserve(additional);
+    }));
+    match result {
+        Ok(()) => true,
+        Err(_) => {
+            unsafe {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_sender_buffer_reserve panicked (likely capacity overflow)"
+                        .to_owned(),
+                );
+            }
+            false
+        }
     }
 }
 
@@ -3039,6 +3092,39 @@ mod tests {
 
     fn assert_err_code(actual: line_sender_error_code, expected: line_sender_error_code) {
         assert_eq!(actual as u32, expected as u32);
+    }
+
+    #[test]
+    fn line_sender_error_code_discriminants_are_abi_stable() {
+        // Pin numeric values exposed to C/FFI consumers (questdb-py via
+        // ctypes/cffi, Go cgo, Java FFM) that cache them. New variants must
+        // be appended to preserve the ABI.
+        use line_sender_error_code::*;
+        let expected: &[(line_sender_error_code, u32)] = &[
+            (line_sender_error_could_not_resolve_addr, 0),
+            (line_sender_error_invalid_api_call, 1),
+            (line_sender_error_socket_error, 2),
+            (line_sender_error_invalid_utf8, 3),
+            (line_sender_error_invalid_name, 4),
+            (line_sender_error_invalid_timestamp, 5),
+            (line_sender_error_auth_error, 6),
+            (line_sender_error_tls_error, 7),
+            (line_sender_error_http_not_supported, 8),
+            (line_sender_error_server_flush_error, 9),
+            (line_sender_error_config_error, 10),
+            (line_sender_error_array_error, 11),
+            (line_sender_error_protocol_version_error, 12),
+            (line_sender_error_invalid_decimal, 13),
+            // New since 6.1.0 — must remain at the tail.
+            (line_sender_error_server_rejection, 14),
+        ];
+        for (variant, want) in expected {
+            assert_eq!(
+                *variant as u32, *want,
+                "{:?} discriminant changed — appended-only ABI broken",
+                variant,
+            );
+        }
     }
 
     fn utf8(bytes: &'static [u8]) -> line_sender_utf8 {

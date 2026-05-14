@@ -82,9 +82,6 @@ enum class line_sender_error_code
     /** Error sent back from the server during flush. */
     server_flush_error,
 
-    /** QWP/WebSocket server rejection or terminal protocol violation. */
-    server_rejection,
-
     /** Bad configuration. */
     config_error,
 
@@ -96,6 +93,9 @@ enum class line_sender_error_code
 
     /** The supplied decimal is invalid. */
     invalid_decimal,
+
+    /** QWP/WebSocket server rejection or terminal protocol violation. */
+    server_rejection,
 };
 
 /** The protocol used to connect with. */

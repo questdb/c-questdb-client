@@ -859,13 +859,19 @@ class Buffer:
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
             protocol_version.value[0],
             c_size_t(max_name_len))
-        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_reserve,
+            self._impl,
+            c_size_t(init_buf_size))
 
     @classmethod
     def from_sender(cls, sender_impl, init_buf_size=65536):
         self = cls.__new__(cls)
         self._impl = _DLL.line_sender_buffer_new_for_sender(sender_impl)
-        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_reserve,
+            self._impl,
+            c_size_t(init_buf_size))
         return self
 
     def __len__(self):
@@ -881,7 +887,10 @@ class Buffer:
             return ''
 
     def reserve(self, additional):
-        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(additional))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_reserve,
+            self._impl,
+            c_size_t(additional))
 
     @property
     def capacity(self):

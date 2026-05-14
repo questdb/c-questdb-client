@@ -70,9 +70,6 @@ pub enum ErrorCode {
     /// Error sent back from the server during flush.
     ServerFlushError,
 
-    /// QWP/WebSocket server rejection or terminal protocol violation.
-    ServerRejection,
-
     /// Bad configuration.
     ConfigError,
 
@@ -84,6 +81,9 @@ pub enum ErrorCode {
 
     /// The supplied decimal is invalid.
     InvalidDecimal,
+
+    /// QWP/WebSocket server rejection or terminal protocol violation.
+    ServerRejection,
 }
 
 /// An error that occurred when using QuestDB client library.
