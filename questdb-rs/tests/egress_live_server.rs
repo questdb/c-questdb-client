@@ -2440,7 +2440,10 @@ fn exec_done_for_bound_multi_row_insert() {
     wait_for_rows(srv, &table, 3);
     {
         let mut cur = reader
-            .prepare(&format!("select name, v, ts from \"{}\" order by ts", table))
+            .prepare(&format!(
+                "select name, v, ts from \"{}\" order by ts",
+                table
+            ))
             .execute()
             .expect("execute select");
         let view = cur.next_batch().expect("next select").expect("Some batch");
