@@ -3153,6 +3153,61 @@ mod tests {
         }
     }
 
+    // ---- C5 regression: FFI panic boundaries ----
+
+    /// `ffi_catch_bool` must convert a Rust panic into `false` + `err_out`
+    /// rather than unwinding across the `extern "C"` boundary into the C
+    /// caller (UB on stable rustc; process abort with `panic=abort`).
+    #[test]
+    fn ffi_catch_bool_converts_panic_to_err_out() {
+        unsafe {
+            let mut err: *mut line_sender_error = ptr::null_mut();
+            let result = ffi_catch_bool(&mut err, || panic!("simulated panic"));
+            assert!(!result, "panicking closure must return false");
+            assert!(!err.is_null(), "err_out must be populated");
+            assert_err_code(
+                line_sender_error_get_code(err),
+                line_sender_error_code::line_sender_error_invalid_api_call,
+            );
+            free_err(&mut err);
+        }
+    }
+
+    /// `ffi_catch_bool` must be transparent for non-panicking closures —
+    /// no spurious err_out, return value preserved.
+    #[test]
+    fn ffi_catch_bool_is_transparent_when_no_panic() {
+        let mut err: *mut line_sender_error = ptr::null_mut();
+        let result_true = ffi_catch_bool(&mut err, || true);
+        assert!(result_true);
+        assert!(err.is_null());
+
+        let result_false = ffi_catch_bool(&mut err, || false);
+        assert!(!result_false);
+        assert!(err.is_null());
+    }
+
+    /// `ffi_invoke_c_callback` must swallow a Rust panic raised inside the
+    /// closure rather than letting it unwind back to the trampoline caller.
+    /// The void-returning callback contract has no err_out channel; the helper
+    /// returns normally and logs to stderr.
+    ///
+    /// Note: this test exercises panics in *Rust code* invoked from inside the
+    /// helper's closure — which is the case that catch_unwind can actually
+    /// catch. A panic from inside an `extern "C"` callback aborts the process
+    /// at the ABI boundary (stable rustc treats `extern "C"` as nounwind);
+    /// `catch_unwind` cannot intervene before that abort, so we don't claim to
+    /// test that case here. The genuine protection against a panicking
+    /// callback comes from the outer `ffi_catch_bool` on the FFI entry point
+    /// (`line_sender_flush*`), which catches Rust-side panics that the closure
+    /// caused indirectly without crossing an `extern "C"` frame.
+    #[test]
+    fn ffi_invoke_c_callback_swallows_panic() {
+        ffi_invoke_c_callback("test_callback", || {
+            panic!("simulated panic inside trampoline closure");
+        });
+    }
+
     fn utf8(bytes: &'static [u8]) -> line_sender_utf8 {
         line_sender_utf8 {
             len: bytes.len(),
