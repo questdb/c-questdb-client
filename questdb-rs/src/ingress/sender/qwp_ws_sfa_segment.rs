@@ -22,8 +22,6 @@
  *
  ******************************************************************************/
 
-#![allow(dead_code)]
-
 //! Java-compatible `.sfa` Store-and-Forward segment codec.
 //!
 //! This is the narrow disk-format layer shared by the future QWP/WebSocket SF
@@ -45,6 +43,9 @@ pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
 
+// Keep the payloads in these errors: recovery reports them through Debug today,
+// and tests pattern-match specific corruption details.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum SfaSegmentError {
     Io(io::Error),
@@ -74,6 +75,7 @@ pub(crate) struct SfaSegmentHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct SfaFrame {
     pub(crate) fsn: u64,
     pub(crate) offset: u64,
@@ -90,6 +92,7 @@ pub(crate) struct SfaSegmentMetadataScan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct SfaSegmentScan {
     pub(crate) header: SfaSegmentHeader,
     pub(crate) frames: Vec<SfaFrame>,
@@ -105,6 +108,9 @@ pub(crate) struct SfaAppend {
 
 #[derive(Debug)]
 pub(crate) struct SfaSegment {
+    // Kept with file-backed segments so the segment owns the file handle
+    // alongside the writable mapping.
+    #[allow(dead_code)]
     file: Option<File>,
     mapping: Arc<SfaSegmentMapping>,
     path: Option<PathBuf>,
@@ -112,6 +118,9 @@ pub(crate) struct SfaSegment {
     header: SfaSegmentHeader,
     append_offset: u64,
     frame_count: u64,
+    // Recovery records this on opened segments; queue recovery also reports the
+    // metadata scan directly before opening the segment.
+    #[allow(dead_code)]
     torn_tail_bytes: u64,
 }
 
@@ -146,6 +155,7 @@ unsafe impl Send for SfaSegmentMapping {}
 unsafe impl Sync for SfaSegmentMapping {}
 
 impl SfaSegment {
+    #[cfg(test)]
     pub(crate) fn create(
         path: impl AsRef<Path>,
         base_seq: u64,
@@ -263,6 +273,7 @@ impl SfaSegment {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn try_append(&mut self, payload: &[u8]) -> Result<Option<u64>, SfaSegmentError> {
         let Some(appended) = self.try_append_at(self.append_offset, payload)? else {
             return Ok(None);
@@ -321,20 +332,6 @@ impl SfaSegment {
         Ok(())
     }
 
-    pub(crate) fn payload_slice_for_fsn(&self, fsn: u64) -> Option<&[u8]> {
-        let payload = self.payload_for_fsn(fsn)?;
-        Some(self.mapping.slice(payload.offset, payload.len))
-    }
-
-    pub(crate) fn payload_for_fsn(&self, fsn: u64) -> Option<SfaMappedPayload> {
-        let offset = self.frame_offset_for_fsn(fsn)?;
-        self.mapped_payload_at_offset(offset)
-    }
-
-    pub(crate) fn frame_offset_for_fsn(&self, fsn: u64) -> Option<u64> {
-        self.frame_offset_for_fsn_with_limit(fsn, self.frame_count, self.append_offset)
-    }
-
     pub(crate) fn frame_offset_for_fsn_with_limit(
         &self,
         fsn: u64,
@@ -353,10 +350,6 @@ impl SfaSegment {
             pos = self.next_frame_offset_with_limit(pos, append_offset)?;
         }
         Some(pos)
-    }
-
-    pub(crate) fn mapped_payload_at_offset(&self, offset: u64) -> Option<SfaMappedPayload> {
-        self.mapped_payload_at_offset_with_limit(offset, self.append_offset)
     }
 
     pub(crate) fn mapped_payload_at_offset_with_limit(
@@ -387,6 +380,7 @@ impl SfaSegment {
         self.frame_count
     }
 
+    #[cfg(test)]
     pub(crate) fn torn_tail_bytes(&self) -> u64 {
         self.torn_tail_bytes
     }
@@ -395,10 +389,6 @@ impl SfaSegment {
         self.frame_count
             .checked_sub(1)
             .and_then(|last_index| self.header.base_seq.checked_add(last_index))
-    }
-
-    fn payload_at_offset(&self, offset: u64) -> Option<SfaMappedPayload> {
-        self.payload_at_offset_with_limit(offset, self.append_offset)
     }
 
     fn payload_at_offset_with_limit(
@@ -431,10 +421,6 @@ impl SfaSegment {
         })
     }
 
-    fn next_frame_offset(&self, offset: u64) -> Option<u64> {
-        self.next_frame_offset_with_limit(offset, self.append_offset)
-    }
-
     fn next_frame_offset_with_limit(&self, offset: u64, append_offset: u64) -> Option<u64> {
         let payload = self.payload_at_offset_with_limit(offset, append_offset)?;
         offset
@@ -450,11 +436,6 @@ impl SfaMappedPayload {
 
     pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         self.mapping.with_slice(self.offset, self.len, f)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn to_vec(&self) -> Vec<u8> {
-        self.with_bytes(|bytes| bytes.to_vec())
     }
 }
 
@@ -516,6 +497,7 @@ impl SfaSegmentMapping {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn initial_segment_path(slot_dir: &Path) -> PathBuf {
     slot_dir.join(INITIAL_SEGMENT_FILE_NAME)
 }
@@ -524,6 +506,7 @@ pub(crate) fn spare_segment_path(slot_dir: &Path, generation: u64) -> PathBuf {
     slot_dir.join(format!("sf-{generation:016x}.sfa"))
 }
 
+#[cfg(test)]
 pub(crate) fn scan_file(path: impl AsRef<Path>) -> Result<SfaSegmentScan, SfaSegmentError> {
     let bytes = fs::read(path)?;
     scan_segment_bytes(&bytes)
@@ -566,6 +549,7 @@ pub(crate) fn scan_segment_metadata_bytes(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegmentError> {
     let mut frames = Vec::new();
     let raw = scan_segment_bytes_inner(bytes, |fsn, offset, _payload_len, payload| {

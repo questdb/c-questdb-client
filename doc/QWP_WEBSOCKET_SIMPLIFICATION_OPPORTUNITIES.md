@@ -422,8 +422,9 @@ Validation:
 
 Current shape:
 
-Several QWP/WebSocket files still use file-level `#![allow(dead_code)]`,
-including driver, queue, SFA queue, SFA slot, and SFA segment modules.
+After S5a, `qwp_ws_sfa_segment.rs` no longer uses file-level
+`#![allow(dead_code)]`. Several other QWP/WebSocket files still use file-level
+dead-code suppression, including driver, queue, SFA queue, and SFA slot modules.
 
 Target shape:
 
@@ -439,19 +440,30 @@ Target shape:
 - Treat newly exposed warnings as a cleanup queue, not as a mandate to churn all
   QWP/WebSocket modules in one patch.
 
-First S5 slice:
+S5 is the umbrella item. S5a is the first implementation slice under that
+umbrella and is implemented.
 
-- Start with `qwp_ws_sfa_segment.rs`.
-- Remove that file's broad `#![allow(dead_code)]`.
-- Gate full payload scan / golden-fixture helpers behind `#[cfg(test)]` if
-  current call sites are tests only:
+### S5a: `qwp_ws_sfa_segment.rs` Dead-Code Cleanup
+
+Status:
+
+Implemented. The file-level dead-code suppression is gone. Full payload scan /
+golden-fixture helpers are test-only:
+
   - `SfaFrame`;
   - `SfaSegmentScan`;
   - `scan_file()`;
   - `scan_segment_bytes()`.
-- Keep metadata-only scan surface production-visible when recovery uses it.
 
-Explicit non-goals for the first slice:
+Metadata-only recovery scanning stays production-visible. The remaining
+intentional diagnostic/state payloads use small local `allow(dead_code)` markers
+instead of hiding the whole module.
+
+Fixture-only creation/append/path helpers are also test-only, and unused direct
+payload wrapper methods were deleted. The production queue already uses the
+published-offset `*_with_limit` payload accessors.
+
+Explicit S5a non-goals:
 
 - Do not decide `qwp_ws_driver.rs` API surface wholesale. The driver mixes
   manual APIs, runner internals, feature-gated transports, tests, events, and
@@ -471,13 +483,12 @@ dead-code lint.
 
 Ordering note:
 
-C1 was completed before the first S5 slice. Continue with the scoped S5a shape
-below; do not reopen broad dead-code cleanup while doing unrelated correctness
-items.
+C1 was completed before S5a. Continue with scoped slices; do not reopen broad
+dead-code cleanup while doing unrelated correctness items.
 
-Validation:
+Validation used for S5a:
 
-- For the first S5 slice:
+- For S5a:
   `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib qwp_ws_sfa_segment`
 - Also run sibling SFA queue tests because they import segment helpers:
   `cargo test --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws --lib qwp_ws_sfa_queue`
@@ -689,12 +700,10 @@ with storage-position state. That is not Java-like and is not simpler.
 
 Recommended order:
 
-1. S5a: remove broad dead-code suppression from `qwp_ws_sfa_segment.rs` only and
-   cfg-test full scan helpers.
-2. C3: broaden orphan lock tests.
-3. S5 follow-ups: decide queue diagnostics and driver API surface in separate
+1. C3: broaden orphan lock tests.
+2. S5 follow-ups: decide queue diagnostics and driver API surface in separate
    small slices.
-4. C2: unify connect/retry plumbing as its own slice.
+3. C2: unify connect/retry plumbing as its own slice.
 
 Do not combine C2 with the smaller deletion cleanups. The connect/retry helper
 is a policy refactor and deserves its own tests and review.
