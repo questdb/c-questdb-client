@@ -564,7 +564,7 @@ mod tests {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     use crate::ingress::conf::{ConfigSetting, QwpWsConfig};
-    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[cfg(all(feature = "sync-sender-qwp-ws", unix))]
     use crate::ingress::sender::qwp_ws_sfa_segment::initial_segment_path;
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use crate::ingress::sender::qwp_ws_sfa_slot::SfaSlotOptions;

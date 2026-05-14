@@ -781,15 +781,6 @@ fn spawn_role_reject_upgrade_server(
     (port, handle)
 }
 
-fn spawn_unsupported_version_upgrade_server(
-    done: Arc<AtomicBool>,
-    version: u8,
-) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
-    spawn_retrying_failing_upgrade_server(done, move |stream| {
-        let _ = upgrade_mock_stream_with_version(stream, version);
-    })
-}
-
 fn spawn_malformed_101_upgrade_server(
     done: Arc<AtomicBool>,
 ) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
@@ -1029,6 +1020,7 @@ fn qwp_ws_durable_ack_keepalive_ping_completes_pending_ok() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (ping_tx, ping_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
 
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -1056,13 +1048,13 @@ fn qwp_ws_durable_ack_keepalive_ping_completes_pending_ok() {
             let (_, opcode, payload) = read_frame(&mut stream).unwrap();
             if opcode == 0x9 {
                 write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
+                write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
                 ping_tx.send(payload).unwrap();
                 break;
             }
         }
 
-        thread::sleep(Duration::from_millis(100));
-        write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+        let _ = done_rx.recv_timeout(Duration::from_secs(5));
     });
 
     let conf = format!(
@@ -1084,9 +1076,12 @@ fn qwp_ws_durable_ack_keepalive_ping_completes_pending_ok() {
     let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
 
     assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
-    assert!(sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap());
-    assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+    let acked = sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap();
+    let acked_fsn = sender.acked_fsn().unwrap();
+    done_tx.send(()).unwrap();
     server.join().unwrap();
+    assert!(acked);
+    assert_eq!(acked_fsn, Some(fsn));
 }
 
 #[test]
@@ -3061,47 +3056,86 @@ fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
 }
 
 #[test]
-fn qwp_ws_sync_initial_retry_unsupported_version_retries_after_round_exhaustion() {
-    let done = Arc::new(AtomicBool::new(false));
-    let (first_port, first_attempts, first_handle) =
-        spawn_unsupported_version_upgrade_server(Arc::clone(&done), 2);
-    let (second_port, second_attempts, second_handle) =
-        spawn_unsupported_version_upgrade_server(Arc::clone(&done), 2);
+fn qwp_ws_sync_initial_retry_unsupported_version_retries_next_round() {
+    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    let first_attempts = Arc::new(AtomicUsize::new(0));
+    let second_attempts = Arc::new(AtomicUsize::new(0));
+    let (payload_tx, payload_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let first_handle = {
+        let first_attempts = Arc::clone(&first_attempts);
+        thread::spawn(move || {
+            let (mut stream, _) = first_listener.accept().unwrap();
+            first_attempts.fetch_add(1, Ordering::AcqRel);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _ = upgrade_mock_stream_with_version(&mut stream, 2);
+
+            let (mut stream, _) = first_listener.accept().unwrap();
+            first_attempts.fetch_add(1, Ordering::AcqRel);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            perform_server_upgrade(&mut stream).unwrap();
+            let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
+            payload_tx.send(payload).unwrap();
+            write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        })
+    };
+    let second_handle = {
+        let second_attempts = Arc::clone(&second_attempts);
+        thread::spawn(move || {
+            let (mut stream, _) = second_listener.accept().unwrap();
+            second_attempts.fetch_add(1, Ordering::AcqRel);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _ = upgrade_mock_stream_with_version(&mut stream, 2);
+        })
+    };
 
     let conf = format!(
         "qwpws::addr=127.0.0.1:{first_port},127.0.0.1:{second_port};\
          initial_connect_retry=sync;\
-         reconnect_initial_backoff_millis=10;\
-         reconnect_max_backoff_millis=10;\
-         reconnect_max_duration_millis=120;"
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;\
+         reconnect_max_duration_millis=2000;"
     );
-    let result = SenderBuilder::from_conf(&conf).unwrap().build();
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+    done_tx.send(()).unwrap();
 
-    done.store(true, Ordering::Release);
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     first_handle.join().unwrap();
     second_handle.join().unwrap();
 
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(
-        err.msg()
-            .contains("QWP/WebSocket initial connect retry budget exhausted"),
-        "got: {}",
-        err.msg()
-    );
-    assert!(
-        err.msg().contains("unsupported X-QWP-Version"),
-        "got: {}",
-        err.msg()
-    );
-    assert!(
-        first_attempts.load(Ordering::Acquire) >= 2,
-        "first endpoint was not retried"
-    );
-    assert!(
-        second_attempts.load(Ordering::Acquire) >= 2,
-        "second endpoint was not retried"
-    );
+    assert_eq!(&frame[0..4], b"QWP1");
+    assert_eq!(first_attempts.load(Ordering::Acquire), 2);
+    assert_eq!(second_attempts.load(Ordering::Acquire), 1);
 }
 
 #[test]

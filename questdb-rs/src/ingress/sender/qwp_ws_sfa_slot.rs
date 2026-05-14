@@ -47,7 +47,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
-    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -256,6 +256,13 @@ impl SlotLock {
     }
 }
 
+#[cfg(any(unix, windows))]
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        unlock_lock_file(&self.file);
+    }
+}
+
 fn validate_sf_dir(sf_dir: &Path) -> Result<(), SfaQueueError> {
     if sf_dir.as_os_str().is_empty() {
         return Err(SfaQueueError::InvalidSfDir);
@@ -322,6 +329,11 @@ fn try_lock_file(file: &File) -> bool {
     (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) == 0
 }
 
+#[cfg(unix)]
+fn unlock_lock_file(file: &File) {
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
 #[cfg(windows)]
 fn open_lock_file(lock_path: &Path) -> Result<File, io::Error> {
     OpenOptions::new()
@@ -346,6 +358,20 @@ fn try_lock_file(file: &File) -> bool {
             &mut overlapped,
         ) != 0
     }
+}
+
+#[cfg(windows)]
+fn unlock_lock_file(file: &File) {
+    let mut overlapped = OVERLAPPED::default();
+    let _ = unsafe {
+        UnlockFileEx(
+            file.as_raw_handle() as HANDLE,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
 }
 
 #[cfg(test)]
