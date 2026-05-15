@@ -1426,9 +1426,8 @@ mod tests {
     fn tls_roots_with_conflicting_ca_rejected() {
         #[cfg(feature = "tls-webpki-certs")]
         {
-            let err =
-                ReaderConfig::from_conf("wss::addr=h:1;tls_ca=webpki_roots;tls_roots=/tmp/x")
-                    .unwrap_err();
+            let err = ReaderConfig::from_conf("wss::addr=h:1;tls_ca=webpki_roots;tls_roots=/tmp/x")
+                .unwrap_err();
             assert_eq!(err.code(), ErrorCode::ConfigError);
         }
     }

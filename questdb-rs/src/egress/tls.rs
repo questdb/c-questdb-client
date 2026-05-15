@@ -263,10 +263,8 @@ mod tests {
     use std::io::Write;
 
     fn config_with_roots(path: &str) -> ReaderConfig {
-        ReaderConfig::from_conf(format!(
-            "wss::addr=h:9000;tls_ca=pem_file;tls_roots={path}"
-        ))
-        .unwrap()
+        ReaderConfig::from_conf(format!("wss::addr=h:9000;tls_ca=pem_file;tls_roots={path}"))
+            .unwrap()
     }
 
     #[test]
