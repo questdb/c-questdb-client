@@ -3111,13 +3111,47 @@ fn cancel_does_not_replenish_credit_window() {
 /// forever on `transport.read_frame()` because the cursor wasn't marked
 /// done after a `QUERY_ERROR` terminal. Polling `is_finished()` lets
 /// the test fail with a useful message instead of hanging the CI run.
+///
+/// `F` is **not** required to be `Send`. `Cursor` is intentionally
+/// `!Send` (the `on_failover_reset` callback can capture non-`Send`
+/// state — see the `_not_send` marker on `Cursor` / `ReaderQuery`) but
+/// the watchdog needs to spawn the operation on a side thread to be
+/// able to time it out. We bridge the two by wrapping `op` in a
+/// newtype that unsafely asserts `Send`.
+///
+/// Safety: the only thing the main thread does while the side thread
+/// runs is poll `JoinHandle::is_finished()` and sleep — it never
+/// touches the captures of `op` (most importantly the `Cursor` it
+/// borrows). On regression the main thread *panics* without joining,
+/// which leaks the side thread (still blocked on `read`); that's
+/// acceptable because the test has already failed and the process is
+/// about to abort.
 fn assert_returns_within<F, R>(deadline: Duration, label: &str, op: F) -> R
 where
-    F: FnOnce() -> R + Send,
+    F: FnOnce() -> R,
     R: Send,
 {
+    struct ForceSend<F>(F);
+    // Safety: see the doc comment above. The wrapper is local to this
+    // helper; callers can't accidentally migrate F's captures to
+    // another thread through any path other than the one watchdog
+    // pattern below.
+    unsafe impl<F> Send for ForceSend<F> {}
+    impl<F: FnOnce() -> R, R> ForceSend<F> {
+        // `call(self)` instead of `.0()` is deliberate. Rust 2021's
+        // disjoint-field capture would otherwise move only `op.0`
+        // (the inner F) into the side-thread closure, which loses
+        // the `Send` assertion the wrapper exists to provide.
+        // A method that takes `self` by value forces whole-struct
+        // capture, so the side thread sees the `ForceSend<F>`.
+        fn call(self) -> R {
+            (self.0)()
+        }
+    }
+
+    let op = ForceSend(op);
     std::thread::scope(|s| {
-        let h = s.spawn(op);
+        let h = s.spawn(move || op.call());
         let started = Instant::now();
         while !h.is_finished() {
             if started.elapsed() > deadline {

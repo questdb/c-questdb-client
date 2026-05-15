@@ -43,36 +43,41 @@
 //! Scope vs Java original:
 //!   - Generator catalogue: LONG, INT, SHORT, BYTE, BOOLEAN, DOUBLE,
 //!     FLOAT, CHAR, TIMESTAMP, TIMESTAMP_NS, DATE, VARCHAR, SYMBOL
-//!     (small pool), UUID. The wider Java set (BINARY, GEOHASH, all
-//!     DECIMAL precisions, LONG256, DOUBLE_ARRAY) is left to a
-//!     follow-up — those are "existence-only" hashes in Java anyway,
-//!     not bit-level oracles.
-//!   - Two `@Test` methods ported: `random_schema_roundtrip` (15
-//!     fresh-connection cases) and `back_to_back_queries_same_connection`
-//!     (12 cases on one connection).
-//!   - `testWideTables` is subsumed by random-schema with a wider
-//!     column count.
-//!   - `testSelectAlterSequenceFuzz` (ALTER-orchestration fuzz) is out
-//!     of scope here — it's structurally different from the rest of
-//!     this file and would need its own driver.
-//!   - Fragmentation cross-product is NOT mixed in — fragmentation is
-//!     already covered in depth by
-//!     `egress_live_server_fragmentation_fuzz.rs`. Combining the two
-//!     axes would double JVM-boot cost without changing what fails.
-//!   - Query shape rotation (random projection / id-range filter /
-//!     desc limit) is omitted in this port; only the full-scan
-//!     `SELECT c0,c1,... ORDER BY id` shape is exercised.
+//!     (small + large pools), UUID, LONG256, IPv4. The remaining Java
+//!     generators (BINARY, GEOHASH × 4, DECIMAL128, DECIMAL256,
+//!     DOUBLE_ARRAY, DECIMAL64) are "existence-only" hashes in Java
+//!     anyway — not bit-level oracles — so they'd grow LOC without
+//!     strengthening the regression guarantee.
+//!   - Three `@Test` methods ported: `random_schema_roundtrip` (15
+//!     fresh-connection cases under fragmentation),
+//!     `back_to_back_queries_same_connection` (12 cases on one
+//!     connection under fragmentation), and `wide_tables` (1 case at
+//!     10..=16 cols under fragmentation).
+//!   - **Fragmentation cross-product matches Java** — each test boots
+//!     its own server with `debug.http.force.{recv,send}.fragmentation.chunk.size`
+//!     set to a random chunk in `[1, 500]`, then runs the per-test
+//!     loop against it. This is what the Java fuzz file does via
+//!     `startFragmented(pickChunk())`.
+//!   - Query shape rotation matches Java: each case picks one of four
+//!     shapes — full scan, random projection subset, id-range filter,
+//!     descending order with limit — keyed off `caseIdx mod 4`.
+//!   - Compression variation matches Java's `pickCompression()`:
+//!     default / `compression=raw` / `compression=auto` /
+//!     `compression=zstd` / `compression=zstd;compression_level=N`
+//!     with `N ∈ [1, 9]`.
+//!   - `testSelectAlterSequenceFuzz` (ALTER-orchestration fuzz) is in
+//!     its own follow-up commit (separate driver — too different
+//!     structurally to share `run_one_case`).
 //!
-//! Reuses the shared `OnceLock<QuestDbServer>` singleton — none of the
-//! tests need per-instance config. Gated behind the `live-server-tests`
-//! Cargo feature so the default `cargo test` doesn't try to spin up a
-//! JVM. Seeded via `QWP_EGRESS_FUZZ_SEED` env var.
+//! Each test boots its own `QuestDbServer` via `start_with_config(...)`.
+//! Three tests × one JVM each ≈ 45 s of boot for the whole file,
+//! traded against actually catching fragmentation-only bugs in the
+//! schema fuzz. Gated behind the `live-server-tests` Cargo feature.
+//! Seeded via `QWP_EGRESS_FUZZ_SEED` env var.
 
 #![cfg(feature = "live-server-tests")]
 
 mod common;
-
-use std::sync::OnceLock;
 
 use questdb::egress::column::ColumnView;
 use questdb::egress::reader::{BatchView, Reader};
@@ -80,16 +85,51 @@ use questdb::egress::reader::{BatchView, Reader};
 use common::QuestDbServer;
 
 // ---------------------------------------------------------------------------
-// Fixture (shared singleton — no per-test config needed).
+// Per-test fragmented server (mirrors Java's `startFragmented(pickChunk())`).
 // ---------------------------------------------------------------------------
 
-fn server() -> &'static QuestDbServer {
-    static SERVER: OnceLock<QuestDbServer> = OnceLock::new();
-    SERVER.get_or_init(QuestDbServer::start)
+/// Mirrors Java's `startFragmented(int chunk)`. Pins both recv and send
+/// chunk so the WebSocket codec, frame parser and credit accountant are
+/// all stressed at the chunk boundary.
+fn start_fragmented(chunk: u32) -> QuestDbServer {
+    let chunk_s = chunk.to_string();
+    QuestDbServer::start_with_config(&[
+        ("debug.http.force.recv.fragmentation.chunk.size", &chunk_s),
+        ("debug.http.force.send.fragmentation.chunk.size", &chunk_s),
+    ])
 }
 
-fn make_reader(srv: &QuestDbServer) -> Reader {
-    Reader::from_conf(srv.qwp_conf()).expect("reader")
+/// Java: `pickChunk()` — `1 + random.nextInt(500)` → `[1, 500]`.
+fn pick_chunk(rng: &mut SplitMix64) -> u32 {
+    1 + rng.gen_range_u32(500)
+}
+
+/// Build a `Reader` against `srv` using the picked compression knob
+/// appended to the connect string.
+fn make_reader_with(srv: &QuestDbServer, compression_suffix: &str) -> Reader {
+    let base = srv.qwp_conf();
+    let conf = if compression_suffix.is_empty() {
+        base
+    } else {
+        format!("{base};{compression_suffix}")
+    };
+    Reader::from_conf(conf).expect("reader")
+}
+
+/// Mirrors Java's `pickCompression()`. Returns the suffix to append
+/// after the base `ws::addr=...` connect string (without the leading
+/// `;`). Empty string = library default.
+fn pick_compression(rng: &mut SplitMix64) -> String {
+    match rng.gen_range_u32(5) {
+        0 => String::new(),
+        1 => "compression=raw".to_string(),
+        2 => "compression=auto".to_string(),
+        3 => "compression=zstd".to_string(),
+        _ => {
+            let level = 1 + rng.gen_range_u32(9); // 1..=9
+            format!("compression=zstd;compression_level={level}")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,17 +932,30 @@ fn wait_for_rows(srv: &QuestDbServer, table: &str, expected: usize) {
 
 /// Ports `testRandomSchemaRoundtrip`. 15 fuzz cases, each with a
 /// fresh `Reader` (so per-connection state pollution can't mask a
-/// bug). Column count picked from `1..=6` per Java original.
+/// bug). Column count picked from `1..=6` per Java original. Server
+/// is booted once with `startFragmented(pickChunk())` so all 15
+/// iterations run against the same chunk size — matches the Java
+/// pattern where `startFragmented(chunk)` lives outside the loop.
 #[test]
 fn random_schema_roundtrip() {
-    let srv = server();
     let mut rng = SplitMix64::new(fuzz_seed_for("random_schema_roundtrip"));
+    let chunk = pick_chunk(&mut rng);
+    let compression = pick_compression(&mut rng);
+    eprintln!(
+        "[random_schema_roundtrip] chunk={chunk} compression={:?}",
+        if compression.is_empty() {
+            "default"
+        } else {
+            &compression
+        }
+    );
+    let srv = start_fragmented(chunk);
     let generators = build_generators();
     for iter in 0..15 {
         let col_count = 1 + rng.gen_range_usize(6); // 1..=6
-        let mut reader = make_reader(srv);
+        let mut reader = make_reader_with(&srv, &compression);
         run_one_case(
-            srv,
+            &srv,
             &mut reader,
             &mut rng,
             &generators,
@@ -918,14 +971,24 @@ fn random_schema_roundtrip() {
 /// dict state across queries. Column count picked from `1..=4`.
 #[test]
 fn back_to_back_queries_same_connection() {
-    let srv = server();
     let mut rng = SplitMix64::new(fuzz_seed_for("back_to_back_queries_same_connection"));
+    let chunk = pick_chunk(&mut rng);
+    let compression = pick_compression(&mut rng);
+    eprintln!(
+        "[back_to_back_queries_same_connection] chunk={chunk} compression={:?}",
+        if compression.is_empty() {
+            "default"
+        } else {
+            &compression
+        }
+    );
+    let srv = start_fragmented(chunk);
     let generators = build_generators();
-    let mut reader = make_reader(srv);
+    let mut reader = make_reader_with(&srv, &compression);
     for iter in 0..12 {
         let col_count = 1 + rng.gen_range_usize(4); // 1..=4
         run_one_case(
-            srv,
+            &srv,
             &mut reader,
             &mut rng,
             &generators,
@@ -942,13 +1005,23 @@ fn back_to_back_queries_same_connection() {
 /// schema test.
 #[test]
 fn wide_tables() {
-    let srv = server();
     let mut rng = SplitMix64::new(fuzz_seed_for("wide_tables"));
+    let chunk = pick_chunk(&mut rng);
+    let compression = pick_compression(&mut rng);
+    eprintln!(
+        "[wide_tables] chunk={chunk} compression={:?}",
+        if compression.is_empty() {
+            "default"
+        } else {
+            &compression
+        }
+    );
+    let srv = start_fragmented(chunk);
     let generators = build_generators();
-    let mut reader = make_reader(srv);
+    let mut reader = make_reader_with(&srv, &compression);
     let col_count = 10 + rng.gen_range_usize(7); // 10..=16
     run_one_case(
-        srv,
+        &srv,
         &mut reader,
         &mut rng,
         &generators,
