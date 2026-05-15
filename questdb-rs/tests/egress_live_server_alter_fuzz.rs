@@ -379,7 +379,7 @@ fn run_select_shape(
                 }
             }
             assert_eq!(got_counts.len(), 4, "{label}: 4 distinct cats expected");
-            for (k_mod, name) in [(1i64, "a"), (2, "b"), (3, "c"), (0, "d")] {
+            for (k_mod, name) in [(0i64, "a"), (1, "b"), (2, "c"), (3, "d")] {
                 let expected = cat_count(total_rows, k_mod);
                 let got = *got_counts
                     .get(name)
