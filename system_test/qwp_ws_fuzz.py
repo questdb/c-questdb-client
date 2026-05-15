@@ -44,6 +44,28 @@ Every test seeds a master RNG and prints it to stderr exactly once at
 re-run a failure. The master RNG only ever derives child seeds — for each
 producer thread and for the optional ALTER thread — so freezing the master
 seed reproduces every downstream stream.
+
+NULL handling
+=============
+
+The QWP wire protocol does not have a typed-null marker — none of the
+QWP_TYPE_* constants in `qwp.rs` is a NULL. A column is read back as
+NULL by the server **if and only if** the producer omitted it from the
+line. The Rust client's `column_*_opt(name, None)` is a thin
+ergonomic shortcut that does exactly the same thing as not calling
+the setter at all.
+
+That makes `column_skip_factor` the canonical null-fuzz axis: every
+row it drops a column from exercises the server's NULL-default path
+for that type. The 14-column suite (BOOLEAN, LONG, DOUBLE, STRING /
+SYMBOL / VARCHAR, DECIMAL256, DOUBLE_ARRAY {1D,2D,3D}, TIMESTAMP
+{micros,nanos}, plus the designated TIMESTAMP) verifies the
+canonical NULL-comparison strings end-to-end via the
+`_missing_default` table in `format_*_cell`.
+
+If the protocol ever grows a typed-null wire marker, a separate
+``explicit_null_factor`` axis can be wired in alongside
+``column_skip_factor`` without disturbing existing tests.
 """
 
 import sys
