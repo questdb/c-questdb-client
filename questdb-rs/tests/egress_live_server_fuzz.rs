@@ -94,9 +94,15 @@ use common::QuestDbServer;
 /// all stressed at the chunk boundary.
 fn start_fragmented(chunk: u32) -> QuestDbServer {
     let chunk_s = chunk.to_string();
+    // INSERT ... VALUES (...) for up to 500 rows * 16 wide columns can
+    // produce > 1 MB of SQL. The HTTP /exec endpoint reads the SQL from
+    // the URL query string, which the server caps via
+    // http.request.header.buffer.size (default ~64 KB). Bump it so the
+    // worst-case fuzz roll never overflows the URL parser.
     QuestDbServer::start_with_config(&[
         ("debug.http.force.recv.fragmentation.chunk.size", &chunk_s),
         ("debug.http.force.send.fragmentation.chunk.size", &chunk_s),
+        ("http.request.header.buffer.size", "4194304"),
     ])
 }
 
