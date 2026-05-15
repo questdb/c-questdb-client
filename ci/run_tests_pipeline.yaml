@@ -204,5 +204,6 @@ stages:
                 --test egress_live_server_bind_fuzz \
                 --test egress_live_server_fragmentation_fuzz \
                 --test egress_live_server_fuzz \
+                --test egress_live_server_alter_fuzz \
                 -- --nocapture
             displayName: "QWP egress live-server fuzz"
