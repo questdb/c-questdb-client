@@ -365,7 +365,7 @@ fn read_until_query_request(ws: &mut WebSocket<ChunkingStream>) -> Option<i64> {
 /// column. Returns `(row_count, id_sum)`. The query SQL is irrelevant
 /// — the mock ignores it and always emits the canned LONG result.
 fn run_and_sum(addr: &str) -> (usize, i64) {
-    let conf = format!("qwp::addr={}", addr);
+    let conf = format!("ws::addr={}", addr);
     let mut reader = Reader::from_conf(&conf).expect("connect");
     let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let mut row_count = 0usize;
