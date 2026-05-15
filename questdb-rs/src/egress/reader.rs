@@ -418,6 +418,13 @@ impl Reader {
         // long-running diagnostics see real dial pressure, not just the
         // attempt index that landed.
         let mut total_dials: u32 = 0;
+        // Outer-attempt counter — i.e. how many `walk_via_tracker` rounds
+        // actually fired. Distinct from `attempts_total` (the configured
+        // cap) because the deadline branch below can break out of the
+        // loop before issuing a walk, leaving the configured value
+        // misleadingly higher than reality. Used by both exhaustion
+        // error messages so diagnostics report real effort, not policy.
+        let mut attempts_made: u32 = 0;
         for attempt in 0..attempts_total {
             if attempt > 0 {
                 // Failover.md §11.9 + §3.1: full-jitter `[0, base)`.
@@ -447,6 +454,10 @@ impl Reader {
                     .saturating_mul(2)
                     .min(cfg.failover_backoff_max_ms);
             }
+            // Count the attempt only after the deadline gate above has
+            // let us through; otherwise we'd over-report attempts in
+            // the wall-clock-exhausted message.
+            attempts_made = attempts_made.saturating_add(1);
             match walk_via_tracker(
                 &mut self.tracker,
                 &cfg,
@@ -499,16 +510,22 @@ impl Reader {
                 .unwrap_or_else(|| "<no error captured>".to_string());
             return Err(fmt!(
                 SocketError,
-                "failover wall-clock budget exhausted (failover_max_duration_ms={}); last error: {}",
+                "failover wall-clock budget exhausted (failover_max_duration_ms={}) after {} attempt(s); last error: {}",
                 cfg.failover_max_duration_ms,
+                attempts_made,
                 last_msg
             ));
         }
         Err(last_err.unwrap_or_else(|| {
+            // `attempts_made` rather than `attempts_total` (the
+            // configured cap): the two are equal on natural exhaustion,
+            // but a future change to the loop's break conditions
+            // shouldn't quietly turn this into a lie about how many
+            // attempts actually ran.
             fmt!(
                 SocketError,
                 "failover exhausted after {} attempts",
-                attempts_total
+                attempts_made
             )
         }))
     }

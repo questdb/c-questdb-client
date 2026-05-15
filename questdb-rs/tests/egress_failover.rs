@@ -3580,3 +3580,58 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
         err.msg()
     );
 }
+
+/// Regression for `reconnect_with_failover`'s exhaustion-error counter:
+/// when `failover_max_duration_ms` cuts the loop short, the surfaced
+/// message must report the **actual** number of attempts that ran, not
+/// the configured `failover_max_attempts + 1` cap. Otherwise an
+/// operator reading the log sees a number that overstates the real
+/// dial pressure and points at the wrong knob to tune.
+#[test]
+fn deadline_exhaustion_reports_actual_attempt_count_not_configured_cap() {
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "x"),
+        drop_at_connect_script(),
+    ]);
+    // 50 configured attempts, but with 100ms backoffs and a 50ms
+    // budget the deadline trips after the first failed walk — actual
+    // attempts will be 1 or 2, never 51.
+    const CONFIGURED_CAP: u32 = 50;
+    let conf = format!(
+        "ws::addr={};failover_max_attempts={CONFIGURED_CAP};\
+         failover_backoff_initial_ms=100;failover_backoff_max_ms=100;\
+         failover_max_duration_ms=50",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("must fail"),
+    };
+    // The `prefer_over_trigger` logic may still surface the trigger
+    // error instead of the deadline wrapper. Only enforce the
+    // count-accuracy invariant when we actually got the deadline
+    // message — otherwise the test's premise doesn't hold.
+    if err.msg().contains("wall-clock budget exhausted") {
+        // Extract the "after N attempt(s)" number.
+        let msg = err.msg();
+        let needle = "after ";
+        let start = msg.find(needle).expect("missing 'after N attempt' phrase");
+        let rest = &msg[start + needle.len()..];
+        let end = rest.find(' ').expect("malformed attempt-count phrase");
+        let n: u32 = rest[..end].parse().expect("attempt count not a u32");
+        // Hard upper bound: anything ≥ CONFIGURED_CAP would mean the
+        // bug is back (or the message is once again hard-coding the
+        // configured cap). A handful of attempts is plausible if the
+        // first walk and one retry both fired before the 50 ms budget
+        // expired; CONFIGURED_CAP itself must never appear here.
+        assert!(
+            n < CONFIGURED_CAP,
+            "attempt count {n} ≥ configured cap {CONFIGURED_CAP} — \
+             message is reporting the configured cap instead of \
+             the actual count. msg={msg}",
+        );
+        assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
+    }
+}
