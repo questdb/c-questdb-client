@@ -234,11 +234,7 @@ impl FragMock {
                 let n = accept_count_t.fetch_add(1, Ordering::SeqCst);
                 let rows = {
                     let q = rows_t.lock().unwrap();
-                    if q.is_empty() {
-                        0
-                    } else {
-                        q[n % q.len()]
-                    }
+                    if q.is_empty() { 0 } else { q[n % q.len()] }
                 };
                 let cs = match ChunkingStream::new(stream, chunk_size) {
                     Ok(cs) => cs,
@@ -285,14 +281,15 @@ impl Drop for FragMock {
 /// read the client's QUERY_REQUEST, then emit RESULT_BATCH (rows) +
 /// RESULT_END. Errors close the connection cleanly.
 fn run_session(stream: ChunkingStream, rows: usize) {
-    let mut ws: WebSocket<ChunkingStream> = match accept_hdr(stream, |_req: &Request, mut resp: Response| {
-        resp.headers_mut()
-            .insert("x-qwp-version", HeaderValue::from_static("2"));
-        Ok(resp)
-    }) {
-        Ok(w) => w,
-        Err(_) => return,
-    };
+    let mut ws: WebSocket<ChunkingStream> =
+        match accept_hdr(stream, |_req: &Request, mut resp: Response| {
+            resp.headers_mut()
+                .insert("x-qwp-version", HeaderValue::from_static("2"));
+            Ok(resp)
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
 
     // SERVER_INFO is the first frame the reader expects post-upgrade.
     if ws
@@ -344,7 +341,9 @@ fn run_session(stream: ChunkingStream, rows: usize) {
 fn read_until_query_request(ws: &mut WebSocket<ChunkingStream>) -> Option<i64> {
     loop {
         match ws.read() {
-            Ok(Message::Binary(bytes)) if !bytes.is_empty() && bytes[0] == MSG_KIND_QUERY_REQUEST => {
+            Ok(Message::Binary(bytes))
+                if !bytes.is_empty() && bytes[0] == MSG_KIND_QUERY_REQUEST =>
+            {
                 if bytes.len() < 1 + 8 {
                     return None;
                 }
@@ -429,12 +428,7 @@ fn fragmented_back_to_back_queries() {
     for _ in 0..3 {
         let (n, sum) = run_and_sum(&url);
         assert_eq!(n, rows, "chunk={} row_count drift", chunk);
-        assert_eq!(
-            sum,
-            expected_sum(rows),
-            "chunk={} id_sum drift",
-            chunk
-        );
+        assert_eq!(sum, expected_sum(rows), "chunk={} id_sum drift", chunk);
     }
     // Sanity: each query should have produced exactly one mock accept.
     assert!(
@@ -455,12 +449,7 @@ fn fragmented_streaming_big_result() {
     let mock = FragMock::start(vec![rows], chunk);
     let (n, sum) = run_and_sum(&mock.url());
     assert_eq!(n, rows, "chunk={} row_count drift", chunk);
-    assert_eq!(
-        sum,
-        expected_sum(rows),
-        "chunk={} id_sum drift",
-        chunk
-    );
+    assert_eq!(sum, expected_sum(rows), "chunk={} id_sum drift", chunk);
 }
 
 /// Mirrors `testHandshakeSurvivesMicroChunk`. Chunk pinned at 5 — the

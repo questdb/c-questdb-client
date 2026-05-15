@@ -4534,14 +4534,9 @@ mod tests {
             let payload = Bytes::from(out);
             let mut dict = SymbolDict::new();
             let mut reg = SchemaRegistry::new();
-            let err = decode_result_batch(
-                &payload,
-                0,
-                &mut dict,
-                &mut reg,
-                &mut ZstdScratch::new(),
-            )
-            .expect_err("decoder must reject huge table name length");
+            let err =
+                decode_result_batch(&payload, 0, &mut dict, &mut reg, &mut ZstdScratch::new())
+                    .expect_err("decoder must reject huge table name length");
             assert!(
                 err.msg().contains("table name length"),
                 "error must mention table name length, got: {}",

@@ -2671,6 +2671,7 @@ fn failover_constants_reexported_at_egress_root() {
     // `const` block to satisfy `clippy::assertions_on_constants`
     // and `clippy::bool_assert_comparison` simultaneously: an
     // `assert_eq!(.., true)` lints the same as `assert!(const)`.
+    #[allow(clippy::assertions_on_constants)]
     const _: () = assert!(DEFAULT_FAILOVER_ENABLED);
     assert_eq!(DEFAULT_FAILOVER_MAX_ATTEMPTS, 8);
     assert_eq!(DEFAULT_FAILOVER_BACKOFF_INITIAL_MS, 50);

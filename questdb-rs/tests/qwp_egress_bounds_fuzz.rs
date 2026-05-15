@@ -46,10 +46,10 @@
 
 use proptest::prelude::*;
 
-use questdb::egress::ColumnKind;
 use questdb::egress::_bench_internals::{
     Bytes, SchemaRegistry, SymbolDict, ZstdScratch, decode_result_batch,
 };
+use questdb::egress::ColumnKind;
 
 // ---------------------------------------------------------------------------
 // Wire constants. Match `benches/decoder.rs` and `egress::wire::msg_kind`.
@@ -178,11 +178,7 @@ fn build_null_bitmap(row_count: usize, null_count: usize, rng: &mut SplitMix64) 
 /// bitmap, or `NULL_FLAG_PRESENT` and a bitmap with `null_count` slots
 /// set. Returns the resulting non-null count so the caller knows how many
 /// compact values to write.
-fn write_validity(
-    out: &mut Vec<u8>,
-    rng: &mut SplitMix64,
-    row_count: usize,
-) -> usize {
+fn write_validity(out: &mut Vec<u8>, rng: &mut SplitMix64, row_count: usize) -> usize {
     if row_count == 0 || !rng.gen_bool() {
         out.push(NULL_FLAG_NONE);
         return row_count;
@@ -199,12 +195,7 @@ fn write_validity(
 // Per-column body writers.
 // ---------------------------------------------------------------------------
 
-fn write_column_data(
-    out: &mut Vec<u8>,
-    rng: &mut SplitMix64,
-    kind: ColumnKind,
-    row_count: usize,
-) {
+fn write_column_data(out: &mut Vec<u8>, rng: &mut SplitMix64, kind: ColumnKind, row_count: usize) {
     use ColumnKind as K;
     match kind {
         // Non-nullable fixed-width per Rust spec (decode_fixed_non_nullable

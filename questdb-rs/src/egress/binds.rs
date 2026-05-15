@@ -923,10 +923,7 @@ mod tests {
                 expected_kind.as_u8(),
                 expected_kind.name()
             );
-            assert_eq!(
-                encoded[1], 0x00,
-                "null_flag must be 0x00 for non-null bind"
-            );
+            assert_eq!(encoded[1], 0x00, "null_flag must be 0x00 for non-null bind");
             &encoded[2..]
         }
 
