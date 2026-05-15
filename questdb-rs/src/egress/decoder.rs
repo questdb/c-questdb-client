@@ -937,9 +937,28 @@ fn decode_varlen(
         .checked_mul(4)
         .ok_or_else(|| fmt!(ProtocolError, "varlen offsets size overflow"))?;
     let offsets_bytes = r.read_bytes(offsets_byte_len)?;
-    let mut compact = Vec::with_capacity(non_null + 1);
-    for chunk in offsets_bytes.chunks_exact(4) {
-        compact.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+    let count = non_null + 1;
+    let mut compact: Vec<u32> = Vec::with_capacity(count);
+    // Bulk copy the LE wire bytes into the `Vec<u32>` backing buffer. On
+    // little-endian targets this is the entire decode — one `memcpy`, no
+    // per-row `from_le_bytes` / `try_into` / `push` shuffle. The source is
+    // `&[u8]`, so source alignment is irrelevant; the destination is a
+    // `Vec<u32>` of exactly `count` elements (= `offsets_byte_len` bytes).
+    //
+    // SAFETY: `compact`'s capacity is `count` u32s = `offsets_byte_len`
+    // bytes; we copy exactly that many bytes from a non-overlapping slice
+    // of the same length, then set the length.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            offsets_bytes.as_ptr(),
+            compact.as_mut_ptr().cast::<u8>(),
+            offsets_byte_len,
+        );
+        compact.set_len(count);
+    }
+    #[cfg(target_endian = "big")]
+    for v in &mut compact {
+        *v = v.swap_bytes();
     }
 
     // Validate offsets are monotonically non-decreasing and start at 0.
