@@ -54,6 +54,45 @@ use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
 
+// ============================================================================
+// PHASE 1 SERVER COMPATIBILITY — bind-type gap
+// ============================================================================
+//
+// Single source of truth for the bind types the Phase 1 server doesn't
+// accept. Every client-side rejection / encoder note in this file
+// references this block by the literal marker `PHASE 1 SERVER
+// COMPATIBILITY` so enabling a type later is one grep.
+//
+// TODO(phase-1-binds): link tracking issue.
+//
+// Reference: `core/src/main/java/io/questdb/cutlass/qwp/server/egress/QwpEgressRequestDecoder.java`
+// `decodeBind` switch.
+//
+// - **BINARY (0x17), IPv4 (0x18)** — no decoder case on the server;
+//   fall into `default ->` with "unsupported wire type". Client rejects
+//   in `check_bindable` so the user sees a typed `InvalidBind` instead
+//   of an out-of-band `QUERY_ERROR` that arrives with `request_id=0`
+//   and breaks correlation.
+// - **DOUBLE_ARRAY (0x11), LONG_ARRAY (0x12)** — explicit server case
+//   throwing "ARRAY bind parameters not yet supported in Phase 1
+//   egress". The QWP spec (§6 "Bind parameters") describes the
+//   eventual array bind encoding (per-row dimension header), so this
+//   is a Phase 1 limitation that may be lifted server-side.
+// - **SYMBOL (0x09)** — defensive. The Phase 1 server currently
+//   accepts SYMBOL bind type codes leniently, dispatching them to
+//   `BindVariableService.setStr` (spec §6 "Server leniency note"). The
+//   spec instructs compliant clients to send STRING / VARCHAR for
+//   symbol binds, and a future server revision may tighten this. The
+//   Rust `Bind` enum has no `Symbol(_)` value variant and
+//   `SimpleNullKind` excludes `Symbol`, so this arm is unreachable
+//   through the typed API; it stays as a defense against any future
+//   code path that synthesises a SYMBOL-kinded `Bind`.
+//
+// Encoder arms for IPv4 / Binary remain wired for forward
+// compatibility — when the server lifts a restriction the bytes are
+// already correct and only `check_bindable` needs editing.
+// ============================================================================
+
 /// Inclusive upper bound on a DECIMAL column's scale, matching the
 /// server's `Decimals.MAX_SCALE`. Negative scales and scales above
 /// this bound are rejected client-side at encode time so the user
@@ -68,15 +107,9 @@ pub const MAX_DECIMAL_SCALE: i8 = 38;
 /// (DECIMAL\* scale, GEOHASH precision_bits) or have a different null
 /// layout (VARCHAR, BINARY) and use a dedicated `Null*` variant.
 ///
-/// SYMBOL is also excluded: per the QWP egress spec (§6 "Bind
-/// parameters"), compliant clients send symbol binds as STRING /
-/// VARCHAR — there is no need for a SYMBOL wire type code on the bind
-/// path (the server is lenient and accepts it for now, but the spec
-/// instructs clients not to emit it). DOUBLE_ARRAY / LONG_ARRAY are
-/// excluded because the Phase 1 server rejects array binds with "not
-/// yet supported"; the spec describes the eventual encoding (per-row
-/// dimension header), so this exclusion may be lifted when the server
-/// implements them.
+/// SYMBOL, DOUBLE_ARRAY, LONG_ARRAY are excluded — see `PHASE 1 SERVER
+/// COMPATIBILITY` block at the top of this module for the server-side
+/// rationale and the conditions under which each may be re-enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SimpleNullKind {
@@ -152,9 +185,10 @@ impl TryFrom<ColumnKind> for SimpleNullKind {
 /// metadata have dedicated `Null*` variants; everything else uses
 /// [`Bind::Null`].
 ///
-/// `#[non_exhaustive]` so future bind types (e.g. when array binds are
-/// promoted out of the Phase 1 limitation) can be added without
-/// breaking exhaustive matches in user code.
+/// `#[non_exhaustive]` so future bind types (e.g. when the server
+/// lifts the array-bind restriction documented in the `PHASE 1 SERVER
+/// COMPATIBILITY` block at module top) can be added without breaking
+/// exhaustive matches in user code.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Bind {
@@ -387,17 +421,11 @@ pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
         }
         Bind::Uuid(b) => out.extend_from_slice(b),
         Bind::Long256(b) => out.extend_from_slice(b),
-        // The Phase 1 server rejects IPv4 and BINARY bind type codes
-        // outright (no decoder case → "unsupported wire type"), and
-        // rejects array binds with "not yet supported in Phase 1". The
-        // server accepts SYMBOL leniently (spec §6) but compliant
-        // clients send STRING / VARCHAR. `check_bindable` surfaces all
-        // of these client-side. The `Bind::Ipv4` / `Bind::Binary` arms
-        // below are reachable only if the bind-set is encoded without
-        // going through `QueryRequestBuilder::build` — we keep the wire
-        // encoding for completeness and forward compatibility, so when
-        // the server lifts a restriction the encoder is already
-        // correct.
+        // `Bind::Ipv4` / `Bind::Binary` are normally rejected client-side
+        // by `check_bindable` — see `PHASE 1 SERVER COMPATIBILITY` at
+        // module top. The encoder arms stay wired for forward
+        // compatibility and to handle bind-sets encoded without going
+        // through `QueryRequestBuilder::build`.
         Bind::Ipv4(addr) => out.extend_from_slice(&u32::from(*addr).to_le_bytes()),
         Bind::Decimal64 { value, .. } => out.extend_from_slice(&value.to_le_bytes()),
         Bind::Decimal128 { value, .. } => out.extend_from_slice(&value.to_le_bytes()),
@@ -431,31 +459,14 @@ fn write_varlen_offsets(byte_lens: &[usize], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Reject bind kinds whose wire type code the Phase 1 server doesn't
-/// decode. Surfacing the rejection client-side avoids ambiguous server
-/// errors (the server's QUERY_ERROR for these arrives with
-/// `request_id=0`, breaking correlation).
+/// Reject bind kinds the Phase 1 server doesn't decode, so the user
+/// sees a typed `InvalidBind` instead of a server `QUERY_ERROR` whose
+/// `request_id=0` breaks correlation.
 ///
-/// Reference: `core/src/main/java/io/questdb/cutlass/qwp/server/egress/QwpEgressRequestDecoder.java`
-/// `decodeBind` switch.
-///
-/// - **BINARY (0x17), IPv4 (0x18)**: no decoder case — fall into the
-///   `default ->` arm with "unsupported wire type".
-/// - **DOUBLE_ARRAY (0x11), LONG_ARRAY (0x12)**: explicit case throwing
-///   "ARRAY bind parameters not yet supported in Phase 1 egress". The
-///   QWP spec (§6 "Bind parameters") describes the eventual array bind
-///   encoding (per-row dimension header), so this is a Phase 1
-///   limitation that may be lifted server-side.
-/// - **SYMBOL (0x09)** is listed defensively. The Phase 1 server
-///   currently accepts SYMBOL bind type codes leniently, dispatching
-///   them to `BindVariableService.setStr` (spec §6 "Server leniency
-///   note"). However, the spec instructs compliant clients to send
-///   STRING / VARCHAR for symbol binds — and a future server revision
-///   may tighten this to reject SYMBOL bind type codes. The Rust
-///   `Bind` enum has no `Symbol(_)` value variant, and
-///   [`SimpleNullKind`] excludes Symbol, so this arm is unreachable
-///   through the typed API; it stays here as a defense against any
-///   future code path that might synthesise a SYMBOL-kinded `Bind`.
+/// Set membership (Symbol, Binary, Ipv4, DoubleArray, LongArray) and
+/// the per-kind server-side rationale are documented once in the
+/// `PHASE 1 SERVER COMPATIBILITY` block at the top of this module —
+/// keep that block in sync if this match list changes.
 pub fn check_bindable(kind: ColumnKind) -> Result<()> {
     match kind {
         ColumnKind::Symbol

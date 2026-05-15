@@ -38,7 +38,7 @@
 static int closed_port_phase(void)
 {
     line_sender_utf8 conf =
-        QDB_UTF8_LITERAL("qwp::addr=127.0.0.1:1;");
+        QDB_UTF8_LITERAL("ws::addr=127.0.0.1:1;");
 
     line_reader_error* err = NULL;
     line_reader* reader = line_reader_from_conf(conf, &err);
@@ -101,7 +101,7 @@ static int live_lifecycle_phase(const char* addr)
      */
     char conf_buf[256];
     int n = snprintf(
-        conf_buf, sizeof(conf_buf), "qwp::addr=%s;failover=off", addr);
+        conf_buf, sizeof(conf_buf), "ws::addr=%s;failover=off", addr);
     if (n <= 0 || (size_t)n >= sizeof(conf_buf))
     {
         fprintf(

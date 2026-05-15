@@ -132,7 +132,7 @@ fn start_fragmented(chunk: u32) -> QuestDbServer {
 }
 
 fn make_reader(srv: &QuestDbServer) -> Reader {
-    Reader::from_conf(srv.ws_conf()).expect("reader")
+    Reader::from_conf(srv.qwp_conf()).expect("reader")
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ fn wait_for_rows(srv: &QuestDbServer, table: &str, expected: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let sql = format!("select count(*) from \"{table}\"");
     while std::time::Instant::now() < deadline {
-        if let Ok(mut r) = Reader::from_conf(srv.ws_conf())
+        if let Ok(mut r) = Reader::from_conf(srv.qwp_conf())
             && let Ok(mut cur) = r.prepare(&sql).execute()
             && let Ok(Some(view)) = cur.next_batch()
             && let Ok(c) = view.column(0)

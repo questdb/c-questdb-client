@@ -61,7 +61,7 @@ namespace
 // Connect target that is virtually never bound on a developer machine —
 // 127.0.0.1:1 is in the system reserved range and rejects connections
 // fast on every supported platform.
-constexpr const char* CLOSED_PORT_CONF = "qwp::addr=127.0.0.1:1;";
+constexpr const char* CLOSED_PORT_CONF = "ws::addr=127.0.0.1:1;";
 
 } // namespace
 
@@ -238,14 +238,14 @@ TEST_CASE("from_conf rejects malformed config strings as ConfigError")
     };
     const case_t cases[] = {
         {"", "empty config"},
-        {"qwp::", "missing addr key"},
+        {"ws::", "missing addr key"},
         {"unknown_scheme::addr=127.0.0.1:9000;", "unknown scheme"},
-        {"qwp::addr=h:1;mystery_key=x;", "unknown parameter"},
-        {"qwp::addr=h:1;username=u;password=p;token=t;",
+        {"ws::addr=h:1;mystery_key=x;", "unknown parameter"},
+        {"ws::addr=h:1;username=u;password=p;token=t;",
          "conflicting auth parameters"},
-        {"qwp::addr=h:notaport;", "non-numeric port"},
-        {"qwp::addr=h:1;compression=xyz;", "invalid compression value"},
-        {"qwp::addr=h:1;target=leader;", "invalid target value"},
+        {"ws::addr=h:notaport;", "non-numeric port"},
+        {"ws::addr=h:1;compression=xyz;", "invalid compression value"},
+        {"ws::addr=h:1;target=leader;", "invalid target value"},
     };
 
     for (const auto& c : cases)
@@ -341,7 +341,7 @@ TEST_CASE("from_env distinguishes invalid-UTF-8 env value from unset")
     // Windows because _putenv_s takes a UTF-8 string and won't store
     // invalid bytes — there's no portable way to reproduce the
     // VarError::NotUnicode path there.
-    REQUIRE(setenv("QDB_CLIENT_CONF", "qwp::addr=h:1\xC3\x28", 1) == 0);
+    REQUIRE(setenv("QDB_CLIENT_CONF", "ws::addr=h:1\xC3\x28", 1) == 0);
 
     line_reader_error* err = nullptr;
     line_reader* r = line_reader_from_env(&err);
@@ -386,7 +386,7 @@ TEST_CASE("C++ wrapper converts C error to thrown line_reader_error")
     bool threw = false;
     try
     {
-        reader r{"qwp::"_utf8}; // missing addr → ConfigError
+        reader r{"ws::"_utf8}; // missing addr → ConfigError
         (void)r;
     }
     catch (const line_reader_error& e)

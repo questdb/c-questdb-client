@@ -282,7 +282,7 @@ public:
     MockServer(const MockServer&) = delete;
     MockServer& operator=(const MockServer&) = delete;
 
-    // "127.0.0.1:NNNN" — use to build the reader's `qwp::addr=...`.
+    // "127.0.0.1:NNNN" — use to build the reader's `ws::addr=...`.
     std::string addr() const;
 
     // Number of TCP connections accepted so far.

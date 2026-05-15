@@ -29,7 +29,7 @@
 //! The mock here wraps a `TcpListener` in a `rustls::ServerConfig`
 //! seeded from the checked-in self-signed certs and runs the WS
 //! upgrade through `tungstenite::accept_hdr` over the live TLS
-//! stream — exercising the full `qwps://` connect path the way a
+//! stream — exercising the full `wss://` connect path the way a
 //! real broker would.
 
 #![cfg(feature = "sync-reader-ws")]
@@ -52,7 +52,7 @@ use tungstenite::{Message, accept_hdr};
 
 // ---------------------------------------------------------------------------
 // Wire helpers (subset of egress_failover.rs — duplicated here so this file
-// stays standalone and we can grep "qwps" or "TLS" without false positives
+// stays standalone and we can grep "wss" or "TLS" without false positives
 // from the much larger failover suite).
 // ---------------------------------------------------------------------------
 
@@ -296,7 +296,7 @@ fn serve_one(tcp: TcpStream, cfg: Arc<ServerConfig>) {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Happy path: a `qwps://` client trusting the test self-signed CA
+/// Happy path: a `wss://` client trusting the test self-signed CA
 /// connects, runs a query end-to-end through the encrypted channel,
 /// and sees the cursor reach `RESULT_END`. Pins the full TLS path —
 /// rustls handshake + tungstenite WS upgrade + QWP frame exchange.
@@ -304,7 +304,7 @@ fn serve_one(tcp: TcpStream, cfg: Arc<ServerConfig>) {
 fn qwps_handshake_succeeds_with_pem_root() {
     let srv = TlsMockServer::start();
     let conf = format!(
-        "qwps::addr={};tls_ca=pem_file;tls_roots={};failover=off",
+        "wss::addr={};tls_ca=pem_file;tls_roots={};failover=off",
         srv.url(),
         root_ca_path().display()
     );
@@ -334,7 +334,7 @@ fn qwps_handshake_fails_against_unknown_ca_with_tls_error() {
     // Default tls_ca=webpki_roots; no `tls_roots` override. The
     // self-signed CA isn't in webpki's bundle so verification must
     // fail before the WS upgrade is even attempted.
-    let conf = format!("qwps::addr={};failover=off", srv.url());
+    let conf = format!("wss::addr={};failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Err(e) => e,
         Ok(_) => panic!("connect must fail when the server cert chain doesn't validate"),
@@ -348,7 +348,7 @@ fn qwps_handshake_fails_against_unknown_ca_with_tls_error() {
     );
 }
 
-/// Negative path: a `qwp://` (plain TCP) client against a TLS server.
+/// Negative path: a `ws://` (plain TCP) client against a TLS server.
 /// The server reads the client's HTTP upgrade bytes as TLS records,
 /// fails the handshake, and tears the connection down. The client
 /// sees a closed connection mid-handshake — we don't pin the exact
@@ -359,7 +359,7 @@ fn qwps_handshake_fails_against_unknown_ca_with_tls_error() {
 #[test]
 fn qwp_plain_client_against_tls_server_fails() {
     let srv = TlsMockServer::start();
-    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let conf = format!("ws::addr={};failover=off", srv.url());
     // Bound how long we tolerate the doomed handshake — a stuck
     // mock would otherwise hang the test indefinitely. Any of the
     // listed error codes is an acceptable failure mode.
@@ -398,7 +398,7 @@ fn qwp_plain_client_against_tls_server_fails() {
 #[test]
 fn qwps_handshake_fails_against_unknown_ca_with_os_roots() {
     let srv = TlsMockServer::start();
-    let conf = format!("qwps::addr={};tls_ca=os_roots;failover=off", srv.url());
+    let conf = format!("wss::addr={};tls_ca=os_roots;failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Err(e) => e,
         Ok(_) => panic!(
@@ -425,7 +425,7 @@ fn qwps_handshake_fails_against_unknown_ca_with_os_roots() {
 fn qwps_handshake_fails_against_unknown_ca_with_webpki_and_os_roots() {
     let srv = TlsMockServer::start();
     let conf = format!(
-        "qwps::addr={};tls_ca=webpki_and_os_roots;failover=off",
+        "wss::addr={};tls_ca=webpki_and_os_roots;failover=off",
         srv.url()
     );
     let err = match Reader::from_conf(&conf) {
@@ -458,10 +458,7 @@ fn qwps_handshake_fails_against_unknown_ca_with_webpki_and_os_roots() {
 #[test]
 fn qwps_unsafe_off_skips_verification_against_untrusted_cert() {
     let srv = TlsMockServer::start();
-    let conf = format!(
-        "qwps::addr={};tls_verify=unsafe_off;failover=off",
-        srv.url()
-    );
+    let conf = format!("wss::addr={};tls_verify=unsafe_off;failover=off", srv.url());
     let mut reader = Reader::from_conf(&conf).expect(
         "tls_verify=unsafe_off must accept any cert; if this errored, the \
          NoCertificateVerification verifier was not wired in",

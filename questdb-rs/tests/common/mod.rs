@@ -307,19 +307,11 @@ impl QuestDbServer {
         );
     }
 
-    /// `qwp::` connect string for the egress reader. Kept for the
-    /// existing pinned-value tests in `egress_live_server.rs`; new
-    /// tests should prefer [`Self::ws_conf`] which matches the current
-    /// post-`8e6dba3` scheme name on `vi_egress`.
+    /// `ws::` connect string for the egress reader. Returns the
+    /// post-`8e6dba3` scheme that `vi_egress`'s parser accepts; the
+    /// function name predates that rename and is kept for source
+    /// stability across the merge.
     pub fn qwp_conf(&self) -> String {
-        format!("qwp::addr={}:{}", self.host, self.http_port)
-    }
-
-    /// `ws::` connect string for the egress reader. Tracks the
-    /// post-`8e6dba3 "qwp:: -> ws::"` scheme rename on `vi_egress`,
-    /// which is what `refs/pull/142/merge` exercises in CI. New fuzz
-    /// tests use this form so they work against the merge commit.
-    pub fn ws_conf(&self) -> String {
         format!("ws::addr={}:{}", self.host, self.http_port)
     }
 

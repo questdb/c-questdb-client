@@ -716,7 +716,7 @@ impl Drop for DeadEndpoint {
 #[test]
 fn happy_path_no_failover() {
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n1")]);
-    let conf = format!("qwp::addr={}", srv.url());
+    let conf = format!("ws::addr={}", srv.url());
     let mut reader = Reader::from_conf(&conf).expect("connect");
 
     // Verify the on_failover_reset callback is NEVER invoked when the
@@ -766,7 +766,7 @@ fn cache_reset_mid_stream_does_not_break_cursor() {
         Action::SendRaw(cache_reset_frame(0x03)), // clear both
         Action::SendResultEnd,
     ]]);
-    let conf = format!("qwp::addr={}", srv.url());
+    let conf = format!("ws::addr={}", srv.url());
     let mut reader = Reader::from_conf(&conf).expect("connect");
     let mut cursor = reader.prepare("select 1").execute().expect("execute");
     // The CacheReset events must not surface as Err or as a phantom
@@ -787,7 +787,7 @@ fn mid_query_close_triggers_failover() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -910,7 +910,7 @@ fn pre_batch_failover_without_callback_still_replays() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -997,7 +997,7 @@ fn add_credit_failover_post_conditions_are_consistent() {
     ]]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -1093,7 +1093,7 @@ fn add_credit_with_failover_disabled_never_dials_b() {
     ]]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover=off",
+        "ws::addr={};failover=off",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -1131,7 +1131,7 @@ fn failover_disabled_surfaces_socket_error() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover=off",
+        "ws::addr={};failover=off",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
@@ -1182,7 +1182,7 @@ fn attempts_exhausted_surfaces_error() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
@@ -1238,7 +1238,7 @@ fn reader_poisoned_after_failover_exhaustion_returns_err_not_panic() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
@@ -1283,7 +1283,7 @@ fn mid_query_auth_failure_not_retried() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![vec![Action::Reject401]]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=5;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=5;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -1309,7 +1309,7 @@ fn initial_connect_walks_all_endpoints() {
     // `reserve_then_close_addr` helper flake on macOS).
     let dead = DeadEndpoint::new();
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
-    let conf = format!("qwp::addr={},{}", dead.url(), srv_b.url());
+    let conf = format!("ws::addr={},{}", dead.url(), srv_b.url());
     let mut reader = Reader::from_conf(&conf).expect("walk past unreachable");
     assert_eq!(
         reader.current_addr().port,
@@ -1341,7 +1341,7 @@ fn backoff_bounded_by_jitter_ceiling() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=3;failover_backoff_initial_ms=20;failover_backoff_max_ms=200",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=20;failover_backoff_max_ms=200",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
@@ -1384,7 +1384,7 @@ fn cancelling_cursor_does_not_failover_on_drop() {
     ]]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -1451,7 +1451,7 @@ fn failover_suppressed_when_drop_arrives_during_cancel_drain() {
     // untouched.
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -1526,7 +1526,7 @@ fn single_endpoint_failover_exhausts_budget() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
@@ -1589,7 +1589,7 @@ fn write_fail_after_reconnect_terminates_or_recovers_via_outer_loop() {
         "b",
     )]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -1663,7 +1663,7 @@ fn failover_event_attempts_is_cumulative_across_rotations() {
     // (skip-failed-first), fails, then continues to A's recovered slot.
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -1708,7 +1708,7 @@ fn backoff_caps_at_max_ms() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=8;failover_backoff_initial_ms=10;failover_backoff_max_ms=20",
+        "ws::addr={};failover_max_attempts=8;failover_backoff_initial_ms=10;failover_backoff_max_ms=20",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
@@ -1751,7 +1751,7 @@ fn role_filter_propagates_through_failover() {
     ]);
     let c = MockServer::start(vec![happy_script(ServerRole::Replica, "c")]);
     let conf = format!(
-        "qwp::addr={};target=primary;failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};target=primary;failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&a, &b, &c])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to B");
@@ -1811,7 +1811,7 @@ fn decode_error_does_not_trigger_failover_and_closes_transport() {
     ]]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -1923,7 +1923,7 @@ fn cancel_write_failure_does_not_trigger_failover() {
     ]]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -1967,7 +1967,7 @@ fn unable_to_connect_classifies_as_socket_error() {
     // `SocketError`. A regression flipping it back to `ConfigError`
     // — or to anything non-failover-eligible — goes red here.
     let dead = DeadEndpoint::new();
-    let conf = format!("qwp::addr={}", dead.url());
+    let conf = format!("ws::addr={}", dead.url());
     let err = match Reader::from_conf(&conf) {
         Err(e) => e,
         Ok(_) => panic!("connecting to a closed port must error"),
@@ -1993,7 +1993,7 @@ fn initial_connect_bails_immediately_on_auth_error() {
     // bail on A's 401 without ever dialing B.
     let srv_a = MockServer::start(vec![vec![Action::Reject401]]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
-    let conf = format!("qwp::addr={}", build_addr_list(&[&srv_a, &srv_b]));
+    let conf = format!("ws::addr={}", build_addr_list(&[&srv_a, &srv_b]));
 
     let err = match Reader::from_conf(&conf) {
         Err(e) => e,
@@ -2032,7 +2032,7 @@ fn initial_connect_auth_terminal_regardless_of_position_in_addr_list() {
     // the simpler invariant: 401 alone, no fallback, surfaces as
     // `AuthError`.
     let srv = MockServer::start(vec![vec![Action::Reject401]]);
-    let conf = format!("qwp::addr={}", srv.url());
+    let conf = format!("ws::addr={}", srv.url());
     let err = match Reader::from_conf(&conf) {
         Err(e) => e,
         Ok(_) => panic!("401 must surface as AuthError"),
@@ -2066,7 +2066,7 @@ fn replay_preserves_payload_and_changes_request_id() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -2184,7 +2184,7 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -2265,7 +2265,7 @@ fn cursor_current_addr_tracks_failover_endpoint_switch() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -2365,7 +2365,7 @@ fn failover_callback_runs_before_replayed_read() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -2456,7 +2456,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&s0, &s1, &s2, &s3])
     );
 
@@ -2516,7 +2516,7 @@ fn on_failover_reset_callback_replacement() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -2591,7 +2591,7 @@ fn all_role_mismatch_endpoints_during_failover_surfaces_role_mismatch() {
     let b = MockServer::start(vec![happy_script(ServerRole::Replica, "b")]);
     let c = MockServer::start(vec![happy_script(ServerRole::Replica, "c")]);
     let conf = format!(
-        "qwp::addr={};target=primary;failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};target=primary;failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&a, &b, &c])
     );
 
@@ -2685,7 +2685,7 @@ fn failover_constants_reexported_at_egress_root() {
     // const but forgets the parser default, or vice versa), users
     // who compare against the constants would see surprising
     // behaviour at runtime — pin the equality.
-    let cfg = questdb::egress::ReaderConfig::from_conf("qwp::addr=h:1").expect("parse");
+    let cfg = questdb::egress::ReaderConfig::from_conf("ws::addr=h:1").expect("parse");
     assert_eq!(cfg.failover, DEFAULT_FAILOVER_ENABLED);
     assert_eq!(cfg.failover_max_attempts, DEFAULT_FAILOVER_MAX_ATTEMPTS);
     assert_eq!(
@@ -2711,7 +2711,7 @@ fn unsupported_server_version_surfaces_handshake_error() {
         // advertises; the trigger is `server_version > max_version`.
         Action::HandshakeVersion(99),
     ]]);
-    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let conf = format!("ws::addr={};failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("connect must reject a higher-than-max QWP version"),
         Err(e) => e,
@@ -2740,7 +2740,7 @@ fn unresolvable_host_surfaces_could_not_resolve_addr() {
     // RFC 6761 guarantees `.invalid` is never resolvable. Subdomain
     // padding keeps it out of any local /etc/hosts override that
     // might intercept a bare label.
-    let conf = "qwp::addr=does-not-exist.qwp-test.invalid:9009;failover=off";
+    let conf = "ws::addr=does-not-exist.qwp-test.invalid:9009;failover=off";
     let err = match Reader::from_conf(conf) {
         Ok(_) => panic!("connect must fail when DNS does not resolve"),
         Err(e) => e,
@@ -2771,7 +2771,7 @@ fn unresolvable_host_surfaces_could_not_resolve_addr() {
 /// recorded — every test that calls this expects exactly one accept.
 fn capture_auth_header_for_conf(conf_suffix: &str) -> Option<String> {
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
-    let conf = format!("qwp::addr={};{}", srv.url(), conf_suffix);
+    let conf = format!("ws::addr={};{}", srv.url(), conf_suffix);
     let mut reader = Reader::from_conf(&conf).expect("connect");
     let mut cursor = reader.prepare("select 1").execute().expect("execute");
     // Drain to terminal so the test only returns once the upgrade
@@ -2820,7 +2820,7 @@ fn verbatim_auth_header_emitted_on_wire() {
 #[test]
 fn no_auth_means_no_authorization_header() {
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
-    let conf = format!("qwp::addr={}", srv.url());
+    let conf = format!("ws::addr={}", srv.url());
     let mut reader = Reader::from_conf(&conf).expect("connect");
     let mut cursor = reader.prepare("select 1").execute().expect("execute");
     while cursor.next_batch().expect("next_batch").is_some() {}
@@ -2839,7 +2839,7 @@ fn no_auth_means_no_authorization_header() {
 fn auth_header_is_emitted_before_401_rejection() {
     let srv = MockServer::start(vec![vec![Action::Reject401]]);
     let conf = format!(
-        "qwp::addr={};username=admin;password=quest;failover=off",
+        "ws::addr={};username=admin;password=quest;failover=off",
         srv.url()
     );
     let err = match Reader::from_conf(&conf) {
@@ -2869,7 +2869,7 @@ fn upgrade_421_with_primary_catchup_surfaces_transient_role_mismatch() {
         role: Some("PRIMARY_CATCHUP".into()),
         zone: Some("eu-west-1a".into()),
     }]]);
-    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let conf = format!("ws::addr={};failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("421 + X-QuestDB-Role must surface as RoleMismatch"),
         Err(e) => e,
@@ -2902,7 +2902,7 @@ fn upgrade_421_with_replica_role_surfaces_topological_role_mismatch() {
         role: Some("REPLICA".into()),
         zone: None,
     }]]);
-    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let conf = format!("ws::addr={};failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("421 + REPLICA role must surface as RoleMismatch"),
         Err(e) => e,
@@ -2926,7 +2926,7 @@ fn upgrade_421_without_role_header_is_generic_handshake_error() {
         role: None,
         zone: None,
     }]]);
-    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let conf = format!("ws::addr={};failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("421 with no role header still rejects connect"),
         Err(e) => e,
@@ -2956,7 +2956,7 @@ fn upgrade_421_with_unknown_role_classifies_topological() {
         role: Some("future_role_we_dont_know".into()),
         zone: None,
     }]]);
-    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let conf = format!("ws::addr={};failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("unknown 421 role still rejects"),
         Err(e) => e,
@@ -2977,7 +2977,7 @@ fn upgrade_421_with_unknown_role_classifies_topological() {
 #[test]
 fn server_info_target_mismatch_attaches_upgrade_reject() {
     let srv = MockServer::start(vec![happy_script(ServerRole::Replica, "node-r1")]);
-    let conf = format!("qwp::addr={};target=primary;failover=off", srv.url());
+    let conf = format!("ws::addr={};target=primary;failover=off", srv.url());
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("target=primary against REPLICA must reject"),
         Err(e) => e,
@@ -3028,7 +3028,7 @@ fn tracker_prefers_unknown_over_transport_error_on_reconnect() {
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let srv_c = MockServer::start(vec![happy_script(ServerRole::Standalone, "c")]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         // A first so initial walk lands on A (lowest-index Unknown).
         build_addr_list(&[&srv_a, &srv_b, &srv_c])
     );
@@ -3110,7 +3110,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
         happy_script(ServerRole::Standalone, "b-recovered"),
     ]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -3157,7 +3157,7 @@ fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=0;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=0;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         srv.url()
     );
     // `failover_max_attempts=0` is rejected at config parse
@@ -3193,7 +3193,7 @@ fn initial_connect_does_not_run_fall_through_reset() {
     let srv_a = MockServer::start(vec![drop_at_connect_script()]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "qwp::addr={};failover=off",
+        "ws::addr={};failover=off",
         build_addr_list(&[&srv_a, &srv_b])
     );
     assert!(
@@ -3236,7 +3236,7 @@ fn mid_stream_demote_happens_before_walk_picks_next() {
     ]);
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
     let conf = format!(
-        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -3279,7 +3279,7 @@ fn auth_timeout_bounds_upgrade_stall() {
     let timeout_ms = 200u64;
     let srv = MockServer::start(vec![vec![Action::StallUpgrade(stall)]]);
     let conf = format!(
-        "qwp::addr={};failover=off;auth_timeout_ms={}",
+        "ws::addr={};failover=off;auth_timeout_ms={}",
         srv.url(),
         timeout_ms
     );
@@ -3328,7 +3328,7 @@ fn auth_timeout_does_not_fire_within_budget() {
     // No stall — the mock answers the upgrade promptly. `auth_timeout_ms`
     // should not interfere with a normal connect.
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
-    let conf = format!("qwp::addr={};failover=off;auth_timeout_ms=5000", srv.url());
+    let conf = format!("ws::addr={};failover=off;auth_timeout_ms=5000", srv.url());
     let mut reader = Reader::from_conf(&conf).expect("connect must succeed within budget");
     // Sanity: cursor still works after the upgrade clears the
     // `auth_timeout_ms` read deadline.
@@ -3361,7 +3361,7 @@ fn server_info_timeout_bounds_post_upgrade_stall() {
     // via `from_conf` and override the field before opening the
     // Reader. Matches the Java reference's `withServerInfoTimeout`
     // surface.
-    let mut cfg = ReaderConfig::from_conf(format!("qwp::addr={};failover=off", srv.url()))
+    let mut cfg = ReaderConfig::from_conf(format!("ws::addr={};failover=off", srv.url()))
         .expect("conf parse");
     cfg.server_info_timeout_ms = 100;
 
@@ -3406,7 +3406,7 @@ fn server_info_timeout_does_not_fire_within_budget() {
     use questdb::egress::ReaderConfig;
 
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
-    let mut cfg = ReaderConfig::from_conf(format!("qwp::addr={};failover=off", srv.url()))
+    let mut cfg = ReaderConfig::from_conf(format!("ws::addr={};failover=off", srv.url()))
         .expect("conf parse");
     cfg.server_info_timeout_ms = 5_000;
 
@@ -3430,7 +3430,7 @@ fn server_info_timeout_does_not_fire_within_budget() {
 #[test]
 fn zone_knob_is_compatible_with_v2_server_without_cap_zone() {
     let srv = MockServer::start(vec![happy_script(ServerRole::Primary, "p0")]);
-    let conf = format!("qwp::addr={};zone=eu-west-1a;target=primary", srv.url());
+    let conf = format!("ws::addr={};zone=eu-west-1a;target=primary", srv.url());
     // `target=primary` collapses every host's zone tier to `Same`
     // regardless of the client's `zone=` — writers follow the master
     // across zones (failover.md §2). So a server without CAP_ZONE
@@ -3449,7 +3449,7 @@ fn zone_knob_is_compatible_with_v2_server_without_cap_zone() {
 #[test]
 fn zone_unset_on_server_does_not_block_connect() {
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
-    let conf = format!("qwp::addr={};zone=eu-west-1a", srv.url());
+    let conf = format!("ws::addr={};zone=eu-west-1a", srv.url());
     let reader = Reader::from_conf(&conf).expect("connect must succeed without server zone");
     assert_eq!(reader.current_addr().port, srv.addr.port());
 }
@@ -3470,7 +3470,7 @@ fn failover_max_duration_caps_total_wall_clock() {
     // deadline. With failover_max_duration_ms=120ms, the deadline
     // must intervene.
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=100;\
+        "ws::addr={};failover_max_attempts=100;\
          failover_backoff_initial_ms=200;failover_backoff_max_ms=200;\
          failover_max_duration_ms=120",
         srv.url()
@@ -3519,7 +3519,7 @@ fn failover_max_duration_zero_means_unbounded() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=1;\
+        "ws::addr={};failover_max_attempts=1;\
          failover_backoff_initial_ms=1;failover_backoff_max_ms=2;\
          failover_max_duration_ms=0",
         srv.url()
@@ -3553,7 +3553,7 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
     ]);
     // Large attempts cap, small duration cap → deadline trips first.
     let conf = format!(
-        "qwp::addr={};failover_max_attempts=50;\
+        "ws::addr={};failover_max_attempts=50;\
          failover_backoff_initial_ms=100;failover_backoff_max_ms=100;\
          failover_max_duration_ms=50",
         srv.url()

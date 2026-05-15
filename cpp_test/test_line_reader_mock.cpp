@@ -48,7 +48,7 @@ namespace
 
 questdb::egress::reader connect_to(const qm::MockServer& srv)
 {
-    const std::string conf = "qwp::addr=" + srv.addr() + ";";
+    const std::string conf = "ws::addr=" + srv.addr() + ";";
     return questdb::egress::reader{questdb::ingress::utf8_view{conf}};
 }
 
@@ -836,7 +836,7 @@ TEST_CASE("mock: add_credit failover on write failure replays credit on B")
     qm::MockServer srv_a({s_a});
     qm::MockServer srv_b({s_b});
 
-    const std::string conf = "qwp::addr=" + srv_a.addr() + "," + srv_b.addr() +
+    const std::string conf = "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
         ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
 
@@ -928,7 +928,7 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
     qm::MockServer srv_b({s_b});
 
     const std::string conf =
-        "qwp::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
         ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
 
@@ -1430,7 +1430,7 @@ TEST_CASE("mock: WebSocket upgrade rejected with 401 surfaces a connect-time err
     qm::Script s = {qm::ActionReject401{}};
     qm::MockServer srv({s});
 
-    const std::string conf = "qwp::addr=" + srv.addr() + ";";
+    const std::string conf = "ws::addr=" + srv.addr() + ";";
     line_sender_utf8 c{conf.size(), conf.c_str()};
     line_reader_error* err = nullptr;
     line_reader* r = line_reader_from_conf(c, &err);
@@ -1459,7 +1459,7 @@ TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
     qm::MockServer srv1({{qm::ActionReject401{}}});
     qm::MockServer srv2({{qm::ActionReject401{}}});
     const std::string conf =
-        "qwp::addr=" + srv1.addr() + "," + srv2.addr() + ";";
+        "ws::addr=" + srv1.addr() + "," + srv2.addr() + ";";
     line_sender_utf8 c{conf.size(), conf.c_str()};
     line_reader_error* err = nullptr;
     line_reader* r = line_reader_from_conf(c, &err);
@@ -2278,7 +2278,7 @@ TEST_CASE("mock: failover event exposes new_request_id, elapsed_ns, trigger_msg"
     // A small but non-zero initial backoff so `elapsed_ns` is reliably
     // > 0 without slowing the test.
     const std::string conf =
-        "qwp::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
         ";failover_backoff_initial_ms=2;failover_backoff_max_ms=20";
     questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
 
@@ -2490,7 +2490,7 @@ TEST_CASE("mock: target=primary against replica-only endpoint surfaces role_mism
     };
     qm::MockServer srv({s});
 
-    const std::string conf = "qwp::addr=" + srv.addr() + ";target=primary;";
+    const std::string conf = "ws::addr=" + srv.addr() + ";target=primary;";
     line_sender_utf8 c{conf.size(), conf.c_str()};
     line_reader_error* err = nullptr;
     line_reader* r = line_reader_from_conf(c, &err);
@@ -2523,7 +2523,7 @@ void run_malformed_batch(
     // mock and hang. Disabling makes the malformed-frame error
     // surface directly on `next_batch`.
     const std::string conf =
-        "qwp::addr=" + srv.addr() + ";failover=off;";
+        "ws::addr=" + srv.addr() + ";failover=off;";
     questdb::egress::reader reader{
         questdb::ingress::utf8_view{conf}};
     auto cur = reader.execute("select 1"_utf8);

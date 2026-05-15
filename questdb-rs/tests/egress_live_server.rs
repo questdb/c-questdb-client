@@ -2220,7 +2220,7 @@ fn multi_addr_walks_past_unreachable_endpoint() {
     // First addr is a non-listening loopback port; second is the real
     // server. The walk should fall through to the live one.
     let srv = server();
-    let conf = format!("qwp::addr=127.0.0.1:1,127.0.0.1:{}", srv.http_port);
+    let conf = format!("ws::addr=127.0.0.1:1,127.0.0.1:{}", srv.http_port);
     let mut reader = Reader::from_conf(&conf).expect("walk past unreachable");
     let info = reader.server_info().expect("server_info");
     assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
@@ -2289,6 +2289,20 @@ fn credit_flow_control_keeps_server_streaming() {
     assert!(matches!(cursor.terminal(), Some(Terminal::End { .. })));
 }
 
+/// `EXEC_DONE.op_type` discriminator values, mirroring the server-side
+/// `CompiledQuery.TYPE_*` constants in
+/// `core/src/main/java/io/questdb/griffin/CompiledQuery.java`. Pinned
+/// in tests so a server-side renumbering surfaces here instead of
+/// silently passing — the QWP wire format guarantees these values are
+/// stable across server versions, and any drift is a protocol break
+/// the client must hear about. Update both sides in lockstep if the
+/// server intentionally adds/renumbers a `TYPE_*` constant.
+mod op_type {
+    pub const INSERT: u8 = 2;
+    pub const DROP: u8 = 7;
+    pub const CREATE_TABLE: u8 = 9;
+}
+
 #[test]
 fn exec_done_for_ddl_and_insert() {
     // Drives non-SELECT statements through the egress channel and
@@ -2319,7 +2333,14 @@ fn exec_done_for_ddl_and_insert() {
                 rows_affected,
             }) => {
                 assert_eq!(*rows_affected, 0, "CREATE TABLE: rows_affected = 0");
-                eprintln!("[exec_done create] op_type=0x{:02X}", op_type);
+                assert_eq!(
+                    *op_type,
+                    op_type::CREATE_TABLE,
+                    "CREATE TABLE: op_type must be CompiledQuery.TYPE_CREATE_TABLE (= {}); \
+                     server renumber? got 0x{:02X}",
+                    op_type::CREATE_TABLE,
+                    op_type,
+                );
             }
             other => panic!("expected ExecDone for CREATE TABLE, got {:?}", other),
         }
@@ -2344,7 +2365,14 @@ fn exec_done_for_ddl_and_insert() {
                 rows_affected,
             }) => {
                 assert_eq!(*rows_affected, 3, "INSERT: rows_affected = 3");
-                eprintln!("[exec_done insert] op_type=0x{:02X}", op_type);
+                assert_eq!(
+                    *op_type,
+                    op_type::INSERT,
+                    "INSERT: op_type must be CompiledQuery.TYPE_INSERT (= {}); \
+                     server renumber? got 0x{:02X}",
+                    op_type::INSERT,
+                    op_type,
+                );
             }
             other => panic!("expected ExecDone for INSERT, got {:?}", other),
         }
@@ -2376,7 +2404,23 @@ fn exec_done_for_ddl_and_insert() {
             .execute()
             .expect("execute drop");
         assert!(cur.next_batch().expect("next drop").is_none());
-        assert!(matches!(cur.terminal(), Some(Terminal::ExecDone { .. })));
+        match cur.terminal() {
+            Some(Terminal::ExecDone {
+                op_type,
+                rows_affected,
+            }) => {
+                assert_eq!(*rows_affected, 0, "DROP TABLE: rows_affected = 0");
+                assert_eq!(
+                    *op_type,
+                    op_type::DROP,
+                    "DROP TABLE: op_type must be CompiledQuery.TYPE_DROP (= {}); \
+                     server renumber? got 0x{:02X}",
+                    op_type::DROP,
+                    op_type,
+                );
+            }
+            other => panic!("expected ExecDone for DROP TABLE, got {:?}", other),
+        }
     }
 }
 
@@ -2430,7 +2474,14 @@ fn exec_done_for_bound_multi_row_insert() {
                     *rows_affected, 3,
                     "bound INSERT: rows_affected = bound row count"
                 );
-                eprintln!("[exec_done bound insert] op_type=0x{:02X}", op_type);
+                assert_eq!(
+                    *op_type,
+                    op_type::INSERT,
+                    "bound INSERT: op_type must be CompiledQuery.TYPE_INSERT (= {}); \
+                     server renumber? got 0x{:02X}",
+                    op_type::INSERT,
+                    op_type,
+                );
             }
             other => panic!("expected ExecDone for bound INSERT, got {:?}", other),
         }

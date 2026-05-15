@@ -63,7 +63,7 @@ fn main() {
     let warmup = env_bool("QDB_WARMUP", true);
     let touch = env_bool("QDB_TOUCH", false);
 
-    let mut conf = format!("qwp::addr={addr};compression={compression};");
+    let mut conf = format!("ws::addr={addr};compression={compression};");
     if let Ok(lvl) = std::env::var("QDB_COMPRESSION_LEVEL") {
         conf.push_str(&format!("compression_level={lvl};"));
     }

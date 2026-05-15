@@ -12,7 +12,7 @@
 //!     cd system_test/failover_clients
 //!     cargo build --release
 //!     ./target/release/simple_client \
-//!         "qwp::addr=h:p" "select 1"
+//!         "ws::addr=h:p" "select 1"
 //!
 //! Output format intentionally matches `failover_client`'s `connected
 //! to ...` and `completed: batches=N rows=M failover_resets=K
@@ -24,7 +24,7 @@ use questdb::egress::Reader;
 fn main() {
     let conf = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwp::addr=localhost:9000".into());
+        .unwrap_or_else(|| "ws::addr=localhost:9000".into());
     let sql: String = std::env::args().nth(2).unwrap_or_else(|| "SELECT 1".into());
 
     let mut reader = Reader::from_conf(&conf).expect("connect");

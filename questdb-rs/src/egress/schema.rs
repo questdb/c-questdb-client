@@ -55,7 +55,14 @@ use crate::egress::wire::varint;
 pub(crate) const MAX_SCHEMAS_PER_CONNECTION: usize = 65_535;
 
 /// A single column in a result schema.
+///
+/// Marked `#[non_exhaustive]` so future schema metadata (nullability,
+/// precision, etc.) can be added without breaking downstream struct
+/// literal constructions or pattern matches. Crate-internal sites still
+/// use field-name literal syntax — `non_exhaustive` only restricts
+/// out-of-crate construction and exhaustive matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SchemaColumn {
     pub name: String,
     pub kind: ColumnKind,

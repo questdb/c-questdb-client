@@ -155,7 +155,7 @@ fn load_pem_file(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 
 /// Build the rustls client config for the negotiated TLS knobs.
 ///
-/// Returns `None` when TLS is disabled (plain `qwp://` scheme) — the
+/// Returns `None` when TLS is disabled (plain `ws://` scheme) — the
 /// transport then handshakes directly over the bare TCP stream.
 pub(crate) fn build_client_config(
     config: &ReaderConfig,
@@ -261,10 +261,8 @@ mod tests {
     use std::io::Write;
 
     fn config_with_roots(path: &str) -> ReaderConfig {
-        ReaderConfig::from_conf(format!(
-            "qwps::addr=h:9000;tls_ca=pem_file;tls_roots={path}"
-        ))
-        .unwrap()
+        ReaderConfig::from_conf(format!("wss::addr=h:9000;tls_ca=pem_file;tls_roots={path}"))
+            .unwrap()
     }
 
     #[test]

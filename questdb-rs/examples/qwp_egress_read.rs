@@ -1,30 +1,32 @@
-//! Rust counterpart to QwpEgressReadBenchmarkWide (Java).
+//! Rust counterpart to QwpEgressReadBenchmark (Java).
 //!
-//! End-to-end throughput test that streams a wide table over QWP egress and
-//! reports rows/sec + MiB/sec on the wire. Mirrors the Java workload:
+//! End-to-end throughput test that streams a 5-column table over QWP egress
+//! and reports rows/sec + MiB/sec on the wire. Mirrors the Java workload:
 //!
-//!   CREATE TABLE egress_bench_wide (
-//!       ts TIMESTAMP, id LONG, price DOUBLE, sym SYMBOL, note VARCHAR,
-//!       d1 DOUBLE, d2 DOUBLE, d3 DOUBLE, d4 DOUBLE, d5 DOUBLE,
-//!       s1..s5 SYMBOL capacity 200000
+//!   CREATE TABLE egress_bench (
+//!       ts TIMESTAMP, id LONG, price DOUBLE, sym SYMBOL, note VARCHAR
 //!   ) TIMESTAMP(ts) PARTITION BY HOUR WAL;
 //!
+//! The wide companion (`qwp_egress_read_wide`) runs the same three protocol
+//! paths over a 15-column row with five extra DOUBLEs and five
+//! high-cardinality SYMBOLs.
+//!
 //! Run:
-//!     cargo run --release --example qwp_egress_read_wide \
+//!     cargo run --release --example qwp_egress_read \
 //!         --features sync-reader-ws,sync-sender-http
 //!
 //! Env tuning:
 //!     ROW_COUNT=10000000  (default 10M)
 //!     SKIP_POPULATE=1     re-use the existing table
 //!     QDB_HOST=localhost  QDB_PORT=9000
+//!     SKIP_ITER=1         skip the per-row consume loop (decode-only timing)
 
 use questdb::egress::column::ColumnView;
 use questdb::egress::reader::Reader;
 use questdb::ingress::{Buffer, Sender, TimestampMicros};
 use std::time::{Duration, Instant};
 
-const TABLE: &str = "egress_bench_wide";
-const HIGH_CARD: usize = 100_000;
+const TABLE: &str = "egress_bench";
 const SYMBOLS: &[&str] = &[
     "AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "NFLX",
 ];
@@ -87,9 +89,7 @@ fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
     let mut iter_ns: u128 = 0;
     let skip_iter = std::env::var("SKIP_ITER").is_ok();
 
-    let sql = format!(
-        "SELECT ts, id, price, sym, note, d1, d2, d3, d4, d5, s1, s2, s3, s4, s5 FROM {TABLE}"
-    );
+    let sql = format!("SELECT ts, id, price, sym, note FROM {TABLE}");
     let start = Instant::now();
     let mut cursor = reader.prepare(&sql).execute().expect("execute");
     loop {
@@ -123,46 +123,6 @@ fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
             ColumnView::Varchar(c) => c,
             _ => panic!("note not Varchar"),
         };
-        let d1 = match view.column(5).unwrap() {
-            ColumnView::Double(c) => c,
-            _ => panic!("d1 not Double"),
-        };
-        let d2 = match view.column(6).unwrap() {
-            ColumnView::Double(c) => c,
-            _ => panic!("d2 not Double"),
-        };
-        let d3 = match view.column(7).unwrap() {
-            ColumnView::Double(c) => c,
-            _ => panic!("d3 not Double"),
-        };
-        let d4 = match view.column(8).unwrap() {
-            ColumnView::Double(c) => c,
-            _ => panic!("d4 not Double"),
-        };
-        let d5 = match view.column(9).unwrap() {
-            ColumnView::Double(c) => c,
-            _ => panic!("d5 not Double"),
-        };
-        let s1 = match view.column(10).unwrap() {
-            ColumnView::Symbol(c) => c,
-            _ => panic!("s1 not Symbol"),
-        };
-        let s2 = match view.column(11).unwrap() {
-            ColumnView::Symbol(c) => c,
-            _ => panic!("s2 not Symbol"),
-        };
-        let s3 = match view.column(12).unwrap() {
-            ColumnView::Symbol(c) => c,
-            _ => panic!("s3 not Symbol"),
-        };
-        let s4 = match view.column(13).unwrap() {
-            ColumnView::Symbol(c) => c,
-            _ => panic!("s4 not Symbol"),
-        };
-        let s5 = match view.column(14).unwrap() {
-            ColumnView::Symbol(c) => c,
-            _ => panic!("s5 not Symbol"),
-        };
 
         for r in 0..n {
             let ts_v = if ts.is_null(r) { 0 } else { ts.value(r) };
@@ -172,33 +132,9 @@ fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
             } else {
                 price.value(r).to_bits() as i64
             };
-            let d1b = double_bits(&d1, r);
-            let d2b = double_bits(&d2, r);
-            let d3b = double_bits(&d3, r);
-            let d4b = double_bits(&d4, r);
-            let d5b = double_bits(&d5, r);
             let sym_len = sym.resolve(r).map(str::len).unwrap_or(0) as i64;
             let note_len = note.value(r).map(str::len).unwrap_or(0) as i64;
-            let s1l = sym_len_at(&s1, r);
-            let s2l = sym_len_at(&s2, r);
-            let s3l = sym_len_at(&s3, r);
-            let s4l = sym_len_at(&s4, r);
-            let s5l = sym_len_at(&s5, r);
-            checksum ^= (ts_v
-                ^ id_v
-                ^ price_bits
-                ^ d1b
-                ^ d2b
-                ^ d3b
-                ^ d4b
-                ^ d5b
-                ^ sym_len
-                ^ note_len
-                ^ s1l
-                ^ s2l
-                ^ s3l
-                ^ s4l
-                ^ s5l) as u64;
+            checksum ^= (ts_v ^ id_v ^ price_bits ^ sym_len ^ note_len) as u64;
         }
         iter_ns += t1.elapsed().as_nanos();
         rows += n as u64;
@@ -225,64 +161,20 @@ fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
     }
 }
 
-fn double_bits(c: &questdb::egress::column::FixedColumn<'_, f64>, r: usize) -> i64 {
-    if c.is_null(r) {
-        0
-    } else {
-        c.value(r).to_bits() as i64
-    }
-}
-
-fn sym_len_at(c: &questdb::egress::column::SymbolColumn<'_>, r: usize) -> i64 {
-    // For benchmark data we know there are no null rows; skip the per-row
-    // validity check inside `resolve()` and go straight to the dict.
-    c.dict().get(c.codes()[r]).map(str::len).unwrap_or(0) as i64
-}
-
 fn ingest_rows(host: &str, port: u16, row_count: u64) {
     println!("ingesting {row_count} rows over ILP/HTTP...");
     let start = Instant::now();
     let mut sender = Sender::from_conf(format!("http::addr={host}:{port};")).expect("sender");
     let mut buf = Buffer::new(sender.protocol_version());
-    let s1_pool = build_pool("s1_");
-    let s2_pool = build_pool("s2_");
-    let s3_pool = build_pool("s3_");
-    let s4_pool = build_pool("s4_");
-    let s5_pool = build_pool("s5_");
     let flush_every: u64 = 10_000;
     for i in 1..=row_count {
-        let h1 = (i as usize) % HIGH_CARD;
-        let h2 = (i as usize + 20_000) % HIGH_CARD;
-        let h3 = (i as usize + 40_000) % HIGH_CARD;
-        let h4 = (i as usize + 60_000) % HIGH_CARD;
-        let h5 = (i as usize + 80_000) % HIGH_CARD;
         buf.table(TABLE)
             .unwrap()
             .symbol("sym", SYMBOLS[(i as usize) % SYMBOLS.len()])
             .unwrap()
-            .symbol("s1", &s1_pool[h1])
-            .unwrap()
-            .symbol("s2", &s2_pool[h2])
-            .unwrap()
-            .symbol("s3", &s3_pool[h3])
-            .unwrap()
-            .symbol("s4", &s4_pool[h4])
-            .unwrap()
-            .symbol("s5", &s5_pool[h5])
-            .unwrap()
             .column_i64("id", i as i64)
             .unwrap()
             .column_f64("price", i as f64 * 1.5)
-            .unwrap()
-            .column_f64("d1", i as f64 * 0.25)
-            .unwrap()
-            .column_f64("d2", i as f64 * 0.5)
-            .unwrap()
-            .column_f64("d3", i as f64 * 0.75)
-            .unwrap()
-            .column_f64("d4", i as f64 * 1.25)
-            .unwrap()
-            .column_f64("d5", i as f64 * 1.75)
             .unwrap()
             .column_str("note", format!("n{}", i & 0xFFF))
             .unwrap()
@@ -307,19 +199,11 @@ fn ingest_rows(host: &str, port: u16, row_count: u64) {
     );
 }
 
-fn build_pool(prefix: &str) -> Vec<String> {
-    (0..HIGH_CARD).map(|i| format!("{prefix}{i}")).collect()
-}
-
 fn recreate_table(host: &str, port: u16) {
     let drop = format!("DROP TABLE IF EXISTS {TABLE}");
     let create = format!(
         "CREATE TABLE {TABLE} (\
-            ts TIMESTAMP, id LONG, price DOUBLE, sym SYMBOL, note VARCHAR,\
-            d1 DOUBLE, d2 DOUBLE, d3 DOUBLE, d4 DOUBLE, d5 DOUBLE,\
-            s1 SYMBOL capacity 200000, s2 SYMBOL capacity 200000,\
-            s3 SYMBOL capacity 200000, s4 SYMBOL capacity 200000,\
-            s5 SYMBOL capacity 200000\
+            ts TIMESTAMP, id LONG, price DOUBLE, sym SYMBOL, note VARCHAR\
         ) TIMESTAMP(ts) PARTITION BY HOUR WAL"
     );
     exec_sql(host, port, &drop);

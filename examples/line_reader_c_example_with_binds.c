@@ -14,7 +14,7 @@ int main(int argc, const char* argv[])
     line_reader_query* query = NULL;
     line_reader_cursor* cursor = NULL;
 
-    line_sender_utf8 conf = QDB_UTF8_LITERAL("qwp::addr=localhost:9000;");
+    line_sender_utf8 conf = QDB_UTF8_LITERAL("ws::addr=localhost:9000;");
     reader = line_reader_from_conf(conf, &err);
     if (!reader)
         goto on_error;
