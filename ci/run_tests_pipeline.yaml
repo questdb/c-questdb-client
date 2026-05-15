@@ -161,19 +161,32 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
-          # Linux and Windows runners ship with JDK 25 at $(JAVA_HOME_25_X64).
+          # Linux and Windows runners ship with JDK 25 at $JAVA_HOME_25_X64.
           # macOS-latest doesn't, so we brew-install openjdk@25 there and
-          # point JAVA_HOME at the resulting bundle. Both paths set the
-          # same JAVA_HOME variable for the steps below.
-          - script: |
-              brew install openjdk@25
-              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home"
-            condition: eq(variables['imageName'], 'macos-latest')
-            displayName: "Install JDK 25 via brew (macOS)"
-          - script: |
-              echo "##vso[task.setvariable variable=JAVA_HOME]$(JAVA_HOME_25_X64)"
-            condition: ne(variables['imageName'], 'macos-latest')
-            displayName: "Use pre-installed JDK 25 (Linux/Windows)"
+          # discover its install location with `brew --prefix`. Both
+          # paths set JAVA_HOME via a single bash step so the Windows
+          # version doesn't trip on cmd.exe's quote handling
+          # (`echo "##vso[...]$x"` in cmd preserves the surrounding
+          # quotes, which previously made Maven@3 see a stray `"` at
+          # the end of the JDK path).
+          - bash: |
+              set -e
+              if [[ "$AGENT_OS" == "Darwin" ]]; then
+                brew install openjdk@25
+                JDK_HOME="$(brew --prefix openjdk@25)/libexec/openjdk.jdk/Contents/Home"
+                if [ ! -d "$JDK_HOME" ]; then
+                  JDK_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+                fi
+                if [ ! -d "$JDK_HOME" ]; then
+                  echo "JDK 25 not found after brew install" >&2
+                  exit 1
+                fi
+              else
+                JDK_HOME="$JAVA_HOME_25_X64"
+              fi
+              echo "Resolved JDK 25: $JDK_HOME"
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
+            displayName: "Resolve JDK 25"
           - script: |
               git clone --depth 1 https://github.com/questdb/questdb.git
               cd questdb
