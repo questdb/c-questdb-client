@@ -498,7 +498,7 @@ class reader
 public:
     /**
      * Open a reader using the given config string (e.g.
-     * `"qwp::addr=localhost:9000;"`).
+     * `"ws::addr=localhost:9000;"`).
      * @throws line_reader_error on failure.
      */
     explicit reader(::questdb::ingress::utf8_view config)

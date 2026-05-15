@@ -25,7 +25,7 @@
 //!     cd system_test/failover_clients
 //!     cargo build --release
 //!     ./target/release/exhaustion_client \
-//!         "qwp::addr=h1:p1,h2:p2;failover_max_attempts=1;\
+//!         "ws::addr=h1:p1,h2:p2;failover_max_attempts=1;\
 //!          failover_backoff_initial_ms=1;failover_backoff_max_ms=2" \
 //!         "select 1"
 
@@ -46,7 +46,7 @@ fn die(phase: &str, code: i32, msg: String) -> ! {
 fn main() {
     let conf = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwp::addr=localhost:9000".into());
+        .unwrap_or_else(|| "ws::addr=localhost:9000".into());
     let sql: String = std::env::args().nth(2).unwrap_or_else(|| "select 1".into());
 
     let mut reader = Reader::from_conf(&conf).expect("connect");

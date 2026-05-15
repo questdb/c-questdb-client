@@ -2220,7 +2220,7 @@ fn multi_addr_walks_past_unreachable_endpoint() {
     // First addr is a non-listening loopback port; second is the real
     // server. The walk should fall through to the live one.
     let srv = server();
-    let conf = format!("qwp::addr=127.0.0.1:1,127.0.0.1:{}", srv.http_port);
+    let conf = format!("ws::addr=127.0.0.1:1,127.0.0.1:{}", srv.http_port);
     let mut reader = Reader::from_conf(&conf).expect("walk past unreachable");
     let info = reader.server_info().expect("server_info");
     assert_eq!(info.role, questdb::egress::ServerRole::Standalone);

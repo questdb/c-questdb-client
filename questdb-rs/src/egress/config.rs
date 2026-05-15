@@ -27,8 +27,8 @@
 //! Connect-string format mirrors the ingress sender's:
 //!
 //! ```text
-//! qwp::addr=host:port;key=value;key=value;...
-//! qwps::addr=host:port;...    # TLS (wss://)
+//! ws::addr=host:port;key=value;key=value;...
+//! wss::addr=host:port;...    # TLS
 //! ```
 //!
 //! Recognised keys (defaults shown in parentheses):
@@ -182,7 +182,7 @@ pub struct Endpoint {
     /// the host contains a `:`.
     pub host: String,
     /// TCP port. The connect-string parser defaults this to `9000`
-    /// for both `qwp://` and `qwps://` schemes if the address omits
+    /// for both `ws://` and `wss://` schemes if the address omits
     /// `:<port>`.
     pub port: u16,
 }
@@ -470,12 +470,12 @@ impl ReaderConfig {
             .map_err(|e| fmt!(ConfigError, "Config parse error: {}", e))?;
         let scheme = conf.service();
         let tls = match scheme {
-            "qwp" => false,
-            "qwps" => true,
+            "ws" => false,
+            "wss" => true,
             other => {
                 return Err(fmt!(
                     ConfigError,
-                    "Unknown scheme \"{}\" — expected \"qwp\" or \"qwps\"",
+                    "Unknown scheme \"{}\" — expected \"ws\" or \"wss\"",
                     other
                 ));
             }
@@ -1035,7 +1035,7 @@ impl ReaderConfig {
 /// Default `tls_ca` mirrors the ingress sender: prefer webpki roots if
 /// the bundled-certs feature is on, fall back to OS roots, and finally
 /// to `pem_file` (which forces the user to supply `tls_roots`). Keeps
-/// `qwps://` working out of the box on the common feature combos.
+/// `wss://` working out of the box on the common feature combos.
 fn default_tls_ca() -> CertificateAuthority {
     #[cfg(feature = "tls-webpki-certs")]
     {
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn minimal_plain_conf() {
-        let c = ReaderConfig::from_conf("qwp::addr=localhost:9000").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=localhost:9000").unwrap();
         assert_eq!(c.addrs.len(), 1);
         assert_eq!(c.addrs[0], Endpoint::new("localhost", 9000));
         assert!(!c.tls);
@@ -1145,7 +1145,7 @@ mod tests {
 
     #[test]
     fn tls_scheme_changes_url() {
-        let c = ReaderConfig::from_conf("qwps::addr=h:8443").unwrap();
+        let c = ReaderConfig::from_conf("wss::addr=h:8443").unwrap();
         assert!(c.tls);
         assert_eq!(c.url(), "wss://h:8443/read/v1");
     }
@@ -1158,19 +1158,19 @@ mod tests {
 
     #[test]
     fn missing_addr_rejected() {
-        let err = ReaderConfig::from_conf("qwp::path=/read/v1").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::path=/read/v1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn unknown_key_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;mystery=x").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;mystery=x").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn basic_auth_in_conf() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;username=admin;password=quest").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;username=admin;password=quest").unwrap();
         assert_eq!(
             c.auth.header_value(),
             Some("Basic YWRtaW46cXVlc3Q=".to_string())
@@ -1179,44 +1179,44 @@ mod tests {
 
     #[test]
     fn bearer_in_conf() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;token=tok").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;token=tok").unwrap();
         assert_eq!(c.auth.header_value(), Some("Bearer tok".to_string()));
     }
 
     #[test]
     fn auth_modes_mutually_exclusive() {
         let err =
-            ReaderConfig::from_conf("qwp::addr=h:1;username=u;password=p;token=t").unwrap_err();
+            ReaderConfig::from_conf("ws::addr=h:1;username=u;password=p;token=t").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[cfg(not(feature = "compression-zstd"))]
     #[test]
     fn compression_zstd_rejected_without_feature() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;compression=zstd").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;compression=auto").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;compression=auto").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[cfg(feature = "compression-zstd")]
     #[test]
     fn compression_zstd_accepted_with_feature() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;compression=zstd").unwrap();
         assert_eq!(c.compression, Compression::Zstd);
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=auto").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;compression=auto").unwrap();
         assert_eq!(c.compression, Compression::Auto);
     }
 
     #[test]
     fn invalid_compression_value() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;compression=xyz").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;compression=xyz").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn compression_level_default_is_three() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         assert_eq!(c.compression_level, DEFAULT_COMPRESSION_LEVEL);
         assert_eq!(c.compression_level, 3);
     }
@@ -1225,7 +1225,7 @@ mod tests {
     #[test]
     fn compression_level_parses_and_is_emitted() {
         let c =
-            ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd;compression_level=9").unwrap();
+            ReaderConfig::from_conf("ws::addr=h:1;compression=zstd;compression_level=9").unwrap();
         assert_eq!(c.compression_level, 9);
         let headers = c.upgrade_headers();
         let accept = headers
@@ -1239,7 +1239,7 @@ mod tests {
     #[test]
     fn compression_level_emitted_for_auto() {
         let c =
-            ReaderConfig::from_conf("qwp::addr=h:1;compression=auto;compression_level=7").unwrap();
+            ReaderConfig::from_conf("ws::addr=h:1;compression=auto;compression_level=7").unwrap();
         let headers = c.upgrade_headers();
         let accept = headers
             .iter()
@@ -1254,7 +1254,7 @@ mod tests {
         // Setting `compression_level` against `compression=raw` is harmless
         // (the spec says `level=N` only applies to zstd). The header value
         // collapses to the bare `raw` token.
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression_level=15").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;compression_level=15").unwrap();
         let headers = c.upgrade_headers();
         let accept = headers
             .iter()
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn compression_level_out_of_range_rejected() {
         for bad in ["0", "23", "100"] {
-            let err = ReaderConfig::from_conf(format!("qwp::addr=h:1;compression_level={}", bad))
+            let err = ReaderConfig::from_conf(format!("ws::addr=h:1;compression_level={}", bad))
                 .unwrap_err();
             assert_eq!(
                 err.code(),
@@ -1284,7 +1284,7 @@ mod tests {
             DEFAULT_COMPRESSION_LEVEL,
             MAX_COMPRESSION_LEVEL,
         ] {
-            let c = ReaderConfig::from_conf(format!("qwp::addr=h:1;compression_level={}", ok))
+            let c = ReaderConfig::from_conf(format!("ws::addr=h:1;compression_level={}", ok))
                 .expect("level in-range");
             assert_eq!(c.compression_level, ok);
         }
@@ -1292,13 +1292,13 @@ mod tests {
 
     #[test]
     fn target_parses() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;target=primary").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;target=primary").unwrap();
         assert_eq!(c.target, Target::Primary);
     }
 
     #[test]
     fn multi_addr_parses() {
-        let c = ReaderConfig::from_conf("qwp::addr=h1:9000,h2:9001,h3,h4:9999;").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h1:9000,h2:9001,h3,h4:9999;").unwrap();
         assert_eq!(c.addrs.len(), 4);
         assert_eq!(c.addrs[0], Endpoint::new("h1", 9000));
         assert_eq!(c.addrs[1], Endpoint::new("h2", 9001));
@@ -1308,19 +1308,19 @@ mod tests {
 
     #[test]
     fn empty_addr_entry_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=h1:9000,,h2:9001;").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h1:9000,,h2:9001;").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn target_invalid_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;target=leader").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;target=leader").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn upgrade_headers_default() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         let h = c.upgrade_headers();
         // Always emit max_version + accept-encoding; nothing else by default.
         assert_eq!(h.len(), 2);
@@ -1331,7 +1331,7 @@ mod tests {
     #[test]
     fn upgrade_headers_full_set() {
         let c = ReaderConfig::from_conf(
-            "qwp::addr=h:1;client_id=app1;max_batch_rows=1000;username=u;password=p",
+            "ws::addr=h:1;client_id=app1;max_batch_rows=1000;username=u;password=p",
         )
         .unwrap();
         let h = c.upgrade_headers();
@@ -1344,26 +1344,26 @@ mod tests {
         assert!(!names.contains(&"X-QWP-Request-Durable-Ack"));
 
         // max_batch_rows omitted when 0.
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;max_batch_rows=0").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;max_batch_rows=0").unwrap();
         let h = c.upgrade_headers();
         assert!(h.iter().all(|(n, _)| *n != "X-QWP-Max-Batch-Rows"));
     }
 
     #[test]
     fn path_must_start_with_slash() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;path=read/v1").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;path=read/v1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn default_port_when_omitted() {
-        let c = ReaderConfig::from_conf("qwp::addr=localhost").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=localhost").unwrap();
         assert_eq!(c.addrs[0].port, 9000);
     }
 
     #[test]
     fn invalid_port_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:notaport").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:notaport").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
@@ -1373,7 +1373,7 @@ mod tests {
         // outbound connect target it's nonsense. Parse-time rejection
         // gives a precise diagnostic instead of a downstream
         // EADDRNOTAVAIL / ECONNREFUSED with a misleading message.
-        let err = ReaderConfig::from_conf("qwp::addr=h:0").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:0").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(
             err.msg().contains("Port 0"),
@@ -1382,19 +1382,19 @@ mod tests {
         );
         // Reject when port 0 is one of several entries, too —
         // partial-zero lists shouldn't slip past.
-        let err = ReaderConfig::from_conf("qwp::addr=a:9000,b:0").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=a:9000,b:0").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         // And in the IPv6-bracketed path (which funnels through the
         // same `port_str.parse()` site).
-        let err = ReaderConfig::from_conf("qwp::addr=[::1]:0").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=[::1]:0").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn tls_keys_with_plain_scheme_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;tls_roots=/tmp/x").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;tls_roots=/tmp/x").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;tls_ca=pem_file").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;tls_ca=pem_file").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
@@ -1403,7 +1403,7 @@ mod tests {
         // PEM bundles are unencrypted under rustls; the JKS/PKCS12
         // password concept doesn't translate. Setting it must fail
         // loudly rather than silently doing nothing.
-        let err = ReaderConfig::from_conf("qwps::addr=h:1;tls_roots_password=secret").unwrap_err();
+        let err = ReaderConfig::from_conf("wss::addr=h:1;tls_roots_password=secret").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(
             err.msg().contains("tls_roots_password"),
@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn tls_roots_implies_pem_file_ca() {
-        let c = ReaderConfig::from_conf("qwps::addr=h:1;tls_roots=/path/to/roots.pem").unwrap();
+        let c = ReaderConfig::from_conf("wss::addr=h:1;tls_roots=/path/to/roots.pem").unwrap();
         assert_eq!(c.tls_ca, CertificateAuthority::PemFile);
         assert_eq!(
             c.tls_roots.as_deref(),
@@ -1427,7 +1427,7 @@ mod tests {
         #[cfg(feature = "tls-webpki-certs")]
         {
             let err =
-                ReaderConfig::from_conf("qwps::addr=h:1;tls_ca=webpki_roots;tls_roots=/tmp/x")
+                ReaderConfig::from_conf("wss::addr=h:1;tls_ca=webpki_roots;tls_roots=/tmp/x")
                     .unwrap_err();
             assert_eq!(err.code(), ErrorCode::ConfigError);
         }
@@ -1436,20 +1436,20 @@ mod tests {
     #[test]
     fn tls_ca_pem_file_explicit() {
         let c =
-            ReaderConfig::from_conf("qwps::addr=h:1;tls_ca=pem_file;tls_roots=/tmp/r.pem").unwrap();
+            ReaderConfig::from_conf("wss::addr=h:1;tls_ca=pem_file;tls_roots=/tmp/r.pem").unwrap();
         assert_eq!(c.tls_ca, CertificateAuthority::PemFile);
     }
 
     #[test]
     fn tls_ca_invalid_value_rejected() {
-        let err = ReaderConfig::from_conf("qwps::addr=h:1;tls_ca=mystery").unwrap_err();
+        let err = ReaderConfig::from_conf("wss::addr=h:1;tls_ca=mystery").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[cfg(feature = "tls-webpki-certs")]
     #[test]
     fn tls_ca_webpki_roots_default() {
-        let c = ReaderConfig::from_conf("qwps::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("wss::addr=h:1").unwrap();
         assert_eq!(c.tls_ca, CertificateAuthority::WebpkiRoots);
         assert_eq!(c.tls_roots, None);
     }
@@ -1462,7 +1462,7 @@ mod tests {
         // X-QWP-Request-Durable-Ack header was also removed). A connect
         // string still carrying the key now fails parsing rather than
         // being silently honoured.
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;durable_ack=true").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;durable_ack=true").unwrap_err();
         assert!(
             err.msg().to_lowercase().contains("durable_ack")
                 || err.msg().to_lowercase().contains("unknown")
@@ -1471,7 +1471,7 @@ mod tests {
 
     #[test]
     fn failover_defaults() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         assert!(c.failover);
         assert_eq!(c.failover_max_attempts, DEFAULT_FAILOVER_MAX_ATTEMPTS);
         assert_eq!(
@@ -1484,7 +1484,7 @@ mod tests {
     #[test]
     fn failover_keys_parsed() {
         let c = ReaderConfig::from_conf(
-            "qwp::addr=h:1;failover=off;failover_max_attempts=3;failover_backoff_initial_ms=100;failover_backoff_max_ms=2000",
+            "ws::addr=h:1;failover=off;failover_max_attempts=3;failover_backoff_initial_ms=100;failover_backoff_max_ms=2000",
         )
         .unwrap();
         assert!(!c.failover);
@@ -1496,14 +1496,14 @@ mod tests {
     #[test]
     fn failover_backoff_initial_zero_rejected() {
         let err =
-            ReaderConfig::from_conf("qwp::addr=h:1;failover_backoff_initial_ms=0").unwrap_err();
+            ReaderConfig::from_conf("ws::addr=h:1;failover_backoff_initial_ms=0").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn failover_backoff_max_below_initial_rejected() {
         let err = ReaderConfig::from_conf(
-            "qwp::addr=h:1;failover_backoff_initial_ms=500;failover_backoff_max_ms=100",
+            "ws::addr=h:1;failover_backoff_initial_ms=500;failover_backoff_max_ms=100",
         )
         .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1511,14 +1511,14 @@ mod tests {
 
     #[test]
     fn failover_invalid_attempts_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_attempts=abc").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;failover_max_attempts=abc").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn failover_max_attempts_above_cap_rejected() {
         let conf = format!(
-            "qwp::addr=h:1;failover_max_attempts={}",
+            "ws::addr=h:1;failover_max_attempts={}",
             MAX_FAILOVER_MAX_ATTEMPTS + 1
         );
         let err = ReaderConfig::from_conf(&conf).unwrap_err();
@@ -1529,7 +1529,7 @@ mod tests {
     #[test]
     fn failover_max_attempts_at_cap_accepted() {
         let conf = format!(
-            "qwp::addr=h:1;failover_max_attempts={}",
+            "ws::addr=h:1;failover_max_attempts={}",
             MAX_FAILOVER_MAX_ATTEMPTS
         );
         let c = ReaderConfig::from_conf(&conf).unwrap();
@@ -1543,7 +1543,7 @@ mod tests {
         // rejected at parse time so a failover storm can't burn
         // multi-hour `thread::sleep` calls inside the cursor.
         let conf = format!(
-            "qwp::addr=h:1;failover_backoff_initial_ms=1;failover_backoff_max_ms={}",
+            "ws::addr=h:1;failover_backoff_initial_ms=1;failover_backoff_max_ms={}",
             MAX_FAILOVER_BACKOFF_MAX_MS + 1
         );
         let err = ReaderConfig::from_conf(&conf).unwrap_err();
@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn failover_backoff_max_at_cap_accepted() {
         let conf = format!(
-            "qwp::addr=h:1;failover_backoff_initial_ms=1;failover_backoff_max_ms={}",
+            "ws::addr=h:1;failover_backoff_initial_ms=1;failover_backoff_max_ms={}",
             MAX_FAILOVER_BACKOFF_MAX_MS
         );
         let c = ReaderConfig::from_conf(&conf).unwrap();
@@ -1569,27 +1569,27 @@ mod tests {
 
     #[test]
     fn zone_unset_is_none_by_default() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         assert_eq!(c.zone, None);
     }
 
     #[test]
     fn zone_parses() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=eu-west-1a").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;zone=eu-west-1a").unwrap();
         assert_eq!(c.zone.as_deref(), Some("eu-west-1a"));
     }
 
     #[test]
     fn zone_empty_or_whitespace_normalises_to_none() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;zone=").unwrap();
         assert_eq!(c.zone, None, "empty value collapses to unset");
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=   ").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;zone=   ").unwrap();
         assert_eq!(c.zone, None, "whitespace-only collapses to unset");
     }
 
     #[test]
     fn zone_trims_value() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;zone=  eu-west-1a  ").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;zone=  eu-west-1a  ").unwrap();
         assert_eq!(c.zone.as_deref(), Some("eu-west-1a"));
     }
 
@@ -1597,22 +1597,22 @@ mod tests {
     fn zone_rejects_cr_lf() {
         // CRLF in a zone value would smuggle into log lines and any
         // header that re-serialises it. Reject up front.
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;zone=eu\nwest").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;zone=eu\nwest").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;zone=eu\rwest").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;zone=eu\rwest").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn auth_timeout_defaults_to_15s() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         assert_eq!(c.auth_timeout_ms, DEFAULT_AUTH_TIMEOUT_MS);
         assert_eq!(DEFAULT_AUTH_TIMEOUT_MS, 15_000);
     }
 
     #[test]
     fn auth_timeout_parses() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;auth_timeout_ms=3000").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;auth_timeout_ms=3000").unwrap();
         assert_eq!(c.auth_timeout_ms, 3_000);
     }
 
@@ -1621,14 +1621,14 @@ mod tests {
         // No "unbounded" sentinel — 0 is misconfiguration. Pinning a
         // thread waiting on a single peer indefinitely is what we're
         // trying to *avoid* with this knob.
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;auth_timeout_ms=0").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;auth_timeout_ms=0").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("auth_timeout_ms"), "msg: {}", err.msg());
     }
 
     #[test]
     fn auth_timeout_above_cap_rejected() {
-        let conf = format!("qwp::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS + 1);
+        let conf = format!("ws::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS + 1);
         let err = ReaderConfig::from_conf(&conf).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("exceeds the hard cap"));
@@ -1636,21 +1636,21 @@ mod tests {
 
     #[test]
     fn auth_timeout_at_cap_accepted() {
-        let conf = format!("qwp::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS);
+        let conf = format!("ws::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS);
         let c = ReaderConfig::from_conf(&conf).unwrap();
         assert_eq!(c.auth_timeout_ms, MAX_AUTH_TIMEOUT_MS);
     }
 
     #[test]
     fn failover_max_duration_defaults_to_30s() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         assert_eq!(c.failover_max_duration_ms, DEFAULT_FAILOVER_MAX_DURATION_MS);
         assert_eq!(DEFAULT_FAILOVER_MAX_DURATION_MS, 30_000);
     }
 
     #[test]
     fn failover_max_duration_parses() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_duration_ms=60000").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_max_duration_ms=60000").unwrap();
         assert_eq!(c.failover_max_duration_ms, 60_000);
     }
 
@@ -1658,14 +1658,14 @@ mod tests {
     fn failover_max_duration_zero_is_unbounded() {
         // `0` is the documented sentinel for "no wall-clock cap" per
         // wire-egress.md §11.9.1. Must not be rejected.
-        let c = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_duration_ms=0").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_max_duration_ms=0").unwrap();
         assert_eq!(c.failover_max_duration_ms, 0);
     }
 
     #[test]
     fn failover_max_duration_above_cap_rejected() {
         let conf = format!(
-            "qwp::addr=h:1;failover_max_duration_ms={}",
+            "ws::addr=h:1;failover_max_duration_ms={}",
             MAX_FAILOVER_MAX_DURATION_MS + 1
         );
         let err = ReaderConfig::from_conf(&conf).unwrap_err();
@@ -1677,7 +1677,7 @@ mod tests {
 
     #[test]
     fn server_info_timeout_defaults_to_5s() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         assert_eq!(c.server_info_timeout_ms, DEFAULT_SERVER_INFO_TIMEOUT_MS);
         assert_eq!(DEFAULT_SERVER_INFO_TIMEOUT_MS, 5_000);
     }
@@ -1688,7 +1688,7 @@ mod tests {
         // connect-string key MUST be rejected (covered by the generic
         // "unknown config key" branch) so a user typo doesn't get
         // silently ignored.
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;server_info_timeout_ms=1000").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;server_info_timeout_ms=1000").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(
             err.msg().contains("Unknown config key"),
@@ -1701,7 +1701,7 @@ mod tests {
     fn server_info_timeout_zero_rejected_by_validate() {
         // Programmatic mutation past the default — `validate()` is the
         // safety net before `Reader::from_config` opens any socket.
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         c.server_info_timeout_ms = 0;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1710,7 +1710,7 @@ mod tests {
 
     #[test]
     fn server_info_timeout_above_cap_rejected_by_validate() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         c.server_info_timeout_ms = MAX_SERVER_INFO_TIMEOUT_MS + 1;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1719,7 +1719,7 @@ mod tests {
 
     #[test]
     fn server_info_timeout_at_cap_accepted() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         c.server_info_timeout_ms = MAX_SERVER_INFO_TIMEOUT_MS;
         c.validate().unwrap();
     }
@@ -1730,7 +1730,7 @@ mod tests {
         // address-rotation arithmetic in
         // `Reader::reconnect_with_failover` is provably free of usize
         // overflow on 32-bit targets.
-        let mut addr = String::from("qwp::addr=");
+        let mut addr = String::from("ws::addr=");
         for i in 0..(MAX_ADDRS + 1) {
             if i > 0 {
                 addr.push(',');
@@ -1750,7 +1750,7 @@ mod tests {
     fn failover_max_attempts_zero_rejected() {
         // Matches Java QwpQueryClient.java:401 — `failover_max_attempts must be >= 1`.
         // Users who want failover entirely off should set `failover=off`.
-        let err = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_attempts=0").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=h:1;failover_max_attempts=0").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(
             err.msg().contains("failover_max_attempts"),
@@ -1780,7 +1780,7 @@ mod tests {
         // diagnostic output safe to feed back into a new connect
         // string without quoting/escaping bookkeeping.
         let ep = Endpoint::new("example.com", 1234);
-        let conf = format!("qwp::addr={}", ep);
+        let conf = format!("ws::addr={}", ep);
         let parsed = ReaderConfig::from_conf(&conf).expect("parse round-trip");
         assert_eq!(parsed.addrs(), &[ep]);
     }
@@ -1799,7 +1799,7 @@ mod tests {
 
     #[test]
     fn ipv6_addr_parses_with_explicit_port() {
-        let c = ReaderConfig::from_conf("qwp::addr=[::1]:9000").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=[::1]:9000").unwrap();
         assert_eq!(c.addrs.len(), 1);
         // Stored host is bare; brackets re-applied only by Display.
         assert_eq!(c.addrs[0], Endpoint::new("::1", 9000));
@@ -1808,14 +1808,14 @@ mod tests {
 
     #[test]
     fn ipv6_addr_default_port() {
-        let c = ReaderConfig::from_conf("qwp::addr=[2001:db8::1]").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=[2001:db8::1]").unwrap();
         assert_eq!(c.addrs[0], Endpoint::new("2001:db8::1", 9000));
         assert_eq!(c.url_for(0), "ws://[2001:db8::1]:9000/read/v1");
     }
 
     #[test]
     fn ipv6_addr_in_multi_addr_list() {
-        let c = ReaderConfig::from_conf("qwp::addr=[::1]:9000,h2:9001,[2001:db8::5]").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=[::1]:9000,h2:9001,[2001:db8::5]").unwrap();
         assert_eq!(c.addrs.len(), 3);
         assert_eq!(c.addrs[0], Endpoint::new("::1", 9000));
         assert_eq!(c.addrs[1], Endpoint::new("h2", 9001));
@@ -1824,24 +1824,24 @@ mod tests {
 
     #[test]
     fn ipv6_addr_missing_close_bracket_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=[::1:9000").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=[::1:9000").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn ipv6_addr_garbage_after_bracket_rejected() {
-        let err = ReaderConfig::from_conf("qwp::addr=[::1]junk").unwrap_err();
+        let err = ReaderConfig::from_conf("ws::addr=[::1]junk").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
     fn unbracketed_ipv6_rejected() {
         for bad in [
-            "qwp::addr=::1",
-            "qwp::addr=::1:9000",
-            "qwp::addr=2001:db8::1",
-            "qwp::addr=fe80::1%eth0",
-            "qwp::addr=h1:9000,::1:9001",
+            "ws::addr=::1",
+            "ws::addr=::1:9000",
+            "ws::addr=2001:db8::1",
+            "ws::addr=fe80::1%eth0",
+            "ws::addr=h1:9000,::1:9001",
         ] {
             let err = ReaderConfig::from_conf(bad).unwrap_err();
             assert_eq!(
@@ -1859,7 +1859,7 @@ mod tests {
 
     #[test]
     fn single_colon_host_port_still_accepted() {
-        let c = ReaderConfig::from_conf("qwp::addr=h1:9000").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h1:9000").unwrap();
         assert_eq!(c.addrs[0], Endpoint::new("h1", 9000));
     }
 
@@ -1868,19 +1868,19 @@ mod tests {
         // `url_for` was migrated to format via `{ep}`. Lock the
         // common-case URL string so the migration didn't introduce
         // a regression for the predominant non-IPv6 path users see.
-        let c = ReaderConfig::from_conf("qwp::addr=db-a:9000;path=/exec").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=db-a:9000;path=/exec").unwrap();
         assert_eq!(c.url_for(0), "ws://db-a:9000/exec");
     }
 
     #[test]
     fn validate_accepts_parsed_default_config() {
-        let c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.validate().expect("a freshly-parsed config must validate");
     }
 
     #[test]
     fn validate_rejects_post_parse_backoff_overflow() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.failover_backoff_max_ms = u64::MAX;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1893,7 +1893,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_max_attempts_overflow() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.failover_max_attempts = MAX_FAILOVER_MAX_ATTEMPTS + 1;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1901,7 +1901,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_max_attempts_zero() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.failover_max_attempts = 0;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1909,7 +1909,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_backoff_zero_initial() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.failover_backoff_initial_ms = 0;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_backoff_inversion() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.failover_backoff_initial_ms = 1000;
         c.failover_backoff_max_ms = 50;
         let err = c.validate().unwrap_err();
@@ -1926,7 +1926,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_max_version_out_of_range() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.max_version = 0;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1947,7 +1947,7 @@ mod tests {
     fn validate_rejects_post_parse_client_id_with_crlf() {
         // Clean parse, then mutate to inject a CRLF + a forged
         // Authorization line into the X-QuestDB-Client-Id header.
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.client_id = Some("foo\r\nAuthorization: Bearer attacker".into());
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1965,7 +1965,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_zone_with_crlf() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.zone = Some("eu-west-1a\r\nX-Injected: 1".into());
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1979,7 +1979,7 @@ mod tests {
         // `reject_control_bytes` lives in `AuthMode::from_parts`; the
         // `pub` `auth` field on ReaderConfig lets a caller skip that
         // path entirely.
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.auth = AuthMode::Verbatim {
             value: "Bearer xx\r\nX-Injected: 1".into(),
         };
@@ -1994,7 +1994,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_bearer_token_with_control_bytes() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.auth = AuthMode::Bearer {
             token: "abc\r\ndef".into(),
         };
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_post_parse_basic_auth_with_control_bytes() {
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.auth = AuthMode::Basic {
             username: "user\nfoo".into(),
             password: "pw".into(),
@@ -2023,7 +2023,7 @@ mod tests {
         // the server splits credentials on the first ':'. The same
         // hazard re-emerges if the caller assigns a Basic AuthMode
         // directly to the parsed config.
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.auth = AuthMode::Basic {
             username: "admin:override".into(),
             password: "real".into(),
@@ -2037,7 +2037,7 @@ mod tests {
         // Sanity counterpart: clean string fields after a clean parse
         // must still pass — the new validate hooks must not be
         // overzealous.
-        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.client_id = Some("benign-id".into());
         c.zone = Some("eu-west-1a".into());
         c.auth = AuthMode::Bearer {

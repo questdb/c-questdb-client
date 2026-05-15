@@ -78,7 +78,7 @@ struct Result {
 }
 
 fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
-    let conf = format!("qwp::addr={host}:{port};compression=raw;");
+    let conf = format!("ws::addr={host}:{port};compression=raw;");
     let mut reader = Reader::from_conf(&conf).expect("connect");
     reader.reset_timing();
     let bytes_before = reader.bytes_received();

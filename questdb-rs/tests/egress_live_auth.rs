@@ -64,7 +64,7 @@ const ADDR_ENV: &str = "QDB_LIVE_BROKER_ADDR";
 const DEFAULT_ADDR: &str = "localhost:9000";
 
 /// Skip silently when `QDB_LIVE_BROKER_AUTH` is unset (the CI default).
-/// Otherwise drive a real `qwp://` connect + Basic-auth handshake +
+/// Otherwise drive a real `ws://` connect + Basic-auth handshake +
 /// trivial query against the broker named by `QDB_LIVE_BROKER_ADDR`
 /// (or `localhost:9000`). Catches base64 padding / encoding regressions
 /// in the `Authorization` header that the mock-driven tests can't see.
@@ -98,7 +98,7 @@ fn live_basic_auth_handshake_and_query() {
     // means a single auth attempt; any error surfaces directly from
     // that endpoint instead of being wrapped in a multi-endpoint
     // aggregation. Useful when the operator is debugging credentials.
-    let conf = format!("qwp::addr={addr};username={user};password={pass};failover=off");
+    let conf = format!("ws::addr={addr};username={user};password={pass};failover=off");
     eprintln!("live auth smoke: connecting to {addr} as {user:?}");
 
     let mut reader = match Reader::from_conf(&conf) {
@@ -150,7 +150,7 @@ fn live_basic_auth_rejects_wrong_password() {
     }
     let addr = env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let bad_pass = "definitely-not-the-real-password-xyzzy-9c1f";
-    let conf = format!("qwp::addr={addr};username={user};password={bad_pass};failover=off");
+    let conf = format!("ws::addr={addr};username={user};password={bad_pass};failover=off");
     match Reader::from_conf(&conf) {
         Ok(_) => panic!(
             "live broker at {addr} accepted clearly-wrong password for user {user:?}; \

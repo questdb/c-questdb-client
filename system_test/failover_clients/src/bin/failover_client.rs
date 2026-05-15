@@ -22,7 +22,7 @@
 //!     cd system_test/failover_clients
 //!     cargo build --release
 //!     ./target/release/failover_client \
-//!         "qwp::addr=h1:p1,h2:p2;target=primary" "SELECT ..."
+//!         "ws::addr=h1:p1,h2:p2;target=primary" "SELECT ..."
 //!
 //! Final stderr line is the same `completed: batches=N rows=M
 //! failover_resets=K final_endpoint=...` summary `qwp_egress_failover`
@@ -42,7 +42,7 @@ const INITIAL_CREDIT_BYTES: u64 = 4 * 1024;
 fn main() {
     let conf = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwp::addr=localhost:9000".into());
+        .unwrap_or_else(|| "ws::addr=localhost:9000".into());
     let sql: String = std::env::args().nth(2).unwrap_or_else(|| "SELECT 1".into());
 
     let mut reader = Reader::from_conf(&conf).expect("connect");

@@ -788,7 +788,7 @@ impl<'r> ReaderQuery<'r> {
     ///
     /// # fn ex() -> questdb::egress::Result<()> {
     /// let mut reader = Reader::from_conf(
-    ///     "qwp::addr=db-a:9000,db-b:9000;target=primary",
+    ///     "ws::addr=db-a:9000,db-b:9000;target=primary",
     /// )?;
     /// // The handler accumulates rows in a buffer shared with the
     /// // callback. On failover the callback discards what was buffered

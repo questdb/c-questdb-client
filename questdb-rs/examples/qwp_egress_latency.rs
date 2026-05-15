@@ -22,7 +22,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(9000);
 
-    let conf = format!("qwp::addr={host}:{port};");
+    let conf = format!("ws::addr={host}:{port};");
     let mut reader = Reader::from_conf(&conf).expect("connect");
     println!("connected to {host}:{port}, sql = {sql:?}");
 

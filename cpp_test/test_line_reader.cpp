@@ -178,7 +178,7 @@ bool broker_reachable()
 std::string reader_conf()
 {
     std::ostringstream s;
-    s << "qwp::addr=" << broker_host() << ":" << broker_http_port() << ";";
+    s << "ws::addr=" << broker_host() << ":" << broker_http_port() << ";";
     return s.str();
 }
 

@@ -276,9 +276,9 @@ impl QuestDbServer {
         );
     }
 
-    /// `qwp::` connect string for the egress reader.
+    /// `ws::` connect string for the egress reader.
     pub fn qwp_conf(&self) -> String {
-        format!("qwp::addr={}:{}", self.host, self.http_port)
+        format!("ws::addr={}:{}", self.host, self.http_port)
     }
 
     /// `http::` connect string for the ingress sender.

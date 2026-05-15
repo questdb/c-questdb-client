@@ -6,7 +6,7 @@
 //! Run with:
 //!     cargo run --release --example qwp_egress_failover \
 //!         --features sync-reader-ws \
-//!         -- "qwp::addr=db-a:9000,db-b:9000,db-c:9000;target=primary" "SELECT 1"
+//!         -- "ws::addr=db-a:9000,db-b:9000,db-c:9000;target=primary" "SELECT 1"
 //!
 //! When ANY of the endpoints in the address list dies mid-query (peer
 //! reset, TLS reset, server bounce), the cursor automatically reconnects
@@ -30,10 +30,10 @@ fn main() {
     // out of the box against a local server. To actually exercise
     // mid-query failover, pass a multi-endpoint conf string as
     // argv[1], e.g.
-    //   `qwp::addr=db-a:9000,db-b:9000,db-c:9000;target=primary`.
+    //   `ws::addr=db-a:9000,db-b:9000,db-c:9000;target=primary`.
     let conf = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "qwp::addr=localhost:9000".into());
+        .unwrap_or_else(|| "ws::addr=localhost:9000".into());
     let sql: String = std::env::args().nth(2).unwrap_or_else(|| "SELECT 1".into());
 
     let mut reader = Reader::from_conf(&conf).expect("connect");
