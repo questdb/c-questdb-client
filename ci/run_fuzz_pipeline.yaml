@@ -1,0 +1,105 @@
+trigger: none
+
+pr: none
+
+# Hourly cron against the default branch, always run even if there were no
+# changes since the previous run. questdb/questdb's ci/test-fuzz.yml runs
+# every 15 minutes on a self-hosted hetzner-incus pool; we run hourly on
+# Microsoft-hosted images to keep the paid-minutes bill reasonable. The
+# PR-time fuzz coverage stays in run_tests_pipeline.yaml (TestQwpWsFuzz
+# job); this pipeline is the always-on stability watchdog and the source
+# of Slack #builds alerts.
+schedules:
+  - cron: "0 * * * *"
+    displayName: Run QWP/WS fuzz every hour
+    branches:
+      include:
+        - main
+    always: true
+
+stages:
+  - stage: ScheduledFuzz
+    displayName: "Scheduled QWP/WS fuzz"
+    jobs:
+      - job: TestQwpWsFuzz
+        displayName: "QWP/WS fuzz suite (cross-platform)"
+        strategy:
+          matrix:
+            linux:
+              imageName: "ubuntu-latest"
+            mac:
+              imageName: "macos-latest"
+            windows-2022:
+              imageName: "windows-2022"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          # Same JDK 25 dance as the PR-time fuzz job in
+          # run_tests_pipeline.yaml — Linux/Windows hosted agents ship JDK
+          # 25 at $JAVA_HOME_25_X64; macos-latest does not, so we brew it
+          # in. Resolution stays in a single bash step so the Windows
+          # leg's cmd.exe quote handling doesn't leave a stray `"` on
+          # the resolved path.
+          - bash: |
+              set -e
+              if [[ "$AGENT_OS" == "Darwin" ]]; then
+                brew install openjdk@25
+                JDK_HOME="$(brew --prefix openjdk@25)/libexec/openjdk.jdk/Contents/Home"
+                if [ ! -d "$JDK_HOME" ]; then
+                  JDK_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+                fi
+                if [ ! -d "$JDK_HOME" ]; then
+                  echo "JDK 25 not found after brew install" >&2
+                  exit 1
+                fi
+              else
+                JDK_HOME="$JAVA_HOME_25_X64"
+              fi
+              echo "Resolved JDK 25: $JDK_HOME"
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
+            displayName: "Resolve JDK 25"
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
+            displayName: "TestQwpWsFuzz"
+
+      # Mirrors questdb/questdb's docker-release-pipeline.yml NotifyOnFailure
+      # pattern. BUILDS_SLACK_HOOK_URL must be configured as a secret
+      # pipeline variable (or attached via a shared variable group) before
+      # this pipeline is enabled — otherwise the curl will POST to an
+      # empty URL and the failure message is lost.
+      - job: NotifyOnFailure
+        displayName: "Notify Slack on failure"
+        dependsOn:
+          - TestQwpWsFuzz
+        condition: failed()
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Notify Slack on Failure
+            inputs:
+              script: |
+                curl -X POST -H 'Content-type: application/json' \
+                  --data '{"text":"🚨 *c-questdb-client QWP/WS fuzz failed*\n\nBranch: `$(Build.SourceBranchName)`\nBuild: <$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|#$(Build.BuildId)>\nCommit: `$(Build.SourceVersion)`"}' \
+                  "$(BUILDS_SLACK_HOOK_URL)"
+            env:
+              BUILDS_SLACK_HOOK_URL: $(BUILDS_SLACK_HOOK_URL)
