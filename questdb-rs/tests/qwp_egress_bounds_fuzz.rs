@@ -338,9 +338,11 @@ fn write_decimal(out: &mut Vec<u8>, rng: &mut SplitMix64, row_count: usize, elem
 fn write_array(out: &mut Vec<u8>, rng: &mut SplitMix64, row_count: usize) {
     let non_null = write_validity(out, rng, row_count);
     for _ in 0..non_null {
-        // Keep it simple: 1D arrays with 0..=3 elements. Matches Java.
+        // 1D arrays with 1..=3 elements. The decoder rejects dim==0
+        // explicitly (see decode_array's per-dim check), so stay above
+        // the minimum to keep the sanity_check_decode happy.
         out.push(1u8); // nDims
-        let dim: u32 = rng.gen_range(4) as u32;
+        let dim: u32 = (1 + rng.gen_range(3)) as u32; // 1..=3
         out.extend_from_slice(&dim.to_le_bytes());
         write_random_bytes(out, rng, dim as usize * 8);
     }
