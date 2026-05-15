@@ -367,9 +367,7 @@ pub(super) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> 
 /// A zero-byte payload is valid (no code, empty reason). A 1-byte payload is
 /// already rejected upstream by validate_control_frame_header, but is
 /// rejected here defensively for callers that bypass that check.
-pub(super) fn parse_ws_close_payload(
-    payload: &[u8],
-) -> Result<(Option<u16>, String), String> {
+pub(super) fn parse_ws_close_payload(payload: &[u8]) -> Result<(Option<u16>, String), String> {
     if payload.is_empty() {
         return Ok((None, String::new()));
     }

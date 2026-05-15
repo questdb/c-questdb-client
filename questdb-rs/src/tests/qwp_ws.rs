@@ -256,11 +256,7 @@ fn write_server_close_frame(
 /// (FIN | RSV1..3 | opcode). Used to construct deliberately malformed frames
 /// — FIN=0 for fragmentation, RSV bits set without extensions, exotic
 /// opcodes, undersized close payloads, etc.
-fn write_raw_ws_frame(
-    stream: &mut TcpStream,
-    byte0: u8,
-    payload: &[u8],
-) -> std::io::Result<()> {
+fn write_raw_ws_frame(stream: &mut TcpStream, byte0: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut frame = vec![byte0];
     let plen = payload.len();
     if plen <= 125 {
