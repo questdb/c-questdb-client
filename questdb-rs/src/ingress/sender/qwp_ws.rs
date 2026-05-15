@@ -1487,8 +1487,10 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
             }
             WS_OPCODE_CLOSE => {
                 let payload = read_control_frame_payload(stream, header, &mut control_payload)?;
-                let (code, reason) = codec::ws_close_details(payload);
-                return Err(WsMessageError::Close(WsCloseFrame { code, reason }));
+                return match codec::parse_ws_close_payload(payload) {
+                    Ok((code, reason)) => Err(WsMessageError::Close(WsCloseFrame { code, reason })),
+                    Err(reason) => Err(WsMessageError::ProtocolViolation(reason)),
+                };
             }
             WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
                 if first_opcode.is_some() {
@@ -1646,9 +1648,12 @@ impl WsFrameReader {
                 Ok(WsFrameRead::Progress)
             }
             WS_OPCODE_CLOSE => {
-                let (code, reason) = codec::ws_close_details(self.payload_slice(header));
+                let parse_result = codec::parse_ws_close_payload(self.payload_slice(header));
                 self.consume_frame(header.frame_end);
-                Err(WsMessageError::Close(WsCloseFrame { code, reason }))
+                match parse_result {
+                    Ok((code, reason)) => Err(WsMessageError::Close(WsCloseFrame { code, reason })),
+                    Err(reason) => Err(WsMessageError::ProtocolViolation(reason)),
+                }
             }
             WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
                 if self.fragment_opcode.is_some() {

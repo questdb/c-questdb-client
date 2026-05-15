@@ -356,14 +356,44 @@ pub(super) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> 
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-pub(super) fn ws_close_details(payload: &[u8]) -> (Option<u16>, String) {
-    if payload.len() >= 2 {
-        let code = u16::from_be_bytes([payload[0], payload[1]]);
-        let reason = std::str::from_utf8(&payload[2..]).unwrap_or("");
-        (Some(code), reason.to_string())
-    } else {
-        (None, String::new())
+/// Parse a CLOSE frame payload per RFC 6455 §5.5.1 and §7.4.
+///
+/// Returns Ok((code, reason)) for well-formed payloads. Returns Err with a
+/// human-readable message when the payload is malformed: reserved or
+/// out-of-range close code, or non-UTF-8 reason bytes. Callers translate the
+/// Err into a WsMessageError::ProtocolViolation, which routes through the
+/// driver as a terminal Halt.
+///
+/// A zero-byte payload is valid (no code, empty reason). A 1-byte payload is
+/// already rejected upstream by validate_control_frame_header, but is
+/// rejected here defensively for callers that bypass that check.
+pub(super) fn parse_ws_close_payload(
+    payload: &[u8],
+) -> Result<(Option<u16>, String), String> {
+    if payload.is_empty() {
+        return Ok((None, String::new()));
     }
+    if payload.len() < 2 {
+        return Err(
+            "WebSocket close frame payload length must be 0 or at least 2 bytes".to_string(),
+        );
+    }
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    if !is_valid_wire_ws_close_code(code) {
+        return Err(format!(
+            "WebSocket close frame uses reserved or out-of-range close code: {code}"
+        ));
+    }
+    let reason = std::str::from_utf8(&payload[2..])
+        .map_err(|_| "WebSocket close frame reason is not valid UTF-8".to_string())?;
+    Ok((Some(code), reason.to_string()))
+}
+
+// Codes 1004, 1005, 1006, 1015 are reserved sentinels that must not appear on
+// the wire. 1016–2999 are reserved for future protocol-level extensions.
+// 3000–3999 are framework-registered; 4000–4999 are private-use.
+fn is_valid_wire_ws_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
 // ---------- QWP response decoding ----------

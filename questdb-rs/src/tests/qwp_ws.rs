@@ -252,6 +252,30 @@ fn write_server_close_frame(
     stream.write_all(&frame)
 }
 
+/// Write a server-origin frame with a caller-controlled first byte
+/// (FIN | RSV1..3 | opcode). Used to construct deliberately malformed frames
+/// — FIN=0 for fragmentation, RSV bits set without extensions, exotic
+/// opcodes, undersized close payloads, etc.
+fn write_raw_ws_frame(
+    stream: &mut TcpStream,
+    byte0: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let mut frame = vec![byte0];
+    let plen = payload.len();
+    if plen <= 125 {
+        frame.push(plen as u8);
+    } else if plen <= 0xFFFF {
+        frame.push(126);
+        frame.extend_from_slice(&(plen as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(plen as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)
+}
+
 fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Result<()> {
     let mut ok = Vec::new();
     ok.push(QWP_STATUS_OK);
@@ -2778,6 +2802,143 @@ fn qwp_ws_text_response_is_pollable_as_protocol_violation() {
     assert_server_protocol_violation(
         |stream| write_server_frame(stream, 0x1, b"not-qwp", false),
         "QWP/WebSocket server response was not a binary frame",
+    );
+}
+
+#[test]
+fn qwp_ws_rsv_bits_set_is_protocol_violation() {
+    // FIN=1, RSV1=1, opcode=BINARY (0x2) -> 0xC2. No extensions were
+    // negotiated during the upgrade, so any RSV bit is a violation.
+    assert_server_protocol_violation(
+        |stream| write_raw_ws_frame(stream, 0xC2, b"hello"),
+        "WebSocket RSV bits are set but no extensions were negotiated",
+    );
+}
+
+#[test]
+fn qwp_ws_continuation_without_prior_data_is_protocol_violation() {
+    // FIN=1, opcode=CONTINUATION (0x0) -> 0x80. The client has nothing
+    // to continue, so this is a hard violation.
+    assert_server_protocol_violation(
+        |stream| write_raw_ws_frame(stream, 0x80, b""),
+        "Continuation frame without prior data frame",
+    );
+}
+
+#[test]
+fn qwp_ws_new_data_frame_mid_fragment_is_protocol_violation() {
+    // FIN=0 BINARY (0x02) starts a fragmented message; the next frame is
+    // another FIN=1 BINARY (0x82) instead of a continuation -> violation.
+    assert_server_protocol_violation(
+        |stream| {
+            write_raw_ws_frame(stream, 0x02, b"frag1")?;
+            write_raw_ws_frame(stream, 0x82, b"frag2")
+        },
+        "Unexpected new data frame mid-message",
+    );
+}
+
+#[test]
+fn qwp_ws_fragmented_control_frame_is_protocol_violation() {
+    // FIN=0 CLOSE (0x08). RFC 6455 forbids fragmenting control frames.
+    // Payload is the close code so it's a syntactically plausible close.
+    assert_server_protocol_violation(
+        |stream| write_raw_ws_frame(stream, 0x08, &1000u16.to_be_bytes()),
+        "WebSocket control frame must not be fragmented",
+    );
+}
+
+#[test]
+fn qwp_ws_close_frame_with_one_byte_payload_is_protocol_violation() {
+    // FIN=1 CLOSE (0x88) with a 1-byte payload. Close payloads must be
+    // 0 bytes (no code) or >= 2 bytes (code + optional reason).
+    assert_server_protocol_violation(
+        |stream| write_raw_ws_frame(stream, 0x88, &[0x00]),
+        "WebSocket close frame payload length must be 0 or at least 2 bytes",
+    );
+}
+
+// RFC 6455 §7.4.1 reserves close code 1004 with no defined meaning. It must
+// not appear on the wire.
+#[test]
+fn qwp_ws_close_code_1004_reserved_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_close_frame(stream, 1004, ""),
+        "WebSocket close frame uses reserved or out-of-range close code: 1004",
+    );
+}
+
+// 1005 is a sentinel meaning "no status code was received" — only legal in
+// application APIs, never on the wire.
+#[test]
+fn qwp_ws_close_code_1005_sentinel_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_close_frame(stream, 1005, ""),
+        "WebSocket close frame uses reserved or out-of-range close code: 1005",
+    );
+}
+
+// 1006 is a sentinel for "abnormal closure" — only legal in application APIs,
+// never on the wire.
+#[test]
+fn qwp_ws_close_code_1006_sentinel_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_close_frame(stream, 1006, ""),
+        "WebSocket close frame uses reserved or out-of-range close code: 1006",
+    );
+}
+
+// 1015 is a sentinel for "TLS handshake failure" — only legal in application
+// APIs, never on the wire.
+#[test]
+fn qwp_ws_close_code_1015_sentinel_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_close_frame(stream, 1015, ""),
+        "WebSocket close frame uses reserved or out-of-range close code: 1015",
+    );
+}
+
+// Close codes below 1000 are unassigned.
+#[test]
+fn qwp_ws_close_code_below_1000_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_close_frame(stream, 999, ""),
+        "WebSocket close frame uses reserved or out-of-range close code: 999",
+    );
+}
+
+// 1016–2999 are reserved for future protocol-level WebSocket extensions and
+// must not appear on the wire today.
+#[test]
+fn qwp_ws_close_code_reserved_future_range_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_close_frame(stream, 1016, ""),
+        "WebSocket close frame uses reserved or out-of-range close code: 1016",
+    );
+}
+
+// Codes >= 5000 are outside the IANA / framework / private-use ranges.
+#[test]
+fn qwp_ws_close_code_above_4999_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_close_frame(stream, 5000, ""),
+        "WebSocket close frame uses reserved or out-of-range close code: 5000",
+    );
+}
+
+// Close reason after the 2-byte code must be valid UTF-8 per RFC 6455 §5.5.1.
+// The bytes 0xC3 0x28 are a well-known invalid UTF-8 sequence (overlong /
+// incomplete continuation).
+#[test]
+fn qwp_ws_close_frame_with_invalid_utf8_reason_is_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1000u16.to_be_bytes());
+            payload.extend_from_slice(&[0xC3, 0x28]);
+            write_raw_ws_frame(stream, 0x88, &payload)
+        },
+        "WebSocket close frame reason is not valid UTF-8",
     );
 }
 
