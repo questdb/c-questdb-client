@@ -1104,6 +1104,10 @@ impl Buffer {
     ///
     /// The wire encoding writes the 4 octets as `u32::from(addr).to_le_bytes()`,
     /// matching Rust's natural Ipv4Addr packing (octet 0 in the high byte).
+    ///
+    /// IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
+    /// currently implement this wire type; batches using it will be rejected
+    /// with a descriptive error. This may change in future server releases.
     pub fn column_ipv4<'a, N>(
         &mut self,
         name: N,
@@ -1235,6 +1239,11 @@ impl Buffer {
     }
 
     /// Adds a BINARY column (opaque byte sequence). QWP-only.
+    ///
+    /// BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
+    /// not currently implement this wire type; batches using it will be
+    /// rejected with a descriptive error. This may change in future server
+    /// releases.
     pub fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,
@@ -1327,8 +1336,11 @@ impl Buffer {
     #[allow(private_bounds)]
     /// Adds an array column to the current row.
     ///
-    /// Arrays require ILP protocol version 2 or later. QWP/UDP currently
-    /// supports `f64` arrays.
+    /// Arrays require ILP protocol version 2 or later. QWP supports `f64`
+    /// (DOUBLE_ARRAY, `0x11`) and `i64` (LONG_ARRAY, `0x12`) element types.
+    /// LONG_ARRAY is part of the QWP v1 spec. Server-side ingest does not
+    /// currently implement this wire type; batches using it will be rejected
+    /// with a descriptive error. This may change in future server releases.
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,

@@ -829,6 +829,10 @@ bool line_sender_buffer_column_long256(
  *   `addr = ((uint32_t)a << 24) | (b << 16) | (c << 8) | d`
  * The encoder writes `addr.to_le_bytes()` so the wire bytes appear as
  * `[d, c, b, a]`.
+ *
+ * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
+ * currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
  */
 LINESENDER_API
 bool line_sender_buffer_column_ipv4(
@@ -859,6 +863,10 @@ bool line_sender_buffer_column_char(
 
 /**
  * Record a BINARY column value (opaque byte sequence). QWP-only.
+ *
+ * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does not
+ * currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
  */
 LINESENDER_API
 bool line_sender_buffer_column_binary(
@@ -884,6 +892,10 @@ bool line_sender_buffer_column_geohash(
 /**
  * Record a multidimensional array of `int64` values in C-major order. QWP-only.
  *
+ * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest does
+ * not currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] rank Number of dimensions of the array.
@@ -907,6 +919,10 @@ bool line_sender_buffer_column_i64_arr_c_major(
 /**
  * Record a multidimensional array of `int64` values with byte strides. QWP-only.
  *
+ * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest does
+ * not currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
+ *
  * @param[in] strides Array strides, in the unit of bytes. Strides can be
  *                    negative.
  */
@@ -923,6 +939,10 @@ bool line_sender_buffer_column_i64_arr_byte_strides(
 
 /**
  * Record a multidimensional array of `int64` values with element strides. QWP-only.
+ *
+ * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest does
+ * not currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
  *
  * @param[in] strides Array strides, in the unit of elements. Strides can be
  *                    negative.

@@ -816,6 +816,10 @@ public:
      * Record an IPv4 column value. QWP-only.
      *
      * `value` is the address packed as a u32 with octet 0 in the high byte.
+     *
+     * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
+     * currently implement this wire type; batches using it will be rejected
+     * with a descriptive error. This may change in future server releases.
      */
     line_sender_buffer& column_ipv4(column_name_view name, uint32_t value)
     {
@@ -849,6 +853,11 @@ public:
 
     /**
      * Record a BINARY column value. QWP-only.
+     *
+     * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
+     * not currently implement this wire type; batches using it will be
+     * rejected with a descriptive error. This may change in future server
+     * releases.
      */
     line_sender_buffer& column_binary(
         column_name_view name, const uint8_t* data, size_t data_len)
@@ -883,6 +892,11 @@ public:
 
     /**
      * Record an int64 multidimensional array (C-major layout). QWP-only.
+     *
+     * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest
+     * does not currently implement this wire type; batches using it will
+     * be rejected with a descriptive error. This may change in future
+     * server releases.
      */
     line_sender_buffer& column_i64_arr(
         column_name_view name,
@@ -905,6 +919,11 @@ public:
 
     /**
      * Record an int64 multidimensional array with byte strides. QWP-only.
+     *
+     * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest
+     * does not currently implement this wire type; batches using it will
+     * be rejected with a descriptive error. This may change in future
+     * server releases.
      */
     line_sender_buffer& column_i64_arr_byte_strides(
         column_name_view name,
@@ -929,6 +948,11 @@ public:
 
     /**
      * Record an int64 multidimensional array with element strides. QWP-only.
+     *
+     * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest
+     * does not currently implement this wire type; batches using it will
+     * be rejected with a descriptive error. This may change in future
+     * server releases.
      */
     line_sender_buffer& column_i64_arr_elem_strides(
         column_name_view name,

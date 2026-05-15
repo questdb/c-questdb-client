@@ -2456,6 +2456,11 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
             bounce_thread = None
             if fuzz.max_bounces > 0:
+                if not (hasattr(QDB_FIXTURE, 'stop')
+                        and hasattr(QDB_FIXTURE, 'start')):
+                    self.skipTest(
+                        'bounce fuzz tests require a managed QuestDB fixture '
+                        'with stop()/start() control')
                 bounce_thread = qwp_ws_fuzz.BounceThread(
                     fixture=QDB_FIXTURE,
                     rnd=self._master_rng.child(),
@@ -3257,9 +3262,9 @@ class TestQwpUdpSender(unittest.TestCase):
             ") TIMESTAMP(ts) PARTITION BY DAY WAL")
 
         decimals = [
-            Decimal("1.2"),
-            Decimal("-3.45"),
             Decimal("0.0015"),
+            Decimal("-3.45"),
+            Decimal("1.2"),
             Decimal("NaN"),
             Decimal("Infinity"),
             Decimal("-0"),
@@ -3285,7 +3290,7 @@ class TestQwpUdpSender(unittest.TestCase):
         resp = sql_query(f"select d from '{table_name}' order by ts")
         self.assertEqual(
             [row[0] for row in resp['dataset']],
-            ['1.2000', '-3.4500', '0.0015', None, None, '0.0000'])
+            ['0.0015', '-3.4500', '1.2000', None, None, '0.0000'])
 
     def test_decimal_signed_overflow_is_rejected_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
@@ -3310,11 +3315,11 @@ class TestQwpUdpSender(unittest.TestCase):
         with self._mk_qwpudp_sender() as sender:
             (sender
              .table(table_name)
-             .column('d', QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE)
+             .column('d', Decimal('0.1'))
              .at_now())
             (sender
              .table(table_name)
-             .column('d', Decimal('0.1'))
+             .column('d', QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE)
              .at_now())
             with self.assertRaisesRegex(qls.SenderError, r'.*signed DECIMAL256 range.*'):
                 sender.flush()
