@@ -165,9 +165,9 @@ stages:
             submodules: false
           - template: compile.yaml
           - task: JavaToolInstaller@0
-            displayName: "Install JDK 17"
+            displayName: "Install JDK 25"
             inputs:
-              versionSpec: '17'
+              versionSpec: '25'
               jdkArchitectureOption: $(jdkArch)
               jdkSourceOption: 'PreInstalled'
           - script: |
@@ -180,7 +180,7 @@ stages:
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "JDKVersion"
-              jdkVersionOption: "1.17"
+              jdkVersionOption: "1.25"
               options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
