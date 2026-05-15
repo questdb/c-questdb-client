@@ -920,29 +920,32 @@ fn run_one_case(
     // Wait for WAL to apply.
     wait_for_rows(srv, &table, row_count);
 
-    // SELECT and verify per-cell.
-    let mut col_list = String::new();
-    for c in 0..col_count {
-        if c > 0 {
-            col_list.push(',');
-        }
-        col_list.push_str(&format!("c{c}"));
-    }
-    let select = format!("select {col_list} from \"{table}\" order by id");
-    let mut cur = reader.prepare(select).execute().expect("execute");
-    let mut row_offset = 0usize;
+    // Pick a query shape (mirrors Java's `planQuery`) and run it.
+    let plan = plan_query(rng, &table, col_count, row_count, iter);
+    let expected_rows = plan.last_row_id - plan.first_row_id + 1;
+    let mut cur = reader.prepare(plan.sql.clone()).execute().expect("execute");
+    let mut output_offset = 0usize;
     while let Some(view) = cur.next_batch().expect("next_batch") {
         let n = view.row_count();
         for r in 0..n {
-            let global_row = row_offset + r;
-            // `c` indexes three parallel arrays — `picked[c]`,
-            // `expected_hash[global_row][c]`, `expected_null[global_row][c]`.
-            // Rewriting as `enumerate()` would drop the explicit index
-            // and hurt readability for no perf benefit.
+            let out_row = output_offset + r;
+            // For ascending shapes: out_row 0 → first_row_id; for
+            // descending: out_row 0 → last_row_id. Map back to the
+            // 0-based input index into `expected_*`.
+            let id = if plan.descending {
+                plan.last_row_id - out_row
+            } else {
+                plan.first_row_id + out_row
+            };
+            let input_row = id - 1;
+            // `out_c` indexes the projected output columns; `in_c` is
+            // the corresponding input column index (into `picked` and
+            // `expected_*`). For shape 0 the mapping is identity.
             #[allow(clippy::needless_range_loop)]
-            for c in 0..col_count {
+            for out_c in 0..plan.proj_map.len() {
+                let in_c = plan.proj_map[out_c];
                 let is_null = view
-                    .column(c)
+                    .column(out_c)
                     .ok()
                     .map(|cv| match cv {
                         ColumnView::Boolean(x) => x.is_null(r),
@@ -959,35 +962,166 @@ fn run_one_case(
                         ColumnView::TimestampNanos(x) => x.is_null(r),
                         ColumnView::Char(x) => x.is_null(r),
                         ColumnView::Varchar(x) => x.is_null(r),
+                        ColumnView::Long256(x) => x.is_null(r),
+                        ColumnView::Ipv4(x) => x.is_null(r),
                         _ => false,
                     })
                     .unwrap_or(false);
                 assert_eq!(
-                    is_null, expected_null[global_row][c],
-                    "iter={iter} row={global_row} col={c} null-mismatch"
+                    is_null, expected_null[input_row][in_c],
+                    "iter={iter} shape={} row={input_row} out_c={out_c} in_c={in_c} null-mismatch",
+                    plan.shape
                 );
                 if !is_null {
-                    let observed = picked[c].observed_hash(&view, c, r);
+                    let observed = picked[in_c].observed_hash(&view, out_c, r);
                     assert_eq!(
                         observed,
-                        expected_hash[global_row][c],
-                        "iter={iter} row={global_row} col={c} type={} hash-mismatch",
-                        picked[c].sql_type()
+                        expected_hash[input_row][in_c],
+                        "iter={iter} shape={} row={input_row} out_c={out_c} in_c={in_c} \
+                         type={} hash-mismatch",
+                        plan.shape,
+                        picked[in_c].sql_type()
                     );
                 }
             }
         }
-        row_offset += n;
+        output_offset += n;
     }
     assert_eq!(
-        row_offset, row_count,
-        "iter={iter} row_count drift expected={row_count} got={row_offset}"
+        output_offset, expected_rows,
+        "iter={iter} shape={} row_count drift expected={expected_rows} got={output_offset}",
+        plan.shape
     );
     drop(cur);
 
     // Drop the table so the next iteration starts clean (and the
     // shared singleton's tempdir doesn't grow unbounded across runs).
     let _ = srv.http_exec(&format!("drop table \"{table}\""));
+}
+
+// ---------------------------------------------------------------------------
+// Query-shape planner.
+//
+// Ports `QwpEgressFuzzTest.planQuery`. Rotates through four shapes so
+// the fuzz exercises projection logic, filter pushdown, and reverse-
+// order delivery on top of the full-scan path.
+// ---------------------------------------------------------------------------
+
+struct Plan {
+    sql: String,
+    /// 0 = full scan, 1 = random projection, 2 = id-range filter,
+    /// 3 = order-by-desc-with-limit. Logged on assertion failure so
+    /// repros point at the right shape.
+    shape: u8,
+    /// `true` ⇒ output row 0 holds the largest id, decreasing per row.
+    descending: bool,
+    /// 1-based id of the first input row that should appear in the
+    /// result. Inclusive.
+    first_row_id: usize,
+    /// 1-based id of the last input row that should appear in the
+    /// result. Inclusive.
+    last_row_id: usize,
+    /// `output column i` corresponds to `input column proj_map[i]`.
+    /// For shape 0 / 2 / 3 this is just `0..col_count`; for shape 1
+    /// it's a length-`pick_count` shuffled subset.
+    proj_map: Vec<usize>,
+}
+
+fn plan_query(
+    rng: &mut SplitMix64,
+    table: &str,
+    col_count: usize,
+    row_count: usize,
+    iter: usize,
+) -> Plan {
+    // Row counts below 4 don't have enough material for the filter /
+    // limit shapes; force the full scan in that case (mirrors Java).
+    let shape = if row_count < 4 { 0 } else { (iter % 4) as u8 };
+
+    let identity_proj: Vec<usize> = (0..col_count).collect();
+    let proj_to_sql = |cols: &[usize]| {
+        cols.iter()
+            .map(|c| format!("c{c}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    match shape {
+        0 => Plan {
+            sql: format!(
+                "select {} from \"{table}\" order by id",
+                proj_to_sql(&identity_proj)
+            ),
+            shape,
+            descending: false,
+            first_row_id: 1,
+            last_row_id: row_count,
+            proj_map: identity_proj,
+        },
+        1 => {
+            // Random projection subset, shuffled. `pick_count ∈ 1..=col_count`.
+            let pick_count = 1 + rng.gen_range_usize(col_count);
+            let mut shuffled = identity_proj.clone();
+            // Fisher-Yates: shuffle the prefix that will become the result.
+            for i in (1..col_count).rev() {
+                let j = rng.gen_range_usize(i + 1);
+                shuffled.swap(i, j);
+            }
+            shuffled.truncate(pick_count);
+            Plan {
+                sql: format!(
+                    "select {} from \"{table}\" order by id",
+                    proj_to_sql(&shuffled)
+                ),
+                shape,
+                descending: false,
+                first_row_id: 1,
+                last_row_id: row_count,
+                proj_map: shuffled,
+            }
+        }
+        2 => {
+            // id-range filter `WHERE id >= lo AND id <= hi`. Both
+            // bounds inclusive, both in `1..=row_count`.
+            // `lo ∈ 1..=row_count - 1`, `hi = lo + span` with
+            // `span ∈ 0..=row_count - lo`.
+            let lo = 1 + rng.gen_range_usize(row_count - 1);
+            let max_span = row_count - lo;
+            let span = if max_span == 0 {
+                0
+            } else {
+                rng.gen_range_usize(max_span + 1)
+            };
+            let hi = lo + span;
+            Plan {
+                sql: format!(
+                    "select {} from \"{table}\" where id >= {lo} and id <= {hi} order by id",
+                    proj_to_sql(&identity_proj)
+                ),
+                shape,
+                descending: false,
+                first_row_id: lo,
+                last_row_id: hi,
+                proj_map: identity_proj,
+            }
+        }
+        _ => {
+            // ORDER BY id DESC LIMIT k. Returns the last `k` rows in
+            // reverse order. `k ∈ 1..=row_count`.
+            let limit = 1 + rng.gen_range_usize(row_count);
+            Plan {
+                sql: format!(
+                    "select {} from \"{table}\" order by id desc limit {limit}",
+                    proj_to_sql(&identity_proj)
+                ),
+                shape: 3,
+                descending: true,
+                first_row_id: row_count - limit + 1,
+                last_row_id: row_count,
+                proj_map: identity_proj,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
