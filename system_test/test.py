@@ -41,6 +41,7 @@ import tempfile
 import socket
 import threading
 import questdb_line_sender as qls
+import qwp_ws_fuzz
 import uuid
 from fixture import (
     Project,
@@ -65,6 +66,7 @@ SUITE_MATRIX = 'matrix'
 SUITE_QWP_WS_SMOKE = 'qwp_ws_smoke'
 SUITE_QWP_WS_PROTOCOL = 'qwp_ws_protocol'
 SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
+SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
 # The first QuestDB version that supports array types.
@@ -115,6 +117,8 @@ def _suite_kind(test):
         return SUITE_QWP_WS_PROTOCOL
     if class_name == 'TestQwpWsRestart':
         return SUITE_QWP_WS_RESTART
+    if class_name == 'TestQwpWsFuzz':
+        return SUITE_QWP_WS_FUZZ
     return SUITE_MATRIX
 
 
@@ -2279,6 +2283,628 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
                     timeout_sec=60)
 
 
+class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
+    """Schema-fuzz suite ported from
+    `io.questdb.test.cutlass.qwp.e2e.QwpSenderFuzzTest`.
+
+    Each test seeds a master RNG, prints the seed to stderr, and uses it to
+    derive everything downstream — load shape, fuzz factors, per-thread RNGs
+    and the optional ALTER thread RNG. Freeze the printed seed via
+    ``QWP_WS_FUZZ_SEED=0x...`` to reproduce a failure, then filter unittest
+    to just that method.
+    """
+
+    BASE_TIMESTAMP_US = 1_465_839_830_102_300
+    POLL_INTERVAL_SEC = 0.05
+    DRAIN_TIMEOUT_SEC = 120
+
+    def setUp(self):
+        self._require_fuzz_fixture()
+        seed = qwp_ws_fuzz.derive_master_seed()
+        self._master_rng = qwp_ws_fuzz.Rng(seed)
+        self._seed_label = (
+            f'{self.id()} seed={qwp_ws_fuzz.format_seed(seed)}')
+        sys.stderr.write(f'[qwp_ws_fuzz seed] {self._seed_label}\n')
+        sys.stderr.flush()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {self.id()}')
+
+    def tearDown(self):
+        if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            QDB_FIXTURE.http_sql_query(
+                f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {self.id()}')
+
+    def _require_fuzz_fixture(self):
+        self._require_qwp_ws_protocol()
+        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+            self.skipTest('QWP/WebSocket fuzz tests require a managed QuestDB fixture')
+        root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
+        # Same repo-only gate as TestQwpWsRestart: the release-matrix server
+        # builds on the fixed version list do not expose QWP/WebSocket.
+        if root_dir is not None and root_dir.name != 'repo':
+            self.skipTest('QWP/WebSocket fuzz tests require a QuestDB repo fixture')
+        if QDB_FIXTURE.auth:
+            self.skipTest('QWP/WebSocket fuzz tests run without auth')
+        if getattr(QDB_FIXTURE, 'http_auth', False):
+            self.skipTest('QWP/WebSocket fuzz tests run without HTTP auth')
+        if QDB_FIXTURE.http:
+            self.skipTest('QWP/WebSocket fuzz tests run outside the HTTP ILP matrix')
+
+    @staticmethod
+    def _is_windows():
+        return qwp_ws_fuzz.is_windows()
+
+    def _log(self, msg: str):
+        sys.stderr.write(f'[qwp_ws_fuzz] {msg}\n')
+        sys.stderr.flush()
+
+    def _list_columns(self, table_name: str):
+        try:
+            resp = sql_query(f'SHOW COLUMNS FROM \'{table_name}\'')
+        except Exception:
+            return []
+        cols = resp.get('columns') or []
+        dataset = resp.get('dataset') or []
+        name_idx = type_idx = None
+        for i, c in enumerate(cols):
+            if c.get('name') == 'column':
+                name_idx = i
+            elif c.get('name') == 'type':
+                type_idx = i
+        if name_idx is None or type_idx is None:
+            return []
+        return [
+            {'name': row[name_idx], 'type': row[type_idx]}
+            for row in dataset
+        ]
+
+    def _query_table_sorted(self, table_name: str):
+        resp = sql_query(
+            f'SELECT * FROM \'{table_name}\' ORDER BY timestamp')
+        return resp.get('columns') or [], resp.get('dataset') or []
+
+    def _wait_for_row_count(self, table_name: str, expected: int):
+        deadline = time.monotonic() + self.DRAIN_TIMEOUT_SEC
+        last = -1
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                resp = sql_query(f'SELECT count() FROM \'{table_name}\'')
+                row = (resp.get('dataset') or [[0]])[0]
+                last = int(row[0])
+                if last >= expected:
+                    return last
+            except Exception as e:  # noqa: BLE001 — table may not exist yet
+                last_error = e
+            time.sleep(self.POLL_INTERVAL_SEC)
+        self.fail(
+            f'[{self._seed_label}] timed out waiting for {expected} rows in '
+            f'{table_name!r}; last_count={last}, last_error={last_error!r}')
+
+    def _drop_table_if_exists(self, table_name: str):
+        try:
+            sql_query(f'DROP TABLE IF EXISTS \'{table_name}\'')
+        except Exception as e:  # noqa: BLE001 — table may already be absent
+            self._log(f'DROP TABLE IF EXISTS {table_name!r} ignored: {e}')
+
+    def _run_fuzz(self, load: 'qwp_ws_fuzz.LoadParams',
+                  fuzz: 'qwp_ws_fuzz.FuzzParams'):
+        # Pre-create per-table buffers. Java keys by lowercase name (case-
+        # insensitive) so 'WEATHER0' and 'weather0' resolve to the same
+        # table on both client- and server-side.
+        tables = {}
+        for i in range(load.num_of_tables):
+            name = qwp_ws_fuzz.canonical_table_name(i)
+            tables[name] = qwp_ws_fuzz.TableData(name)
+            self._drop_table_if_exists(name)
+
+        run_id = uuid.uuid4().hex[:8]
+        timestamp_us = [self.BASE_TIMESTAMP_US]
+        ts_lock = threading.Lock()
+
+        def next_ts():
+            with ts_lock:
+                timestamp_us[0] += 1
+                return timestamp_us[0]
+
+        failure_counter = [0]
+        failure_messages = []
+        fail_lock = threading.Lock()
+
+        def record_failure(msg: str):
+            with fail_lock:
+                failure_messages.append(msg)
+                failure_counter[0] += 1
+            self._log(msg)
+
+        producers_done = threading.Event()
+        stop_event = threading.Event()
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-fuzz-') as sf_root:
+            producer_threads = []
+            for thread_index in range(load.num_of_threads):
+                thread_seed_rng = self._master_rng.child()
+                sender_id = f'fuzz-{run_id}-t{thread_index}'
+                thread = threading.Thread(
+                    target=self._producer_loop,
+                    name=f'qwp-ws-fuzz-producer-{thread_index}',
+                    args=(
+                        sender_id, sf_root, load, fuzz, thread_seed_rng,
+                        tables, next_ts, record_failure))
+                producer_threads.append(thread)
+                thread.start()
+
+            alter_thread = None
+            if fuzz.column_convert_prob > 0:
+                budget = max(1, int(
+                    load.num_of_lines
+                    * load.num_of_tables
+                    * fuzz.column_convert_prob))
+                alter_thread = qwp_ws_fuzz.AlterThread(
+                    sql_query=sql_query,
+                    list_columns=self._list_columns,
+                    tables=list(tables.keys()),
+                    convert_budget=budget,
+                    rnd=self._master_rng.child(),
+                    producers_done=producers_done,
+                    stop_event=stop_event,
+                    failure_counter=failure_counter,
+                    log=self._log)
+                alter_thread.start()
+
+            try:
+                for thread in producer_threads:
+                    thread.join()
+            finally:
+                producers_done.set()
+
+            if alter_thread is not None:
+                alter_thread.join(timeout=30)
+                if alter_thread.is_alive():
+                    stop_event.set()
+                    alter_thread.join(timeout=30)
+
+        self.assertEqual(
+            failure_counter[0], 0,
+            f'[{self._seed_label}] producer/alter failures: {failure_messages}')
+
+        for name, table in tables.items():
+            expected = table.valid_count()
+            if expected == 0:
+                continue
+            self._wait_for_row_count(name, expected)
+
+        for name, table in tables.items():
+            if table.valid_count() == 0:
+                continue
+            columns, rows = self._query_table_sorted(name)
+            try:
+                qwp_ws_fuzz.compare_table(
+                    table=table,
+                    server_columns=columns,
+                    server_rows=rows,
+                    seed_label=self._seed_label)
+            except qwp_ws_fuzz.TableMismatch as e:
+                self.fail(str(e))
+
+    def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
+                       tables, next_ts, record_failure):
+        conf = self._sender_conf(
+            sender_id,
+            sf_root,
+            reconnect_max_duration_millis=120000,
+            close_flush_timeout_millis=60000)
+        try:
+            sender = self._connect_sender(conf)
+        except Exception as e:  # noqa: BLE001
+            record_failure(f'connect failed for {sender_id}: {e}')
+            return
+        try:
+            points = 0
+            for _ in range(load.num_of_iterations):
+                for _ in range(load.num_of_lines):
+                    table_name = qwp_ws_fuzz.pick_table_name(
+                        load.num_of_tables, rnd)
+                    line = qwp_ws_fuzz.generate_line(
+                        table_name, sender, fuzz, next_ts(), rnd)
+                    tables[table_name.lower()].add_line(line)
+                    points += 1
+                    if points % qwp_ws_fuzz.BATCH_SIZE == 0:
+                        sender.flush()
+                sender.flush()
+                if load.wait_between_iterations_ms > 0:
+                    time.sleep(load.wait_between_iterations_ms / 1000.0)
+            sender.close_drain()
+        except Exception as e:  # noqa: BLE001
+            record_failure(f'producer {sender_id} failed: {e}')
+        finally:
+            try:
+                sender.close(False)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _r(self):
+        """Shorthand alias for the master RNG used in test parameterization."""
+        return self._master_rng
+
+    def test_add_columns(self):
+        r = self._r()
+        load = qwp_ws_fuzz.LoadParams(
+            num_of_lines=15 + r.next_int(100),
+            num_of_iterations=5 + r.next_int(5),
+            num_of_threads=2 + r.next_int(5 if self._is_windows() else 20),
+            num_of_tables=1 + r.next_int(4),
+            wait_between_iterations_ms=r.next_int(75))
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=1,
+            new_column_factor=1 + r.next_int(3),
+            non_ascii_value_factor=6,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=False,
+            column_convert_prob=0.1)
+        self._run_fuzz(load, fuzz)
+
+    def test_add_columns_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(15, 2, 2, 5, 75)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=-1,
+            new_column_factor=4,
+            non_ascii_value_factor=3,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=False,
+            column_convert_prob=0.15)
+        self._run_fuzz(load, fuzz)
+
+    def test_add_convert_columns(self):
+        load = qwp_ws_fuzz.LoadParams(15, 2, 2, 5, 75)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=-1,
+            new_column_factor=4,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=True,
+            column_convert_prob=0.2)
+        self._run_fuzz(load, fuzz)
+
+    def test_all_mixed(self):
+        load = qwp_ws_fuzz.LoadParams(
+            50, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=3,
+            column_reordering_factor=4,
+            column_skip_factor=5,
+            new_column_factor=10,
+            non_ascii_value_factor=5,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=True,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_all_mixed_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            50, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=3,
+            column_reordering_factor=4,
+            column_skip_factor=5,
+            new_column_factor=10,
+            non_ascii_value_factor=5,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=True,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_all_mixed_single_table(self):
+        load = qwp_ws_fuzz.LoadParams(
+            50, 3 if self._is_windows() else 5, 5, 1, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=3,
+            column_reordering_factor=4,
+            column_skip_factor=5,
+            new_column_factor=10,
+            non_ascii_value_factor=5,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=True,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_all_mixed_split_part(self):
+        load = qwp_ws_fuzz.LoadParams(
+            50, 3 if self._is_windows() else 5, 5, 1, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=10,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=False,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_case_variation_reordering_columns(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=2,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_case_variation_reordering_columns_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_case_variation_reordering_columns_send_symbols_with_space(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=3,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=True)
+        self._run_fuzz(load, fuzz)
+
+    def test_duplicates_reordering_columns(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=4,
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=False,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_duplicates_reordering_columns_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=4,
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=False,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_duplicates_reordering_columns_send_symbols_with_space(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=4,
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=True,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_load(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 7, 12, 20)
+        fuzz = qwp_ws_fuzz.FuzzParams()
+        self._run_fuzz(load, fuzz)
+
+    def test_load_large_payload(self):
+        load = qwp_ws_fuzz.LoadParams(
+            500, 3 if self._is_windows() else 5, 5, 5, 10)
+        fuzz = qwp_ws_fuzz.FuzzParams()
+        self._run_fuzz(load, fuzz)
+
+    def test_load_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 7, 12, 20)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=5,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=False,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_load_send_symbols_with_space(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 4, 8, 20)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=-1,
+            new_column_factor=2,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=True)
+        self._run_fuzz(load, fuzz)
+
+    def test_load_small_buffer(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 20)
+        fuzz = qwp_ws_fuzz.FuzzParams()
+        # Note: Java sets recvBufferSize=2048 on the server fixture; the
+        # Python tests run against the standard server config, so this
+        # variant exercises the same fuzz axes at smaller batch sizes only.
+        self._run_fuzz(load, fuzz)
+
+    def test_non_ascii_values(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=-1,
+            new_column_factor=3,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_non_ascii_values_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=-1,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=False,
+            exercise_symbols=False,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_columns(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=8,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=True,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_columns_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=-1,
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=False,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_many_threads(self):
+        r = self._r()
+        load = qwp_ws_fuzz.LoadParams(
+            num_of_lines=15 + r.next_int(100),
+            num_of_iterations=5 + r.next_int(5),
+            num_of_threads=2 + r.next_int(5 if self._is_windows() else 20),
+            num_of_tables=1 + r.next_int(4),
+            wait_between_iterations_ms=r.next_int(75))
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=3,
+            column_skip_factor=-1,
+            new_column_factor=1 + r.next_int(3),
+            non_ascii_value_factor=-1,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_non_ascii(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=-1,
+            new_column_factor=2,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=False,
+            exercise_symbols=True,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_skip_columns_with_non_ascii(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=4,
+            new_column_factor=2,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_skip_columns_with_non_ascii_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            column_skip_factor=4,
+            new_column_factor=-1,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=False)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_skip_duplicate_columns_with_non_ascii(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=4,
+            column_reordering_factor=4,
+            column_skip_factor=4,
+            new_column_factor=-1,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=False,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    def test_reordering_skip_duplicate_columns_with_non_ascii_no_symbols(self):
+        load = qwp_ws_fuzz.LoadParams(
+            100, 3 if self._is_windows() else 5, 5, 5, 50)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=4,
+            column_reordering_factor=4,
+            column_skip_factor=4,
+            new_column_factor=-1,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=True,
+            exercise_symbols=False,
+            send_symbols_with_space=False,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+
 class TestQwpUdpSender(unittest.TestCase):
     def setUp(self):
         test_name = self.id()
@@ -3281,6 +3907,7 @@ def run_with_fixtures(args):
     run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
     run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
     run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
+    run_qwp_ws_fuzz_suite = _select_tests(SUITE_QWP_WS_FUZZ).countTestCases() > 0
 
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
@@ -3391,6 +4018,24 @@ def run_with_fixtures(args):
                 QDB_FIXTURE.protocol_version = latest_protocol
                 QDB_FIXTURE.drop_all_tables()
                 if not _run_selected_tests(SUITE_QWP_WS_RESTART):
+                    sys.exit(1)
+            finally:
+                QDB_FIXTURE.stop()
+
+        if run_qwp_ws_fuzz_suite:
+            QDB_FIXTURE = QuestDbFixture(
+                questdb_dir,
+                auth=False,
+                qwp_udp=False)
+            TLS_PROXY_FIXTURE = None
+            try:
+                sys.stderr.write(f'>>>> STARTING {questdb_dir} [qwp_ws_fuzz] <<<<\n')
+                QDB_FIXTURE.start()
+                BUILD_MODE = qls.BuildMode.CONF
+                QDB_FIXTURE.http = False
+                QDB_FIXTURE.protocol_version = latest_protocol
+                QDB_FIXTURE.drop_all_tables()
+                if not _run_selected_tests(SUITE_QWP_WS_FUZZ):
                     sys.exit(1)
             finally:
                 QDB_FIXTURE.stop()
