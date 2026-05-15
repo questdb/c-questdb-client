@@ -32,6 +32,7 @@ import pathlib
 import json
 import tarfile
 import shutil
+import signal
 import subprocess
 import time
 import socket
@@ -489,6 +490,15 @@ class QuestDbFixture(QuestDbFixtureBase):
             f'(auth: {self.auth}, http_auth: {self.http_auth}, '
             f'http: {self.http}, qwp_udp: {self.qwp_udp})\n')
         self._log = open(self._log_path, 'ab')
+        # On Windows, Popen.terminate() maps to TerminateProcess(), which kills
+        # the JVM without running shutdown hooks. That leaves QuestDB's writers
+        # mid-update and can corrupt the sequencer's _meta/_txnlog ordering.
+        # CREATE_NEW_PROCESS_GROUP lets stop() send CTRL_BREAK_EVENT to the JVM
+        # only (not to pytest), which triggers a graceful shutdown.
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            if sys.platform == 'win32'
+            else 0)
         try:
             self._proc = subprocess.Popen(
                 launch_args,
@@ -496,7 +506,8 @@ class QuestDbFixture(QuestDbFixtureBase):
                 cwd=self._data_dir,
                 # env=launch_env,
                 stdout=self._log,
-                stderr=subprocess.STDOUT)
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags)
 
             def check_http_up():
                 if self._proc.poll() is not None:
@@ -545,8 +556,18 @@ class QuestDbFixture(QuestDbFixtureBase):
         if self._tls_proxy:
             self._tls_proxy.stop()
         if self._proc:
-            self._proc.terminate()
-            self._proc.wait()
+            if sys.platform == 'win32':
+                # CTRL_BREAK_EVENT is the closest Windows analogue of SIGTERM
+                # for a JVM child: it runs shutdown hooks. Requires the child
+                # to have been started with CREATE_NEW_PROCESS_GROUP.
+                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                self._proc.terminate()
+            try:
+                self._proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
             self._proc = None
         if self._log:
             self._log.close()
