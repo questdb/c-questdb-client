@@ -41,13 +41,14 @@
 //! partial varint reads.
 //!
 //! Scope vs Java original:
-//!   - Generator catalogue: LONG, INT, SHORT, BYTE, BOOLEAN, DOUBLE,
-//!     FLOAT, CHAR, TIMESTAMP, TIMESTAMP_NS, DATE, VARCHAR, SYMBOL
-//!     (small + large pools), UUID, LONG256, IPv4. The remaining Java
-//!     generators (BINARY, GEOHASH × 4, DECIMAL128, DECIMAL256,
-//!     DOUBLE_ARRAY, DECIMAL64) are "existence-only" hashes in Java
-//!     anyway — not bit-level oracles — so they'd grow LOC without
-//!     strengthening the regression guarantee.
+//!   - Generator catalogue (bit-level hash oracles): LONG, INT, SHORT,
+//!     BYTE, BOOLEAN, DOUBLE, FLOAT, CHAR, TIMESTAMP, TIMESTAMP_NS,
+//!     DATE, VARCHAR, SYMBOL (small + large pools), UUID, LONG256,
+//!     IPv4. The remaining Java generators (BINARY, GEOHASH × 4,
+//!     DECIMAL128, DECIMAL256, DOUBLE_ARRAY, DECIMAL64) are
+//!     "existence-only" hashes in Java anyway — not bit-level oracles
+//!     — so they'd grow LOC without strengthening the regression
+//!     guarantee.
 //!   - Three `@Test` methods ported: `random_schema_roundtrip` (15
 //!     fresh-connection cases under fragmentation),
 //!     `back_to_back_queries_same_connection` (12 cases on one
@@ -689,6 +690,92 @@ impl ColumnGenerator for UuidGenerator {
     }
 }
 
+// --- Long256 -----------------------------------------------------------
+
+struct Long256Generator;
+impl ColumnGenerator for Long256Generator {
+    fn sql_type(&self) -> &'static str {
+        "LONG256"
+    }
+    fn random_value(&self, rng: &mut SplitMix64) -> CellGen {
+        // 4 random u64 limbs assembled into a 32-byte little-endian
+        // payload, then hex-encoded big-endian for the SQL literal
+        // (QuestDB's `0xNNNN...` LONG256 literal expects big-endian).
+        // Hash mirrors Java's `Long256Generator`: XOR of the 4 limbs.
+        let w0 = rng.next_u64();
+        let w1 = rng.next_u64();
+        let w2 = rng.next_u64();
+        let w3 = rng.next_u64();
+        let hash = (w0 ^ w1 ^ w2 ^ w3) as i64;
+        // QuestDB stores LONG256 as four little-endian u64 limbs in
+        // ascending limb order on the wire; `ColumnView::Long256.value()`
+        // surfaces the raw 32 bytes verbatim. Build the SQL literal
+        // by hex-encoding the most-significant limb first (big-endian
+        // overall), so the bytes that come back match what we wrote.
+        let mut bytes_be = [0u8; 32];
+        bytes_be[0..8].copy_from_slice(&w3.to_be_bytes());
+        bytes_be[8..16].copy_from_slice(&w2.to_be_bytes());
+        bytes_be[16..24].copy_from_slice(&w1.to_be_bytes());
+        bytes_be[24..32].copy_from_slice(&w0.to_be_bytes());
+        let mut hex = String::with_capacity(2 + 64);
+        hex.push_str("0x");
+        for b in &bytes_be {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        CellGen { literal: hex, hash }
+    }
+    fn observed_hash(&self, view: &BatchView<'_>, col: usize, row: usize) -> i64 {
+        let ColumnView::Long256(c) = view.column(col).unwrap() else {
+            panic!("col {col} not Long256");
+        };
+        let bytes = c.value(row);
+        // Wire stores limbs ascending in little-endian order: bytes
+        // 0..8 = w0 (LE), 8..16 = w1, 16..24 = w2, 24..32 = w3.
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[0..8]);
+        let w0 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&bytes[8..16]);
+        let w1 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&bytes[16..24]);
+        let w2 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&bytes[24..32]);
+        let w3 = u64::from_le_bytes(buf);
+        (w0 ^ w1 ^ w2 ^ w3) as i64
+    }
+}
+
+// --- IPv4 --------------------------------------------------------------
+
+struct Ipv4Generator;
+impl ColumnGenerator for Ipv4Generator {
+    fn sql_type(&self) -> &'static str {
+        "IPV4"
+    }
+    fn random_value(&self, rng: &mut SplitMix64) -> CellGen {
+        // Java: each octet in `[1, 254]` to avoid `0.0.0.0` (NULL
+        // sentinel) and broadcast-y values. Same constraint here.
+        let a = (1 + rng.gen_range_u32(254)) as u8;
+        let b = (1 + rng.gen_range_u32(254)) as u8;
+        let c = (1 + rng.gen_range_u32(254)) as u8;
+        let d = (1 + rng.gen_range_u32(254)) as u8;
+        // QuestDB stores IPv4 as a host-order u32: `a.b.c.d` →
+        // `(a << 24) | (b << 16) | (c << 8) | d`. That's what
+        // `ColumnView::Ipv4.value()` returns. Hash mirrors the wire.
+        let packed =
+            (u32::from(a) << 24) | (u32::from(b) << 16) | (u32::from(c) << 8) | u32::from(d);
+        CellGen {
+            literal: format!("CAST('{a}.{b}.{c}.{d}' AS IPV4)"),
+            hash: packed as i64,
+        }
+    }
+    fn observed_hash(&self, view: &BatchView<'_>, col: usize, row: usize) -> i64 {
+        let ColumnView::Ipv4(c) = view.column(col).unwrap() else {
+            panic!("col {col} not Ipv4");
+        };
+        c.value(row) as i64
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Generator catalogue (one entry per type the catalogue advertises).
 // ---------------------------------------------------------------------------
@@ -710,6 +797,8 @@ fn build_generators() -> Vec<Box<dyn ColumnGenerator>> {
         Box::new(SymbolGenerator::new("lo", 8)),
         Box::new(SymbolGenerator::new("hi", 1000)),
         Box::new(UuidGenerator),
+        Box::new(Long256Generator),
+        Box::new(Ipv4Generator),
     ]
 }
 
