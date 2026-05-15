@@ -788,16 +788,12 @@ impl ReaderConfig {
             }
         }
 
-        // tls_verify=unsafe_off needs the crate feature.
-        #[cfg(not(feature = "insecure-skip-verify"))]
-        {
-            if matches!(tls_verify, TlsVerify::UnsafeOff) {
-                return Err(fmt!(
-                    ConfigError,
-                    "\"tls_verify=unsafe_off\" requires the \"insecure-skip-verify\" crate feature"
-                ));
-            }
-        }
+        // The `tls_verify=unsafe_off` feature-gate check is enforced by
+        // `validate()` (called below) so a post-parse mutation of
+        // `cfg.tls_verify = TlsVerify::UnsafeOff` is also rejected —
+        // without that, the runtime would silently downgrade to the
+        // default verifier and the caller's explicit "off" intent would
+        // be lost.
 
         // tls_* knobs only make sense with TLS scheme.
         if !tls && (tls_roots.is_some() || tls_ca_explicit) {
@@ -980,6 +976,19 @@ impl ReaderConfig {
             reject_crlf("zone", z)?;
         }
         self.auth.validate()?;
+        // tls_verify=unsafe_off needs the crate feature. Re-checked
+        // here so a post-parse mutation of `cfg.tls_verify =
+        // TlsVerify::UnsafeOff` is rejected too — the TLS builder
+        // silently downgrades to the default verifier when the feature
+        // is off (runtime is safe), so without this check the caller's
+        // explicit "off" intent would be lost without diagnostic.
+        #[cfg(not(feature = "insecure-skip-verify"))]
+        if matches!(self.tls_verify, TlsVerify::UnsafeOff) {
+            return Err(fmt!(
+                ConfigError,
+                "\"tls_verify=unsafe_off\" requires the \"insecure-skip-verify\" crate feature"
+            ));
+        }
         Ok(())
     }
 
@@ -1396,6 +1405,51 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
         let err = ReaderConfig::from_conf("ws::addr=h:1;tls_ca=pem_file").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    // `tls_verify=unsafe_off` is gated by the `insecure-skip-verify`
+    // crate feature. The feature gate has to be enforced by `validate()`
+    // (not just at parse time) because the field is `pub`: a caller can
+    // build a clean config via `from_conf` and then assign
+    // `cfg.tls_verify = TlsVerify::UnsafeOff` directly. The TLS builder
+    // silently downgrades to the default verifier when the feature is
+    // off, so without the validate-time check the caller's explicit
+    // "off" intent would be lost without diagnostic.
+    #[cfg(not(feature = "insecure-skip-verify"))]
+    #[test]
+    fn validate_rejects_unsafe_off_when_feature_disabled() {
+        // Parse-time rejection: the existing behaviour, still in place.
+        let err = ReaderConfig::from_conf("wss::addr=h:1;tls_verify=unsafe_off").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("insecure-skip-verify"),
+            "msg: {}",
+            err.msg()
+        );
+
+        // Post-parse mutation: builds a clean config first, then flips
+        // the field. Without the re-check in `validate()` this path
+        // would pass silently.
+        let mut cfg = ReaderConfig::from_conf("wss::addr=h:1").unwrap();
+        assert_eq!(cfg.tls_verify, TlsVerify::On);
+        cfg.tls_verify = TlsVerify::UnsafeOff;
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("insecure-skip-verify"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[cfg(feature = "insecure-skip-verify")]
+    #[test]
+    fn validate_accepts_unsafe_off_when_feature_enabled() {
+        // Mirror of `validate_rejects_unsafe_off_when_feature_disabled`
+        // — pins that the feature gate only fires in the off direction.
+        let cfg = ReaderConfig::from_conf("wss::addr=h:1;tls_verify=unsafe_off").unwrap();
+        assert_eq!(cfg.tls_verify, TlsVerify::UnsafeOff);
+        cfg.validate().expect("unsafe_off must pass validate when feature is on");
     }
 
     #[test]
