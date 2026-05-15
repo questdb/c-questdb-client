@@ -56,6 +56,57 @@ stages:
                 egress::decoder::tests
             displayName: "Run QWP egress fuzz suite"
 
+      # Live-server fuzz: bind / fragmentation / random-schema cases that
+      # need a real QuestDB. Builds the questdb jar from `master`, then
+      # runs the three `egress_live_server_*_fuzz` cargo tests. Linux-only
+      # for now — keeps the hourly Maven cost bounded; the per-PR coverage
+      # in run_tests_pipeline.yaml already runs the same suite.
+      # Seed varies per build via `QWP_EGRESS_FUZZ_SEED=$(Build.BuildId)`
+      # so the hourly cron actually explores beyond the deterministic
+      # default that the PR-time job uses.
+      - job: TestQwpEgressLiveServerFuzz
+        displayName: "QWP egress live-server fuzz (hourly)"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+            displayName: git clone questdb
+          - script: |
+              set -euo pipefail
+              JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
+              sudo mkdir -p /opt/jdk25
+              curl -fsSL "$JDK_URL" | sudo tar -xz -C /opt/jdk25 --strip-components=1
+              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/jdk25"
+              echo "##vso[task.prependpath]/opt/jdk25/bin"
+            displayName: "Install JDK 25"
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "default"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              set -euxo pipefail
+              cd questdb-rs
+              # `--test NAME` selectors skip the pre-existing broken
+              # `egress_live_server.rs` build (FailoverEvent callback
+              # non-Send) that we don't want to inherit as a hourly
+              # alert source.
+              QWP_EGRESS_FUZZ_SEED="$(Build.BuildId)" \
+                cargo test --features live-server-tests \
+                --test egress_live_server_bind_fuzz \
+                --test egress_live_server_fragmentation_fuzz \
+                --test egress_live_server_fuzz \
+                -- --nocapture
+            displayName: "QWP egress live-server fuzz (varying seed)"
+
       # Mirrors ia_qwp_ws's NotifyOnFailure pattern. BUILDS_SLACK_HOOK_URL
       # must be configured as a secret pipeline variable (or attached via a
       # shared variable group) before this pipeline is enabled — otherwise
@@ -64,6 +115,7 @@ stages:
         displayName: "Notify Slack on failure"
         dependsOn:
           - TestQwpEgressFuzz
+          - TestQwpEgressLiveServerFuzz
         condition: failed()
         pool:
           vmImage: "ubuntu-latest"

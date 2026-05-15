@@ -158,3 +158,51 @@ stages:
           - script: |
               python3 system_test/test_egress_failover.py run --repo ./questdb -v
             displayName: "egress integration test"
+      # Per-PR live-server fuzz coverage for the OSS-questdb tests that
+      # need a real server (bind / fragmentation / random-schema). Three
+      # `--test NAME` selectors so cargo only builds the new fuzz
+      # binaries — `egress_live_server.rs` has pre-existing compile
+      # errors under `live-server-tests` on vi_egress (FailoverEvent
+      # callback non-Send) that we don't want to inherit as a blocker.
+      # Default seed gives a deterministic per-PR sweep; the hourly
+      # cron in run_fuzz_pipeline.yaml varies the seed per build.
+      - job: TestQwpEgressLiveServerFuzz
+        displayName: "QWP egress live-server fuzz suite"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+            displayName: git clone questdb
+          - script: |
+              set -euo pipefail
+              JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
+              sudo mkdir -p /opt/jdk25
+              curl -fsSL "$JDK_URL" | sudo tar -xz -C /opt/jdk25 --strip-components=1
+              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/jdk25"
+              echo "##vso[task.prependpath]/opt/jdk25/bin"
+            displayName: "Install JDK 25 (required by QuestDB master)"
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "default"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              set -euxo pipefail
+              cd questdb-rs
+              # `--test NAME` selectors skip the pre-existing broken
+              # `egress_live_server.rs` build (FailoverEvent callback
+              # non-Send; tracked upstream, not regressed here).
+              cargo test --features live-server-tests \
+                --test egress_live_server_bind_fuzz \
+                --test egress_live_server_fragmentation_fuzz \
+                --test egress_live_server_fuzz \
+                -- --nocapture
+            displayName: "QWP egress live-server fuzz"
