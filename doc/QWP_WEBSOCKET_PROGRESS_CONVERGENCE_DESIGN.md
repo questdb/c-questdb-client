@@ -513,13 +513,14 @@ Target model for sender errors:
 - keep one store-owned source of truth for QWP sender diagnostics;
 - keep a terminal sender-error latch only if stable non-consuming terminal lookup
   needs it;
-- derive `poll_qwp_ws_error` and handler notification delivery from that source
-  of truth;
-- do not keep two cloned bounded rings merely so polling and handler
-  notification can consume independently;
-- if independent delivery is part of the intended public contract, model it as
-  sender/API-layer cursors over one diagnostic log rather than duplicated
-  storage.
+- remove the public pollable diagnostic API and use callback notification plus
+  terminal-error payloads as the public model;
+- do not keep two cloned bounded rings, or independent poll and notification
+  cursors, merely to preserve post-hoc diagnostic polling;
+- define `qwp_ws_errors_dropped` as dropped callback-notification count.
+
+The focused design is
+[`.md`](QWP_WEBSOCKET_NOTIFICATION_ONLY_ERROR_DELIVERY.md).
 
 No store, core, runner, or progress-thread code should call user callbacks.
 If Rust later adds Java-style asynchronous error dispatch, it should be an
