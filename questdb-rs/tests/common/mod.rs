@@ -134,7 +134,9 @@ fn http_status(host: &str, port: u16, path: &str) -> u16 {
 /// DDL / setup queries; result body is not parsed.
 pub fn http_exec(host: &str, port: u16, sql: &str) -> u16 {
     let url = format!("http://{}:{}/exec", host, port);
-    match ureq::get(&url).prepare("query", sql).call() {
+    // ureq 3.1's `RequestBuilder::query` replaces the older `prepare`
+    // call; identical semantics, percent-encoded URL query string.
+    match ureq::get(&url).query("query", sql).call() {
         Ok(resp) => resp.status().as_u16(),
         Err(ureq::Error::StatusCode(code)) => code,
         Err(e) => {
@@ -178,9 +180,27 @@ impl QuestDbServer {
     // dump_recent_log defined in the impl block above; this is the boot
     // path.
 
-    /// Boot a fresh server. Blocks until `/ping` responds 204 or the
-    /// timeout fires; on failure dumps the JVM log to stderr.
+    /// Boot a fresh server with no extra server-conf keys. Convenience
+    /// wrapper around [`Self::start_with_config`].
+    ///
+    /// Used by the shared singleton in `egress_live_server.rs` so dozens
+    /// of pinned-value smoke tests can amortise the ~15 s JVM boot.
     pub fn start() -> Self {
+        Self::start_with_config(&[])
+    }
+
+    /// Boot a fresh server and append `extra_conf` to its `server.conf`.
+    /// Each `(key, value)` produces one line `key=value` after the
+    /// fixture's default port / telemetry block. Blocks until `/ping`
+    /// responds 204 or the 45 s timeout fires; on failure dumps the JVM
+    /// log to stderr.
+    ///
+    /// Use this constructor for tests that need per-instance debug
+    /// knobs (e.g. `debug.http.force.recv.fragmentation.chunk.size`
+    /// for fragmentation fuzz). The returned `QuestDbServer` owns its
+    /// JVM — `Drop` kills it at end of test, so each per-test instance
+    /// costs one ~15 s boot.
+    pub fn start_with_config(extra_conf: &[(&str, &str)]) -> Self {
         let jar = locate_jar();
         let java = locate_java();
         let ports = allocate_ports(3);
@@ -189,7 +209,7 @@ impl QuestDbServer {
         let data_dir = tempfile::tempdir().expect("tempdir");
         let conf_dir = data_dir.path().join("conf");
         std::fs::create_dir_all(&conf_dir).expect("conf dir");
-        let conf = format!(
+        let mut conf = format!(
             "http.bind.to=127.0.0.1:{http}\n\
              line.tcp.net.bind.to=127.0.0.1:{ilp}\n\
              pg.net.bind.to=127.0.0.1:{pg}\n\
@@ -201,6 +221,12 @@ impl QuestDbServer {
             ilp = ilp_port,
             pg = pg_port,
         );
+        for (k, v) in extra_conf {
+            conf.push_str(k);
+            conf.push('=');
+            conf.push_str(v);
+            conf.push('\n');
+        }
         std::fs::write(conf_dir.join("server.conf"), conf).expect("server.conf");
 
         let log_path = data_dir.path().join("jvm.log");
@@ -276,9 +302,20 @@ impl QuestDbServer {
         );
     }
 
-    /// `qwp::` connect string for the egress reader.
+    /// `qwp::` connect string for the egress reader. Kept for the
+    /// existing pinned-value tests in `egress_live_server.rs`; new
+    /// tests should prefer [`Self::ws_conf`] which matches the current
+    /// post-`8e6dba3` scheme name on `vi_egress`.
     pub fn qwp_conf(&self) -> String {
         format!("qwp::addr={}:{}", self.host, self.http_port)
+    }
+
+    /// `ws::` connect string for the egress reader. Tracks the
+    /// post-`8e6dba3 "qwp:: -> ws::"` scheme rename on `vi_egress`,
+    /// which is what `refs/pull/142/merge` exercises in CI. New fuzz
+    /// tests use this form so they work against the merge commit.
+    pub fn ws_conf(&self) -> String {
+        format!("ws::addr={}:{}", self.host, self.http_port)
     }
 
     /// `http::` connect string for the ingress sender.
