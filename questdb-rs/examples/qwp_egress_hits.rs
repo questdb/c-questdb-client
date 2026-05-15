@@ -253,14 +253,14 @@ fn touch_column(col: &ColumnView<'_>, n: usize) -> u64 {
         }
         ColumnView::Ipv4(c) => {
             for r in 0..n {
-                acc ^= u64::from(u32::from(c.value(r)));
+                acc ^= u64::from(c.value(r));
             }
         }
         ColumnView::Symbol(c) => {
             let dict = c.dict();
             let codes = c.codes();
-            for r in 0..n {
-                acc ^= dict.get(codes[r]).map(str::len).unwrap_or(0) as u64;
+            for &code in codes.iter().take(n) {
+                acc ^= dict.get(code).map(str::len).unwrap_or(0) as u64;
             }
         }
         ColumnView::Varchar(c) => {

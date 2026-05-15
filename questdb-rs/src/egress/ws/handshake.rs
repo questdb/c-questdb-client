@@ -691,57 +691,17 @@ Content-Length: 11\r\n\r\nhello world";
 
     #[test]
     fn terminator_straddles_read_boundary() {
-        // Deliberately straddle "\r\n\r\n" across read boundaries to
-        // confirm the rescan window does its job. We can't directly
-        // control read-chunk size in `MemStream` (Cursor::read returns
-        // as much as it can per call), so instead we use a chunked
-        // stream that returns 1 byte per `read()` — the worst-case
-        // straddle.
-        struct OneByteStream<'a> {
-            data: &'a [u8],
-            pos: usize,
-            written: Vec<u8>,
-        }
-        impl Read for OneByteStream<'_> {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.pos >= self.data.len() {
-                    return Ok(0);
-                }
-                buf[0] = self.data[self.pos];
-                self.pos += 1;
-                Ok(1)
-            }
-        }
-        impl Write for OneByteStream<'_> {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.written.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        // Use a MockServer to produce a valid response keyed to the
-        // request's runtime random key, then replay that response
-        // one byte at a time.
-        let captured = {
-            let mut server = MockServer::default();
-            upgrade(&mut server, "h:1", "/", &[]).unwrap();
-            server.to_send.into_inner()
-        };
-        // captured contains the original full response. We need to
-        // re-run upgrade with a NEW key against a stream that returns
-        // a response signed for THAT new key — so a 1-byte stream is
-        // not enough on its own. Instead, this test asserts that the
-        // crlf-straddle search window covers the boundary by directly
-        // exercising `find_crlf_crlf` with the worst-case offset.
+        // We can't easily run upgrade() against a 1-byte-at-a-time
+        // stream because the response needs to be signed against the
+        // request's runtime-random Sec-WebSocket-Key. Instead, assert
+        // that the crlf-straddle search window covers the boundary by
+        // directly exercising `find_crlf_crlf` with the worst-case
+        // offset (terminator split across a read boundary).
         let mut buf = b"HTTP/1.1 101 OK\r\nA: 1\r".to_vec();
         assert!(find_crlf_crlf(&buf).is_none());
         buf.extend_from_slice(b"\n\r\n");
         let idx = find_crlf_crlf(&buf).expect("must find terminator across boundary");
         assert_eq!(idx, buf.len() - 4);
-        let _ = captured;
     }
 
     // ----- Mock server -------------------------------------------------
@@ -757,15 +717,6 @@ Content-Length: 11\r\n\r\nhello world";
     }
 
     impl MockServer {
-        fn new(canned_response: Vec<u8>) -> Self {
-            Self {
-                written: Vec::new(),
-                to_send: std::io::Cursor::new(canned_response),
-                prepared: true,
-                omit_header: None,
-            }
-        }
-
         fn without_header(name: &'static str) -> Self {
             Self {
                 written: Vec::new(),

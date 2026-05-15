@@ -328,39 +328,18 @@ impl AdvanceTo for BytesMut {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::egress::ws::frame::{Opcode, encode_client_frame};
-    use crate::egress::ws::mask::MaskRng;
-    use std::io::{Cursor, Read, Write};
+    use crate::egress::ws::frame::Opcode;
 
-    // A simple in-memory full-duplex stream for tests. Read side has
-    // pre-loaded bytes; write side collects everything to a Vec.
-    struct DuplexStream {
-        read_buf: Cursor<Vec<u8>>,
-        write_buf: Vec<u8>,
-    }
-
-    impl Read for DuplexStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.read_buf.read(buf)
-        }
-    }
-
-    impl Write for DuplexStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.write_buf.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    // Test helper: build a complete client→server framed payload as
-    // raw bytes (as the SERVER would observe them on the wire).
-    // We don't mask in tests — we're framing for the parser, not the
-    // production write path. Caller manually flips the MASK bit and
-    // splices a mask key when round-tripping.
+    // Exercising the frame-read state machine end-to-end requires
+    // either a generic Stream type parameter (and we don't want to
+    // leak that through `Reader`'s public API) or a real TcpStream
+    // pair. The transport layer's integration tests
+    // (egress_failover.rs, egress_tls.rs) exercise this code path
+    // against an in-process WS server, which is the right place to
+    // assert behaviour. The module-level tests below cover the pieces
+    // that DON'T need a live stream: framing, masking, handshake.
+    // Keeping it that way avoids smuggling generics into the public
+    // API just for tests.
 
     /// Build the bytes a *server* would send for a frame with the
     /// given opcode and payload. No mask bit (server→client frames
@@ -382,31 +361,6 @@ mod tests {
         out.extend_from_slice(payload);
         out
     }
-
-    fn make_client(server_bytes: Vec<u8>) -> WsClient {
-        // We need a Stream::Plain over an in-memory duplex. The
-        // current Stream enum only accepts TcpStream/Rustls. For
-        // pure unit testing of read/write framing logic, we cheat:
-        // create a tiny shim using a TcpStream pair — but tests for
-        // this layer don't actually need a real socket. We refactor
-        // by exposing a generic-stream variant for tests.
-        let _ = server_bytes;
-        unimplemented!(
-            "WsClient unit tests need a generic Stream variant; \
-             the production Stream enum is TCP-bound. See README."
-        );
-    }
-
-    // NB: the WsClient unit tests above are stubs — exercising the
-    // frame-read state machine end-to-end requires either a generic
-    // Stream type parameter (and we don't want to leak that through
-    // `Reader`'s public API) or a real TcpStream pair. The transport
-    // layer's integration tests (egress_failover.rs, egress_tls.rs)
-    // exercise this code path against an in-process tungstenite
-    // server, which is the right place to assert behaviour. The
-    // module-level tests below cover the pieces that DON'T need a
-    // live stream: framing, masking, handshake. Keeping it that way
-    // avoids smuggling generics into the public API just for tests.
 
     #[test]
     fn server_frame_helper_round_trips() {
