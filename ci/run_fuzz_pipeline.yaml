@@ -79,6 +79,30 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
+          # On failure, archive the QuestDB server log so reviewers don't
+          # have to repro locally to see why the fuzz step blew up. Path
+          # comes from system_test/fixture.py:_log_path
+          # ($BUILD_DIR/questdb/repo/data/log/log.txt). continueOnError
+          # keeps a missing log directory (e.g., server never started)
+          # from masking the real test failure with an archive-step
+          # failure.
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              artifactName: qdb-log-$(Agent.OS)
 
       # Mirrors questdb/questdb's docker-release-pipeline.yml NotifyOnFailure
       # pattern. BUILDS_SLACK_HOOK_URL must be configured as a secret
