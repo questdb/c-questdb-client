@@ -630,6 +630,39 @@ pub unsafe extern "C" fn line_reader_close(reader: *mut line_reader) {
     })
 }
 
+/// Peek at the reader's active-query flag.
+///
+/// Returns `1` when a `line_reader_query` or `line_reader_cursor` produced by
+/// this reader is still live, `0` otherwise. Returns `0` for a NULL handle.
+///
+/// Intended for higher-level bindings (e.g. the C++ wrapper) that want to
+/// surface "close while a cursor is live" as a programmable error before it
+/// silently triggers the leak-on-active branch in `line_reader_close`.
+///
+/// TOCTOU note: a concurrent `_query_new` / `_query_free` from another thread
+/// can flip the flag between this peek and the next call. The C contract
+/// already forbids racing `_close` against `_query_new` on the same reader,
+/// so callers that observe the flag under that contract get a stable answer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_has_active_query(reader: *const line_reader) -> u8 {
+    unsafe {
+        if reader.is_null() {
+            return 0;
+        }
+        // Project to the `AtomicBool` field via `addr_of!` so we never
+        // synthesise an intermediate `&line_reader` reborrow — doing so
+        // would cover the `UnsafeCell<Reader>` field and disturb the
+        // laundered `&mut Reader` held by an in-flight query/cursor under
+        // Stacked Borrows. Same pattern as the stat getters below.
+        let active: &AtomicBool = &*std::ptr::addr_of!((*reader).1);
+        // `Acquire` pairs with the `AcqRel` flip in `_query_new` / the
+        // `Release` clear in `_query_free` / `_cursor_free`, so observers
+        // see a consistent state under the C contract's
+        // happens-before edge.
+        active.load(Ordering::Acquire) as u8
+    }
+}
+
 /// Cumulative bytes successfully read from the wire across the reader's
 /// lifetime (header + payload, before decoding). Returns `0` for a NULL
 /// handle (defense-in-depth — passing NULL is a contract violation).

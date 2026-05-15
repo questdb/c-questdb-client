@@ -2662,6 +2662,87 @@ TEST_CASE("mock: ActionSendRaw delivers a hand-built SERVER_INFO frame")
     CHECK_FALSE(cur.next_batch());
 }
 
+// Move-assigning over a reader that still owns a live cursor would
+// drive `line_reader_close` down its defense-in-depth leak branch
+// (cursor holds a laundered `&mut Reader`; freeing would dangle). The
+// C++ wrapper must surface that as an exception rather than letting
+// the leak happen silently.
+TEST_CASE("mock: reader move-assign with live cursor throws")
+{
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+
+    auto reader_a = connect_to(srv_a);
+    auto reader_b = connect_to(srv_b);
+
+    // Take a cursor on `reader_a`. While `cur` is alive, the underlying
+    // C reader's active flag is set.
+    auto cur = reader_a.execute("select 1"_utf8);
+    CHECK(::line_reader_has_active_query(
+              reinterpret_cast<const ::line_reader*>(0)) == 0);
+
+    bool threw = false;
+    try
+    {
+        reader_a = std::move(reader_b);
+    }
+    catch (const questdb::egress::line_reader_error& e)
+    {
+        threw = true;
+        CHECK(e.code() == line_reader_error_invalid_api_call);
+        // Pin the wording so a future error-message refactor can't
+        // quietly drop the "leak" / "live" diagnostic that the user
+        // needs to debug the contract violation.
+        const std::string m = std::string(e.what());
+        CHECK(m.find("live") != std::string::npos);
+        CHECK(m.find("leak") != std::string::npos);
+    }
+    CHECK(threw);
+
+    // The destination reader is unchanged: `cur` still works and drains
+    // to its terminal. No use-after-free, no observable leak.
+    CHECK_FALSE(cur.next_batch());
+    CHECK(cur.terminal_kind() == line_reader_terminal_kind_end);
+}
+
+// Once the cursor is destroyed the active flag clears and the same
+// move-assign succeeds. Pinned as a separate case so a future regression
+// that leaves the flag stuck `true` after cursor teardown is caught here
+// rather than as a mysterious second-failure-only symptom.
+TEST_CASE("mock: reader move-assign succeeds once cursor is dropped")
+{
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+
+    auto reader_a = connect_to(srv_a);
+    auto reader_b = connect_to(srv_b);
+
+    {
+        auto cur = reader_a.execute("select 1"_utf8);
+        CHECK_FALSE(cur.next_batch());
+    } // cur destroyed → active flag cleared
+
+    // No throw; reader_a now talks to srv_b's handshake.
+    reader_a = std::move(reader_b);
+    CHECK(reader_a.server_version() == 2);
+}
+
 // ---------------------------------------------------------------------------
 // Coverage gaps documented but not yet asserted in this suite — left as
 // breadcrumbs for the next contributor:

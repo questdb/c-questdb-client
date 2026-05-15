@@ -529,10 +529,33 @@ public:
         other._impl = nullptr;
     }
 
-    reader& operator=(reader&& other) noexcept
+    /**
+     * Move-assign. Closes the previously-held reader before adopting
+     * `other`'s impl.
+     *
+     * @throws line_reader_error with `invalid_api_call` if a `query` or
+     *         `cursor` produced by this reader is still live. Replacing
+     *         the impl in that state would force `line_reader_close` down
+     *         its defense-in-depth branch and silently leak the underlying
+     *         reader (so the live cursor's internal `&mut Reader` stays
+     *         valid rather than dangling). Surfacing it here as an
+     *         exception keeps the leak visible to the application; close
+     *         the outstanding cursor / query first.
+     */
+    reader& operator=(reader&& other) noexcept(false)
     {
         if (this != &other)
         {
+            if (_impl && ::line_reader_has_active_query(_impl))
+            {
+                throw line_reader_error{
+                    error_code::invalid_api_call,
+                    "reader::operator=(reader&&): a query or cursor is "
+                    "still live on the destination reader. Move-assigning "
+                    "now would leak the underlying reader (see "
+                    "line_reader_close). Destroy the outstanding cursor / "
+                    "query first."};
+            }
             ::line_reader_close(_impl);
             _impl = other._impl;
             other._impl = nullptr;

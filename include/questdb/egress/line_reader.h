@@ -322,6 +322,21 @@ line_reader* line_reader_from_env(
 LINEREADER_API
 void line_reader_close(line_reader* reader);
 
+/**
+ * Peek at the reader's active-query flag.
+ *
+ * Returns `1` when a `line_reader_query` or `line_reader_cursor` produced
+ * by this reader is still live (i.e. `line_reader_close` would refuse to
+ * free and leak the reader instead), `0` otherwise. Returns `0` for a
+ * NULL handle.
+ *
+ * Intended for higher-level language bindings that want to surface
+ * "close while a query/cursor is live" as a programmable error before it
+ * silently triggers the leak-on-active branch in `line_reader_close`.
+ */
+LINEREADER_API
+uint8_t line_reader_has_active_query(const line_reader* reader);
+
 /////////// Reader stats and connection info.
 
 /** Cumulative bytes received from the wire (header + payload). */
