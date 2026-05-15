@@ -41,7 +41,17 @@ static bool example(const char* host, const char* port, const char* table)
     line_sender_column_name host_name = QDB_COLUMN_NAME_LITERAL("host");
     line_sender_column_name active_name = QDB_COLUMN_NAME_LITERAL("active");
     line_sender_column_name qty_name = QDB_COLUMN_NAME_LITERAL("qty");
+    line_sender_column_name retries_name = QDB_COLUMN_NAME_LITERAL("retries");
+    line_sender_column_name port_name = QDB_COLUMN_NAME_LITERAL("port");
+    line_sender_column_name region_name = QDB_COLUMN_NAME_LITERAL("region");
     line_sender_column_name temp_name = QDB_COLUMN_NAME_LITERAL("temp");
+    line_sender_column_name temp_f_name = QDB_COLUMN_NAME_LITERAL("temp_f");
+    line_sender_column_name trace_id_name = QDB_COLUMN_NAME_LITERAL("trace_id");
+    line_sender_column_name client_ip_name = QDB_COLUMN_NAME_LITERAL("client_ip");
+    line_sender_column_name first_seen_name =
+        QDB_COLUMN_NAME_LITERAL("first_seen");
+    line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
+    line_sender_column_name loc_name = QDB_COLUMN_NAME_LITERAL("loc");
     line_sender_column_name note_name = QDB_COLUMN_NAME_LITERAL("note");
 
     if (!line_sender_buffer_table(buffer, table_name, &err))
@@ -54,7 +64,35 @@ static bool example(const char* host, const char* port, const char* table)
         goto on_error;
     if (!line_sender_buffer_column_i64(buffer, qty_name, 7, &err))
         goto on_error;
+    if (!line_sender_buffer_column_i8(buffer, retries_name, 3, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_i16(buffer, port_name, 9009, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_i32(buffer, region_name, 42, &err))
+        goto on_error;
     if (!line_sender_buffer_column_f64(buffer, temp_name, 21.5, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_f32(buffer, temp_f_name, 21.5f, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_uuid(
+            buffer,
+            trace_id_name,
+            0x0102030405060708ULL,
+            0x090A0B0C0D0E0F10ULL,
+            &err))
+        goto on_error;
+    if (!line_sender_buffer_column_ipv4(
+            buffer, client_ip_name, 0xC0A8012AU, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_date(
+            buffer, first_seen_name, 1700000000000LL, &err))
+        goto on_error;
+    line_sender_utf8 price_value = QDB_UTF8_LITERAL("1.25");
+    if (!line_sender_buffer_column_dec64_str(
+            buffer, price_name, price_value.buf, price_value.len, &err))
+        goto on_error;
+    if (!line_sender_buffer_column_geohash(
+            buffer, loc_name, 0x012EA85BULL, 25, &err))
         goto on_error;
 
     line_sender_utf8 note_value = QDB_UTF8_LITERAL("example-row");

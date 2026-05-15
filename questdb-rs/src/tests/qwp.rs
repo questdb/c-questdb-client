@@ -1473,7 +1473,7 @@ fn qwp_udp_round_trips_decimal_columns() -> TestResult {
 
     buffer
         .table("trades")?
-        .column_dec("price", "1.2")?
+        .column_dec("price", "1.20")?
         .at_now()?;
     buffer
         .table("trades")?
@@ -1485,7 +1485,7 @@ fn qwp_udp_round_trips_decimal_columns() -> TestResult {
         .at_now()?;
     buffer
         .table("trades")?
-        .column_dec("price", "1.5e-3")?
+        .column_dec("price", "0.1")?
         .at_now()?;
 
     sender.flush(&mut buffer)?;
@@ -1505,10 +1505,10 @@ fn qwp_udp_round_trips_decimal_columns() -> TestResult {
     assert_eq!(
         decoded.table.rows,
         vec![
-            vec![expected_decimal(4, 12_000)],
+            vec![expected_decimal(2, 120)],
             vec![DecodedValue::Null],
-            vec![expected_decimal(4, -34_500)],
-            vec![expected_decimal(4, 15)],
+            vec![expected_decimal(2, -345)],
+            vec![expected_decimal(2, 10)],
         ]
     );
 
@@ -1651,6 +1651,29 @@ fn qwp_udp_rejects_positive_decimal_above_signed_256_limit() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_decimal_downscale_precision_loss_rejects() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", "1.25")?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", "1.234")?
+        .at_now()?;
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::InvalidApiCall,
+        "precision loss",
+    );
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_rejects_signed_decimal_overflow_after_scale_unification() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
@@ -1658,17 +1681,17 @@ fn qwp_udp_rejects_signed_decimal_overflow_after_scale_unification() -> TestResu
 
     buffer
         .table("trades")?
-        .column_dec("price", DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE_STR)?
+        .column_dec("price", "0.1")?
         .at_now()?;
     buffer
         .table("trades")?
-        .column_dec("price", "0.1")?
+        .column_dec("price", DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE_STR)?
         .at_now()?;
 
     assert_err_contains(
         sender.flush(&mut buffer),
         ErrorCode::InvalidDecimal,
-        "signed DECIMAL256 range",
+        "DECIMAL256 range",
     );
     assert_eq!(buffer.row_count(), 2);
 
@@ -1688,7 +1711,7 @@ fn qwp_udp_marker_rewind_restores_decimal_scale() -> TestResult {
     buffer.set_marker()?;
     buffer
         .table("trades")?
-        .column_dec("price", "1.5e-3")?
+        .column_dec("price", "1.5")?
         .at_now()?;
 
     buffer.rewind_to_marker()?;
