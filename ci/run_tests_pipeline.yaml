@@ -158,14 +158,13 @@ stages:
           - script: |
               python3 system_test/test_egress_failover.py run --repo ./questdb -v
             displayName: "egress integration test"
-      # Per-PR live-server fuzz coverage for the OSS-questdb tests that
-      # need a real server (bind / fragmentation / random-schema). Three
-      # `--test NAME` selectors so cargo only builds the new fuzz
-      # binaries — `egress_live_server.rs` has pre-existing compile
-      # errors under `live-server-tests` on vi_egress (FailoverEvent
-      # callback non-Send) that we don't want to inherit as a blocker.
-      # Default seed gives a deterministic per-PR sweep; the hourly
-      # cron in run_fuzz_pipeline.yaml varies the seed per build.
+      # Live-server fuzz coverage for the OSS-questdb tests that need a
+      # real server (bind / fragmentation / random-schema / ALTER
+      # orchestration). `--test NAME` selectors limit the build to the
+      # fuzz binaries so other live-server tests don't drag this job
+      # into unrelated breakage. Default seed gives a deterministic
+      # sweep for inbound changes; the hourly cron in
+      # run_fuzz_pipeline.yaml varies the seed per build.
       - job: TestQwpEgressLiveServerFuzz
         displayName: "QWP egress live-server fuzz suite"
         pool:
@@ -197,9 +196,9 @@ stages:
           - script: |
               set -euxo pipefail
               cd questdb-rs
-              # `--test NAME` selectors skip the pre-existing broken
-              # `egress_live_server.rs` build (FailoverEvent callback
-              # non-Send; tracked upstream, not regressed here).
+              # `--test NAME` selectors limit the build to the fuzz
+              # binaries — other live-server tests stay out of this
+              # job's scope.
               cargo test --features live-server-tests \
                 --test egress_live_server_bind_fuzz \
                 --test egress_live_server_fragmentation_fuzz \

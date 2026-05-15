@@ -66,9 +66,9 @@
 //!     default / `compression=raw` / `compression=auto` /
 //!     `compression=zstd` / `compression=zstd;compression_level=N`
 //!     with `N ∈ [1, 9]`.
-//!   - `testSelectAlterSequenceFuzz` (ALTER-orchestration fuzz) is in
-//!     its own follow-up commit (separate driver — too different
-//!     structurally to share `run_one_case`).
+//!   - `testSelectAlterSequenceFuzz` (ALTER-orchestration fuzz) lives
+//!     in a sibling file (`egress_live_server_alter_fuzz.rs`); its
+//!     driver is structurally too different to share `run_one_case`.
 //!
 //! Each test boots its own `QuestDbServer` via `start_with_config(...)`.
 //! Three tests × one JVM each ≈ 45 s of boot for the whole file,

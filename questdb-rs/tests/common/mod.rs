@@ -307,10 +307,10 @@ impl QuestDbServer {
         );
     }
 
-    /// `ws::` connect string for the egress reader. Returns the
-    /// post-`8e6dba3` scheme that `vi_egress`'s parser accepts; the
-    /// function name predates that rename and is kept for source
-    /// stability across the merge.
+    /// `ws::` connect string for the egress reader. The function name
+    /// is a historical artefact — the connect-string scheme is now
+    /// `ws`/`wss`, but the helper kept its older name for source
+    /// stability across call sites.
     pub fn qwp_conf(&self) -> String {
         format!("ws::addr={}:{}", self.host, self.http_port)
     }
