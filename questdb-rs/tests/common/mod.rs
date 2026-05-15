@@ -35,6 +35,12 @@
 //! Built only when the `live-server-tests` feature is enabled.
 
 #![cfg(feature = "live-server-tests")]
+// `tests/common/mod.rs` is compiled once per integration-test binary
+// (Rust's "tests/<name>.rs each is a separate crate" model). Helpers
+// that only some binaries need surface as `dead_code` in the others.
+// Mark the module as such to keep `clippy -D warnings` quiet without
+// peppering individual fns with `#[allow]`.
+#![allow(dead_code)]
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -232,7 +238,6 @@ impl QuestDbServer {
         let log_path = data_dir.path().join("jvm.log");
         let log_file = std::fs::OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&log_path)
             .expect("open jvm.log");
