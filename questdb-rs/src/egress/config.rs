@@ -1449,7 +1449,8 @@ mod tests {
         // — pins that the feature gate only fires in the off direction.
         let cfg = ReaderConfig::from_conf("wss::addr=h:1;tls_verify=unsafe_off").unwrap();
         assert_eq!(cfg.tls_verify, TlsVerify::UnsafeOff);
-        cfg.validate().expect("unsafe_off must pass validate when feature is on");
+        cfg.validate()
+            .expect("unsafe_off must pass validate when feature is on");
     }
 
     #[test]
