@@ -482,7 +482,7 @@ class FailoverTest(unittest.TestCase):
         # could, but a closed-port `dead_addr` is closer to what the
         # Rust mock-server test does and simpler to reason about.)
         conf = (
-            f'qwp::addr={dead_addr},'
+            f'ws::addr={dead_addr},'
             f'127.0.0.1:{self.server2.http_port}')
         sql = 'select 1'
 
@@ -567,7 +567,7 @@ class FailoverTest(unittest.TestCase):
         # Server #1 listed FIRST so the cursor opens against it.
         # `target=primary` accepts STANDALONE per spec §11.8.
         conf = (
-            f'qwp::addr=127.0.0.1:{self.server1.http_port},'
+            f'ws::addr=127.0.0.1:{self.server1.http_port},'
             f'127.0.0.1:{self.server2.http_port};target=primary')
         sql = 'SELECT * FROM failover_test ORDER BY val'
 
@@ -737,7 +737,7 @@ class FailoverTest(unittest.TestCase):
         # Tight backoff so exhaustion is fast even with two retries
         # (initial attempt + max_attempts=1 → 2 total walks).
         conf = (
-            f'qwp::addr=127.0.0.1:{self.server1.http_port},'
+            f'ws::addr=127.0.0.1:{self.server1.http_port},'
             f'127.0.0.1:{self.server2.http_port};'
             f'failover_max_attempts=1;'
             f'failover_backoff_initial_ms=1;'
@@ -840,7 +840,7 @@ class FailoverTest(unittest.TestCase):
         self.assertTrue(self.server1.is_alive())
 
         conf = (
-            f'qwp::addr=127.0.0.1:{self.server1.http_port};'
+            f'ws::addr=127.0.0.1:{self.server1.http_port};'
             # `failover_max_attempts=2` matches the Rust test. The
             # backoff is tiny so exhaustion lands within seconds even
             # with three loopback dials per attempt.
