@@ -202,3 +202,23 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
+          # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
+          # publish the QuestDB server log so PR reviewers don't have to
+          # repro locally. Path comes from system_test/fixture.py:_log_path.
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              artifactName: qdb-log-$(Agent.OS)
