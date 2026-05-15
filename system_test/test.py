@@ -2418,6 +2418,12 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 failure_counter[0] += 1
             self._log(msg)
 
+        if fuzz.max_bounces > 0 and not (
+                hasattr(QDB_FIXTURE, 'stop') and hasattr(QDB_FIXTURE, 'start')):
+            self.skipTest(
+                'bounce fuzz tests require a managed QuestDB fixture '
+                'with stop()/start() control')
+
         producers_done = threading.Event()
         stop_event = threading.Event()
 
@@ -2458,11 +2464,6 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
             bounce_thread = None
             if fuzz.max_bounces > 0:
-                if not (hasattr(QDB_FIXTURE, 'stop')
-                        and hasattr(QDB_FIXTURE, 'start')):
-                    self.skipTest(
-                        'bounce fuzz tests require a managed QuestDB fixture '
-                        'with stop()/start() control')
                 bounce_thread = qwp_ws_fuzz.BounceThread(
                     fixture=QDB_FIXTURE,
                     rnd=self._master_rng.child(),
