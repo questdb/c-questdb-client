@@ -98,6 +98,7 @@ COL_NAME_BASES = (
     # side expected counts from server-side reality.
     ('series_1d', 'SERIES_1D', 'sERIES_1d', 'Series_1d'),  # DOUBLE[]
     ('series_2d', 'SERIES_2D', 'sERIES_2d', 'Series_2d'),  # DOUBLE[][]
+    ('series_3d', 'SERIES_3D', 'sERIES_3d', 'Series_3d'),  # DOUBLE[][][]
     ('event_us', 'EVENT_US', 'event_Us', 'Event_US'),  # TIMESTAMP (micros)
     ('event_ns', 'EVENT_NS', 'event_Ns', 'Event_NS'),  # TIMESTAMP (nanos)
 )
@@ -106,7 +107,7 @@ COL_TYPES = (
     'STRING', 'DOUBLE', 'DOUBLE', 'DOUBLE', 'STRING', 'DOUBLE',
     # Extended types.
     'BOOLEAN', 'LONG', 'DECIMAL256',
-    'DOUBLE_ARRAY_1D', 'DOUBLE_ARRAY_2D',
+    'DOUBLE_ARRAY_1D', 'DOUBLE_ARRAY_2D', 'DOUBLE_ARRAY_3D',
     'TIMESTAMP_MICROS', 'TIMESTAMP_NANOS',
 )
 COL_VALUE_BASES = (
@@ -115,8 +116,32 @@ COL_VALUE_BASES = (
     # for those that don't need it. LONG / DECIMAL still use it as a
     # numeric magnitude so values stay readable in failure logs.
     '', '4', '7',
+    '', '', '',
     '', '',
-    '', '',
+)
+
+# Extreme strings & symbols emitted under extreme_string_factor. Each
+# entry has to be: (1) acceptable to the QWP client validator (no
+# control chars, no embedded NUL for strings), and (2) idempotent
+# UTF-8 (no normalisation surprises across the wire). We deliberately
+# omit isolated combining marks since QuestDB does not always apply
+# NFC normalisation and a producer-vs-server mismatch there is its
+# own coverage gap that needs a separate oracle.
+EXTREME_STRINGS = (
+    '',                     # empty
+    'x',                    # 1-char
+    'X' * 256,              # long
+    '🎉',                   # surrogate-pair emoji
+    '🎉🎉🎉🎉🎉',           # repeated emoji
+    'שלום',                 # RTL Hebrew
+    'مرحبا',                # RTL Arabic
+    'naïve café',           # composed latin diacritics (NFC)
+    'A­B',             # soft hyphen (zero-width-ish)
+)
+EXTREME_SYMBOLS = tuple(
+    # Symbols can't contain spaces unless send_symbols_with_space is on,
+    # so we use the same set minus the value with an internal space.
+    s for s in EXTREME_STRINGS if ' ' not in s
 )
 
 NON_ASCII_CHARS = (
@@ -350,6 +375,13 @@ def format_expected_cell(value, server_type: str) -> str:
         except (TypeError, ValueError):
             return str(value)
     if server_type in _NUMERIC_INT_TYPES:
+        # int -> str path preserves precision for values near i64 limits.
+        # Going through float() would silently round e.g. 2^60 - 1 up
+        # to 2^60.
+        if isinstance(value, bool):
+            return '1' if value else '0'
+        if isinstance(value, int):
+            return str(value)
         try:
             return str(int(float(value)))
         except (TypeError, ValueError):
@@ -446,6 +478,9 @@ _ISO_FORMATS_BY_FRAC_DIGITS = {
 }
 
 
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
 def _iso_to_nanos(s: str) -> int:
     """Parse an /exec TIMESTAMP string into nanoseconds-since-epoch.
 
@@ -453,6 +488,10 @@ def _iso_to_nanos(s: str) -> int:
     the stored column type (3/6/9 digits). We pad to 9 digits and treat
     them all as nanoseconds so the oracle compares apples-to-apples
     whether the producer sent micros or nanos.
+
+    Uses `(dt - EPOCH).total_seconds()` rather than `dt.timestamp()`
+    because the latter underflows on Windows for pre-1970 timestamps;
+    we now generate pre-epoch values under `extreme_timestamp_factor`.
     """
     if not isinstance(s, str):
         return int(s)
@@ -467,7 +506,8 @@ def _iso_to_nanos(s: str) -> int:
         date_part, frac9 = text, '000000000'
     dt = datetime.datetime.strptime(date_part, '%Y-%m-%dT%H:%M:%S')
     dt = dt.replace(tzinfo=datetime.timezone.utc)
-    secs = int(dt.timestamp())
+    delta = dt - _EPOCH
+    secs = delta.days * 86_400 + delta.seconds
     return secs * 1_000_000_000 + int(frac9)
 
 
@@ -535,6 +575,10 @@ class FuzzParams:
         'max_bounces',
         'min_bounce_interval_s',
         'max_bounce_interval_s',
+        'extreme_string_factor',
+        'extreme_numeric_factor',
+        'extreme_timestamp_factor',
+        'negative_zero_factor',
     )
 
     def __init__(
@@ -550,7 +594,11 @@ class FuzzParams:
             column_convert_prob=0.0,
             max_bounces=0,
             min_bounce_interval_s=0.5,
-            max_bounce_interval_s=3.0):
+            max_bounce_interval_s=3.0,
+            extreme_string_factor=-1,
+            extreme_numeric_factor=-1,
+            extreme_timestamp_factor=-1,
+            negative_zero_factor=-1):
         self.duplicates_factor = duplicates_factor
         self.column_reordering_factor = column_reordering_factor
         self.column_skip_factor = column_skip_factor
@@ -564,6 +612,10 @@ class FuzzParams:
         self.min_bounce_interval_s = min_bounce_interval_s
         self.max_bounce_interval_s = max(
             min_bounce_interval_s, max_bounce_interval_s)
+        self.extreme_string_factor = extreme_string_factor
+        self.extreme_numeric_factor = extreme_numeric_factor
+        self.extreme_timestamp_factor = extreme_timestamp_factor
+        self.negative_zero_factor = negative_zero_factor
 
 
 class LoadParams:
@@ -592,6 +644,46 @@ class LoadParams:
         self.wait_between_iterations_ms = wait_between_iterations_ms
 
 
+# Designated TIMESTAMP column lives at nanosecond precision and is
+# generated by `next_ts()` in the test harness. The constants below are
+# used by the non-designated TIMESTAMP columns and cover three regions:
+#
+#  * "default" — clustered near now-ish, similar to the existing fuzz;
+#  * "pre-epoch" — pre-1970 negative timestamps;
+#  * "far future" — well past 2100, still within i64 nano range.
+#
+# Python's `datetime` handles years 1..9999, which bounds the
+# round-trippable range; we stay inside it deliberately.
+
+_DEFAULT_TS_US_BASE = 1_700_000_000_000_000        # ~2023-11-15
+_PRE_EPOCH_TS_US_BASE = -1_500_000_000_000_000     # ~1922-07-27
+_FAR_FUTURE_TS_US_BASE = 4_000_000_000_000_000     # ~2096-10-02
+_TS_US_JITTER = 86_400_000_000                     # one day in micros
+
+_DEFAULT_TS_NS_BASE = 1_700_000_000_000_000_000    # ~2023-11-15
+_PRE_EPOCH_TS_NS_BASE = -1_500_000_000_000_000_000 # ~1922-07-27
+_FAR_FUTURE_TS_NS_BASE = 4_000_000_000_000_000_000 # ~2096-10-02
+_TS_NS_JITTER = 86_400_000_000_000                 # one day in nanos
+
+
+def _pick_timestamp_us(params: FuzzParams, rnd: Rng) -> int:
+    if should_fuzz(params.extreme_timestamp_factor, rnd):
+        bucket = rnd.next_int(2)
+        base = _PRE_EPOCH_TS_US_BASE if bucket == 0 else _FAR_FUTURE_TS_US_BASE
+    else:
+        base = _DEFAULT_TS_US_BASE
+    return base + rnd.next_int(_TS_US_JITTER)
+
+
+def _pick_timestamp_ns(params: FuzzParams, rnd: Rng) -> int:
+    if should_fuzz(params.extreme_timestamp_factor, rnd):
+        bucket = rnd.next_int(2)
+        base = _PRE_EPOCH_TS_NS_BASE if bucket == 0 else _FAR_FUTURE_TS_NS_BASE
+    else:
+        base = _DEFAULT_TS_NS_BASE
+    return base + rnd.next_int(_TS_NS_JITTER)
+
+
 def add_column_value(col_type: str, value_base: str, col_name: str,
                      sender, params: FuzzParams, rnd: Rng):
     """Append a column to the sender buffer and return the expected value
@@ -603,28 +695,41 @@ def add_column_value(col_type: str, value_base: str, col_name: str,
     if col_type == 'DOUBLE':
         d = rnd.next_int(9)
         f_val = float(int(value_base) * 10 + d)
+        if should_fuzz(params.negative_zero_factor, rnd):
+            # Server may normalise -0.0 to 0.0; oracle absorbs the gap
+            # because both canonicalise to '0.0' in _format_float.
+            f_val = -0.0
+        elif (should_fuzz(params.extreme_numeric_factor, rnd)
+                and rnd.next_boolean()):
+            f_val = -f_val
         sender.column(col_name, f_val)
         return _format_float(f_val)
     if col_type == 'SYMBOL':
-        if should_fuzz(params.non_ascii_value_factor, rnd):
-            postfix = NON_ASCII_CHARS[rnd.next_int(len(NON_ASCII_CHARS))]
+        if should_fuzz(params.extreme_string_factor, rnd):
+            sym_val = EXTREME_SYMBOLS[rnd.next_int(len(EXTREME_SYMBOLS))]
         else:
-            postfix = rnd.next_ascii_letter()
-        base = value_base
-        if (params.send_symbols_with_space
-                and rnd.next_int(SEND_SYMBOLS_WITH_SPACE_RANDOMIZE_FACTOR) == 0):
-            if len(base) > 1:
-                space_index = rnd.next_int(len(base) - 1)
-                base = base[:space_index] + '  ' + base[space_index:]
-        sym_val = base + postfix
+            if should_fuzz(params.non_ascii_value_factor, rnd):
+                postfix = NON_ASCII_CHARS[rnd.next_int(len(NON_ASCII_CHARS))]
+            else:
+                postfix = rnd.next_ascii_letter()
+            base = value_base
+            if (params.send_symbols_with_space
+                    and rnd.next_int(SEND_SYMBOLS_WITH_SPACE_RANDOMIZE_FACTOR) == 0):
+                if len(base) > 1:
+                    space_index = rnd.next_int(len(base) - 1)
+                    base = base[:space_index] + '  ' + base[space_index:]
+            sym_val = base + postfix
         sender.symbol(col_name, sym_val)
         return sym_val
     if col_type == 'STRING':
-        if should_fuzz(params.non_ascii_value_factor, rnd):
-            postfix = NON_ASCII_CHARS[rnd.next_int(len(NON_ASCII_CHARS))]
+        if should_fuzz(params.extreme_string_factor, rnd):
+            str_val = EXTREME_STRINGS[rnd.next_int(len(EXTREME_STRINGS))]
         else:
-            postfix = rnd.next_ascii_letter()
-        str_val = value_base + postfix
+            if should_fuzz(params.non_ascii_value_factor, rnd):
+                postfix = NON_ASCII_CHARS[rnd.next_int(len(NON_ASCII_CHARS))]
+            else:
+                postfix = rnd.next_ascii_letter()
+            str_val = value_base + postfix
         sender.column(col_name, str_val)
         return str_val
     if col_type == 'BOOLEAN':
@@ -634,34 +739,69 @@ def add_column_value(col_type: str, value_base: str, col_name: str,
     if col_type == 'LONG':
         d = rnd.next_int(9)
         i_val = int(value_base) * 10 + d
+        if should_fuzz(params.extreme_numeric_factor, rnd):
+            # Java's value scheme produces tiny positive ints; widen to
+            # cover negative, zero, and large i64 magnitudes (kept just
+            # below i64::MAX so a server-side ALTER to LONG-only keeps
+            # everything in range).
+            picks = (
+                0, -1, 1, -1 << 30, (1 << 30) - 1,
+                -1 << 60, (1 << 60) - 1,
+            )
+            i_val = picks[rnd.next_int(len(picks))]
         sender.column(col_name, i_val)
         return i_val
     if col_type == 'DECIMAL256':
-        # Keep magnitude small enough that DECIMAL(p,s) widening between
-        # iterations doesn't change the comparison string. Two-digit
-        # fractional part is exactly representable for any p>=4,s>=2.
+        # Default magnitude stays in scale-2 territory. Under
+        # extreme_numeric_factor we throw in negatives and large
+        # magnitudes that still fit in DECIMAL256 (~78 decimal digits
+        # before QWP_DECIMAL256_POSITIVE_OVERFLOW). Scale stays at 2
+        # across all rows so the server's inferred DECIMAL(p,2) keeps
+        # the canonical string format stable.
         whole = int(value_base) * 10 + rnd.next_int(9)
         frac = rnd.next_int(100)
-        dec_str = f'{whole}.{frac:02d}'
+        sign = ''
+        if should_fuzz(params.extreme_numeric_factor, rnd):
+            shape = rnd.next_int(5)
+            if shape == 0:
+                whole = 0
+                frac = 0
+            elif shape == 1:
+                sign = '-'
+            elif shape == 2:
+                # Large positive magnitude, well under DECIMAL256 cap.
+                whole = 10 ** (20 + rnd.next_int(40)) + whole
+            elif shape == 3:
+                sign = '-'
+                whole = 10 ** (20 + rnd.next_int(40)) + whole
+            # shape == 4 keeps the default small-positive case.
+        dec_str = f'{sign}{whole}.{frac:02d}'
         sender.column_dec_str(col_name, dec_str)
         return dec_str
     if col_type == 'TIMESTAMP_MICROS':
-        # Non-designated TIMESTAMP column — value can repeat across rows.
-        ts_us = 1_700_000_000_000_000 + rnd.next_int(86_400_000_000)
+        ts_us = _pick_timestamp_us(params, rnd)
         sender.column(col_name, qls.TimestampMicros(ts_us))
         # Oracle compares in nanoseconds-since-epoch — see format_*_cell.
         return ts_us * 1_000
     if col_type == 'TIMESTAMP_NANOS':
-        ts_ns = 1_700_000_000_000_000_000 + rnd.next_int(86_400_000_000_000)
+        ts_ns = _pick_timestamp_ns(params, rnd)
         sender.column(col_name, qls.TimestampNanos(ts_ns))
         return ts_ns
     if col_type == 'DOUBLE_ARRAY_1D':
         # Rank fixed per-column so the server's auto-created DOUBLE[]
-        # column type doesn't reject rows with the wrong rank.
-        length = 2 + rnd.next_int(3)
-        arr = np.array(
-            [float(rnd.next_int(100)) for _ in range(length)],
-            dtype=np.float64)
+        # column type doesn't reject rows with the wrong rank. We
+        # still vary length and values within the rank-1 envelope.
+        length = 2 + rnd.next_int(8)
+        elements = []
+        for _ in range(length):
+            v = float(rnd.next_int(100))
+            if should_fuzz(params.negative_zero_factor, rnd):
+                v = -0.0
+            elif (should_fuzz(params.extreme_numeric_factor, rnd)
+                    and rnd.next_boolean()):
+                v = -v
+            elements.append(v)
+        arr = np.array(elements, dtype=np.float64)
         sender.column_f64_arr(col_name, arr)
         return arr.tolist()
     if col_type == 'DOUBLE_ARRAY_2D':
@@ -670,6 +810,17 @@ def add_column_value(col_type: str, value_base: str, col_name: str,
         arr = np.array(
             [[float(rnd.next_int(100)) for _ in range(cols)]
              for _ in range(rows)],
+            dtype=np.float64)
+        sender.column_f64_arr(col_name, arr)
+        return arr.tolist()
+    if col_type == 'DOUBLE_ARRAY_3D':
+        d1 = 2 + rnd.next_int(2)
+        d2 = 2 + rnd.next_int(2)
+        d3 = 2 + rnd.next_int(2)
+        arr = np.array(
+            [[[float(rnd.next_int(100)) for _ in range(d3)]
+              for _ in range(d2)]
+             for _ in range(d1)],
             dtype=np.float64)
         sender.column_f64_arr(col_name, arr)
         return arr.tolist()

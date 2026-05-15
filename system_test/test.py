@@ -2974,6 +2974,62 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             max_bounce_interval_s=1.5)
         self._run_fuzz(load, fuzz)
 
+    # --- Type-side coverage extensions --------------------------------
+    #
+    # Each variant tightens one of the value-shape axes flagged in the
+    # review: unicode/emoji/RTL/empty/long strings, negative & large
+    # decimals & integers, pre-1970 & far-future timestamps, negative
+    # zero in arrays. The new fuzz factors all default to -1 in
+    # FuzzParams so existing tests keep their established behaviour.
+
+    def test_extreme_strings(self):
+        load = qwp_ws_fuzz.LoadParams(
+            80, 3 if self._is_windows() else 5, 4, 3, 30)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=3,
+            new_column_factor=4,
+            non_ascii_value_factor=3,
+            diff_cases_in_col_names=True,
+            extreme_string_factor=2)
+        self._run_fuzz(load, fuzz)
+
+    def test_extreme_numerics(self):
+        load = qwp_ws_fuzz.LoadParams(
+            80, 3 if self._is_windows() else 5, 4, 3, 30)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=3,
+            new_column_factor=4,
+            diff_cases_in_col_names=True,
+            extreme_numeric_factor=2,
+            negative_zero_factor=4)
+        self._run_fuzz(load, fuzz)
+
+    def test_extreme_timestamps(self):
+        load = qwp_ws_fuzz.LoadParams(
+            80, 3 if self._is_windows() else 5, 4, 3, 30)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=3,
+            extreme_timestamp_factor=2)
+        self._run_fuzz(load, fuzz)
+
+    def test_extreme_everything(self):
+        load = qwp_ws_fuzz.LoadParams(
+            80, 3 if self._is_windows() else 5, 4, 3, 30)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=4,
+            column_reordering_factor=3,
+            column_skip_factor=5,
+            new_column_factor=4,
+            non_ascii_value_factor=3,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            extreme_string_factor=3,
+            extreme_numeric_factor=3,
+            extreme_timestamp_factor=3,
+            negative_zero_factor=4,
+            column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
     def test_n_bounce_sweep(self):
         # Many short bounces so the chaos thread gets multiple chances
         # to land mid-flush. Each bounce is ~3-5s of process restart so
