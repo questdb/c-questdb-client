@@ -225,7 +225,7 @@ fn fuzz_double_binds() {
                 got.to_bits()
             );
         }
-        drop(cur);
+        while cur.next_batch().expect("drain").is_some() {}
     }
 }
 
@@ -277,7 +277,7 @@ fn fuzz_integral_binds_projection() {
         assert_eq!(c3.value(0), byte_val, "iter {iter}: byte");
         // BOOLEAN surfaces as a u8 (0 / 1) on the wire.
         assert_eq!(c4.value(0) != 0, bool_val, "iter {iter}: bool");
-        drop(cur);
+        while cur.next_batch().expect("drain").is_some() {}
     }
 }
 
@@ -342,7 +342,7 @@ fn fuzz_same_sql_different_binds_cache_reuse() {
             (target as i64) * 7,
             "iter {iter}: target={target}"
         );
-        drop(cur);
+        while cur.next_batch().expect("drain").is_some() {}
     }
     // Best-effort cleanup; ignore failure (test passed by here).
     let _ = srv.http_exec(&format!("drop table \"{table}\""));
@@ -374,7 +374,7 @@ fn fuzz_uuid_binds() {
             panic!("iter {iter}: col 0 not Uuid");
         };
         assert_eq!(c.value(0), &bytes, "iter {iter}: uuid byte mismatch");
-        drop(cur);
+        while cur.next_batch().expect("drain").is_some() {}
     }
 }
 
