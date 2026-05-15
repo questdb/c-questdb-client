@@ -148,13 +148,10 @@ stages:
           matrix:
             linux:
               imageName: "ubuntu-latest"
-              jdkArch: "x64"
             mac:
               imageName: "macos-latest"
-              jdkArch: "arm64"
             windows-2022:
               imageName: "windows-2022"
-              jdkArch: "x64"
         pool:
           vmImage: $(imageName)
         timeoutInMinutes: 90
@@ -164,12 +161,19 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
-          - task: JavaToolInstaller@0
-            displayName: "Install JDK 25"
-            inputs:
-              versionSpec: '25'
-              jdkArchitectureOption: $(jdkArch)
-              jdkSourceOption: 'PreInstalled'
+          # Linux and Windows runners ship with JDK 25 at $(JAVA_HOME_25_X64).
+          # macOS-latest doesn't, so we brew-install openjdk@25 there and
+          # point JAVA_HOME at the resulting bundle. Both paths set the
+          # same JAVA_HOME variable for the steps below.
+          - script: |
+              brew install openjdk@25
+              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home"
+            condition: eq(variables['imageName'], 'macos-latest')
+            displayName: "Install JDK 25 via brew (macOS)"
+          - script: |
+              echo "##vso[task.setvariable variable=JAVA_HOME]$(JAVA_HOME_25_X64)"
+            condition: ne(variables['imageName'], 'macos-latest')
+            displayName: "Use pre-installed JDK 25 (Linux/Windows)"
           - script: |
               git clone --depth 1 https://github.com/questdb/questdb.git
               cd questdb
@@ -179,8 +183,8 @@ stages:
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
-              javaHomeOption: "JDKVersion"
-              jdkVersionOption: "1.25"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
               options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
