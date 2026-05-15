@@ -47,7 +47,6 @@ static bool example(const char* host, const char* port, const char* table)
     line_sender_column_name temp_name = QDB_COLUMN_NAME_LITERAL("temp");
     line_sender_column_name temp_f_name = QDB_COLUMN_NAME_LITERAL("temp_f");
     line_sender_column_name trace_id_name = QDB_COLUMN_NAME_LITERAL("trace_id");
-    line_sender_column_name client_ip_name = QDB_COLUMN_NAME_LITERAL("client_ip");
     line_sender_column_name first_seen_name =
         QDB_COLUMN_NAME_LITERAL("first_seen");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
@@ -80,9 +79,6 @@ static bool example(const char* host, const char* port, const char* table)
             0x0102030405060708ULL,
             0x090A0B0C0D0E0F10ULL,
             &err))
-        goto on_error;
-    if (!line_sender_buffer_column_ipv4(
-            buffer, client_ip_name, 0xC0A8012AU, &err))
         goto on_error;
     if (!line_sender_buffer_column_date(
             buffer, first_seen_name, 1700000000000LL, &err))

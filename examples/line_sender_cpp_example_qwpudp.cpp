@@ -26,7 +26,6 @@ static bool example(
             .column_f32("temp_f"_cn, 21.5f)
             .column("temp"_cn, 21.5)
             .column_uuid("trace_id"_cn, 0x0102030405060708ULL, 0x090A0B0C0D0E0F10ULL)
-            .column_ipv4("client_ip"_cn, 0xC0A8012AU)
             .column_date("first_seen"_cn, int64_t{1700000000000})
             .column_dec64("price"_cn, "1.25"sv)
             .column_geohash("loc"_cn, uint64_t{0x012EA85B}, uint8_t{25})

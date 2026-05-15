@@ -3109,7 +3109,12 @@ class TestQwpUdpSender(unittest.TestCase):
                 QDB_FIXTURE.protocol_version is not None):
             self.skipTest('QWP/UDP development system test uses no ILP protocol version override')
 
-    def _test_qwp_udp_example(self, bin_name, table_name, expected_rows):
+    def _test_qwp_udp_example(
+            self,
+            bin_name,
+            table_name,
+            expected_rows,
+            expected_columns=None):
         self._require_qwp_udp_system_test()
         if BUILD_MODE != qls.BuildMode.API:
             self.skipTest('BuildMode.API-only test')
@@ -3130,16 +3135,16 @@ class TestQwpUdpSender(unittest.TestCase):
 
         resp = retry_check_table(
             table_name, min_rows=len(expected_rows), timeout_sec=30)
-        self.assertEqual(
-            resp['columns'],
-            [
+        if expected_columns is None:
+            expected_columns = [
                 {'name': 'host', 'type': 'SYMBOL'},
                 {'name': 'active', 'type': 'BOOLEAN'},
                 {'name': 'qty', 'type': 'LONG'},
                 {'name': 'temp', 'type': 'DOUBLE'},
                 {'name': 'note', 'type': 'VARCHAR'},
                 {'name': 'timestamp', 'type': 'TIMESTAMP'},
-            ])
+            ]
+        self.assertEqual(resp['columns'], expected_columns)
         self.assertEqual(
             sorted(row[:-1] for row in resp['dataset']),
             sorted(expected_rows))
@@ -3149,14 +3154,74 @@ class TestQwpUdpSender(unittest.TestCase):
         self._test_qwp_udp_example(
             'line_sender_c_example_qwpudp',
             table_name,
-            [['srv-api', True, 7, 21.5, 'example-row']])
+            [[
+                'srv-api',
+                True,
+                7,
+                3,
+                9009,
+                42,
+                21.5,
+                21.5,
+                '090a0b0c-0d0e-0f10-0102-030405060708',
+                '2023-11-14T22:13:20.000Z',
+                '1.25',
+                'kxb2v',
+                'example-row',
+            ]],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'active', 'type': 'BOOLEAN'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'retries', 'type': 'BYTE'},
+                {'name': 'port', 'type': 'SHORT'},
+                {'name': 'region', 'type': 'INT'},
+                {'name': 'temp', 'type': 'DOUBLE'},
+                {'name': 'temp_f', 'type': 'FLOAT'},
+                {'name': 'trace_id', 'type': 'UUID'},
+                {'name': 'first_seen', 'type': 'DATE'},
+                {'name': 'price', 'type': 'DECIMAL(18,2)'},
+                {'name': 'loc', 'type': 'GEOHASH(5c)'},
+                {'name': 'note', 'type': 'VARCHAR'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
 
     def test_cpp_example_qwp_udp(self):
         table_name = 'cpp_qwp_ex_' + uuid.uuid4().hex[:8]
         self._test_qwp_udp_example(
             'line_sender_cpp_example_qwpudp',
             table_name,
-            [['srv-api', True, 7, 21.5, 'example-row']])
+            [[
+                'srv-api',
+                True,
+                7,
+                3,
+                9009,
+                42,
+                21.5,
+                21.5,
+                '090a0b0c-0d0e-0f10-0102-030405060708',
+                '2023-11-14T22:13:20.000Z',
+                '1.25',
+                'kxb2v',
+                'example-row',
+            ]],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'active', 'type': 'BOOLEAN'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'retries', 'type': 'BYTE'},
+                {'name': 'port', 'type': 'SHORT'},
+                {'name': 'region', 'type': 'INT'},
+                {'name': 'temp_f', 'type': 'FLOAT'},
+                {'name': 'temp', 'type': 'DOUBLE'},
+                {'name': 'trace_id', 'type': 'UUID'},
+                {'name': 'first_seen', 'type': 'DATE'},
+                {'name': 'price', 'type': 'DECIMAL(18,2)'},
+                {'name': 'loc', 'type': 'GEOHASH(5c)'},
+                {'name': 'note', 'type': 'VARCHAR'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
 
     def test_c_batch_example_qwp_udp(self):
         table_name = 'c_qwp_bt_' + uuid.uuid4().hex[:8]
