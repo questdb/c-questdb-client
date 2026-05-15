@@ -104,6 +104,7 @@ const QWP_LONG256_BYTES: usize = 32;
 pub(crate) const QWP_VERSION_1: u8 = 1;
 const QWP_INLINE_SCHEMA_ID: u64 = 0;
 const QWP_DECIMAL_MAX_SCALE: u8 = 76;
+const QWP_DECIMAL_SCALE_UNSET: u8 = u8::MAX;
 const QWP_DECIMAL_MAG_LIMBS: usize = 4;
 const QWP_DECIMAL_MAG_BYTES: usize = QWP_DECIMAL_MAG_LIMBS * 8;
 const QWP_DECIMAL_SIGN_BIT: u64 = 1u64 << 63;
@@ -3983,7 +3984,6 @@ impl QwpWsColumnBuffer {
         row_idx: u32,
         value: Option<StoredQwpDecimal>,
     ) -> crate::Result<()> {
-        let is_first_non_null = self.non_null_count == 0;
         let QwpWsColumnValues::Decimal {
             cells,
             decimal_scale,
@@ -3992,7 +3992,7 @@ impl QwpWsColumnBuffer {
             return Err(type_mismatch_error_ws(&self.name));
         };
         if let Some(value) = value {
-            if is_first_non_null {
+            if *decimal_scale == QWP_DECIMAL_SCALE_UNSET {
                 *decimal_scale = value.scale;
             }
             cells.push(QwpWsDecimalCell {
@@ -4014,7 +4014,6 @@ impl QwpWsColumnBuffer {
         row_idx: u32,
         value: Option<StoredQwpDecimal>,
     ) -> crate::Result<()> {
-        let is_first_non_null = self.non_null_count == 0;
         let QwpWsColumnValues::Decimal64 {
             cells,
             decimal_scale,
@@ -4025,7 +4024,7 @@ impl QwpWsColumnBuffer {
         if let Some(value) = value {
             let bytes = value.wire_bytes_with_scale(value.scale)?;
             narrow_decimal_le_fits(&bytes, 8).ok_or_else(|| decimal_fit_error(64))?;
-            if is_first_non_null {
+            if *decimal_scale == QWP_DECIMAL_SCALE_UNSET {
                 *decimal_scale = value.scale;
             }
             cells.push(QwpWsDecimalCell {
@@ -4047,7 +4046,6 @@ impl QwpWsColumnBuffer {
         row_idx: u32,
         value: Option<StoredQwpDecimal>,
     ) -> crate::Result<()> {
-        let is_first_non_null = self.non_null_count == 0;
         let QwpWsColumnValues::Decimal128 {
             cells,
             decimal_scale,
@@ -4058,7 +4056,7 @@ impl QwpWsColumnBuffer {
         if let Some(value) = value {
             let bytes = value.wire_bytes_with_scale(value.scale)?;
             narrow_decimal_le_fits(&bytes, 16).ok_or_else(|| decimal_fit_error(128))?;
-            if is_first_non_null {
+            if *decimal_scale == QWP_DECIMAL_SCALE_UNSET {
                 *decimal_scale = value.scale;
             }
             cells.push(QwpWsDecimalCell {
@@ -4265,15 +4263,15 @@ impl QwpWsColumnValues {
             },
             ColumnKind::Decimal => Self::Decimal {
                 cells: Vec::new(),
-                decimal_scale: 0,
+                decimal_scale: QWP_DECIMAL_SCALE_UNSET,
             },
             ColumnKind::Decimal64 => Self::Decimal64 {
                 cells: Vec::new(),
-                decimal_scale: 0,
+                decimal_scale: QWP_DECIMAL_SCALE_UNSET,
             },
             ColumnKind::Decimal128 => Self::Decimal128 {
                 cells: Vec::new(),
-                decimal_scale: 0,
+                decimal_scale: QWP_DECIMAL_SCALE_UNSET,
             },
             ColumnKind::DoubleArray => Self::DoubleArray {
                 cells: Vec::new(),
@@ -4337,20 +4335,10 @@ impl QwpWsColumnValues {
                 lookup.clear();
                 data.clear();
             }
-            Self::Decimal {
-                cells,
-                decimal_scale,
-            }
-            | Self::Decimal64 {
-                cells,
-                decimal_scale,
-            }
-            | Self::Decimal128 {
-                cells,
-                decimal_scale,
-            } => {
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => {
                 cells.clear();
-                *decimal_scale = 0;
             }
         }
     }
@@ -4747,7 +4735,12 @@ impl QwpWsColumnValues {
                 cells,
                 decimal_scale,
             } => {
-                out.push(*decimal_scale);
+                let scale_byte = if *decimal_scale == QWP_DECIMAL_SCALE_UNSET {
+                    0
+                } else {
+                    *decimal_scale
+                };
+                out.push(scale_byte);
                 for cell in cells {
                     if let Some(value) = cell.value {
                         out.extend_from_slice(&value.wire_bytes_with_scale(*decimal_scale)?);
@@ -4759,7 +4752,12 @@ impl QwpWsColumnValues {
                 cells,
                 decimal_scale,
             } => {
-                out.push(*decimal_scale);
+                let scale_byte = if *decimal_scale == QWP_DECIMAL_SCALE_UNSET {
+                    0
+                } else {
+                    *decimal_scale
+                };
+                out.push(scale_byte);
                 for cell in cells {
                     if let Some(value) = cell.value {
                         let bytes = value.wire_bytes_with_scale(*decimal_scale)?;
@@ -4774,7 +4772,12 @@ impl QwpWsColumnValues {
                 cells,
                 decimal_scale,
             } => {
-                out.push(*decimal_scale);
+                let scale_byte = if *decimal_scale == QWP_DECIMAL_SCALE_UNSET {
+                    0
+                } else {
+                    *decimal_scale
+                };
+                out.push(scale_byte);
                 for cell in cells {
                     if let Some(value) = cell.value {
                         let bytes = value.wire_bytes_with_scale(*decimal_scale)?;
@@ -5699,7 +5702,7 @@ impl ColumnStats {
             variable_data_len: 0,
             symbol_dict_bytes: 0,
             symbol_row_index_bytes: 0,
-            decimal_scale: 0,
+            decimal_scale: QWP_DECIMAL_SCALE_UNSET,
             geohash_precision_bits: 0,
             dict_head: CELL_END,
             dict_tail: CELL_END,
@@ -7116,7 +7119,11 @@ fn encode_column_from_cells(
         }
 
         ColumnKind::Decimal => {
-            out.push(col.decimal_scale);
+            out.push(if col.decimal_scale == QWP_DECIMAL_SCALE_UNSET {
+                0
+            } else {
+                col.decimal_scale
+            });
             for cell in CellIter::new(cells, col.cell_head) {
                 match cell.value {
                     ValueRef::DecimalNull => {}
@@ -7136,7 +7143,11 @@ fn encode_column_from_cells(
         }
 
         ColumnKind::Decimal64 => {
-            out.push(col.decimal_scale);
+            out.push(if col.decimal_scale == QWP_DECIMAL_SCALE_UNSET {
+                0
+            } else {
+                col.decimal_scale
+            });
             for cell in CellIter::new(cells, col.cell_head) {
                 match cell.value {
                     ValueRef::Decimal64Null => {}
@@ -7158,7 +7169,11 @@ fn encode_column_from_cells(
         }
 
         ColumnKind::Decimal128 => {
-            out.push(col.decimal_scale);
+            out.push(if col.decimal_scale == QWP_DECIMAL_SCALE_UNSET {
+                0
+            } else {
+                col.decimal_scale
+            });
             for cell in CellIter::new(cells, col.cell_head) {
                 match cell.value {
                     ValueRef::Decimal128Null => {}

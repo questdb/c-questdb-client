@@ -2426,11 +2426,13 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             for thread_index in range(load.num_of_threads):
                 thread_seed_rng = self._master_rng.child()
                 sender_id = f'fuzz-{run_id}-t{thread_index}'
+                producer_sf = os.path.join(sf_root, f'producer-{thread_index}')
+                os.makedirs(producer_sf, exist_ok=True)
                 thread = threading.Thread(
                     target=self._producer_loop,
                     name=f'qwp-ws-fuzz-producer-{thread_index}',
                     args=(
-                        sender_id, sf_root, load, fuzz, thread_seed_rng,
+                        sender_id, producer_sf, load, fuzz, thread_seed_rng,
                         tables, next_ts, record_failure))
                 producer_threads.append(thread)
                 thread.start()
