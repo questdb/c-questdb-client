@@ -632,7 +632,6 @@ impl Reader {
         ReaderQuery {
             reader: self,
             builder: QueryRequest::builder(sql),
-            error: None,
             on_failover_reset: None,
             _not_send: std::marker::PhantomData,
         }
@@ -721,9 +720,6 @@ type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverEvent) + 'r>;
 pub struct ReaderQuery<'r> {
     reader: &'r mut Reader,
     builder: QueryRequestBuilder,
-    /// First fatal error (if any) deferred until `execute`, so the fluent
-    /// chain stays clean.
-    error: Option<crate::egress::Error>,
     /// Optional handler called every time the cursor reconnects after a
     /// transport-level failure (see [`FailoverEvent`]).
     on_failover_reset: Option<FailoverResetCallback<'r>>,
@@ -911,9 +907,6 @@ impl<'r> ReaderQuery<'r> {
 
     /// Send the QUERY_REQUEST and return a streaming `Cursor`.
     pub fn execute(self) -> Result<Cursor<'r>> {
-        if let Some(e) = self.error {
-            return Err(e);
-        }
         if self.reader.cursor_active {
             return Err(fmt!(
                 InvalidApiCall,
