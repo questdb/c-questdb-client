@@ -142,3 +142,46 @@ stages:
             env:
               JAVA_HOME: $(JAVA_HOME_25_X64)
             displayName: "integration test"
+      - job: TestQwpWsFuzz
+        displayName: "QWP/WS fuzz suite (cross-platform)"
+        strategy:
+          matrix:
+            linux:
+              imageName: "ubuntu-latest"
+              jdkArch: "x64"
+            mac:
+              imageName: "macos-latest"
+              jdkArch: "arm64"
+            windows-2022:
+              imageName: "windows-2022"
+              jdkArch: "x64"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          - task: JavaToolInstaller@0
+            displayName: "Install JDK 17"
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: $(jdkArch)
+              jdkSourceOption: 'PreInstalled'
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "JDKVersion"
+              jdkVersionOption: "1.17"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
+            displayName: "TestQwpWsFuzz"
