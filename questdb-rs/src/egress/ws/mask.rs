@@ -53,7 +53,11 @@ impl MaskRng {
     /// [`Self::from_system_random`] for the production path.
     pub(crate) fn from_seed(seed: u64) -> Self {
         // xorshift64 stalls on all-zero state; force a non-zero seed.
-        let state = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed };
+        let state = if seed == 0 {
+            0xDEAD_BEEF_CAFE_BABE
+        } else {
+            seed
+        };
         Self { state }
     }
 

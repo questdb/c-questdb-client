@@ -119,7 +119,9 @@ impl Headers {
     /// Upgrade`.
     pub(crate) fn header_has_token(&self, name: &str, token: &str) -> bool {
         match self.find_ci(name) {
-            Some(value) => value.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)),
+            Some(value) => value
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case(token)),
             None => false,
         }
     }
@@ -361,7 +363,9 @@ fn push_header(out: &mut Vec<u8>, name: &str, value: &str) {
 /// Read up to `\r\n\r\n` from `stream`, returning the header bytes
 /// (including the terminator) and any post-terminator bytes already
 /// buffered.
-fn read_response_prefix<S: Read>(stream: &mut S) -> std::result::Result<(Vec<u8>, Vec<u8>), HandshakeError> {
+fn read_response_prefix<S: Read>(
+    stream: &mut S,
+) -> std::result::Result<(Vec<u8>, Vec<u8>), HandshakeError> {
     // Pull bytes in modest chunks (4 KiB) so a misbehaving peer can't
     // force us into one giant allocation before we even see the first
     // CRLF. Real responses fit comfortably in the first chunk; this
@@ -398,9 +402,7 @@ fn read_response_prefix<S: Read>(stream: &mut S) -> std::result::Result<(Vec<u8>
 }
 
 fn find_crlf_crlf(haystack: &[u8]) -> Option<usize> {
-    haystack
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
+    haystack.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 #[derive(Debug)]
@@ -468,7 +470,10 @@ fn parse_status_line(line: &[u8]) -> std::result::Result<u16, &'static str> {
 }
 
 fn split_header_line(line: &[u8]) -> std::result::Result<(String, String), &'static str> {
-    let colon = line.iter().position(|&b| b == b':').ok_or("header line missing `:`")?;
+    let colon = line
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or("header line missing `:`")?;
     let name = std::str::from_utf8(&line[..colon]).map_err(|_| "header name is not UTF-8")?;
     let value = std::str::from_utf8(&line[colon + 1..]).map_err(|_| "header value is not UTF-8")?;
     if name.is_empty() || name.chars().any(|c| c.is_ascii_whitespace()) {
@@ -523,7 +528,10 @@ fn read_response_body<S: Read>(
 
 /// Read repeatedly into `buf` until full or EOF. Returns the number of
 /// bytes actually filled (≤ `buf.len()`).
-fn read_to_fill<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::result::Result<usize, HandshakeError> {
+fn read_to_fill<S: Read>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> std::result::Result<usize, HandshakeError> {
     let mut filled = 0;
     while filled < buf.len() {
         match stream.read(&mut buf[filled..])? {
@@ -591,7 +599,12 @@ mod tests {
         // freshly-generated key, then replies. Confirms the
         // SHA1+base64 plumbing matches the spec exactly.
         let mut server = MockServer::default();
-        let result = upgrade(&mut server, "host:1234", "/path", &[("X-Extra", "abc".into())]);
+        let result = upgrade(
+            &mut server,
+            "host:1234",
+            "/path",
+            &[("X-Extra", "abc".into())],
+        );
         assert!(result.is_ok(), "{:?}", result.err());
 
         // Confirm the extra header made it onto the wire.
@@ -646,9 +659,15 @@ Content-Length: 11\r\n\r\nhello world";
 
     #[test]
     fn parse_status_line_minimal() {
-        assert_eq!(parse_status_line(b"HTTP/1.1 101 Switching Protocols").unwrap(), 101);
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 101 Switching Protocols").unwrap(),
+            101
+        );
         assert_eq!(parse_status_line(b"HTTP/1.0 200 OK").unwrap(), 200);
-        assert_eq!(parse_status_line(b"HTTP/1.1 421 Misdirected Request").unwrap(), 421);
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 421 Misdirected Request").unwrap(),
+            421
+        );
     }
 
     #[test]
@@ -698,7 +717,9 @@ Content-Length: 11\r\n\r\nhello world";
                 self.written.extend_from_slice(buf);
                 Ok(buf.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
 
         // Use a MockServer to produce a valid response keyed to the
@@ -807,6 +828,8 @@ Content-Length: 11\r\n\r\nhello world";
             self.written.extend_from_slice(buf);
             Ok(buf.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

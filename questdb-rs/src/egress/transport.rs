@@ -55,9 +55,7 @@ use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
 use crate::egress::ws::client::{Stream, WsClient, WsReadError};
-use crate::egress::ws::handshake::{
-    self, HandshakeError as WsHandshakeError, Headers, HttpReject,
-};
+use crate::egress::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
 use crate::egress::ws::mask::build_from_system_random;
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
@@ -176,8 +174,7 @@ impl WsTransport {
         let host_header = endpoint.to_string();
         let path = config.path.clone();
         let extra_headers = config.upgrade_headers();
-        let handshake_result =
-            handshake::upgrade(&mut stream, &host_header, &path, &extra_headers);
+        let handshake_result = handshake::upgrade(&mut stream, &host_header, &path, &extra_headers);
 
         let handshake = match handshake_result {
             Ok(h) => h,
@@ -390,14 +387,7 @@ fn build_stream(tcp: &TcpStream, host: &str, config: &ReaderConfig) -> Result<St
 
     if let Some(client_config) = build_client_config(config)? {
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|e| {
-                fmt!(
-                    ConfigError,
-                    "invalid TLS server name {:?}: {}",
-                    host,
-                    e
-                )
-            })?;
+            .map_err(|e| fmt!(ConfigError, "invalid TLS server name {:?}: {}", host, e))?;
         let conn = rustls::ClientConnection::new(Arc::clone(&client_config), server_name)
             .map_err(|e| fmt!(TlsError, "rustls handshake setup failed: {}", e))?;
         let stream_owned = rustls::StreamOwned::new(conn, owned);
@@ -437,9 +427,12 @@ fn teardown_inplace(socket: &mut WsClient) {
 // ---------------------------------------------------------------------------
 
 fn read_version_header(headers: &Headers) -> Result<u8> {
-    let raw = headers
-        .find_ci(HDR_VERSION)
-        .ok_or_else(|| fmt!(HandshakeError, "server response missing X-QWP-Version header"))?;
+    let raw = headers.find_ci(HDR_VERSION).ok_or_else(|| {
+        fmt!(
+            HandshakeError,
+            "server response missing X-QWP-Version header"
+        )
+    })?;
     raw.parse::<u8>()
         .map_err(|_| fmt!(HandshakeError, "X-QWP-Version {:?} is not a u8", raw))
 }
@@ -558,10 +551,7 @@ fn map_handshake_error(e: WsHandshakeError) -> Error {
             } else {
                 ErrorCode::SocketError
             };
-            Error::new(
-                code,
-                format!("WebSocket handshake IO error: {}", io_err),
-            )
+            Error::new(code, format!("WebSocket handshake IO error: {}", io_err))
         }
         WsHandshakeError::Protocol(msg) => Error::new(
             ErrorCode::HandshakeError,
@@ -577,7 +567,11 @@ fn map_handshake_error(e: WsHandshakeError) -> Error {
 }
 
 fn map_http_reject(reject: HttpReject) -> Error {
-    let HttpReject { status, headers, body: _ } = reject;
+    let HttpReject {
+        status,
+        headers,
+        body: _,
+    } = reject;
     // 421 carries an `X-QuestDB-Role` upgrade-reject (failover.md §5).
     // Handled out-of-line so the mapped Error can attach `UpgradeReject`.
     if status == 421

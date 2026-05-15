@@ -115,7 +115,9 @@ fn main() {
     );
     println!("elapsed      : {:.3} s", secs);
     println!("wire MiB/s   : {wire_mib_per_s:.2}   (compressed bytes / elapsed)");
-    println!("body MiB/s   : {body_mib_per_s:.2}   (decompressed bytes / elapsed — apples-to-apples)");
+    println!(
+        "body MiB/s   : {body_mib_per_s:.2}   (decompressed bytes / elapsed — apples-to-apples)"
+    );
     println!("row rate     : {:.0} rows/s", rows_per_s);
     println!(
         "read / dec   : {} ms / {} ms",
@@ -293,12 +295,7 @@ fn report(r: &Run, phase: &str) {
     let mb_per_s = r.wire_bytes as f64 / secs / 1_000_000.0;
     println!(
         "[{phase}] {} rows in {} batches ({} cols) — {:.3}s — {} bytes — {:.2} MB/s",
-        r.rows,
-        r.batches,
-        r.columns,
-        secs,
-        r.wire_bytes,
-        mb_per_s,
+        r.rows, r.batches, r.columns, secs, r.wire_bytes, mb_per_s,
     );
 }
 

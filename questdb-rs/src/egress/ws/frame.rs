@@ -186,9 +186,7 @@ impl FrameHeader {
         };
 
         if is_control && payload_len > 125 {
-            return Err(FrameError::Protocol(
-                "control frame payload > 125 bytes",
-            ));
+            return Err(FrameError::Protocol("control frame payload > 125 bytes"));
         }
 
         Ok(FrameHeader {
@@ -280,8 +278,14 @@ mod tests {
 
     #[test]
     fn parse_incomplete_returns_incomplete() {
-        assert_eq!(FrameHeader::parse(&[0x82]).unwrap_err(), FrameError::Incomplete);
-        assert_eq!(FrameHeader::parse(&[0x82, 126, 0]).unwrap_err(), FrameError::Incomplete);
+        assert_eq!(
+            FrameHeader::parse(&[0x82]).unwrap_err(),
+            FrameError::Incomplete
+        );
+        assert_eq!(
+            FrameHeader::parse(&[0x82, 126, 0]).unwrap_err(),
+            FrameError::Incomplete
+        );
         assert_eq!(
             FrameHeader::parse(&[0x82, 127, 0, 0, 0, 0]).unwrap_err(),
             FrameError::Incomplete

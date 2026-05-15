@@ -296,9 +296,8 @@ impl WsClient {
         // aarch64; the data is uninitialised but `Read::read` is
         // documented to "fill the buffer", i.e. it writes before
         // returning the count of bytes written.
-        let slice = unsafe {
-            std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
-        };
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
         let n = self.stream.read(slice)?;
         if n == 0 {
             return Err(WsReadError::Io(io::Error::new(
@@ -352,7 +351,9 @@ mod tests {
             self.write_buf.extend_from_slice(buf);
             Ok(buf.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     // Test helper: build a complete client→server framed payload as
