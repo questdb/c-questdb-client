@@ -2448,6 +2448,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     rnd=self._master_rng.child(),
                     producers_done=producers_done,
                     stop_event=stop_event,
+                    record_failure=record_failure,
                     failure_counter=failure_counter,
                     log=self._log)
                 alter_thread.start()
@@ -2462,6 +2463,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     max_interval_s=fuzz.max_bounce_interval_s,
                     writers_done=producers_done,
                     stop_event=stop_event,
+                    record_failure=record_failure,
                     failure_counter=failure_counter,
                     log=self._log)
                 bounce_thread.start()

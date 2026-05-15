@@ -992,6 +992,56 @@ _ALTER_TOLERATED_PATTERNS = (
 )
 
 
+def is_transient_network_error(exc: BaseException) -> bool:
+    """True if `exc` looks like a connection-layer failure that we
+    expect to see while the server is mid-bounce (stop/start cycle).
+
+    During a bounce the producer threads keep sending and the ALTER
+    thread keeps querying; both can hit:
+
+      * `urllib.error.URLError` — urllib's wrapper for refused or
+        broken connections (subclass of `OSError` since Python 3.3,
+        but kept explicit for readability and resilience against
+        future refactors).
+      * `ConnectionResetError` — Linux RSTs the TCP socket when the
+        java process exits mid-transaction. Surfaces as `OSError
+        [Errno 104]`.
+      * `ConnectionRefusedError` — server isn't bound yet when we
+        retry too eagerly after `start()`.
+      * `ConnectionAbortedError`, `BrokenPipeError` — similar Win/Unix
+        flavours of the above.
+      * `TimeoutError` (and `socket.timeout`, which is an alias since
+        Python 3.10) — server accepts the TCP connection but hasn't
+        started serving requests yet.
+
+    All of those derive from `OSError` in modern Python; the explicit
+    isinstance tuple is for clarity in failure logs. A residual
+    fallback inspects the error message for the same patterns in case
+    a wrapping layer obscures the type (urllib stack on Windows has
+    been known to do this).
+    """
+    if isinstance(exc, (
+            urllib.error.URLError,
+            ConnectionResetError,
+            ConnectionRefusedError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            TimeoutError,
+    )):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    message = str(exc).lower()
+    return (
+        'connection reset' in message
+        or 'connection refused' in message
+        or 'connection aborted' in message
+        or 'broken pipe' in message
+        or 'timed out' in message
+        or 'timeout' in message
+    )
+
+
 class AlterThread(threading.Thread):
     """Background thread that races `ALTER TABLE ... ALTER COLUMN TYPE`
     statements against the producers.
@@ -1013,6 +1063,7 @@ class AlterThread(threading.Thread):
             rnd: Rng,
             producers_done: threading.Event,
             stop_event: threading.Event,
+            record_failure,
             failure_counter: list,
             log):
         super().__init__(name='qwp-ws-fuzz-alter', daemon=True)
@@ -1023,6 +1074,7 @@ class AlterThread(threading.Thread):
         self._rnd = rnd
         self._producers_done = producers_done
         self._stop_event = stop_event
+        self._record_failure = record_failure
         self._failure_counter = failure_counter
         self._log = log
         self.applied_conversions = 0
@@ -1045,6 +1097,9 @@ class AlterThread(threading.Thread):
         try:
             cols = self._list_columns(table_name)
         except Exception as e:  # noqa: BLE001 — fixture surfaces a few error shapes
+            if is_transient_network_error(e):
+                # Server is mid-bounce; the next iteration will retry.
+                return False
             self._log(
                 f'fuzz alter: list_columns({table_name!r}) failed: {e}')
             return False
@@ -1069,20 +1124,23 @@ class AlterThread(threading.Thread):
                 self._log(
                     f'fuzz alter: {table_name}.{name} {col_type} -> {target}')
                 return True
-            except urllib.error.URLError:
-                # Server is unreachable — likely mid-bounce. Drop this
-                # attempt; the outer loop will pick a new target after a
-                # short sleep, by which point start() should have
-                # finished.
-                return False
             except Exception as e:  # noqa: BLE001
+                if is_transient_network_error(e):
+                    # Server is mid-bounce — the connection was RST'd or
+                    # timed out before the ALTER could complete. Drop
+                    # this attempt; the outer loop retries after a
+                    # short sleep.
+                    self._log(
+                        f'fuzz alter: transient network error '
+                        f'({type(e).__name__}: {e}); retrying')
+                    return False
                 message = str(e)
                 if any(p in message.lower() for p in _ALTER_TOLERATED_PATTERNS):
                     continue
-                self._log(
+                self._record_failure(
                     f'fuzz alter: unexpected failure on '
-                    f'{table_name}.{name} -> {target}: {e}')
-                self._failure_counter[0] += 1
+                    f'{table_name}.{name} -> {target}: '
+                    f'{type(e).__name__}: {e}')
                 return False
         return False
 
@@ -1116,6 +1174,7 @@ class BounceThread(threading.Thread):
             max_interval_s: float,
             writers_done: threading.Event,
             stop_event: threading.Event,
+            record_failure,
             failure_counter: list,
             log,
     ):
@@ -1127,6 +1186,7 @@ class BounceThread(threading.Thread):
         self._max_interval_s = max(max_interval_s, min_interval_s)
         self._writers_done = writers_done
         self._stop_event = stop_event
+        self._record_failure = record_failure
         self._failure_counter = failure_counter
         self._log = log
         self.bounces_performed = 0
@@ -1153,10 +1213,10 @@ class BounceThread(threading.Thread):
                 self.bounces_performed += 1
                 self._log(f'fuzz bounce #{idx}: server back up')
             except Exception as e:  # noqa: BLE001 — fixture lifecycle is fragile
-                self._log(
+                self._record_failure(
                     f'fuzz bounce: unexpected failure at attempt '
-                    f'{self.bounces_performed + 1}: {e}')
-                self._failure_counter[0] += 1
+                    f'{self.bounces_performed + 1}: '
+                    f'{type(e).__name__}: {e}')
                 # One defensive recovery attempt so the rest of the test
                 # has a chance to surface the underlying assertion
                 # failure rather than a query timeout.
