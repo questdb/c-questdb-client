@@ -329,9 +329,12 @@ fn write_decimal(out: &mut Vec<u8>, rng: &mut SplitMix64, row_count: usize, elem
 fn write_array(out: &mut Vec<u8>, rng: &mut SplitMix64, row_count: usize) {
     let non_null = write_validity(out, rng, row_count);
     for _ in 0..non_null {
-        // 1D arrays with 1..=3 elements. The decoder rejects dim==0
-        // explicitly (see decode_array's per-dim check), so stay above
-        // the minimum to keep the sanity_check_decode happy.
+        // 1D arrays with 1..=3 elements. The spec permits empty arrays
+        // (dim==0), but the bounds fuzz only mutates *non-empty*
+        // shapes so truncation/corruption have something to chew on —
+        // dim==0 has no element bytes to truncate. The dim==0 case is
+        // pinned by `array_dim_zero_is_valid_empty_array` in the
+        // decoder hardening tests.
         out.push(1u8); // nDims
         let dim: u32 = (1 + rng.gen_range(3)) as u32; // 1..=3
         out.extend_from_slice(&dim.to_le_bytes());

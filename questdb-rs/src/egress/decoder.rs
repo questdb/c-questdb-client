@@ -691,20 +691,6 @@ fn decode_array(r: &mut ByteReader<'_>, parent: &Bytes, row_count: usize) -> Res
         for d in 0..n_dims {
             let dim_bytes = r.read_bytes(4)?;
             let dim = u32::from_le_bytes(dim_bytes.try_into().unwrap());
-            // Reject zero-length dimensions explicitly. Without this check
-            // the multiplicative element cap short-circuits the moment any
-            // dim is zero — any subsequent dim could carry u32::MAX without
-            // ever tripping MAX_ARRAY_ELEMENTS_PER_ROW. Matches the
-            // java-questdb-client fix referenced by
-            // `QwpResultBatchDecoderHardeningTest.testArrayDimZeroIsRejected`.
-            if dim == 0 {
-                return Err(fmt!(
-                    ProtocolError,
-                    "array row {} has dim {} = 0 (must be >= 1)",
-                    row,
-                    d
-                ));
-            }
             shapes.push(dim);
             total = total.checked_mul(dim as u64).ok_or_else(|| {
                 fmt!(
@@ -4400,36 +4386,40 @@ mod tests {
         // ARRAY column dimension validation.
         // -----------------------------------------------------------------
 
-        /// Ports `testArrayDimZeroIsRejected`. A dim of zero in any
-        /// position must surface as an error: the multiplicative cap
-        /// short-circuits on the first zero, so subsequent dims could
-        /// otherwise be u32::MAX without ever tripping
-        /// `MAX_ARRAY_ELEMENTS_PER_ROW`.
+        /// Inverts the Java port `testArrayDimZeroIsRejected`. The QWP
+        /// spec (`docs/qwp/wire-egress.md` §11.5.1) explicitly states:
+        ///
+        /// > A non-NULL empty array is a valid value.
+        ///
+        /// On the wire an empty non-NULL array manifests as a dim list
+        /// whose product is zero — most naturally a single dim of zero.
+        /// The C++ contract test
+        /// `mock: non-null empty-data array row exposes data == NULL`
+        /// at `cpp_test/test_line_reader_mock.cpp:1091` pins this case
+        /// against the Rust reader: shape `[2, 0, 3]` decodes to a
+        /// non-null row with `data == nullptr` and `element_count == 0`.
+        ///
+        /// The Java client's `testArrayDimZeroIsRejected` makes the
+        /// opposite assumption and contradicts the spec. We diverge
+        /// here on purpose.
         #[test]
-        fn array_dim_zero_rejected() {
-            // 2D row with a zero in the first dim. Without the
-            // per-dim `> 0` check, decoder accepts it as an
-            // "empty" row even though the second dim is large.
+        fn array_dim_zero_is_valid_empty_array() {
+            // 2D row with a zero in the first dim → 0 elements,
+            // 0 data bytes. Spec-compliant empty non-NULL array.
             let body = array_col_body(&[&[0u32, 5u32]]);
             let (flags_byte, payload) = BatchBuilder::new(1)
                 .add_column("a", ColumnKind::DoubleArray, body)
                 .build();
             let mut dict = SymbolDict::new();
             let mut reg = SchemaRegistry::new();
-            let err = decode_result_batch(
+            decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
                 &mut reg,
                 &mut ZstdScratch::new(),
             )
-            .expect_err("decoder must reject ARRAY row with dim==0");
-            let msg = err.msg();
-            assert!(
-                msg.contains("dim"),
-                "error must blame an ARRAY dim, got: {}",
-                msg
-            );
+            .expect("ARRAY row with dim==0 must decode as a valid empty array");
         }
 
         /// Ports `testArrayValidDimensionsAreAccepted`. Positive baseline
