@@ -280,6 +280,13 @@ impl Drop for FragMock {
 /// x-qwp-version=2 to match the SERVER_INFO frame), send SERVER_INFO,
 /// read the client's QUERY_REQUEST, then emit RESULT_BATCH (rows) +
 /// RESULT_END. Errors close the connection cleanly.
+///
+/// `tungstenite::accept_hdr`'s callback returns `Result<Response, Response>`
+/// where the `Err` variant is the full `Response<Option<String>>` (~136 B).
+/// `clippy::result-large-err` flags it under `-D warnings`; the function is
+/// test-only and we don't own the tungstenite signature, so we silence the
+/// lint locally rather than wrap the response in `Box`.
+#[allow(clippy::result_large_err)]
 fn run_session(stream: ChunkingStream, rows: usize) {
     let mut ws: WebSocket<ChunkingStream> =
         match accept_hdr(stream, |_req: &Request, mut resp: Response| {
