@@ -1786,8 +1786,13 @@ fn record_all_sfa_cleanup(
     slot_dir: &Path,
     diagnostics: &mut Vec<SfaRecoveryDiagnostic>,
 ) -> Result<(), SfaQueueError> {
+    let dir_iter = match fs::read_dir(slot_dir) {
+        Ok(iter) => iter,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
     let mut cleanup_failed = false;
-    for entry in fs::read_dir(slot_dir)? {
+    for entry in dir_iter {
         let entry = entry?;
         let path = entry.path();
         if !is_sfa_file(&path) {
