@@ -78,15 +78,29 @@ pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
 pub(crate) const QWP_SCHEMA_MODE_REFERENCE: u8 = 0x01;
 pub(crate) const QWP_TYPE_BOOLEAN: u8 = 0x01;
-pub(crate) const QWP_TYPE_DOUBLE: u8 = 0x07;
+pub(crate) const QWP_TYPE_BYTE: u8 = 0x02;
+pub(crate) const QWP_TYPE_SHORT: u8 = 0x03;
+pub(crate) const QWP_TYPE_INT: u8 = 0x04;
 pub(crate) const QWP_TYPE_LONG: u8 = 0x05;
-// Match the newer Java QWP client/spec text column type.
-pub(crate) const QWP_TYPE_VARCHAR: u8 = 0x0F;
+pub(crate) const QWP_TYPE_FLOAT: u8 = 0x06;
+pub(crate) const QWP_TYPE_DOUBLE: u8 = 0x07;
 pub(crate) const QWP_TYPE_SYMBOL: u8 = 0x09;
 pub(crate) const QWP_TYPE_TIMESTAMP: u8 = 0x0A;
+pub(crate) const QWP_TYPE_DATE: u8 = 0x0B;
+pub(crate) const QWP_TYPE_UUID: u8 = 0x0C;
+pub(crate) const QWP_TYPE_LONG256: u8 = 0x0D;
+pub(crate) const QWP_TYPE_GEOHASH: u8 = 0x0E;
+pub(crate) const QWP_TYPE_VARCHAR: u8 = 0x0F;
 pub(crate) const QWP_TYPE_TIMESTAMP_NANOS: u8 = 0x10;
 pub(crate) const QWP_TYPE_DOUBLE_ARRAY: u8 = 0x11;
+pub(crate) const QWP_TYPE_LONG_ARRAY: u8 = 0x12;
+pub(crate) const QWP_TYPE_DECIMAL64: u8 = 0x13;
+pub(crate) const QWP_TYPE_DECIMAL128: u8 = 0x14;
 pub(crate) const QWP_TYPE_DECIMAL256: u8 = 0x15;
+pub(crate) const QWP_TYPE_CHAR: u8 = 0x16;
+pub(crate) const QWP_TYPE_BINARY: u8 = 0x17;
+pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
+const QWP_LONG256_BYTES: usize = 32;
 pub(crate) const QWP_VERSION_1: u8 = 1;
 const QWP_INLINE_SCHEMA_ID: u64 = 0;
 const QWP_DECIMAL_MAX_SCALE: u8 = 76;
@@ -179,9 +193,9 @@ impl StoredQwpDecimal {
         if target_scale < self.scale {
             return Err(error::fmt!(
                 InvalidApiCall,
-                "internal QWP decimal scale regression: target {} < value {}",
-                target_scale,
-                self.scale
+                "cannot rescale decimal from scale {} to {} without precision loss",
+                self.scale,
+                target_scale
             ));
         }
 
@@ -547,13 +561,27 @@ impl DecimalValue {
 enum ColumnKind {
     Bool,
     Symbol,
+    I8,
+    I16,
+    I32,
     I64,
+    F32,
     F64,
     String,
+    Decimal64,
+    Decimal128,
     Decimal,
     DoubleArray,
     TimestampMicros,
     TimestampNanos,
+    Uuid,
+    Long256,
+    Ipv4,
+    Date,
+    Char,
+    Binary,
+    Geohash,
+    LongArray,
 }
 
 // --- Designated timestamp ---
@@ -569,7 +597,11 @@ enum DesignatedTs {
 #[derive(Clone, Copy, Debug)]
 enum ValueRef {
     Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
     I64(i64),
+    F32(f32),
     F64(f64),
     TimestampMicros(i64),
     TimestampNanos(i64),
@@ -577,22 +609,47 @@ enum ValueRef {
     String(ValueSlice),
     DecimalNull,
     Decimal(DecimalValue),
+    Decimal64Null,
+    Decimal64(DecimalValue),
+    Decimal128Null,
+    Decimal128(DecimalValue),
     DoubleArray(ValueSlice),
+    Uuid(ValueSlice),
+    Long256(ValueSlice),
+    Ipv4(u32),
+    DateMillis(i64),
+    Char(u16),
+    Binary(ValueSlice),
+    Geohash { bits: u64, precision_bits: u8 },
+    LongArray(ValueSlice),
 }
 
 impl ValueRef {
     fn kind(&self) -> ColumnKind {
         match self {
             ValueRef::Bool(_) => ColumnKind::Bool,
+            ValueRef::I8(_) => ColumnKind::I8,
+            ValueRef::I16(_) => ColumnKind::I16,
+            ValueRef::I32(_) => ColumnKind::I32,
             ValueRef::I64(_) => ColumnKind::I64,
+            ValueRef::F32(_) => ColumnKind::F32,
             ValueRef::F64(_) => ColumnKind::F64,
             ValueRef::TimestampMicros(_) => ColumnKind::TimestampMicros,
             ValueRef::TimestampNanos(_) => ColumnKind::TimestampNanos,
             ValueRef::Symbol(_) => ColumnKind::Symbol,
             ValueRef::String(_) => ColumnKind::String,
-            ValueRef::DecimalNull => ColumnKind::Decimal,
-            ValueRef::Decimal(_) => ColumnKind::Decimal,
+            ValueRef::DecimalNull | ValueRef::Decimal(_) => ColumnKind::Decimal,
+            ValueRef::Decimal64Null | ValueRef::Decimal64(_) => ColumnKind::Decimal64,
+            ValueRef::Decimal128Null | ValueRef::Decimal128(_) => ColumnKind::Decimal128,
             ValueRef::DoubleArray(_) => ColumnKind::DoubleArray,
+            ValueRef::Uuid(_) => ColumnKind::Uuid,
+            ValueRef::Long256(_) => ColumnKind::Long256,
+            ValueRef::Ipv4(_) => ColumnKind::Ipv4,
+            ValueRef::DateMillis(_) => ColumnKind::Date,
+            ValueRef::Char(_) => ColumnKind::Char,
+            ValueRef::Binary(_) => ColumnKind::Binary,
+            ValueRef::Geohash { .. } => ColumnKind::Geohash,
+            ValueRef::LongArray(_) => ColumnKind::LongArray,
         }
     }
 }
@@ -1106,6 +1163,29 @@ impl QwpBuffer {
         Ok(ValueSlice(ByteSlice { offset, len }))
     }
 
+    fn append_value_long256(
+        &mut self,
+        value: &[u8; QWP_LONG256_BYTES],
+    ) -> crate::Result<ValueSlice> {
+        let offset =
+            Self::checked_arena_offset(self.value_bytes.len(), QWP_LONG256_BYTES, "value_bytes")?;
+        self.value_bytes.extend_from_slice(value);
+        Ok(ValueSlice(ByteSlice {
+            offset,
+            len: checked_qwp_u32(QWP_LONG256_BYTES, "long256 length")?,
+        }))
+    }
+
+    fn append_value_uuid(&mut self, lo: u64, hi: u64) -> crate::Result<ValueSlice> {
+        let offset = Self::checked_arena_offset(self.value_bytes.len(), 16, "value_bytes")?;
+        self.value_bytes.extend_from_slice(&lo.to_le_bytes());
+        self.value_bytes.extend_from_slice(&hi.to_le_bytes());
+        Ok(ValueSlice(ByteSlice {
+            offset,
+            len: checked_qwp_u32(16, "uuid length")?,
+        }))
+    }
+
     fn append_value_decimal(
         &mut self,
         value: DecimalView<'_>,
@@ -1129,18 +1209,11 @@ impl QwpBuffer {
         }))
     }
 
-    fn append_value_f64_array<T, D>(&mut self, view: &T) -> crate::Result<ValueSlice>
+    fn append_value_array<T, D>(&mut self, view: &T) -> crate::Result<ValueSlice>
     where
         T: NdArrayView<D>,
         D: ArrayElement + ArrayElementSealed,
     {
-        if D::type_tag() != <f64 as ArrayElementSealed>::type_tag() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "QWP/UDP currently supports only f64 arrays"
-            ));
-        }
-
         let ndim = view.ndim();
         if ndim == 0 {
             return Err(error::fmt!(
@@ -1310,6 +1383,63 @@ impl QwpBuffer {
     }
 
     #[inline(always)]
+    pub(crate) fn column_i8<'a, N>(&mut self, name: N, value: i8) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::I8(value),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_i16<'a, N>(&mut self, name: N, value: i16) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::I16(value),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_i32<'a, N>(&mut self, name: N, value: i32) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::I32(value),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
     pub(crate) fn column_i64<'a, N>(&mut self, name: N, value: i64) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1323,6 +1453,25 @@ impl QwpBuffer {
         self.push_entry(EntryMeta {
             name: name_ns,
             value: ValueRef::I64(value),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_f32<'a, N>(&mut self, name: N, value: f32) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::F32(value),
         })?;
         self.state.op_state.record_column();
         Ok(self)
@@ -1393,6 +1542,227 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    pub(crate) fn column_dec64<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        let value: DecimalView<'a> = value.try_into()?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_ref = match self.append_value_decimal(value)? {
+            Some(decimal_value) => {
+                let bytes =
+                    decimal_value.wire_bytes_with_scale(&self.value_bytes, decimal_value.scale)?;
+                narrow_decimal_le_fits(&bytes, 8).ok_or_else(|| decimal_fit_error(64))?;
+                ValueRef::Decimal64(decimal_value)
+            }
+            None => ValueRef::Decimal64Null,
+        };
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: value_ref,
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    pub(crate) fn column_dec128<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        let value: DecimalView<'a> = value.try_into()?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_ref = match self.append_value_decimal(value)? {
+            Some(decimal_value) => {
+                let bytes =
+                    decimal_value.wire_bytes_with_scale(&self.value_bytes, decimal_value.scale)?;
+                narrow_decimal_le_fits(&bytes, 16).ok_or_else(|| decimal_fit_error(128))?;
+                ValueRef::Decimal128(decimal_value)
+            }
+            None => ValueRef::Decimal128Null,
+        };
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: value_ref,
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    pub(crate) fn column_uuid<'a, N>(
+        &mut self,
+        name: N,
+        lo: u64,
+        hi: u64,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_vs = self.append_value_uuid(lo, hi)?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Uuid(value_vs),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    pub(crate) fn column_long256<'a, N>(
+        &mut self,
+        name: N,
+        value: &[u8; QWP_LONG256_BYTES],
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_vs = self.append_value_long256(value)?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Long256(value_vs),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_ipv4<'a, N>(&mut self, name: N, value: u32) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Ipv4(value),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_date<'a, N>(&mut self, name: N, millis: i64) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::DateMillis(millis),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_char<'a, N>(&mut self, name: N, value: u16) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Char(value),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    pub(crate) fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        let offset =
+            Self::checked_arena_offset(self.value_bytes.len(), value.len(), "value_bytes")?;
+        let len = checked_qwp_u32(value.len(), "binary length")?;
+        self.value_bytes.extend_from_slice(value);
+        let value_vs = ValueSlice(ByteSlice { offset, len });
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Binary(value_vs),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_geohash<'a, N>(
+        &mut self,
+        name: N,
+        bits: u64,
+        precision_bits: u8,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if !(1..=60).contains(&precision_bits) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "GEOHASH precision must be in 1..=60, got {}",
+                precision_bits
+            ));
+        }
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Geohash {
+                bits,
+                precision_bits,
+            },
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
     #[allow(private_bounds)]
     pub(crate) fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
@@ -1406,10 +1776,23 @@ impl QwpBuffer {
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
         let name_ns = self.append_name(name.as_ref())?;
-        let value_vs = self.append_value_f64_array(view)?;
+        let value_vs = self.append_value_array(view)?;
+        let value = match D::type_tag() {
+            tag if tag == <f64 as ArrayElementSealed>::type_tag() => {
+                ValueRef::DoubleArray(value_vs)
+            }
+            tag if tag == <i64 as ArrayElementSealed>::type_tag() => ValueRef::LongArray(value_vs),
+            other => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Unsupported array element type tag {}",
+                    other
+                ));
+            }
+        };
         self.push_entry(EntryMeta {
             name: name_ns,
-            value: ValueRef::DoubleArray(value_vs),
+            value,
         })?;
         self.state.op_state.record_column();
         Ok(self)
@@ -1601,14 +1984,22 @@ impl QwpBuffer {
         for entry in &self.entries[self.pending.entry_start as usize..] {
             size += entry.name.0.len as usize;
             size += match &entry.value {
-                ValueRef::Bool(_) => 1,
+                ValueRef::Bool(_) | ValueRef::I8(_) => 1,
+                ValueRef::I16(_) | ValueRef::Char(_) => 2,
+                ValueRef::I32(_) | ValueRef::Ipv4(_) | ValueRef::F32(_) => 4,
                 ValueRef::Symbol(vs) => vs.0.len as usize + 3,
-                ValueRef::I64(_) | ValueRef::F64(_) => 8,
+                ValueRef::I64(_) | ValueRef::F64(_) | ValueRef::DateMillis(_) => 8,
+                ValueRef::Uuid(_) => 16,
+                ValueRef::Long256(_) => QWP_LONG256_BYTES,
                 ValueRef::String(vs) => vs.0.len as usize + 9,
-                ValueRef::DecimalNull => 1,
+                ValueRef::Binary(vs) => vs.0.len as usize + 9,
+                ValueRef::DecimalNull | ValueRef::Decimal64Null | ValueRef::Decimal128Null => 1,
                 ValueRef::Decimal(_) => QWP_DECIMAL_MAG_BYTES + 4,
-                ValueRef::DoubleArray(vs) => vs.0.len as usize + 5,
+                ValueRef::Decimal64(_) => 8 + 4,
+                ValueRef::Decimal128(_) => 16 + 4,
+                ValueRef::DoubleArray(vs) | ValueRef::LongArray(vs) => vs.0.len as usize + 5,
                 ValueRef::TimestampMicros(_) | ValueRef::TimestampNanos(_) => 9,
+                ValueRef::Geohash { .. } => 9,
             };
         }
         size + 1
@@ -2047,8 +2438,20 @@ enum QwpWsColumnValues {
     Bool {
         cells: Vec<QwpWsCell<bool>>,
     },
+    I8 {
+        cells: Vec<QwpWsCell<i8>>,
+    },
+    I16 {
+        cells: Vec<QwpWsCell<i16>>,
+    },
+    I32 {
+        cells: Vec<QwpWsCell<i32>>,
+    },
     I64 {
         cells: Vec<QwpWsCell<i64>>,
+    },
+    F32 {
+        cells: Vec<QwpWsCell<f32>>,
     },
     F64 {
         cells: Vec<QwpWsCell<f64>>,
@@ -2073,7 +2476,43 @@ enum QwpWsColumnValues {
         cells: Vec<QwpWsDecimalCell>,
         decimal_scale: u8,
     },
+    Decimal64 {
+        cells: Vec<QwpWsDecimalCell>,
+        decimal_scale: u8,
+    },
+    Decimal128 {
+        cells: Vec<QwpWsDecimalCell>,
+        decimal_scale: u8,
+    },
     DoubleArray {
+        cells: Vec<QwpWsSliceCell>,
+        data: Vec<u8>,
+    },
+    Uuid {
+        cells: Vec<QwpWsCell<(u64, u64)>>,
+    },
+    Long256 {
+        cells: Vec<QwpWsSliceCell>,
+        data: Vec<u8>,
+    },
+    Ipv4 {
+        cells: Vec<QwpWsCell<u32>>,
+    },
+    Date {
+        cells: Vec<QwpWsCell<i64>>,
+    },
+    Char {
+        cells: Vec<QwpWsCell<u16>>,
+    },
+    Binary {
+        cells: Vec<QwpWsSliceCell>,
+        data: Vec<u8>,
+    },
+    Geohash {
+        cells: Vec<QwpWsCell<u64>>,
+        precision_bits: u8,
+    },
+    LongArray {
         cells: Vec<QwpWsSliceCell>,
         data: Vec<u8>,
     },
@@ -2470,6 +2909,45 @@ impl QwpWsColumnarBuffer {
     }
 
     #[inline(always)]
+    pub(crate) fn column_i8<'a, N>(&mut self, name: N, value: i8) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::I8, |column, row_idx| {
+            column.append_i8(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_i16<'a, N>(&mut self, name: N, value: i16) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::I16, |column, row_idx| {
+            column.append_i16(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_i32<'a, N>(&mut self, name: N, value: i32) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::I32, |column, row_idx| {
+            column.append_i32(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
     pub(crate) fn column_i64<'a, N>(&mut self, name: N, value: i64) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,
@@ -2477,6 +2955,19 @@ impl QwpWsColumnarBuffer {
     {
         self.append_named_value(name, ColumnKind::I64, |column, row_idx| {
             column.append_i64(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_f32<'a, N>(&mut self, name: N, value: f32) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::F32, |column, row_idx| {
+            column.append_f32(row_idx, value)
         })?;
         self.state.op_state.record_column();
         Ok(self)
@@ -2539,6 +3030,167 @@ impl QwpWsColumnarBuffer {
         Ok(self)
     }
 
+    pub(crate) fn column_dec64<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        self.check_op(Op::Column)?;
+        let value: DecimalView<'a> = match value.try_into() {
+            Ok(value) => value,
+            Err(err) => {
+                self.rollback_current_row();
+                return Err(err.into());
+            }
+        };
+        let decimal = match StoredQwpDecimal::from_decimal_view(value) {
+            Ok(decimal) => decimal,
+            Err(err) => {
+                self.rollback_current_row();
+                return Err(err);
+            }
+        };
+        self.append_named_value(name, ColumnKind::Decimal64, |column, row_idx| {
+            column.append_decimal64(row_idx, decimal)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    pub(crate) fn column_dec128<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        self.check_op(Op::Column)?;
+        let value: DecimalView<'a> = match value.try_into() {
+            Ok(value) => value,
+            Err(err) => {
+                self.rollback_current_row();
+                return Err(err.into());
+            }
+        };
+        let decimal = match StoredQwpDecimal::from_decimal_view(value) {
+            Ok(decimal) => decimal,
+            Err(err) => {
+                self.rollback_current_row();
+                return Err(err);
+            }
+        };
+        self.append_named_value(name, ColumnKind::Decimal128, |column, row_idx| {
+            column.append_decimal128(row_idx, decimal)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_uuid<'a, N>(
+        &mut self,
+        name: N,
+        lo: u64,
+        hi: u64,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::Uuid, |column, row_idx| {
+            column.append_uuid(row_idx, lo, hi)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    pub(crate) fn column_long256<'a, N>(
+        &mut self,
+        name: N,
+        value: &[u8; QWP_LONG256_BYTES],
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::Long256, |column, row_idx| {
+            column.append_long256(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_ipv4<'a, N>(&mut self, name: N, value: u32) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::Ipv4, |column, row_idx| {
+            column.append_ipv4(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_date<'a, N>(&mut self, name: N, millis: i64) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::Date, |column, row_idx| {
+            column.append_date(row_idx, millis)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_char<'a, N>(&mut self, name: N, value: u16) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::Char, |column, row_idx| {
+            column.append_char(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    pub(crate) fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::Binary, |column, row_idx| {
+            column.append_binary(row_idx, value)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
+    #[inline(always)]
+    pub(crate) fn column_geohash<'a, N>(
+        &mut self,
+        name: N,
+        bits: u64,
+        precision_bits: u8,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        self.append_named_value(name, ColumnKind::Geohash, |column, row_idx| {
+            column.append_geohash(row_idx, bits, precision_bits)
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
+    }
+
     #[allow(private_bounds)]
     pub(crate) fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
@@ -2555,9 +3207,25 @@ impl QwpWsColumnarBuffer {
                 return Err(err);
             }
         };
-        self.append_named_value(name, ColumnKind::DoubleArray, |column, row_idx| {
-            column.append_double_array(row_idx, &payload)
-        })?;
+        let tag = D::type_tag();
+        let f64_tag = <f64 as ArrayElementSealed>::type_tag();
+        let i64_tag = <i64 as ArrayElementSealed>::type_tag();
+        if tag == f64_tag {
+            self.append_named_value(name, ColumnKind::DoubleArray, |column, row_idx| {
+                column.append_double_array(row_idx, &payload)
+            })?;
+        } else if tag == i64_tag {
+            self.append_named_value(name, ColumnKind::LongArray, |column, row_idx| {
+                column.append_long_array(row_idx, &payload)
+            })?;
+        } else {
+            self.rollback_current_row();
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Unsupported array element type tag {}",
+                tag
+            ));
+        }
         self.state.op_state.record_column();
         Ok(self)
     }
@@ -2826,13 +3494,6 @@ impl QwpWsColumnarBuffer {
         T: NdArrayView<D>,
         D: ArrayElement + ArrayElementSealed,
     {
-        if D::type_tag() != <f64 as ArrayElementSealed>::type_tag() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "QWP/UDP currently supports only f64 arrays"
-            ));
-        }
-
         let ndim = view.ndim();
         if ndim == 0 {
             return Err(error::fmt!(
@@ -3100,7 +3761,11 @@ impl QwpWsColumnBuffer {
     fn reserve_for_rows(&mut self, rows: usize) {
         match &mut self.values {
             QwpWsColumnValues::Bool { cells } => cells.reserve(rows),
+            QwpWsColumnValues::I8 { cells } => cells.reserve(rows),
+            QwpWsColumnValues::I16 { cells } => cells.reserve(rows),
+            QwpWsColumnValues::I32 { cells } => cells.reserve(rows),
             QwpWsColumnValues::I64 { cells } => cells.reserve(rows),
+            QwpWsColumnValues::F32 { cells } => cells.reserve(rows),
             QwpWsColumnValues::F64 { cells } => cells.reserve(rows),
             QwpWsColumnValues::TimestampMicros { cells } => cells.reserve(rows),
             QwpWsColumnValues::TimestampNanos { cells } => cells.reserve(rows),
@@ -3121,7 +3786,26 @@ impl QwpWsColumnBuffer {
                 data.reserve(rows * 8);
             }
             QwpWsColumnValues::Decimal { cells, .. } => cells.reserve(rows),
+            QwpWsColumnValues::Decimal64 { cells, .. } => cells.reserve(rows),
+            QwpWsColumnValues::Decimal128 { cells, .. } => cells.reserve(rows),
             QwpWsColumnValues::DoubleArray { cells, data } => {
+                cells.reserve(rows);
+                data.reserve(rows * 16);
+            }
+            QwpWsColumnValues::Uuid { cells } => cells.reserve(rows),
+            QwpWsColumnValues::Long256 { cells, data } => {
+                cells.reserve(rows);
+                data.reserve(rows * QWP_LONG256_BYTES);
+            }
+            QwpWsColumnValues::Ipv4 { cells } => cells.reserve(rows),
+            QwpWsColumnValues::Date { cells } => cells.reserve(rows),
+            QwpWsColumnValues::Char { cells } => cells.reserve(rows),
+            QwpWsColumnValues::Binary { cells, data } => {
+                cells.reserve(rows);
+                data.reserve(rows * 8);
+            }
+            QwpWsColumnValues::Geohash { cells, .. } => cells.reserve(rows),
+            QwpWsColumnValues::LongArray { cells, data } => {
                 cells.reserve(rows);
                 data.reserve(rows * 16);
             }
@@ -3174,8 +3858,44 @@ impl QwpWsColumnBuffer {
         Ok(())
     }
 
+    fn append_i8(&mut self, row_idx: u32, value: i8) -> crate::Result<()> {
+        let QwpWsColumnValues::I8 { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell { row_idx, value });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_i16(&mut self, row_idx: u32, value: i16) -> crate::Result<()> {
+        let QwpWsColumnValues::I16 { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell { row_idx, value });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_i32(&mut self, row_idx: u32, value: i32) -> crate::Result<()> {
+        let QwpWsColumnValues::I32 { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell { row_idx, value });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
     fn append_i64(&mut self, row_idx: u32, value: i64) -> crate::Result<()> {
         let QwpWsColumnValues::I64 { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell { row_idx, value });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_f32(&mut self, row_idx: u32, value: f32) -> crate::Result<()> {
+        let QwpWsColumnValues::F32 { cells } = &mut self.values else {
             return Err(type_mismatch_error_ws(&self.name));
         };
         cells.push(QwpWsCell { row_idx, value });
@@ -3263,6 +3983,7 @@ impl QwpWsColumnBuffer {
         row_idx: u32,
         value: Option<StoredQwpDecimal>,
     ) -> crate::Result<()> {
+        let is_first_non_null = self.non_null_count == 0;
         let QwpWsColumnValues::Decimal {
             cells,
             decimal_scale,
@@ -3271,7 +3992,75 @@ impl QwpWsColumnBuffer {
             return Err(type_mismatch_error_ws(&self.name));
         };
         if let Some(value) = value {
-            *decimal_scale = (*decimal_scale).max(value.scale);
+            if is_first_non_null {
+                *decimal_scale = value.scale;
+            }
+            cells.push(QwpWsDecimalCell {
+                row_idx,
+                value: Some(value),
+            });
+            self.increment_non_null()?;
+        } else {
+            cells.push(QwpWsDecimalCell {
+                row_idx,
+                value: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn append_decimal64(
+        &mut self,
+        row_idx: u32,
+        value: Option<StoredQwpDecimal>,
+    ) -> crate::Result<()> {
+        let is_first_non_null = self.non_null_count == 0;
+        let QwpWsColumnValues::Decimal64 {
+            cells,
+            decimal_scale,
+        } = &mut self.values
+        else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        if let Some(value) = value {
+            let bytes = value.wire_bytes_with_scale(value.scale)?;
+            narrow_decimal_le_fits(&bytes, 8).ok_or_else(|| decimal_fit_error(64))?;
+            if is_first_non_null {
+                *decimal_scale = value.scale;
+            }
+            cells.push(QwpWsDecimalCell {
+                row_idx,
+                value: Some(value),
+            });
+            self.increment_non_null()?;
+        } else {
+            cells.push(QwpWsDecimalCell {
+                row_idx,
+                value: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn append_decimal128(
+        &mut self,
+        row_idx: u32,
+        value: Option<StoredQwpDecimal>,
+    ) -> crate::Result<()> {
+        let is_first_non_null = self.non_null_count == 0;
+        let QwpWsColumnValues::Decimal128 {
+            cells,
+            decimal_scale,
+        } = &mut self.values
+        else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        if let Some(value) = value {
+            let bytes = value.wire_bytes_with_scale(value.scale)?;
+            narrow_decimal_le_fits(&bytes, 16).ok_or_else(|| decimal_fit_error(128))?;
+            if is_first_non_null {
+                *decimal_scale = value.scale;
+            }
             cells.push(QwpWsDecimalCell {
                 row_idx,
                 value: Some(value),
@@ -3302,6 +4091,135 @@ impl QwpWsColumnBuffer {
         Ok(())
     }
 
+    fn append_uuid(&mut self, row_idx: u32, lo: u64, hi: u64) -> crate::Result<()> {
+        let QwpWsColumnValues::Uuid { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell {
+            row_idx,
+            value: (lo, hi),
+        });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_long256(
+        &mut self,
+        row_idx: u32,
+        value: &[u8; QWP_LONG256_BYTES],
+    ) -> crate::Result<()> {
+        let QwpWsColumnValues::Long256 { cells, data } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        let offset =
+            QwpBuffer::checked_arena_offset(data.len(), QWP_LONG256_BYTES, "QWP/WS long256")?;
+        let len = checked_qwp_u32(QWP_LONG256_BYTES, "QWP/WS long256 length")?;
+        data.extend_from_slice(value);
+        cells.push(QwpWsSliceCell {
+            row_idx,
+            offset,
+            len,
+        });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_ipv4(&mut self, row_idx: u32, value: u32) -> crate::Result<()> {
+        let QwpWsColumnValues::Ipv4 { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell { row_idx, value });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_date(&mut self, row_idx: u32, millis: i64) -> crate::Result<()> {
+        let QwpWsColumnValues::Date { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell {
+            row_idx,
+            value: millis,
+        });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_char(&mut self, row_idx: u32, value: u16) -> crate::Result<()> {
+        let QwpWsColumnValues::Char { cells } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        cells.push(QwpWsCell { row_idx, value });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_binary(&mut self, row_idx: u32, value: &[u8]) -> crate::Result<()> {
+        let QwpWsColumnValues::Binary { cells, data } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        let offset = QwpBuffer::checked_arena_offset(data.len(), value.len(), "QWP/WS binary")?;
+        let len = checked_qwp_u32(value.len(), "QWP/WS binary length")?;
+        data.extend_from_slice(value);
+        cells.push(QwpWsSliceCell {
+            row_idx,
+            offset,
+            len,
+        });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_long_array(&mut self, row_idx: u32, payload: &[u8]) -> crate::Result<()> {
+        let QwpWsColumnValues::LongArray { cells, data } = &mut self.values else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        let offset =
+            QwpBuffer::checked_arena_offset(data.len(), payload.len(), "QWP/WS long array")?;
+        let len = checked_qwp_u32(payload.len(), "QWP/WS long array length")?;
+        data.extend_from_slice(payload);
+        cells.push(QwpWsSliceCell {
+            row_idx,
+            offset,
+            len,
+        });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
+    fn append_geohash(&mut self, row_idx: u32, bits: u64, precision_bits: u8) -> crate::Result<()> {
+        let QwpWsColumnValues::Geohash {
+            cells,
+            precision_bits: col_precision,
+        } = &mut self.values
+        else {
+            return Err(type_mismatch_error_ws(&self.name));
+        };
+        if !(1..=60).contains(&precision_bits) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "GEOHASH precision must be in 1..=60, got {}",
+                precision_bits
+            ));
+        }
+        if *col_precision == 0 {
+            *col_precision = precision_bits;
+        } else if *col_precision != precision_bits {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "GEOHASH precision mismatch within column: pinned at {} bits, got {}",
+                *col_precision,
+                precision_bits
+            ));
+        }
+        cells.push(QwpWsCell {
+            row_idx,
+            value: bits,
+        });
+        self.increment_non_null()?;
+        Ok(())
+    }
+
     fn increment_non_null(&mut self) -> crate::Result<()> {
         self.non_null_count = self.non_null_count.checked_add(1).ok_or_else(|| {
             error::fmt!(
@@ -3327,7 +4245,11 @@ impl QwpWsColumnValues {
     fn new(kind: ColumnKind) -> Self {
         match kind {
             ColumnKind::Bool => Self::Bool { cells: Vec::new() },
+            ColumnKind::I8 => Self::I8 { cells: Vec::new() },
+            ColumnKind::I16 => Self::I16 { cells: Vec::new() },
+            ColumnKind::I32 => Self::I32 { cells: Vec::new() },
             ColumnKind::I64 => Self::I64 { cells: Vec::new() },
+            ColumnKind::F32 => Self::F32 { cells: Vec::new() },
             ColumnKind::F64 => Self::F64 { cells: Vec::new() },
             ColumnKind::TimestampMicros => Self::TimestampMicros { cells: Vec::new() },
             ColumnKind::TimestampNanos => Self::TimestampNanos { cells: Vec::new() },
@@ -3345,7 +4267,35 @@ impl QwpWsColumnValues {
                 cells: Vec::new(),
                 decimal_scale: 0,
             },
+            ColumnKind::Decimal64 => Self::Decimal64 {
+                cells: Vec::new(),
+                decimal_scale: 0,
+            },
+            ColumnKind::Decimal128 => Self::Decimal128 {
+                cells: Vec::new(),
+                decimal_scale: 0,
+            },
             ColumnKind::DoubleArray => Self::DoubleArray {
+                cells: Vec::new(),
+                data: Vec::new(),
+            },
+            ColumnKind::Uuid => Self::Uuid { cells: Vec::new() },
+            ColumnKind::Long256 => Self::Long256 {
+                cells: Vec::new(),
+                data: Vec::new(),
+            },
+            ColumnKind::Ipv4 => Self::Ipv4 { cells: Vec::new() },
+            ColumnKind::Date => Self::Date { cells: Vec::new() },
+            ColumnKind::Char => Self::Char { cells: Vec::new() },
+            ColumnKind::Binary => Self::Binary {
+                cells: Vec::new(),
+                data: Vec::new(),
+            },
+            ColumnKind::Geohash => Self::Geohash {
+                cells: Vec::new(),
+                precision_bits: 0,
+            },
+            ColumnKind::LongArray => Self::LongArray {
                 cells: Vec::new(),
                 data: Vec::new(),
             },
@@ -3355,14 +4305,27 @@ impl QwpWsColumnValues {
     fn clear_rows(&mut self) {
         match self {
             Self::Bool { cells } => cells.clear(),
+            Self::I8 { cells } => cells.clear(),
+            Self::I16 { cells } => cells.clear(),
+            Self::I32 { cells } => cells.clear(),
             Self::I64 { cells } => cells.clear(),
+            Self::F32 { cells } => cells.clear(),
             Self::F64 { cells } => cells.clear(),
             Self::TimestampMicros { cells } => cells.clear(),
             Self::TimestampNanos { cells } => cells.clear(),
-            Self::String { cells, data } | Self::DoubleArray { cells, data } => {
+            Self::String { cells, data }
+            | Self::DoubleArray { cells, data }
+            | Self::Long256 { cells, data }
+            | Self::Binary { cells, data }
+            | Self::LongArray { cells, data } => {
                 cells.clear();
                 data.clear();
             }
+            Self::Uuid { cells } => cells.clear(),
+            Self::Ipv4 { cells } => cells.clear(),
+            Self::Date { cells } => cells.clear(),
+            Self::Char { cells } => cells.clear(),
+            Self::Geohash { cells, .. } => cells.clear(),
             Self::Symbol {
                 cells,
                 dict,
@@ -3377,6 +4340,14 @@ impl QwpWsColumnValues {
             Self::Decimal {
                 cells,
                 decimal_scale,
+            }
+            | Self::Decimal64 {
+                cells,
+                decimal_scale,
+            }
+            | Self::Decimal128 {
+                cells,
+                decimal_scale,
             } => {
                 cells.clear();
                 *decimal_scale = 0;
@@ -3387,13 +4358,30 @@ impl QwpWsColumnValues {
     fn capacity(&self) -> usize {
         match self {
             Self::Bool { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<bool>>(),
+            Self::I8 { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<i8>>(),
+            Self::I16 { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<i16>>(),
+            Self::I32 { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<i32>>(),
             Self::I64 { cells }
             | Self::TimestampMicros { cells }
             | Self::TimestampNanos { cells } => {
                 cells.capacity() * std::mem::size_of::<QwpWsCell<i64>>()
             }
+            Self::F32 { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<f32>>(),
             Self::F64 { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<f64>>(),
-            Self::String { cells, data } | Self::DoubleArray { cells, data } => {
+            Self::String { cells, data }
+            | Self::DoubleArray { cells, data }
+            | Self::Long256 { cells, data } => {
+                cells.capacity() * std::mem::size_of::<QwpWsSliceCell>() + data.capacity()
+            }
+            Self::Uuid { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<(u64, u64)>>(),
+            Self::Ipv4 { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<u32>>(),
+            Self::Date { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<i64>>(),
+            Self::Char { cells } => cells.capacity() * std::mem::size_of::<QwpWsCell<u16>>(),
+            Self::Binary { cells, data } => {
+                cells.capacity() * std::mem::size_of::<QwpWsSliceCell>() + data.capacity()
+            }
+            Self::Geohash { cells, .. } => cells.capacity() * std::mem::size_of::<QwpWsCell<u64>>(),
+            Self::LongArray { cells, data } => {
                 cells.capacity() * std::mem::size_of::<QwpWsSliceCell>() + data.capacity()
             }
             Self::Symbol {
@@ -3403,7 +4391,9 @@ impl QwpWsColumnValues {
                     + dict.capacity() * std::mem::size_of::<QwpWsSymbolEntry>()
                     + data.capacity()
             }
-            Self::Decimal { cells, .. } => {
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => {
                 cells.capacity() * std::mem::size_of::<QwpWsDecimalCell>()
             }
         }
@@ -3412,11 +4402,38 @@ impl QwpWsColumnValues {
     fn rollback_row(&mut self, row_idx: u32) -> bool {
         match self {
             Self::Bool { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::I8 { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::I16 { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::I32 { cells } => pop_value_cell_for_row(cells, row_idx),
             Self::I64 { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::F32 { cells } => pop_value_cell_for_row(cells, row_idx),
             Self::F64 { cells } => pop_value_cell_for_row(cells, row_idx),
             Self::TimestampMicros { cells } => pop_value_cell_for_row(cells, row_idx),
             Self::TimestampNanos { cells } => pop_value_cell_for_row(cells, row_idx),
-            Self::String { cells, data } | Self::DoubleArray { cells, data } => {
+            Self::String { cells, data }
+            | Self::DoubleArray { cells, data }
+            | Self::Long256 { cells, data } => {
+                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
+                    data.truncate(cell.offset as usize);
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Uuid { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::Ipv4 { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::Date { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::Char { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::Binary { cells, data } => {
+                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
+                    data.truncate(cell.offset as usize);
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Geohash { cells, .. } => pop_value_cell_for_row(cells, row_idx),
+            Self::LongArray { cells, data } => {
                 if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
                     data.truncate(cell.offset as usize);
                     true
@@ -3445,6 +4462,14 @@ impl QwpWsColumnValues {
             Self::Decimal {
                 cells,
                 decimal_scale,
+            }
+            | Self::Decimal64 {
+                cells,
+                decimal_scale,
+            }
+            | Self::Decimal128 {
+                cells,
+                decimal_scale,
             } => {
                 let Some(cell) = pop_decimal_cell_for_row(cells, row_idx) else {
                     return false;
@@ -3470,7 +4495,11 @@ impl QwpWsColumnValues {
     fn estimated_data_len(&self, row_count: usize) -> usize {
         match self {
             Self::Bool { .. } => packed_bytes(row_count),
+            Self::I8 { .. } => row_count,
+            Self::I16 { .. } => row_count.saturating_mul(2),
+            Self::I32 { .. } => row_count.saturating_mul(4),
             Self::I64 { .. } | Self::F64 { .. } => row_count.saturating_mul(8),
+            Self::F32 { .. } => row_count.saturating_mul(4),
             Self::TimestampMicros { cells } | Self::TimestampNanos { cells } => {
                 cells.len().saturating_mul(8)
             }
@@ -3486,7 +4515,36 @@ impl QwpWsColumnValues {
                     .count()
                     .saturating_mul(QWP_DECIMAL_MAG_BYTES)
             }
+            Self::Decimal64 { cells, .. } => {
+                1 + cells
+                    .iter()
+                    .filter(|cell| cell.value.is_some())
+                    .count()
+                    .saturating_mul(8)
+            }
+            Self::Decimal128 { cells, .. } => {
+                1 + cells
+                    .iter()
+                    .filter(|cell| cell.value.is_some())
+                    .count()
+                    .saturating_mul(16)
+            }
             Self::DoubleArray { data, .. } => data.len(),
+            Self::Uuid { cells } => cells.len().saturating_mul(16),
+            Self::Long256 { data, .. } => data.len(),
+            Self::Ipv4 { cells } => cells.len().saturating_mul(4),
+            Self::Date { cells } => cells.len().saturating_mul(8),
+            Self::Char { .. } => row_count.saturating_mul(2),
+            Self::Binary { cells, data } => (cells.len() + 1).saturating_mul(4) + data.len(),
+            Self::Geohash {
+                cells,
+                precision_bits,
+            } => {
+                1 + cells
+                    .len()
+                    .saturating_mul(geohash_bytes_per_value(*precision_bits))
+            }
+            Self::LongArray { data, .. } => data.len(),
         }
     }
 
@@ -3552,6 +4610,51 @@ impl QwpWsColumnValues {
                 }
                 Ok(())
             }
+            Self::I8 { cells } => {
+                let mut cursor = 0usize;
+                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                    let value = cells.get(cursor).map_or(0i8, |cell| {
+                        if cell.row_idx == row_idx {
+                            cursor += 1;
+                            cell.value
+                        } else {
+                            0
+                        }
+                    });
+                    out.push(value as u8);
+                }
+                Ok(())
+            }
+            Self::I16 { cells } => {
+                let mut cursor = 0usize;
+                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                    let value = cells.get(cursor).map_or(0i16, |cell| {
+                        if cell.row_idx == row_idx {
+                            cursor += 1;
+                            cell.value
+                        } else {
+                            0
+                        }
+                    });
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                Ok(())
+            }
+            Self::I32 { cells } => {
+                let mut cursor = 0usize;
+                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                    let value = cells.get(cursor).map_or(i32::MIN, |cell| {
+                        if cell.row_idx == row_idx {
+                            cursor += 1;
+                            cell.value
+                        } else {
+                            i32::MIN
+                        }
+                    });
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                Ok(())
+            }
             Self::I64 { cells } => {
                 let mut cursor = 0usize;
                 for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
@@ -3561,6 +4664,21 @@ impl QwpWsColumnValues {
                             cell.value
                         } else {
                             i64::MIN
+                        }
+                    });
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                Ok(())
+            }
+            Self::F32 { cells } => {
+                let mut cursor = 0usize;
+                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                    let value = cells.get(cursor).map_or(f32::NAN, |cell| {
+                        if cell.row_idx == row_idx {
+                            cursor += 1;
+                            cell.value
+                        } else {
+                            f32::NAN
                         }
                     });
                     out.extend_from_slice(&value.to_le_bytes());
@@ -3596,14 +4714,19 @@ impl QwpWsColumnValues {
                 let offsets_end =
                     checked_qwp_usize_add(offsets_start, offset_table_len, "string offset table")?;
                 out.resize(offsets_end, 0);
-                out[offsets_start..offsets_start + 4].copy_from_slice(&0i32.to_le_bytes());
-                let mut cumulative = 0i32;
+                out[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
+                let mut cumulative: usize = 0;
                 for (idx, cell) in cells.iter().enumerate() {
                     let range = cell.offset as usize..(cell.offset + cell.len) as usize;
                     out.extend_from_slice(&data[range]);
-                    cumulative += cell.len as i32;
+                    cumulative = checked_qwp_usize_add(
+                        cumulative,
+                        cell.len as usize,
+                        "string column bytes",
+                    )?;
+                    let offset_u32 = checked_qwp_u32(cumulative, "string column offset")?;
                     let pos = offsets_start + (idx + 1) * 4;
-                    out[pos..pos + 4].copy_from_slice(&cumulative.to_le_bytes());
+                    out[pos..pos + 4].copy_from_slice(&offset_u32.to_le_bytes());
                 }
                 Ok(())
             }
@@ -3632,7 +4755,121 @@ impl QwpWsColumnValues {
                 }
                 Ok(())
             }
+            Self::Decimal64 {
+                cells,
+                decimal_scale,
+            } => {
+                out.push(*decimal_scale);
+                for cell in cells {
+                    if let Some(value) = cell.value {
+                        let bytes = value.wire_bytes_with_scale(*decimal_scale)?;
+                        let low = narrow_decimal_le_fits(&bytes, 8)
+                            .ok_or_else(|| decimal_fit_error(64))?;
+                        out.extend_from_slice(low);
+                    }
+                }
+                Ok(())
+            }
+            Self::Decimal128 {
+                cells,
+                decimal_scale,
+            } => {
+                out.push(*decimal_scale);
+                for cell in cells {
+                    if let Some(value) = cell.value {
+                        let bytes = value.wire_bytes_with_scale(*decimal_scale)?;
+                        let low = narrow_decimal_le_fits(&bytes, 16)
+                            .ok_or_else(|| decimal_fit_error(128))?;
+                        out.extend_from_slice(low);
+                    }
+                }
+                Ok(())
+            }
             Self::DoubleArray { cells, data } => {
+                for cell in cells {
+                    let range = cell.offset as usize..(cell.offset + cell.len) as usize;
+                    out.extend_from_slice(&data[range]);
+                }
+                Ok(())
+            }
+            Self::Uuid { cells } => {
+                for cell in cells {
+                    out.extend_from_slice(&cell.value.0.to_le_bytes());
+                    out.extend_from_slice(&cell.value.1.to_le_bytes());
+                }
+                Ok(())
+            }
+            Self::Long256 { cells, data } => {
+                for cell in cells {
+                    let range = cell.offset as usize..(cell.offset + cell.len) as usize;
+                    out.extend_from_slice(&data[range]);
+                }
+                Ok(())
+            }
+            Self::Ipv4 { cells } => {
+                for cell in cells {
+                    out.extend_from_slice(&cell.value.to_le_bytes());
+                }
+                Ok(())
+            }
+            Self::Date { cells } => {
+                for cell in cells {
+                    out.extend_from_slice(&cell.value.to_le_bytes());
+                }
+                Ok(())
+            }
+            Self::Char { cells } => {
+                let mut cursor = 0usize;
+                for row_idx in 0..checked_qwp_u32(row_count, "QWP/WS row count")? {
+                    let value = cells.get(cursor).map_or(0u16, |cell| {
+                        if cell.row_idx == row_idx {
+                            cursor += 1;
+                            cell.value
+                        } else {
+                            0
+                        }
+                    });
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+                Ok(())
+            }
+            Self::Binary { cells, data } => {
+                let offsets_start = out.len();
+                let offset_count = checked_qwp_usize_add(cells.len(), 1, "binary offset count")?;
+                let offset_table_len =
+                    checked_qwp_usize_mul(offset_count, 4, "binary offset table")?;
+                let offsets_end =
+                    checked_qwp_usize_add(offsets_start, offset_table_len, "binary offset table")?;
+                out.resize(offsets_end, 0);
+                out[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
+                let mut cumulative: usize = 0;
+                for (idx, cell) in cells.iter().enumerate() {
+                    let range = cell.offset as usize..(cell.offset + cell.len) as usize;
+                    out.extend_from_slice(&data[range]);
+                    cumulative = checked_qwp_usize_add(
+                        cumulative,
+                        cell.len as usize,
+                        "binary column bytes",
+                    )?;
+                    let offset_u32 = checked_qwp_u32(cumulative, "binary column offset")?;
+                    let pos = offsets_start + (idx + 1) * 4;
+                    out[pos..pos + 4].copy_from_slice(&offset_u32.to_le_bytes());
+                }
+                Ok(())
+            }
+            Self::Geohash {
+                cells,
+                precision_bits,
+            } => {
+                write_qwp_varint(out, *precision_bits as u64);
+                let bytes_per_value = geohash_bytes_per_value(*precision_bits);
+                for cell in cells {
+                    let le = cell.value.to_le_bytes();
+                    out.extend_from_slice(&le[..bytes_per_value]);
+                }
+                Ok(())
+            }
+            Self::LongArray { cells, data } => {
                 for cell in cells {
                     let range = cell.offset as usize..(cell.offset + cell.len) as usize;
                     out.extend_from_slice(&data[range]);
@@ -3649,22 +4886,41 @@ impl QwpWsColumnValues {
     fn row_at_cursor(&self, cursor: usize) -> Option<u32> {
         match self {
             Self::Bool { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::I8 { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::I16 { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::I32 { cells } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::I64 { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::F32 { cells } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::F64 { cells } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::TimestampMicros { cells } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::TimestampNanos { cells } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::String { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::Symbol { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
-            Self::Decimal { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
-            Self::DoubleArray { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::DoubleArray { cells, .. } | Self::Long256 { cells, .. } => {
+                cells.get(cursor).map(|cell| cell.row_idx)
+            }
+            Self::Uuid { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::Ipv4 { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::Date { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::Char { cells } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::Binary { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::Geohash { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
+            Self::LongArray { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
         }
     }
 
     fn value_at_cursor_is_null(&self, cursor: usize) -> bool {
-        matches!(
-            self,
-            Self::Decimal { cells, .. } if cells.get(cursor).is_some_and(|cell| cell.value.is_none())
-        )
+        match self {
+            Self::Decimal { cells, .. }
+            | Self::Decimal64 { cells, .. }
+            | Self::Decimal128 { cells, .. } => {
+                cells.get(cursor).is_some_and(|cell| cell.value.is_none())
+            }
+            _ => false,
+        }
     }
 }
 
@@ -4328,6 +5584,7 @@ struct ColumnStats {
     symbol_dict_bytes: usize,
     symbol_row_index_bytes: usize,
     decimal_scale: u8,
+    geohash_precision_bits: u8,
     dict_head: u32,
     dict_tail: u32,
     cell_head: u32,
@@ -4359,9 +5616,23 @@ impl ColumnStats {
 
         let data_len = match kind {
             ColumnKind::Bool => packed_bytes(row_count),
+            ColumnKind::I8 => row_count,
+            ColumnKind::I16 => checked_qwp_usize_mul(row_count, 2, "column data size")?,
+            ColumnKind::I32 => checked_qwp_usize_mul(row_count, 4, "column data size")?,
             ColumnKind::I64 | ColumnKind::F64 => {
                 checked_qwp_usize_mul(row_count, 8, "column data size")?
             }
+            ColumnKind::F32 => checked_qwp_usize_mul(row_count, 4, "column data size")?,
+            ColumnKind::Decimal64 => checked_qwp_usize_add(
+                1,
+                checked_qwp_usize_mul(non_null_count as usize, 8, "decimal64 column size")?,
+                "decimal64 column size",
+            )?,
+            ColumnKind::Decimal128 => checked_qwp_usize_add(
+                1,
+                checked_qwp_usize_mul(non_null_count as usize, 16, "decimal128 column size")?,
+                "decimal128 column size",
+            )?,
             ColumnKind::Decimal => checked_qwp_usize_add(
                 1,
                 checked_qwp_usize_mul(
@@ -4374,13 +5645,37 @@ impl ColumnStats {
             ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
                 checked_qwp_usize_mul(non_null_count as usize, 8, "column data size")?
             }
+            ColumnKind::Uuid => {
+                checked_qwp_usize_mul(non_null_count as usize, 16, "uuid column size")?
+            }
+            ColumnKind::Long256 => checked_qwp_usize_mul(
+                non_null_count as usize,
+                QWP_LONG256_BYTES,
+                "long256 column size",
+            )?,
+            ColumnKind::Ipv4 => {
+                checked_qwp_usize_mul(non_null_count as usize, 4, "ipv4 column size")?
+            }
+            ColumnKind::Date => {
+                checked_qwp_usize_mul(non_null_count as usize, 8, "date column size")?
+            }
+            ColumnKind::Char => checked_qwp_usize_mul(row_count, 2, "char column size")?,
+            ColumnKind::Binary => {
+                let offset_count =
+                    checked_qwp_usize_add(non_null_count as usize, 1, "binary offset count")?;
+                let offsets = checked_qwp_usize_mul(offset_count, 4, "binary offset table")?;
+                checked_qwp_usize_add(offsets, variable_data_len, "binary column size")?
+            }
+            ColumnKind::Geohash => {
+                checked_qwp_usize_add(1, variable_data_len, "geohash column size")?
+            }
             ColumnKind::String => {
                 let offset_count =
                     checked_qwp_usize_add(non_null_count as usize, 1, "string offset count")?;
                 let offsets = checked_qwp_usize_mul(offset_count, 4, "string offset table")?;
                 checked_qwp_usize_add(offsets, variable_data_len, "string column size")?
             }
-            ColumnKind::DoubleArray => variable_data_len,
+            ColumnKind::DoubleArray | ColumnKind::LongArray => variable_data_len,
             ColumnKind::Symbol => {
                 let base = checked_qwp_usize_add(
                     qwp_varint_size(dict_count as u64),
@@ -4405,6 +5700,7 @@ impl ColumnStats {
             symbol_dict_bytes: 0,
             symbol_row_index_bytes: 0,
             decimal_scale: 0,
+            geohash_precision_bits: 0,
             dict_head: CELL_END,
             dict_tail: CELL_END,
             cell_head: CELL_END,
@@ -4448,6 +5744,36 @@ impl ColumnStats {
                     "internal QWP type mismatch for boolean column"
                 )),
             },
+            ColumnKind::I8 => match value {
+                ValueRef::I8(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for byte column"
+                )),
+            },
+            ColumnKind::I16 => match value {
+                ValueRef::I16(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for short column"
+                )),
+            },
+            ColumnKind::I32 => match value {
+                ValueRef::I32(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for int column"
+                )),
+            },
             ColumnKind::I64 => match value {
                 ValueRef::I64(_) => {
                     self.non_null_count = new_non_null_count;
@@ -4468,16 +5794,56 @@ impl ColumnStats {
                     "internal QWP type mismatch for double column"
                 )),
             },
+            ColumnKind::F32 => match value {
+                ValueRef::F32(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for float column"
+                )),
+            },
             ColumnKind::Decimal => match value {
                 ValueRef::DecimalNull => Ok(()),
                 ValueRef::Decimal(decimal_value) => {
+                    if self.non_null_count == 0 {
+                        self.decimal_scale = decimal_value.scale;
+                    }
                     self.non_null_count = new_non_null_count;
-                    self.decimal_scale = self.decimal_scale.max(decimal_value.scale);
                     Ok(())
                 }
                 _ => Err(error::fmt!(
                     InvalidApiCall,
                     "internal QWP type mismatch for decimal column"
+                )),
+            },
+            ColumnKind::Decimal64 => match value {
+                ValueRef::Decimal64Null => Ok(()),
+                ValueRef::Decimal64(decimal_value) => {
+                    if self.non_null_count == 0 {
+                        self.decimal_scale = decimal_value.scale;
+                    }
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for decimal64 column"
+                )),
+            },
+            ColumnKind::Decimal128 => match value {
+                ValueRef::Decimal128Null => Ok(()),
+                ValueRef::Decimal128(decimal_value) => {
+                    if self.non_null_count == 0 {
+                        self.decimal_scale = decimal_value.scale;
+                    }
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for decimal128 column"
                 )),
             },
             ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => match value {
@@ -4488,6 +5854,106 @@ impl ColumnStats {
                 _ => Err(error::fmt!(
                     InvalidApiCall,
                     "internal QWP type mismatch for timestamp column"
+                )),
+            },
+            ColumnKind::Uuid => match value {
+                ValueRef::Uuid(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for uuid column"
+                )),
+            },
+            ColumnKind::Long256 => match value {
+                ValueRef::Long256(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for long256 column"
+                )),
+            },
+            ColumnKind::Ipv4 => match value {
+                ValueRef::Ipv4(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for ipv4 column"
+                )),
+            },
+            ColumnKind::Date => match value {
+                ValueRef::DateMillis(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for date column"
+                )),
+            },
+            ColumnKind::Char => match value {
+                ValueRef::Char(_) => {
+                    self.non_null_count = new_non_null_count;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for char column"
+                )),
+            },
+            ColumnKind::Binary => match value {
+                ValueRef::Binary(vs) => {
+                    let new_variable_data_len = checked_qwp_usize_add(
+                        self.variable_data_len,
+                        vs.0.len as usize,
+                        "binary payload bytes",
+                    )?;
+                    self.non_null_count = new_non_null_count;
+                    self.variable_data_len = new_variable_data_len;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for binary column"
+                )),
+            },
+            ColumnKind::Geohash => match value {
+                ValueRef::Geohash { precision_bits, .. } => {
+                    if !(1..=60).contains(precision_bits) {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "GEOHASH precision must be in 1..=60, got {}",
+                            precision_bits
+                        ));
+                    }
+                    if self.non_null_count == 0 {
+                        self.geohash_precision_bits = *precision_bits;
+                    } else if self.geohash_precision_bits != *precision_bits {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "GEOHASH precision mismatch within column: pinned at {} bits, got {}",
+                            self.geohash_precision_bits,
+                            precision_bits
+                        ));
+                    }
+                    let bytes = geohash_bytes_per_value(*precision_bits);
+                    let new_variable_data_len = checked_qwp_usize_add(
+                        self.variable_data_len,
+                        bytes,
+                        "geohash payload bytes",
+                    )?;
+                    self.non_null_count = new_non_null_count;
+                    self.variable_data_len = new_variable_data_len;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for geohash column"
                 )),
             },
             ColumnKind::String => match value {
@@ -4522,6 +5988,22 @@ impl ColumnStats {
                     "internal QWP type mismatch for double array column"
                 )),
             },
+            ColumnKind::LongArray => match value {
+                ValueRef::LongArray(vs) => {
+                    let new_variable_data_len = checked_qwp_usize_add(
+                        self.variable_data_len,
+                        vs.0.len as usize,
+                        "array payload bytes",
+                    )?;
+                    self.non_null_count = new_non_null_count;
+                    self.variable_data_len = new_variable_data_len;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for long array column"
+                )),
+            },
             ColumnKind::Symbol => {
                 // Symbol accounting handled by RowGroupPlanner
                 Ok(())
@@ -4543,6 +6025,7 @@ struct ColumnUndo {
     symbol_dict_bytes: usize,
     symbol_row_index_bytes: usize,
     decimal_scale: u8,
+    geohash_precision_bits: u8,
     dict_tail: u32,
     cell_tail: u32,
     col_idx: u16,
@@ -4565,6 +6048,9 @@ struct Checkpoint {
     current_len: usize,
     total_schema_len: usize,
     bool_column_count: usize,
+    fixed1_column_count: usize,
+    fixed2_column_count: usize,
+    fixed4_column_count: usize,
     fixed8_column_count: usize,
     sparse_column_count: usize,
     active_bitmap_column_count: usize,
@@ -4584,6 +6070,9 @@ pub(crate) struct RowGroupPlanner {
     current_len: usize,
     total_schema_len: usize,
     bool_column_count: usize,
+    fixed1_column_count: usize,
+    fixed2_column_count: usize,
+    fixed4_column_count: usize,
     fixed8_column_count: usize,
     sparse_column_count: usize,
     active_bitmap_column_count: usize,
@@ -4604,6 +6093,9 @@ impl Clone for RowGroupPlanner {
             current_len: self.current_len,
             total_schema_len: self.total_schema_len,
             bool_column_count: self.bool_column_count,
+            fixed1_column_count: self.fixed1_column_count,
+            fixed2_column_count: self.fixed2_column_count,
+            fixed4_column_count: self.fixed4_column_count,
             fixed8_column_count: self.fixed8_column_count,
             sparse_column_count: self.sparse_column_count,
             active_bitmap_column_count: self.active_bitmap_column_count,
@@ -4653,6 +6145,9 @@ impl RowGroupPlanner {
             current_len: 0,
             total_schema_len: 0,
             bool_column_count: 0,
+            fixed1_column_count: 0,
+            fixed2_column_count: 0,
+            fixed4_column_count: 0,
             fixed8_column_count: 0,
             sparse_column_count: 0,
             active_bitmap_column_count: 0,
@@ -4672,6 +6167,9 @@ impl RowGroupPlanner {
         self.current_len = 0;
         self.total_schema_len = 0;
         self.bool_column_count = 0;
+        self.fixed1_column_count = 0;
+        self.fixed2_column_count = 0;
+        self.fixed4_column_count = 0;
         self.fixed8_column_count = 0;
         self.sparse_column_count = 0;
         self.active_bitmap_column_count = 0;
@@ -4702,6 +6200,9 @@ impl RowGroupPlanner {
             current_len: self.current_len,
             total_schema_len: self.total_schema_len,
             bool_column_count: self.bool_column_count,
+            fixed1_column_count: self.fixed1_column_count,
+            fixed2_column_count: self.fixed2_column_count,
+            fixed4_column_count: self.fixed4_column_count,
             fixed8_column_count: self.fixed8_column_count,
             sparse_column_count: self.sparse_column_count,
             active_bitmap_column_count: self.active_bitmap_column_count,
@@ -4717,6 +6218,7 @@ impl RowGroupPlanner {
             col.symbol_dict_bytes = undo.symbol_dict_bytes;
             col.symbol_row_index_bytes = undo.symbol_row_index_bytes;
             col.decimal_scale = undo.decimal_scale;
+            col.geohash_precision_bits = undo.geohash_precision_bits;
             col.dict_tail = undo.dict_tail;
             col.dict_count = undo.dict_count;
             if col.dict_tail != CELL_END {
@@ -4752,6 +6254,9 @@ impl RowGroupPlanner {
         self.current_len = cp.current_len;
         self.total_schema_len = cp.total_schema_len;
         self.bool_column_count = cp.bool_column_count;
+        self.fixed1_column_count = cp.fixed1_column_count;
+        self.fixed2_column_count = cp.fixed2_column_count;
+        self.fixed4_column_count = cp.fixed4_column_count;
         self.fixed8_column_count = cp.fixed8_column_count;
         self.sparse_column_count = cp.sparse_column_count;
         self.active_bitmap_column_count = cp.active_bitmap_column_count;
@@ -4769,6 +6274,9 @@ impl RowGroupPlanner {
         let old_column_count = self.columns.len();
         let old_total_schema_len = self.total_schema_len;
         let old_bool_column_count = self.bool_column_count;
+        let old_fixed1_column_count = self.fixed1_column_count;
+        let old_fixed2_column_count = self.fixed2_column_count;
+        let old_fixed4_column_count = self.fixed4_column_count;
         let old_fixed8_column_count = self.fixed8_column_count;
         let old_sparse_column_count = self.sparse_column_count;
         let old_active_bitmap_column_count = self.active_bitmap_column_count;
@@ -4791,6 +6299,7 @@ impl RowGroupPlanner {
                     symbol_dict_bytes: col.symbol_dict_bytes,
                     symbol_row_index_bytes: col.symbol_row_index_bytes,
                     decimal_scale: col.decimal_scale,
+                    geohash_precision_bits: col.geohash_precision_bits,
                     dict_tail: col.dict_tail,
                     cell_tail: col.cell_tail,
                     col_idx: undo_col_idx,
@@ -4845,6 +6354,9 @@ impl RowGroupPlanner {
         let bitmap_delta = bitmap_bytes(new_row_count) - bitmap_bytes(old_row_count);
 
         let mut touched_bool_column_count = 0usize;
+        let mut touched_fixed1_column_count = 0usize;
+        let mut touched_fixed2_column_count = 0usize;
+        let mut touched_fixed4_column_count = 0usize;
         let mut touched_fixed8_column_count = 0usize;
         let mut touched_sparse_column_count = 0usize;
         let mut touched_old_active_bitmap_column_count = 0usize;
@@ -4856,13 +6368,25 @@ impl RowGroupPlanner {
             let col = &self.columns[undo.col_idx as usize];
             match col.kind {
                 ColumnKind::Bool => touched_bool_column_count += 1,
+                ColumnKind::I8 => touched_fixed1_column_count += 1,
+                ColumnKind::I16 | ColumnKind::Char => touched_fixed2_column_count += 1,
+                ColumnKind::I32 | ColumnKind::F32 => touched_fixed4_column_count += 1,
                 ColumnKind::I64 | ColumnKind::F64 => touched_fixed8_column_count += 1,
                 ColumnKind::Symbol
                 | ColumnKind::String
+                | ColumnKind::Decimal64
+                | ColumnKind::Decimal128
                 | ColumnKind::Decimal
                 | ColumnKind::DoubleArray
                 | ColumnKind::TimestampMicros
-                | ColumnKind::TimestampNanos => {
+                | ColumnKind::TimestampNanos
+                | ColumnKind::Uuid
+                | ColumnKind::Long256
+                | ColumnKind::Ipv4
+                | ColumnKind::Date
+                | ColumnKind::Binary
+                | ColumnKind::Geohash
+                | ColumnKind::LongArray => {
                     touched_sparse_column_count += 1;
                     if uses_null_bitmap(
                         col.supports_sparse_nulls,
@@ -4890,11 +6414,17 @@ impl RowGroupPlanner {
         }
 
         debug_assert!(touched_bool_column_count <= old_bool_column_count);
+        debug_assert!(touched_fixed1_column_count <= old_fixed1_column_count);
+        debug_assert!(touched_fixed2_column_count <= old_fixed2_column_count);
+        debug_assert!(touched_fixed4_column_count <= old_fixed4_column_count);
         debug_assert!(touched_fixed8_column_count <= old_fixed8_column_count);
         debug_assert!(touched_sparse_column_count <= old_sparse_column_count);
         debug_assert!(touched_old_active_bitmap_column_count <= old_active_bitmap_column_count);
 
         delta += (old_bool_column_count - touched_bool_column_count) * packed_delta;
+        delta += old_fixed1_column_count - touched_fixed1_column_count;
+        delta += (old_fixed2_column_count - touched_fixed2_column_count) * 2;
+        delta += (old_fixed4_column_count - touched_fixed4_column_count) * 4;
         delta += (old_fixed8_column_count - touched_fixed8_column_count) * 8;
         let old_dense_sparse_column_count =
             old_sparse_column_count - old_active_bitmap_column_count;
@@ -5083,13 +6613,25 @@ impl RowGroupPlanner {
         let col = ColumnStats::new(entry);
         match col.kind {
             ColumnKind::Bool => self.bool_column_count += 1,
+            ColumnKind::I8 => self.fixed1_column_count += 1,
+            ColumnKind::I16 | ColumnKind::Char => self.fixed2_column_count += 1,
+            ColumnKind::I32 | ColumnKind::F32 => self.fixed4_column_count += 1,
             ColumnKind::I64 | ColumnKind::F64 => self.fixed8_column_count += 1,
             ColumnKind::Symbol
             | ColumnKind::String
+            | ColumnKind::Decimal64
+            | ColumnKind::Decimal128
             | ColumnKind::Decimal
             | ColumnKind::DoubleArray
             | ColumnKind::TimestampMicros
-            | ColumnKind::TimestampNanos => self.sparse_column_count += 1,
+            | ColumnKind::TimestampNanos
+            | ColumnKind::Uuid
+            | ColumnKind::Long256
+            | ColumnKind::Ipv4
+            | ColumnKind::Date
+            | ColumnKind::Binary
+            | ColumnKind::Geohash
+            | ColumnKind::LongArray => self.sparse_column_count += 1,
         }
         self.total_schema_len += col.cached_schema_len;
         self.columns.push(col);
@@ -5165,10 +6707,41 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
         kind,
         ColumnKind::Symbol
             | ColumnKind::String
+            | ColumnKind::Decimal64
+            | ColumnKind::Decimal128
             | ColumnKind::Decimal
             | ColumnKind::DoubleArray
             | ColumnKind::TimestampMicros
             | ColumnKind::TimestampNanos
+            | ColumnKind::Uuid
+            | ColumnKind::Long256
+            | ColumnKind::Ipv4
+            | ColumnKind::Date
+            | ColumnKind::Binary
+            | ColumnKind::Geohash
+            | ColumnKind::LongArray
+    )
+}
+
+fn narrow_decimal_le_fits(bytes: &[u8; QWP_DECIMAL_MAG_BYTES], width: usize) -> Option<&[u8]> {
+    debug_assert!(width == 8 || width == 16);
+    let (low, high) = bytes.split_at(width);
+    let sign_byte = if (low[width - 1] & 0x80) != 0 {
+        0xFF
+    } else {
+        0x00
+    };
+    if high.iter().all(|&b| b == sign_byte) {
+        Some(low)
+    } else {
+        None
+    }
+}
+
+fn decimal_fit_error(width: u32) -> crate::Error {
+    error::fmt!(
+        InvalidApiCall,
+        "decimal value does not fit DECIMAL{width} wire width"
     )
 }
 
@@ -5193,15 +6766,33 @@ fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
     let _ = nullable;
     match kind {
         ColumnKind::Bool => QWP_TYPE_BOOLEAN,
-        ColumnKind::Symbol => QWP_TYPE_SYMBOL,
+        ColumnKind::I8 => QWP_TYPE_BYTE,
+        ColumnKind::I16 => QWP_TYPE_SHORT,
+        ColumnKind::I32 => QWP_TYPE_INT,
         ColumnKind::I64 => QWP_TYPE_LONG,
+        ColumnKind::F32 => QWP_TYPE_FLOAT,
         ColumnKind::F64 => QWP_TYPE_DOUBLE,
+        ColumnKind::Symbol => QWP_TYPE_SYMBOL,
         ColumnKind::String => QWP_TYPE_VARCHAR,
+        ColumnKind::Decimal64 => QWP_TYPE_DECIMAL64,
+        ColumnKind::Decimal128 => QWP_TYPE_DECIMAL128,
         ColumnKind::Decimal => QWP_TYPE_DECIMAL256,
         ColumnKind::DoubleArray => QWP_TYPE_DOUBLE_ARRAY,
         ColumnKind::TimestampMicros => QWP_TYPE_TIMESTAMP,
         ColumnKind::TimestampNanos => QWP_TYPE_TIMESTAMP_NANOS,
+        ColumnKind::Uuid => QWP_TYPE_UUID,
+        ColumnKind::Long256 => QWP_TYPE_LONG256,
+        ColumnKind::Ipv4 => QWP_TYPE_IPV4,
+        ColumnKind::Date => QWP_TYPE_DATE,
+        ColumnKind::Char => QWP_TYPE_CHAR,
+        ColumnKind::Binary => QWP_TYPE_BINARY,
+        ColumnKind::Geohash => QWP_TYPE_GEOHASH,
+        ColumnKind::LongArray => QWP_TYPE_LONG_ARRAY,
     }
+}
+
+fn geohash_bytes_per_value(precision_bits: u8) -> usize {
+    (precision_bits as usize).div_ceil(8)
 }
 
 /// Encode a row group directly from the planner's pre-indexed cells.
@@ -5400,6 +6991,48 @@ fn encode_column_from_cells(
             }
         }
 
+        ColumnKind::I8 => {
+            debug_assert!(
+                !uses_null_bitmap,
+                "I8 columns must not use null bitmaps in QWP"
+            );
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                let v = match maybe_cell.map(|c| c.value) {
+                    Some(ValueRef::I8(v)) => v,
+                    _ => 0,
+                };
+                out.push(v as u8);
+            }
+        }
+
+        ColumnKind::I16 => {
+            debug_assert!(
+                !uses_null_bitmap,
+                "I16 columns must not use null bitmaps in QWP"
+            );
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                let v = match maybe_cell.map(|c| c.value) {
+                    Some(ValueRef::I16(v)) => v,
+                    _ => 0,
+                };
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        ColumnKind::I32 => {
+            debug_assert!(
+                !uses_null_bitmap,
+                "I32 columns must not use null bitmaps in QWP"
+            );
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                let v = match maybe_cell.map(|c| c.value) {
+                    Some(ValueRef::I32(v)) => v,
+                    _ => i32::MIN,
+                };
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
         ColumnKind::I64 => {
             debug_assert!(
                 !uses_null_bitmap,
@@ -5428,6 +7061,20 @@ fn encode_column_from_cells(
             }
         }
 
+        ColumnKind::F32 => {
+            debug_assert!(
+                !uses_null_bitmap,
+                "F32 columns must not use null bitmaps in QWP"
+            );
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                let v = match maybe_cell.map(|c| c.value) {
+                    Some(ValueRef::F32(v)) => v,
+                    _ => f32::NAN,
+                };
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
         ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
             for cell in CellIter::new(cells, col.cell_head) {
                 if let ValueRef::TimestampMicros(v) | ValueRef::TimestampNanos(v) = cell.value {
@@ -5450,17 +7097,19 @@ fn encode_column_from_cells(
             let offsets_end =
                 checked_qwp_usize_add(offsets_start, offset_table_len, "string offset table")?;
             out.resize(offsets_end, 0);
-            out[offsets_start..offsets_start + 4].copy_from_slice(&0i32.to_le_bytes());
+            out[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
 
-            let mut cumulative: i32 = 0;
+            let mut cumulative: usize = 0;
             let mut offset_idx = 1usize;
             for cell in CellIter::new(cells, col.cell_head) {
                 if let ValueRef::String(vs) = cell.value {
                     let text = &value_bytes[vs.0.as_range()];
                     out.extend_from_slice(text);
-                    cumulative += text.len() as i32;
+                    cumulative =
+                        checked_qwp_usize_add(cumulative, text.len(), "string column bytes")?;
+                    let offset_u32 = checked_qwp_u32(cumulative, "string column offset")?;
                     let pos = offsets_start + offset_idx * 4;
-                    out[pos..pos + 4].copy_from_slice(&cumulative.to_le_bytes());
+                    out[pos..pos + 4].copy_from_slice(&offset_u32.to_le_bytes());
                     offset_idx += 1;
                 }
             }
@@ -5486,10 +7135,145 @@ fn encode_column_from_cells(
             }
         }
 
+        ColumnKind::Decimal64 => {
+            out.push(col.decimal_scale);
+            for cell in CellIter::new(cells, col.cell_head) {
+                match cell.value {
+                    ValueRef::Decimal64Null => {}
+                    ValueRef::Decimal64(decimal_value) => {
+                        let bytes =
+                            decimal_value.wire_bytes_with_scale(value_bytes, col.decimal_scale)?;
+                        let low = narrow_decimal_le_fits(&bytes, 8)
+                            .ok_or_else(|| decimal_fit_error(64))?;
+                        out.extend_from_slice(low);
+                    }
+                    _ => {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "internal QWP type mismatch for decimal64 column"
+                        ));
+                    }
+                }
+            }
+        }
+
+        ColumnKind::Decimal128 => {
+            out.push(col.decimal_scale);
+            for cell in CellIter::new(cells, col.cell_head) {
+                match cell.value {
+                    ValueRef::Decimal128Null => {}
+                    ValueRef::Decimal128(decimal_value) => {
+                        let bytes =
+                            decimal_value.wire_bytes_with_scale(value_bytes, col.decimal_scale)?;
+                        let low = narrow_decimal_le_fits(&bytes, 16)
+                            .ok_or_else(|| decimal_fit_error(128))?;
+                        out.extend_from_slice(low);
+                    }
+                    _ => {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "internal QWP type mismatch for decimal128 column"
+                        ));
+                    }
+                }
+            }
+        }
+
         ColumnKind::DoubleArray => {
             for cell in CellIter::new(cells, col.cell_head) {
                 if let ValueRef::DoubleArray(vs) = cell.value {
                     out.extend_from_slice(&value_bytes[vs.0.as_range()]);
+                }
+            }
+        }
+
+        ColumnKind::LongArray => {
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::LongArray(vs) = cell.value {
+                    out.extend_from_slice(&value_bytes[vs.0.as_range()]);
+                }
+            }
+        }
+
+        ColumnKind::Uuid => {
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::Uuid(vs) = cell.value {
+                    out.extend_from_slice(&value_bytes[vs.0.as_range()]);
+                }
+            }
+        }
+
+        ColumnKind::Long256 => {
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::Long256(vs) = cell.value {
+                    out.extend_from_slice(&value_bytes[vs.0.as_range()]);
+                }
+            }
+        }
+
+        ColumnKind::Ipv4 => {
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::Ipv4(v) = cell.value {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+
+        ColumnKind::Date => {
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::DateMillis(v) = cell.value {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+
+        ColumnKind::Char => {
+            debug_assert!(
+                !uses_null_bitmap,
+                "Char columns must not use null bitmaps in QWP"
+            );
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                let v = match maybe_cell.map(|c| c.value) {
+                    Some(ValueRef::Char(v)) => v,
+                    _ => 0u16,
+                };
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        ColumnKind::Binary => {
+            let non_null_count = col.non_null_count as usize;
+            let offsets_start = out.len();
+            let offset_count = checked_qwp_usize_add(non_null_count, 1, "binary offset count")?;
+            let offset_table_len = checked_qwp_usize_mul(offset_count, 4, "binary offset table")?;
+            let offsets_end =
+                checked_qwp_usize_add(offsets_start, offset_table_len, "binary offset table")?;
+            out.resize(offsets_end, 0);
+            out[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
+
+            let mut cumulative: usize = 0;
+            let mut offset_idx = 1usize;
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::Binary(vs) = cell.value {
+                    let payload = &value_bytes[vs.0.as_range()];
+                    out.extend_from_slice(payload);
+                    cumulative =
+                        checked_qwp_usize_add(cumulative, payload.len(), "binary column bytes")?;
+                    let offset_u32 = checked_qwp_u32(cumulative, "binary column offset")?;
+                    let pos = offsets_start + offset_idx * 4;
+                    out[pos..pos + 4].copy_from_slice(&offset_u32.to_le_bytes());
+                    offset_idx += 1;
+                }
+            }
+        }
+
+        ColumnKind::Geohash => {
+            write_qwp_varint(out, col.geohash_precision_bits as u64);
+            let bytes_per_value = geohash_bytes_per_value(col.geohash_precision_bits);
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::Geohash { bits, .. } = cell.value {
+                    let le = bits.to_le_bytes();
+                    out.extend_from_slice(&le[..bytes_per_value]);
                 }
             }
         }
@@ -6573,6 +8357,25 @@ mod tests {
                 DecodedValue::F64Array { .. } => return SemanticKind::F64Array,
                 DecodedValue::TimestampMicros(_) => return SemanticKind::TimestampMicros,
                 DecodedValue::TimestampNanos(_) => return SemanticKind::TimestampNanos,
+                DecodedValue::I8(_) | DecodedValue::I16(_) | DecodedValue::I32(_) => panic!(
+                    "narrow integer columns are not exercised by qwp_prop tests; \
+                     extend PropSegmentConfig if a narrow int column should be inferred"
+                ),
+                DecodedValue::Uuid { .. } | DecodedValue::Long256(_) | DecodedValue::Ipv4(_) => {
+                    panic!("UUID/LONG256/IPv4 columns are not exercised by qwp_prop tests")
+                }
+                DecodedValue::DateMillis(_) | DecodedValue::Char(_) | DecodedValue::Binary(_) => {
+                    panic!("DATE/CHAR/BINARY columns are not exercised by qwp_prop tests")
+                }
+                DecodedValue::Geohash { .. } => {
+                    panic!("GEOHASH columns are not exercised by qwp_prop tests")
+                }
+                DecodedValue::I64Array { .. } => {
+                    panic!("LONG_ARRAY columns are not exercised by qwp_prop tests")
+                }
+                DecodedValue::F32(_) => {
+                    panic!("FLOAT columns are not exercised by qwp_prop tests")
+                }
                 DecodedValue::Null => {}
             }
         }
@@ -6612,6 +8415,24 @@ mod tests {
             },
             DecodedValue::TimestampMicros(value) => SemanticValue::TimestampMicros(value),
             DecodedValue::TimestampNanos(value) => SemanticValue::TimestampNanos(value),
+            DecodedValue::I8(_) | DecodedValue::I16(_) | DecodedValue::I32(_) => {
+                panic!("narrow integer columns are not exercised by qwp_prop tests")
+            }
+            DecodedValue::Uuid { .. } | DecodedValue::Long256(_) | DecodedValue::Ipv4(_) => {
+                panic!("UUID/LONG256/IPv4 columns are not exercised by qwp_prop tests")
+            }
+            DecodedValue::DateMillis(_) | DecodedValue::Char(_) | DecodedValue::Binary(_) => {
+                panic!("DATE/CHAR/BINARY columns are not exercised by qwp_prop tests")
+            }
+            DecodedValue::Geohash { .. } => {
+                panic!("GEOHASH columns are not exercised by qwp_prop tests")
+            }
+            DecodedValue::I64Array { .. } => {
+                panic!("LONG_ARRAY columns are not exercised by qwp_prop tests")
+            }
+            DecodedValue::F32(_) => {
+                panic!("FLOAT columns are not exercised by qwp_prop tests")
+            }
             DecodedValue::Null => SemanticValue::Null,
         }
     }
@@ -6776,23 +8597,29 @@ mod tests {
         }
 
         #[test]
-        fn qwp_prop_decimal_scale_widening_preserves_values(
-            (first, later) in prop_decimal_scale_widening_pair_strategy(),
+        fn qwp_prop_decimal_upscale_preserves_values(
+            (small_scale, large_scale) in prop_decimal_scale_widening_pair_strategy(),
         ) {
-            let later_decimal = parse_decimal_text(later.as_str())
+            // The strategy yields (smaller-scale, larger-scale). Java parity
+            // pins the column to the FIRST value's scale and rescales
+            // subsequent values UP losslessly. So feed the LARGER-scale
+            // value first (pins the column to that scale), then the smaller-
+            // scale value which upscales without precision loss.
+            let pinned_decimal = parse_decimal_text(large_scale.as_str())
                 .unwrap()
                 .expect("finite generated decimal must parse");
+
             let mut buf = QwpBuffer::new(512);
             buf.table("trades")
                 .unwrap()
-                .column_dec("price", first.as_str())
+                .column_dec("price", large_scale.as_str())
                 .unwrap()
                 .at_now()
                 .unwrap();
 
             buf.table("trades")
                 .unwrap()
-                .column_dec("price", later.as_str())
+                .column_dec("price", small_scale.as_str())
                 .unwrap()
                 .at_now()
                 .unwrap();
@@ -6804,8 +8631,8 @@ mod tests {
             prop_assert_eq!(
                 decoded.table.rows,
                 vec![
-                    vec![decoded_decimal_from_text_with_scale(first.as_str(), later_decimal.scale)],
-                    vec![decoded_decimal_from_text_with_scale(later.as_str(), later_decimal.scale)],
+                    vec![decoded_decimal_from_text_with_scale(large_scale.as_str(), pinned_decimal.scale)],
+                    vec![decoded_decimal_from_text_with_scale(small_scale.as_str(), pinned_decimal.scale)],
                 ],
             );
         }
@@ -6863,7 +8690,7 @@ mod tests {
 
         buf.table("trades")
             .unwrap()
-            .column_dec("price", "1.2")
+            .column_dec("price", "1.20")
             .unwrap();
         buf.at_now().unwrap();
         assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES);
@@ -6871,7 +8698,7 @@ mod tests {
         buf.set_marker().unwrap();
         buf.table("trades")
             .unwrap()
-            .column_dec("price", "1.5e-3")
+            .column_dec("price", "1.50")
             .unwrap();
         buf.at_now().unwrap();
         assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES * 2);
@@ -9514,5 +11341,814 @@ mod tests {
         .unwrap();
 
         assert_eq!(reference, socket_datagrams);
+    }
+
+    fn first_table(decoded: &DecodedDatagram) -> &crate::tests::qwp_decode::DecodedTable {
+        &decoded.table
+    }
+
+    #[test]
+    fn qwp_column_i8_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        for v in [i8::MIN, -1, 0, 1, i8::MAX] {
+            buf.table("metrics").unwrap().column_i8("v", v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = first_table(&decoded);
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_BYTE);
+        assert!(!table.columns[0].nullable);
+        let got: Vec<_> = table.rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                DecodedValue::I8(i8::MIN),
+                DecodedValue::I8(-1),
+                DecodedValue::I8(0),
+                DecodedValue::I8(1),
+                DecodedValue::I8(i8::MAX),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwp_column_i16_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        for v in [i16::MIN, -1, 0, 1, i16::MAX] {
+            buf.table("metrics").unwrap().column_i16("v", v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = first_table(&decoded);
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_SHORT);
+        assert!(!table.columns[0].nullable);
+        let got: Vec<_> = table.rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                DecodedValue::I16(i16::MIN),
+                DecodedValue::I16(-1),
+                DecodedValue::I16(0),
+                DecodedValue::I16(1),
+                DecodedValue::I16(i16::MAX),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwp_column_i32_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        for v in [i32::MIN, -1, 0, 1, i32::MAX] {
+            buf.table("metrics").unwrap().column_i32("v", v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = first_table(&decoded);
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_INT);
+        assert!(!table.columns[0].nullable);
+        let got: Vec<_> = table.rows.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                DecodedValue::I32(i32::MIN),
+                DecodedValue::I32(-1),
+                DecodedValue::I32(0),
+                DecodedValue::I32(1),
+                DecodedValue::I32(i32::MAX),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwp_narrow_int_sentinel_fills_missing_rows() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("metrics")
+            .unwrap()
+            .column_i8("b", 7)
+            .unwrap()
+            .column_i16("s", 1234)
+            .unwrap()
+            .column_i32("i", 99_999)
+            .unwrap()
+            .column_bool("flag", true)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("metrics")
+            .unwrap()
+            .column_bool("flag", false)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = first_table(&decoded);
+        let by_name: std::collections::HashMap<_, _> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| (col.name.as_str(), idx))
+            .collect();
+        for col in &table.columns {
+            assert!(
+                !col.nullable,
+                "narrow int / bool columns must use sentinel mode, not bitmap (column {})",
+                col.name
+            );
+        }
+        let b_idx = by_name["b"];
+        let s_idx = by_name["s"];
+        let i_idx = by_name["i"];
+        // BYTE/SHORT sentinel = 0 per spec §11.1; INT sentinel = i32::MIN
+        // so the server's Integer.MIN_VALUE null convention round-trips a
+        // missing row as null rather than as the value 0.
+        assert_eq!(table.rows[1][b_idx], DecodedValue::I8(0));
+        assert_eq!(table.rows[1][s_idx], DecodedValue::I16(0));
+        assert_eq!(table.rows[1][i_idx], DecodedValue::I32(i32::MIN));
+    }
+
+    #[test]
+    fn qwp_narrow_int_method_pins_wire_type_regardless_of_value() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("metrics")
+            .unwrap()
+            .column_i8("b", 0)
+            .unwrap()
+            .column_i16("s", 0)
+            .unwrap()
+            .column_i32("i", 0)
+            .unwrap()
+            .column_i64("l", 0)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = first_table(&decoded);
+        let codes: Vec<u8> = table.columns.iter().map(|c| c.type_code).collect();
+        assert_eq!(
+            codes,
+            vec![QWP_TYPE_BYTE, QWP_TYPE_SHORT, QWP_TYPE_INT, QWP_TYPE_LONG]
+        );
+    }
+
+    #[test]
+    fn qwp_column_dec64_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        for v in ["0.00", "1.25", "-1.25", "92233720368547.75"] {
+            buf.table("trades")
+                .unwrap()
+                .column_dec64("price", v)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        assert_eq!(datagrams.len(), 1);
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = first_table(&decoded);
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_DECIMAL64);
+        let strs: Vec<String> = table
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                DecodedValue::Decimal { scale, unscaled_be } => {
+                    decimal_to_string(*scale, unscaled_be)
+                }
+                other => panic!("unexpected value {:?}", other),
+            })
+            .collect();
+        assert_eq!(strs, vec!["0.00", "1.25", "-1.25", "92233720368547.75"]);
+    }
+
+    #[test]
+    fn qwp_column_dec128_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        for v in [
+            "0",
+            "170141183460469231731687303715884105727",
+            "-170141183460469231731687303715884105728",
+        ] {
+            buf.table("trades")
+                .unwrap()
+                .column_dec128("amt", v)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = first_table(&decoded);
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_DECIMAL128);
+        let strs: Vec<String> = table
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                DecodedValue::Decimal { scale, unscaled_be } => {
+                    decimal_to_string(*scale, unscaled_be)
+                }
+                other => panic!("unexpected value {:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            strs,
+            vec![
+                "0".to_string(),
+                "170141183460469231731687303715884105727".to_string(),
+                "-170141183460469231731687303715884105728".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwp_column_dec64_rejects_overflow_at_call_site() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("trades").unwrap();
+        let err = buf
+            .column_dec64("v", "9223372036854775808")
+            .expect_err("call should fail for value > i64::MAX");
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(
+            err.msg().contains("DECIMAL64"),
+            "error should name DECIMAL64: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn qwp_column_dec128_rejects_overflow_at_call_site() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("trades").unwrap();
+        let err = buf
+            .column_dec128("v", "170141183460469231731687303715884105728")
+            .expect_err("call should fail for value > i128::MAX");
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("DECIMAL128"), "{}", err.msg());
+    }
+
+    #[test]
+    fn qwp_column_dec64_upscales_subsequent_lossless() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap().column_dec64("v", "1.25").unwrap();
+        buf.at_now().unwrap();
+        buf.table("t").unwrap().column_dec64("v", "1.1").unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_DECIMAL64);
+        let strs: Vec<String> = table
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                DecodedValue::Decimal { scale, unscaled_be } => {
+                    decimal_to_string(*scale, unscaled_be)
+                }
+                other => panic!("unexpected value {:?}", other),
+            })
+            .collect();
+        assert_eq!(strs, vec!["1.25".to_string(), "1.10".to_string()]);
+    }
+
+    #[test]
+    fn qwp_column_dec64_downscale_precision_loss_rejects() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap().column_dec64("v", "1.25").unwrap();
+        buf.at_now().unwrap();
+        buf.table("t").unwrap().column_dec64("v", "1.234").unwrap();
+        buf.at_now().unwrap();
+        let err = buf
+            .encode_datagrams(64 * 1024)
+            .expect_err("downscale must error on precision loss");
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("precision loss"), "{}", err.msg());
+    }
+
+    #[test]
+    fn qwp_column_dec128_upscales_subsequent_lossless() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap().column_dec128("v", "1.25").unwrap();
+        buf.at_now().unwrap();
+        buf.table("t").unwrap().column_dec128("v", "1.1").unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let strs: Vec<String> = decoded
+            .table
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                DecodedValue::Decimal { scale, unscaled_be } => {
+                    decimal_to_string(*scale, unscaled_be)
+                }
+                other => panic!("unexpected value {:?}", other),
+            })
+            .collect();
+        assert_eq!(strs, vec!["1.25".to_string(), "1.10".to_string()]);
+    }
+
+    #[test]
+    fn qwp_column_dec_upscales_subsequent_lossless() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap().column_dec("v", "1.25").unwrap();
+        buf.at_now().unwrap();
+        buf.table("t").unwrap().column_dec("v", "1.1").unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let strs: Vec<String> = decoded
+            .table
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                DecodedValue::Decimal { scale, unscaled_be } => {
+                    decimal_to_string(*scale, unscaled_be)
+                }
+                other => panic!("unexpected value {:?}", other),
+            })
+            .collect();
+        assert_eq!(strs, vec!["1.25".to_string(), "1.10".to_string()]);
+    }
+
+    #[test]
+    fn qwp_column_uuid_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let cases: &[(u64, u64)] = &[
+            (0, 0),
+            (1, 0),
+            (0, 1),
+            (0xDEAD_BEEF_DEAD_BEEFu64, 0xCAFE_BABE_CAFE_BABEu64),
+            (u64::MAX, u64::MAX),
+        ];
+        for (lo, hi) in cases {
+            buf.table("trades")
+                .unwrap()
+                .column_uuid("id", *lo, *hi)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_UUID);
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|&(lo, hi)| DecodedValue::Uuid { lo, hi })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn qwp_column_long256_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let v0 = [0u8; 32];
+        let mut v1 = [0u8; 32];
+        for (i, b) in v1.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let v2 = [0xFFu8; 32];
+        for v in [&v0, &v1, &v2] {
+            buf.table("hashes").unwrap().column_long256("h", v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_LONG256);
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                DecodedValue::Long256(v0),
+                DecodedValue::Long256(v1),
+                DecodedValue::Long256(v2),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwp_column_ipv4_roundtrip() {
+        use std::net::Ipv4Addr;
+        let mut buf = QwpBuffer::new(127);
+        let cases: &[Ipv4Addr] = &[
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 2),
+            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ];
+        for v in cases {
+            buf.table("conns")
+                .unwrap()
+                .column_ipv4("src", u32::from(*v))
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_IPV4);
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|&v| DecodedValue::Ipv4(u32::from(v)))
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn qwp_uuid_long256_ipv4_use_bitmap_for_missing_rows() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t")
+            .unwrap()
+            .column_uuid("u", 1, 2)
+            .unwrap()
+            .column_long256("l", &[7u8; 32])
+            .unwrap()
+            .column_ipv4("ip", 0x0100007Fu32)
+            .unwrap();
+        buf.at_now().unwrap();
+        buf.table("t")
+            .unwrap()
+            .column_ipv4("ip", 0x0200007Fu32)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        let by_name: std::collections::HashMap<_, _> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.as_str(), i))
+            .collect();
+        assert!(table.columns[by_name["u"]].nullable);
+        assert!(table.columns[by_name["l"]].nullable);
+        assert_eq!(table.rows[1][by_name["u"]], DecodedValue::Null);
+        assert_eq!(table.rows[1][by_name["l"]], DecodedValue::Null);
+        assert_eq!(
+            table.rows[1][by_name["ip"]],
+            DecodedValue::Ipv4(0x0200007Fu32)
+        );
+    }
+
+    #[test]
+    fn qwp_column_date_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let cases: &[i64] = &[0, 1, -1, i64::MIN, i64::MAX, 1_700_000_000_000];
+        for v in cases {
+            buf.table("t").unwrap().column_date("d", *v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_DATE);
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        let expected: Vec<_> = cases.iter().map(|&v| DecodedValue::DateMillis(v)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn qwp_column_char_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let cases: &[u16] = &[0x0041, 0x4E2D, 0xFFFF, 0x0001];
+        for v in cases {
+            buf.table("t").unwrap().column_char("c", *v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_CHAR);
+        assert!(!table.columns[0].nullable);
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        let expected: Vec<_> = cases.iter().map(|&v| DecodedValue::Char(v)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn qwp_column_binary_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let v0: &[u8] = b"";
+        let v1: &[u8] = &[0xFF, 0xFE, 0xFD, 0x00, 0x01];
+        let v2: &[u8] = &[0xAB; 64];
+        for v in [v0, v1, v2] {
+            buf.table("t").unwrap().column_binary("b", v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_BINARY);
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                DecodedValue::Binary(v0.to_vec()),
+                DecodedValue::Binary(v1.to_vec()),
+                DecodedValue::Binary(v2.to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn qwp_column_geohash_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let precision_bits: u8 = 25;
+        let mask = (1u64 << precision_bits) - 1;
+        let cases: &[u64] = &[0, 0x1F, 0xABCDE, mask];
+        for bits in cases {
+            buf.table("t")
+                .unwrap()
+                .column_geohash("g", *bits, precision_bits)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_GEOHASH);
+        let bytes_per_value = (precision_bits as usize).div_ceil(8);
+        let byte_mask = if bytes_per_value == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (bytes_per_value * 8)) - 1
+        };
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|&bits| DecodedValue::Geohash {
+                bits: bits & byte_mask,
+                precision_bits,
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn qwp_column_geohash_precision_mismatch_rejects() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap().column_geohash("g", 7, 5).unwrap();
+        buf.at_now().unwrap();
+        buf.table("t").unwrap().column_geohash("g", 7, 6).unwrap();
+        let err = buf
+            .at_now()
+            .expect_err("row commit must reject precision mismatch");
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("GEOHASH"), "{}", err.msg());
+    }
+
+    #[test]
+    fn qwp_column_geohash_precision_out_of_range_rejects() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap();
+        let err = buf
+            .column_geohash("g", 0, 0)
+            .expect_err("precision 0 must fail");
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        let err = buf
+            .column_geohash("g", 0, 61)
+            .expect_err("precision 61 must fail");
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+    }
+
+    #[test]
+    fn qwp_column_long_array_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let a1: Vec<i64> = vec![1, 2, 3, -1, -2];
+        let a2: Vec<i64> = vec![i64::MAX, i64::MIN, 0];
+        for v in [&a1, &a2] {
+            buf.table("t").unwrap().column_arr("arr", v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_LONG_ARRAY);
+        let got: Vec<_> = table.rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                DecodedValue::I64Array {
+                    shape: vec![a1.len()],
+                    values: a1,
+                },
+                DecodedValue::I64Array {
+                    shape: vec![a2.len()],
+                    values: a2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn qwp_column_long_array_ilp_buffer_rejects() {
+        use crate::ingress::ProtocolVersion;
+        use crate::ingress::buffer::Buffer;
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        let arr: Vec<i64> = vec![1, 2, 3];
+        let err = buf
+            .table("t")
+            .unwrap()
+            .column_arr("arr", &arr)
+            .expect_err("LONG_ARRAY on ILP must be rejected");
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+    }
+
+    #[test]
+    fn qwp_column_uuid_lo_first_then_hi_byte_order() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t")
+            .unwrap()
+            .column_uuid("id", 0x0102030405060708u64, 0x090A0B0C0D0E0F10u64)
+            .unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_UUID);
+        match table.rows[0][0] {
+            DecodedValue::Uuid { lo, hi } => {
+                assert_eq!(lo, 0x0102030405060708u64);
+                assert_eq!(hi, 0x090A0B0C0D0E0F10u64);
+            }
+            ref other => panic!("expected UUID, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qwp_column_long256_little_endian_byte_order() {
+        let mut buf = QwpBuffer::new(127);
+        let raw: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x1D, 0x1E, 0x1F, 0x20,
+        ];
+        buf.table("t").unwrap().column_long256("v", &raw).unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_LONG256);
+        match &table.rows[0][0] {
+            DecodedValue::Long256(bytes) => assert_eq!(bytes.as_slice(), &raw),
+            other => panic!("expected Long256, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qwp_column_ipv4_big_endian_octet_order() {
+        let mut buf = QwpBuffer::new(127);
+        let addr: u32 = (192u32 << 24) | (168u32 << 16) | (1u32 << 8) | 42u32;
+        buf.table("t").unwrap().column_ipv4("ip", addr).unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_IPV4);
+        match table.rows[0][0] {
+            DecodedValue::Ipv4(v) => assert_eq!(v, addr),
+            ref other => panic!("expected Ipv4, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qwp_column_date_millis_roundtrip_negative() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("t").unwrap().column_date("d", -1).unwrap();
+        buf.at_now().unwrap();
+        buf.table("t")
+            .unwrap()
+            .column_date("d", 1_700_000_000_000)
+            .unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_DATE);
+        match table.rows[0][0] {
+            DecodedValue::DateMillis(v) => assert_eq!(v, -1),
+            ref other => panic!("expected DateMillis, got {:?}", other),
+        }
+        match table.rows[1][0] {
+            DecodedValue::DateMillis(v) => assert_eq!(v, 1_700_000_000_000),
+            ref other => panic!("expected DateMillis, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qwp_column_char_bmp_codepoint_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        for &v in &[b'A' as u16, 0xD7FFu16, 0xE000u16, 0xFFFDu16] {
+            buf.table("t").unwrap().column_char("c", v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_CHAR);
+        let got: Vec<u16> = table
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                DecodedValue::Char(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(got, vec![b'A' as u16, 0xD7FFu16, 0xE000u16, 0xFFFDu16]);
+    }
+
+    #[test]
+    fn qwp_column_binary_does_not_validate_utf8() {
+        let mut buf = QwpBuffer::new(127);
+        let non_utf8: &[u8] = &[0xFF, 0xFE, 0x00, 0x80, 0xC0];
+        buf.table("t")
+            .unwrap()
+            .column_binary("b", non_utf8)
+            .unwrap();
+        buf.at_now().unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        match &decoded.table.rows[0][0] {
+            DecodedValue::Binary(bytes) => assert_eq!(bytes.as_slice(), non_utf8),
+            other => panic!("expected Binary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn qwp_column_f32_roundtrip() {
+        let mut buf = QwpBuffer::new(127);
+        let cases: &[f32] = &[0.0, 1.5, -1.5, f32::MIN, f32::MAX];
+        for v in cases {
+            buf.table("t").unwrap().column_f32("v", *v).unwrap();
+            buf.at_now().unwrap();
+        }
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        let decoded = decode_datagram(&datagrams[0]).unwrap();
+        let table = &decoded.table;
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_FLOAT);
+        assert!(!table.columns[0].nullable);
+        let got: Vec<_> = table
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                DecodedValue::F32(v) => v,
+                _ => panic!(),
+            })
+            .collect();
+        for (g, e) in got.iter().zip(cases.iter()) {
+            assert_eq!(g.to_bits(), e.to_bits());
+        }
+    }
+
+    fn decimal_to_string(scale: u8, unscaled_be: &[u8]) -> String {
+        let signed_value: i128 = {
+            if unscaled_be.is_empty() {
+                0
+            } else {
+                let mut buf = [0u8; 16];
+                let sign_byte = if unscaled_be[0] & 0x80 != 0 {
+                    0xFF
+                } else {
+                    0x00
+                };
+                assert!(
+                    unscaled_be.len() <= 16,
+                    "test helper supports magnitudes up to 16 bytes only"
+                );
+                buf.fill(sign_byte);
+                buf[16 - unscaled_be.len()..].copy_from_slice(unscaled_be);
+                i128::from_be_bytes(buf)
+            }
+        };
+        if scale == 0 {
+            return signed_value.to_string();
+        }
+        let negative = signed_value < 0;
+        let abs = if negative {
+            (0i128.wrapping_sub(signed_value)) as u128
+        } else {
+            signed_value as u128
+        };
+        let abs_str = abs.to_string();
+        let scale = scale as usize;
+        let (whole, frac) = if abs_str.len() > scale {
+            let split = abs_str.len() - scale;
+            (abs_str[..split].to_string(), abs_str[split..].to_string())
+        } else {
+            (
+                "0".to_string(),
+                format!("{:0>width$}", abs_str, width = scale),
+            )
+        };
+        let sign = if negative { "-" } else { "" };
+        format!("{sign}{whole}.{frac}")
     }
 }

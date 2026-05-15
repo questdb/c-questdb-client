@@ -629,6 +629,158 @@ impl Buffer {
         }
     }
 
+    /// Adds an 8-bit signed integer column to the current row. QWP-only.
+    pub fn column_i8<'a, N>(&mut self, name: N, value: i8) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_i8 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_i8(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i8(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds an 8-bit signed integer column if `value` is `Some`. QWP-only.
+    pub fn column_i8_opt<'a, N>(&mut self, name: N, value: Option<i8>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_i8(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a 16-bit signed integer column to the current row. QWP-only.
+    pub fn column_i16<'a, N>(&mut self, name: N, value: i16) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_i16 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_i16(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i16(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 16-bit signed integer column if `value` is `Some`. QWP-only.
+    pub fn column_i16_opt<'a, N>(&mut self, name: N, value: Option<i16>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_i16(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a 32-bit signed integer column to the current row. QWP-only.
+    pub fn column_i32<'a, N>(&mut self, name: N, value: i32) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_i32 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_i32(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i32(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 32-bit signed integer column if `value` is `Some`. QWP-only.
+    pub fn column_i32_opt<'a, N>(&mut self, name: N, value: Option<i32>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_i32(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a 32-bit floating-point column to the current row. QWP-only.
+    pub fn column_f32<'a, N>(&mut self, name: N, value: f32) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_f32 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_f32(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_f32(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 32-bit floating-point column if `value` is `Some`. QWP-only.
+    pub fn column_f32_opt<'a, N>(&mut self, name: N, value: Option<f32>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_f32(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Adds a floating-point column to the current row.
     #[inline(always)]
     pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
@@ -754,6 +906,424 @@ impl Buffer {
         }
     }
 
+    /// Adds a 64-bit decimal column to the current row. QWP-only.
+    ///
+    /// The unscaled magnitude (at the column's pinned scale) must fit a signed
+    /// 64-bit integer; values that do not fit return `InvalidApiCall`.
+    pub fn column_dec64<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        let _ = &name;
+        match &mut self.inner {
+            BufferInner::Ilp(_) => {
+                let _ = value.try_into().map_err(Error::from)?;
+                Err(error::fmt!(
+                    InvalidApiCall,
+                    "column_dec64 requires a QWP transport (qwpws:: or qwpudp::)"
+                ))
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_dec64(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_dec64(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 64-bit decimal column if `value` is `Some`. QWP-only.
+    pub fn column_dec64_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        if let Some(value) = value {
+            self.column_dec64(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a 128-bit decimal column to the current row. QWP-only.
+    ///
+    /// The unscaled magnitude (at the column's pinned scale) must fit a signed
+    /// 128-bit integer; values that do not fit return `InvalidApiCall`.
+    pub fn column_dec128<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        let _ = &name;
+        match &mut self.inner {
+            BufferInner::Ilp(_) => {
+                let _ = value.try_into().map_err(Error::from)?;
+                Err(error::fmt!(
+                    InvalidApiCall,
+                    "column_dec128 requires a QWP transport (qwpws:: or qwpudp::)"
+                ))
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_dec128(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_dec128(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 128-bit decimal column if `value` is `Some`. QWP-only.
+    pub fn column_dec128_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        if let Some(value) = value {
+            self.column_dec128(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a UUID column to the current row. QWP-only.
+    ///
+    /// Per spec, the wire encoding writes `lo` (8 bytes LE) followed by `hi`
+    /// (8 bytes LE).
+    pub fn column_uuid<'a, N>(&mut self, name: N, lo: u64, hi: u64) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = &name;
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_uuid requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_uuid(name, lo, hi)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_uuid(name, lo, hi)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a UUID column if `value` is `Some`. QWP-only.
+    pub fn column_uuid_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<(u64, u64)>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some((lo, hi)) = value {
+            self.column_uuid(name, lo, hi)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a LONG256 column to the current row. QWP-only.
+    ///
+    /// `value` is the wire-format byte buffer: four 64-bit limbs encoded
+    /// little-endian, least-significant limb first (32 bytes total).
+    pub fn column_long256<'a, N>(&mut self, name: N, value: &[u8; 32]) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_long256 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_long256(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_long256(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a LONG256 column if `value` is `Some`. QWP-only.
+    pub fn column_long256_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<&[u8; 32]>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_long256(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds an IPv4 column to the current row. QWP-only.
+    ///
+    /// The wire encoding writes the 4 octets as `u32::from(addr).to_le_bytes()`,
+    /// matching Rust's natural Ipv4Addr packing (octet 0 in the high byte).
+    pub fn column_ipv4<'a, N>(
+        &mut self,
+        name: N,
+        value: std::net::Ipv4Addr,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, value);
+        let packed = u32::from(value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_ipv4 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_ipv4(name, packed)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_ipv4(name, packed)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds an IPv4 column if `value` is `Some`. QWP-only.
+    pub fn column_ipv4_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<std::net::Ipv4Addr>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_ipv4(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a DATE column (milliseconds since the Unix epoch). QWP-only.
+    pub fn column_date<'a, N>(&mut self, name: N, millis: i64) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &millis);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_date requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_date(name, millis)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_date(name, millis)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a DATE column if `value` is `Some`. QWP-only.
+    pub fn column_date_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<i64>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_date(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a CHAR column (single UTF-16 code unit). QWP-only.
+    pub fn column_char<'a, N>(&mut self, name: N, value: u16) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_char requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_char(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_char(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a CHAR column if `value` is `Some`. QWP-only.
+    pub fn column_char_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<u16>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_char(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a BINARY column (opaque byte sequence). QWP-only.
+    pub fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_binary requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_binary(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_binary(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a BINARY column if `value` is `Some`. QWP-only.
+    pub fn column_binary_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<&[u8]>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_binary(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a GEOHASH column. `precision_bits` must be in `1..=60` and is
+    /// pinned per column (subsequent rows must match). QWP-only.
+    pub fn column_geohash<'a, N>(
+        &mut self,
+        name: N,
+        bits: u64,
+        precision_bits: u8,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &bits, &precision_bits);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_geohash requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_geohash(name, bits, precision_bits)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_geohash(name, bits, precision_bits)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a GEOHASH column if `value` is `Some`. QWP-only.
+    pub fn column_geohash_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<(u64, u8)>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some((bits, precision)) = value {
+            self.column_geohash(name, bits, precision)
+        } else {
+            Ok(self)
+        }
+    }
+
     #[allow(private_bounds)]
     /// Adds an array column to the current row.
     ///
@@ -768,6 +1338,12 @@ impl Buffer {
     {
         match &mut self.inner {
             BufferInner::Ilp(inner) => {
+                if D::type_tag() != 10 {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "column_arr with non-f64 element type requires a QWP transport (qwpws:: or qwpudp::)"
+                    ));
+                }
                 inner.column_arr(name, view)?;
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
@@ -882,8 +1458,9 @@ impl Buffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bookmark, StoredBookmark};
+    use super::{Bookmark, Buffer, StoredBookmark};
     use crate::ErrorCode;
+    use crate::ingress::ProtocolVersion;
 
     #[test]
     fn stored_bookmark_reports_missing_bookmark_when_never_captured() {
@@ -902,5 +1479,128 @@ mod tests {
         stored.clear_if_matches(7, Bookmark::from_raw(0, 0));
 
         assert_eq!(stored.restore(7, bookmark).unwrap(), 42);
+    }
+
+    #[test]
+    fn buffer_column_i8_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_i8("v", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(
+            err.msg().contains("column_i8"),
+            "error message should name column_i8: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn buffer_column_i16_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_i16("v", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_i16"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_i32_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_i32("v", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_i32"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_dec64_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V3);
+        buf.table("trades").unwrap();
+        let err = buf.column_dec64("v", "1.25").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_dec64"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_dec128_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V3);
+        buf.table("trades").unwrap();
+        let err = buf.column_dec128("v", "1.25").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_dec128"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_uuid_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_uuid("v", 1, 2).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_uuid"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_long256_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_long256("v", &[0u8; 32]).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_long256"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_ipv4_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf
+            .column_ipv4("v", std::net::Ipv4Addr::new(127, 0, 0, 1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_ipv4"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_date_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_date("v", 42).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_date"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_char_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_char("v", 0x0041).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_char"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_binary_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_binary("v", b"abc").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_binary"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_geohash_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_geohash("v", 0xABCD, 16).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_geohash"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_f32_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_f32("v", 1.5_f32).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_f32"), "{}", err.msg());
     }
 }

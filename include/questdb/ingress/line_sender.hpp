@@ -428,6 +428,52 @@ public:
     }
 
     /**
+     * Record an 8-bit signed integer (BYTE on the wire). QWP-only.
+     *
+     * On ILP buffers this throws line_sender_error_invalid_api_call.
+     */
+    line_sender_buffer& column_i8(column_name_view name, int8_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i8, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a 16-bit signed integer (SHORT on the wire). QWP-only.
+     */
+    line_sender_buffer& column_i16(column_name_view name, int16_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i16, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a 32-bit signed integer (INT on the wire). QWP-only.
+     */
+    line_sender_buffer& column_i32(column_name_view name, int32_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i32, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a 32-bit floating-point value (FLOAT on the wire). QWP-only.
+     */
+    line_sender_buffer& column_f32(column_name_view name, float value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f32, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
      * Record a multidimensional array of `double` values.
      *
      * QuestDB server version 9.0.0 or later is required for array support.
@@ -443,33 +489,64 @@ public:
         column_name_view name, const array::strided_view<T, M>& array)
     {
         static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
+            std::is_same_v<T, double> || std::is_same_v<T, int64_t>,
+            "Only double and int64_t types are supported for arrays");
         may_init();
-        switch (M)
+        if constexpr (std::is_same_v<T, double>)
         {
-        case array::strides_mode::bytes:
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_f64_arr_byte_strides,
-                _impl,
-                name._impl,
-                array.rank(),
-                array.shape(),
-                array.strides(),
-                array.data(),
-                array.data_size());
-            break;
-        case array::strides_mode::elements:
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_f64_arr_elem_strides,
-                _impl,
-                name._impl,
-                array.rank(),
-                array.shape(),
-                array.strides(),
-                array.data(),
-                array.data_size());
-            break;
+            switch (M)
+            {
+            case array::strides_mode::bytes:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_f64_arr_byte_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            case array::strides_mode::elements:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_f64_arr_elem_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            }
+        }
+        else
+        {
+            switch (M)
+            {
+            case array::strides_mode::bytes:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_i64_arr_byte_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            case array::strides_mode::elements:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_i64_arr_elem_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            }
         }
         return *this;
     }
@@ -491,17 +568,31 @@ public:
         column_name_view name, const array::row_major_view<T>& array)
     {
         static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
+            std::is_same_v<T, double> || std::is_same_v<T, int64_t>,
+            "Only double and int64_t types are supported for arrays");
         may_init();
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_f64_arr_c_major,
-            _impl,
-            name._impl,
-            array.rank(),
-            array.shape(),
-            array.data(),
-            array.data_size());
+        if constexpr (std::is_same_v<T, double>)
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_c_major,
+                _impl,
+                name._impl,
+                array.rank(),
+                array.shape(),
+                array.data(),
+                array.data_size());
+        }
+        else
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_i64_arr_c_major,
+                _impl,
+                name._impl,
+                array.rank(),
+                array.shape(),
+                array.data(),
+                array.data_size());
+        }
         return *this;
     }
 
@@ -625,6 +716,238 @@ public:
             decimal.scale(),
             decimal.data(),
             decimal.data_size());
+        return *this;
+    }
+
+    /**
+     * Record a decimal string value as DECIMAL64 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec64(
+        column_name_view name, decimal::decimal_str_view value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec64_str,
+            _impl,
+            name._impl,
+            value.data(),
+            value.size());
+        return *this;
+    }
+
+    /**
+     * Record an unscaled-int decimal value as DECIMAL64 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec64(
+        column_name_view name, const decimal::decimal_view& decimal)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec64,
+            _impl,
+            name._impl,
+            decimal.scale(),
+            decimal.data(),
+            decimal.data_size());
+        return *this;
+    }
+
+    /**
+     * Record a decimal string value as DECIMAL128 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec128(
+        column_name_view name, decimal::decimal_str_view value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec128_str,
+            _impl,
+            name._impl,
+            value.data(),
+            value.size());
+        return *this;
+    }
+
+    /**
+     * Record an unscaled-int decimal value as DECIMAL128 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec128(
+        column_name_view name, const decimal::decimal_view& decimal)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec128,
+            _impl,
+            name._impl,
+            decimal.scale(),
+            decimal.data(),
+            decimal.data_size());
+        return *this;
+    }
+
+    /**
+     * Record a UUID column value. QWP-only.
+     */
+    line_sender_buffer& column_uuid(
+        column_name_view name, uint64_t lo, uint64_t hi)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_uuid, _impl, name._impl, lo, hi);
+        return *this;
+    }
+
+    /**
+     * Record a LONG256 column value. QWP-only.
+     *
+     * `value` is 32 bytes: four 64-bit limbs encoded little-endian,
+     * least-significant limb first.
+     */
+    line_sender_buffer& column_long256(
+        column_name_view name, const uint8_t (&value)[32])
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_long256, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record an IPv4 column value. QWP-only.
+     *
+     * `value` is the address packed as a u32 with octet 0 in the high byte.
+     */
+    line_sender_buffer& column_ipv4(column_name_view name, uint32_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_ipv4, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a DATE column value (milliseconds since Unix epoch). QWP-only.
+     */
+    line_sender_buffer& column_date(column_name_view name, int64_t millis)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_date, _impl, name._impl, millis);
+        return *this;
+    }
+
+    /**
+     * Record a CHAR column value (single UTF-16 code unit). QWP-only.
+     */
+    line_sender_buffer& column_char(column_name_view name, uint16_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_char, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a BINARY column value. QWP-only.
+     */
+    line_sender_buffer& column_binary(
+        column_name_view name, const uint8_t* data, size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_binary,
+            _impl,
+            name._impl,
+            data,
+            data_len);
+        return *this;
+    }
+
+    /**
+     * Record a GEOHASH column value. QWP-only.
+     *
+     * `precision_bits` must be in 1..=60 and is pinned per column.
+     */
+    line_sender_buffer& column_geohash(
+        column_name_view name, uint64_t bits, uint8_t precision_bits)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_geohash,
+            _impl,
+            name._impl,
+            bits,
+            precision_bits);
+        return *this;
+    }
+
+    /**
+     * Record an int64 multidimensional array (C-major layout). QWP-only.
+     */
+    line_sender_buffer& column_i64_arr(
+        column_name_view name,
+        size_t rank,
+        const uintptr_t* shape,
+        const int64_t* data,
+        size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i64_arr_c_major,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            data,
+            data_len);
+        return *this;
+    }
+
+    /**
+     * Record an int64 multidimensional array with byte strides. QWP-only.
+     */
+    line_sender_buffer& column_i64_arr_byte_strides(
+        column_name_view name,
+        size_t rank,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const int64_t* data,
+        size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i64_arr_byte_strides,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            strides,
+            data,
+            data_len);
+        return *this;
+    }
+
+    /**
+     * Record an int64 multidimensional array with element strides. QWP-only.
+     */
+    line_sender_buffer& column_i64_arr_elem_strides(
+        column_name_view name,
+        size_t rank,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const int64_t* data,
+        size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i64_arr_elem_strides,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            strides,
+            data,
+            data_len);
         return *this;
     }
 

@@ -35,16 +35,28 @@ struct QwpMessageHeader {
 const HEADER_SIZE: usize = std::mem::size_of::<QwpMessageHeader>();
 const _: () = assert!(HEADER_SIZE == 12);
 const TYPE_BOOLEAN: u8 = 0x01;
+const TYPE_BYTE: u8 = 0x02;
+const TYPE_SHORT: u8 = 0x03;
+const TYPE_INT: u8 = 0x04;
 const TYPE_LONG: u8 = 0x05;
+const TYPE_FLOAT: u8 = 0x06;
 const TYPE_DOUBLE: u8 = 0x07;
 pub(crate) const TYPE_VARCHAR: u8 = 0x0F;
 const TYPE_SYMBOL: u8 = 0x09;
 const TYPE_TIMESTAMP: u8 = 0x0A;
+const TYPE_DATE: u8 = 0x0B;
+const TYPE_UUID: u8 = 0x0C;
+const TYPE_LONG256: u8 = 0x0D;
+const TYPE_GEOHASH: u8 = 0x0E;
 const TYPE_TIMESTAMP_NANOS: u8 = 0x10;
 const TYPE_DOUBLE_ARRAY: u8 = 0x11;
+const TYPE_LONG_ARRAY: u8 = 0x12;
 const TYPE_DECIMAL64: u8 = 0x13;
 const TYPE_DECIMAL128: u8 = 0x14;
 const TYPE_DECIMAL256: u8 = 0x15;
+const TYPE_CHAR: u8 = 0x16;
+const TYPE_BINARY: u8 = 0x17;
+const TYPE_IPV4: u8 = 0x18;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DecodedDatagram {
@@ -75,13 +87,25 @@ pub(crate) struct DecodedColumn {
 pub(crate) enum DecodedValue {
     Bool(bool),
     Symbol(String),
+    I8(i8),
+    I16(i16),
+    I32(i32),
     I64(i64),
+    F32(f32),
     F64(f64),
     String(String),
     Decimal { scale: u8, unscaled_be: Vec<u8> },
     F64Array { shape: Vec<usize>, values: Vec<f64> },
+    I64Array { shape: Vec<usize>, values: Vec<i64> },
     TimestampMicros(i64),
     TimestampNanos(i64),
+    Uuid { lo: u64, hi: u64 },
+    Long256([u8; 32]),
+    Ipv4(u32),
+    DateMillis(i64),
+    Char(u16),
+    Binary(Vec<u8>),
+    Geohash { bits: u64, precision_bits: u8 },
     Null,
 }
 
@@ -155,11 +179,25 @@ impl<'a> Decoder<'a> {
         Ok(f64::from_le_bytes(raw))
     }
 
+    fn read_f32(&mut self) -> Result<f32, String> {
+        let bytes = self.read_exact(4)?;
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(bytes);
+        Ok(f32::from_le_bytes(raw))
+    }
+
     fn read_i32(&mut self) -> Result<i32, String> {
         let bytes = self.read_exact(4)?;
         let mut raw = [0u8; 4];
         raw.copy_from_slice(bytes);
         Ok(i32::from_le_bytes(raw))
+    }
+
+    fn read_i16(&mut self) -> Result<i16, String> {
+        let bytes = self.read_exact(2)?;
+        let mut raw = [0u8; 2];
+        raw.copy_from_slice(bytes);
+        Ok(i16::from_le_bytes(raw))
     }
 }
 
@@ -317,6 +355,60 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                 }
                 values
             }
+            TYPE_BYTE => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    raw_values.push(decoder.read_u8()? as i8);
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(DecodedValue::I8(raw_values[next_value]));
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_SHORT => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    raw_values.push(decoder.read_i16()?);
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(DecodedValue::I16(raw_values[next_value]));
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_INT => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    raw_values.push(decoder.read_i32()?);
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(DecodedValue::I32(raw_values[next_value]));
+                    next_value += 1;
+                }
+                values
+            }
             TYPE_LONG => {
                 let non_null_count = has_value.iter().filter(|&&present| present).count();
                 let mut raw_values = Vec::with_capacity(non_null_count);
@@ -333,6 +425,21 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                     }
                     values.push(DecodedValue::I64(raw_values[next_value]));
                     next_value += 1;
+                }
+                values
+            }
+            TYPE_FLOAT => {
+                let mut raw_values = Vec::with_capacity(row_count_usize);
+                for _ in 0..row_count_usize {
+                    raw_values.push(decoder.read_f32()?);
+                }
+                let mut values = Vec::with_capacity(row_count_usize);
+                for (idx, present) in has_value.iter().enumerate() {
+                    if *present {
+                        values.push(DecodedValue::F32(raw_values[idx]));
+                    } else {
+                        values.push(DecodedValue::Null);
+                    }
                 }
                 values
             }
@@ -454,6 +561,197 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                     }
                     values.push(raw_values[next_value].clone());
                     next_value += 1;
+                }
+                values
+            }
+            TYPE_LONG_ARRAY => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    let ndim = decoder.read_u8()? as usize;
+                    let mut shape = Vec::with_capacity(ndim);
+                    let mut elem_count = 1usize;
+                    for _ in 0..ndim {
+                        let dim = usize::try_from(decoder.read_i32()?)
+                            .map_err(|_| "negative array dimension".to_owned())?;
+                        elem_count = elem_count
+                            .checked_mul(dim)
+                            .ok_or_else(|| "array element count overflow".to_owned())?;
+                        shape.push(dim);
+                    }
+                    let mut values = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        values.push(decoder.read_i64()?);
+                    }
+                    raw_values.push(DecodedValue::I64Array { shape, values });
+                }
+
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(raw_values[next_value].clone());
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_UUID => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    let lo_bytes = decoder.read_exact(8)?;
+                    let mut lo_arr = [0u8; 8];
+                    lo_arr.copy_from_slice(lo_bytes);
+                    let hi_bytes = decoder.read_exact(8)?;
+                    let mut hi_arr = [0u8; 8];
+                    hi_arr.copy_from_slice(hi_bytes);
+                    raw_values.push((u64::from_le_bytes(lo_arr), u64::from_le_bytes(hi_arr)));
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    let (lo, hi) = raw_values[next_value];
+                    next_value += 1;
+                    values.push(DecodedValue::Uuid { lo, hi });
+                }
+                values
+            }
+            TYPE_LONG256 => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    let bytes = decoder.read_exact(32)?;
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(bytes);
+                    raw_values.push(arr);
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(DecodedValue::Long256(raw_values[next_value]));
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_IPV4 => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    let bytes = decoder.read_exact(4)?;
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(bytes);
+                    raw_values.push(u32::from_le_bytes(arr));
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(DecodedValue::Ipv4(raw_values[next_value]));
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_DATE => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    raw_values.push(decoder.read_i64()?);
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(DecodedValue::DateMillis(raw_values[next_value]));
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_CHAR => {
+                let mut raw_values = Vec::with_capacity(row_count_usize);
+                for _ in 0..row_count_usize {
+                    let bytes = decoder.read_exact(2)?;
+                    let mut arr = [0u8; 2];
+                    arr.copy_from_slice(bytes);
+                    raw_values.push(u16::from_le_bytes(arr));
+                }
+                let mut values = Vec::with_capacity(row_count_usize);
+                for (idx, present) in has_value.iter().enumerate() {
+                    if *present {
+                        values.push(DecodedValue::Char(raw_values[idx]));
+                    } else {
+                        values.push(DecodedValue::Null);
+                    }
+                }
+                values
+            }
+            TYPE_GEOHASH => {
+                let precision_bits = decoder.read_varint()? as u8;
+                let bytes_per_value = (precision_bits as usize).div_ceil(8);
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    let bytes = decoder.read_exact(bytes_per_value)?;
+                    let mut arr = [0u8; 8];
+                    arr[..bytes.len()].copy_from_slice(bytes);
+                    raw_values.push(u64::from_le_bytes(arr));
+                }
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(DecodedValue::Geohash {
+                        bits: raw_values[next_value],
+                        precision_bits,
+                    });
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_BINARY => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let offset_count = non_null_count + 1;
+                let mut offsets = Vec::with_capacity(offset_count);
+                for _ in 0..offset_count {
+                    offsets.push(decoder.read_i32()?);
+                }
+                let data_len = usize::try_from(*offsets.last().unwrap_or(&0))
+                    .map_err(|_| "negative binary data length".to_owned())?;
+                let data = decoder.read_exact(data_len)?;
+                let mut next_offset = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    let start = usize::try_from(offsets[next_offset]).map_err(|_| {
+                        format!("invalid binary start offset {}", offsets[next_offset])
+                    })?;
+                    let end = usize::try_from(offsets[next_offset + 1]).map_err(|_| {
+                        format!("invalid binary end offset {}", offsets[next_offset + 1])
+                    })?;
+                    values.push(DecodedValue::Binary(data[start..end].to_vec()));
+                    next_offset += 1;
                 }
                 values
             }

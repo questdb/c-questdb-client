@@ -2476,7 +2476,7 @@ TEST_CASE("line_sender c api qwpudp decimal column")
     const uint8_t neg_345[] = {0xfe, 0xa7};
 
     CHECK(::line_sender_buffer_table(buffer, table, &err));
-    CHECK(::line_sender_buffer_column_dec_str(buffer, price, "1.2", 3, &err));
+    CHECK(::line_sender_buffer_column_dec_str(buffer, price, "1.5e-3", 6, &err));
     CHECK(::line_sender_buffer_at_now(buffer, &err));
 
     CHECK(::line_sender_buffer_table(buffer, table, &err));
@@ -2495,7 +2495,7 @@ TEST_CASE("line_sender c api qwpudp decimal column")
     CHECK(::line_sender_buffer_at_now(buffer, &err));
 
     CHECK(::line_sender_buffer_table(buffer, table, &err));
-    CHECK(::line_sender_buffer_column_dec_str(buffer, price, "1.5e-3", 6, &err));
+    CHECK(::line_sender_buffer_column_dec_str(buffer, price, "1.2", 3, &err));
     CHECK(::line_sender_buffer_at_now(buffer, &err));
 
     CHECK(::line_sender_flush(sender, buffer, &err));
@@ -2511,12 +2511,12 @@ TEST_CASE("line_sender c api qwpudp decimal column")
     CHECK(decoded.scale == 4);
     REQUIRE(decoded.values.size() == 4);
     REQUIRE(decoded.values[0].has_value());
-    CHECK(*decoded.values[0] == trimmed_signed_i64_be(12'000));
+    CHECK(*decoded.values[0] == trimmed_signed_i64_be(15));
     CHECK(!decoded.values[1].has_value());
     REQUIRE(decoded.values[2].has_value());
     CHECK(*decoded.values[2] == trimmed_signed_i64_be(-34'500));
     REQUIRE(decoded.values[3].has_value());
-    CHECK(*decoded.values[3] == trimmed_signed_i64_be(15));
+    CHECK(*decoded.values[3] == trimmed_signed_i64_be(12'000));
 }
 
 TEST_CASE("line_sender c api qwpudp decimal signed boundaries")
@@ -2933,7 +2933,7 @@ TEST_CASE("line_sender c++ qwpudp decimal column")
     buffer.table("cpp_decimals")
         .column(
             "price",
-            questdb::ingress::decimal::decimal_str_view{std::string_view{"1.2"}})
+            questdb::ingress::decimal::decimal_str_view{std::string_view{"1.5e-3"}})
         .at_now();
     buffer.table("cpp_decimals")
         .column(
@@ -2944,7 +2944,7 @@ TEST_CASE("line_sender c++ qwpudp decimal column")
     buffer.table("cpp_decimals")
         .column(
             "price",
-            questdb::ingress::decimal::decimal_str_view{std::string_view{"1.5e-3"}})
+            questdb::ingress::decimal::decimal_str_view{std::string_view{"1.2"}})
         .at_now();
 
     sender.flush(buffer);
@@ -2960,12 +2960,12 @@ TEST_CASE("line_sender c++ qwpudp decimal column")
     CHECK(decoded.scale == 4);
     REQUIRE(decoded.values.size() == 4);
     REQUIRE(decoded.values[0].has_value());
-    CHECK(*decoded.values[0] == trimmed_signed_i64_be(12'000));
+    CHECK(*decoded.values[0] == trimmed_signed_i64_be(15));
     CHECK(!decoded.values[1].has_value());
     REQUIRE(decoded.values[2].has_value());
     CHECK(*decoded.values[2] == trimmed_signed_i64_be(-34'500));
     REQUIRE(decoded.values[3].has_value());
-    CHECK(*decoded.values[3] == trimmed_signed_i64_be(15));
+    CHECK(*decoded.values[3] == trimmed_signed_i64_be(12'000));
 }
 
 TEST_CASE("line_sender c++ qwpudp decimal signed boundaries")
@@ -4063,4 +4063,457 @@ TEST_CASE("line_sender c++ qwpudp new_buffer inherits max_name_len")
     sender.flush(buffer);
     const auto datagram = receiver.recv_datagram();
     CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c qwp narrow integer + decimal columns happy path")
+{
+    udp_capture receiver;
+    line_sender_error* err = nullptr;
+    line_sender_utf8 host = QDB_UTF8_LITERAL("127.0.0.1");
+    line_sender_utf8 port_str{0, nullptr};
+    auto port_s = std::to_string(receiver.port());
+    CHECK(::line_sender_utf8_init(&port_str, port_s.size(), port_s.c_str(), &err));
+    line_sender_opts* opts = ::line_sender_opts_new_service(
+        line_sender_protocol_qwpudp, host, port_str);
+    line_sender* sender = ::line_sender_build(opts, &err);
+    ::line_sender_opts_free(opts);
+    REQUIRE(sender != nullptr);
+
+    line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+
+    line_sender_table_name tbl = QDB_TABLE_NAME_LITERAL("qwp_narrow");
+    line_sender_column_name b_name = QDB_COLUMN_NAME_LITERAL("b");
+    line_sender_column_name s_name = QDB_COLUMN_NAME_LITERAL("s");
+    line_sender_column_name i_name = QDB_COLUMN_NAME_LITERAL("i");
+    line_sender_column_name d64_name = QDB_COLUMN_NAME_LITERAL("d64");
+    line_sender_column_name d128_name = QDB_COLUMN_NAME_LITERAL("d128");
+
+    CHECK(::line_sender_buffer_table(buffer, tbl, &err));
+    CHECK(::line_sender_buffer_column_i8(buffer, b_name, int8_t{-12}, &err));
+    CHECK(::line_sender_buffer_column_i16(buffer, s_name, int16_t{12345}, &err));
+    CHECK(::line_sender_buffer_column_i32(buffer, i_name, int32_t{-1234567}, &err));
+
+    const char* d64_str = "1.25";
+    CHECK(::line_sender_buffer_column_dec64_str(
+        buffer, d64_name, const_cast<char*>(d64_str), 4, &err));
+    const char* d128_str = "170141183460469231731687303715884105727";
+    CHECK(::line_sender_buffer_column_dec128_str(
+        buffer, d128_name, const_cast<char*>(d128_str), 39, &err));
+
+    CHECK(::line_sender_buffer_at_nanos(buffer, 1000, &err));
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    ::line_sender_buffer_free(buffer);
+    ::line_sender_close(sender);
+
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c narrow column methods reject ilp buffer")
+{
+    questdb::ingress::test::mock_server server;
+    line_sender_error* err = nullptr;
+    line_sender_utf8 host = QDB_UTF8_LITERAL("127.0.0.1");
+    line_sender_utf8 port_str{0, nullptr};
+    auto port_s = std::to_string(server.port());
+    CHECK(::line_sender_utf8_init(&port_str, port_s.size(), port_s.c_str(), &err));
+    line_sender_opts* opts = ::line_sender_opts_new_service(
+        line_sender_protocol_tcp, host, port_str);
+    line_sender* sender = ::line_sender_build(opts, &err);
+    ::line_sender_opts_free(opts);
+    REQUIRE(sender != nullptr);
+    server.accept();
+
+    line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+
+    line_sender_table_name tbl = QDB_TABLE_NAME_LITERAL("t");
+    line_sender_column_name col = QDB_COLUMN_NAME_LITERAL("v");
+    CHECK(::line_sender_buffer_table(buffer, tbl, &err));
+
+    auto expect_qwp_only = [&](bool ok, const char* method) {
+        CHECK_FALSE(ok);
+        REQUIRE(err != nullptr);
+        CHECK(::line_sender_error_get_code(err)
+              == line_sender_error_invalid_api_call);
+        size_t msg_len = 0;
+        const char* msg = ::line_sender_error_msg(err, &msg_len);
+        const std::string msg_str(msg, msg_len);
+        CHECK(msg_str.find(method) != std::string::npos);
+        ::line_sender_error_free(err);
+        err = nullptr;
+    };
+
+    expect_qwp_only(
+        ::line_sender_buffer_column_i8(buffer, col, int8_t{1}, &err),
+        "column_i8");
+    expect_qwp_only(
+        ::line_sender_buffer_column_i16(buffer, col, int16_t{1}, &err),
+        "column_i16");
+    expect_qwp_only(
+        ::line_sender_buffer_column_i32(buffer, col, int32_t{1}, &err),
+        "column_i32");
+
+    const char* dec_str = "1.25";
+    expect_qwp_only(
+        ::line_sender_buffer_column_dec64_str(
+            buffer, col, const_cast<char*>(dec_str), 4, &err),
+        "column_dec64");
+    expect_qwp_only(
+        ::line_sender_buffer_column_dec128_str(
+            buffer, col, const_cast<char*>(dec_str), 4, &err),
+        "column_dec128");
+
+    ::line_sender_buffer_free(buffer);
+    ::line_sender_close(sender);
+}
+
+TEST_CASE("line_sender c++ narrow column methods reject ilp buffer")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())}};
+    server.accept();
+
+    auto buffer = sender.new_buffer();
+    buffer.table("t");
+
+    auto expects_qwp_only = [](auto&& fn, const char* method) {
+        try
+        {
+            fn();
+            FAIL("expected " << method << " to throw on ILP buffer");
+        }
+        catch (const questdb::ingress::line_sender_error& e)
+        {
+            CHECK(
+                e.code()
+                == questdb::ingress::line_sender_error_code::
+                       invalid_api_call);
+            CHECK(std::string{e.what()}.find(method) != std::string::npos);
+        }
+    };
+
+    expects_qwp_only([&]() { buffer.column_i8("v", int8_t{1}); }, "column_i8");
+    expects_qwp_only(
+        [&]() { buffer.column_i16("v", int16_t{1}); }, "column_i16");
+    expects_qwp_only(
+        [&]() { buffer.column_i32("v", int32_t{1}); }, "column_i32");
+
+    using questdb::ingress::decimal::decimal_str_view;
+    expects_qwp_only(
+        [&]() {
+            buffer.column_dec64("v", decimal_str_view{std::string_view{"1.25"}});
+        },
+        "column_dec64");
+    expects_qwp_only(
+        [&]() {
+            buffer.column_dec128("v", decimal_str_view{std::string_view{"1.25"}});
+        },
+        "column_dec128");
+}
+
+TEST_CASE("line_sender c++ qwpudp narrow integer + decimal happy path")
+{
+    udp_capture receiver;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())}};
+
+    auto buffer = sender.new_buffer();
+    buffer.table("qwp_narrow_cpp")
+        .column_i8("b", int8_t{-12})
+        .column_i16("s", int16_t{12345})
+        .column_i32("i", int32_t{-1234567})
+        .column_dec64(
+            "d64",
+            questdb::ingress::decimal::decimal_str_view{std::string_view{"1.25"}})
+        .column_dec128(
+            "d128",
+            questdb::ingress::decimal::decimal_str_view{
+                std::string_view{"170141183460469231731687303715884105727"}})
+        .at(questdb::ingress::timestamp_nanos{1000});
+
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c qwp uuid+long256+ipv4 happy path")
+{
+    udp_capture receiver;
+    line_sender_error* err = nullptr;
+    line_sender_utf8 host = QDB_UTF8_LITERAL("127.0.0.1");
+    line_sender_utf8 port_str{0, nullptr};
+    auto port_s = std::to_string(receiver.port());
+    CHECK(::line_sender_utf8_init(&port_str, port_s.size(), port_s.c_str(), &err));
+    line_sender_opts* opts = ::line_sender_opts_new_service(
+        line_sender_protocol_qwpudp, host, port_str);
+    line_sender* sender = ::line_sender_build(opts, &err);
+    ::line_sender_opts_free(opts);
+    REQUIRE(sender != nullptr);
+
+    line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+
+    line_sender_table_name tbl = QDB_TABLE_NAME_LITERAL("qwp_uuid_long256_ipv4");
+    line_sender_column_name uuid_name = QDB_COLUMN_NAME_LITERAL("id");
+    line_sender_column_name long256_name = QDB_COLUMN_NAME_LITERAL("hash");
+    line_sender_column_name ipv4_name = QDB_COLUMN_NAME_LITERAL("addr");
+
+    CHECK(::line_sender_buffer_table(buffer, tbl, &err));
+    CHECK(::line_sender_buffer_column_uuid(
+        buffer, uuid_name, uint64_t{0x0123456789abcdefULL},
+        uint64_t{0xfedcba9876543210ULL}, &err));
+
+    uint8_t hash[32];
+    for (int i = 0; i < 32; ++i)
+        hash[i] = static_cast<uint8_t>(i);
+    CHECK(::line_sender_buffer_column_long256(buffer, long256_name, hash, &err));
+
+    uint32_t addr = (192u << 24) | (168u << 16) | (1u << 8) | 1u;
+    CHECK(::line_sender_buffer_column_ipv4(buffer, ipv4_name, addr, &err));
+
+    CHECK(::line_sender_buffer_at_nanos(buffer, 1000, &err));
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    ::line_sender_buffer_free(buffer);
+    ::line_sender_close(sender);
+
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwp uuid+long256+ipv4 happy path")
+{
+    udp_capture receiver;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())}};
+
+    auto buffer = sender.new_buffer();
+    uint8_t hash[32];
+    for (int i = 0; i < 32; ++i)
+        hash[i] = static_cast<uint8_t>(i ^ 0x55);
+    uint32_t addr = (10u << 24) | (0u << 16) | (0u << 8) | 1u;
+    buffer.table("qwp_uuid_long256_ipv4_cpp")
+        .column_uuid("id", 0xAAAAAAAAAAAAAAAAULL, 0xBBBBBBBBBBBBBBBBULL)
+        .column_long256("hash", hash)
+        .column_ipv4("addr", addr)
+        .at(questdb::ingress::timestamp_nanos{2000});
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwp date+char+binary happy path")
+{
+    udp_capture receiver;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())}};
+
+    auto buffer = sender.new_buffer();
+    const uint8_t blob[5] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
+    buffer.table("qwp_date_char_binary_cpp")
+        .column_date("d", int64_t{1700000000000})
+        .column_char("c", uint16_t{0x4E2D})
+        .column_binary("b", blob, sizeof(blob))
+        .at(questdb::ingress::timestamp_nanos{3000});
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwp geohash happy path")
+{
+    udp_capture receiver;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())}};
+
+    auto buffer = sender.new_buffer();
+    buffer.table("qwp_geohash_cpp")
+        .column_geohash("g", uint64_t{0xABCDEFu}, uint8_t{25})
+        .at(questdb::ingress::timestamp_nanos{4000});
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwp float happy path")
+{
+    udp_capture receiver;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())}};
+
+    auto buffer = sender.new_buffer();
+    buffer.table("qwp_float_cpp")
+        .column_f32("v", 3.5f)
+        .at(questdb::ingress::timestamp_nanos{6000});
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ float reject ilp buffer")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())}};
+    server.accept();
+    auto buffer = sender.new_buffer();
+    buffer.table("t");
+    try
+    {
+        buffer.column_f32("v", 1.5f);
+        FAIL("expected column_f32 to throw on ILP buffer");
+    }
+    catch (const questdb::ingress::line_sender_error& e)
+    {
+        CHECK(
+            e.code()
+            == questdb::ingress::line_sender_error_code::invalid_api_call);
+        CHECK(std::string{e.what()}.find("column_f32") != std::string::npos);
+    }
+}
+
+TEST_CASE("line_sender c++ qwp long_array happy path")
+{
+    udp_capture receiver;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())}};
+
+    auto buffer = sender.new_buffer();
+    size_t shape[] = {3};
+    int64_t data[] = {1, -2, 3};
+    buffer.table("qwp_long_array_cpp")
+        .column_i64_arr("arr", 1, shape, data, 3)
+        .at(questdb::ingress::timestamp_nanos{5000});
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ geohash reject ilp buffer")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())}};
+    server.accept();
+    auto buffer = sender.new_buffer();
+    buffer.table("t");
+    try
+    {
+        buffer.column_geohash("v", 0, 5);
+        FAIL("expected column_geohash to throw on ILP buffer");
+    }
+    catch (const questdb::ingress::line_sender_error& e)
+    {
+        CHECK(
+            e.code()
+            == questdb::ingress::line_sender_error_code::invalid_api_call);
+        CHECK(std::string{e.what()}.find("column_geohash") != std::string::npos);
+    }
+}
+
+TEST_CASE("line_sender c++ date+char+binary reject ilp buffer")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())}};
+    server.accept();
+    auto buffer = sender.new_buffer();
+    buffer.table("t");
+
+    auto expects_qwp_only = [](auto&& fn, const char* method) {
+        try
+        {
+            fn();
+            FAIL("expected " << method << " to throw on ILP buffer");
+        }
+        catch (const questdb::ingress::line_sender_error& e)
+        {
+            CHECK(
+                e.code()
+                == questdb::ingress::line_sender_error_code::
+                       invalid_api_call);
+            CHECK(std::string{e.what()}.find(method) != std::string::npos);
+        }
+    };
+
+    expects_qwp_only(
+        [&]() { buffer.column_date("v", int64_t{42}); }, "column_date");
+    expects_qwp_only(
+        [&]() { buffer.column_char("v", uint16_t{0x0041}); }, "column_char");
+    const uint8_t blob[3] = {1, 2, 3};
+    expects_qwp_only(
+        [&]() { buffer.column_binary("v", blob, sizeof(blob)); },
+        "column_binary");
+}
+
+TEST_CASE("line_sender c uuid+long256+ipv4 reject ilp buffer")
+{
+    questdb::ingress::test::mock_server server;
+    line_sender_error* err = nullptr;
+    line_sender_utf8 host = QDB_UTF8_LITERAL("127.0.0.1");
+    line_sender_utf8 port_str{0, nullptr};
+    auto port_s = std::to_string(server.port());
+    CHECK(::line_sender_utf8_init(&port_str, port_s.size(), port_s.c_str(), &err));
+    line_sender_opts* opts = ::line_sender_opts_new_service(
+        line_sender_protocol_tcp, host, port_str);
+    line_sender* sender = ::line_sender_build(opts, &err);
+    ::line_sender_opts_free(opts);
+    REQUIRE(sender != nullptr);
+    server.accept();
+
+    line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    line_sender_table_name tbl = QDB_TABLE_NAME_LITERAL("t");
+    CHECK(::line_sender_buffer_table(buffer, tbl, &err));
+
+    line_sender_column_name col = QDB_COLUMN_NAME_LITERAL("v");
+    auto expect_qwp_only = [&](bool ok, const char* method) {
+        CHECK_FALSE(ok);
+        REQUIRE(err != nullptr);
+        CHECK(::line_sender_error_get_code(err)
+              == line_sender_error_invalid_api_call);
+        size_t msg_len = 0;
+        const char* msg = ::line_sender_error_msg(err, &msg_len);
+        CHECK(std::string(msg, msg_len).find(method) != std::string::npos);
+        ::line_sender_error_free(err);
+        err = nullptr;
+    };
+
+    expect_qwp_only(
+        ::line_sender_buffer_column_uuid(buffer, col, 1, 2, &err),
+        "column_uuid");
+
+    uint8_t bytes[32] = {0};
+    expect_qwp_only(
+        ::line_sender_buffer_column_long256(buffer, col, bytes, &err),
+        "column_long256");
+
+    expect_qwp_only(
+        ::line_sender_buffer_column_ipv4(buffer, col, 0x7F000001u, &err),
+        "column_ipv4");
+
+    ::line_sender_buffer_free(buffer);
+    ::line_sender_close(sender);
 }

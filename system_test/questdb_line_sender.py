@@ -361,6 +361,152 @@ def _setup_cdll():
         c_int64,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_buffer_column_i8,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_int8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i16,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_int16,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i32,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_int32,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f32,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_float,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec64_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec64,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint32,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec128_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec128,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint32,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_uuid,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_long256,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_ipv4,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint32,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_date,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_char,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint16,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_binary,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_geohash,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint64,
+        ctypes.c_uint8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i64_arr_c_major,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        ctypes.POINTER(c_int64),
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i64_arr_byte_strides,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_ssize_t_p,
+        ctypes.POINTER(c_int64),
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i64_arr_elem_strides,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_ssize_t_p,
+        ctypes.POINTER(c_int64),
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_buffer_column_f64,
         c_bool,
         c_line_sender_buffer_p,
@@ -384,6 +530,17 @@ def _setup_cdll():
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_f64_arr_byte_strides,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_ssize_t_p,
+        c_double_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f64_arr_elem_strides,
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
@@ -940,6 +1097,183 @@ class Buffer:
             c_utf8,
             len(c_utf8))
 
+    def column_i8(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i8,
+            self._impl,
+            _column_name(name),
+            int(value))
+        return self
+
+    def column_i16(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i16,
+            self._impl,
+            _column_name(name),
+            int(value))
+        return self
+
+    def column_i32(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i32,
+            self._impl,
+            _column_name(name),
+            int(value))
+        return self
+
+    def column_f32(self, name: str, value: float):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_f32,
+            self._impl,
+            _column_name(name),
+            ctypes.c_float(value))
+        return self
+
+    def column_dec64_str(self, name: str, value: str):
+        c_utf8 = value.encode('utf-8')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec64_str,
+            self._impl,
+            _column_name(name),
+            c_utf8,
+            len(c_utf8))
+        return self
+
+    def column_dec64(self, name: str, scale: int, le_bytes: bytes):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec64,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint32(scale),
+            le_bytes,
+            len(le_bytes))
+        return self
+
+    def column_dec128_str(self, name: str, value: str):
+        c_utf8 = value.encode('utf-8')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec128_str,
+            self._impl,
+            _column_name(name),
+            c_utf8,
+            len(c_utf8))
+        return self
+
+    def column_dec128(self, name: str, scale: int, le_bytes: bytes):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec128,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint32(scale),
+            le_bytes,
+            len(le_bytes))
+        return self
+
+    def column_uuid(self, name: str, lo: int, hi: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_uuid,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint64(lo),
+            ctypes.c_uint64(hi))
+        return self
+
+    def column_long256(self, name: str, value: bytes):
+        if len(value) != 32:
+            raise ValueError('column_long256 value must be exactly 32 bytes')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_long256,
+            self._impl,
+            _column_name(name),
+            value)
+        return self
+
+    def column_ipv4(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_ipv4,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint32(value))
+        return self
+
+    def column_date(self, name: str, millis: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_date,
+            self._impl,
+            _column_name(name),
+            int(millis))
+        return self
+
+    def column_char(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_char,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint16(value))
+        return self
+
+    def column_binary(self, name: str, value: bytes):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_binary,
+            self._impl,
+            _column_name(name),
+            value,
+            len(value))
+        return self
+
+    def column_geohash(self, name: str, bits: int, precision_bits: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_geohash,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint64(bits),
+            ctypes.c_uint8(precision_bits))
+        return self
+
+    def column_i64_arr(self, name: str, array):
+        arr = numpy.ascontiguousarray(array, dtype=numpy.int64)
+        c_shape = (c_size_t * arr.ndim)(*arr.shape)
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i64_arr_c_major,
+            self._impl,
+            _column_name(name),
+            c_size_t(arr.ndim),
+            c_shape,
+            arr.ctypes.data_as(ctypes.POINTER(c_int64)),
+            c_size_t(arr.size))
+        return self
+
+    def column_i64_arr_byte_strides(self, name: str, array):
+        arr = numpy.asarray(array, dtype=numpy.int64)
+        c_shape = (c_size_t * arr.ndim)(*arr.shape)
+        c_strides = (c_ssize_t * arr.ndim)(*arr.strides)
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i64_arr_byte_strides,
+            self._impl,
+            _column_name(name),
+            c_size_t(arr.ndim),
+            c_shape,
+            c_strides,
+            arr.ctypes.data_as(ctypes.POINTER(c_int64)),
+            c_size_t(arr.size))
+        return self
+
+    def column_i64_arr_elem_strides(self, name: str, array):
+        arr = numpy.asarray(array, dtype=numpy.int64)
+        c_shape = (c_size_t * arr.ndim)(*arr.shape)
+        c_strides = (c_ssize_t * arr.ndim)(
+            *(s // arr.itemsize for s in arr.strides))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i64_arr_elem_strides,
+            self._impl,
+            _column_name(name),
+            c_size_t(arr.ndim),
+            c_shape,
+            c_strides,
+            arr.ctypes.data_as(ctypes.POINTER(c_int64)),
+            c_size_t(arr.size))
+        return self
+
     def column(
             self, name: str,
             value: Union[bool, int, float, str, TimestampMicros, datetime]):
@@ -1200,6 +1534,78 @@ class Sender:
             self, name: str,
             value: str):
         self._buffer.column_dec_str(name, value)
+        return self
+
+    def column_i8(self, name: str, value: int):
+        self._buffer.column_i8(name, value)
+        return self
+
+    def column_i16(self, name: str, value: int):
+        self._buffer.column_i16(name, value)
+        return self
+
+    def column_i32(self, name: str, value: int):
+        self._buffer.column_i32(name, value)
+        return self
+
+    def column_f32(self, name: str, value: float):
+        self._buffer.column_f32(name, value)
+        return self
+
+    def column_dec64_str(self, name: str, value: str):
+        self._buffer.column_dec64_str(name, value)
+        return self
+
+    def column_dec64(self, name: str, scale: int, le_bytes: bytes):
+        self._buffer.column_dec64(name, scale, le_bytes)
+        return self
+
+    def column_dec128_str(self, name: str, value: str):
+        self._buffer.column_dec128_str(name, value)
+        return self
+
+    def column_dec128(self, name: str, scale: int, le_bytes: bytes):
+        self._buffer.column_dec128(name, scale, le_bytes)
+        return self
+
+    def column_uuid(self, name: str, lo: int, hi: int):
+        self._buffer.column_uuid(name, lo, hi)
+        return self
+
+    def column_long256(self, name: str, value: bytes):
+        self._buffer.column_long256(name, value)
+        return self
+
+    def column_ipv4(self, name: str, value: int):
+        self._buffer.column_ipv4(name, value)
+        return self
+
+    def column_date(self, name: str, millis: int):
+        self._buffer.column_date(name, millis)
+        return self
+
+    def column_char(self, name: str, value: int):
+        self._buffer.column_char(name, value)
+        return self
+
+    def column_binary(self, name: str, value: bytes):
+        self._buffer.column_binary(name, value)
+        return self
+
+    def column_geohash(self, name: str, bits: int, precision_bits: int):
+        self._buffer.column_geohash(name, bits, precision_bits)
+        return self
+
+    def column_i64_arr(self, name: str, array):
+        self._buffer.column_i64_arr(name, array)
+        return self
+
+    def column_i64_arr_byte_strides(self, name: str, array):
+        self._buffer.column_i64_arr_byte_strides(name, array)
+        return self
+
+    def column_i64_arr_elem_strides(self, name: str, array):
+        self._buffer.column_i64_arr_elem_strides(name, array)
         return self
 
     def column_f64_arr(

@@ -76,6 +76,7 @@ macro_rules! fmt_error {
 
 macro_rules! new_stride_array {
     (
+        $ty:ty,
         $rank:expr,
         $m:literal,
         $n:literal,
@@ -87,7 +88,7 @@ macro_rules! new_stride_array {
         $buffer:expr,
         $name:expr
     ) => {{
-        let view = match StrideArrayView::<f64, $m, $n>::new($shape, $strides, $data, $data_len) {
+        let view = match StrideArrayView::<$ty, $m, $n>::new($shape, $strides, $data, $data_len) {
             Ok(value) => value,
             Err(err) => {
                 set_err_out_from_error($err_out, err);
@@ -97,13 +98,13 @@ macro_rules! new_stride_array {
         bubble_err_to_c!(
             $err_out,
             $buffer
-                .column_arr::<ColumnName<'_>, StrideArrayView<'_, f64, $m, $n>, f64>($name, &view)
+                .column_arr::<ColumnName<'_>, StrideArrayView<'_, $ty, $m, $n>, $ty>($name, &view)
         );
     }};
 }
 
 macro_rules! generate_array_dims_branches {
-    ($rank:expr, $m:literal, $shape:expr, $strides:expr, $data:expr, $data_len:expr, $err_out:expr, $buffer:expr, $name:expr => $($n:literal),*) => {
+    ($ty:ty, $rank:expr, $m:literal, $shape:expr, $strides:expr, $data:expr, $data_len:expr, $err_out:expr, $buffer:expr, $name:expr => $($n:literal),*) => {
         match $rank {
             0 => {
                 if !$err_out.is_null() {
@@ -117,6 +118,7 @@ macro_rules! generate_array_dims_branches {
             }
             $(
                 $n => new_stride_array!(
+                    $ty,
                     $rank,
                     $m,
                     $n,
@@ -1270,6 +1272,66 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64(
     }
 }
 
+/// Record an 8-bit signed integer for the given column. QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_i8(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: i8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_i8(name.as_name(), value));
+        true
+    }
+}
+
+/// Record a 16-bit signed integer for the given column. QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_i16(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: i16,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_i16(name.as_name(), value));
+        true
+    }
+}
+
+/// Record a 32-bit signed integer for the given column. QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_i32(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: i32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_i32(name.as_name(), value));
+        true
+    }
+}
+
+/// Record a 32-bit floating-point value for the given column. QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_f32(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: f32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_f32(name.as_name(), value));
+        true
+    }
+}
+
 /// Record a string value for the given column.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
@@ -1393,6 +1455,302 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec(
     true
 }
 
+/// Record a 64-bit decimal string value for the given column. QWP-only.
+/// Same string format as `line_sender_buffer_column_dec_str`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_dec64_str(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: *mut c_char,
+    value_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unsafe { unwrap_buffer_mut(buffer) };
+    let name = name.as_name();
+    let value = unsafe { slice::from_raw_parts(value as *const u8, value_len) };
+    let value = match str::from_utf8(value) {
+        Ok(value) => value,
+        Err(err) => {
+            if !err_out.is_null() {
+                unsafe {
+                    set_err_out_from_error(
+                        err_out,
+                        questdb::Error::new(
+                            questdb::ErrorCode::InvalidDecimal,
+                            format!("Decimal string is not valid UTF-8: {err}"),
+                        ),
+                    );
+                }
+            }
+            return false;
+        }
+    };
+    unsafe {
+        bubble_err_to_c!(
+            err_out,
+            buffer.column_dec64(name, DecimalView::String { value })
+        );
+    }
+    true
+}
+
+/// Record a 64-bit decimal value for the given column. QWP-only.
+/// Same scaled-int format as `line_sender_buffer_column_dec`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_dec64(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    scale: u32,
+    data: *const u8,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let data = if data.is_null() {
+            &[]
+        } else {
+            slice::from_raw_parts(data, data_len)
+        };
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        let decimal = bubble_err_to_c!(err_out, DecimalView::try_new_scaled(scale, data));
+        bubble_err_to_c!(err_out, buffer.column_dec64(name, decimal));
+    }
+    true
+}
+
+/// Record a 128-bit decimal string value for the given column. QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_dec128_str(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: *mut c_char,
+    value_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unsafe { unwrap_buffer_mut(buffer) };
+    let name = name.as_name();
+    let value = unsafe { slice::from_raw_parts(value as *const u8, value_len) };
+    let value = match str::from_utf8(value) {
+        Ok(value) => value,
+        Err(err) => {
+            if !err_out.is_null() {
+                unsafe {
+                    set_err_out_from_error(
+                        err_out,
+                        questdb::Error::new(
+                            questdb::ErrorCode::InvalidDecimal,
+                            format!("Decimal string is not valid UTF-8: {err}"),
+                        ),
+                    );
+                }
+            }
+            return false;
+        }
+    };
+    unsafe {
+        bubble_err_to_c!(
+            err_out,
+            buffer.column_dec128(name, DecimalView::String { value })
+        );
+    }
+    true
+}
+
+/// Record a 128-bit decimal value for the given column. QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_dec128(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    scale: u32,
+    data: *const u8,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let data = if data.is_null() {
+            &[]
+        } else {
+            slice::from_raw_parts(data, data_len)
+        };
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        let decimal = bubble_err_to_c!(err_out, DecimalView::try_new_scaled(scale, data));
+        bubble_err_to_c!(err_out, buffer.column_dec128(name, decimal));
+    }
+    true
+}
+
+/// Record a UUID column value. QWP-only.
+///
+/// The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_uuid(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    lo: u64,
+    hi: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_uuid(name.as_name(), lo, hi));
+        true
+    }
+}
+
+/// Record a LONG256 column value. QWP-only.
+///
+/// `value` must point to exactly 32 bytes: four 64-bit limbs encoded
+/// little-endian, least-significant limb first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_long256(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: *const u8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        if value.is_null() {
+            if !err_out.is_null() {
+                set_err_out_from_error(
+                    err_out,
+                    questdb::Error::new(
+                        questdb::ErrorCode::InvalidApiCall,
+                        "column_long256 value pointer must not be NULL".to_string(),
+                    ),
+                );
+            }
+            return false;
+        }
+        let buffer = unwrap_buffer_mut(buffer);
+        let bytes: &[u8; 32] = &*(value as *const [u8; 32]);
+        bubble_err_to_c!(err_out, buffer.column_long256(name.as_name(), bytes));
+        true
+    }
+}
+
+/// Record an IPv4 column value. QWP-only.
+///
+/// `value` is the address packed as a u32 with octet 0 in the high byte:
+/// `addr = ((a << 24) | (b << 16) | (c << 8) | d)`. The encoder writes
+/// `value.to_le_bytes()` so the wire bytes appear as `[d, c, b, a]`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_ipv4(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let addr = std::net::Ipv4Addr::from(value);
+        bubble_err_to_c!(err_out, buffer.column_ipv4(name.as_name(), addr));
+        true
+    }
+}
+
+/// Record a DATE column value (milliseconds since the Unix epoch). QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_date(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    millis: i64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_date(name.as_name(), millis));
+        true
+    }
+}
+
+/// Record a CHAR column value (single UTF-16 code unit). QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_char(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: u16,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_char(name.as_name(), value));
+        true
+    }
+}
+
+/// Record a BINARY column value (opaque byte sequence). QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_binary(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    data: *const u8,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let bytes = if data.is_null() {
+            &[]
+        } else {
+            slice::from_raw_parts(data, data_len)
+        };
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_binary(name.as_name(), bytes));
+        true
+    }
+}
+
+/// Record a GEOHASH column value. QWP-only.
+///
+/// `precision_bits` must be in `1..=60` and is pinned per column.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_geohash(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    bits: u64,
+    precision_bits: u8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(
+            err_out,
+            buffer.column_geohash(name.as_name(), bits, precision_bits)
+        );
+        true
+    }
+}
+
+/// Records an int64 multidimensional array with C-major memory layout. QWP-only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_i64_arr_c_major(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    data: *const i64,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        let view = match CMajorArrayView::<i64>::new(rank, shape, data, data_len) {
+            Ok(value) => value,
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                return false;
+            }
+        };
+        bubble_err_to_c!(
+            err_out,
+            buffer.column_arr::<ColumnName<'_>, CMajorArrayView<'_, i64>, i64>(name, &view)
+        );
+        true
+    }
+}
+
 /// Records a float64 multidimensional array with **C-MAJOR memory layout**.
 ///
 /// @param[in] buffer Line buffer object.
@@ -1467,6 +1825,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
         let buffer = unwrap_buffer_mut(buffer);
         let name = name.as_name();
         generate_array_dims_branches!(
+            f64,
             rank,
             1,
             shape,
@@ -1515,6 +1874,73 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
         let buffer = unwrap_buffer_mut(buffer);
         let name = name.as_name();
         generate_array_dims_branches!(
+            f64,
+            rank,
+            8,
+            shape,
+            strides,
+            data,
+            data_len,
+            err_out,
+            buffer,
+            name
+            => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+        );
+        true
+    }
+}
+
+/// Records an int64 multidimensional array with **byte stride specification**.
+/// QWP-only. See `line_sender_buffer_column_f64_arr_byte_strides` for parameter docs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_i64_arr_byte_strides(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    strides: *const isize,
+    data: *const i64,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        generate_array_dims_branches!(
+            i64,
+            rank,
+            1,
+            shape,
+            strides,
+            data,
+            data_len,
+            err_out,
+            buffer,
+            name
+            => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+        );
+        true
+    }
+}
+
+/// Records an int64 multidimensional array with **element count stride specification**.
+/// QWP-only. See `line_sender_buffer_column_f64_arr_elem_strides` for parameter docs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_i64_arr_elem_strides(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    strides: *const isize,
+    data: *const i64,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        generate_array_dims_branches!(
+            i64,
             rank,
             8,
             shape,

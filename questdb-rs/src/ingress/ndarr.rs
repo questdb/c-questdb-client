@@ -187,6 +187,14 @@ impl ArrayElementSealed for f64 {
     }
 }
 
+impl ArrayElement for i64 {}
+
+impl ArrayElementSealed for i64 {
+    fn type_tag() -> u8 {
+        6 // Long
+    }
+}
+
 /// impl NdArrayView for one dimension vector
 impl<T: ArrayElement> NdArrayView<T> for Vec<T> {
     type Iter<'a>

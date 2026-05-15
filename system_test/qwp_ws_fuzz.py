@@ -98,6 +98,10 @@ BATCH_SIZE = 10
 # (column-type label, integer-conversion compatible types) used by the ALTER
 # thread to pick a valid target type.
 INTEGER_COLUMN_TYPES = ('BYTE', 'SHORT', 'INT', 'LONG')
+# Rank for widening-only ALTER targets. Narrowing would force the server to
+# range-check ints sent under the wider wire type — and its cast does not
+# honour the NULL sentinel, so sparse-null rows get dropped on overflow.
+INTEGER_TYPE_RANK = {t: i for i, t in enumerate(INTEGER_COLUMN_TYPES)}
 
 COL_NAME_BASES = (
     # ----- Java-parity columns (STRING/DOUBLE × 6) -----
@@ -123,6 +127,20 @@ COL_NAME_BASES = (
     ('series_3d', 'SERIES_3D', 'sERIES_3d', 'Series_3d'),  # DOUBLE[][][]
     ('event_us', 'EVENT_US', 'event_Us', 'Event_US'),  # TIMESTAMP (micros)
     ('event_ns', 'EVENT_NS', 'event_Ns', 'Event_NS'),  # TIMESTAMP (nanos)
+    ('age', 'AGE', 'Age', 'aGE'),                      # BYTE (i8)
+    ('depth', 'DEPTH', 'DePth', 'depTH'),              # SHORT (i16)
+    ('rank_i', 'RANK_I', 'rank_I', 'Rank_i'),          # INT (i32)
+    ('amount64', 'AMOUNT64', 'amount_64', 'Amount64'), # DECIMAL64
+    ('amount128', 'AMOUNT128', 'amount_128', 'Amount128'),  # DECIMAL128
+    ('trace_id', 'TRACE_ID', 'trace_Id', 'TraceID'),   # UUID
+    ('hash256', 'HASH256', 'hash_256', 'Hash256'),     # LONG256
+    # ('src_ip', 'SRC_IP', 'Src_Ip', 'src_IP'),  # IPv4 — server dispatch missing
+    ('event_ms', 'EVENT_MS', 'event_Ms', 'Event_MS'),  # DATE
+    ('marker_c', 'MARKER_C', 'marker_C', 'Marker_C'),  # CHAR
+    # ('blob', 'BLOB', 'Blob', 'bLOB'),  # BINARY — server dispatch missing
+    ('region', 'REGION', 'Region', 'reGION'),          # GEOHASH
+    # ('counters', 'COUNTERS', 'Counters', 'CountER'),  # LONG_ARRAY — server WAL appender rejects
+    ('frame_pos', 'FRAME_POS', 'frame_Pos', 'Frame_PoS'),  # FLOAT
 )
 COL_TYPES = (
     # Java-parity types — share `COL_VALUE_BASES` numeric strings.
@@ -131,6 +149,12 @@ COL_TYPES = (
     'BOOLEAN', 'LONG', 'DECIMAL256',
     'DOUBLE_ARRAY_1D', 'DOUBLE_ARRAY_2D', 'DOUBLE_ARRAY_3D',
     'TIMESTAMP_MICROS', 'TIMESTAMP_NANOS',
+    'BYTE', 'SHORT', 'INT',
+    'DECIMAL64', 'DECIMAL128',
+    'UUID', 'LONG256',  # 'IPV4' disabled until server supports type code 0x18
+    'DATE', 'CHAR',     # 'BINARY' disabled until server supports type code 0x17
+    'GEOHASH',          # 'LONG_ARRAY' disabled until server WAL supports it
+    'FLOAT',
 )
 COL_VALUE_BASES = (
     'europe', '8', '2', '1', 'note', '6',
@@ -140,6 +164,12 @@ COL_VALUE_BASES = (
     '', '4', '7',
     '', '', '',
     '', '',
+    '3', '5', '9',
+    '11', '13',
+    '', '',         # UUID, LONG256
+    '', '',         # DATE, CHAR
+    '',             # GEOHASH
+    '',             # FLOAT
 )
 
 # Extreme strings & symbols emitted under extreme_string_factor. Each
@@ -165,6 +195,8 @@ EXTREME_SYMBOLS = tuple(
     # so we use the same set minus the value with an internal space.
     s for s in EXTREME_STRINGS if ' ' not in s
 )
+
+
 
 NON_ASCII_CHARS = (
     'ó', 'í', 'Á', 'ч', 'Ъ', 'Ж', 'ю',
@@ -320,6 +352,7 @@ class TableData:
         self._name = name
         self._lock = threading.Lock()
         self._rows = []
+        self._initial_col_types = {}
 
     @property
     def name(self) -> str:
@@ -328,6 +361,15 @@ class TableData:
     def add_line(self, line: LineData):
         with self._lock:
             self._rows.append(line)
+
+    def record_initial_col_type(self, col_name: str, col_type: str):
+        key = col_name.lower()
+        with self._lock:
+            self._initial_col_types.setdefault(key, col_type)
+
+    def initial_col_type(self, col_name: str):
+        with self._lock:
+            return self._initial_col_types.get(col_name.lower())
 
     def all_rows(self):
         with self._lock:
@@ -375,13 +417,15 @@ def _is_array_type(server_type: str) -> bool:
 def _missing_default(server_type: str) -> str:
     # When a producer omits a column from a line, the server picks a
     # per-type default. JSON renders DOUBLE/FLOAT/array NULLs as null;
-    # BOOLEAN has no null sentinel and defaults to false; everything
-    # else comes back as null too. We canonicalise to the strings the
-    # actual-side formatter would produce.
+    # BOOLEAN has no null sentinel and defaults to false; BYTE/SHORT
+    # are non-nullable in QuestDB and default to 0; everything else
+    # comes back as null too.
     if server_type in _NUMERIC_FLOAT_TYPES:
         return 'null'
     if _is_array_type(server_type):
         return 'null'
+    if server_type in ('BYTE', 'SHORT'):
+        return '0'
     if server_type == 'BOOLEAN':
         return 'false'
     return ''
@@ -391,6 +435,14 @@ def format_expected_cell(value, server_type: str) -> str:
     """Format an expected (producer-side) value to the comparison string."""
     if value is None:
         return _missing_default(server_type)
+    if server_type == 'FLOAT':
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if f == 0.0:
+            return '0.0'
+        return str(np.float32(f))
     if server_type in _NUMERIC_FLOAT_TYPES:
         try:
             return _format_float(float(value))
@@ -420,6 +472,14 @@ def format_expected_cell(value, server_type: str) -> str:
         if isinstance(value, str):
             return str(_iso_to_nanos(value))
         return str(value)
+    if server_type == 'DATE':
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str):
+            return str(_iso_to_nanos(value) // 1_000_000)
+        return str(value)
+    if _is_geohash_type(server_type):
+        return _format_geohash_expected(value, server_type)
     if _is_decimal_type(server_type):
         return _normalize_decimal(value)
     if _is_array_type(server_type):
@@ -451,6 +511,14 @@ def format_actual_cell(value, server_type: str) -> str:
         if isinstance(value, int):
             return str(value)
         return str(value)
+    if server_type == 'DATE':
+        if isinstance(value, str):
+            return str(_iso_to_nanos(value) // 1_000_000)
+        if isinstance(value, int):
+            return str(value)
+        return str(value)
+    if _is_geohash_type(server_type):
+        return str(value)
     if _is_decimal_type(server_type):
         return _normalize_decimal(value)
     if _is_array_type(server_type):
@@ -464,6 +532,67 @@ def _format_float(f: float) -> str:
         # Avoid "-0.0" vs "0.0" mismatch.
         return '0.0'
     return repr(f)
+
+
+def _format_uuid(lo: int, hi: int) -> str:
+    lo &= (1 << 64) - 1
+    hi &= (1 << 64) - 1
+    combined = (hi << 64) | lo
+    hex_str = f'{combined:032x}'
+    return f'{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}'
+
+
+def _format_long256(raw: bytes) -> str:
+    # QuestDB Long256 string formatter strips full leading zero bytes
+    # (pairs of '0'), never partial nibbles.
+    rev = bytes(reversed(raw))
+    hex_str = rev.hex()
+    while len(hex_str) > 2 and hex_str.startswith('00'):
+        hex_str = hex_str[2:]
+    return '0x' + hex_str
+
+
+_GEOHASH_BASE32 = '0123456789bcdefghjkmnpqrstuvwxyz'
+
+
+def _is_geohash_type(server_type: str) -> bool:
+    return server_type.startswith('GEOHASH(') and server_type.endswith(')')
+
+
+def _geohash_dimension(server_type: str):
+    if not _is_geohash_type(server_type):
+        return None, None
+    inner = server_type[len('GEOHASH('):-1]
+    if not inner:
+        return None, None
+    suffix = inner[-1]
+    try:
+        n = int(inner[:-1])
+    except ValueError:
+        return None, None
+    return suffix, n
+
+
+def _format_geohash_expected(value, server_type: str) -> str:
+    if not isinstance(value, str) or '/' not in value:
+        return str(value)
+    hex_part, _, _ = value.partition('/')
+    try:
+        bits = int(hex_part, 16)
+    except ValueError:
+        return value
+    suffix, n = _geohash_dimension(server_type)
+    if suffix == 'c' and n is not None:
+        return ''.join(
+            _GEOHASH_BASE32[(bits >> (i * 5)) & 0x1F]
+            for i in range(n - 1, -1, -1)
+        )
+    if suffix == 'b' and n is not None:
+        return ''.join(
+            '1' if (bits >> i) & 1 else '0'
+            for i in range(n - 1, -1, -1)
+        )
+    return value
 
 
 def _format_array(value) -> str:
@@ -773,6 +902,89 @@ def add_column_value(col_type: str, value_base: str, col_name: str,
             i_val = picks[rnd.next_int(len(picks))]
         sender.column(col_name, i_val)
         return i_val
+    if col_type == 'BYTE':
+        i_val = (int(value_base) * 10 + rnd.next_int(9)) % 100
+        sender.column_i8(col_name, i_val)
+        return i_val
+    if col_type == 'SHORT':
+        i_val = (int(value_base) * 1000 + rnd.next_int(900))
+        sender.column_i16(col_name, i_val)
+        return i_val
+    if col_type == 'INT':
+        i_val = int(value_base) * 1_000_000 + rnd.next_int(1_000_000)
+        sender.column_i32(col_name, i_val)
+        return i_val
+    if col_type == 'DECIMAL64':
+        whole = int(value_base) * 10 + rnd.next_int(9)
+        frac = rnd.next_int(100)
+        dec_str = f'{whole}.{frac:02d}'
+        sender.column_dec64_str(col_name, dec_str)
+        return dec_str
+    if col_type == 'DECIMAL128':
+        whole = int(value_base) * 1000 + rnd.next_int(1000)
+        frac = rnd.next_int(100)
+        dec_str = f'{whole}.{frac:02d}'
+        sender.column_dec128_str(col_name, dec_str)
+        return dec_str
+    if col_type == 'UUID':
+        lo = rnd.next_long()
+        hi = rnd.next_long()
+        sender.column_uuid(col_name, lo, hi)
+        return _format_uuid(lo, hi)
+    if col_type == 'LONG256':
+        raw = bytes(rnd.next_int(256) for _ in range(32))
+        sender.column_long256(col_name, raw)
+        return _format_long256(raw)
+    if col_type == 'IPV4':
+        a = rnd.next_int(256)
+        b = rnd.next_int(256)
+        c = rnd.next_int(256)
+        d = rnd.next_int(256)
+        addr = (a << 24) | (b << 16) | (c << 8) | d
+        sender.column_ipv4(col_name, addr)
+        return f'{a}.{b}.{c}.{d}'
+    if col_type == 'DATE':
+        ms = 1_700_000_000_000 + rnd.next_int(86_400_000)
+        sender.column_date(col_name, ms)
+        return ms
+    if col_type == 'CHAR':
+        v = rnd.next_int(0x110000)
+        # Reject C0/C1 controls, DEL, surrogates, and non-BMP: QuestDB's
+        # /exec JSON does not escape raw control bytes, which would then
+        # break json.loads on the client.
+        if (
+            v < 0x20
+            or 0x7F <= v <= 0x9F
+            or 0xD800 <= v <= 0xDFFF
+            or v >= 0x10000
+        ):
+            v = ord('A') + rnd.next_int(26)
+        sender.column_char(col_name, v)
+        return chr(v)
+    if col_type == 'BINARY':
+        length = 1 + rnd.next_int(16)
+        raw = bytes(rnd.next_int(256) for _ in range(length))
+        sender.column_binary(col_name, raw)
+        return raw.hex()
+    if col_type == 'GEOHASH':
+        precision_bits = 25
+        mask = (1 << precision_bits) - 1
+        bits = rnd.next_long() & mask
+        sender.column_geohash(col_name, bits, precision_bits)
+        return f'{bits:08x}/{precision_bits}'
+    if col_type == 'LONG_ARRAY':
+        length = 2 + rnd.next_int(3)
+        arr = np.array(
+            [(rnd.next_long() % 2_000_000) - 1_000_000 for _ in range(length)],
+            dtype=np.int64)
+        sender.column_i64_arr(col_name, arr)
+        return arr.tolist()
+    if col_type == 'FLOAT':
+        whole = rnd.next_int(1000)
+        frac = rnd.next_int(1000)
+        f_val = whole + frac / 1000.0
+        sender.column_f32(col_name, f_val)
+        return _format_float(float(np.float32(f_val)))
     if col_type == 'DECIMAL256':
         # Default magnitude stays in scale-2 territory. Under
         # extreme_numeric_factor we throw in negatives and large
@@ -852,8 +1064,10 @@ def add_column_value(col_type: str, value_base: str, col_name: str,
 
 
 def add_column(line: LineData, col_index: int, sender,
-               params: FuzzParams, rnd: Rng) -> str:
+               params: FuzzParams, rnd: Rng,
+               table_data: 'TableData') -> str:
     name = generate_column_name(col_index, False, params.diff_cases_in_col_names, rnd)
+    table_data.record_initial_col_type(name, COL_TYPES[col_index])
     value = add_column_value(
         COL_TYPES[col_index], COL_VALUE_BASES[col_index], name, sender, params, rnd)
     line.add_column(name, value)
@@ -870,9 +1084,11 @@ def add_symbol(line: LineData, sym_index: int, sender,
 
 
 def add_duplicate_column(line: LineData, col_index: int, col_name: str,
-                         sender, params: FuzzParams, rnd: Rng):
+                         sender, params: FuzzParams, rnd: Rng,
+                         table_data: 'TableData'):
     if not should_fuzz(params.duplicates_factor, rnd):
         return
+    table_data.record_initial_col_type(col_name, COL_TYPES[col_index])
     value = add_column_value(
         COL_TYPES[col_index], COL_VALUE_BASES[col_index], col_name, sender, params, rnd)
     line.add_column(col_name, value)
@@ -887,12 +1103,14 @@ def add_duplicate_symbol(line: LineData, sym_index: int, sym_name: str,
     line.add_tag(sym_name, value)
 
 
-def add_new_column(line: LineData, sender, params: FuzzParams, rnd: Rng):
+def add_new_column(line: LineData, sender, params: FuzzParams, rnd: Rng,
+                   table_data: 'TableData'):
     if not should_fuzz(params.new_column_factor, rnd):
         return
     extra_col_index = rnd.next_int(len(COL_NAME_BASES))
     name = generate_column_name(
         extra_col_index, True, params.diff_cases_in_col_names, rnd)
+    table_data.record_initial_col_type(name, COL_TYPES[extra_col_index])
     value = add_column_value(
         COL_TYPES[extra_col_index], COL_VALUE_BASES[extra_col_index],
         name, sender, params, rnd)
@@ -920,7 +1138,8 @@ def canonical_table_name(table_index: int) -> str:
 
 
 def generate_line(table_name: str, sender, params: FuzzParams,
-                  timestamp_us: int, rnd: Rng) -> LineData:
+                  timestamp_us: int, rnd: Rng,
+                  table_data: 'TableData') -> LineData:
     line = LineData(timestamp_us)
     sender.table(table_name)
 
@@ -939,9 +1158,10 @@ def generate_line(table_name: str, sender, params: FuzzParams,
             len(COL_NAME_BASES), params.column_reordering_factor, rnd),
         params.column_skip_factor, rnd)
     for col_index in col_indexes:
-        col_name = add_column(line, col_index, sender, params, rnd)
-        add_duplicate_column(line, col_index, col_name, sender, params, rnd)
-        add_new_column(line, sender, params, rnd)
+        col_name = add_column(line, col_index, sender, params, rnd, table_data)
+        add_duplicate_column(line, col_index, col_name, sender, params, rnd,
+                             table_data)
+        add_new_column(line, sender, params, rnd, table_data)
 
     sender.at_micros(timestamp_us)
     return line
@@ -969,6 +1189,13 @@ def change_column_type_to(col_type: str, rnd: Rng) -> str:
         return 'STRING' if rnd.next_boolean() else 'VARCHAR'
     if col_type == 'VARCHAR':
         return 'STRING' if rnd.next_boolean() else 'SYMBOL'
+    if col_type in INTEGER_COLUMN_TYPES:
+        rank = INTEGER_TYPE_RANK[col_type]
+        wider = [t for t in INTEGER_COLUMN_TYPES
+                 if INTEGER_TYPE_RANK[t] > rank]
+        if not wider:
+            return col_type
+        return wider[rnd.next_int(len(wider))]
     if col_type == 'FLOAT':
         return 'DOUBLE'
     if col_type == 'DOUBLE':
@@ -1282,8 +1509,16 @@ def compare_table(
             if col_name.lower() == 'timestamp' and _is_timestamp_type(col_type):
                 continue
             expected_raw = expected_line.get_value(col_name)
-            expected_str = format_expected_cell(expected_raw, col_type)
             actual_str = format_actual_cell(server_row[col_index], col_type)
+            if expected_raw is None:
+                initial_type = table.initial_col_type(col_name) or col_type
+                expected_str = _missing_default(initial_type)
+                if (initial_type in ('BYTE', 'SHORT')
+                        and initial_type != col_type
+                        and actual_str == _missing_default(col_type)):
+                    continue
+            else:
+                expected_str = format_expected_cell(expected_raw, col_type)
             if expected_str != actual_str:
                 raise TableMismatch(
                     f'[{seed_label}] table {table.name!r} row {row_index} '

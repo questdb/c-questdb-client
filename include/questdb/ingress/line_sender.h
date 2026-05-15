@@ -635,6 +635,52 @@ bool line_sender_buffer_column_f64(
     line_sender_error** err_out);
 
 /**
+ * Record an 8-bit signed integer for the given column. QWP-only.
+ *
+ * On ILP buffers this returns line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i8(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int8_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a 16-bit signed integer for the given column. QWP-only.
+ *
+ * On ILP buffers this returns line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i16(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int16_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a 32-bit signed integer for the given column. QWP-only.
+ *
+ * On ILP buffers this returns line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i32(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int32_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a 32-bit floating-point value for the given column. QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f32(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    float value,
+    line_sender_error** err_out);
+
+/**
  * Record a string value for the given column.
  *
  * @param[in] buffer Line buffer object.
@@ -689,6 +735,206 @@ bool line_sender_buffer_column_dec(
     line_sender_column_name name,
     const unsigned int scale,
     const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a decimal string value as DECIMAL64. QWP-only.
+ *
+ * Same string format as line_sender_buffer_column_dec_str. The unscaled
+ * magnitude must fit a signed 64-bit integer at the column's pinned scale;
+ * values that do not fit return line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec64_str(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const char *value,
+    size_t value_len,
+    line_sender_error** err_out);
+
+/**
+ * Record an unscaled-int decimal value as DECIMAL64. QWP-only.
+ *
+ * Same scale + two's-complement big-endian format as
+ * line_sender_buffer_column_dec. Values that do not fit a signed 64-bit
+ * integer at the chosen scale return line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec64(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const unsigned int scale,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a decimal string value as DECIMAL128. QWP-only.
+ *
+ * Same string format as line_sender_buffer_column_dec_str. Values that do
+ * not fit a signed 128-bit integer at the column's pinned scale return
+ * line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec128_str(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const char *value,
+    size_t value_len,
+    line_sender_error** err_out);
+
+/**
+ * Record an unscaled-int decimal value as DECIMAL128. QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec128(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const unsigned int scale,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a UUID column value. QWP-only.
+ *
+ * The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+ */
+LINESENDER_API
+bool line_sender_buffer_column_uuid(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint64_t lo,
+    uint64_t hi,
+    line_sender_error** err_out);
+
+/**
+ * Record a LONG256 column value. QWP-only.
+ *
+ * `value` must point to exactly 32 bytes: four 64-bit limbs encoded
+ * little-endian, least-significant limb first.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_long256(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const uint8_t* value,
+    line_sender_error** err_out);
+
+/**
+ * Record an IPv4 column value. QWP-only.
+ *
+ * `value` is the address packed as a u32 with octet 0 in the high byte:
+ *   `addr = ((uint32_t)a << 24) | (b << 16) | (c << 8) | d`
+ * The encoder writes `addr.to_le_bytes()` so the wire bytes appear as
+ * `[d, c, b, a]`.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_ipv4(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint32_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a DATE column value (milliseconds since the Unix epoch). QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_date(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int64_t millis,
+    line_sender_error** err_out);
+
+/**
+ * Record a CHAR column value (single UTF-16 code unit). QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_char(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint16_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a BINARY column value (opaque byte sequence). QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_binary(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a GEOHASH column value. QWP-only.
+ *
+ * `precision_bits` must be in `1..=60` and is pinned per column.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_geohash(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint64_t bits,
+    uint8_t precision_bits,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of `int64` values in C-major order. QWP-only.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shape Array of dimension sizes (length = `rank`).
+ *                  Each element must be a positive integer.
+ * @param[in] data First array element data.
+ * @param[in] data_len Element length of the array.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i64_arr_c_major(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const int64_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of `int64` values with byte strides. QWP-only.
+ *
+ * @param[in] strides Array strides, in the unit of bytes. Strides can be
+ *                    negative.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i64_arr_byte_strides(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const int64_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of `int64` values with element strides. QWP-only.
+ *
+ * @param[in] strides Array strides, in the unit of elements. Strides can be
+ *                    negative.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i64_arr_elem_strides(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const int64_t* data,
     size_t data_len,
     line_sender_error** err_out);
 

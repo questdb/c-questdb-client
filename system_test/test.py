@@ -2316,19 +2316,20 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _require_fuzz_fixture(self):
         self._require_qwp_ws_protocol()
-        if not isinstance(QDB_FIXTURE, QuestDbFixture):
-            self.skipTest('QWP/WebSocket fuzz tests require a managed QuestDB fixture')
-        root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-        # Same repo-only gate as TestQwpWsRestart: the release-matrix server
-        # builds on the fixed version list do not expose QWP/WebSocket.
-        if root_dir is not None and root_dir.name != 'repo':
-            self.skipTest('QWP/WebSocket fuzz tests require a QuestDB repo fixture')
+        if isinstance(QDB_FIXTURE, QuestDbFixture):
+            # Same repo-only gate as TestQwpWsRestart: the release-matrix server
+            # builds on the fixed version list do not expose QWP/WebSocket.
+            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
+            if root_dir is not None and root_dir.name != 'repo':
+                self.skipTest('QWP/WebSocket fuzz tests require a QuestDB repo fixture')
+            if QDB_FIXTURE.http:
+                self.skipTest('QWP/WebSocket fuzz tests run outside the HTTP ILP matrix')
+        elif not isinstance(QDB_FIXTURE, QuestDbExternalFixture):
+            self.skipTest('QWP/WebSocket fuzz tests require a managed or --existing QuestDB fixture')
         if QDB_FIXTURE.auth:
             self.skipTest('QWP/WebSocket fuzz tests run without auth')
         if getattr(QDB_FIXTURE, 'http_auth', False):
             self.skipTest('QWP/WebSocket fuzz tests run without HTTP auth')
-        if QDB_FIXTURE.http:
-            self.skipTest('QWP/WebSocket fuzz tests run outside the HTTP ILP matrix')
 
     @staticmethod
     def _is_windows():
@@ -2538,9 +2539,11 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 for _ in range(load.num_of_lines):
                     table_name = qwp_ws_fuzz.pick_table_name(
                         load.num_of_tables, rnd)
+                    table_data = tables[table_name.lower()]
                     line = qwp_ws_fuzz.generate_line(
-                        table_name, sender, fuzz, next_ts(), rnd)
-                    tables[table_name.lower()].add_line(line)
+                        table_name, sender, fuzz, next_ts(), rnd,
+                        table_data)
+                    table_data.add_line(line)
                     points += 1
                     if points % qwp_ws_fuzz.BATCH_SIZE == 0:
                         sender.flush()
