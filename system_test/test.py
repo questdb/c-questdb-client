@@ -2452,6 +2452,20 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     log=self._log)
                 alter_thread.start()
 
+            bounce_thread = None
+            if fuzz.max_bounces > 0:
+                bounce_thread = qwp_ws_fuzz.BounceThread(
+                    fixture=QDB_FIXTURE,
+                    rnd=self._master_rng.child(),
+                    max_bounces=fuzz.max_bounces,
+                    min_interval_s=fuzz.min_bounce_interval_s,
+                    max_interval_s=fuzz.max_bounce_interval_s,
+                    writers_done=producers_done,
+                    stop_event=stop_event,
+                    failure_counter=failure_counter,
+                    log=self._log)
+                bounce_thread.start()
+
             try:
                 for thread in producer_threads:
                     thread.join()
@@ -2464,9 +2478,23 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     stop_event.set()
                     alter_thread.join(timeout=30)
 
+            if bounce_thread is not None:
+                # Bounces are inherently slower (process restart + HTTP-up
+                # wait), so give the thread a generous wind-down budget.
+                bounce_thread.join(timeout=60)
+                if bounce_thread.is_alive():
+                    stop_event.set()
+                    bounce_thread.join(timeout=60)
+                if bounce_thread.bounces_performed > 0:
+                    self._log(
+                        f'fuzz bounce summary: '
+                        f'{bounce_thread.bounces_performed}'
+                        f'/{fuzz.max_bounces} performed')
+
         self.assertEqual(
             failure_counter[0], 0,
-            f'[{self._seed_label}] producer/alter failures: {failure_messages}')
+            f'[{self._seed_label}] producer/alter/bounce failures: '
+            f'{failure_messages}')
 
         for name, table in tables.items():
             expected = table.valid_count()
@@ -2493,7 +2521,10 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             sender_id,
             sf_root,
             reconnect_max_duration_millis=120000,
-            close_flush_timeout_millis=60000)
+            # 2 min on close_drain — bounce-test variants need a long
+            # enough budget for SFA to replay queued frames into a
+            # freshly-restarted server.
+            close_flush_timeout_millis=120000)
         try:
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
@@ -2902,6 +2933,63 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             exercise_symbols=False,
             send_symbols_with_space=False,
             column_convert_prob=0.05)
+        self._run_fuzz(load, fuzz)
+
+    # --- Bounce-during-fuzz variants ----------------------------------
+    #
+    # Each variant stops + starts the QDB fixture at random intervals
+    # while producers are mid-batch. The QWP/WebSocket sender's SFA
+    # layer must keep queued frames durable across the bounce so all
+    # producer-acknowledged rows still land on the other side.
+
+    def test_load_with_bounce(self):
+        # Pad the per-iteration wait so producers stay alive long enough
+        # for the chaos thread to actually fire its bounces — without
+        # the inter-iteration sleep, 5 threads × 5 iterations × 100
+        # rows finishes in under a second and the bounce thread never
+        # gets a chance to run.
+        load = qwp_ws_fuzz.LoadParams(
+            100, 5 if not self._is_windows() else 3, 5, 5, 400)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            max_bounces=3,
+            min_bounce_interval_s=0.3,
+            max_bounce_interval_s=1.5)
+        self._run_fuzz(load, fuzz)
+
+    def test_all_mixed_with_bounce(self):
+        load = qwp_ws_fuzz.LoadParams(
+            50, 5 if not self._is_windows() else 3, 5, 5, 400)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            duplicates_factor=3,
+            column_reordering_factor=4,
+            column_skip_factor=5,
+            new_column_factor=10,
+            non_ascii_value_factor=5,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=True,
+            column_convert_prob=0.05,
+            max_bounces=3,
+            min_bounce_interval_s=0.3,
+            max_bounce_interval_s=1.5)
+        self._run_fuzz(load, fuzz)
+
+    def test_n_bounce_sweep(self):
+        # Many short bounces so the chaos thread gets multiple chances
+        # to land mid-flush. Each bounce is ~3-5s of process restart so
+        # the test takes ~30-60s including the producers' SFA replay.
+        load = qwp_ws_fuzz.LoadParams(
+            100, 10 if not self._is_windows() else 6, 5, 5, 400)
+        fuzz = qwp_ws_fuzz.FuzzParams(
+            column_reordering_factor=4,
+            new_column_factor=5,
+            non_ascii_value_factor=4,
+            diff_cases_in_col_names=True,
+            exercise_symbols=True,
+            send_symbols_with_space=False,
+            max_bounces=10,
+            min_bounce_interval_s=0.3,
+            max_bounce_interval_s=1.2)
         self._run_fuzz(load, fuzz)
 
 

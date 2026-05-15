@@ -89,19 +89,25 @@ COL_NAME_BASES = (
      'ВЕТЕР', 'вЕТЕр',
      'ВетЕР'),
     # ----- Extended wire-type coverage (not in Java) -----
-    ('flag', 'FLAG', 'Flag', 'flAG'),                # BOOLEAN
-    ('count', 'COUNT', 'CounT', 'Count'),            # LONG (i64)
-    ('price', 'PRICE', 'pRICE', 'Price'),            # DECIMAL256
-    ('series', 'SERIES', 'sERIES', 'Series'),        # DOUBLE_ARRAY (1- or 2-D)
-    ('event_us', 'EVENT_US', 'event_Us', 'Event_US'),# TIMESTAMP (micros)
-    ('event_ns', 'EVENT_NS', 'event_Ns', 'Event_NS'),# TIMESTAMP (nanos)
+    ('flag', 'FLAG', 'Flag', 'flAG'),                  # BOOLEAN
+    ('count', 'COUNT', 'CounT', 'Count'),              # LONG (i64)
+    ('price', 'PRICE', 'pRICE', 'Price'),              # DECIMAL256
+    # Arrays are split by rank because the server locks in
+    # dimensionality on first row — sending a different rank later
+    # gets the batch silently dropped, which would divorce producer-
+    # side expected counts from server-side reality.
+    ('series_1d', 'SERIES_1D', 'sERIES_1d', 'Series_1d'),  # DOUBLE[]
+    ('series_2d', 'SERIES_2D', 'sERIES_2d', 'Series_2d'),  # DOUBLE[][]
+    ('event_us', 'EVENT_US', 'event_Us', 'Event_US'),  # TIMESTAMP (micros)
+    ('event_ns', 'EVENT_NS', 'event_Ns', 'Event_NS'),  # TIMESTAMP (nanos)
 )
 COL_TYPES = (
     # Java-parity types — share `COL_VALUE_BASES` numeric strings.
     'STRING', 'DOUBLE', 'DOUBLE', 'DOUBLE', 'STRING', 'DOUBLE',
     # Extended types.
     'BOOLEAN', 'LONG', 'DECIMAL256',
-    'DOUBLE_ARRAY', 'TIMESTAMP_MICROS', 'TIMESTAMP_NANOS',
+    'DOUBLE_ARRAY_1D', 'DOUBLE_ARRAY_2D',
+    'TIMESTAMP_MICROS', 'TIMESTAMP_NANOS',
 )
 COL_VALUE_BASES = (
     'europe', '8', '2', '1', 'note', '6',
@@ -109,7 +115,8 @@ COL_VALUE_BASES = (
     # for those that don't need it. LONG / DECIMAL still use it as a
     # numeric magnitude so values stay readable in failure logs.
     '', '4', '7',
-    '', '', '',
+    '', '',
+    '', '',
 )
 
 NON_ASCII_CHARS = (
@@ -306,18 +313,30 @@ def _is_decimal_type(server_type: str) -> bool:
     return server_type.startswith('DECIMAL')
 
 
+def _is_timestamp_type(server_type: str) -> bool:
+    # QuestDB reports both microsecond and nanosecond timestamp columns;
+    # the suffix encodes precision (`TIMESTAMP_NS`). Both round-trip
+    # through `_iso_to_nanos` so we treat them identically here.
+    return server_type == 'TIMESTAMP' or server_type.startswith('TIMESTAMP_')
+
+
 def _is_array_type(server_type: str) -> bool:
     # 'DOUBLE[]', 'DOUBLE[][]', and any future array types include '['.
     return '[' in server_type
 
 
 def _missing_default(server_type: str) -> str:
-    # Java's `getDefaultValue` returns "null" for DOUBLE/FLOAT and "" for
-    # everything else when filling in missing columns.
+    # When a producer omits a column from a line, the server picks a
+    # per-type default. JSON renders DOUBLE/FLOAT/array NULLs as null;
+    # BOOLEAN has no null sentinel and defaults to false; everything
+    # else comes back as null too. We canonicalise to the strings the
+    # actual-side formatter would produce.
     if server_type in _NUMERIC_FLOAT_TYPES:
         return 'null'
     if _is_array_type(server_type):
         return 'null'
+    if server_type == 'BOOLEAN':
+        return 'false'
     return ''
 
 
@@ -339,7 +358,7 @@ def format_expected_cell(value, server_type: str) -> str:
         if isinstance(value, str):
             return value.lower()
         return 'true' if value else 'false'
-    if server_type == 'TIMESTAMP':
+    if _is_timestamp_type(server_type):
         # Expected values are integers in nanoseconds-since-epoch (see
         # add_column_value for TIMESTAMP_MICROS / TIMESTAMP_NANOS).
         if isinstance(value, int):
@@ -372,7 +391,7 @@ def format_actual_cell(value, server_type: str) -> str:
         if isinstance(value, bool):
             return 'true' if value else 'false'
         return str(value).lower()
-    if server_type == 'TIMESTAMP':
+    if _is_timestamp_type(server_type):
         if isinstance(value, str):
             return str(_iso_to_nanos(value))
         if isinstance(value, int):
@@ -500,7 +519,8 @@ def skip_columns(indexes, skip_factor: int, rnd: Rng):
 
 class FuzzParams:
     """Fuzz axis settings for one test method, mirroring Java's
-    `initFuzzParameters`."""
+    `initFuzzParameters` plus our extensions for ALTER COLUMN TYPE
+    racing and server-bounce chaos."""
 
     __slots__ = (
         'duplicates_factor',
@@ -512,6 +532,9 @@ class FuzzParams:
         'exercise_symbols',
         'send_symbols_with_space',
         'column_convert_prob',
+        'max_bounces',
+        'min_bounce_interval_s',
+        'max_bounce_interval_s',
     )
 
     def __init__(
@@ -524,7 +547,10 @@ class FuzzParams:
             diff_cases_in_col_names=False,
             exercise_symbols=True,
             send_symbols_with_space=False,
-            column_convert_prob=0.0):
+            column_convert_prob=0.0,
+            max_bounces=0,
+            min_bounce_interval_s=0.5,
+            max_bounce_interval_s=3.0):
         self.duplicates_factor = duplicates_factor
         self.column_reordering_factor = column_reordering_factor
         self.column_skip_factor = column_skip_factor
@@ -534,6 +560,10 @@ class FuzzParams:
         self.exercise_symbols = exercise_symbols
         self.send_symbols_with_space = send_symbols_with_space
         self.column_convert_prob = column_convert_prob
+        self.max_bounces = max_bounces
+        self.min_bounce_interval_s = min_bounce_interval_s
+        self.max_bounce_interval_s = max(
+            min_bounce_interval_s, max_bounce_interval_s)
 
 
 class LoadParams:
@@ -625,21 +655,22 @@ def add_column_value(col_type: str, value_base: str, col_name: str,
         ts_ns = 1_700_000_000_000_000_000 + rnd.next_int(86_400_000_000_000)
         sender.column(col_name, qls.TimestampNanos(ts_ns))
         return ts_ns
-    if col_type == 'DOUBLE_ARRAY':
-        # Mix 1-D and 2-D arrays. Integer-valued floats so any rounding
-        # in server-side storage stays lossless.
-        if rnd.next_boolean():
-            length = 2 + rnd.next_int(3)
-            arr = np.array(
-                [float(rnd.next_int(100)) for _ in range(length)],
-                dtype=np.float64)
-        else:
-            rows = 2 + rnd.next_int(2)
-            cols = 2 + rnd.next_int(2)
-            arr = np.array(
-                [[float(rnd.next_int(100)) for _ in range(cols)]
-                 for _ in range(rows)],
-                dtype=np.float64)
+    if col_type == 'DOUBLE_ARRAY_1D':
+        # Rank fixed per-column so the server's auto-created DOUBLE[]
+        # column type doesn't reject rows with the wrong rank.
+        length = 2 + rnd.next_int(3)
+        arr = np.array(
+            [float(rnd.next_int(100)) for _ in range(length)],
+            dtype=np.float64)
+        sender.column_f64_arr(col_name, arr)
+        return arr.tolist()
+    if col_type == 'DOUBLE_ARRAY_2D':
+        rows = 2 + rnd.next_int(2)
+        cols = 2 + rnd.next_int(2)
+        arr = np.array(
+            [[float(rnd.next_int(100)) for _ in range(cols)]
+             for _ in range(rows)],
+            dtype=np.float64)
         sender.column_f64_arr(col_name, arr)
         return arr.tolist()
     # Fallback — anything we forgot.
@@ -750,25 +781,25 @@ def generate_line(table_name: str, sender, params: FuzzParams,
 def change_column_type_to(col_type: str, rnd: Rng) -> str:
     """Pick a target column type for ALTER, matching Java's
     `changeColumnTypeTo`. Returns the original type if no compatible target
-    exists."""
+    exists.
+
+    Note: Java's fuzz also cycles BYTE/SHORT/INT/LONG, but the QWP/WS
+    wire only carries LONG and skipped columns become LONG-NULL on the
+    server. Narrowing to BYTE/SHORT then causes the server to reject
+    every row that omits the column ("integer value null out of range
+    for SHORT"), which the DropAndContinue policy silently swallows on
+    the client. We therefore leave integer columns alone.
+    """
     if col_type == 'STRING':
         return 'SYMBOL' if rnd.next_boolean() else 'VARCHAR'
     if col_type == 'SYMBOL':
         return 'STRING' if rnd.next_boolean() else 'VARCHAR'
     if col_type == 'VARCHAR':
         return 'STRING' if rnd.next_boolean() else 'SYMBOL'
-    if col_type in INTEGER_COLUMN_TYPES:
-        nxt = col_type
-        # Java loops until it picks a *different* type.
-        while nxt == col_type:
-            nxt = INTEGER_COLUMN_TYPES[rnd.next_int(len(INTEGER_COLUMN_TYPES))]
-        return nxt
     if col_type == 'FLOAT':
         return 'DOUBLE'
     if col_type == 'DOUBLE':
         return 'FLOAT'
-    if col_type == 'TIMESTAMP':
-        return 'LONG'
     return col_type
 
 
@@ -865,13 +896,15 @@ class AlterThread(threading.Thread):
                 self._log(
                     f'fuzz alter: {table_name}.{name} {col_type} -> {target}')
                 return True
+            except urllib.error.URLError:
+                # Server is unreachable — likely mid-bounce. Drop this
+                # attempt; the outer loop will pick a new target after a
+                # short sleep, by which point start() should have
+                # finished.
+                return False
             except Exception as e:  # noqa: BLE001
                 message = str(e)
                 if any(p in message.lower() for p in _ALTER_TOLERATED_PATTERNS):
-                    continue
-                if isinstance(e, urllib.error.HTTPError):
-                    # Surface transport-level failures only — schema-rejection
-                    # bodies match the tolerated-pattern list above.
                     continue
                 self._log(
                     f'fuzz alter: unexpected failure on '
@@ -879,6 +912,91 @@ class AlterThread(threading.Thread):
                 self._failure_counter[0] += 1
                 return False
         return False
+
+
+class BounceThread(threading.Thread):
+    """Background thread that bounces the QuestDB fixture at random
+    intervals while producers are mid-batch.
+
+    Stops when:
+
+    * the bounce budget is exhausted (``bounces_performed >= max_bounces``);
+    * the producers signal completion via ``writers_done.set()``;
+    * ``stop_event`` is set; or
+    * a previous bounce raised, in which case ``failure_counter`` gets
+      bumped and the thread tries one defensive ``start()`` before
+      exiting so the rest of the test still has a server to talk to.
+
+    Each bounce is atomic from the caller's perspective: once the loop
+    enters a bounce cycle it completes ``stop()`` + ``start()`` before
+    re-checking the exit conditions. That guarantees we never leave the
+    server down at the end of the run.
+    """
+
+    def __init__(
+            self,
+            *,
+            fixture,
+            rnd: Rng,
+            max_bounces: int,
+            min_interval_s: float,
+            max_interval_s: float,
+            writers_done: threading.Event,
+            stop_event: threading.Event,
+            failure_counter: list,
+            log,
+    ):
+        super().__init__(name='qwp-ws-fuzz-bounce', daemon=True)
+        self._fixture = fixture
+        self._rnd = rnd
+        self._max_bounces = max_bounces
+        self._min_interval_s = min_interval_s
+        self._max_interval_s = max(max_interval_s, min_interval_s)
+        self._writers_done = writers_done
+        self._stop_event = stop_event
+        self._failure_counter = failure_counter
+        self._log = log
+        self.bounces_performed = 0
+
+    def run(self):
+        while (
+                self.bounces_performed < self._max_bounces
+                and not self._writers_done.is_set()
+                and not self._stop_event.is_set()
+                and self._failure_counter[0] == 0):
+            interval = self._pick_interval()
+            # Bail early if writers signal completion mid-sleep.
+            if self._writers_done.wait(timeout=interval):
+                return
+            try:
+                idx = self.bounces_performed + 1
+                self._log(f'fuzz bounce #{idx}: stopping QDB')
+                self._fixture.stop()
+                # Tiny gap so the OS settles the listening sockets
+                # before start() rebinds them.
+                time.sleep(0.02 + self._rnd.next_int(200) / 1000.0)
+                self._log(f'fuzz bounce #{idx}: starting QDB')
+                self._fixture.start()
+                self.bounces_performed += 1
+                self._log(f'fuzz bounce #{idx}: server back up')
+            except Exception as e:  # noqa: BLE001 — fixture lifecycle is fragile
+                self._log(
+                    f'fuzz bounce: unexpected failure at attempt '
+                    f'{self.bounces_performed + 1}: {e}')
+                self._failure_counter[0] += 1
+                # One defensive recovery attempt so the rest of the test
+                # has a chance to surface the underlying assertion
+                # failure rather than a query timeout.
+                try:
+                    self._fixture.start()
+                except Exception:
+                    pass
+                return
+
+    def _pick_interval(self) -> float:
+        span_ms = max(1, int(
+            (self._max_interval_s - self._min_interval_s) * 1000))
+        return self._min_interval_s + self._rnd.next_int(span_ms) / 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +1035,7 @@ def compare_table(
     # the per-cell comparison. Other TIMESTAMP columns are compared
     # normally — `format_*_cell` canonicalises both sides to nanoseconds.
     has_designated_ts = any(
-        col['name'].lower() == 'timestamp' and col['type'] == 'TIMESTAMP'
+        col['name'].lower() == 'timestamp' and _is_timestamp_type(col['type'])
         for col in server_columns)
     if not has_designated_ts:
         raise TableMismatch(
@@ -928,7 +1046,7 @@ def compare_table(
         for col_index, col in enumerate(server_columns):
             col_name = col['name']
             col_type = col['type']
-            if col_name.lower() == 'timestamp' and col_type == 'TIMESTAMP':
+            if col_name.lower() == 'timestamp' and _is_timestamp_type(col_type):
                 continue
             expected_raw = expected_line.get_value(col_name)
             expected_str = format_expected_cell(expected_raw, col_type)
