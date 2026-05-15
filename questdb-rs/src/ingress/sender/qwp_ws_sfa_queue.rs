@@ -770,14 +770,12 @@ impl SfaProducer {
         self.engine.validate_submit(payload)?;
         let fsn = self.next_fsn;
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
-        if self.append_to_active(payload)? {
-            self.publish(next_fsn);
+        if self.append_to_active(payload, next_fsn)? {
             return Ok(QwpReceipt { fsn });
         }
 
         self.rotate_active()?;
-        if self.append_to_active(payload)? {
-            self.publish(next_fsn);
+        if self.append_to_active(payload, next_fsn)? {
             Ok(QwpReceipt { fsn })
         } else {
             Err(QueueError::PayloadExceedsByteCapacity {
@@ -796,7 +794,19 @@ impl SfaProducer {
         self.engine.completed_fsn()
     }
 
-    fn append_to_active(&mut self, payload: &[u8]) -> Result<bool, SfaQueueError> {
+    /// Append `payload` to the active segment and advance `published_upper`
+    /// to `next_fsn` *before* publishing segment visibility.
+    ///
+    /// The ordering matters: once `active.publish` makes the frame readable
+    /// by the sender thread, the server can ACK it. The ACK path validates
+    /// `target_upper <= engine.published_upper` and would raise
+    /// `ProtocolAckedUnsentFrame` if the engine's watermark hadn't caught
+    /// up yet. So `engine.published_upper` is bumped first, then the frame
+    /// is made visible — readers may briefly observe `published_upper`
+    /// ahead of the segment (handled by the runner returning Idle), but
+    /// they can never observe a visible frame whose ack would violate the
+    /// watermark.
+    fn append_to_active(&mut self, payload: &[u8], next_fsn: u64) -> Result<bool, SfaQueueError> {
         let Some(appended) = self
             .active
             .try_append_at(self.active_append_offset, payload)?
@@ -808,16 +818,13 @@ impl SfaProducer {
             .active_frame_count
             .checked_add(1)
             .ok_or(QueueError::SequenceOverflow)?;
-        self.active
-            .publish(self.active_append_offset, self.active_frame_count);
-        Ok(true)
-    }
-
-    fn publish(&mut self, next_fsn: u64) {
         self.next_fsn = next_fsn;
         self.engine
             .published_upper
             .store(next_fsn, Ordering::Release);
+        self.active
+            .publish(self.active_append_offset, self.active_frame_count);
+        Ok(true)
     }
 
     fn rotate_active(&mut self) -> Result<(), SfaQueueError> {
