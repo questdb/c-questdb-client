@@ -48,14 +48,23 @@ stages:
           # locally via the regression seeds checked in under
           # questdb-rs/proptest-regressions/egress/.
           - bash: |
-              set -e
+              set -euxo pipefail
               cd questdb-rs
+              # `cargo test` only accepts one positional filter, and a filter
+              # under `--test NAME` applies inside that integration bin — it
+              # does not reach `mod tests` blocks in the lib. Split into one
+              # invocation per scope so the proptest modules in src/egress/
+              # actually run.
               PROPTEST_CASES=10000 cargo test --release \
                 --features sync-reader-ws \
                 --test qwp_egress_bounds_fuzz \
-                --test qwp_egress_fragmentation_fuzz \
-                egress::binds::tests \
-                egress::decoder::tests
+                --test qwp_egress_fragmentation_fuzz
+              PROPTEST_CASES=10000 cargo test --release \
+                --features sync-reader-ws \
+                --lib egress::binds::tests
+              PROPTEST_CASES=10000 cargo test --release \
+                --features sync-reader-ws \
+                --lib egress::decoder::tests
             displayName: "Run QWP egress fuzz suite"
 
       # Live-server fuzz: bind / fragmentation / random-schema cases
