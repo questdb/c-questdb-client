@@ -138,15 +138,26 @@ fn http_status(host: &str, port: u16, path: &str) -> u16 {
 
 /// Run a SQL statement via the QuestDB HTTP `/exec` endpoint. Used for
 /// DDL / setup queries; result body is not parsed.
+///
+/// ureq's default request-prelude buffer is 128 KB, which is too small
+/// for wide-schema `INSERT ... VALUES (...)` strings the fuzz tests
+/// generate; bump to 4 MiB to match the server-side
+/// `http.request.header.buffer.size` we set in `start_fragmented`.
 pub fn http_exec(host: &str, port: u16, sql: &str) -> u16 {
     let url = format!("http://{}:{}/exec", host, port);
-    // ureq 3.1's `RequestBuilder::query` replaces the older `prepare`
-    // call; identical semantics, percent-encoded URL query string.
-    match ureq::get(&url).query("query", sql).call() {
+    let agent = ureq::Agent::config_builder()
+        .output_buffer_size(4 * 1024 * 1024)
+        .build()
+        .new_agent();
+    match agent.get(&url).query("query", sql).call() {
         Ok(resp) => resp.status().as_u16(),
         Err(ureq::Error::StatusCode(code)) => code,
         Err(e) => {
-            eprintln!("[live-server] http_exec error: {}", e);
+            eprintln!(
+                "[live-server] http_exec error: {} (sql len={})",
+                e,
+                sql.len()
+            );
             0
         }
     }
