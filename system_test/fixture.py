@@ -489,6 +489,7 @@ class QuestDbFixture(QuestDbFixtureBase):
             f'Starting QuestDB: {launch_args!r} '
             f'(auth: {self.auth}, http_auth: {self.http_auth}, '
             f'http: {self.http}, qwp_udp: {self.qwp_udp})\n')
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log = open(self._log_path, 'ab')
         # On Windows, Popen.terminate() maps to TerminateProcess(), which kills
         # the JVM without running shutdown hooks. That leaves QuestDB's writers
@@ -572,6 +573,29 @@ class QuestDbFixture(QuestDbFixtureBase):
         if self._log:
             self._log.close()
             self._log = None
+
+    def wipe_data_dir(self):
+        """Remove everything under the data dir except ``conf/``.
+
+        Reclaims disk space accumulated by dropped tables whose async purge
+        hasn't run yet. Must be called only after stop(); refuses to wipe
+        while QuestDB is running.
+        """
+        if self._proc is not None:
+            raise RuntimeError(
+                'wipe_data_dir() called while QuestDB is still running')
+        if not self._data_dir.exists():
+            return
+        for child in self._data_dir.iterdir():
+            if child.name == 'conf':
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
 
     def __exit__(self, _ty, _value, _tb):
         self.stop()

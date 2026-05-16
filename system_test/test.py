@@ -2304,6 +2304,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         self._master_rng = qwp_ws_fuzz.Rng(seed)
         self._seed_label = (
             f'{self.id()} seed={qwp_ws_fuzz.format_seed(seed)}')
+        self._created_tables = []
         sys.stderr.write(f'[qwp_ws_fuzz seed] {self._seed_label}\n')
         sys.stderr.flush()
         QDB_FIXTURE.http_sql_query(
@@ -2311,6 +2312,8 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def tearDown(self):
         if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            for name in self._created_tables:
+                self._drop_table_if_exists(name)
             QDB_FIXTURE.http_sql_query(
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {self.id()}')
 
@@ -2398,6 +2401,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             name = qwp_ws_fuzz.canonical_table_name(i)
             tables[name] = qwp_ws_fuzz.TableData(name)
             self._drop_table_if_exists(name)
+            self._created_tables.append(name)
 
         run_id = uuid.uuid4().hex[:8]
         timestamp_us = [self.BASE_TIMESTAMP_US]
@@ -4173,6 +4177,7 @@ def run_with_fixtures(args):
                                 TLS_PROXY_FIXTURE = None
                 finally:
                     QDB_FIXTURE.stop()
+                    QDB_FIXTURE.wipe_data_dir()
 
         if run_qwp_ws_smoke_suite:
             for http_auth in (False, True):
@@ -4207,6 +4212,7 @@ def run_with_fixtures(args):
                             QWP_WS_SMOKE_TLS = False
                 finally:
                     QDB_FIXTURE.stop()
+                    QDB_FIXTURE.wipe_data_dir()
 
         if run_qwp_ws_protocol_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4225,6 +4231,7 @@ def run_with_fixtures(args):
                     sys.exit(1)
             finally:
                 QDB_FIXTURE.stop()
+                QDB_FIXTURE.wipe_data_dir()
 
         if run_qwp_ws_restart_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4243,6 +4250,7 @@ def run_with_fixtures(args):
                     sys.exit(1)
             finally:
                 QDB_FIXTURE.stop()
+                QDB_FIXTURE.wipe_data_dir()
 
         if run_qwp_ws_fuzz_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4261,6 +4269,7 @@ def run_with_fixtures(args):
                     sys.exit(1)
             finally:
                 QDB_FIXTURE.stop()
+                QDB_FIXTURE.wipe_data_dir()
 
 
 def run(args, show_help=False):
