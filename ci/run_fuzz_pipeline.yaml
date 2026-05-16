@@ -10,7 +10,7 @@ pr: none
 # watchdog for the QWP egress proptest suites and the source of Slack
 # #builds alerts.
 schedules:
-  - cron: "0,30 * * * *"
+  - cron: "10,40 * * * *"
     displayName: Run QWP egress fuzz every 30 minutes
     branches:
       include:
