@@ -50,8 +50,6 @@
 //!   layer.
 //! - Text frames: QWP is binary-only.
 
-#![cfg(feature = "sync-reader-ws")]
-
 pub(crate) mod client;
 pub(crate) mod frame;
 pub(crate) mod handshake;

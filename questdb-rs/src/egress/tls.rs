@@ -30,8 +30,6 @@
 //! ingress `CertificateAuthority` enum, which is re-exported from
 //! `crate::egress` for parity with the connect-string keys.
 
-#![cfg(feature = "sync-reader-ws")]
-
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;

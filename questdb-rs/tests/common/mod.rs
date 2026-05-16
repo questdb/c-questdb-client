@@ -35,6 +35,12 @@
 //! Built only when the `live-server-tests` feature is enabled.
 
 #![cfg(feature = "live-server-tests")]
+// `tests/common/mod.rs` is compiled once per integration-test binary
+// (Rust's "tests/<name>.rs each is a separate crate" model). Helpers
+// that only some binaries need surface as `dead_code` in the others.
+// Mark the module as such to keep `clippy -D warnings` quiet without
+// peppering individual fns with `#[allow]`.
+#![allow(dead_code)]
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -132,13 +138,26 @@ fn http_status(host: &str, port: u16, path: &str) -> u16 {
 
 /// Run a SQL statement via the QuestDB HTTP `/exec` endpoint. Used for
 /// DDL / setup queries; result body is not parsed.
+///
+/// ureq's default request-prelude buffer is 128 KB, which is too small
+/// for wide-schema `INSERT ... VALUES (...)` strings the fuzz tests
+/// generate; bump to 4 MiB to match the server-side
+/// `http.request.header.buffer.size` we set in `start_fragmented`.
 pub fn http_exec(host: &str, port: u16, sql: &str) -> u16 {
     let url = format!("http://{}:{}/exec", host, port);
-    match ureq::get(&url).prepare("query", sql).call() {
+    let agent = ureq::Agent::config_builder()
+        .output_buffer_size(4 * 1024 * 1024)
+        .build()
+        .new_agent();
+    match agent.get(&url).query("query", sql).call() {
         Ok(resp) => resp.status().as_u16(),
         Err(ureq::Error::StatusCode(code)) => code,
         Err(e) => {
-            eprintln!("[live-server] http_exec error: {}", e);
+            eprintln!(
+                "[live-server] http_exec error: {} (sql len={})",
+                e,
+                sql.len()
+            );
             0
         }
     }
@@ -178,9 +197,27 @@ impl QuestDbServer {
     // dump_recent_log defined in the impl block above; this is the boot
     // path.
 
-    /// Boot a fresh server. Blocks until `/ping` responds 204 or the
-    /// timeout fires; on failure dumps the JVM log to stderr.
+    /// Boot a fresh server with no extra server-conf keys. Convenience
+    /// wrapper around [`Self::start_with_config`].
+    ///
+    /// Used by the shared singleton in `egress_live_server.rs` so dozens
+    /// of pinned-value smoke tests can amortise the ~15 s JVM boot.
     pub fn start() -> Self {
+        Self::start_with_config(&[])
+    }
+
+    /// Boot a fresh server and append `extra_conf` to its `server.conf`.
+    /// Each `(key, value)` produces one line `key=value` after the
+    /// fixture's default port / telemetry block. Blocks until `/ping`
+    /// responds 204 or the 45 s timeout fires; on failure dumps the JVM
+    /// log to stderr.
+    ///
+    /// Use this constructor for tests that need per-instance debug
+    /// knobs (e.g. `debug.http.force.recv.fragmentation.chunk.size`
+    /// for fragmentation fuzz). The returned `QuestDbServer` owns its
+    /// JVM — `Drop` kills it at end of test, so each per-test instance
+    /// costs one ~15 s boot.
+    pub fn start_with_config(extra_conf: &[(&str, &str)]) -> Self {
         let jar = locate_jar();
         let java = locate_java();
         let ports = allocate_ports(3);
@@ -189,7 +226,7 @@ impl QuestDbServer {
         let data_dir = tempfile::tempdir().expect("tempdir");
         let conf_dir = data_dir.path().join("conf");
         std::fs::create_dir_all(&conf_dir).expect("conf dir");
-        let conf = format!(
+        let mut conf = format!(
             "http.bind.to=127.0.0.1:{http}\n\
              line.tcp.net.bind.to=127.0.0.1:{ilp}\n\
              pg.net.bind.to=127.0.0.1:{pg}\n\
@@ -201,12 +238,17 @@ impl QuestDbServer {
             ilp = ilp_port,
             pg = pg_port,
         );
+        for (k, v) in extra_conf {
+            conf.push_str(k);
+            conf.push('=');
+            conf.push_str(v);
+            conf.push('\n');
+        }
         std::fs::write(conf_dir.join("server.conf"), conf).expect("server.conf");
 
         let log_path = data_dir.path().join("jvm.log");
         let log_file = std::fs::OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&log_path)
             .expect("open jvm.log");
@@ -276,7 +318,10 @@ impl QuestDbServer {
         );
     }
 
-    /// `ws::` connect string for the egress reader.
+    /// `ws::` connect string for the egress reader. The function name
+    /// is a historical artefact — the connect-string scheme is now
+    /// `ws`/`wss`, but the helper kept its older name for source
+    /// stability across call sites.
     pub fn qwp_conf(&self) -> String {
         format!("ws::addr={}:{}", self.host, self.http_port)
     }

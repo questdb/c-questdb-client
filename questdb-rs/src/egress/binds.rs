@@ -904,4 +904,272 @@ mod tests {
             ColumnKind::Geohash
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Property-based fuzz: random value → encode → manually parse the wire
+    // bytes → assert the round-trip matches the input bit-for-bit. Ports
+    // `core/.../QwpEgressBindFuzzTest.java` from the OSS questdb repo. The
+    // Java original drives a live `TestServerMain` so the server does the
+    // decode; here we re-implement the per-type wire reader inline because
+    // the Rust crate ships only the encoder (the server is the canonical
+    // decoder in production). The reader mirrors the layout documented at
+    // the top of this file so any encoder change that drifts from the spec
+    // surfaces here as a fuzz failure.
+    // -----------------------------------------------------------------------
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strip the `[type_code, null_flag=0x00]` prefix from a non-null
+        /// value bind, returning the remaining payload bytes. Panics —
+        /// which proptest reports as a shrinkable failure — if the prefix
+        /// doesn't match.
+        fn body_of_non_null(expected_kind: ColumnKind, encoded: &[u8]) -> &[u8] {
+            assert!(encoded.len() >= 2, "encoded bind too short");
+            assert_eq!(
+                encoded[0],
+                expected_kind.as_u8(),
+                "type code mismatch: encoded={:02x} expected={:02x} ({})",
+                encoded[0],
+                expected_kind.as_u8(),
+                expected_kind.name()
+            );
+            assert_eq!(encoded[1], 0x00, "null_flag must be 0x00 for non-null bind");
+            &encoded[2..]
+        }
+
+        // ---- Scalar round-trips (Java's testFuzzIntegralBindsProjection
+        // territory: long, int, short, byte, bool) ----------------------
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 200,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn fuzz_bool(v: bool) {
+                let bytes = enc(Bind::Bool(v));
+                let body = body_of_non_null(ColumnKind::Boolean, &bytes);
+                prop_assert_eq!(body, &[v as u8][..]);
+            }
+
+            #[test]
+            fn fuzz_i8(v: i8) {
+                let bytes = enc(Bind::I8(v));
+                let body = body_of_non_null(ColumnKind::Byte, &bytes);
+                prop_assert_eq!(body, &[v as u8][..]);
+            }
+
+            #[test]
+            fn fuzz_i16(v: i16) {
+                let bytes = enc(Bind::I16(v));
+                let body = body_of_non_null(ColumnKind::Short, &bytes);
+                prop_assert_eq!(body.len(), 2);
+                let got = i16::from_le_bytes(body.try_into().unwrap());
+                prop_assert_eq!(got, v);
+            }
+
+            #[test]
+            fn fuzz_i32(v: i32) {
+                let bytes = enc(Bind::I32(v));
+                let body = body_of_non_null(ColumnKind::Int, &bytes);
+                prop_assert_eq!(body.len(), 4);
+                let got = i32::from_le_bytes(body.try_into().unwrap());
+                prop_assert_eq!(got, v);
+            }
+
+            #[test]
+            fn fuzz_i64(v: i64) {
+                let bytes = enc(Bind::I64(v));
+                let body = body_of_non_null(ColumnKind::Long, &bytes);
+                prop_assert_eq!(body.len(), 8);
+                let got = i64::from_le_bytes(body.try_into().unwrap());
+                prop_assert_eq!(got, v);
+            }
+
+            // -- Floats: compare by raw bits so NaN round-trips. The Java
+            // reference test uses `Double.isNaN(d)` plus `==` for finite
+            // values; raw-bits is equivalent and also catches -0.0 vs 0.0
+            // (the encoder must not normalise — that's the server's job).
+
+            #[test]
+            fn fuzz_f32_bits(bits: u32) {
+                let v = f32::from_bits(bits);
+                let bytes = enc(Bind::F32(v));
+                let body = body_of_non_null(ColumnKind::Float, &bytes);
+                prop_assert_eq!(body.len(), 4);
+                let got = f32::from_le_bytes(body.try_into().unwrap());
+                prop_assert_eq!(got.to_bits(), v.to_bits());
+            }
+
+            #[test]
+            fn fuzz_f64_bits(bits: u64) {
+                let v = f64::from_bits(bits);
+                let bytes = enc(Bind::F64(v));
+                let body = body_of_non_null(ColumnKind::Double, &bytes);
+                prop_assert_eq!(body.len(), 8);
+                let got = f64::from_le_bytes(body.try_into().unwrap());
+                prop_assert_eq!(got.to_bits(), v.to_bits());
+            }
+
+            // -- Temporal scalars: same wire as I64 but typed differently.
+
+            #[test]
+            fn fuzz_timestamp_micros(v: i64) {
+                let bytes = enc(Bind::TimestampMicros(v));
+                let body = body_of_non_null(ColumnKind::Timestamp, &bytes);
+                prop_assert_eq!(i64::from_le_bytes(body.try_into().unwrap()), v);
+            }
+
+            #[test]
+            fn fuzz_timestamp_nanos(v: i64) {
+                let bytes = enc(Bind::TimestampNanos(v));
+                let body = body_of_non_null(ColumnKind::TimestampNanos, &bytes);
+                prop_assert_eq!(i64::from_le_bytes(body.try_into().unwrap()), v);
+            }
+
+            #[test]
+            fn fuzz_date_millis(v: i64) {
+                let bytes = enc(Bind::DateMillis(v));
+                let body = body_of_non_null(ColumnKind::Date, &bytes);
+                prop_assert_eq!(i64::from_le_bytes(body.try_into().unwrap()), v);
+            }
+
+            // -- 16-bit Char: u16 LE.
+
+            #[test]
+            fn fuzz_char(v: u16) {
+                let bytes = enc(Bind::Char(v));
+                let body = body_of_non_null(ColumnKind::Char, &bytes);
+                prop_assert_eq!(body.len(), 2);
+                let got = u16::from_le_bytes(body.try_into().unwrap());
+                prop_assert_eq!(got, v);
+            }
+
+            // -- IPv4: 4 bytes LE.
+
+            #[test]
+            fn fuzz_ipv4(octets: [u8; 4]) {
+                let addr = Ipv4Addr::from(u32::from_be_bytes(octets));
+                let bytes = enc(Bind::Ipv4(addr));
+                let body = body_of_non_null(ColumnKind::Ipv4, &bytes);
+                prop_assert_eq!(body.len(), 4);
+                let got = Ipv4Addr::from(u32::from_le_bytes(body.try_into().unwrap()));
+                prop_assert_eq!(got, addr);
+            }
+
+            // -- Wide raw blobs: 16-byte UUID + 32-byte LONG256.
+
+            #[test]
+            fn fuzz_uuid(raw in proptest::array::uniform16(any::<u8>())) {
+                let bytes = enc(Bind::Uuid(raw));
+                let body = body_of_non_null(ColumnKind::Uuid, &bytes);
+                prop_assert_eq!(body, &raw[..]);
+            }
+
+            #[test]
+            fn fuzz_long256(raw in proptest::array::uniform32(any::<u8>())) {
+                let bytes = enc(Bind::Long256(raw));
+                let body = body_of_non_null(ColumnKind::Long256, &bytes);
+                prop_assert_eq!(body, &raw[..]);
+            }
+
+            // -- DECIMAL64 / DECIMAL128 / DECIMAL256: scale (i8 0..=38) + LE
+            // mantissa bytes. Scale comes first on the wire per the docs at
+            // the top of this file.
+
+            #[test]
+            fn fuzz_decimal64(value: i64, scale in 0i8..=MAX_DECIMAL_SCALE) {
+                let bytes = enc(Bind::Decimal64 { value, scale });
+                let body = body_of_non_null(ColumnKind::Decimal64, &bytes);
+                prop_assert_eq!(body.len(), 1 + 8);
+                prop_assert_eq!(body[0] as i8, scale);
+                prop_assert_eq!(i64::from_le_bytes(body[1..].try_into().unwrap()), value);
+            }
+
+            #[test]
+            fn fuzz_decimal128(value: i128, scale in 0i8..=MAX_DECIMAL_SCALE) {
+                let bytes = enc(Bind::Decimal128 { value, scale });
+                let body = body_of_non_null(ColumnKind::Decimal128, &bytes);
+                prop_assert_eq!(body.len(), 1 + 16);
+                prop_assert_eq!(body[0] as i8, scale);
+                prop_assert_eq!(i128::from_le_bytes(body[1..].try_into().unwrap()), value);
+            }
+
+            #[test]
+            fn fuzz_decimal256(
+                raw in proptest::array::uniform32(any::<u8>()),
+                scale in 0i8..=MAX_DECIMAL_SCALE,
+            ) {
+                let bytes = enc(Bind::Decimal256 { bytes: raw, scale });
+                let body = body_of_non_null(ColumnKind::Decimal256, &bytes);
+                prop_assert_eq!(body.len(), 1 + 32);
+                prop_assert_eq!(body[0] as i8, scale);
+                prop_assert_eq!(&body[1..], &raw[..]);
+            }
+
+            // -- GEOHASH: varint precision (1..=60) + ceil(precision/8) bytes.
+
+            #[test]
+            fn fuzz_geohash(raw_value: u64, precision_bits in 1u8..=60) {
+                // The encoder rejects values with bits set above
+                // `precision_bits` (see check_bindable + encode_geohash). The
+                // Java reference test routes geohash binds through SQL, where
+                // the server normalises; here we mask upfront so the fuzz
+                // exercises the encoder's value-shaping rather than its
+                // out-of-range rejection (already covered by the unit tests
+                // above).
+                let mask = if precision_bits == 64 {
+                    !0u64
+                } else {
+                    (1u64 << precision_bits) - 1
+                };
+                let value = raw_value & mask;
+                let bytes = enc(Bind::Geohash { value, precision_bits });
+                let body = body_of_non_null(ColumnKind::Geohash, &bytes);
+                // Precision is a varint; for the 1..=60 range it always fits
+                // in a single byte (high bit clear), so the layout is
+                // `precision_byte || ceil(precision_bits/8) value bytes`.
+                prop_assert_eq!(body[0], precision_bits);
+                let byte_width = (precision_bits as usize).div_ceil(8);
+                prop_assert_eq!(body.len(), 1 + byte_width);
+                let mut buf = [0u8; 8];
+                buf[..byte_width].copy_from_slice(&body[1..]);
+                let got = u64::from_le_bytes(buf);
+                prop_assert_eq!(got, value);
+            }
+
+            // -- VARCHAR / BINARY: offsets array (2 × u32_le for one row:
+            // `[0, byte_len]`) + concatenated bytes. UTF-8 validity for
+            // VARCHAR is the spec's responsibility; we run it through with
+            // arbitrary `String`s — proptest's default `String` strategy
+            // covers a mix of ASCII and multibyte codepoints.
+
+            #[test]
+            fn fuzz_varchar(s in ".{0,32}") {
+                let bytes = enc(Bind::Varchar(s.clone()));
+                let body = body_of_non_null(ColumnKind::Varchar, &bytes);
+                let utf8_bytes = s.as_bytes();
+                prop_assert_eq!(body.len(), 8 + utf8_bytes.len());
+                let offset0 = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                let offset1 = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                prop_assert_eq!(offset0, 0);
+                prop_assert_eq!(offset1 as usize, utf8_bytes.len());
+                prop_assert_eq!(&body[8..], utf8_bytes);
+            }
+
+            #[test]
+            fn fuzz_binary(buf in proptest::collection::vec(any::<u8>(), 0..32)) {
+                let bytes = enc(Bind::Binary(buf.clone()));
+                let body = body_of_non_null(ColumnKind::Binary, &bytes);
+                prop_assert_eq!(body.len(), 8 + buf.len());
+                let offset0 = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                let offset1 = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                prop_assert_eq!(offset0, 0);
+                prop_assert_eq!(offset1 as usize, buf.len());
+                prop_assert_eq!(&body[8..], &buf[..]);
+            }
+        }
+    }
 }

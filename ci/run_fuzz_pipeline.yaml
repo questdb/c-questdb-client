@@ -1,0 +1,147 @@
+trigger: none
+
+pr: none
+
+# Cron against the default branch (and the open egress feature branches),
+# always run even if there were no changes since the previous run. Keeps
+# the paid-minutes bill bounded by running on Microsoft-hosted images
+# while the pull-request-time fuzz coverage stays in
+# run_tests_pipeline.yaml. This pipeline is the always-on stability
+# watchdog for the QWP egress proptest suites and the source of Slack
+# #builds alerts.
+schedules:
+  - cron: "10,40 * * * *"
+    displayName: Run QWP egress fuzz every 30 minutes
+    branches:
+      include:
+        - main
+        - vi_egress
+        - sm_egress_fuzz
+    always: true
+
+stages:
+  - stage: ScheduledFuzz
+    displayName: "Scheduled QWP egress fuzz"
+    jobs:
+      - job: TestQwpEgressFuzz
+        displayName: "QWP egress fuzz suite (cross-platform)"
+        strategy:
+          matrix:
+            linux:
+              imageName: "ubuntu-latest"
+            mac:
+              imageName: "macos-latest"
+            windows-2022:
+              imageName: "windows-2022"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          # The egress fuzz suites are pure-Rust proptest harnesses
+          # (no server, no JDK). Crank PROPTEST_CASES well above the
+          # in-source default so the scheduled cron actually explores
+          # beyond what a standard `cargo test` would. Failures replay
+          # locally via the regression seeds checked in under
+          # questdb-rs/proptest-regressions/egress/.
+          - bash: |
+              set -euxo pipefail
+              cd questdb-rs
+              # `cargo test` only accepts one positional filter, and a filter
+              # under `--test NAME` applies inside that integration bin — it
+              # does not reach `mod tests` blocks in the lib. Split into one
+              # invocation per scope so the proptest modules in src/egress/
+              # actually run.
+              PROPTEST_CASES=10000 cargo test --release \
+                --features sync-reader-ws \
+                --test qwp_egress_bounds_fuzz \
+                --test qwp_egress_fragmentation_fuzz
+              PROPTEST_CASES=10000 cargo test --release \
+                --features sync-reader-ws \
+                --lib egress::binds::tests
+              PROPTEST_CASES=10000 cargo test --release \
+                --features sync-reader-ws \
+                --lib egress::decoder::tests
+            displayName: "Run QWP egress fuzz suite"
+
+      # Live-server fuzz: bind / fragmentation / random-schema cases
+      # that need a real QuestDB. Builds the questdb jar from `master`,
+      # then runs the `egress_live_server_*_fuzz` cargo tests.
+      # Linux-only — keeps the scheduled Maven cost bounded; the
+      # pull-request-time pipeline (run_tests_pipeline.yaml) already
+      # runs the same suite for inbound changes.
+      # Seed varies per build via `QWP_EGRESS_FUZZ_SEED=$(Build.BuildId)`
+      # so the scheduled cron actually explores beyond the deterministic
+      # default that pull-request runs use.
+      - job: TestQwpEgressLiveServerFuzz
+        displayName: "QWP egress live-server fuzz (scheduled)"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+            displayName: git clone questdb
+          - script: |
+              set -euo pipefail
+              JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
+              sudo mkdir -p /opt/jdk25
+              curl -fsSL "$JDK_URL" | sudo tar -xz -C /opt/jdk25 --strip-components=1
+              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/jdk25"
+              echo "##vso[task.prependpath]/opt/jdk25/bin"
+            displayName: "Install JDK 25"
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "default"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              set -euxo pipefail
+              cd questdb-rs
+              # `--test NAME` selectors limit the build to the fuzz
+              # binaries we own. Other live-server tests are excluded
+              # from this scheduled run so a transient unrelated failure
+              # there can't drown out a real fuzz regression.
+              QWP_EGRESS_FUZZ_SEED="$(Build.BuildId)" \
+                cargo test --features live-server-tests \
+                --test egress_live_server_bind_fuzz \
+                --test egress_live_server_fragmentation_fuzz \
+                --test egress_live_server_fuzz \
+                --test egress_live_server_alter_fuzz \
+                -- --nocapture
+            displayName: "QWP egress live-server fuzz (varying seed)"
+
+      # Slack notification on fuzz failure. BUILDS_SLACK_HOOK_URL must
+      # be configured as a secret pipeline variable (or attached via a
+      # shared variable group) before this pipeline is enabled —
+      # otherwise the curl POSTs to an empty URL and the failure message
+      # is lost.
+      - job: NotifyOnFailure
+        displayName: "Notify Slack on failure"
+        dependsOn:
+          - TestQwpEgressFuzz
+          - TestQwpEgressLiveServerFuzz
+        condition: failed()
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Notify Slack on Failure
+            inputs:
+              script: |
+                curl -X POST -H 'Content-type: application/json' \
+                  --data '{"text":"🚨 *c-questdb-client QWP egress fuzz failed*\n\nBranch: `$(Build.SourceBranchName)`\nBuild: <$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|#$(Build.BuildId)>\nCommit: `$(Build.SourceVersion)`"}' \
+                  "$(BUILDS_SLACK_HOOK_URL)"
+            env:
+              BUILDS_SLACK_HOOK_URL: $(BUILDS_SLACK_HOOK_URL)
