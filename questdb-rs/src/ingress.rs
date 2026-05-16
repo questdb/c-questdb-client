@@ -346,23 +346,35 @@ impl Protocol {
     }
 
     fn from_schema(schema: &str) -> Result<Self> {
-        match schema {
-            #[cfg(feature = "_sender-tcp")]
-            "tcp" => Ok(Protocol::Tcp),
-            #[cfg(feature = "_sender-tcp")]
-            "tcps" => Ok(Protocol::Tcps),
-            #[cfg(feature = "_sender-http")]
-            "http" => Ok(Protocol::Http),
-            #[cfg(feature = "_sender-http")]
-            "https" => Ok(Protocol::Https),
-            #[cfg(feature = "_sender-qwp-udp")]
-            "qwpudp" => Ok(Protocol::QwpUdp),
-            #[cfg(feature = "_sender-qwp-ws")]
-            "qwpws" | "ws" => Ok(Protocol::QwpWs),
-            #[cfg(feature = "_sender-qwp-ws")]
-            "qwpwss" | "wss" => Ok(Protocol::QwpWss),
-            _ => Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema)),
+        #[cfg(feature = "_sender-tcp")]
+        if schema.eq_ignore_ascii_case("tcp") {
+            return Ok(Protocol::Tcp);
         }
+        #[cfg(feature = "_sender-tcp")]
+        if schema.eq_ignore_ascii_case("tcps") {
+            return Ok(Protocol::Tcps);
+        }
+        #[cfg(feature = "_sender-http")]
+        if schema.eq_ignore_ascii_case("http") {
+            return Ok(Protocol::Http);
+        }
+        #[cfg(feature = "_sender-http")]
+        if schema.eq_ignore_ascii_case("https") {
+            return Ok(Protocol::Https);
+        }
+        #[cfg(feature = "_sender-qwp-udp")]
+        if schema.eq_ignore_ascii_case("qwpudp") {
+            return Ok(Protocol::QwpUdp);
+        }
+        #[cfg(feature = "_sender-qwp-ws")]
+        if schema.eq_ignore_ascii_case("qwpws") || schema.eq_ignore_ascii_case("ws") {
+            return Ok(Protocol::QwpWs);
+        }
+        #[cfg(feature = "_sender-qwp-ws")]
+        if schema.eq_ignore_ascii_case("qwpwss") || schema.eq_ignore_ascii_case("wss") {
+            return Ok(Protocol::QwpWss);
+        }
+        Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema))
     }
 }
 
@@ -377,7 +389,11 @@ fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan>> {
     let Some((service, params)) = conf.split_once("::") else {
         return Ok(None);
     };
-    if !matches!(service, "qwpws" | "qwpwss" | "ws" | "wss") {
+    if !service.eq_ignore_ascii_case("qwpws")
+        && !service.eq_ignore_ascii_case("qwpwss")
+        && !service.eq_ignore_ascii_case("ws")
+        && !service.eq_ignore_ascii_case("wss")
+    {
         return Ok(None);
     }
 

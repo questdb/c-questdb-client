@@ -457,6 +457,58 @@ fn unsupported_service() {
     );
 }
 
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn uppercase_scheme_accepted_tcp() {
+    let builder = SenderBuilder::from_conf("TCP::addr=localhost:9009;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Tcp);
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn uppercase_scheme_accepted_https() {
+    let builder = SenderBuilder::from_conf("HTTPS::addr=localhost:9000;").unwrap();
+    assert_eq!(builder.protocol, Protocol::Https);
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn uppercase_scheme_accepted_qwpudp() {
+    let builder = SenderBuilder::from_conf("QWPUDP::addr=localhost:9009;").unwrap();
+    assert_eq!(builder.protocol, Protocol::QwpUdp);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn uppercase_scheme_accepted_qwpws() {
+    let builder = SenderBuilder::from_conf("QWPWS::addr=localhost:9000;").unwrap();
+    assert_eq!(builder.protocol, Protocol::QwpWs);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn uppercase_qwpws_preserves_multi_addr() {
+    let builder = SenderBuilder::from_conf("QWPWS::addr=h1:9001,h2:9002,h3:9003;").unwrap();
+    assert_eq!(builder.protocol, Protocol::QwpWs);
+    let endpoints: &Vec<conf::QwpWsEndpoint> = &builder.qwp_ws.as_ref().unwrap().endpoints;
+    assert_eq!(endpoints.len(), 3);
+    assert_eq!(endpoints[0].host, "h1");
+    assert_eq!(endpoints[0].port, "9001");
+    assert_eq!(endpoints[1].host, "h2");
+    assert_eq!(endpoints[1].port, "9002");
+    assert_eq!(endpoints[2].host, "h3");
+    assert_eq!(endpoints[2].port, "9003");
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn mixed_case_qwpws_preserves_multi_addr() {
+    let builder = SenderBuilder::from_conf("QwpWs::addr=h1:9001,h2:9002;").unwrap();
+    assert_eq!(builder.protocol, Protocol::QwpWs);
+    let endpoints: &Vec<conf::QwpWsEndpoint> = &builder.qwp_ws.as_ref().unwrap().endpoints;
+    assert_eq!(endpoints.len(), 2);
+}
+
 #[cfg(feature = "sync-sender-http")]
 #[test]
 fn http_basic_auth() {

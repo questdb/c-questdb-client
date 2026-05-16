@@ -1107,12 +1107,13 @@ fn test_tls_insecure_skip_verify(
 
 #[cfg(feature = "_sync-sender")]
 #[test]
-fn bad_uppercase_protocol() {
-    let res = Sender::from_conf("TCP::addr=localhost:9009;");
-    assert!(res.is_err());
+fn unsupported_protocol_error_only_for_unknown_scheme() {
+    // Case-insensitive scheme matching: bogus schemes still report the error,
+    // but case variants of known schemes do not.
+    let res = Sender::from_conf("nope::addr=localhost:9009;");
     let err = res.unwrap_err();
-    assert!(err.code() == ErrorCode::ConfigError);
-    assert!(err.msg() == "Unsupported protocol: TCP");
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert_eq!(err.msg(), "Unsupported protocol: nope");
 }
 
 #[cfg(feature = "sync-sender-tcp")]
