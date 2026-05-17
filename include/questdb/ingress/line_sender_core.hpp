@@ -121,6 +121,15 @@ enum class protocol
 
     /** QuestWire Protocol over WebSocket Secure (TLS). */
     qwpwss,
+
+    /**
+     * Sentinel for a protocol the Rust `Protocol` enum knows about but
+     * this FFI build does not. Returned by `line_sender::protocol()` for
+     * future variants added after this FFI was compiled; constructing
+     * `opts(protocol::unknown, ...)` yields a null-impl opts (same
+     * failure path as other constructor errors).
+     */
+    unknown,
 };
 
 enum class qwp_ws_progress

@@ -203,7 +203,12 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
 }
 
 /// Protocol used to communicate with the QuestDB server.
+///
+/// `#[non_exhaustive]` so new wire protocols can be added without breaking
+/// exhaustive matches in downstream code (the surface already covers ILP/TCP,
+/// ILP/HTTP, QWP/UDP, and QWP/WS, and is expected to grow).
 #[derive(PartialEq, Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Protocol {
     #[cfg(feature = "_sender-tcp")]
     /// ILP over TCP (streaming).

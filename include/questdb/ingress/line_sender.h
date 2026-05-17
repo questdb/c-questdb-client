@@ -135,6 +135,15 @@ typedef enum line_sender_protocol
 
     /** QuestWire Protocol over WebSocket Secure (TLS). */
     line_sender_protocol_qwpwss,
+
+    /**
+     * Sentinel for a protocol the Rust `Protocol` enum knows about but
+     * this FFI build does not. Returned by `line_sender_get_protocol`
+     * for future `Protocol` variants added after this FFI was compiled.
+     * Passing this value to `line_sender_opts_new` /
+     * `line_sender_opts_new_service` causes them to return NULL.
+     */
+    line_sender_protocol_unknown,
 } line_sender_protocol;
 
 /** The line protocol version used to write data to buffer. */

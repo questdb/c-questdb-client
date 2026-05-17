@@ -319,6 +319,13 @@ pub enum line_sender_protocol {
 
     /// QuestWire Protocol over WebSocket Secure (TLS).
     line_sender_protocol_qwpwss,
+
+    /// Sentinel for a protocol the Rust `Protocol` enum knows about but this
+    /// FFI build does not. Returned by `line_sender_get_protocol` for future
+    /// `Protocol` variants added after this FFI was compiled; never a valid
+    /// input to `line_sender_opts_new` / `line_sender_opts_new_service`
+    /// (those return null when passed this value).
+    line_sender_protocol_unknown,
 }
 
 impl From<Protocol> for line_sender_protocol {
@@ -331,13 +338,15 @@ impl From<Protocol> for line_sender_protocol {
             Protocol::QwpUdp => line_sender_protocol::line_sender_protocol_qwpudp,
             Protocol::QwpWs => line_sender_protocol::line_sender_protocol_qwpws,
             Protocol::QwpWss => line_sender_protocol::line_sender_protocol_qwpwss,
+            _ => line_sender_protocol::line_sender_protocol_unknown,
         }
     }
 }
 
-impl From<line_sender_protocol> for Protocol {
-    fn from(protocol: line_sender_protocol) -> Self {
-        match protocol {
+impl TryFrom<line_sender_protocol> for Protocol {
+    type Error = ();
+    fn try_from(protocol: line_sender_protocol) -> Result<Self, Self::Error> {
+        Ok(match protocol {
             line_sender_protocol::line_sender_protocol_tcp => Protocol::Tcp,
             line_sender_protocol::line_sender_protocol_tcps => Protocol::Tcps,
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
@@ -345,7 +354,8 @@ impl From<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_qwpudp => Protocol::QwpUdp,
             line_sender_protocol::line_sender_protocol_qwpws => Protocol::QwpWs,
             line_sender_protocol::line_sender_protocol_qwpwss => Protocol::QwpWss,
-        }
+            line_sender_protocol::line_sender_protocol_unknown => return Err(()),
+        })
     }
 }
 
@@ -2200,7 +2210,10 @@ pub unsafe extern "C" fn line_sender_opts_new(
     host: line_sender_utf8,
     port: u16,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port);
+    let Ok(protocol) = Protocol::try_from(protocol) else {
+        return ptr::null_mut();
+    };
+    let builder = SenderBuilder::new(protocol, host.as_str(), port);
     let builder = match builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))) {
         Ok(builder) => builder,
         Err(_) => return ptr::null_mut(),
@@ -2217,7 +2230,10 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     host: line_sender_utf8,
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port.as_str());
+    let Ok(protocol) = Protocol::try_from(protocol) else {
+        return ptr::null_mut();
+    };
+    let builder = SenderBuilder::new(protocol, host.as_str(), port.as_str());
     let builder = match builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))) {
         Ok(builder) => builder,
         Err(_) => return ptr::null_mut(),
