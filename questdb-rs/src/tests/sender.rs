@@ -1270,7 +1270,6 @@ const SIGPIPE_CHILD_READY_MARKER: &str = "QUESTDB_INGRESS_SIGPIPE_CHILD_READY";
 #[cfg(all(feature = "sync-sender-tcp", target_os = "linux"))]
 #[test]
 fn ingress_tcp_flush_does_not_kill_process_on_closed_peer() -> TestResult {
-    use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt;
 
     if let Ok(port_str) = std::env::var(SIGPIPE_CHILD_PORT_ENV) {
@@ -1286,10 +1285,9 @@ fn ingress_tcp_flush_does_not_kill_process_on_closed_peer() -> TestResult {
     let port = listener.local_addr()?.port();
 
     let _accept = std::thread::spawn(move || -> std::io::Result<()> {
-        let (sock, _) = listener.accept()?;
-        let sock = socket2::SockRef::from(&sock);
-        sock.set_linger(Some(Duration::ZERO))?;
-        drop(sock);
+        let (tcp, _) = listener.accept()?;
+        socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO))?;
+        // `tcp` dropped at end of scope -> close(2) with SO_LINGER=0 -> RST.
         Ok(())
     });
 
