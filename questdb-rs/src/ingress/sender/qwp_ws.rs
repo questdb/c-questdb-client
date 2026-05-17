@@ -2061,9 +2061,20 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<(Vec<u8>, Ve
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 512];
     loop {
-        let n = stream
-            .read(&mut tmp)
-            .map_err(|io| error::fmt!(SocketError, "Could not read upgrade response: {}", io))?;
+        let n = stream.read(&mut tmp).map_err(|io| {
+            // macOS reports SO_RCVTIMEO expiry as `WouldBlock` (EAGAIN,
+            // os error 35), Linux/Windows report `TimedOut`. Surface
+            // both as the same explicit timeout error so the failure
+            // mode does not look platform-specific to the caller.
+            if matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+                error::fmt!(
+                    SocketError,
+                    "WebSocket upgrade response read timed out"
+                )
+            } else {
+                error::fmt!(SocketError, "Could not read upgrade response: {}", io)
+            }
+        })?;
         if n == 0 {
             return Err(error::fmt!(
                 SocketError,

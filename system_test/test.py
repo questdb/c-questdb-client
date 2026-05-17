@@ -2532,9 +2532,16 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
+        # `initial_connect_retry=sync` brings the 120s reconnect budget
+        # to bear on the *first* connect, not just post-disconnect ones.
+        # Without it, a producer that races a bounce gets one shot at
+        # the WS upgrade, sees its 15s auth_timeout fire mid-bounce,
+        # and fails the whole test even though the server is back up a
+        # second later.
         conf = self._sender_conf(
             sender_id,
             sf_root,
+            initial_connect_retry='sync',
             reconnect_max_duration_millis=120000,
             # 2 min on close_drain — bounce-test variants need a long
             # enough budget for SFA to replay queued frames into a
