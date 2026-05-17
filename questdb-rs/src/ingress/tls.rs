@@ -1,10 +1,20 @@
 use crate::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
+#[cfg(any(
+    feature = "_sender-tcp",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws"
+))]
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use std::fs::File;
 use std::path::Path;
+#[cfg(any(
+    feature = "_sender-tcp",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws"
+))]
 use std::sync::Arc;
 
 #[cfg(feature = "insecure-skip-verify")]
@@ -62,14 +72,28 @@ mod danger {
     }
 }
 
-#[cfg(feature = "tls-webpki-certs")]
+#[cfg(all(
+    feature = "tls-webpki-certs",
+    any(
+        feature = "_sender-tcp",
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws"
+    ),
+))]
 fn add_webpki_roots(root_store: &mut RootCertStore) {
     root_store
         .roots
         .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
 }
 
-#[cfg(feature = "tls-native-certs")]
+#[cfg(all(
+    feature = "tls-native-certs",
+    any(
+        feature = "_sender-tcp",
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws"
+    ),
+))]
 fn unpack_os_native_certs(
     res: rustls_native_certs::CertificateResult,
 ) -> crate::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
@@ -88,7 +112,14 @@ fn unpack_os_native_certs(
     Ok(res.certs)
 }
 
-#[cfg(feature = "tls-native-certs")]
+#[cfg(all(
+    feature = "tls-native-certs",
+    any(
+        feature = "_sender-tcp",
+        feature = "_sender-http",
+        feature = "_sender-qwp-ws"
+    ),
+))]
 fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
     let os_certs = unpack_os_native_certs(rustls_native_certs::load_native_certs())?;
 
@@ -103,7 +134,7 @@ fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TlsSettings {
     #[cfg(feature = "insecure-skip-verify")]
     SkipVerify,
@@ -117,6 +148,14 @@ pub(crate) enum TlsSettings {
     #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
     WebpkiAndOsRoots,
 
+    #[cfg_attr(
+        not(any(
+            feature = "_sender-tcp",
+            feature = "_sender-http",
+            feature = "_sender-qwp-ws"
+        )),
+        allow(dead_code)
+    )]
     PemFile(Vec<CertificateDer<'static>>),
 }
 
@@ -211,6 +250,11 @@ impl TlsSettings {
     }
 }
 
+#[cfg(any(
+    feature = "_sender-tcp",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws"
+))]
 pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig>> {
     let mut root_store = RootCertStore::empty();
 

@@ -29,9 +29,36 @@
 
 namespace questdb::ingress
 {
+class buffer_bookmark
+{
+public:
+    /** Default-constructed bookmarks are intentionally invalid. */
+    buffer_bookmark() noexcept
+        : _impl{0, 0}
+    {
+    }
+
+private:
+    explicit buffer_bookmark(::line_sender_bookmark impl) noexcept
+        : _impl{impl}
+    {
+    }
+
+    ::line_sender_bookmark _impl;
+
+    friend class line_sender_buffer;
+};
+
 class line_sender_buffer
 {
 public:
+    /**
+     * Construct an ILP buffer with the given ILP protocol version.
+     *
+     * This constructor is ILP-only. It does not create QWP/UDP buffers.
+     * For protocol-neutral construction, especially when using QWP/UDP, prefer
+     * `line_sender::new_buffer()`.
+     */
     explicit line_sender_buffer(
         protocol_version version,
         size_t init_buf_size = 64 * 1024,
@@ -43,11 +70,47 @@ public:
     {
     }
 
-    line_sender_buffer(const line_sender_buffer& other) noexcept
-        : _impl{::line_sender_buffer_clone(other._impl)}
+    /**
+     * Construct a standalone QWP/UDP buffer.
+     *
+     * This is the QWP counterpart to the ILP-only constructor above.
+     * For protocol-neutral construction tied to a sender instance, prefer
+     * `line_sender::new_buffer()`.
+     */
+    static line_sender_buffer qwp_udp(
+        size_t init_buf_size = 64 * 1024,
+        size_t max_name_len = 127)
+    {
+        auto* raw_buffer =
+            ::line_sender_buffer_new_qwp_with_max_name_len(max_name_len);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
+        return line_sender_buffer{
+            raw_buffer,
+            protocol_version::v1,
+            init_buf_size,
+            max_name_len,
+            true};
+    }
+
+    line_sender_buffer(const line_sender_buffer& other)
+        : _impl{
+              other._impl
+                  ? line_sender_error::wrapped_call(
+                        ::line_sender_buffer_clone, other._impl)
+                  : nullptr}
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
+        , _is_qwp{other._is_qwp}
 
     {
     }
@@ -57,23 +120,29 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
+        , _is_qwp{other._is_qwp}
 
     {
         other._impl = nullptr;
     }
 
-    line_sender_buffer& operator=(const line_sender_buffer& other) noexcept
+    line_sender_buffer& operator=(const line_sender_buffer& other)
     {
         if (this != &other)
         {
+            // Clone before freeing the old buffer so a clone failure leaves
+            // *this unchanged (strong exception guarantee).
+            ::line_sender_buffer* new_impl =
+                other._impl
+                    ? line_sender_error::wrapped_call(
+                          ::line_sender_buffer_clone, other._impl)
+                    : nullptr;
             ::line_sender_buffer_free(_impl);
-            if (other._impl)
-                _impl = ::line_sender_buffer_clone(other._impl);
-            else
-                _impl = nullptr;
+            _impl = new_impl;
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
+            _is_qwp = other._is_qwp;
         }
         return *this;
     }
@@ -87,6 +156,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
+            _is_qwp = other._is_qwp;
             other._impl = nullptr;
         }
         return *this;
@@ -97,15 +167,25 @@ public:
      * the specified additional byte count. This may be rounded up.
      * This does not allocate if such additional capacity is already
      * satisfied.
+     *
+     * For ILP buffers this is expressed in bytes. For QWP buffers this is
+     * only a best-effort hint and may be ignored.
      * See: `capacity`.
      */
     void reserve(size_t additional)
     {
         may_init();
-        ::line_sender_buffer_reserve(_impl, additional);
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_reserve, _impl, additional);
     }
 
-    /** Get the current capacity of the buffer. */
+    /**
+     * Get the current buffer capacity.
+     *
+     * For ILP buffers this is byte capacity. For QWP buffers this is an
+     * implementation-defined capacity hint and should not be interpreted as
+     * byte capacity.
+     */
     size_t capacity() const noexcept
     {
         if (_impl)
@@ -114,7 +194,13 @@ public:
             return 0;
     }
 
-    /** The number of bytes accumulated in the buffer. */
+    /**
+     * The current encoded size of the buffered data.
+     *
+     * For ILP buffers this is the exact pending byte length. For QWP buffers
+     * this is a buffered size hint, not the exact size of any eventual UDP
+     * datagram.
+     */
     size_t size() const noexcept
     {
         if (_impl)
@@ -133,9 +219,11 @@ public:
     }
 
     /**
-     * Tell whether the buffer is transactional. It is transactional iff it
-     * contains data for at most one table. Additionally, you must send the
-     * buffer over HTTP to get transactional behavior.
+     * Tell whether the buffer is transactional.
+     *
+     * ILP buffers are transactional iff they contain data for at most one
+     * table. QWP/UDP does not support transactional flushes, so QWP buffers
+     * always return `false`.
      */
     bool transactional() const noexcept
     {
@@ -151,7 +239,11 @@ public:
 
     /**
      * Get a bytes view of the contents of the buffer
-     * (not guaranteed to be an encoded string)
+     * (not guaranteed to be an encoded string).
+     *
+     * This is only meaningful for ILP buffers. For QWP buffers the returned
+     * view is currently empty because rows are encoded into UDP datagrams only
+     * during `flush()`.
      */
     buffer_view peek() const noexcept
     {
@@ -164,10 +256,48 @@ public:
     }
 
     /**
+     * Capture a bookmark for the current buffer state.
+     *
+     * Capturing a new bookmark replaces the previously stored bookmark or
+     * marker.
+     */
+    buffer_bookmark bookmark()
+    {
+        may_init();
+        ::line_sender_bookmark out{};
+        ::line_sender_error* c_err{nullptr};
+        if (::line_sender_buffer_bookmark(_impl, &out, &c_err))
+            return buffer_bookmark{out};
+        throw line_sender_error::from_c(c_err);
+    }
+
+    /**
+     * Rewind the buffer to a previously captured bookmark.
+     *
+     * On success, the stored bookmark is consumed.
+     */
+    void rewind_to_bookmark(buffer_bookmark bookmark)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_rewind_to_bookmark, _impl, bookmark._impl);
+    }
+
+    /**
+     * Discard a previously captured bookmark if it is still current.
+     */
+    void clear_bookmark(buffer_bookmark bookmark) noexcept
+    {
+        if (_impl)
+            ::line_sender_buffer_clear_bookmark(_impl, bookmark._impl);
+    }
+
+    /**
      * Mark a rewind point.
      * This allows undoing accumulated changes to the buffer for one or more
      * rows by calling `rewind_to_marker`.
-     * Any previous marker will be discarded.
+     * Any previously stored rewind point will be discarded, including one
+     * established by `bookmark()`.
      * Once the marker is no longer needed, call `clear_marker`.
      */
     void set_marker()
@@ -177,8 +307,12 @@ public:
     }
 
     /**
-     * Undo all changes since the last `set_marker` call.
-     * As a side-effect, this also clears the marker.
+     * Undo all changes since the currently stored rewind point was captured.
+     *
+     * This may rewind a state established by either `set_marker()` or
+     * `bookmark()`.
+     *
+     * As a side-effect, this also clears the stored rewind point.
      */
     void rewind_to_marker()
     {
@@ -187,7 +321,10 @@ public:
             ::line_sender_buffer_rewind_to_marker, _impl);
     }
 
-    /** Discard the marker. */
+    /**
+     * Discard the current stored rewind point, including one established by
+     * `bookmark()`.
+     */
     void clear_marker() noexcept
     {
         if (_impl)
@@ -291,6 +428,52 @@ public:
     }
 
     /**
+     * Record an 8-bit signed integer (BYTE on the wire). QWP-only.
+     *
+     * On ILP buffers this throws line_sender_error_invalid_api_call.
+     */
+    line_sender_buffer& column_i8(column_name_view name, int8_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i8, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a 16-bit signed integer (SHORT on the wire). QWP-only.
+     */
+    line_sender_buffer& column_i16(column_name_view name, int16_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i16, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a 32-bit signed integer (INT on the wire). QWP-only.
+     */
+    line_sender_buffer& column_i32(column_name_view name, int32_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i32, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a 32-bit floating-point value (FLOAT on the wire). QWP-only.
+     */
+    line_sender_buffer& column_f32(column_name_view name, float value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f32, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
      * Record a multidimensional array of `double` values.
      *
      * QuestDB server version 9.0.0 or later is required for array support.
@@ -306,33 +489,64 @@ public:
         column_name_view name, const array::strided_view<T, M>& array)
     {
         static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
+            std::is_same_v<T, double> || std::is_same_v<T, int64_t>,
+            "Only double and int64_t types are supported for arrays");
         may_init();
-        switch (M)
+        if constexpr (std::is_same_v<T, double>)
         {
-        case array::strides_mode::bytes:
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_f64_arr_byte_strides,
-                _impl,
-                name._impl,
-                array.rank(),
-                array.shape(),
-                array.strides(),
-                array.data(),
-                array.data_size());
-            break;
-        case array::strides_mode::elements:
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_f64_arr_elem_strides,
-                _impl,
-                name._impl,
-                array.rank(),
-                array.shape(),
-                array.strides(),
-                array.data(),
-                array.data_size());
-            break;
+            switch (M)
+            {
+            case array::strides_mode::bytes:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_f64_arr_byte_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            case array::strides_mode::elements:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_f64_arr_elem_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            }
+        }
+        else
+        {
+            switch (M)
+            {
+            case array::strides_mode::bytes:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_i64_arr_byte_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            case array::strides_mode::elements:
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_column_i64_arr_elem_strides,
+                    _impl,
+                    name._impl,
+                    array.rank(),
+                    array.shape(),
+                    array.strides(),
+                    array.data(),
+                    array.data_size());
+                break;
+            }
         }
         return *this;
     }
@@ -354,17 +568,31 @@ public:
         column_name_view name, const array::row_major_view<T>& array)
     {
         static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
+            std::is_same_v<T, double> || std::is_same_v<T, int64_t>,
+            "Only double and int64_t types are supported for arrays");
         may_init();
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_f64_arr_c_major,
-            _impl,
-            name._impl,
-            array.rank(),
-            array.shape(),
-            array.data(),
-            array.data_size());
+        if constexpr (std::is_same_v<T, double>)
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_c_major,
+                _impl,
+                name._impl,
+                array.rank(),
+                array.shape(),
+                array.data(),
+                array.data_size());
+        }
+        else
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_i64_arr_c_major,
+                _impl,
+                name._impl,
+                array.rank(),
+                array.shape(),
+                array.data(),
+                array.data_size());
+        }
         return *this;
     }
 
@@ -488,6 +716,262 @@ public:
             decimal.scale(),
             decimal.data(),
             decimal.data_size());
+        return *this;
+    }
+
+    /**
+     * Record a decimal string value as DECIMAL64 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec64(
+        column_name_view name, decimal::decimal_str_view value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec64_str,
+            _impl,
+            name._impl,
+            value.data(),
+            value.size());
+        return *this;
+    }
+
+    /**
+     * Record an unscaled-int decimal value as DECIMAL64 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec64(
+        column_name_view name, const decimal::decimal_view& decimal)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec64,
+            _impl,
+            name._impl,
+            decimal.scale(),
+            decimal.data(),
+            decimal.data_size());
+        return *this;
+    }
+
+    /**
+     * Record a decimal string value as DECIMAL128 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec128(
+        column_name_view name, decimal::decimal_str_view value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec128_str,
+            _impl,
+            name._impl,
+            value.data(),
+            value.size());
+        return *this;
+    }
+
+    /**
+     * Record an unscaled-int decimal value as DECIMAL128 on the wire. QWP-only.
+     */
+    line_sender_buffer& column_dec128(
+        column_name_view name, const decimal::decimal_view& decimal)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_dec128,
+            _impl,
+            name._impl,
+            decimal.scale(),
+            decimal.data(),
+            decimal.data_size());
+        return *this;
+    }
+
+    /**
+     * Record a UUID column value. QWP-only.
+     */
+    line_sender_buffer& column_uuid(
+        column_name_view name, uint64_t lo, uint64_t hi)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_uuid, _impl, name._impl, lo, hi);
+        return *this;
+    }
+
+    /**
+     * Record a LONG256 column value. QWP-only.
+     *
+     * `value` is 32 bytes: four 64-bit limbs encoded little-endian,
+     * least-significant limb first.
+     */
+    line_sender_buffer& column_long256(
+        column_name_view name, const uint8_t (&value)[32])
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_long256, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record an IPv4 column value. QWP-only.
+     *
+     * `value` is the address packed as a u32 with octet 0 in the high byte.
+     *
+     * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
+     * currently implement this wire type; batches using it will be rejected
+     * with a descriptive error. This may change in future server releases.
+     */
+    line_sender_buffer& column_ipv4(column_name_view name, uint32_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_ipv4, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a DATE column value (milliseconds since Unix epoch). QWP-only.
+     */
+    line_sender_buffer& column_date(column_name_view name, int64_t millis)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_date, _impl, name._impl, millis);
+        return *this;
+    }
+
+    /**
+     * Record a CHAR column value (single UTF-16 code unit). QWP-only.
+     */
+    line_sender_buffer& column_char(column_name_view name, uint16_t value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_char, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a BINARY column value. QWP-only.
+     *
+     * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
+     * not currently implement this wire type; batches using it will be
+     * rejected with a descriptive error. This may change in future server
+     * releases.
+     */
+    line_sender_buffer& column_binary(
+        column_name_view name, const uint8_t* data, size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_binary,
+            _impl,
+            name._impl,
+            data,
+            data_len);
+        return *this;
+    }
+
+    /**
+     * Record a GEOHASH column value. QWP-only.
+     *
+     * `precision_bits` must be in 1..=60 and is pinned per column.
+     */
+    line_sender_buffer& column_geohash(
+        column_name_view name, uint64_t bits, uint8_t precision_bits)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_geohash,
+            _impl,
+            name._impl,
+            bits,
+            precision_bits);
+        return *this;
+    }
+
+    /**
+     * Record an int64 multidimensional array (C-major layout). QWP-only.
+     *
+     * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest
+     * does not currently implement this wire type; batches using it will
+     * be rejected with a descriptive error. This may change in future
+     * server releases.
+     */
+    line_sender_buffer& column_i64_arr(
+        column_name_view name,
+        size_t rank,
+        const uintptr_t* shape,
+        const int64_t* data,
+        size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i64_arr_c_major,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            data,
+            data_len);
+        return *this;
+    }
+
+    /**
+     * Record an int64 multidimensional array with byte strides. QWP-only.
+     *
+     * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest
+     * does not currently implement this wire type; batches using it will
+     * be rejected with a descriptive error. This may change in future
+     * server releases.
+     */
+    line_sender_buffer& column_i64_arr_byte_strides(
+        column_name_view name,
+        size_t rank,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const int64_t* data,
+        size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i64_arr_byte_strides,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            strides,
+            data,
+            data_len);
+        return *this;
+    }
+
+    /**
+     * Record an int64 multidimensional array with element strides. QWP-only.
+     *
+     * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest
+     * does not currently implement this wire type; batches using it will
+     * be rejected with a descriptive error. This may change in future
+     * server releases.
+     */
+    line_sender_buffer& column_i64_arr_elem_strides(
+        column_name_view name,
+        size_t rank,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const int64_t* data,
+        size_t data_len)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_i64_arr_elem_strides,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            strides,
+            data,
+            data_len);
         return *this;
     }
 
@@ -653,15 +1137,48 @@ public:
     }
 
 private:
+    line_sender_buffer(
+        ::line_sender_buffer* impl,
+        protocol_version version,
+        size_t init_buf_size,
+        size_t max_name_len,
+        bool is_qwp = false) noexcept
+        : _impl{impl}
+        , _protocol_version{version}
+        , _init_buf_size{init_buf_size}
+        , _max_name_len{max_name_len}
+        , _is_qwp{is_qwp}
+    {
+    }
+
     inline void may_init()
     {
         if (!_impl)
         {
-            _impl = ::line_sender_buffer_with_max_name_len(
-                static_cast<::line_sender_protocol_version>(
-                    static_cast<int>(_protocol_version)),
-                _max_name_len);
-            ::line_sender_buffer_reserve(_impl, _init_buf_size);
+            ::line_sender_buffer* tmp = nullptr;
+            if (_is_qwp)
+            {
+                tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
+                    _max_name_len);
+            }
+            else
+            {
+                tmp = ::line_sender_buffer_with_max_name_len(
+                    static_cast<::line_sender_protocol_version>(
+                        static_cast<int>(_protocol_version)),
+                    _max_name_len);
+            }
+            try
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_buffer_reserve, tmp, _init_buf_size);
+            }
+            catch (...)
+            {
+                ::line_sender_buffer_free(tmp);
+                throw;
+            }
+            _impl = tmp;
         }
     }
 
@@ -669,6 +1186,7 @@ private:
     protocol_version _protocol_version;
     size_t _init_buf_size;
     size_t _max_name_len;
+    bool _is_qwp{false};
 
     friend class line_sender;
 };
@@ -694,7 +1212,8 @@ public:
     /**
      * Create a new `opts` instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
-     * Instead of "tcp" you can also specify "tcps", "http", and "https".
+     * Instead of "tcp" you can also specify "tcps", "http", "https",
+     * "qwpudp", "qwpws", and "qwpwss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -727,7 +1246,7 @@ public:
      * Create a new `opts` instance with the given protocol, hostname and port.
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
-     * @param[in] port The QuestDB tcp or http port.
+     * @param[in] port The QuestDB port for the selected protocol.
      * validation.
      */
     opts(protocol protocol, utf8_view host, uint16_t port) noexcept
@@ -743,7 +1262,7 @@ public:
      * service name.
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
-     * @param[in] port The QuestDB tcp or http port as service name.
+     * @param[in] port The QuestDB port as service name for the selected protocol.
      */
     opts(protocol protocol, utf8_view host, utf8_view port) noexcept
         : _impl{::line_sender_opts_new_service(
@@ -756,12 +1275,14 @@ public:
     }
 
     opts(const opts& other) noexcept
-        : _impl{::line_sender_opts_clone(other._impl)}
+        : _impl{other._impl ? ::line_sender_opts_clone(other._impl) : nullptr}
+        , _qwp_ws_error_handler{other._qwp_ws_error_handler}
     {
     }
 
     opts(opts&& other) noexcept
         : _impl{other._impl}
+        , _qwp_ws_error_handler{std::move(other._qwp_ws_error_handler)}
     {
         other._impl = nullptr;
     }
@@ -771,7 +1292,9 @@ public:
         if (this != &other)
         {
             reset();
-            _impl = ::line_sender_opts_clone(other._impl);
+            _impl =
+                other._impl ? ::line_sender_opts_clone(other._impl) : nullptr;
+            _qwp_ws_error_handler = other._qwp_ws_error_handler;
         }
         return *this;
     }
@@ -782,6 +1305,7 @@ public:
         {
             reset();
             _impl = other._impl;
+            _qwp_ws_error_handler = std::move(other._qwp_ws_error_handler);
             other._impl = nullptr;
         }
         return *this;
@@ -798,6 +1322,79 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_bind_interface, _impl, bind_interface._impl);
+        return *this;
+    }
+
+    /**
+     * Set the maximum QWP/UDP datagram size in bytes.
+     *
+     * `max_datagram_size` must be between 1 and 65,507 bytes, inclusive.
+     * Values outside this range are rejected.
+     * The upper bound is the UDP/IPv4 payload limit, not a recommended
+     * operating size. The default is 1,400 bytes, leaving room for IPv4 and
+     * UDP headers under a common 1,500-byte Ethernet MTU. If you raise this
+     * value, keep it within the effective UDP payload budget for the path MTU.
+     * Oversized IPv4 packets may be fragmented when fragmentation is allowed,
+     * or dropped when it is not; fragmented UDP is fragile because losing any
+     * fragment loses the whole datagram.
+     *
+     * This setting is only supported for `protocol::qwpudp`.
+     */
+    opts& max_datagram_size(size_t max_datagram_size)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_max_datagram_size, _impl, max_datagram_size);
+        return *this;
+    }
+
+    /**
+     * Set the multicast TTL used for QWP/UDP sends.
+     *
+     * The default is 1. Use a value greater than 0 when sending to a multicast
+     * address. A value of 0 prevents multicast datagrams from leaving the local
+     * host.
+     *
+     * This setting is only supported for `protocol::qwpudp`.
+     */
+    opts& multicast_ttl(uint32_t multicast_ttl)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_multicast_ttl, _impl, multicast_ttl);
+        return *this;
+    }
+
+    /**
+     * Control whether QWP/WebSocket progress is driven by a background thread
+     * or manually by the caller. The default is background progress.
+     *
+     * This setting is only supported for `protocol::qwpws` and
+     * `protocol::qwpwss`.
+     */
+    opts& qwp_ws_progress(qwp_ws_progress progress)
+    {
+        const auto c_progress = static_cast<::line_sender_qwpws_progress>(
+            static_cast<int>(progress));
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_qwpws_progress, _impl, c_progress);
+        return *this;
+    }
+
+    /**
+     * Install a QWP/WebSocket server-diagnostic callback. The callback runs
+     * synchronously from sender API calls such as `flush` and must not call
+     * methods on the same sender.
+     */
+    opts& qwp_ws_error_handler(
+        std::function<void(const qwp_ws_error&)> handler)
+    {
+        _qwp_ws_error_handler =
+            std::make_shared<std::function<void(const qwp_ws_error&)>>(
+                std::move(handler));
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_qwpws_error_handler,
+            _impl,
+            &opts::qwp_ws_error_trampoline,
+            _qwp_ws_error_handler.get());
         return *this;
     }
 
@@ -913,8 +1510,12 @@ public:
     }
 
     /**
-     * The maximum buffer size in bytes that the client will flush to the
-     * server. The default is 100 MiB.
+     * The maximum buffered size that the client will flush to the server.
+     * The default is 100 MiB.
+     *
+     * For ILP this applies to the exact pending byte length.
+     * For QWP/UDP this applies to the buffer size hint returned by
+     * `line_sender_buffer::size()`.
      */
     opts& max_buf_size(size_t max_buf_size)
     {
@@ -988,10 +1589,13 @@ public:
      * `protocol_version::v1` by default. You must explicitly set
      * `protocol_version::v2` in order to ingest arrays.
      *
+     * QWP/UDP does not support explicit protocol version configuration.
+     * Calling this method on a QWP/UDP opts will throw.
+     *
      * QuestDB server version 9.0.0 or later is required for
      * `protocol_version::v2` support.
      */
-    opts& protocol_version(protocol_version version) noexcept
+    opts& protocol_version(protocol_version version)
     {
         const auto c_protocol_version =
             static_cast<::line_sender_protocol_version>(
@@ -1012,6 +1616,18 @@ private:
     {
     }
 
+    static void qwp_ws_error_trampoline(
+        void* user_data,
+        const ::line_sender_qwpws_error_view* view) noexcept
+    {
+        auto* handler =
+            static_cast<std::function<void(const qwp_ws_error&)>*>(user_data);
+        if (handler && view)
+        {
+            (*handler)(qwp_ws_error_from_view(*view));
+        }
+    }
+
     void reset() noexcept
     {
         if (_impl)
@@ -1024,6 +1640,8 @@ private:
     friend class line_sender;
 
     ::line_sender_opts* _impl;
+    std::shared_ptr<std::function<void(const qwp_ws_error&)>>
+        _qwp_ws_error_handler;
 };
 
 /**
@@ -1041,7 +1659,8 @@ public:
     /**
      * Create a new line sender instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
-     * Instead of "tcp" you can also specify "tcps", "http", and "https".
+     * Instead of "tcp" you can also specify "tcps", "http", "https",
+     * "qwpudp", "qwpws", and "qwpwss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -1083,6 +1702,7 @@ public:
     line_sender(const opts& opts)
         : _impl{
               line_sender_error::wrapped_call(::line_sender_build, opts._impl)}
+        , _qwp_ws_error_handler{opts._qwp_ws_error_handler}
     {
     }
 
@@ -1090,6 +1710,7 @@ public:
 
     line_sender(line_sender&& other) noexcept
         : _impl{other._impl}
+        , _qwp_ws_error_handler{std::move(other._qwp_ws_error_handler)}
     {
         other._impl = nullptr;
     }
@@ -1102,28 +1723,71 @@ public:
         {
             close();
             _impl = other._impl;
+            _qwp_ws_error_handler = std::move(other._qwp_ws_error_handler);
             other._impl = nullptr;
         }
         return *this;
     }
 
     /**
-     * Get the current protocol version used by the sender.
+     * Get the configured transport protocol used by the sender.
      */
-    questdb::ingress::protocol_version protocol_version() const noexcept
+    questdb::ingress::protocol protocol() const
+    {
+        ensure_impl();
+        return static_cast<enum protocol>(
+            static_cast<int>(::line_sender_get_protocol(_impl)));
+    }
+
+    /**
+     * Get the current protocol version used by the sender.
+     *
+     * This is meaningful for ILP senders. For protocol-neutral inspection, use
+     * `protocol()`. Do not use this value to construct QWP/UDP buffers; use
+     * `new_buffer()` instead.
+     * For QWP/UDP senders this reports the QWP datagram version, currently
+     * represented as `protocol_version::v1`; it is not an ILP feature version.
+     */
+    questdb::ingress::protocol_version protocol_version() const
     {
         ensure_impl();
         return static_cast<enum protocol_version>(
             static_cast<int>(::line_sender_get_protocol_version(_impl)));
     }
 
-    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024) noexcept
+    /**
+     * Construct a new line buffer with the sender's configured settings.
+     *
+     * This is the preferred protocol-neutral constructor. It may produce a
+     * different buffer implementation than `line_sender_buffer{protocol_version()}`
+     * when the sender uses QWP-over-UDP or QWP-over-WebSocket.
+     */
+    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {
         ensure_impl();
+        auto version = this->protocol_version();
+        auto max_name_len = ::line_sender_get_max_name_len(_impl);
+        auto sender_protocol = this->protocol();
+        bool is_qwp = sender_protocol == protocol::qwpudp ||
+            sender_protocol == protocol::qwpws ||
+            sender_protocol == protocol::qwpwss;
+        auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
         return line_sender_buffer{
-            this->protocol_version(),
+            raw_buffer,
+            version,
             init_buf_size,
-            ::line_sender_get_max_name_len(_impl)};
+            max_name_len,
+            is_qwp};
     }
 
     /**
@@ -1143,6 +1807,16 @@ public:
      * to the underlying OS-level network socket, without waiting to actually
      * send it to the server. In the case of an error, the server will quietly
      * disconnect: consult the server logs for error messages.
+     *
+     * With QWP-over-UDP, the function sends one or more UDP datagrams and
+     * returns local socket errors only. A successful return does not
+     * guarantee delivery, and when a flush spans multiple datagrams there is
+     * no all-or-nothing guarantee for the logical batch.
+     *
+     * With QWP-over-WebSocket, the function publishes the buffer into the
+     * local sender queue and returns before the server necessarily ACKs the
+     * frame. Later terminal diagnostics fail subsequent sender calls and are
+     * also observable through the QWP/WebSocket diagnostic polling API.
      *
      * HTTP should be the first choice, but use TCP if you need to continuously
      * send data to the server at a high rate.
@@ -1178,8 +1852,7 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2{this->protocol_version(), 0};
-            buffer2.may_init();
+            line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep, _impl, buffer2._impl);
         }
@@ -1193,7 +1866,9 @@ public:
      * A flush is transactional iff all the rows belong to the same table. This
      * allows QuestDB to treat the flush as a single database transaction,
      * because it doesn't support transactions spanning multiple tables.
-     * Additionally, only ILP-over-HTTP supports transactional flushes.
+     * Additionally, only ILP-over-HTTP supports transactional flushes;
+     * QWP/UDP is a best-effort datagram transport and has no flush-level
+     * atomicity guarantee.
      *
      * If the flush wouldn't be transactional, this function returns an error
      * and doesn't flush any data.
@@ -1220,8 +1895,7 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2{this->protocol_version(), 0};
-            buffer2.may_init();
+            line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep_with_flags,
                 _impl,
@@ -1231,10 +1905,167 @@ public:
     }
 
     /**
+     * Publish a QWP/WebSocket buffer locally, clear it on success, and return
+     * the assigned frame sequence number. Empty buffers return `std::nullopt`.
+     */
+    std::optional<uint64_t> flush_and_get_fsn(line_sender_buffer& buffer)
+    {
+        buffer.may_init();
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_flush_and_get_fsn,
+            _impl,
+            buffer._impl,
+            &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Publish a QWP/WebSocket buffer locally without clearing it and return the
+     * assigned frame sequence number. Empty buffers return `std::nullopt`.
+     */
+    std::optional<uint64_t> flush_and_keep_and_get_fsn(
+        const line_sender_buffer& buffer)
+    {
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        if (buffer._impl)
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_qwpws_flush_and_keep_and_get_fsn,
+                _impl,
+                buffer._impl,
+                &fsn);
+        }
+        else
+        {
+            line_sender_buffer buffer2 = this->new_buffer(0);
+            line_sender_error::wrapped_call(
+                ::line_sender_qwpws_flush_and_keep_and_get_fsn,
+                _impl,
+                buffer2._impl,
+                &fsn);
+        }
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number published locally,
+     * or `std::nullopt` if no frame has been published.
+     */
+    std::optional<uint64_t> published_fsn() const
+    {
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_published_fsn, _impl, &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK
+     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     */
+    std::optional<uint64_t> acked_fsn() const
+    {
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_acked_fsn, _impl, &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
+     * Returns false on timeout.
+     */
+    bool await_acked_fsn(
+        uint64_t fsn, std::chrono::milliseconds timeout)
+    {
+        ensure_impl();
+        const auto timeout_millis = checked_timeout_millis(timeout);
+        bool reached = false;
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_await_acked_fsn,
+            _impl,
+            fsn,
+            timeout_millis,
+            &reached);
+        return reached;
+    }
+
+    /**
+     * Drive one QWP/WebSocket progress step when the sender was built with
+     * manual progress mode. Returns false when no immediate progress is
+     * available.
+     */
+    bool drive_once()
+    {
+        ensure_impl();
+        bool progressed = false;
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_drive_once, _impl, &progressed);
+        return progressed;
+    }
+
+    /**
+     * Poll the next structured QWP/WebSocket diagnostic.
+     */
+    std::optional<qwp_ws_error> poll_qwp_ws_error()
+    {
+        ensure_impl();
+        ::line_sender_qwpws_error* c_error{nullptr};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_poll_error, _impl, &c_error);
+        if (!c_error)
+            return std::nullopt;
+
+        const std::unique_ptr<
+            ::line_sender_qwpws_error,
+            decltype(&::line_sender_qwpws_error_free)>
+            owned_error{c_error, ::line_sender_qwpws_error_free};
+        const auto view = ::line_sender_qwpws_error_get_view(owned_error.get());
+        return qwp_ws_error_from_view(view);
+    }
+
+    /**
+     * Return how many QWP/WebSocket diagnostics were dropped because the
+     * unified bounded diagnostic log was full.
+     *
+     * The same log feeds poll_qwp_ws_error() and error-handler notification
+     * delivery through independent cursors. A lagging cursor can keep entries
+     * live long enough for later diagnostics to overwrite them and increment
+     * this count.
+     */
+    uint64_t qwp_ws_errors_dropped() const
+    {
+        ensure_impl();
+        uint64_t dropped = 0;
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_errors_dropped, _impl, &dropped);
+        return dropped;
+    }
+
+    /**
+     * Stop accepting new QWP/WebSocket publications and wait for already
+     * published frames to resolve. The timeout is configured with
+     * `close_flush_timeout_millis`; the default is 5000 ms, and values less
+     * than or equal to 0 configure a zero-timeout fast close. Throws on
+     * timeout or terminal failure.
+     */
+    void close_drain()
+    {
+        ensure_impl();
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_close_drain, _impl);
+    }
+
+    /**
      * Check if an error occurred previously and the sender must be closed.
      * This happens when there was an earlier failure.
      * This method is specific to ILP-over-TCP and is not relevant for
-     * ILP-over-HTTP.
+     * ILP-over-HTTP or QWP-over-UDP.
      * @return true if an error occurred with a sender and it must be
      * closed.
      */
@@ -1261,6 +2092,24 @@ public:
     }
 
 private:
+    static std::optional<uint64_t> optional_fsn(
+        const ::line_sender_qwpws_fsn& fsn)
+    {
+        if (fsn.has_value)
+            return fsn.value;
+        return std::nullopt;
+    }
+
+    static uint64_t checked_timeout_millis(
+        std::chrono::milliseconds timeout)
+    {
+        if (timeout.count() < 0)
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket ACK timeout must not be negative."};
+        return static_cast<uint64_t>(timeout.count());
+    }
+
     void ensure_impl() const
     {
         if (!_impl)
@@ -1269,6 +2118,8 @@ private:
     }
 
     ::line_sender* _impl;
+    std::shared_ptr<std::function<void(const qwp_ws_error&)>>
+        _qwp_ws_error_handler;
 };
 
 } // namespace questdb::ingress

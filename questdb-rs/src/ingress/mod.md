@@ -63,8 +63,8 @@ QuestDB instances), call
 
 # Error Handling
 
-The two supported transport modes, HTTP and TCP, handle errors very differently.
-In a nutshell, HTTP is much better at error handling.
+The supported transport modes handle errors very differently. In a nutshell,
+HTTP is much better at error handling.
 
 ## TCP
 
@@ -74,6 +74,16 @@ on the reason. When this has happened, the sender transitions into an error
 state, and it is permanently unusable. You must drop it and create a new sender.
 You can inspect the sender's error state by calling
 [`sender.must_close()`](Sender::must_close).
+
+## QWP/UDP
+
+QWP/UDP is a best-effort datagram transport. A `flush()` call sends one or more
+UDP datagrams and can report only local socket errors. A successful return does
+not guarantee delivery, server-side processing, or flush-level atomicity.
+
+When one logical flush spans multiple datagrams, some datagrams may already
+have been emitted before a later send fails. In that case, retrying the same
+buffer may duplicate rows that were already sent.
 
 ## HTTP
 
@@ -181,6 +191,11 @@ You can specify how long the client should wait for the authentication request
 to resolve. The configuration parameter is:
 
 * `auth_timeout` (milliseconds, default 15 seconds)
+
+For QWP/WebSocket configuration strings, the Java-compatible spelling is also
+accepted:
+
+* `auth_timeout_ms` (milliseconds, default 15 seconds)
 
 ## Encryption on the Wire: TLS
 
@@ -328,9 +343,9 @@ buffer.table(table_name)?.column_f64(price_name, 39269.98)?.at(TimestampNanos::n
 
 ## Handling Optional Data (NULLs)
 
-In QuestDB, `NULL` values are represented by simply omitting the column for that specific row. 
+In QuestDB, `NULL` values are represented by simply omitting the column for that specific row.
 
-To make working with Rust's `Option<T>` ergonomic and keep the fluent builder chain unbroken, the [`Buffer`] API provides `_opt` variants for all column methods (e.g., [`column_str_opt`](Buffer::column_str_opt), [`column_f64_opt`](Buffer::column_f64_opt)). 
+To make working with Rust's `Option<T>` ergonomic and keep the fluent builder chain unbroken, the [`Buffer`] API provides `_opt` variants for all column methods (e.g., [`column_str_opt`](Buffer::column_str_opt), [`column_f64_opt`](Buffer::column_f64_opt)).
 
 If the provided value is `Some(v)`, the column is written normally. If the value is `None`, the method acts as a no-op and skips the column.
 
@@ -357,9 +372,9 @@ use questdb::ingress::{Buffer, SenderBuilder, TimestampNanos};
       // Writes the sensor_id column if it's Some, otherwise skips it (stored as NULL in QuestDB)
       .symbol_opt("sensor_id", data.sensor_id.as_deref())?
       // Writes the temperature column
-      .column_f64_opt("temperature", data.temperature)? 
+      .column_f64_opt("temperature", data.temperature)?
       // Silently skips the humidity column (stored as NULL in QuestDB)
-      .column_f64_opt("humidity", data.humidity)?       
+      .column_f64_opt("humidity", data.humidity)?
       .at(TimestampNanos::now())?;
 #   Ok(())
 # }
@@ -408,3 +423,7 @@ messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
 
 To inspect or log a buffer's contents before you send it, call
 [`buffer.as_bytes()`](Buffer::as_bytes).
+
+This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
+encoded into UDP datagrams during [`flush()`](Sender::flush), so
+[`buffer.as_bytes()`](Buffer::as_bytes) is not useful there.

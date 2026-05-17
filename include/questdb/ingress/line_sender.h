@@ -38,6 +38,27 @@ extern "C" {
 #    define LINESENDER_API
 #endif
 
+/////////// Pointer argument conventions.
+/**
+ * Unless a function's documentation states otherwise, every pointer
+ * parameter must be non-NULL. Passing NULL where non-NULL is required
+ * is undefined behaviour and will typically crash the process. This
+ * applies to opaque handle types in particular — `line_sender*`,
+ * `line_sender_buffer*`, `line_sender_opts*`, `line_sender_error*`,
+ * `line_sender_qwpws_error*` — and is not re-asserted on each
+ * function. The library does not insert defensive NULL checks for
+ * opaque handles; treat them like `this` in C++.
+ *
+ * Two narrow exceptions:
+ *
+ *   - `err_out` (the trailing `line_sender_error**` on fallible
+ *     functions) is always optional: pass NULL to discard error
+ *     information on failure.
+ *
+ *   - `line_sender_close()` and `line_sender_buffer_free()` accept
+ *     NULL and silently no-op, mirroring `free(3)`.
+ */
+
 /////////// Error handling.
 /** An error that occurred when using the line sender. */
 typedef struct line_sender_error line_sender_error;
@@ -86,6 +107,9 @@ typedef enum line_sender_error_code
 
     /** The supplied decimal is invalid. */
     line_sender_error_invalid_decimal,
+
+    /** QWP/WebSocket server rejection or terminal protocol violation. */
+    line_sender_error_server_rejection,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -102,6 +126,15 @@ typedef enum line_sender_protocol
 
     /** InfluxDB Line Protocol over HTTP with TLS. */
     line_sender_protocol_https,
+
+    /** QuestWire Protocol over UDP (IPv4-only). */
+    line_sender_protocol_qwpudp,
+
+    /** QuestWire Protocol over WebSocket. */
+    line_sender_protocol_qwpws,
+
+    /** QuestWire Protocol over WebSocket Secure (TLS). */
+    line_sender_protocol_qwpwss,
 } line_sender_protocol;
 
 /** The line protocol version used to write data to buffer. */
@@ -213,7 +246,8 @@ line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
 
 /**
  * Non-owning view of sender buffer, Modifying the buffer will invalidate
- * the borrowed buffer
+ * the borrowed buffer. Callers must not read from `buf` when `len` is zero;
+ * empty views may use a NULL `buf`.
  */
 typedef struct line_sender_buffer_view
 {
@@ -318,51 +352,140 @@ line_sender_column_name line_sender_column_name_assert(
 typedef struct line_sender_buffer line_sender_buffer;
 
 /**
- * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
- * fixed 127-byte name length limit.
- * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
- * configured protocol settings.
+ * Rollback handle captured from a sender buffer.
+ *
+ * Treat the fields as opaque implementation details.
+ *
+ * This is the stable C ABI v1 layout. Do not change field order or width
+ * without a breaking version bump.
+ */
+typedef struct line_sender_bookmark
+{
+    uint64_t origin;
+    uint64_t generation;
+} line_sender_bookmark;
+
+/**
+ * Construct an ILP `line_sender_buffer` with explicitly set
+ * `protocol_version` and fixed 127-byte name length limit.
+ *
+ * This constructor is ILP-only. It does not create QWP/UDP buffers.
+ * For protocol-neutral construction, especially when using QWP/UDP, prefer
+ * `line_sender_buffer_new_for_sender(...)`.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_new(
     line_sender_protocol_version version);
 
 /**
- * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
- * a max name length limit.
- * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
- * configured protocol and max name length limit settings.
+ * Construct an ILP `line_sender_buffer` with explicitly set
+ * `protocol_version` and a max name length limit.
+ *
+ * This constructor is ILP-only. It does not create QWP/UDP buffers.
+ * For protocol-neutral construction, especially when using QWP/UDP, prefer
+ * `line_sender_buffer_new_for_sender(...)`.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(
     line_sender_protocol_version version, size_t max_name_len);
 
+/**
+ * Construct a QWP/UDP `line_sender_buffer` with fixed 127-byte name length
+ * limit.
+ */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_new_qwp(void);
+
+/**
+ * Construct a QWP/UDP `line_sender_buffer` with a max name length limit.
+ */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
+    size_t max_name_len);
+
 /** Release the `line_sender_buffer` object. */
 LINESENDER_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
 
-/** Create a new copy of the buffer. */
+/**
+ * Create a new copy of the buffer.
+ *
+ * Returns NULL and populates `err_out` if `buffer` is NULL or if the
+ * underlying clone panics (e.g. allocation failure).
+ */
 LINESENDER_API
-line_sender_buffer* line_sender_buffer_clone(const line_sender_buffer* buffer);
+line_sender_buffer* line_sender_buffer_clone(
+    const line_sender_buffer* buffer, line_sender_error** err_out);
 
 /**
  * Pre-allocate to ensure the buffer has enough capacity for at least the
  * specified additional byte count. This may be rounded up.
  * This does not allocate if such additional capacity is already satisfied.
+ *
+ * For ILP buffers this is expressed in bytes. For QWP buffers this is only a
+ * best-effort hint and may be ignored.
+ *
+ * Returns true on success. Returns false and populates `err_out` if `buffer`
+ * is NULL or if the underlying allocator panics (e.g. capacity overflow).
  * See: `capacity`.
  */
 LINESENDER_API
-void line_sender_buffer_reserve(line_sender_buffer* buffer, size_t additional);
+bool line_sender_buffer_reserve(
+    line_sender_buffer* buffer,
+    size_t additional,
+    line_sender_error** err_out);
 
-/** Get the current capacity of the buffer. */
+/**
+ * Get the current buffer capacity.
+ *
+ * For ILP buffers this is byte capacity. For QWP buffers this is an
+ * implementation-defined capacity hint and should not be interpreted as byte
+ * capacity.
+ */
 LINESENDER_API
 size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
+
+/**
+ * Capture a bookmark for the current buffer state.
+ *
+ * Capturing a new bookmark replaces the previously stored bookmark or marker.
+ *
+ * @param[in] buffer Buffer to bookmark. Must be non-NULL.
+ * @param[out] out Receives the captured bookmark on success. Passing NULL
+ * returns false and sets `err_out` if provided.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ */
+LINESENDER_API
+bool line_sender_buffer_bookmark(
+    line_sender_buffer* buffer,
+    line_sender_bookmark* out,
+    line_sender_error** err_out);
+
+/**
+ * Rewind the buffer to a previously captured bookmark.
+ *
+ * On success, the stored bookmark is consumed.
+ */
+LINESENDER_API
+bool line_sender_buffer_rewind_to_bookmark(
+    line_sender_buffer* buffer,
+    line_sender_bookmark bookmark,
+    line_sender_error** err_out);
+
+/**
+ * Discard a previously captured bookmark if it is still current.
+ */
+LINESENDER_API
+void line_sender_buffer_clear_bookmark(
+    line_sender_buffer* buffer,
+    line_sender_bookmark bookmark);
 
 /**
  * Mark a rewind point.
  * This allows undoing accumulated changes to the buffer for one or more
  * rows by calling `rewind_to_marker()`.
- * Any previous marker will be discarded.
+ * Any previously stored rewind point will be discarded, including one
+ * established by `line_sender_buffer_bookmark()`.
  * Once the marker is no longer needed, call `clear_marker()`.
  */
 LINESENDER_API
@@ -370,14 +493,21 @@ bool line_sender_buffer_set_marker(
     line_sender_buffer* buffer, line_sender_error** err_out);
 
 /**
- * Undo all changes since the last `set_marker()` call.
- * As a side-effect, this also clears the marker.
+ * Undo all changes since the currently stored rewind point was captured.
+ *
+ * This may rewind a state established by either
+ * `line_sender_buffer_set_marker()` or `line_sender_buffer_bookmark()`.
+ *
+ * As a side-effect, this also clears the stored rewind point.
  */
 LINESENDER_API
 bool line_sender_buffer_rewind_to_marker(
     line_sender_buffer* buffer, line_sender_error** err_out);
 
-/** Discard the marker. */
+/**
+ * Discard the currently stored rewind point, including one established by
+ * `line_sender_buffer_bookmark()`.
+ */
 LINESENDER_API
 void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 
@@ -388,7 +518,12 @@ void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 LINESENDER_API
 void line_sender_buffer_clear(line_sender_buffer* buffer);
 
-/** The number of bytes accumulated in the buffer. */
+/**
+ * The current encoded size of the buffered data.
+ *
+ * For ILP buffers this is the exact pending byte length. For QWP buffers this
+ * is a buffered size hint, not the exact size of any eventual UDP datagram.
+ */
 LINESENDER_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
 
@@ -397,9 +532,11 @@ LINESENDER_API
 size_t line_sender_buffer_row_count(const line_sender_buffer* buffer);
 
 /**
- * Tell whether the buffer is transactional. It is transactional iff it
- * contains data for at most one table. Additionally, you must send the
- * buffer over HTTP to get transactional behavior.
+ * Tell whether the buffer is transactional.
+ *
+ * ILP buffers are transactional iff they contain data for at most one
+ * table. QWP/UDP does not support transactional flushes, so QWP buffers
+ * always return `false`.
  */
 LINESENDER_API
 bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
@@ -407,9 +544,14 @@ bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
 /**
  * Get a read-only view into the buffer's bytes contents.
  *
+ * This is only meaningful for ILP buffers, where rows are accumulated in
+ * serialized form. For QWP buffers the return value is currently empty because
+ * rows are encoded into UDP datagrams only during `flush`.
+ *
  * @param[in] buffer Line sender buffer object.
  * @return read_only view with the byte representation of the line
- *         sender buffer's contents.
+ *         sender buffer's contents for ILP, or an empty view with `len == 0`
+ *         and `buf == NULL` for QWP.
  */
 LINESENDER_API
 line_sender_buffer_view line_sender_buffer_peek(
@@ -493,6 +635,52 @@ bool line_sender_buffer_column_f64(
     line_sender_error** err_out);
 
 /**
+ * Record an 8-bit signed integer for the given column. QWP-only.
+ *
+ * On ILP buffers this returns line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i8(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int8_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a 16-bit signed integer for the given column. QWP-only.
+ *
+ * On ILP buffers this returns line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i16(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int16_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a 32-bit signed integer for the given column. QWP-only.
+ *
+ * On ILP buffers this returns line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i32(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int32_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a 32-bit floating-point value for the given column. QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f32(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    float value,
+    line_sender_error** err_out);
+
+/**
  * Record a string value for the given column.
  *
  * @param[in] buffer Line buffer object.
@@ -547,6 +735,226 @@ bool line_sender_buffer_column_dec(
     line_sender_column_name name,
     const unsigned int scale,
     const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a decimal string value as DECIMAL64. QWP-only.
+ *
+ * Same string format as line_sender_buffer_column_dec_str. The unscaled
+ * magnitude must fit a signed 64-bit integer at the column's pinned scale;
+ * values that do not fit return line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec64_str(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const char *value,
+    size_t value_len,
+    line_sender_error** err_out);
+
+/**
+ * Record an unscaled-int decimal value as DECIMAL64. QWP-only.
+ *
+ * Same scale + two's-complement big-endian format as
+ * line_sender_buffer_column_dec. Values that do not fit a signed 64-bit
+ * integer at the chosen scale return line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec64(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const unsigned int scale,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a decimal string value as DECIMAL128. QWP-only.
+ *
+ * Same string format as line_sender_buffer_column_dec_str. Values that do
+ * not fit a signed 128-bit integer at the column's pinned scale return
+ * line_sender_error_invalid_api_call.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec128_str(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const char *value,
+    size_t value_len,
+    line_sender_error** err_out);
+
+/**
+ * Record an unscaled-int decimal value as DECIMAL128. QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec128(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const unsigned int scale,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a UUID column value. QWP-only.
+ *
+ * The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
+ */
+LINESENDER_API
+bool line_sender_buffer_column_uuid(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint64_t lo,
+    uint64_t hi,
+    line_sender_error** err_out);
+
+/**
+ * Record a LONG256 column value. QWP-only.
+ *
+ * `value` must point to exactly 32 bytes: four 64-bit limbs encoded
+ * little-endian, least-significant limb first.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_long256(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const uint8_t* value,
+    line_sender_error** err_out);
+
+/**
+ * Record an IPv4 column value. QWP-only.
+ *
+ * `value` is the address packed as a u32 with octet 0 in the high byte:
+ *   `addr = ((uint32_t)a << 24) | (b << 16) | (c << 8) | d`
+ * The encoder writes `addr.to_le_bytes()` so the wire bytes appear as
+ * `[d, c, b, a]`.
+ *
+ * IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
+ * currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_ipv4(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint32_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a DATE column value (milliseconds since the Unix epoch). QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_date(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int64_t millis,
+    line_sender_error** err_out);
+
+/**
+ * Record a CHAR column value (single UTF-16 code unit). QWP-only.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_char(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint16_t value,
+    line_sender_error** err_out);
+
+/**
+ * Record a BINARY column value (opaque byte sequence). QWP-only.
+ *
+ * BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does not
+ * currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_binary(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a GEOHASH column value. QWP-only.
+ *
+ * `precision_bits` must be in `1..=60` and is pinned per column.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_geohash(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    uint64_t bits,
+    uint8_t precision_bits,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of `int64` values in C-major order. QWP-only.
+ *
+ * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest does
+ * not currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shape Array of dimension sizes (length = `rank`).
+ *                  Each element must be a positive integer.
+ * @param[in] data First array element data.
+ * @param[in] data_len Element length of the array.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i64_arr_c_major(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const int64_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of `int64` values with byte strides. QWP-only.
+ *
+ * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest does
+ * not currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
+ *
+ * @param[in] strides Array strides, in the unit of bytes. Strides can be
+ *                    negative.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i64_arr_byte_strides(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const int64_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of `int64` values with element strides. QWP-only.
+ *
+ * LONG_ARRAY (`0x12`) is part of the QWP v1 spec. Server-side ingest does
+ * not currently implement this wire type; batches using it will be rejected
+ * with a descriptive error. This may change in future server releases.
+ *
+ * @param[in] strides Array strides, in the unit of elements. Strides can be
+ *                    negative.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i64_arr_elem_strides(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const int64_t* data,
     size_t data_len,
     line_sender_error** err_out);
 
@@ -762,6 +1170,62 @@ bool line_sender_buffer_check_can_flush(
  */
 typedef struct line_sender line_sender;
 
+typedef enum line_sender_qwpws_progress
+{
+    LINE_SENDER_QWPWS_PROGRESS_BACKGROUND = 0,
+    LINE_SENDER_QWPWS_PROGRESS_MANUAL = 1,
+} line_sender_qwpws_progress;
+
+typedef struct line_sender_qwpws_fsn
+{
+    bool has_value;
+    uint64_t value;
+} line_sender_qwpws_fsn;
+
+typedef enum line_sender_qwpws_error_category
+{
+    LINE_SENDER_QWPWS_ERROR_SCHEMA_MISMATCH = 0,
+    LINE_SENDER_QWPWS_ERROR_PARSE_ERROR = 1,
+    LINE_SENDER_QWPWS_ERROR_INTERNAL_ERROR = 2,
+    LINE_SENDER_QWPWS_ERROR_SECURITY_ERROR = 3,
+    LINE_SENDER_QWPWS_ERROR_WRITE_ERROR = 4,
+    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 5,
+    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 6,
+} line_sender_qwpws_error_category;
+
+typedef enum line_sender_qwpws_error_policy
+{
+    LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE = 0,
+    LINE_SENDER_QWPWS_ERROR_HALT = 1,
+} line_sender_qwpws_error_policy;
+
+typedef struct line_sender_qwpws_error line_sender_qwpws_error;
+
+typedef struct line_sender_qwpws_error_view
+{
+    line_sender_qwpws_error_category category;
+    line_sender_qwpws_error_policy applied_policy;
+    bool has_status;
+    uint8_t status;
+    bool has_message_sequence;
+    uint64_t message_sequence;
+    uint64_t from_fsn;
+    uint64_t to_fsn;
+    const char* message;
+    size_t message_len;
+} line_sender_qwpws_error_view;
+
+/**
+ * QWP/WebSocket server-diagnostic callback.
+ *
+ * The callback runs synchronously from sender API calls such as
+ * `line_sender_flush`. The `event` view is valid only for the duration of the
+ * callback call. The callback must not call methods on the same sender.
+ */
+typedef void (*line_sender_qwpws_error_cb)(
+    void* user_data,
+    const line_sender_qwpws_error_view* event);
+
 /**
  * Accumulates parameters for a new `line_sender` object.
  */
@@ -770,7 +1234,8 @@ typedef struct line_sender_opts line_sender_opts;
 /**
  * Create a new `line_sender_opts` instance from the given configuration
  * string. The format of the string is: "tcp::addr=host:port;key=value;...;"
- * Instead of "tcp" you can also specify "tcps", "http", and "https".
+ * Instead of "tcp" you can also specify "tcps", "http", "https", "qwpudp",
+ * "qwpws", and "qwpwss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:
@@ -801,7 +1266,7 @@ line_sender_opts* line_sender_opts_from_env(line_sender_error** err_out);
  *
  * @param[in] protocol The protocol to use.
  * @param[in] host The QuestDB database host.
- * @param[in] port The QuestDB ILP TCP port.
+ * @param[in] port The QuestDB port for the selected protocol.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_new(
@@ -828,6 +1293,73 @@ LINESENDER_API
 bool line_sender_opts_bind_interface(
     line_sender_opts* opts,
     line_sender_utf8 bind_interface,
+    line_sender_error** err_out);
+
+/**
+ * Set the maximum QWP/UDP datagram size in bytes.
+ *
+ * `max_datagram_size` must be between 1 and 65,507 bytes, inclusive.
+ * Values outside this range are rejected.
+ * The upper bound is the UDP/IPv4 payload limit, not a recommended
+ * operating size. The default is 1,400 bytes, leaving room for IPv4 and
+ * UDP headers under a common 1,500-byte Ethernet MTU. If you raise this
+ * value, keep it within the effective UDP payload budget for the path MTU.
+ * Oversized IPv4 packets may be fragmented when fragmentation is allowed,
+ * or dropped when it is not; fragmented UDP is fragile because losing any
+ * fragment loses the whole datagram.
+ *
+ * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * Returns `false` and sets `err_out` on constraint violation or
+ * protocol mismatch.
+ */
+LINESENDER_API
+bool line_sender_opts_max_datagram_size(
+    line_sender_opts* opts,
+    size_t max_datagram_size,
+    line_sender_error** err_out);
+
+/**
+ * Set the multicast TTL used for QWP/UDP sends.
+ *
+ * The default is 1. Use a value greater than 0 when sending to a multicast
+ * address. A value of 0 prevents multicast datagrams from leaving the local
+ * host.
+ *
+ * `multicast_ttl` must be in the 0–255 range (inclusive).
+ * Values greater than 255 are treated as an error.
+ *
+ * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * Returns `false` and sets `err_out` on constraint violation or
+ * protocol mismatch.
+ */
+LINESENDER_API
+bool line_sender_opts_multicast_ttl(
+    line_sender_opts* opts,
+    uint32_t multicast_ttl,
+    line_sender_error** err_out);
+
+/**
+ * Control whether QWP/WebSocket progress is driven by a background thread or
+ * manually by the caller. The default is background progress. This setting is
+ * only supported for `line_sender_protocol_qwpws` and
+ * `line_sender_protocol_qwpwss`.
+ */
+LINESENDER_API
+bool line_sender_opts_qwpws_progress(
+    line_sender_opts* opts,
+    line_sender_qwpws_progress progress,
+    line_sender_error** err_out);
+
+/**
+ * Install a QWP/WebSocket server-diagnostic callback. Passing NULL restores the
+ * default C callback, which writes one structured line to stderr per
+ * diagnostic.
+ */
+LINESENDER_API
+bool line_sender_opts_qwpws_error_handler(
+    line_sender_opts* opts,
+    line_sender_qwpws_error_cb cb,
+    void* user_data,
     line_sender_error** err_out);
 
 /**
@@ -894,6 +1426,9 @@ bool line_sender_opts_token_y(
  * `line_sender_protocol_version_1` by default. You must explicitly set
  * `line_sender_protocol_version_2` in order to ingest arrays.
  *
+ * QWP/UDP does not support explicit protocol version configuration.
+ * Calling this function on QWP/UDP opts will return an error.
+ *
  * QuestDB server version 9.0.0 or later is required for
  * `line_sender_protocol_version_2` support.
  *
@@ -947,8 +1482,12 @@ bool line_sender_opts_tls_roots(
     line_sender_opts* opts, line_sender_utf8 path, line_sender_error** err_out);
 
 /**
- * Set the maximum buffer size in bytes that the client will flush to the
- * server. The default is 100 MiB.
+ * Set the maximum buffered size that the client will flush to the server.
+ * The default is 100 MiB.
+ *
+ * For ILP this applies to the exact pending byte length.
+ * For QWP/UDP this applies to the buffer size hint returned by
+ * `line_sender_buffer_size()`.
  */
 LINESENDER_API
 bool line_sender_opts_max_buf_size(
@@ -1007,11 +1546,15 @@ bool line_sender_opts_user_agent(
 /**
  * Duplicate the `line_sender_opts` object.
  * Both old and new objects will have to be freed.
+ * Returns NULL if `opts` is NULL.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_clone(line_sender_opts* opts);
 
-/** Release the `line_sender_opts` object. */
+/**
+ * Release the `line_sender_opts` object.
+ * Passing NULL is a no-op.
+ */
 LINESENDER_API
 void line_sender_opts_free(line_sender_opts* opts);
 
@@ -1024,8 +1567,9 @@ void line_sender_opts_free(line_sender_opts* opts);
  * returning.
  *
  * The sender should be accessed by only a single thread a time.
- * @param[in] opts Options for the connection.
- * @note The opts object is freed.
+ * @param[in] opts Options for the connection. Must be non-NULL.
+ * @note The caller retains ownership of `opts` and must release it with
+ * `line_sender_opts_free()` when it is no longer needed.
  */
 LINESENDER_API
 line_sender* line_sender_build(
@@ -1034,7 +1578,8 @@ line_sender* line_sender_build(
 /**
  * Create a new line sender instance from the given configuration string.
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
- * Instead of "tcp" you can also specify "tcps", "http", and "https".
+ * Instead of "tcp" you can also specify "tcps", "http", "https",
+ * "qwpudp", "qwpws", and "qwpwss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:
@@ -1074,7 +1619,22 @@ LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
 
 /**
- * Return the sender's protocol version.
+ * Return the sender's configured transport protocol.
+ */
+LINESENDER_API
+line_sender_protocol line_sender_get_protocol(const line_sender* sender);
+
+/**
+ * Return the sender's ILP protocol version.
+ *
+ * This is meaningful for ILP senders. For protocol-neutral inspection, use
+ * `line_sender_get_protocol(...)`.
+ * Do not use this value to construct QWP/UDP buffers; use
+ * `line_sender_buffer_new_for_sender(...)` instead.
+ * For QWP/UDP senders this reports the QWP datagram version, currently
+ * represented as `line_sender_protocol_version_1`; it is not an ILP feature
+ * version.
+ *
  * This is either the protocol version that was set explicitly,
  * or the one that was auto-detected during the connection process(Only for
  * HTTP). If connecting via TCP and not overridden, the value is
@@ -1091,20 +1651,21 @@ LINESENDER_API
 size_t line_sender_get_max_name_len(const line_sender* sender);
 
 /**
- * Construct a `line_sender_buffer` with the sender's
- * configured `protocol_version` and `max_name_len` settings.
- * This is equivalent to calling:
- *   line_sender_buffer_new(
- *       line_sender_get_protocol_version(sender),
- *       line_sender_get_max_name_len(sender))
+ * Construct a `line_sender_buffer` with the sender's configured settings.
+ *
+ * This is the preferred protocol-neutral constructor. It may produce a
+ * different buffer implementation than `line_sender_buffer_new(...)`, for
+ * example when the sender uses QWP-over-UDP or QWP-over-WebSocket.
  */
+LINESENDER_API
 line_sender_buffer* line_sender_buffer_new_for_sender(
     const line_sender* sender);
 
 /**
  * Tell whether the sender is no longer usable and must be closed.
  * This happens when there was an earlier failure.
- * This fuction is specific to TCP and is not relevant for HTTP.
+ * This fuction is specific to ILP-over-TCP and is not relevant for
+ * ILP-over-HTTP or QWP-over-UDP.
  * @param[in] sender Line sender object.
  * @return true if an error occurred with a sender and it must be closed.
  */
@@ -1117,6 +1678,136 @@ bool line_sender_must_close(const line_sender* sender);
  */
 LINESENDER_API
 void line_sender_close(line_sender* sender);
+
+/**
+ * Publish a QWP/WebSocket buffer locally, clear it on success, and return the
+ * assigned frame sequence number. Empty buffers succeed with
+ * `fsn_out->has_value == false`.
+ */
+LINESENDER_API
+bool line_sender_qwpws_flush_and_get_fsn(
+    line_sender* sender,
+    line_sender_buffer* buffer,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Publish a QWP/WebSocket buffer locally without clearing it and return the
+ * assigned frame sequence number. Empty buffers succeed with
+ * `fsn_out->has_value == false`.
+ */
+LINESENDER_API
+bool line_sender_qwpws_flush_and_keep_and_get_fsn(
+    line_sender* sender,
+    const line_sender_buffer* buffer,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Drive one QWP/WebSocket progress step for a sender built with
+ * `qwp_ws_progress=manual`.
+ */
+LINESENDER_API
+bool line_sender_qwpws_drive_once(
+    line_sender* sender,
+    bool* progressed_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number published locally, or
+ * no value if no frame has been published.
+ */
+LINESENDER_API
+bool line_sender_qwpws_published_fsn(
+    const line_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK or
+ * drop-and-continue rejection, or no value if no frame has completed.
+ */
+LINESENDER_API
+bool line_sender_qwpws_acked_fsn(
+    const line_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
+ * Timeout is a normal successful result with `*reached_out == false`.
+ */
+LINESENDER_API
+bool line_sender_qwpws_await_acked_fsn(
+    line_sender* sender,
+    uint64_t fsn,
+    uint64_t timeout_millis,
+    bool* reached_out,
+    line_sender_error** err_out);
+
+/**
+ * Poll the next structured QWP/WebSocket diagnostic. No diagnostic is a
+ * successful result with `*error_out == NULL`.
+ */
+LINESENDER_API
+bool line_sender_qwpws_poll_error(
+    line_sender* sender,
+    line_sender_qwpws_error** error_out,
+    line_sender_error** err_out);
+
+/**
+ * Return a borrowed view into an owned QWP/WebSocket diagnostic.
+ *
+ * The view's `message` pointer is valid until `error` is freed.
+ */
+LINESENDER_API
+line_sender_qwpws_error_view line_sender_qwpws_error_get_view(
+    const line_sender_qwpws_error* error);
+
+/**
+ * If `error` carries a terminal QWP/WebSocket diagnostic, write a borrowed
+ * view into `view_out` and return true.
+ *
+ * The view's `message` pointer is valid until `error` is freed. Returns false
+ * when `error` has no QWP/WebSocket diagnostic, or when either pointer is NULL.
+ */
+LINESENDER_API
+bool line_sender_error_qwpws_get_view(
+    const line_sender_error* error,
+    line_sender_qwpws_error_view* view_out);
+
+/**
+ * Free an owned QWP/WebSocket diagnostic. Passing NULL is a no-op.
+ */
+LINESENDER_API
+void line_sender_qwpws_error_free(line_sender_qwpws_error* error);
+
+/**
+ * Return how many QWP/WebSocket diagnostics were dropped because the sender's
+ * unified bounded diagnostic log was full.
+ *
+ * The same log feeds line_sender_qwpws_poll_error() and error-handler
+ * notification delivery through independent cursors. A lagging cursor can keep
+ * entries live long enough for later diagnostics to overwrite them and
+ * increment this count.
+ */
+LINESENDER_API
+bool line_sender_qwpws_errors_dropped(
+    const line_sender* sender,
+    uint64_t* dropped_out,
+    line_sender_error** err_out);
+
+/**
+ * Stop accepting new QWP/WebSocket publications and wait for already-published
+ * frames to resolve. The timeout is configured with the QWP/WebSocket
+ * `close_flush_timeout_millis` config key; the default is 5000 ms, and values
+ * less than or equal to 0 configure a zero-timeout fast close. Timeout and
+ * terminal failure are reported through `err_out`.
+ */
+LINESENDER_API
+bool line_sender_qwpws_close_drain(
+    line_sender* sender,
+    line_sender_error** err_out);
 
 /**
  * Send the given buffer of rows to the QuestDB server, clearing the buffer.
@@ -1135,6 +1826,16 @@ void line_sender_close(line_sender* sender);
  * to the underlying OS-level network socket, without waiting to actually
  * send it to the server. In the case of an error, the server will quietly
  * disconnect: consult the server logs for error messages.
+ *
+ * With QWP-over-UDP, the function sends one or more UDP datagrams and returns
+ * local socket errors only. A successful return does not guarantee delivery,
+ * and when a flush spans multiple datagrams there is no all-or-nothing
+ * guarantee for the logical batch.
+ *
+ * With QWP-over-WebSocket, the function publishes the buffer into the local
+ * sender queue and returns before the server necessarily ACKs the frame. Later
+ * terminal diagnostics fail subsequent sender calls and are also observable
+ * through the QWP/WebSocket diagnostic polling API.
  *
  * HTTP should be the first choice, but use TCP if you need to continuously
  * send data to the server at a high rate.
@@ -1180,7 +1881,9 @@ bool line_sender_flush_and_keep(
  * A flush is transactional iff all the rows belong to the same table. This
  * allows QuestDB to treat the flush as a single database transaction,
  * because it doesn't support transactions spanning multiple tables.
- * Additionally, only ILP-over-HTTP supports transactional flushes.
+ * Additionally, only ILP-over-HTTP supports transactional flushes;
+ * QWP/UDP is a best-effort datagram transport and has no flush-level
+ * atomicity guarantee.
  *
  * If the flush wouldn't be transactional, this function returns an error
  * and doesn't flush any data.

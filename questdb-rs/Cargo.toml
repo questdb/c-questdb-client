@@ -24,6 +24,7 @@ dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
 ryu = { version = "1.0" }
 itoa = "1.0"
+log = "0.4"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.12.0"
@@ -41,9 +42,16 @@ rand = { version = "0.9.0", optional = true }
 ndarray = { version = "0.16", optional = true }
 rust_decimal = { version = "1.38.0", optional = true }
 bigdecimal = { version = "0.4.8", optional = true }
+crc32c = "0.6"
+memmap2 = "0.9"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.9", features = ["ws2def"] }
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [build-dependencies]
 serde_json = { version = "1.0.108" }
@@ -58,12 +66,18 @@ chrono = "0.4.31"
 tempfile = "3"
 webpki-roots = "1.0.1"
 rstest = "0.26.1"
+proptest = "1.6.0"
 
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 
-## Sync ILP/TCP + ILP/HTTP Sender
-sync-sender = ["sync-sender-tcp", "sync-sender-http"]
+## Sync senders: ILP/TCP + ILP/HTTP + QWP/UDP + QWP/WS
+sync-sender = [
+    "sync-sender-tcp",
+    "sync-sender-http",
+    "sync-sender-qwp-udp",
+    "sync-sender-qwp-ws",
+]
 
 ## Sync ILP/TCP
 sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
@@ -77,6 +91,12 @@ sync-sender-http = [
     "dep:rand",
 ]
 
+## Sync QWP/UDP
+sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
+
+## Sync QWP/WebSocket
+sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand"]
+
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
 
@@ -84,10 +104,16 @@ tls-native-certs = ["dep:rustls-native-certs"]
 tls-webpki-certs = ["dep:webpki-roots"]
 
 ## Use `aws-lc-rs` as the cryto library.
-aws-lc-crypto = ["dep:aws-lc-rs", "rustls/aws-lc-rs"]
+aws-lc-crypto = [
+    "dep:aws-lc-rs",
+    "rustls/aws-lc-rs",
+]
 
 ## Use `ring` as the crypto library.
-ring-crypto = ["dep:ring", "rustls/ring"]
+ring-crypto = [
+    "dep:ring",
+    "rustls/ring",
+]
 
 ## Allow skipping verification of insecure certificates.
 insecure-skip-verify = []
@@ -107,6 +133,8 @@ bigdecimal = ["dep:bigdecimal"]
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
 _sender-http = []
+_sender-qwp-udp = []
+_sender-qwp-ws = []
 _sync-sender = []
 
 ## Enable all cross-compatible features.
@@ -146,3 +174,7 @@ required-features = ["sync-sender-http", "ndarray", "rust_decimal"]
 [[example]]
 name = "protocol_version"
 required-features = ["sync-sender-http", "ndarray", "bigdecimal"]
+
+[[example]]
+name = "qwp_ws_unified_sfa_bench"
+required-features = ["sync-sender-qwp-ws"]

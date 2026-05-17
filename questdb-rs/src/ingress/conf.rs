@@ -22,8 +22,12 @@
  *
  ******************************************************************************/
 
+#[cfg(feature = "_sender-qwp-ws")]
+use super::QwpWsProgress;
 use crate::{Error, ErrorCode, Result};
 use std::ops::Deref;
+#[cfg(feature = "_sender-qwp-ws")]
+use std::path::PathBuf;
 
 /// Wraps a SenderBuilder config setting with the intent of tracking
 /// whether the value was user-specified or defaulted.
@@ -94,14 +98,182 @@ impl Default for HttpConfig {
     }
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(feature = "_sender-qwp-udp")]
+#[derive(Debug, Clone)]
+pub(crate) struct QwpUdpConfig {
+    pub(crate) max_datagram_size: ConfigSetting<usize>,
+    pub(crate) multicast_ttl: ConfigSetting<u32>,
+}
+
+#[cfg(feature = "_sender-qwp-udp")]
+impl Default for QwpUdpConfig {
+    fn default() -> Self {
+        Self {
+            max_datagram_size: ConfigSetting::new_default(1400),
+            multicast_ttl: ConfigSetting::new_default(1),
+        }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SENDER_ID: &str = "default";
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SfDurability {
+    Memory,
+    Flush,
+    Append,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl SfDurability {
+    pub(crate) fn as_conf_value(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Flush => "flush",
+            Self::Append => "append",
+        }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn is_valid_qwp_ws_sender_id(sender_id: &str) -> bool {
+    !sender_id.is_empty()
+        && sender_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QwpWsEndpoint {
+    pub(crate) host: String,
+    pub(crate) port: String,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsEndpoint {
+    pub(crate) fn new(host: String, port: String) -> Self {
+        Self { host, port }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwpWsInitialConnectMode {
+    Off,
+    Sync,
+    Async,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone)]
+pub(crate) struct QwpWsConfig {
+    pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
+    pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) client_id: ConfigSetting<Option<String>>,
+    pub(crate) max_protocol_version: ConfigSetting<u32>,
+    pub(crate) request_durable_ack: ConfigSetting<bool>,
+    pub(crate) durable_ack_keepalive_interval: ConfigSetting<std::time::Duration>,
+    /// Maximum number of unacknowledged messages in flight on a single
+    /// pipelined async sender. Matches the spec's per-connection cap.
+    pub(crate) max_in_flight: ConfigSetting<usize>,
+    /// Per-outage wall-clock budget for the reconnect loop.
+    pub(crate) reconnect_max_duration: ConfigSetting<std::time::Duration>,
+    /// Initial reconnect backoff; the reconnect loop doubles the delay up to
+    /// `reconnect_max_backoff`.
+    pub(crate) reconnect_initial_backoff: ConfigSetting<std::time::Duration>,
+    /// Cap on the per-attempt reconnect delay.
+    pub(crate) reconnect_max_backoff: ConfigSetting<std::time::Duration>,
+    /// Initial-connect retry mode. Default is fail-fast after one endpoint
+    /// round, matching Java's startup behavior.
+    pub(crate) initial_connect_retry: ConfigSetting<QwpWsInitialConnectMode>,
+    /// Bounded wait used by Sender::close_drain().
+    pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
+    pub(crate) sender_id: ConfigSetting<String>,
+    pub(crate) sf_max_bytes: ConfigSetting<u64>,
+    pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
+    pub(crate) sf_durability: ConfigSetting<SfDurability>,
+    pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
+    pub(crate) drain_orphans: ConfigSetting<bool>,
+    pub(crate) max_background_drainers: ConfigSetting<usize>,
+    pub(crate) progress: ConfigSetting<QwpWsProgress>,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Default for QwpWsConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: ConfigSetting::new_default(Vec::new()),
+            auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
+            request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
+            client_id: ConfigSetting::new_default(None),
+            max_protocol_version: ConfigSetting::new_default(1),
+            request_durable_ack: ConfigSetting::new_default(false),
+            durable_ack_keepalive_interval: ConfigSetting::new_default(
+                std::time::Duration::from_millis(200),
+            ),
+            max_in_flight: ConfigSetting::new_default(128),
+            reconnect_max_duration: ConfigSetting::new_default(std::time::Duration::from_secs(300)),
+            reconnect_initial_backoff: ConfigSetting::new_default(
+                std::time::Duration::from_millis(100),
+            ),
+            reconnect_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
+            initial_connect_retry: ConfigSetting::new_default(QwpWsInitialConnectMode::Off),
+            close_flush_timeout: ConfigSetting::new_default(QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT),
+            sf_dir: ConfigSetting::new_default(None),
+            sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),
+            sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
+            sf_max_total_bytes: ConfigSetting::new_default(None),
+            sf_durability: ConfigSetting::new_default(SfDurability::Memory),
+            sf_append_deadline: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
+            drain_orphans: ConfigSetting::new_default(false),
+            max_background_drainers: ConfigSetting::new_default(
+                QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS,
+            ),
+            progress: ConfigSetting::new_default(QwpWsProgress::Background),
+        }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsConfig {
+    pub(crate) fn sf_max_total_bytes(&self) -> u64 {
+        if let Some(max_total_bytes) = *self.sf_max_total_bytes {
+            return max_total_bytes;
+        }
+
+        let default_max_total_bytes = if self.sf_dir.is_some() {
+            QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES
+        } else {
+            QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES
+        };
+        default_max_total_bytes.max(self.sf_max_bytes.saturating_mul(2))
+    }
+}
+
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) struct BasicAuthParams {
     pub(crate) username: String,
     pub(crate) password: String,
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 impl BasicAuthParams {
     pub(crate) fn to_header_string(&self) -> String {
         use base64ct::{Base64, Encoding};
@@ -111,13 +283,13 @@ impl BasicAuthParams {
     }
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) struct TokenAuthParams {
     pub(crate) token: String,
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 impl TokenAuthParams {
     pub(crate) fn to_header_string(&self) -> crate::Result<String> {
         if self.token.contains('\n') {
@@ -144,9 +316,9 @@ pub(crate) enum AuthParams {
     #[cfg(feature = "_sender-tcp")]
     Ecdsa(EcdsaAuthParams),
 
-    #[cfg(feature = "_sender-http")]
+    #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     Basic(BasicAuthParams),
 
-    #[cfg(feature = "_sender-http")]
+    #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     Token(TokenAuthParams),
 }

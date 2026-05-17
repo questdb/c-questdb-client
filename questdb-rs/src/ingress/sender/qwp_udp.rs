@@ -1,0 +1,240 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+use crate::error;
+use crate::gai;
+use crate::ingress::SyncProtocolHandler;
+use crate::ingress::buffer::{QwpBuffer, QwpSendScratch};
+use crate::ingress::conf::QwpUdpConfig;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+pub(crate) struct SyncQwpUdpHandlerState {
+    pub(crate) socket: UdpSocket,
+    pub(crate) target_addr: SocketAddrV4,
+    pub(crate) max_datagram_size: usize,
+    pub(crate) scratch: QwpSendScratch,
+}
+
+fn resolve_udp_target(host: &str, port: &str) -> crate::Result<SocketAddrV4> {
+    let sock_addr = gai::resolve_host_port_udp(host, port)?;
+    let addr = sock_addr.as_socket_ipv4().ok_or_else(|| {
+        error::fmt!(
+            CouldNotResolveAddr,
+            "Could not resolve {:?}:{:?}: no IPv4 address found",
+            host,
+            port
+        )
+    })?;
+    Ok(addr)
+}
+
+fn resolve_bind_addr(net_interface: &str) -> crate::Result<SocketAddrV4> {
+    let sock_addr = gai::resolve_host_udp(net_interface)?;
+    let addr = sock_addr.as_socket_ipv4().ok_or_else(|| {
+        error::fmt!(
+            CouldNotResolveAddr,
+            "Could not resolve interface address {:?}: no IPv4 address found",
+            net_interface
+        )
+    })?;
+    Ok(SocketAddrV4::new(*addr.ip(), 0))
+}
+
+pub(crate) fn connect_qwp_udp(
+    host: &str,
+    port: &str,
+    net_interface: Option<&str>,
+    qwp_udp: &QwpUdpConfig,
+) -> crate::Result<SyncProtocolHandler> {
+    let target_addr = resolve_udp_target(host, port)?;
+    let bind_addr = match net_interface {
+        Some(net_interface) => resolve_bind_addr(net_interface)?,
+        None => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    };
+
+    let socket = UdpSocket::bind(bind_addr).map_err(|io_err| {
+        error::fmt!(
+            SocketError,
+            "Could not open UDP socket bound to {:?}: {}",
+            bind_addr,
+            io_err
+        )
+    })?;
+
+    socket.connect(target_addr).map_err(|io_err| {
+        error::fmt!(
+            SocketError,
+            "Could not connect UDP socket to {:?}: {}",
+            target_addr,
+            io_err
+        )
+    })?;
+
+    socket
+        .set_multicast_ttl_v4(*qwp_udp.multicast_ttl)
+        .map_err(|io_err| {
+            error::fmt!(
+                SocketError,
+                "Could not set UDP multicast TTL to {}: {}",
+                *qwp_udp.multicast_ttl,
+                io_err
+            )
+        })?;
+
+    let max_datagram_size = *qwp_udp.max_datagram_size;
+
+    Ok(SyncProtocolHandler::SyncQwpUdp(SyncQwpUdpHandlerState {
+        socket,
+        target_addr,
+        max_datagram_size,
+        scratch: QwpSendScratch::new(max_datagram_size),
+    }))
+}
+
+pub(crate) fn flush_qwp_udp(
+    state: &mut SyncQwpUdpHandlerState,
+    buffer: &QwpBuffer,
+) -> crate::Result<()> {
+    let target_addr = state.target_addr;
+    let max_datagram_size = state.max_datagram_size;
+
+    buffer.flush_to_socket(
+        &mut state.scratch,
+        max_datagram_size,
+        // UDP sends are atomic: the kernel either accepts the full
+        // datagram or returns an error. No partial-write check needed.
+        &mut |datagram: &[u8]| {
+            state.socket.send(datagram).map_err(|io_err| {
+                error::fmt!(
+                    SocketError,
+                    "Could not send UDP datagram to {:?}: {}",
+                    target_addr,
+                    io_err
+                )
+            })?;
+            Ok(())
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorCode;
+
+    #[test]
+    fn qwp_udp_rejects_ipv6_only_targets() {
+        let err = match connect_qwp_udp("::1", "9007", None, &QwpUdpConfig::default()) {
+            Ok(_) => panic!("expected IPv6-only target resolution to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::CouldNotResolveAddr);
+        assert!(err.msg().contains("Could not resolve"));
+        assert!(err.msg().contains("::1"));
+    }
+
+    #[test]
+    fn qwp_udp_rejects_ipv6_only_bind_interface() {
+        let err = match connect_qwp_udp("127.0.0.1", "9007", Some("::1"), &QwpUdpConfig::default())
+        {
+            Ok(_) => panic!("expected IPv6-only bind interface resolution to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::CouldNotResolveAddr);
+        assert!(err.msg().contains("Could not resolve"));
+        assert!(err.msg().contains("::1"));
+    }
+
+    #[test]
+    fn qwp_udp_binds_requested_interface() {
+        let handler = connect_qwp_udp(
+            "127.0.0.1",
+            "9007",
+            Some("127.0.0.1"),
+            &QwpUdpConfig::default(),
+        )
+        .unwrap();
+        #[allow(irrefutable_let_patterns)]
+        let SyncProtocolHandler::SyncQwpUdp(ref state) = handler else {
+            panic!("Expected SyncQwpUdp handler");
+        };
+
+        assert_eq!(state.socket.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+    }
+
+    #[test]
+    fn qwp_udp_sets_default_multicast_ttl_on_socket() {
+        let handler = connect_qwp_udp("127.0.0.1", "9007", None, &QwpUdpConfig::default()).unwrap();
+        #[allow(irrefutable_let_patterns)]
+        let SyncProtocolHandler::SyncQwpUdp(ref state) = handler else {
+            panic!("Expected SyncQwpUdp handler");
+        };
+
+        assert_eq!(state.socket.multicast_ttl_v4().unwrap(), 1);
+    }
+
+    #[test]
+    fn qwp_udp_sets_multicast_ttl_on_socket() {
+        let mut qwp_udp = QwpUdpConfig::default();
+        qwp_udp
+            .multicast_ttl
+            .set_specified("multicast_ttl", 7)
+            .unwrap();
+
+        let handler = connect_qwp_udp("127.0.0.1", "9007", None, &qwp_udp).unwrap();
+        #[allow(irrefutable_let_patterns)]
+        let SyncProtocolHandler::SyncQwpUdp(ref state) = handler else {
+            panic!("Expected SyncQwpUdp handler");
+        };
+
+        assert_eq!(state.socket.multicast_ttl_v4().unwrap(), 7);
+    }
+
+    #[test]
+    fn qwp_udp_flush_surfaces_socket_send_failure() {
+        let qwp_udp = QwpUdpConfig::default();
+        let mut handler = connect_qwp_udp("127.0.0.1", "9007", None, &qwp_udp).unwrap();
+        #[allow(irrefutable_let_patterns)]
+        let SyncProtocolHandler::SyncQwpUdp(state) = &mut handler else {
+            panic!("Expected SyncQwpUdp handler");
+        };
+
+        state.socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+
+        let mut buffer = QwpBuffer::new(127);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let err = flush_qwp_udp(state, &buffer).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.msg().contains("Could not send UDP datagram to"));
+    }
+}

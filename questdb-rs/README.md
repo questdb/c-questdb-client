@@ -3,17 +3,34 @@
 Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
 database designed to process time-series data, faster.
 
-The client library is designed for fast ingestion of data into QuestDB via the
-InfluxDB Line Protocol (ILP) over either HTTP (recommended) or TCP.
+The client library is designed for fast ingestion of data into QuestDB. It
+supports three transports: the InfluxDB Line Protocol (ILP) over HTTP
+(recommended) or TCP, and the QuestDB Wire Protocol (QWP) over UDP for
+high-throughput ingestion on trusted networks.
 
 * [QuestDB Database docs](https://questdb.io/docs/)
 * [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
 
+## Transports
+
+The transport is selected by the scheme in the configuration string:
+
+* `http::addr=...` / `https::addr=...` — request-response, errors returned
+  to the client, supports authentication and TLS. Recommended for most
+  workloads.
+* `tcp::addr=...` / `tcps::addr=...` — streaming, legacy; errors cause
+  server-side disconnect and surface only in server logs.
+* `qwpudp::addr=...` — best-effort UDP datagrams (IPv4-only); no
+  acknowledgements, no authentication, no TLS, no transactional guarantees.
+  See the [`ingress`](https://docs.rs/questdb-rs/latest/questdb/ingress/)
+  module docs (in particular `Protocol::QwpUdp`) for semantics and
+  configuration parameters.
+
 ## Protocol Versions
 
-The library supports the following ILP protocol versions.
-
-These protocol versions are supported over both HTTP and TCP.
+The library supports the following ILP protocol versions. These apply to
+ILP/HTTP and ILP/TCP only — QWP/UDP uses its own wire format and is not
+versioned through this mechanism.
 
 * If you use HTTP and `protocol_version=auto` or unset, the library will
   automatically detect the server's

@@ -22,1443 +22,1355 @@
  *
  ******************************************************************************/
 
-use crate::ingress::decimal::DecimalView;
-use crate::ingress::ndarr::{ArrayElementSealed, check_and_get_array_bytes_size};
-use crate::ingress::{
-    ARRAY_BINARY_FORMAT_TYPE, ArrayElement, DOUBLE_BINARY_FORMAT_TYPE, DebugBytes, MAX_ARRAY_DIMS,
-    MAX_NAME_LEN_DEFAULT, NdArrayView, ProtocolVersion, Timestamp, TimestampMicros, TimestampNanos,
-    ndarr,
-};
+mod ilp;
+mod op_state;
+
+#[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+mod qwp;
+
+use crate::ingress::ndarr::ArrayElementSealed;
+use crate::ingress::{ArrayElement, DecimalView, NdArrayView, ProtocolVersion, Timestamp};
 use crate::{Error, error};
-use std::fmt::{Debug, Formatter};
-use std::num::NonZeroUsize;
-use std::slice::from_raw_parts_mut;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
-where
-    C: Fn(u8) -> bool,
-    Q: Fn(&mut Vec<u8>),
-{
-    let mut to_escape = 0usize;
-    for b in s.bytes() {
-        if check_escape_fn(b) {
-            to_escape += 1;
-        }
+pub(crate) use self::ilp::Buffer as IlpBuffer;
+#[allow(unused_imports)]
+pub(crate) use self::ilp::F64Serializer;
+pub use self::ilp::{ColumnName, TableName};
+
+#[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+pub(crate) use self::qwp::QwpBuffer;
+#[cfg(feature = "_sender-qwp-udp")]
+pub(crate) use self::qwp::QwpSendScratch;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use self::qwp::SchemaRegistry;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use self::qwp::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+
+static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque rollback handle captured from a [`Buffer`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bookmark {
+    origin: u64,
+    generation: u64,
+}
+
+impl Bookmark {
+    /// Construct a bookmark from raw parts.
+    ///
+    /// This is exposed for FFI interop. Application code should prefer
+    /// [`Buffer::bookmark`].
+    #[doc(hidden)]
+    pub const fn from_raw(origin: u64, generation: u64) -> Self {
+        Self { origin, generation }
     }
 
-    quoting_fn(output);
-
-    if to_escape == 0 {
-        // output.push_str(s);
-        output.extend_from_slice(s.as_bytes());
-    } else {
-        let additional = s.len() + to_escape;
-        output.reserve(additional);
-        let mut index = output.len();
-        unsafe { output.set_len(index + additional) };
-        for b in s.bytes() {
-            if check_escape_fn(b) {
-                unsafe {
-                    *output.get_unchecked_mut(index) = b'\\';
-                }
-                index += 1;
-            }
-
-            unsafe {
-                *output.get_unchecked_mut(index) = b;
-            }
-            index += 1;
-        }
+    /// Return the originating buffer namespace for this bookmark.
+    ///
+    /// This accessor is primarily intended for FFI wrappers.
+    #[doc(hidden)]
+    pub const fn origin(self) -> u64 {
+        self.origin
     }
 
-    quoting_fn(output);
-}
-
-fn must_escape_unquoted(c: u8) -> bool {
-    matches!(c, b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\')
-}
-
-fn must_escape_quoted(c: u8) -> bool {
-    matches!(c, b'\n' | b'\r' | b'"' | b'\\')
-}
-
-fn write_escaped_unquoted(output: &mut Vec<u8>, s: &str) {
-    write_escaped_impl(must_escape_unquoted, |_output| (), output, s);
-}
-
-fn write_escaped_quoted(output: &mut Vec<u8>, s: &str) {
-    write_escaped_impl(must_escape_quoted, |output| output.push(b'"'), output, s)
-}
-
-pub(crate) struct F64Serializer {
-    buf: ryu::Buffer,
-    n: f64,
-}
-
-impl F64Serializer {
-    pub(crate) fn new(n: f64) -> Self {
-        F64Serializer {
-            buf: ryu::Buffer::new(),
-            n,
-        }
-    }
-
-    // This function was taken and customized from the ryu crate.
-    #[cold]
-    fn format_nonfinite(&self) -> &'static str {
-        const MANTISSA_MASK: u64 = 0x000fffffffffffff;
-        const SIGN_MASK: u64 = 0x8000000000000000;
-        let bits = self.n.to_bits();
-        if bits & MANTISSA_MASK != 0 {
-            "NaN"
-        } else if bits & SIGN_MASK != 0 {
-            "-Infinity"
-        } else {
-            "Infinity"
-        }
-    }
-
-    pub(crate) fn as_str(&mut self) -> &str {
-        if self.n.is_finite() {
-            self.buf.format_finite(self.n)
-        } else {
-            self.format_nonfinite()
-        }
+    /// Return the generation number associated with this bookmark.
+    ///
+    /// This accessor is primarily intended for FFI wrappers.
+    #[doc(hidden)]
+    pub const fn generation(self) -> u64 {
+        self.generation
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-enum Op {
-    Table = 1,
-    Symbol = 1 << 1,
-    Column = 1 << 2,
-    At = 1 << 3,
-    Flush = 1 << 4,
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BufferBookmarkMeta {
+    origin: u64,
 }
 
-impl Op {
-    fn descr(self) -> &'static str {
-        match self {
-            Op::Table => "table",
-            Op::Symbol => "symbol",
-            Op::Column => "column",
-            Op::At => "at",
-            Op::Flush => "flush",
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum OpCase {
-    Init = Op::Table as isize,
-    TableWritten = Op::Symbol as isize | Op::Column as isize,
-    SymbolWritten = Op::Symbol as isize | Op::Column as isize | Op::At as isize,
-    ColumnWritten = Op::Column as isize | Op::At as isize,
-    MayFlushOrTable = Op::Flush as isize | Op::Table as isize,
-}
-
-impl OpCase {
-    fn next_op_descr(self) -> &'static str {
-        match self {
-            OpCase::Init => "should have called `table` instead",
-            OpCase::TableWritten => "should have called `symbol` or `column` instead",
-            OpCase::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
-            OpCase::ColumnWritten => "should have called `column` or `at` instead",
-            OpCase::MayFlushOrTable => "should have called `flush` or `table` instead",
-        }
-    }
-}
-
-// IMPORTANT: This struct MUST remain `Copy` to ensure that
-// there are no heap allocations when performing marker operations.
-#[derive(Debug, Clone, Copy)]
-struct BufferState {
-    op_case: OpCase,
-    row_count: usize,
-    first_table_len: Option<NonZeroUsize>,
-    transactional: bool,
-}
-
-impl BufferState {
-    fn new() -> Self {
+impl BufferBookmarkMeta {
+    pub(super) fn new() -> Self {
         Self {
-            op_case: OpCase::Init,
-            row_count: 0,
-            first_table_len: None,
-            transactional: true,
+            origin: NEXT_BOOKMARK_ORIGIN.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    pub(super) const fn origin(self) -> u64 {
+        self.origin
     }
 }
 
-/// A validated table name.
-///
-/// This type simply wraps a `&str`.
-///
-/// When you pass a `TableName` instead of a plain string to a [`Buffer`] method,
-/// it doesn't have to validate it again. This saves CPU cycles.
-#[derive(Clone, Copy)]
-pub struct TableName<'a> {
-    name: &'a str,
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StoredBookmark<S: Copy> {
+    generation: u64,
+    state: Option<S>,
 }
 
-impl<'a> TableName<'a> {
-    /// Construct a validated table name.
-    pub fn new(name: &'a str) -> crate::Result<Self> {
-        if name.is_empty() {
+impl<S: Copy> StoredBookmark<S> {
+    pub(super) const fn new() -> Self {
+        Self {
+            generation: 0,
+            state: None,
+        }
+    }
+
+    pub(super) fn capture(&mut self, origin: u64, state: S) -> Bookmark {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+        self.state = Some(state);
+        Bookmark::from_raw(origin, self.generation)
+    }
+
+    pub(super) const fn current(&self) -> Option<S> {
+        self.state
+    }
+
+    pub(super) fn restore(&self, origin: u64, bookmark: Bookmark) -> crate::Result<S> {
+        if bookmark.origin() != origin {
             return Err(error::fmt!(
-                InvalidName,
-                "Table names must have a non-zero length."
+                InvalidApiCall,
+                "Can't rewind to the bookmark: Bookmark does not belong to this buffer."
             ));
         }
-
-        let mut prev = '\0';
-        for (index, c) in name.chars().enumerate() {
-            match c {
-                '.' if (index == 0 || index == name.len() - 1 || prev == '.') => {
-                    return Err(error::fmt!(
-                        InvalidName,
-                        concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
-                        name,
-                        index
-                    ));
-                }
-                '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '*' | '%' | '~'
-                | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}'
-                | '\u{0005}' | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}'
-                | '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
-                    return Err(error::fmt!(
-                        InvalidName,
-                        concat!(
-                            "Bad string {:?}: ",
-                            "Table names can't contain ",
-                            "a {:?} character, which was found at ",
-                            "byte position {}."
-                        ),
-                        name,
-                        c,
-                        index
-                    ));
-                }
-                '\u{feff}' => {
-                    // Reject Unicode char 'ZERO WIDTH NO-BREAK SPACE',
-                    // aka UTF-8 BOM if it appears anywhere in the string.
-                    return Err(error::fmt!(
-                        InvalidName,
-                        concat!(
-                            "Bad string {:?}: ",
-                            "Table names can't contain ",
-                            "a UTF-8 BOM character, which was found at ",
-                            "byte position {}."
-                        ),
-                        name,
-                        index
-                    ));
-                }
-                _ => (),
-            }
-            prev = c;
-        }
-
-        Ok(Self { name })
-    }
-
-    /// Construct a table name without validating it.
-    ///
-    /// This breaks API encapsulation and is only intended for use
-    /// when the string was already previously validated.
-    ///
-    /// The QuestDB server will reject an invalid table name.
-    pub fn new_unchecked(name: &'a str) -> Self {
-        Self { name }
-    }
-}
-
-impl<'a> TryFrom<&'a str> for TableName<'a> {
-    type Error = Error;
-
-    fn try_from(name: &'a str) -> crate::Result<Self> {
-        Self::new(name)
-    }
-}
-
-impl AsRef<str> for TableName<'_> {
-    fn as_ref(&self) -> &str {
-        self.name
-    }
-}
-
-/// A validated column name.
-///
-/// This type simply wraps a `&str`.
-///
-/// When you pass a `ColumnName` instead of a plain string to a [`Buffer`] method,
-/// it doesn't have to validate it again. This saves CPU cycles.
-#[derive(Clone, Copy)]
-pub struct ColumnName<'a> {
-    name: &'a str,
-}
-
-impl<'a> ColumnName<'a> {
-    /// Construct a validated table name.
-    pub fn new(name: &'a str) -> crate::Result<Self> {
-        if name.is_empty() {
+        if self.state.is_none() && self.generation == 0 {
+            // This path is mainly defensive for forged or FFI-constructed
+            // bookmarks. Normal Rust callers cannot obtain a matching-origin
+            // bookmark without first capturing one, which advances generation.
             return Err(error::fmt!(
-                InvalidName,
-                "Column names must have a non-zero length."
+                InvalidApiCall,
+                "Can't rewind to the bookmark: No bookmark set."
             ));
         }
-
-        for (index, c) in name.chars().enumerate() {
-            match c {
-                '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '-' | '*'
-                | '%' | '~' | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}'
-                | '\u{0004}' | '\u{0005}' | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}'
-                | '\u{000b}' | '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
-                    return Err(error::fmt!(
-                        InvalidName,
-                        concat!(
-                            "Bad string {:?}: ",
-                            "Column names can't contain ",
-                            "a {:?} character, which was found at ",
-                            "byte position {}."
-                        ),
-                        name,
-                        c,
-                        index
-                    ));
-                }
-                '\u{FEFF}' => {
-                    // Reject Unicode char 'ZERO WIDTH NO-BREAK SPACE',
-                    // aka UTF-8 BOM if it appears anywhere in the string.
-                    return Err(error::fmt!(
-                        InvalidName,
-                        concat!(
-                            "Bad string {:?}: ",
-                            "Column names can't contain ",
-                            "a UTF-8 BOM character, which was found at ",
-                            "byte position {}."
-                        ),
-                        name,
-                        index
-                    ));
-                }
-                _ => (),
-            }
+        match self.state {
+            Some(state) if self.generation == bookmark.generation() => Ok(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "Can't rewind to the bookmark: Bookmark is stale."
+            )),
         }
-
-        Ok(Self { name })
     }
 
-    /// Construct a column name without validating it.
-    ///
-    /// This breaks API encapsulation and is only intended for use
-    /// when the string was already previously validated.
-    ///
-    /// The QuestDB server will reject an invalid column name.
-    pub fn new_unchecked(name: &'a str) -> Self {
-        Self { name }
+    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) {
+        if bookmark.origin() == 0 {
+            return;
+        }
+        if bookmark.origin() != origin {
+            // `clear_bookmark()` is intentionally a no-op in release builds so
+            // cleanup paths stay idempotent, but we still want debug builds to
+            // catch obvious cross-buffer misuse early.
+            debug_assert_eq!(
+                bookmark.origin(),
+                origin,
+                "attempted to clear a bookmark from a different buffer"
+            );
+            return;
+        }
+        if self.state.is_some() && self.generation == bookmark.generation() {
+            self.state = None;
+        }
     }
-}
 
-impl<'a> TryFrom<&'a str> for ColumnName<'a> {
-    type Error = Error;
-
-    fn try_from(name: &'a str) -> crate::Result<Self> {
-        Self::new(name)
-    }
-}
-
-impl AsRef<str> for ColumnName<'_> {
-    fn as_ref(&self) -> &str {
-        self.name
+    pub(super) fn clear(&mut self) {
+        self.state = None;
     }
 }
 
-/// A reusable buffer to prepare a batch of ILP messages.
+#[derive(Clone, Debug)]
+enum BufferInner {
+    Ilp(IlpBuffer),
+
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    Qwp(Box<QwpBuffer>),
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    QwpWs(Box<QwpWsColumnarBuffer>),
+}
+
+/// A reusable row buffer.
 ///
-/// # Example
-///
-/// ```no_run
-/// # use questdb::Result;
-/// # use questdb::ingress::SenderBuilder;
-///
-/// # fn main() -> Result<()> {
-/// # let mut sender = SenderBuilder::from_conf("http::addr=localhost:9000;")?.build()?;
-/// # use questdb::Result;
-/// use questdb::ingress::{Buffer, TimestampMicros, TimestampNanos};
-/// let mut buffer = sender.new_buffer();
-///
-/// // first row
-/// buffer
-///     .table("table1")?
-///     .symbol("bar", "baz")?
-///     .column_bool("a", false)?
-///     .column_i64("b", 42)?
-///     .column_f64("c", 3.14)?
-///     .column_str("d", "hello")?
-///     .column_ts("e", TimestampMicros::now())?
-///     .at(TimestampNanos::now())?;
-///
-/// // second row
-/// buffer
-///     .table("table2")?
-///     .symbol("foo", "bar")?
-///     .at(TimestampNanos::now())?;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// Send the buffer to QuestDB using [`sender.flush(&mut buffer)`](Sender::flush).
-///
-/// # Sequential Coupling
-/// The Buffer API is sequentially coupled:
-///   * A row always starts with [`table`](Buffer::table).
-///   * A row must contain at least one [`symbol`](Buffer::symbol) or
-///     column (
-///     [`column_bool`](Buffer::column_bool),
-///     [`column_i64`](Buffer::column_i64),
-///     [`column_f64`](Buffer::column_f64),
-///     [`column_str`](Buffer::column_str),
-///     [`column_arr`](Buffer::column_arr),
-///     [`column_ts`](Buffer::column_ts)).
-///   * Symbols must appear before columns.
-///   * A row must be terminated with either [`at`](Buffer::at) or
-///     [`at_now`](Buffer::at_now).
-///
-/// This diagram visualizes the sequence:
-///
-/// <img src="https://raw.githubusercontent.com/questdb/c-questdb-client/main/api_seq/seq.svg">
-///
-/// # Buffer method calls, Serialized ILP types and QuestDB types
-///
-/// | Buffer Method | Serialized as ILP type (Click on link to see possible casts) |
-/// |---------------|--------------------------------------------------------------|
-/// | [`symbol`](Buffer::symbol) | [`SYMBOL`](https://questdb.io/docs/concept/symbol/) |
-/// | [`column_bool`](Buffer::column_bool) | [`BOOLEAN`](https://questdb.io/docs/reference/api/ilp/columnset-types#boolean) |
-/// | [`column_i64`](Buffer::column_i64) | [`INTEGER`](https://questdb.io/docs/reference/api/ilp/columnset-types#integer) |
-/// | [`column_f64`](Buffer::column_f64) | [`FLOAT`](https://questdb.io/docs/reference/api/ilp/columnset-types#float) |
-/// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
-/// | [`column_arr`](Buffer::column_arr) | [`ARRAY`](https://questdb.io/docs/reference/api/ilp/columnset-types#array) |
-/// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
-///
-/// QuestDB supports both `STRING` and `SYMBOL` column types.
-///
-/// To understand the difference, refer to the
-/// [QuestDB documentation](https://questdb.io/docs/concept/symbol/). In a nutshell,
-/// symbols are interned strings, most suitable for identifiers that are repeated many
-/// times throughout the column. They offer an advantage in storage space and query
-/// performance.
-///
-/// # Inserting NULL values
-///
-/// To insert a NULL value, skip the symbol or column for that row.
-///
-/// # Recovering from validation errors
-///
-/// If you want to recover from potential validation errors, call
-/// [`buffer.set_marker()`](Buffer::set_marker) to track the last known good state,
-/// append as many rows or parts of rows as you like, and then call
-/// [`buffer.clear_marker()`](Buffer::clear_marker) on success.
-///
-/// If there was an error in one of the rows, use
-/// [`buffer.rewind_to_marker()`](Buffer::rewind_to_marker) to go back to the
-/// marked last known good state.
-///
-#[derive(Clone)]
+/// For ILP senders this exposes the existing byte-oriented buffer implementation.
+/// For QWP/UDP senders it dispatches to the QWP-specific row buffer.
+#[derive(Clone, Debug)]
 pub struct Buffer {
-    output: Vec<u8>,
-    state: BufferState,
-    marker: Option<(usize, BufferState)>,
-    max_name_len: usize,
-    protocol_version: ProtocolVersion,
+    inner: BufferInner,
 }
 
 impl Buffer {
-    /// Creates a new [`Buffer`] with default parameters.
-    ///
-    /// - Uses the specified protocol version
-    /// - Sets maximum name length to **127 characters** (QuestDB server default)
-    ///
-    /// This is equivalent to [`Sender::new_buffer`] when using the [`Sender::protocol_version`]
-    /// and [`Sender::max_name_len`] is 127.
-    ///
-    /// For custom name lengths, use [`Self::with_max_name_len`]
+    /// Creates a new ILP buffer with default parameters.
     pub fn new(protocol_version: ProtocolVersion) -> Self {
-        Self::with_max_name_len(protocol_version, MAX_NAME_LEN_DEFAULT)
+        Self {
+            inner: BufferInner::Ilp(IlpBuffer::new(protocol_version)),
+        }
     }
 
-    /// Creates a new [`Buffer`] with a custom maximum name length.
-    ///
-    /// - `max_name_len`: Maximum allowed length for table/column names, match
-    ///   your QuestDB server's `cairo.max.file.name.length` configuration
-    /// - `protocol_version`: Protocol version to use
-    ///
-    /// This is equivalent to [`Sender::new_buffer`] when using the [`Sender::protocol_version`]
-    /// and [`Sender::max_name_len`].
-    ///
-    /// For the default max name length limit (127), use [`Self::new`].
+    /// Creates a new ILP buffer with a custom maximum name length.
     pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
         Self {
-            output: Vec::new(),
-            state: BufferState::new(),
-            marker: None,
-            max_name_len,
-            protocol_version,
+            inner: BufferInner::Ilp(IlpBuffer::with_max_name_len(protocol_version, max_name_len)),
         }
     }
 
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    /// Creates a new QWP/UDP buffer with default parameters.
+    pub fn new_qwp() -> Self {
+        Self::qwp_with_max_name_len(127)
+    }
+
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    /// Creates a new QWP/UDP buffer with a custom maximum name length.
+    pub fn qwp_with_max_name_len(max_name_len: usize) -> Self {
+        Self {
+            inner: BufferInner::Qwp(Box::new(QwpBuffer::new(max_name_len))),
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
+        Self {
+            inner: BufferInner::QwpWs(Box::new(QwpWsColumnarBuffer::new(max_name_len))),
+        }
+    }
+
+    pub(crate) fn as_ilp(&self) -> Option<&IlpBuffer> {
+        match &self.inner {
+            BufferInner::Ilp(inner) => Some(inner),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(_) => None,
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => None,
+        }
+    }
+
+    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
+        match &self.inner {
+            BufferInner::Ilp(_) => None,
+            BufferInner::Qwp(inner) => Some(inner.as_ref()),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => None,
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn as_qwp_ws(&self) -> Option<&QwpWsColumnarBuffer> {
+        match &self.inner {
+            BufferInner::Ilp(_) => None,
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(_) => None,
+            BufferInner::QwpWs(inner) => Some(inner.as_ref()),
+        }
+    }
+
+    /// Returns the protocol version associated with this buffer.
+    ///
+    /// For ILP buffers this is the ILP protocol version. For QWP/UDP buffers
+    /// this is the QWP datagram version, currently represented as
+    /// [`ProtocolVersion::V1`]. Interpret the value together with the buffer
+    /// transport; do not use it by itself for ILP feature gating.
     pub fn protocol_version(&self) -> ProtocolVersion {
-        self.protocol_version
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.protocol_version(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(_) => ProtocolVersion::V1,
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => ProtocolVersion::V1,
+        }
     }
 
-    /// Pre-allocate to ensure the buffer has enough capacity for at least the
-    /// specified additional byte count. This may be rounded up.
-    /// This does not allocate if such additional capacity is already satisfied.
-    /// See: `capacity`.
+    /// Reserves capacity associated with `additional` more bytes of buffered data.
+    ///
+    /// For ILP buffers this reserves exact serialized-byte capacity. For
+    /// QWP/UDP buffers this is a heuristic prewarm of the internal arenas and
+    /// planner scratch used during datagram planning and encoding; it is not an
+    /// exact guarantee that [`Buffer::len`] can grow by `additional` bytes
+    /// without further allocation.
     pub fn reserve(&mut self, additional: usize) {
-        self.output.reserve(additional);
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.reserve(additional),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.reserve(additional),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.reserve(additional),
+        }
     }
 
-    /// The number of bytes accumulated in the buffer.
+    /// Returns the current buffered size.
+    ///
+    /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
+    /// buffers this is the size hint used for flush planning. For QWP/WebSocket
+    /// buffers this is only a local size hint; the sender enforces
+    /// `max_buf_size` against the encoded replay message.
     pub fn len(&self) -> usize {
-        self.output.len()
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.len(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.len(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.len(),
+        }
     }
 
-    /// The number of rows accumulated in the buffer.
+    /// Returns the number of completed rows currently buffered.
+    ///
+    /// A row is counted only after [`Buffer::at`] or [`Buffer::at_now`] completes
+    /// it.
     pub fn row_count(&self) -> usize {
-        self.state.row_count
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.row_count(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.row_count(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.row_count(),
+        }
     }
 
-    /// Tells whether the buffer is transactional. It is transactional iff it contains
-    /// data for at most one table. Additionally, you must send the buffer over HTTP to
-    /// get transactional behavior.
+    /// Returns whether the buffered batch is transactional.
+    ///
+    /// For ILP buffers this is `true` only while the buffer contains rows for
+    /// at most one table. QWP/UDP does not support transactional flushes, so
+    /// QWP buffers always return `false`.
     pub fn transactional(&self) -> bool {
-        self.state.transactional
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.transactional(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(_) => false,
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => false,
+        }
     }
 
+    /// Returns `true` if the buffer contains no committed or in-progress rows.
     pub fn is_empty(&self) -> bool {
-        self.output.is_empty()
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.is_empty(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.is_empty(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.is_empty(),
+        }
     }
 
-    /// The total number of bytes the buffer can hold before it needs to resize.
+    /// Returns the current retained-capacity hint for the buffer.
+    ///
+    /// For ILP buffers, this is byte capacity. For QWP/UDP buffers, this is an
+    /// implementation-defined retained-capacity hint and should not be
+    /// interpreted as exact byte capacity.
     pub fn capacity(&self) -> usize {
-        self.output.capacity()
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.capacity(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.capacity(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.capacity(),
+        }
     }
 
+    /// Returns the raw serialized ILP bytes currently stored in the buffer.
+    ///
+    /// QWP/UDP buffers build datagrams during flush, so this returns an empty
+    /// slice for QWP/UDP.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.output
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.as_bytes(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.as_bytes(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.as_bytes(),
+        }
     }
 
-    /// Mark a rewind point.
-    /// This allows undoing accumulated changes to the buffer for one or more
-    /// rows by calling [`rewind_to_marker`](Buffer::rewind_to_marker).
-    /// Any previous marker will be discarded.
-    /// Once the marker is no longer needed, call
-    /// [`clear_marker`](Buffer::clear_marker).
+    /// Marks the current buffer state so it can later be restored with
+    /// [`Buffer::rewind_to_marker`].
+    ///
+    /// Setting a new marker replaces the currently stored rewind point,
+    /// including one established by [`Buffer::bookmark`].
     pub fn set_marker(&mut self) -> crate::Result<()> {
-        if (self.state.op_case as isize & Op::Table as isize) == 0 {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                concat!(
-                    "Can't set the marker whilst constructing a line. ",
-                    "A marker may only be set on an empty buffer or after ",
-                    "`at` or `at_now` is called."
-                )
-            ));
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.set_marker(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.set_marker(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.set_marker(),
         }
-        self.marker = Some((self.output.len(), self.state));
-        Ok(())
     }
 
-    /// Undo all changes since the last [`set_marker`](Buffer::set_marker)
-    /// call.
+    /// Captures the current buffer state so it can later be restored with
+    /// [`Buffer::rewind_to_bookmark`].
     ///
-    /// As a side effect, this also clears the marker.
+    /// Capturing a new bookmark replaces the previous bookmark or marker.
+    pub fn bookmark(&mut self) -> crate::Result<Bookmark> {
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.bookmark(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.bookmark(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.bookmark(),
+        }
+    }
+
+    /// Rewinds the buffer to the state referenced by `bookmark` and then
+    /// clears that bookmark.
+    pub fn rewind_to_bookmark(&mut self, bookmark: Bookmark) -> crate::Result<()> {
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.rewind_to_bookmark(bookmark),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.rewind_to_bookmark(bookmark),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.rewind_to_bookmark(bookmark),
+        }
+    }
+
+    /// Clears `bookmark` if it is still the currently active bookmark.
+    pub fn clear_bookmark(&mut self, bookmark: Bookmark) {
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.clear_bookmark(bookmark),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.clear_bookmark(bookmark),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.clear_bookmark(bookmark),
+        }
+    }
+
+    /// Rewinds the buffer to the currently stored rewind point and then clears
+    /// it.
+    ///
+    /// This may rewind a state established by either [`Buffer::set_marker`] or
+    /// [`Buffer::bookmark`].
+    ///
+    /// Returns an error if no rewind point is set.
     pub fn rewind_to_marker(&mut self) -> crate::Result<()> {
-        if let Some((position, state)) = self.marker.take() {
-            self.output.truncate(position);
-            self.state = state;
-            Ok(())
-        } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "Can't rewind to the marker: No marker set."
-            ))
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.rewind_to_marker(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.rewind_to_marker(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.rewind_to_marker(),
         }
     }
 
-    /// Discard any marker as may have been set by
-    /// [`set_marker`](Buffer::set_marker).
-    ///
-    /// Idempotent.
+    /// Clears the current stored rewind point, including one established by
+    /// [`Buffer::bookmark`].
     pub fn clear_marker(&mut self) {
-        self.marker = None;
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.clear_marker(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.clear_marker(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.clear_marker(),
+        }
     }
 
-    /// Reset the buffer and clear contents whilst retaining
-    /// [`capacity`](Buffer::capacity).
+    /// Clears the buffer contents and marker while retaining allocated capacity.
     pub fn clear(&mut self) {
-        self.output.clear();
-        self.state = BufferState::new();
-        self.marker = None;
-    }
-
-    /// Check if the next API operation is allowed as per the OP case state machine.
-    #[inline(always)]
-    fn check_op(&self, op: Op) -> crate::Result<()> {
-        if (self.state.op_case as isize & op as isize) > 0 {
-            Ok(())
-        } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "State error: Bad call to `{}`, {}.",
-                op.descr(),
-                self.state.op_case.next_op_descr()
-            ))
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.clear(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.clear(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.clear(),
         }
     }
 
-    /// Checks if this buffer is ready to be flushed to a sender via one of the
-    /// [`Sender::flush`] functions. An [`Ok`] value indicates that the buffer
-    /// is ready to be flushed via a [`Sender`] while an [`Err`] will contain a
-    /// message indicating why this [`Buffer`] cannot be flushed at the moment.
-    #[inline(always)]
+    /// Validates that the buffer is ready to be flushed with
+    /// [`crate::ingress::Sender::flush`] or one of its variants.
+    ///
+    /// Returns an error when the current API call sequence is incomplete, such
+    /// as an unfinished row.
     pub fn check_can_flush(&self) -> crate::Result<()> {
-        self.check_op(Op::Flush)
-    }
-
-    #[inline(always)]
-    fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
-        if name.len() > self.max_name_len {
-            return Err(error::fmt!(
-                InvalidName,
-                "Bad name: {:?}: Too long (max {} characters)",
-                name,
-                self.max_name_len
-            ));
+        match &self.inner {
+            BufferInner::Ilp(inner) => inner.check_can_flush(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.check_can_flush(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.check_can_flush(),
         }
-        Ok(())
     }
 
-    /// Begin recording a new row for the given table.
+    /// Starts a new row for `name`.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// buffer.table("table_name")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::TableName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// let table_name = TableName::new("table_name")?;
-    /// buffer.table(table_name)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Every row must begin with a table name. See [`Buffer`] for the full call
+    /// sequence.
+    #[inline(always)]
     pub fn table<'a, N>(&mut self, name: N) -> crate::Result<&mut Self>
     where
-        N: TryInto<TableName<'a>>,
+        N: AsRef<str> + TryInto<TableName<'a>>,
         Error: From<N::Error>,
     {
-        let name: TableName<'a> = name.try_into()?;
-        self.validate_max_name_len(name.name)?;
-        self.check_op(Op::Table)?;
-        let table_begin = self.output.len();
-        write_escaped_unquoted(&mut self.output, name.name);
-        let table_end = self.output.len();
-        self.state.op_case = OpCase::TableWritten;
-
-        // A buffer stops being transactional if it targets multiple tables.
-        if let Some(first_table_len) = &self.state.first_table_len {
-            let first_table = &self.output[0..first_table_len.get()];
-            let this_table = &self.output[table_begin..table_end];
-            if first_table != this_table {
-                self.state.transactional = false;
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.table(name)?;
             }
-        } else {
-            debug_assert!(table_begin == 0);
-
-            // This is a bit confusing, so worth explaining:
-            // `NonZeroUsize::new(table_end)` will return `None` if `table_end` is 0,
-            // but we know that `table_end` is never 0 here, we just need an option type
-            // anyway, so we don't bother unwrapping it to then wrap it again.
-            let first_table_len = NonZeroUsize::new(table_end);
-
-            // Instead we just assert that it's `Some`.
-            debug_assert!(first_table_len.is_some());
-
-            self.state.first_table_len = first_table_len;
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.table(name)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.table(name)?;
+            }
         }
         Ok(self)
     }
 
-    /// Record a symbol for the given column.
-    /// Make sure you record all symbol columns before any other column type.
+    /// Adds a symbol column to the current row.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.symbol("col_name", "value")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let value: String = "value".to_owned();
-    /// buffer.symbol("col_name", value)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::ColumnName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.symbol(col_name, "value")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
+    /// All symbol columns must be recorded before any non-symbol columns.
+    #[inline(always)]
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
-        let name: ColumnName<'a> = name.try_into()?;
-        self.validate_max_name_len(name.name)?;
-        self.check_op(Op::Symbol)?;
-        self.output.push(b',');
-        write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push(b'=');
-        write_escaped_unquoted(&mut self.output, value.as_ref());
-        self.state.op_case = OpCase::SymbolWritten;
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.symbol(name, value)?;
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.symbol(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.symbol(name, value)?;
+            }
+        }
         Ok(self)
     }
 
-    /// Record a symbol for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
-    ///
-    /// This is a convenience wrapper around [`Self::symbol`]. Make sure you
-    /// record all symbol columns before any other column type.
-    ///
-    /// **Tip:** If you have an `Option<String>`, use `.as_deref()` to pass it
-    /// without consuming the original string.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val: Option<&str> = Some("value");
-    /// buffer.symbol_opt("col_name", val)?;
-    ///
-    /// let no_val: Option<&str> = None;
-    /// buffer.symbol_opt("skipped_col", no_val)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds a symbol column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn symbol_opt<'a, N, S>(&mut self, name: N, value: Option<S>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
-        if let Some(v) = value {
-            self.symbol(name, v)
+        if let Some(value) = value {
+            self.symbol(name, value)
         } else {
             Ok(self)
         }
     }
 
-    fn write_column_key<'a, N>(&mut self, name: N) -> crate::Result<&mut Self>
-    where
-        N: TryInto<ColumnName<'a>>,
-        Error: From<N::Error>,
-    {
-        let name: ColumnName<'a> = name.try_into()?;
-        self.validate_max_name_len(name.name)?;
-        self.check_op(Op::Column)?;
-        self.output
-            .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
-                b' '
-            } else {
-                b','
-            });
-        write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push(b'=');
-        self.state.op_case = OpCase::ColumnWritten;
-        Ok(self)
-    }
-
-    /// Record a boolean value for the given column.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.column_bool("col_name", true)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::ColumnName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_bool(col_name, true)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds a boolean column to the current row.
     pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
-        self.write_column_key(name)?;
-        self.output.push(if value { b't' } else { b'f' });
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.column_bool(name, value)?;
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_bool(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_bool(name, value)?;
+            }
+        }
         Ok(self)
     }
 
-    /// Record a boolean value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped
-    /// entirely — it is **not** written as `false`. If you need an explicit
-    /// `false`, call [`Self::column_bool`] directly.
-    ///
-    /// This is a convenience wrapper around [`Self::column_bool`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val: Option<bool> = Some(true);
-    /// buffer.column_bool_opt("col_name", val)?;
-    ///
-    /// let no_val: Option<bool> = None;
-    /// buffer.column_bool_opt("skipped_col", no_val)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds a boolean column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_bool_opt<'a, N>(
         &mut self,
         name: N,
         value: Option<bool>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
-        if let Some(v) = value {
-            self.column_bool(name, v)
+        if let Some(value) = value {
+            self.column_bool(name, value)
         } else {
             Ok(self)
         }
     }
 
-    /// Record an integer value for the given column.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.column_i64("col_name", 42)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::ColumnName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_i64(col_name, 42)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds an integer column to the current row.
+    #[inline(always)]
     pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
-        self.write_column_key(name)?;
-        let mut buf = itoa::Buffer::new();
-        let printed = buf.format(value);
-        self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'i');
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.column_i64(name, value)?;
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_i64(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i64(name, value)?;
+            }
+        }
         Ok(self)
     }
 
-    /// Record an integer value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
-    ///
-    /// This is a convenience wrapper around [`Self::column_i64`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val: Option<i64> = Some(42);
-    /// buffer.column_i64_opt("col_name", val)?;
-    ///
-    /// let no_val: Option<i64> = None;
-    /// buffer.column_i64_opt("skipped_col", no_val)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds an integer column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_i64_opt<'a, N>(&mut self, name: N, value: Option<i64>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
-        if let Some(v) = value {
-            self.column_i64(name, v)
+        if let Some(value) = value {
+            self.column_i64(name, value)
         } else {
             Ok(self)
         }
     }
 
-    /// Record a floating point value for the given column.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.column_f64("col_name", 3.14)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::ColumnName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_f64(col_name, 3.14)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
+    /// Adds an 8-bit signed integer column to the current row. QWP-only.
+    pub fn column_i8<'a, N>(&mut self, name: N, value: i8) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
-        self.write_column_key(name)?;
-        if !matches!(self.protocol_version, ProtocolVersion::V1) {
-            self.output.push(b'=');
-            self.output.push(DOUBLE_BINARY_FORMAT_TYPE);
-            self.output.extend_from_slice(&value.to_le_bytes())
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_i8 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_i8(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i8(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds an 8-bit signed integer column if `value` is `Some`. QWP-only.
+    pub fn column_i8_opt<'a, N>(&mut self, name: N, value: Option<i8>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_i8(name, value)
         } else {
-            let mut ser = F64Serializer::new(value);
-            self.output.extend_from_slice(ser.as_str().as_bytes())
+            Ok(self)
+        }
+    }
+
+    /// Adds a 16-bit signed integer column to the current row. QWP-only.
+    pub fn column_i16<'a, N>(&mut self, name: N, value: i16) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_i16 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_i16(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i16(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 16-bit signed integer column if `value` is `Some`. QWP-only.
+    pub fn column_i16_opt<'a, N>(&mut self, name: N, value: Option<i16>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_i16(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a 32-bit signed integer column to the current row. QWP-only.
+    pub fn column_i32<'a, N>(&mut self, name: N, value: i32) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_i32 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_i32(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i32(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 32-bit signed integer column if `value` is `Some`. QWP-only.
+    pub fn column_i32_opt<'a, N>(&mut self, name: N, value: Option<i32>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_i32(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a 32-bit floating-point column to the current row. QWP-only.
+    pub fn column_f32<'a, N>(&mut self, name: N, value: f32) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_f32 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_f32(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_f32(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 32-bit floating-point column if `value` is `Some`. QWP-only.
+    pub fn column_f32_opt<'a, N>(&mut self, name: N, value: Option<f32>) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_f32(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a floating-point column to the current row.
+    #[inline(always)]
+    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.column_f64(name, value)?;
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_f64(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_f64(name, value)?;
+            }
         }
         Ok(self)
     }
 
-    /// Record a floating point value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
-    ///
-    /// This is a convenience wrapper around [`Self::column_f64`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val: Option<f64> = Some(3.14);
-    /// buffer.column_f64_opt("col_name", val)?;
-    ///
-    /// let no_val: Option<f64> = None;
-    /// buffer.column_f64_opt("skipped_col", no_val)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds a floating-point column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_f64_opt<'a, N>(&mut self, name: N, value: Option<f64>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
-        if let Some(v) = value {
-            self.column_f64(name, v)
+        if let Some(value) = value {
+            self.column_f64(name, value)
         } else {
             Ok(self)
         }
     }
 
-    /// Record a string value for the given column.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.column_str("col_name", "value")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let value: String = "value".to_owned();
-    /// buffer.column_str("col_name", value)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::ColumnName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_str(col_name, "value")?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds a string column to the current row.
+    #[inline(always)]
     pub fn column_str<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
-        self.write_column_key(name)?;
-        write_escaped_quoted(&mut self.output, value.as_ref());
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.column_str(name, value)?;
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_str(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_str(name, value)?;
+            }
+        }
         Ok(self)
     }
 
-    /// Record a string value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
-    ///
-    /// This is a convenience wrapper around [`Self::column_str`].
-    ///
-    /// **Tip:** If you have an `Option<String>`, use `.as_deref()` to pass it
-    /// without consuming the original string.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val: Option<&str> = Some("value");
-    /// buffer.column_str_opt("col_name", val)?;
-    ///
-    /// let no_val: Option<&str> = None;
-    /// buffer.column_str_opt("skipped_col", no_val)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds a string column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_str_opt<'a, N, S>(
         &mut self,
         name: N,
         value: Option<S>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
-        if let Some(v) = value {
-            self.column_str(name, v)
+        if let Some(value) = value {
+            self.column_str(name, value)
         } else {
             Ok(self)
         }
     }
 
-    /// Record a decimal value for the given column.
+    /// Adds a decimal column to the current row.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.column_dec("col_name", "123.45")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// When specifying a decimal as a string, use a '.' to separate the whole from the
-    /// fractional parts. For example, "12.20".
-    /// Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN".
-    /// Note that Infinity and NaN values decay to nulls when stored in the database.
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::ColumnName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_dec(col_name, "123.45")?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// With `rust_decimal` feature enabled:
-    ///
-    /// ```no_run
-    /// # #[cfg(feature = "rust_decimal")]
-    /// # {
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use rust_decimal::Decimal;
-    /// use std::str::FromStr;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let value = Decimal::from_str("123.45").unwrap();
-    /// buffer.column_dec("col_name", &value)?;
-    /// # Ok(())
-    /// # }
-    /// # }
-    /// ```
-    ///
-    /// With `bigdecimal` feature enabled:
-    ///
-    /// ```no_run
-    /// # #[cfg(feature = "bigdecimal")]
-    /// # {
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use bigdecimal::BigDecimal;
-    /// use std::str::FromStr;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let value = BigDecimal::from_str("0.123456789012345678901234567890").unwrap();
-    /// buffer.column_dec("col_name", &value)?;
-    /// # Ok(())
-    /// # }
-    /// # }
-    /// ```
+    /// Returns an error if the active protocol does not support decimal values.
+    /// QWP/UDP accepts the same decimal input forms as ILP and encodes them as
+    /// nullable DECIMAL256 columns on the wire.
     pub fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: TryInto<DecimalView<'a>>,
         Error: From<N::Error>,
         Error: From<S::Error>,
     {
-        if self.protocol_version < ProtocolVersion::V3 {
-            return Err(error::fmt!(
-                ProtocolVersionError,
-                "Protocol version {} does not support the decimal datatype",
-                self.protocol_version
-            ));
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.column_dec(name, value)?;
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_dec(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_dec(name, value)?;
+            }
         }
-
-        let value: DecimalView = value.try_into()?;
-        self.write_column_key(name)?;
-        value.serialize(&mut self.output);
         Ok(self)
     }
 
-    /// Record a decimal value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
-    ///
-    /// This is a convenience wrapper around [`Self::column_dec`]. It has the
-    /// exact same requirements and error conditions as the underlying method
-    /// (e.g., it requires Protocol Version 3 or higher).
-    ///
-    /// **Tip:** If you have an `Option<Decimal>`, use `.as_ref()` to pass it
-    /// without consuming the original value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if the provided value is `Some` and violates any of the
-    /// constraints detailed in [`Self::column_dec`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # #[cfg(feature = "bigdecimal")]
-    /// # {
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use bigdecimal::BigDecimal;
-    /// use std::str::FromStr;
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val: Option<BigDecimal> = Some(BigDecimal::from_str("0.123456789012345678901234567890").unwrap());
-    /// buffer.column_dec_opt("col_name", val.as_ref())?;
-    ///
-    /// let no_val: Option<BigDecimal> = None;
-    /// buffer.column_dec_opt("skipped_col", no_val.as_ref())?;
-    /// # Ok(())
-    /// # }
-    /// # }
-    /// ```
+    /// Adds a decimal column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_dec_opt<'a, N, S>(
         &mut self,
         name: N,
         value: Option<S>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: TryInto<DecimalView<'a>>,
         Error: From<N::Error>,
         Error: From<S::Error>,
     {
-        if let Some(v) = value {
-            self.column_dec(name, v)
+        if let Some(value) = value {
+            self.column_dec(name, value)
         } else {
             Ok(self)
         }
     }
 
-    /// Record a multidimensional array value for the given column.
+    /// Adds a 64-bit decimal column to the current row. QWP-only.
     ///
-    /// Supports arrays with up to [`MAX_ARRAY_DIMS`] dimensions. The array elements must
-    /// be of type `f64`, which is currently the only supported data type.
+    /// The unscaled magnitude (at the column's pinned scale) must fit a signed
+    /// 64-bit integer; values that do not fit return `InvalidApiCall`.
+    pub fn column_dec64<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        let _ = &name;
+        match &mut self.inner {
+            BufferInner::Ilp(_) => {
+                let _ = value.try_into().map_err(Error::from)?;
+                Err(error::fmt!(
+                    InvalidApiCall,
+                    "column_dec64 requires a QWP transport (qwpws:: or qwpudp::)"
+                ))
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_dec64(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_dec64(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 64-bit decimal column if `value` is `Some`. QWP-only.
+    pub fn column_dec64_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        if let Some(value) = value {
+            self.column_dec64(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a 128-bit decimal column to the current row. QWP-only.
     ///
-    /// **Note**: QuestDB server version 9.0.0 or later is required for array support.
+    /// The unscaled magnitude (at the column's pinned scale) must fit a signed
+    /// 128-bit integer; values that do not fit return `InvalidApiCall`.
+    pub fn column_dec128<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        let _ = &name;
+        match &mut self.inner {
+            BufferInner::Ilp(_) => {
+                let _ = value.try_into().map_err(Error::from)?;
+                Err(error::fmt!(
+                    InvalidApiCall,
+                    "column_dec128 requires a QWP transport (qwpws:: or qwpudp::)"
+                ))
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_dec128(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_dec128(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a 128-bit decimal column if `value` is `Some`. QWP-only.
+    pub fn column_dec128_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        if let Some(value) = value {
+            self.column_dec128(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a UUID column to the current row. QWP-only.
     ///
-    /// # Examples
+    /// Per spec, the wire encoding writes `lo` (8 bytes LE) followed by `hi`
+    /// (8 bytes LE).
+    pub fn column_uuid<'a, N>(&mut self, name: N, lo: u64, hi: u64) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = &name;
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_uuid requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_uuid(name, lo, hi)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_uuid(name, lo, hi)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a UUID column if `value` is `Some`. QWP-only.
+    pub fn column_uuid_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<(u64, u64)>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some((lo, hi)) = value {
+            self.column_uuid(name, lo, hi)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a LONG256 column to the current row. QWP-only.
     ///
-    /// Recording a 2D array using slices:
+    /// `value` is the wire-format byte buffer: four 64-bit limbs encoded
+    /// little-endian, least-significant limb first (32 bytes total).
+    pub fn column_long256<'a, N>(&mut self, name: N, value: &[u8; 32]) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_long256 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_long256(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_long256(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a LONG256 column if `value` is `Some`. QWP-only.
+    pub fn column_long256_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<&[u8; 32]>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_long256(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds an IPv4 column to the current row. QWP-only.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let array_2d = vec![vec![1.1, 2.2], vec![3.3, 4.4]];
-    /// buffer.column_arr("array_col", &array_2d)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// The wire encoding writes the 4 octets as `u32::from(addr).to_le_bytes()`,
+    /// matching Rust's natural Ipv4Addr packing (octet 0 in the high byte).
     ///
-    /// Recording a 3D array using vectors:
+    /// IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
+    /// currently implement this wire type; batches using it will be rejected
+    /// with a descriptive error. This may change in future server releases.
+    pub fn column_ipv4<'a, N>(
+        &mut self,
+        name: N,
+        value: std::net::Ipv4Addr,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, value);
+        let packed = u32::from(value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_ipv4 requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_ipv4(name, packed)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_ipv4(name, packed)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds an IPv4 column if `value` is `Some`. QWP-only.
+    pub fn column_ipv4_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<std::net::Ipv4Addr>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_ipv4(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a DATE column (milliseconds since the Unix epoch). QWP-only.
+    pub fn column_date<'a, N>(&mut self, name: N, millis: i64) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &millis);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_date requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_date(name, millis)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_date(name, millis)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a DATE column if `value` is `Some`. QWP-only.
+    pub fn column_date_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<i64>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_date(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a CHAR column (single UTF-16 code unit). QWP-only.
+    pub fn column_char<'a, N>(&mut self, name: N, value: u16) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_char requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_char(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_char(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a CHAR column if `value` is `Some`. QWP-only.
+    pub fn column_char_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<u16>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_char(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a BINARY column (opaque byte sequence). QWP-only.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, ColumnName, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x1")?;
-    /// let array_3d = vec![vec![vec![42.0; 4]; 3]; 2];
-    /// let col_name = ColumnName::new("col1")?;
-    /// buffer.column_arr(col_name, &array_3d)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if:
-    /// - Array dimensions exceed [`MAX_ARRAY_DIMS`]
-    /// - Failed to get dimension sizes
-    /// - Column name validation fails
-    /// - Protocol version v1 is used (arrays require v2+)
+    /// BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
+    /// not currently implement this wire type; batches using it will be
+    /// rejected with a descriptive error. This may change in future server
+    /// releases.
+    pub fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, value);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_binary requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_binary(name, value)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_binary(name, value)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a BINARY column if `value` is `Some`. QWP-only.
+    pub fn column_binary_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<&[u8]>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_binary(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
+    /// Adds a GEOHASH column. `precision_bits` must be in `1..=60` and is
+    /// pinned per column (subsequent rows must match). QWP-only.
+    pub fn column_geohash<'a, N>(
+        &mut self,
+        name: N,
+        bits: u64,
+        precision_bits: u8,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        let _ = (&name, &bits, &precision_bits);
+        match &mut self.inner {
+            BufferInner::Ilp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "column_geohash requires a QWP transport (qwpws:: or qwpudp::)"
+            )),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_geohash(name, bits, precision_bits)?;
+                Ok(self)
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_geohash(name, bits, precision_bits)?;
+                Ok(self)
+            }
+        }
+    }
+
+    /// Adds a GEOHASH column if `value` is `Some`. QWP-only.
+    pub fn column_geohash_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<(u64, u8)>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some((bits, precision)) = value {
+            self.column_geohash(name, bits, precision)
+        } else {
+            Ok(self)
+        }
+    }
+
     #[allow(private_bounds)]
+    /// Adds an array column to the current row.
+    ///
+    /// Arrays require ILP protocol version 2 or later. QWP supports `f64`
+    /// (DOUBLE_ARRAY, `0x11`) and `i64` (LONG_ARRAY, `0x12`) element types.
+    /// LONG_ARRAY is part of the QWP v1 spec. Server-side ingest does not
+    /// currently implement this wire type; batches using it will be rejected
+    /// with a descriptive error. This may change in future server releases.
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        if self.protocol_version < ProtocolVersion::V2 {
-            return Err(error::fmt!(
-                ProtocolVersionError,
-                "Protocol version {} does not support array datatype",
-                self.protocol_version
-            ));
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                if D::type_tag() != 10 {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "column_arr with non-f64 element type requires a QWP transport (qwpws:: or qwpudp::)"
+                    ));
+                }
+                inner.column_arr(name, view)?;
+            }
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_arr(name, view)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_arr(name, view)?;
+            }
         }
-        let ndim = view.ndim();
-        if ndim == 0 {
-            return Err(error::fmt!(
-                ArrayError,
-                "Zero-dimensional arrays are not supported",
-            ));
-        }
-
-        // check dimension less equal than max dims
-        if MAX_ARRAY_DIMS < ndim {
-            return Err(error::fmt!(
-                ArrayError,
-                "Array dimension mismatch: expected at most {} dimensions, but got {}",
-                MAX_ARRAY_DIMS,
-                ndim
-            ));
-        }
-
-        let array_buf_size = check_and_get_array_bytes_size(view)?;
-        self.write_column_key(name)?;
-        // binary format flag '='
-        self.output.push(b'=');
-        // binary format entity type
-        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
-        // ndarr datatype
-        self.output.push(D::type_tag());
-        // ndarr dims
-        self.output.push(ndim as u8);
-
-        let dim_header_size = size_of::<u32>() * ndim;
-        self.output.reserve(dim_header_size + array_buf_size);
-
-        for i in 0..ndim {
-            // ndarr shape
-            self.output
-                .extend_from_slice((view.dim(i)? as u32).to_le_bytes().as_slice());
-        }
-
-        let index = self.output.len();
-        let writeable =
-            unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), array_buf_size) };
-
-        // ndarr data
-        ndarr::write_array_data(view, writeable, array_buf_size)?;
-        unsafe { self.output.set_len(array_buf_size + index) }
         Ok(self)
     }
 
-    /// Record a multidimensional array value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
-    ///
-    /// This is a convenience wrapper around [`Self::column_arr`]. When the value is `Some`,
-    /// it has the exact same requirements and error conditions as the underlying method.
-    /// Specifically, it requires QuestDB server version 9.0.0+ and supports up to
-    /// [`MAX_ARRAY_DIMS`] dimensions of `f64` elements.
-    ///
-    /// **Tip:** If you have an `Option<Vec<Vec<f64>>>`, use `.as_ref()` to pass it
-    /// without consuming the original vector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] if the provided value is `Some` and violates any of the
-    /// constraints detailed in [`Self::column_arr`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val: Option<Vec<Vec<f64>>> = Some(vec![vec![1.1, 2.2], vec![3.3, 4.4]]);
-    /// buffer.column_arr_opt("array_col", val.as_ref())?;
-    ///
-    /// let no_val: Option<Vec<Vec<f64>>> = None;
-    /// buffer.column_arr_opt("skipped_col", no_val.as_ref())?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds an array column if `value` is `Some`; otherwise leaves the row unchanged.
     #[allow(private_bounds)]
     pub fn column_arr_opt<'a, N, T, D>(
         &mut self,
@@ -1466,254 +1378,241 @@ impl Buffer {
         value: Option<&T>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        if let Some(v) = value {
-            self.column_arr(name, v)
+        if let Some(value) = value {
+            self.column_arr(name, value)
         } else {
             Ok(self)
         }
     }
 
-    /// Record a timestamp value for the given column.
+    /// Adds a timestamp column to the current row.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::TimestampMicros;
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.column_ts("col_name", TimestampMicros::now())?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::TimestampMicros;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// buffer.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::TimestampMicros;
-    /// use questdb::ingress::ColumnName;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_ts(col_name, TimestampMicros::now())?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or you can also pass in a `TimestampNanos`.
-    ///
-    /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
-    /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
-    ///
-    /// This last option requires the `chrono_timestamp` feature.
+    /// Accepts either microsecond or nanosecond timestamps.
+    #[inline(always)]
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: TryInto<Timestamp>,
         Error: From<N::Error>,
         Error: From<T::Error>,
     {
-        self.write_column_key(name)?;
-        let timestamp: Timestamp = value.try_into()?;
-        let (number, suffix) = match (self.protocol_version, timestamp) {
-            (ProtocolVersion::V1, _) => {
-                let timestamp: TimestampMicros = timestamp.try_into()?;
-                (timestamp.as_i64(), b't')
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => {
+                inner.column_ts(name, value)?;
             }
-            (_, Timestamp::Micros(ts)) => (ts.as_i64(), b't'),
-            (_, Timestamp::Nanos(ts)) => (ts.as_i64(), b'n'),
-        };
-
-        let mut buf = itoa::Buffer::new();
-        let printed = buf.format(number);
-        self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(suffix);
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => {
+                inner.column_ts(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_ts(name, value)?;
+            }
+        }
         Ok(self)
     }
 
-    /// Record a timestamp value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
-    ///
-    /// This is a convenience wrapper around [`Self::column_ts`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::TimestampMicros;
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?;
-    /// let val = Some(TimestampMicros::now());
-    /// buffer.column_ts_opt("col_name", val)?;
-    ///
-    /// let no_val: Option<TimestampMicros> = None;
-    /// buffer.column_ts_opt("skipped_col", no_val)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Adds a timestamp column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_ts_opt<'a, N, T>(&mut self, name: N, value: Option<T>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: TryInto<Timestamp>,
         Error: From<N::Error>,
         Error: From<T::Error>,
     {
-        if let Some(v) = value {
-            self.column_ts(name, v)
+        if let Some(value) = value {
+            self.column_ts(name, value)
         } else {
             Ok(self)
         }
     }
 
-    /// Complete the current row with the designated timestamp. After this call, you can
-    /// start recording the next row by calling [Buffer::table] again, or  you can send
-    /// the accumulated batch by calling [Sender::flush] or one of its variants.
+    /// Completes the current row with a designated timestamp.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::TimestampNanos;
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at(TimestampNanos::now())?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// or
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// use questdb::ingress::TimestampNanos;
-    ///
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at(TimestampNanos::new(1659548315647406592))?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// You can also pass in a `TimestampMicros`.
-    ///
-    /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
-    /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
-    ///
+    /// After this call you may begin the next row with [`Buffer::table`] or
+    /// flush the buffer. Accepts either microsecond or nanosecond timestamps.
+    #[inline(always)]
     pub fn at<T>(&mut self, timestamp: T) -> crate::Result<()>
     where
         T: TryInto<Timestamp>,
         Error: From<T::Error>,
     {
-        self.check_op(Op::At)?;
-        let timestamp: Timestamp = timestamp.try_into()?;
-
-        let (number, termination) = match (self.protocol_version, timestamp) {
-            (ProtocolVersion::V1, _) => {
-                let timestamp: crate::Result<TimestampNanos> = timestamp.try_into();
-                (timestamp?.as_i64(), "\n")
-            }
-            (_, Timestamp::Micros(micros)) => (micros.as_i64(), "t\n"),
-            (_, Timestamp::Nanos(nanos)) => (nanos.as_i64(), "n\n"),
-        };
-
-        if number < 0 {
-            return Err(error::fmt!(
-                InvalidTimestamp,
-                "Timestamp {} is negative. It must be >= 0.",
-                number
-            ));
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.at(timestamp),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.at(timestamp),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.at(timestamp),
         }
-
-        let mut buf = itoa::Buffer::new();
-        let printed = buf.format(number);
-        self.output.push(b' ');
-        self.output.extend_from_slice(printed.as_bytes());
-        self.output.extend_from_slice(termination.as_bytes());
-        self.state.op_case = OpCase::MayFlushOrTable;
-        self.state.row_count += 1;
-        Ok(())
     }
 
-    /// Complete the current row without providing a timestamp. The QuestDB instance
-    /// will insert its own timestamp.
+    /// Completes the current row without a designated timestamp so the server
+    /// assigns one.
     ///
-    /// Letting the server assign the timestamp can be faster since it reliably avoids
-    /// out-of-order operations in the database for maximum ingestion throughput. However,
-    /// it removes the ability to deduplicate rows.
-    ///
-    /// This is NOT equivalent to calling [Buffer::at] with the current time: the QuestDB
-    /// server will set the timestamp only after receiving the row. If you're flushing
-    /// infrequently, the server-assigned timestamp may be significantly behind the
-    /// time the data was recorded in the buffer.
-    ///
-    /// In almost all cases, you should prefer the [Buffer::at] function.
-    ///
-    /// After this call, you can start recording the next row by calling [Buffer::table]
-    /// again, or you can send the accumulated batch by calling [Sender::flush] or one of
-    /// its variants.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, SenderBuilder};
-    /// # fn main() -> Result<()> {
-    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-    /// # let mut buffer = sender.new_buffer();
-    /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at_now()?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// This is not equivalent to calling [`Buffer::at`] with the current client
+    /// time.
+    #[inline(always)]
     pub fn at_now(&mut self) -> crate::Result<()> {
-        self.check_op(Op::At)?;
-        self.output.push(b'\n');
-        self.state.op_case = OpCase::MayFlushOrTable;
-        self.state.row_count += 1;
-        Ok(())
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.at_now(),
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(inner) => inner.at_now(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.at_now(),
+        }
     }
 }
 
-impl Debug for Buffer {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Buffer")
-            .field("output", &DebugBytes(&self.output))
-            .field("state", &self.state)
-            .field("marker", &self.marker)
-            .field("max_name_len", &self.max_name_len)
-            .field("protocol_version", &self.protocol_version)
-            .finish()
+#[cfg(test)]
+mod tests {
+    use super::{Bookmark, Buffer, StoredBookmark};
+    use crate::ErrorCode;
+    use crate::ingress::ProtocolVersion;
+
+    #[test]
+    fn stored_bookmark_reports_missing_bookmark_when_never_captured() {
+        let bookmark = Bookmark::from_raw(7, 1);
+        let stored = StoredBookmark::<u8>::new();
+        let err = stored.restore(7, bookmark).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.msg(), "Can't rewind to the bookmark: No bookmark set.");
+    }
+
+    #[test]
+    fn stored_bookmark_ignores_invalid_zero_origin_clear() {
+        let mut stored = StoredBookmark::<u8>::new();
+        let bookmark = stored.capture(7, 42);
+
+        stored.clear_if_matches(7, Bookmark::from_raw(0, 0));
+
+        assert_eq!(stored.restore(7, bookmark).unwrap(), 42);
+    }
+
+    #[test]
+    fn buffer_column_i8_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_i8("v", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(
+            err.msg().contains("column_i8"),
+            "error message should name column_i8: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn buffer_column_i16_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_i16("v", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_i16"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_i32_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_i32("v", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_i32"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_dec64_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V3);
+        buf.table("trades").unwrap();
+        let err = buf.column_dec64("v", "1.25").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_dec64"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_dec128_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V3);
+        buf.table("trades").unwrap();
+        let err = buf.column_dec128("v", "1.25").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_dec128"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_uuid_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_uuid("v", 1, 2).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_uuid"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_long256_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf.column_long256("v", &[0u8; 32]).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_long256"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_ipv4_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("trades").unwrap();
+        let err = buf
+            .column_ipv4("v", std::net::Ipv4Addr::new(127, 0, 0, 1))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_ipv4"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_date_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_date("v", 42).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_date"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_char_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_char("v", 0x0041).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_char"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_binary_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_binary("v", b"abc").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_binary"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_geohash_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_geohash("v", 0xABCD, 16).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_geohash"), "{}", err.msg());
+    }
+
+    #[test]
+    fn buffer_column_f32_rejects_ilp_buffer() {
+        let mut buf = Buffer::new(ProtocolVersion::V2);
+        buf.table("t").unwrap();
+        let err = buf.column_f32("v", 1.5_f32).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("column_f32"), "{}", err.msg());
     }
 }

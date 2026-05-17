@@ -133,6 +133,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         line_sender_c_example_from_env
         examples/line_sender_c_example_from_env.c)
     compile_example(
+        line_sender_c_example_qwpudp
+        examples/line_sender_c_example_qwpudp.c)
+    compile_example(
+        line_sender_c_example_qwpudp_batch
+        examples/line_sender_c_example_qwpudp_batch.c)
+    compile_example(
         line_sender_c_example_decimal_binary
         examples/concat.c
         examples/line_sender_c_example_decimal_binary.c)
@@ -169,6 +175,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example_from_env
         examples/line_sender_cpp_example_from_env.cpp)
+    compile_example(
+        line_sender_cpp_example_qwpudp
+        examples/line_sender_cpp_example_qwpudp.cpp)
+    compile_example(
+        line_sender_cpp_example_qwpudp_batch
+        examples/line_sender_cpp_example_qwpudp_batch.cpp)
     compile_example(
         line_sender_cpp_example_decimal_custom
         examples/line_sender_cpp_example_decimal_custom.cpp)

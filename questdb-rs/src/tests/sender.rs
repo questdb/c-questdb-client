@@ -24,11 +24,11 @@
 
 use crate::{
     ErrorCode,
-    ingress::{
-        Buffer, DOUBLE_BINARY_FORMAT_TYPE, F64Serializer, Sender, TableName, Timestamp,
-        TimestampMicros, TimestampNanos,
-    },
+    ingress::{Buffer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos},
 };
+
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+use crate::ingress::{DOUBLE_BINARY_FORMAT_TYPE, F64Serializer};
 
 use crate::ingress::ProtocolVersion;
 use crate::tests::TestResult;
@@ -296,6 +296,43 @@ fn test_table_name_too_long() -> TestResult {
 }
 
 #[test]
+fn ilp_buffer_check_can_flush_tracks_public_state_machine() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V3);
+
+    // Flush is allowed on an empty buffer (no-op).
+    buffer.check_can_flush().unwrap();
+
+    buffer.table("test")?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `symbol` or `column` instead."
+    );
+
+    buffer.symbol("sym", "ETH-USD")?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `symbol`, `column` or `at` instead."
+    );
+
+    buffer.column_f64("px", 2711.5)?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `column` or `at` instead."
+    );
+
+    buffer.at_now()?;
+    buffer.check_can_flush()?;
+
+    Ok(())
+}
+
+#[test]
 fn test_row_count() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V2);
     assert_eq!(buffer.row_count(), 0);
@@ -392,6 +429,256 @@ fn test_transactional() -> TestResult {
     buffer.table("test=table=5")?.symbol("o", "p")?.at_now()?;
     buffer.table("test=table=5")?.symbol("q", "r")?.at_now()?;
     assert_eq!(buffer.row_count(), 3); // tables={'test=table=5'}
+    assert!(buffer.transactional());
+
+    Ok(())
+}
+
+#[test]
+fn test_bookmark_rewinds_rows_and_transactional_state() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
+
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+    assert_eq!(buffer.row_count(), 1);
+    assert!(buffer.transactional());
+
+    let bookmark = buffer.bookmark()?;
+    buffer.table("quotes")?.symbol("sym", "BTC-USD")?.at_now()?;
+    assert_eq!(buffer.row_count(), 2);
+    assert!(!buffer.transactional());
+
+    buffer.rewind_to_bookmark(bookmark)?;
+    assert_eq!(buffer.row_count(), 1);
+    assert!(buffer.transactional());
+
+    buffer.table("trades")?.symbol("sym", "SOL-USD")?.at_now()?;
+    assert_eq!(buffer.row_count(), 2);
+    assert!(buffer.transactional());
+
+    Ok(())
+}
+
+#[test]
+fn test_bookmark_rewinds_rows_and_transactional_state_v1() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V1);
+
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+    let bookmark = buffer.bookmark()?;
+    buffer.table("quotes")?.symbol("sym", "BTC-USD")?.at_now()?;
+
+    buffer.rewind_to_bookmark(bookmark)?;
+    assert_eq!(buffer.row_count(), 1);
+    assert!(buffer.transactional());
+    assert_eq!(buffer.as_bytes(), b"trades,sym=ETH-USD\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_bookmark_rejects_mid_row() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
+
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?;
+    let err = buffer.bookmark().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't set the bookmark whilst constructing a line. A bookmark may only be set on an empty buffer or after `at` or `at_now` is called."
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_bookmark_and_marker_share_one_rewind_point() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
+
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+
+    let first = buffer.bookmark()?;
+    buffer.table("trades")?.symbol("sym", "BTC-USD")?.at_now()?;
+    let second = buffer.bookmark()?;
+    buffer.table("trades")?.symbol("sym", "SOL-USD")?.at_now()?;
+
+    let err = buffer.rewind_to_bookmark(first).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
+
+    buffer.rewind_to_bookmark(second)?;
+    assert_eq!(buffer.row_count(), 2);
+
+    let third = buffer.bookmark()?;
+    buffer.table("trades")?.symbol("sym", "XRP-USD")?.at_now()?;
+    buffer.set_marker()?;
+
+    let err = buffer.rewind_to_bookmark(third).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
+
+    buffer.table("trades")?.symbol("sym", "ADA-USD")?.at_now()?;
+    buffer.rewind_to_marker()?;
+    assert_eq!(buffer.row_count(), 3);
+
+    let fourth = buffer.bookmark()?;
+    buffer.table("trades")?.symbol("sym", "DOT-USD")?.at_now()?;
+    buffer.clear_marker();
+    let err = buffer.rewind_to_bookmark(fourth).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_bookmark_rejects_cross_buffer_use_after_clone() -> TestResult {
+    let mut original = Buffer::new(ProtocolVersion::V2);
+    original
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .at_now()?;
+
+    let original_bookmark = original.bookmark()?;
+    let mut cloned = original.clone();
+
+    let err = cloned.rewind_to_bookmark(original_bookmark).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark does not belong to this buffer."
+    );
+
+    original
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .at_now()?;
+    original.rewind_to_bookmark(original_bookmark)?;
+    assert_eq!(original.row_count(), 1);
+
+    let clone_bookmark = cloned.bookmark()?;
+    cloned.table("trades")?.symbol("sym", "SOL-USD")?.at_now()?;
+    cloned.rewind_to_bookmark(clone_bookmark)?;
+    assert_eq!(cloned.row_count(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_clone_preserves_marker_rewind_state() -> TestResult {
+    let mut original = Buffer::new(ProtocolVersion::V2);
+    original
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .at_now()?;
+    original.set_marker()?;
+    original
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .at_now()?;
+
+    let mut cloned = original.clone();
+    cloned.table("trades")?.symbol("sym", "SOL-USD")?.at_now()?;
+    cloned.rewind_to_marker()?;
+
+    assert_eq!(cloned.row_count(), 1);
+    assert_eq!(cloned.as_bytes(), b"trades,sym=ETH-USD\n");
+    assert_eq!(original.row_count(), 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_clear_bookmark_is_idempotent() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
+
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+    let cleared = buffer.bookmark()?;
+    buffer.clear_bookmark(cleared);
+    buffer.clear_bookmark(cleared);
+    let err = buffer.rewind_to_bookmark(cleared).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
+
+    let rewound = buffer.bookmark()?;
+    buffer.table("trades")?.symbol("sym", "BTC-USD")?.at_now()?;
+    buffer.rewind_to_bookmark(rewound)?;
+    buffer.clear_bookmark(rewound);
+    buffer.clear_bookmark(rewound);
+    let err = buffer.rewind_to_bookmark(rewound).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn test_successful_flush_invalidates_bookmark() -> TestResult {
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(ProtocolVersion::V2)?
+        .build()?;
+    server.accept()?;
+
+    let mut buffer = sender.new_buffer();
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+    let bookmark = buffer.bookmark()?;
+    buffer.table("trades")?.symbol("sym", "BTC-USD")?.at_now()?;
+
+    sender.flush(&mut buffer)?;
+    assert!(buffer.is_empty());
+
+    let err = buffer.rewind_to_bookmark(bookmark).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn test_failed_flush_preserves_bookmark() -> TestResult {
+    let max = 1024;
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(ProtocolVersion::V2)?
+        .max_buf_size(max)?
+        .build()?;
+    server.accept()?;
+
+    let mut buffer = sender.new_buffer();
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+    let bookmark = buffer.bookmark()?;
+
+    while buffer.len() < max {
+        buffer.table("trades")?.symbol("sym", "BTC-USD")?.at_now()?;
+    }
+
+    let err = sender.flush(&mut buffer).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("Could not flush buffer: Buffer size of"));
+
+    buffer.rewind_to_bookmark(bookmark)?;
+    assert_eq!(buffer.row_count(), 1);
     assert!(buffer.transactional());
 
     Ok(())
@@ -818,13 +1105,15 @@ fn test_tls_insecure_skip_verify(
     Ok(())
 }
 
+#[cfg(feature = "_sync-sender")]
 #[test]
-fn bad_uppercase_protocol() {
-    let res = Sender::from_conf("TCP::addr=localhost:9009;");
-    assert!(res.is_err());
+fn unsupported_protocol_error_only_for_unknown_scheme() {
+    // Case-insensitive scheme matching: bogus schemes still report the error,
+    // but case variants of known schemes do not.
+    let res = Sender::from_conf("nope::addr=localhost:9009;");
     let err = res.unwrap_err();
-    assert!(err.code() == ErrorCode::ConfigError);
-    assert!(err.msg() == "Unsupported protocol: TCP");
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert_eq!(err.msg(), "Unsupported protocol: nope");
 }
 
 #[cfg(feature = "sync-sender-tcp")]
@@ -856,6 +1145,7 @@ fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
     Ok(())
 }
 
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(name.as_bytes());

@@ -81,13 +81,20 @@ pub enum ErrorCode {
 
     /// The supplied decimal is invalid.
     InvalidDecimal,
+
+    /// QWP/WebSocket server rejection or terminal protocol violation.
+    ServerRejection,
 }
 
 /// An error that occurred when using QuestDB client library.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Error {
     code: ErrorCode,
     msg: String,
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws_role_reject: Option<crate::ingress::QwpWsRoleReject>,
 }
 
 impl Error {
@@ -96,7 +103,27 @@ impl Error {
         Error {
             code,
             msg: msg.into(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws_rejection: None,
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws_role_reject: None,
         }
+    }
+
+    /// Attach a structured QWP/WebSocket rejection to this error.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn with_qwp_ws_rejection(mut self, rejection: crate::ingress::QwpWsSenderError) -> Self {
+        self.qwp_ws_rejection = Some(Box::new(rejection));
+        self
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn with_qwp_ws_role_reject(
+        mut self,
+        role_reject: crate::ingress::QwpWsRoleReject,
+    ) -> Self {
+        self.qwp_ws_role_reject = Some(role_reject);
+        self
     }
 
     #[cfg(feature = "sync-sender-http")]
@@ -132,6 +159,18 @@ impl Error {
     /// Get the string message of this error.
     pub fn msg(&self) -> &str {
         &self.msg
+    }
+
+    /// Return the structured QWP/WebSocket rejection that made this error
+    /// terminal, if one is available.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_rejection(&self) -> Option<&crate::ingress::QwpWsSenderError> {
+        self.qwp_ws_rejection.as_deref()
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn qwp_ws_role_reject(&self) -> Option<&crate::ingress::QwpWsRoleReject> {
+        self.qwp_ws_role_reject.as_ref()
     }
 }
 
