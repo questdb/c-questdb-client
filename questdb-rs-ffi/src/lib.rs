@@ -1006,22 +1006,26 @@ pub unsafe extern "C" fn line_sender_buffer_reserve(
         }
         return false;
     }
-    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-        unwrap_buffer_mut(buffer).reserve(additional);
-    }));
-    match result {
-        Ok(()) => true,
-        Err(_) => {
-            unsafe {
-                set_err_out(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    "line_sender_buffer_reserve panicked (likely capacity overflow)".to_owned(),
-                );
-            }
-            false
+    // `Vec::reserve` panics if the resulting capacity exceeds
+    // `isize::MAX`. This crate links with `panic = "abort"`
+    // (see questdb-rs-ffi/Cargo.toml), so `catch_unwind` is a
+    // no-op and a panic kills the host process. Reject the call
+    // up front instead. The current capacity is included so we
+    // don't accept an `additional` that overflows only because
+    // of what's already buffered.
+    let current = unsafe { unwrap_buffer(buffer).capacity() };
+    if additional > (isize::MAX as usize).saturating_sub(current) {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_buffer_reserve: additional capacity would overflow".to_owned(),
+            );
         }
+        return false;
     }
+    unsafe { unwrap_buffer_mut(buffer).reserve(additional) };
+    true
 }
 
 /// Get the current buffer capacity.

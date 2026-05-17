@@ -2067,10 +2067,7 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<(Vec<u8>, Ve
             // both as the same explicit timeout error so the failure
             // mode does not look platform-specific to the caller.
             if matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
-                error::fmt!(
-                    SocketError,
-                    "WebSocket upgrade response read timed out"
-                )
+                error::fmt!(SocketError, "WebSocket upgrade response read timed out")
             } else {
                 error::fmt!(SocketError, "Could not read upgrade response: {}", io)
             }
