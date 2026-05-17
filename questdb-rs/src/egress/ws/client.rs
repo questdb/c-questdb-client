@@ -313,14 +313,21 @@ impl WsClient {
         }
         self.recv.reserve(READ_CHUNK);
         let spare = self.recv.spare_capacity_mut();
-        // SAFETY: we never read from `slice` (only write through
-        // `stream.read`), and BytesMut guarantees `spare_capacity_mut`
-        // returns at least `recv.capacity() - recv.len()` bytes of
-        // valid, owned memory. Casting `&mut [MaybeUninit<u8>]` to
-        // `&mut [u8]` is sound for write-only access on x86_64 /
-        // aarch64; the data is uninitialised but `Read::read` is
-        // documented to "fill the buffer", i.e. it writes before
-        // returning the count of bytes written.
+        // SAFETY: `reserve(READ_CHUNK)` above ensures `spare_capacity_mut`
+        // returns at least `READ_CHUNK` bytes of owned, allocated (but
+        // uninitialised) memory backing `self.recv`. Reconstituting it
+        // as `&mut [u8]` is the contested pre-`read_buf` pattern: the
+        // construction itself is undecided in Rust's abstract machine
+        // (UCG hasn't ruled on `&mut u8` over uninit), and the cast is
+        // not target-specific. We accept it because (a) we never read
+        // from `slice` before `stream.read` writes into it, and (b) the
+        // only `Read` impls reachable through `self.stream` are
+        // `TcpStream::read` (→ `recv(2)` / `WSARecv`) and
+        // `rustls::StreamOwned::read` (→ AEAD decrypt into destination),
+        // both of which write the buffer without reading it. The
+        // `set_len` below commits exactly the prefix that `read`
+        // reported as filled. TODO: switch to `Read::read_buf` once it
+        // stabilises (rust-lang/rust#78485, #117693).
         let slice =
             unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
         let n = self.stream.read(slice)?;
