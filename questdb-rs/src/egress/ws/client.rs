@@ -49,19 +49,27 @@ use bytes::{Bytes, BytesMut};
 use crate::ws::frame::{FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::MaskRng;
 
-/// Initial recv buffer capacity. Sized for our 600 KB raw batches +
-/// some headroom so the first batch fits in a single syscall. Smaller
-/// values force multiple `read()` calls per batch and trade memory
-/// bandwidth (re-doing the WS header parse) for marginal memory. See
-/// the perf write-up in PR 140.
-const INITIAL_RECV_CAPACITY: usize = 1024 * 1024;
+/// Initial recv buffer capacity. Sized to fit a typical multi-MB QWP
+/// `RESULT_BATCH` in a single `read()` syscall: the batch wire cap is
+/// 64 MiB (`MAX_BATCH_WIRE_BYTES` in `transport.rs`), real-world
+/// batches at the spec's default `max_batch_rows` land in the 2–4 MiB
+/// range under zstd, and the steady-state Linux TCP recv socket buffer
+/// is also a few MiB — so a 4 MiB user-space buffer lets the kernel
+/// hand us most of a batch in one go. Smaller values force multiple
+/// `read()` calls per batch (the previous default was 1 MiB, which
+/// meant 4× the syscalls on a 4 MiB batch); larger values trade
+/// per-connection memory (4 MiB × concurrent readers) for fewer
+/// syscalls. The 4 MiB pick balances both for the single-reader /
+/// few-reader case that QWP egress is built for. See PR 140 for the
+/// original perf write-up.
+const INITIAL_RECV_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// How many spare bytes we reserve before each `read()`. Caps the size
 /// of a single read syscall: bigger values mean fewer syscalls but a
 /// hostile peer that streams continuous bytes could otherwise force us
-/// to keep growing. 1 MiB matches `INITIAL_RECV_CAPACITY` so the
-/// steady-state pattern is "read 1 MiB, consume some, top back up".
-const READ_CHUNK: usize = 1024 * 1024;
+/// to keep growing. Matches [`INITIAL_RECV_CAPACITY`] so the
+/// steady-state pattern is "read 4 MiB, consume some, top back up".
+const READ_CHUNK: usize = 4 * 1024 * 1024;
 
 /// Plain TCP or rustls-wrapped TCP. Replaces `tungstenite::stream::MaybeTlsStream`.
 ///
