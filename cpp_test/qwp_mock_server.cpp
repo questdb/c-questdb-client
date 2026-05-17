@@ -35,6 +35,8 @@ using ssize_t = std::intptr_t;
 // Winsock spells the shutdown constants differently.
 #define QWP_SHUT_RDWR SD_BOTH
 #define QWP_SHUT_WR   SD_SEND
+// Windows TCP has no SIGPIPE; closed-peer writes return WSAECONNRESET.
+#define QWP_MSG_NOSIGNAL 0
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -47,7 +49,34 @@ using socket_t = int;
 #define close_socket(s) ::close(s)
 #define QWP_SHUT_RDWR SHUT_RDWR
 #define QWP_SHUT_WR   SHUT_WR
+// Suppress SIGPIPE on closed-peer writes. Linux exposes the flag per
+// `send()` call (`MSG_NOSIGNAL`); macOS/BSD exposes it as a per-socket
+// option (`SO_NOSIGPIPE` set via `setsockopt`). Define both portably so
+// the mock server can refuse to take down the test process when a
+// client closes the connection mid-frame.
+#ifdef MSG_NOSIGNAL
+#define QWP_MSG_NOSIGNAL MSG_NOSIGNAL
+#else
+#define QWP_MSG_NOSIGNAL 0
 #endif
+#endif
+
+namespace
+{
+// Set the per-socket "do not raise SIGPIPE on closed-peer writes" option.
+// macOS/BSD use `SO_NOSIGPIPE` because they lack `MSG_NOSIGNAL`; Linux
+// already covers this via the `QWP_MSG_NOSIGNAL` flag on each `send()`.
+// Windows has no SIGPIPE. Call this immediately after `socket()`/
+// `accept()` for any fd the mock server will write to.
+inline void set_no_sigpipe([[maybe_unused]] socket_t fd)
+{
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    (void)::setsockopt(
+        fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+}
+} // namespace
 
 namespace qwp_mock
 {
@@ -540,7 +569,7 @@ bool send_all(socket_t fd, const uint8_t* data, size_t len)
 #else
                            len,
 #endif
-                           0);
+                           QWP_MSG_NOSIGNAL);
         if (n <= 0)
             return false;
         data += n;
@@ -722,7 +751,10 @@ void graceful_close(socket_t fd)
     // RFC 6455 §5.5.1 server Close: 0x88 = FIN | OP_CLOSE; payload = 0.
     static const std::uint8_t ws_close[2] = {0x88, 0x00};
     (void)send(
-        fd, reinterpret_cast<const char*>(ws_close), sizeof(ws_close), 0);
+        fd,
+        reinterpret_cast<const char*>(ws_close),
+        sizeof(ws_close),
+        QWP_MSG_NOSIGNAL);
     (void)::shutdown(fd, QWP_SHUT_WR);
     close_socket(fd);
 }
@@ -837,6 +869,8 @@ struct MockServer::Impl
             sockaddr_in addr{};
             socklen_t addr_len = sizeof(addr);
             socket_t client = ::accept(listen_fd, (sockaddr*)&addr, &addr_len);
+            if (client != INVALID_SOCKET_VALUE)
+                set_no_sigpipe(client);
             if (client == INVALID_SOCKET_VALUE)
             {
                 if (shutdown.load())

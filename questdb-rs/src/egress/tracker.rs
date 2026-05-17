@@ -27,12 +27,14 @@
 //! mid-query failover reconnect. Port of the Java reference
 //! `QwpHostHealthTracker`; semantics match failover.md §2.
 //!
-//! The tracker is `!Send`/`!Sync` by construction (it lives on the
-//! `Reader`, which is unconditionally `!Send`). All mutation goes
-//! through `&mut self`, so no internal synchronisation is needed —
-//! unlike the Java original, which uses an internal lock because the
-//! same tracker is shared across sender (ingress) and query-client
-//! (egress) threads in that codebase.
+//! The tracker does not carry internal synchronisation: every mutation
+//! goes through `&mut self`, so the borrow checker already enforces
+//! exclusive access for the lifetime of each call. The Java original
+//! uses an internal lock because in that codebase the same tracker is
+//! shared across sender (ingress) and query-client (egress) threads;
+//! in Rust, sharing across threads would require an explicit
+//! `Mutex`/`RwLock` wrapper at the call site, which is the right place
+//! for that policy.
 
 /// Lifecycle classification for one host.
 ///

@@ -24,13 +24,36 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
+// ----------------------------------------------------------------------------
+// Panic policy
+//
+// This crate sets `panic = "abort"` in both `[profile.release]` and
+// `[profile.dev]` (see `questdb-rs-ffi/Cargo.toml`). Any Rust panic that
+// reaches the panic handler — debug assertion, arithmetic overflow, slice
+// indexing, allocator overflow, `unwrap()` on `None`, etc. — terminates the
+// host process immediately. The unwinder is not linked in, so there is no
+// FFI panic boundary: `catch_unwind` would be a no-op even if it were
+// installed, and a panic cannot be converted into `false` + `err_out`.
+//
+// As a result, every `extern "C"` entry point must validate inputs
+// upstream — *before* any panic-capable call (`Vec::reserve`, slice
+// indexing, `unwrap` on `None`, etc.) is reached. See
+// `line_sender_buffer_reserve` for the canonical pattern: it pre-checks
+// the would-be capacity against `isize::MAX` and returns `false` +
+// `InvalidApiCall` instead of relying on a (dead) panic guard around the
+// underlying `Vec::reserve` call.
+//
+// The `[profile.test]` and `[profile.bench]` profiles are forced to
+// `panic = "unwind"` by cargo (the test harness needs to catch panics
+// to report them), so any test that panics will *not* abort. Do not let
+// this mislead you: in production builds the abort is the contract.
+// ----------------------------------------------------------------------------
+
 use libc::{c_char, c_void, size_t};
 use questdb::ingress::DecimalView;
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
-use std::io::{self, Write};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
@@ -155,11 +178,8 @@ macro_rules! generate_array_dims_branches {
 ///
 /// The builder setters consume `self` (Rust move semantics), so we
 /// clone the current builder, call the setter on the clone, and commit the
-/// returned builder only on success.
-///
-/// This keeps the original object valid on validation errors and during
-/// unwinding if a setter panics; the live `line_sender_opts` object never
-/// contains duplicated stale owned bits.
+/// returned builder only on success. On `Err`, the live `line_sender_opts`
+/// keeps its original builder untouched.
 ///
 /// This costs one clone per setter call during one-time setup — acceptable
 /// since this path is only hit from C/C++ FFI, never from pure Rust.
@@ -176,29 +196,14 @@ macro_rules! generate_array_dims_branches {
 ///   copy is still needed.
 macro_rules! upd_opts {
     ($opts:expr, $err_out:expr, $func:ident $(, $($args:expr),*)?) => {{
-        // catch_unwind makes this macro the single FFI panic boundary for the
-        // entire opts-setter family; AssertUnwindSafe is justified by the
-        // clone-then-replace dance above keeping the live builder consistent.
-        match catch_unwind(AssertUnwindSafe(|| {
-            let builder_ref: &mut SenderBuilder = &mut (*$opts).0;
-            match builder_ref.clone().$func($($($args),*)?) {
-                Ok(builder) => {
-                    *builder_ref = builder;
-                    true
-                }
-                Err(err) => {
-                    set_err_out_from_error($err_out, err);
-                    false
-                }
+        let builder_ref: &mut SenderBuilder = &mut (*$opts).0;
+        match builder_ref.clone().$func($($($args),*)?) {
+            Ok(builder) => {
+                *builder_ref = builder;
+                true
             }
-        })) {
-            Ok(v) => v,
-            Err(_) => {
-                set_err_out(
-                    $err_out,
-                    ErrorCode::InvalidApiCall,
-                    concat!(stringify!($func), " panicked").to_string(),
-                );
+            Err(err) => {
+                set_err_out_from_error($err_out, err);
                 false
             }
         }
@@ -950,8 +955,10 @@ unsafe fn unwrap_buffer_mut<'a>(buffer: *mut line_sender_buffer) -> &'a mut Buff
 
 /// Create a new copy of the buffer.
 ///
-/// Returns NULL and populates `err_out` if `buffer` is NULL or if the
-/// underlying clone panics (e.g. allocation failure).
+/// Returns NULL and populates `err_out` if `buffer` is NULL. If the
+/// underlying clone hits an allocator failure, the process aborts per
+/// the crate-wide panic policy (see the panic-policy header in
+/// `lib.rs`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_clone(
     buffer: *const line_sender_buffer,
@@ -967,25 +974,12 @@ pub unsafe extern "C" fn line_sender_buffer_clone(
         }
         return ptr::null_mut();
     }
-    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+    unsafe {
         let src = &*buffer;
         Box::into_raw(Box::new(line_sender_buffer {
             buffer: src.buffer.clone(),
             empty_peek_buf_is_null: src.empty_peek_buf_is_null,
         }))
-    }));
-    match result {
-        Ok(ptr) => ptr,
-        Err(_) => {
-            unsafe {
-                set_err_out(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    "line_sender_buffer_clone panicked".to_owned(),
-                );
-            }
-            ptr::null_mut()
-        }
     }
 }
 
@@ -1017,12 +1011,11 @@ pub unsafe extern "C" fn line_sender_buffer_reserve(
         return false;
     }
     // `Vec::reserve` panics if the resulting capacity exceeds
-    // `isize::MAX`. This crate links with `panic = "abort"`
-    // (see questdb-rs-ffi/Cargo.toml), so `catch_unwind` is a
-    // no-op and a panic kills the host process. Reject the call
-    // up front instead. The current capacity is included so we
-    // don't accept an `additional` that overflows only because
-    // of what's already buffered.
+    // `isize::MAX`, which under the crate-wide `panic = "abort"`
+    // policy would abort the host process. Reject the call up front
+    // instead. The current capacity is included so we don't accept
+    // an `additional` that overflows only because of what's already
+    // buffered.
     let current = unsafe { unwrap_buffer(buffer).capacity() };
     if additional > (isize::MAX as usize).saturating_sub(current) {
         unsafe {
@@ -2311,7 +2304,7 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_error_handler(
     user_data: *mut c_void,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if opts.is_null() {
             set_err_out(
                 err_out,
@@ -2327,9 +2320,7 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_error_handler(
                 let user_data = user_data as usize;
                 current.qwp_ws_error_handler(move |error| {
                     let view = qwp_ws_sender_error_view(error);
-                    ffi_invoke_c_callback("qwp_ws_error_handler", || {
-                        cb(user_data as *mut c_void, &view);
-                    });
+                    cb(user_data as *mut c_void, &view);
                 })
             }
             None => current.qwp_ws_error_handler(c_default_qwp_ws_error_handler),
@@ -2344,7 +2335,7 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_error_handler(
                 false
             }
         }
-    })
+    }
 }
 
 /// Set the username for authentication.
@@ -2829,48 +2820,6 @@ impl line_sender_qwpws_fsn {
     }
 }
 
-/// Outbound FFI panic boundary for bool-returning extern "C" functions.
-///
-/// Wraps the body of a `pub extern "C" fn` so a Rust panic surfaces as
-/// `false` + `err_out = InvalidApiCall` instead of unwinding across the
-/// `extern "C"` boundary (UB on stable rustc, process abort with `panic=abort`).
-fn ffi_catch_bool<F>(err_out: *mut *mut line_sender_error, f: F) -> bool
-where
-    F: FnOnce() -> bool,
-{
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(value) => value,
-        Err(_) => {
-            unsafe {
-                set_err_out(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    "FFI call panicked".to_string(),
-                );
-            }
-            false
-        }
-    }
-}
-
-/// Inbound FFI panic boundary for user-supplied callbacks.
-///
-/// Wraps the invocation of a C callback (the `cb(user_data, …)` step inside a
-/// Rust trampoline) so a panic doesn't unwind back across the `extern "C"`
-/// boundary into the user's code. Void-returning callbacks have no err_out
-/// channel; the panic is logged to stderr and swallowed.
-fn ffi_invoke_c_callback<F>(label: &str, f: F)
-where
-    F: FnOnce(),
-{
-    if catch_unwind(AssertUnwindSafe(f)).is_err() {
-        let _ = writeln!(
-            io::stderr(),
-            "[questdb ERROR] {label} C callback panicked; panic swallowed at FFI boundary"
-        );
-    }
-}
-
 unsafe fn qwpws_line_sender_ref<'a>(
     sender: *const line_sender,
     err_out: *mut *mut line_sender_error,
@@ -3123,7 +3072,7 @@ pub unsafe extern "C" fn line_sender_qwpws_flush_and_get_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -3152,7 +3101,7 @@ pub unsafe extern "C" fn line_sender_qwpws_flush_and_get_fsn(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3162,7 +3111,7 @@ pub unsafe extern "C" fn line_sender_qwpws_flush_and_keep_and_get_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -3196,7 +3145,7 @@ pub unsafe extern "C" fn line_sender_qwpws_flush_and_keep_and_get_fsn(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3205,7 +3154,7 @@ pub unsafe extern "C" fn line_sender_qwpws_drive_once(
     progressed_out: *mut bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if progressed_out.is_null() {
             set_err_out(
                 err_out,
@@ -3228,7 +3177,7 @@ pub unsafe extern "C" fn line_sender_qwpws_drive_once(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3237,7 +3186,7 @@ pub unsafe extern "C" fn line_sender_qwpws_published_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -3261,7 +3210,7 @@ pub unsafe extern "C" fn line_sender_qwpws_published_fsn(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3270,7 +3219,7 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if fsn_out.is_null() {
             set_err_out(
                 err_out,
@@ -3293,7 +3242,7 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3304,7 +3253,7 @@ pub unsafe extern "C" fn line_sender_qwpws_await_acked_fsn(
     reached_out: *mut bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if reached_out.is_null() {
             set_err_out(
                 err_out,
@@ -3328,7 +3277,7 @@ pub unsafe extern "C" fn line_sender_qwpws_await_acked_fsn(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3337,7 +3286,7 @@ pub unsafe extern "C" fn line_sender_qwpws_poll_error(
     error_out: *mut *mut line_sender_qwpws_error,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if error_out.is_null() {
             set_err_out(
                 err_out,
@@ -3362,7 +3311,7 @@ pub unsafe extern "C" fn line_sender_qwpws_poll_error(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3405,11 +3354,11 @@ pub unsafe extern "C" fn line_sender_error_qwpws_get_view(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_qwpws_error_free(error: *mut line_sender_qwpws_error) {
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+    unsafe {
         if !error.is_null() {
             drop(Box::from_raw(error));
         }
-    }));
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3418,7 +3367,7 @@ pub unsafe extern "C" fn line_sender_qwpws_errors_dropped(
     dropped_out: *mut u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         if dropped_out.is_null() {
             set_err_out(
                 err_out,
@@ -3442,7 +3391,7 @@ pub unsafe extern "C" fn line_sender_qwpws_errors_dropped(
                 false
             }
         }
-    })
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3450,7 +3399,7 @@ pub unsafe extern "C" fn line_sender_qwpws_close_drain(
     sender: *mut line_sender,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         let Some(sender) = qwpws_line_sender_mut(sender, err_out, "line_sender_qwpws_close_drain")
         else {
             return false;
@@ -3462,7 +3411,7 @@ pub unsafe extern "C" fn line_sender_qwpws_close_drain(
                 false
             }
         }
-    })
+    }
 }
 
 /// Send the given buffer of rows to the QuestDB server, clearing the buffer.
@@ -3502,7 +3451,7 @@ pub unsafe extern "C" fn line_sender_flush(
     buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         let sender = unwrap_sender_mut(sender);
         let buffer = unwrap_buffer_mut(buffer);
         match sender.flush(buffer) {
@@ -3512,7 +3461,7 @@ pub unsafe extern "C" fn line_sender_flush(
                 false
             }
         }
-    })
+    }
 }
 
 /// Send the given buffer of rows to the QuestDB server.
@@ -3530,7 +3479,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
     buffer: *const line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         let sender = unwrap_sender_mut(sender);
         let buffer = unwrap_buffer(buffer);
         match sender.flush_and_keep(buffer) {
@@ -3540,7 +3489,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
                 false
             }
         }
-    })
+    }
 }
 
 /// Send the batch of rows in the buffer to the QuestDB server, and, if the parameter
@@ -3567,7 +3516,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep_with_flags(
     transactional: bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    ffi_catch_bool(err_out, || unsafe {
+    unsafe {
         let sender = unwrap_sender_mut(sender);
         let buffer = unwrap_buffer(buffer);
         match sender.flush_and_keep_with_flags(buffer, transactional) {
@@ -3577,7 +3526,7 @@ pub unsafe extern "C" fn line_sender_flush_and_keep_with_flags(
                 false
             }
         }
-    })
+    }
 }
 
 /// Get the current time in nanoseconds since the Unix epoch (UTC).
@@ -3662,61 +3611,6 @@ mod tests {
                 variant,
             );
         }
-    }
-
-    // ---- C5 regression: FFI panic boundaries ----
-
-    /// `ffi_catch_bool` must convert a Rust panic into `false` + `err_out`
-    /// rather than unwinding across the `extern "C"` boundary into the C
-    /// caller (UB on stable rustc; process abort with `panic=abort`).
-    #[test]
-    fn ffi_catch_bool_converts_panic_to_err_out() {
-        unsafe {
-            let mut err: *mut line_sender_error = ptr::null_mut();
-            let result = ffi_catch_bool(&mut err, || panic!("simulated panic"));
-            assert!(!result, "panicking closure must return false");
-            assert!(!err.is_null(), "err_out must be populated");
-            assert_err_code(
-                line_sender_error_get_code(err),
-                line_sender_error_code::line_sender_error_invalid_api_call,
-            );
-            free_err(&mut err);
-        }
-    }
-
-    /// `ffi_catch_bool` must be transparent for non-panicking closures —
-    /// no spurious err_out, return value preserved.
-    #[test]
-    fn ffi_catch_bool_is_transparent_when_no_panic() {
-        let mut err: *mut line_sender_error = ptr::null_mut();
-        let result_true = ffi_catch_bool(&mut err, || true);
-        assert!(result_true);
-        assert!(err.is_null());
-
-        let result_false = ffi_catch_bool(&mut err, || false);
-        assert!(!result_false);
-        assert!(err.is_null());
-    }
-
-    /// `ffi_invoke_c_callback` must swallow a Rust panic raised inside the
-    /// closure rather than letting it unwind back to the trampoline caller.
-    /// The void-returning callback contract has no err_out channel; the helper
-    /// returns normally and logs to stderr.
-    ///
-    /// Note: this test exercises panics in *Rust code* invoked from inside the
-    /// helper's closure — which is the case that catch_unwind can actually
-    /// catch. A panic from inside an `extern "C"` callback aborts the process
-    /// at the ABI boundary (stable rustc treats `extern "C"` as nounwind);
-    /// `catch_unwind` cannot intervene before that abort, so we don't claim to
-    /// test that case here. The genuine protection against a panicking
-    /// callback comes from the outer `ffi_catch_bool` on the FFI entry point
-    /// (`line_sender_flush*`), which catches Rust-side panics that the closure
-    /// caused indirectly without crossing an `extern "C"` frame.
-    #[test]
-    fn ffi_invoke_c_callback_swallows_panic() {
-        ffi_invoke_c_callback("test_callback", || {
-            panic!("simulated panic inside trampoline closure");
-        });
     }
 
     fn utf8(bytes: &'static [u8]) -> line_sender_utf8 {
