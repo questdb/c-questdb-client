@@ -1123,6 +1123,98 @@ fn auto_flush_bytes_unsupported() {
     );
 }
 
+// `reconnect_*` knobs are documented as the reconnect budget but were
+// silently ignored on the *initial* connect because `initial_connect_retry`
+// defaulted to `off`. A user setting `reconnect_max_duration_millis=120000`
+// expecting it to cover startup races against an unhealthy server got one
+// shot at the WS upgrade and no retry. `apply_reconnect_implies_initial_retry`
+// (called from `from_conf` and `build`) closes this footgun by promoting
+// `initial_connect_retry` to `Sync` whenever any `reconnect_*` key is
+// explicitly set and the user has not picked a mode themselves.
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_defaults_leave_initial_connect_retry_off() {
+    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_defaulted_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_reconnect_max_duration_implies_initial_connect_retry_sync() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+    assert_specified_eq(&qwp_ws.reconnect_max_duration, Duration::from_secs(120));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_reconnect_initial_backoff_implies_initial_connect_retry_sync() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_initial_backoff_millis=250;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_reconnect_max_backoff_implies_initial_connect_retry_sync() {
+    let builder =
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;reconnect_max_backoff_millis=10000;")
+            .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_initial_connect_retry_off_is_preserved() {
+    // Belt-and-suspenders: even when the user sets a reconnect budget,
+    // an explicit initial_connect_retry=off override must win.
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=off;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_initial_connect_retry_async_is_preserved() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=async;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Async,
+    );
+}
+
 fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(
     actual: &ConfigSetting<V>,
     expected: IntoV,

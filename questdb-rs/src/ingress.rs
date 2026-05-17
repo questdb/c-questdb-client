@@ -938,6 +938,11 @@ impl SenderBuilder {
             };
         }
 
+        #[cfg(feature = "_sender-qwp-ws")]
+        if let Some(qwp_ws) = builder.qwp_ws.as_mut() {
+            qwp_ws.apply_reconnect_implies_initial_retry();
+        }
+
         Ok(builder)
     }
 
@@ -2108,6 +2113,13 @@ impl SenderBuilder {
                         "QWP/WebSocket configuration is missing."
                     ));
                 };
+                // Builder API callers reach build() without going through
+                // from_conf, so apply the reconnect-implies-initial-retry
+                // auto-on here too. Cheap clone; a no-op when the caller
+                // already specified initial_connect_retry.
+                let mut qwp_ws = qwp_ws.clone();
+                qwp_ws.apply_reconnect_implies_initial_retry();
+                let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
