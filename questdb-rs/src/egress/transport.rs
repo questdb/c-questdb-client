@@ -55,8 +55,8 @@ use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
 use crate::egress::ws::client::{Stream, WsClient, WsReadError};
-use crate::egress::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
-use crate::egress::ws::mask::build_from_system_random;
+use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
+use crate::ws::mask::build_from_system_random;
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
 /// successful handshake. Caps any single `write()` syscall — including
@@ -228,7 +228,7 @@ impl WsTransport {
         // that interval of server silence (legitimate on slow queries).
         set_tcp_read_timeout(stream.tcp_mut(), None);
 
-        let mask_rng = build_from_system_random()?;
+        let mask_rng = build_from_system_random().map_err(|e| fmt!(ConfigError, "{}", e.0))?;
         let socket = WsClient::new(stream, handshake.leftover, mask_rng, MAX_BATCH_WIRE_BYTES);
 
         Ok(WsTransport {

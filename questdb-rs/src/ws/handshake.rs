@@ -32,25 +32,18 @@
 //! validates the response: status MUST be 101, `Upgrade` MUST contain
 //! `websocket`, `Connection` MUST contain `Upgrade`, and
 //! `Sec-WebSocket-Accept` MUST equal `base64(SHA1(client_key +
-//! "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
+//! WS_MAGIC_GUID))` (see [`super::crypto`]).
 //!
 //! Non-101 responses are surfaced as `HttpStatus { status, headers,
-//! body }` so the caller can preserve the existing `UpgradeReject`
-//! diagnostics for 421 / `Authorization` failures.
+//! body }` so the caller can preserve any transport-specific
+//! diagnostics (the egress reader uses this for 421 role-mismatch
+//! failover; the ingress sender uses it for `X-QuestDB-Role`
+//! classification).
 
 use std::io::{Read, Write};
 
-use base64ct::{Base64, Encoding};
-
+use super::crypto::{b64_encode, compute_accept};
 use super::mask::build_from_system_random;
-use crate::egress::error::Result;
-#[cfg(not(any(feature = "ring-crypto", feature = "aws-lc-crypto")))]
-use crate::egress::error::fmt;
-
-/// RFC 6455 magic GUID concatenated with the client's Sec-WebSocket-Key
-/// before SHA1, then base64-encoded for the Sec-WebSocket-Accept
-/// response header. Lifted verbatim from RFC §4.1.
-const WS_MAGIC_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Cap on the bytes we read while looking for `\r\n\r\n`. Slow-loris
 /// defence: a server that dribbles a single byte at a time would
@@ -59,8 +52,8 @@ const WS_MAGIC_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// timeout set yet, so without this cap a hostile peer could stall
 /// the calling thread indefinitely. 32 KiB is generous for any real
 /// HTTP response (we've never seen one exceed ~2 KiB) but small enough
-/// that a hostile slow-trickle can't exhaust client memory before the
-/// `auth_timeout_ms` deadline fires.
+/// that a hostile slow-trickle can't exhaust client memory before any
+/// reasonable handshake timeout fires.
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
 
 /// Maximum length of one header line. Matches Apache / nginx defaults
@@ -79,7 +72,7 @@ pub(crate) struct Header {
 
 /// Case-insensitive multi-value header collection. The handshake
 /// validation logic and the upgrade-reject parser both reach for
-/// `find_ci` and `connection_has_token`.
+/// `find_ci` and `header_has_token`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Headers(Vec<Header>);
 
@@ -93,8 +86,8 @@ impl Headers {
     }
 
     /// Construct from an explicit list of `(name, value)` pairs.
-    /// Convenience for tests in `transport.rs` that need to forge a
-    /// `Headers` for the content-encoding / role-rejection validators.
+    /// Convenience for tests that need to forge a `Headers` for the
+    /// content-encoding / role-rejection validators.
     #[cfg(test)]
     pub(crate) fn from_pairs<I, S1, S2>(pairs: I) -> Self
     where
@@ -131,16 +124,15 @@ impl Headers {
 /// Carries status, headers, and the raw body bytes the server sent
 /// before closing or stalling. The caller decides how to surface this —
 /// e.g., 421 carries `X-QuestDB-Role` for the role-mismatch failover
-/// path; 401 / 403 surface as `AuthError`.
+/// path; 401 / 403 surface as auth errors.
 #[derive(Debug, Clone)]
 pub(crate) struct HttpReject {
     pub status: u16,
     pub headers: Headers,
-    /// Response body when `Content-Length` was honoured. Currently
-    /// unread by `transport.rs` — the upgrade-reject classification
-    /// keys on status code + role/zone headers — but kept on the
-    /// struct so a future diagnostic path can surface the body
-    /// without breaking the type's layout.
+    /// Response body when `Content-Length` was honoured. Kept on the
+    /// struct so a future diagnostic path can surface the body without
+    /// breaking the type's layout, even if a particular caller doesn't
+    /// read it today.
     #[allow(dead_code)]
     pub body: Vec<u8>,
 }
@@ -149,24 +141,25 @@ pub(crate) struct HttpReject {
 #[derive(Debug, Clone)]
 pub(crate) struct Handshake {
     /// Validated server response headers — accessible for negotiated
-    /// values (X-QWP-Version, X-QWP-Content-Encoding).
+    /// values (X-QWP-Version, X-QWP-Content-Encoding, etc.).
     pub headers: Headers,
     /// Bytes the server sent after the `\r\n\r\n` header terminator but
     /// before we drained the buffer. Typically empty (RFC 6455 servers
     /// don't send WS frames before the client's first frame), but we
-    /// preserve any prefetched bytes so the `WsClient` can prepend them
-    /// to its recv buffer.
+    /// preserve any prefetched bytes so the caller can prepend them to
+    /// its recv buffer.
     pub leftover: Vec<u8>,
 }
 
-/// Error path for [`upgrade`]. Variants map to existing egress
-/// `ErrorCode`s in transport.rs.
+/// Error path for [`upgrade`]. Callers convert each variant into their
+/// transport's native error type.
 #[derive(Debug)]
 pub(crate) enum HandshakeError {
     /// IO failure during request write or response read.
     Io(std::io::Error),
     /// Response was malformed (bad status line, header too long,
-    /// missing terminator, etc.).
+    /// missing terminator, etc.) or the entropy source needed for the
+    /// Sec-WebSocket-Key was unavailable.
     Protocol(String),
     /// Response was a well-formed non-101 — caller decides classification.
     HttpStatus(HttpReject),
@@ -187,8 +180,9 @@ impl From<std::io::Error> for HandshakeError {
 /// or `"[::1]:9000"`); the caller is responsible for picking the right
 /// form for IPv6 literals.
 /// `path` is the request-target (e.g. `"/read/v1"`).
-/// `extra_headers` carries the X-QWP-* and Authorization headers from
-/// the connect-string config.
+/// `extra_headers` carries the transport-specific headers (X-QWP-*,
+/// Authorization) the caller wants emitted between the mandatory WS
+/// headers and the terminating CRLF.
 ///
 /// On success, returns the validated [`Handshake`] including any
 /// pre-fetched bytes after `\r\n\r\n`.
@@ -201,10 +195,8 @@ pub(crate) fn upgrade<S: Read + Write>(
     // Generate 16 random bytes for Sec-WebSocket-Key. Reuses the
     // crypto provider that mask.rs seeds from — same entropy source,
     // same cfg-gating story.
-    let key = generate_client_key()
-        .map_err(|_| HandshakeError::Protocol("system entropy source unavailable".into()))?;
-    let expected_accept = compute_accept_for_key(&key)
-        .map_err(|_| HandshakeError::Protocol("SHA1 digest provider unavailable".into()))?;
+    let key = generate_client_key().map_err(|e| HandshakeError::Protocol(e.0))?;
+    let expected_accept = compute_accept(&key);
 
     let mut request = Vec::with_capacity(512);
     write_request(&mut request, path, host_header, &key, extra_headers);
@@ -264,7 +256,7 @@ pub(crate) fn upgrade<S: Read + Write>(
 /// been base64-encoded" (RFC §4.1). We pull 16 bytes from
 /// SystemRandom, then base64-encode for the on-wire value. The 16-byte
 /// raw form is never used after that.
-fn generate_client_key() -> Result<String> {
+fn generate_client_key() -> Result<String, super::mask::EntropyUnavailable> {
     // Reuse the SystemRandom plumbing from mask.rs — same crypto
     // provider feature-gate. We could call `SystemRandom::fill` here
     // directly but reusing `build_from_system_random()` keeps the
@@ -281,54 +273,12 @@ fn generate_client_key() -> Result<String> {
     for chunk in bytes.chunks_mut(4) {
         chunk.copy_from_slice(&rng.next_key());
     }
-    Ok(Base64::encode_string(&bytes))
-}
-
-/// `base64(SHA1(client_key + WS_MAGIC_GUID))`. RFC §4.2.2.
-fn compute_accept_for_key(client_key: &str) -> Result<String> {
-    let mut digest_input = String::with_capacity(client_key.len() + WS_MAGIC_GUID.len());
-    digest_input.push_str(client_key);
-    digest_input.push_str(WS_MAGIC_GUID);
-
-    let digest = sha1_digest(digest_input.as_bytes())?;
-    Ok(Base64::encode_string(&digest))
-}
-
-#[cfg(feature = "ring-crypto")]
-fn sha1_digest(input: &[u8]) -> Result<[u8; 20]> {
-    use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
-    let d = digest(&SHA1_FOR_LEGACY_USE_ONLY, input);
-    let bytes = d.as_ref();
-    debug_assert_eq!(bytes.len(), 20);
-    let mut out = [0u8; 20];
-    out.copy_from_slice(bytes);
-    Ok(out)
-}
-
-#[cfg(all(feature = "aws-lc-crypto", not(feature = "ring-crypto")))]
-fn sha1_digest(input: &[u8]) -> Result<[u8; 20]> {
-    use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
-    let d = digest(&SHA1_FOR_LEGACY_USE_ONLY, input);
-    let bytes = d.as_ref();
-    debug_assert_eq!(bytes.len(), 20);
-    let mut out = [0u8; 20];
-    out.copy_from_slice(bytes);
-    Ok(out)
-}
-
-#[cfg(not(any(feature = "ring-crypto", feature = "aws-lc-crypto")))]
-fn sha1_digest(_input: &[u8]) -> Result<[u8; 20]> {
-    Err(fmt!(
-        HandshakeError,
-        "no crypto provider configured for SHA1 (sync-reader-ws requires ring-crypto or \
-         aws-lc-crypto)"
-    ))
+    Ok(b64_encode(&bytes))
 }
 
 /// Construct the HTTP/1.1 GET request bytes. Header order matches the
 /// existing tungstenite emit order (and the Java reference client) to
-/// keep handshake captures interchangeable across implementations
-/// during the migration.
+/// keep handshake captures interchangeable across implementations.
 fn write_request(
     out: &mut Vec<u8>,
     path: &str,
@@ -748,7 +698,7 @@ Content-Length: 11\r\n\r\nhello world";
     }
 
     fn build_response(client_key: &str, omit: Option<&str>, extras: &[(&str, &str)]) -> Vec<u8> {
-        let accept = compute_accept_for_key(client_key).unwrap();
+        let accept = compute_accept(client_key);
         let mut resp = String::new();
         resp.push_str("HTTP/1.1 101 Switching Protocols\r\n");
         if omit != Some("Upgrade") {

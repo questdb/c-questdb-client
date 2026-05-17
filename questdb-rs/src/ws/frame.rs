@@ -31,7 +31,7 @@
 //!
 //! Writer always sets FIN=1 and MASK=1 (client→server frames MUST be
 //! masked per RFC 6455 §5.3). Mask key generation is the caller's job
-//! (see [`crate::egress::ws::mask::MaskRng`]).
+//! (see [`crate::ws::mask::MaskRng`]).
 
 use super::mask::apply_mask;
 
@@ -80,12 +80,16 @@ const OPCODE_MASK: u8 = 0x0F;
 const MASK_BIT: u8 = 0x80;
 const LEN_MASK: u8 = 0x7F;
 
-const OPCODE_CONTINUATION: u8 = 0x0;
-const OPCODE_TEXT: u8 = 0x1;
-const OPCODE_BINARY: u8 = 0x2;
-const OPCODE_CLOSE: u8 = 0x8;
-const OPCODE_PING: u8 = 0x9;
-const OPCODE_PONG: u8 = 0xA;
+// Opcode byte values per RFC 6455 §5.2. Exposed as `pub(crate)` so
+// callers comparing raw header bytes (e.g. the ingress driver's
+// inbound-frame dispatch) can use the same constants the parser does
+// rather than redeclaring them.
+pub(crate) const OPCODE_CONTINUATION: u8 = 0x0;
+pub(crate) const OPCODE_TEXT: u8 = 0x1;
+pub(crate) const OPCODE_BINARY: u8 = 0x2;
+pub(crate) const OPCODE_CLOSE: u8 = 0x8;
+pub(crate) const OPCODE_PING: u8 = 0x9;
+pub(crate) const OPCODE_PONG: u8 = 0xA;
 
 // Header-size constants documented for readers but not currently
 // referenced outside tests — the inline `[0u8; 14]` upper bound in
@@ -200,7 +204,7 @@ impl FrameHeader {
 
 /// Serialise a complete client-to-server frame into `out`, masking the
 /// payload in place. Always sets FIN=1 and the MASK bit. The caller
-/// provides the 4-byte mask key (see [`crate::egress::ws::mask`]).
+/// provides the 4-byte mask key (see [`crate::ws::mask`]).
 ///
 /// `out` is grown by `header_len + payload.len()` bytes. The returned
 /// slice covers exactly those new bytes — useful for tests; production

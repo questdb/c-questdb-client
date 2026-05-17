@@ -40,6 +40,12 @@
 //! proxies that misparse WS bytes — so per-frame syscalls are not
 //! required. Tungstenite uses the same shape (seed once, generate fast).
 
+/// Error returned by [`build_from_system_random`] when the OS entropy
+/// source itself fails. Callers usually surface this as a configuration
+/// error — at runtime there's nothing the user can do about it.
+#[derive(Debug)]
+pub(crate) struct EntropyUnavailable(pub String);
+
 /// Per-connection mask key generator. Constructed once at WS upgrade
 /// time and consumed by every outbound frame.
 #[derive(Debug)]
@@ -50,7 +56,7 @@ pub(crate) struct MaskRng {
 impl MaskRng {
     /// Build a generator from a 64-bit seed. Caller is responsible for
     /// drawing the seed from a strong entropy source. See
-    /// [`Self::from_system_random`] for the production path.
+    /// [`build_from_system_random`] for the production path.
     pub(crate) fn from_seed(seed: u64) -> Self {
         // xorshift64 stalls on all-zero state; force a non-zero seed.
         let state = if seed == 0 {
@@ -82,39 +88,26 @@ impl MaskRng {
 ///
 /// Fails only if the underlying entropy source itself fails — which on
 /// the supported targets means `getrandom`/`BCryptGenRandom` returned
-/// an error, i.e. something is very wrong. We surface this as
-/// `ConfigError` since there's nothing the user can fix at runtime.
+/// an error, i.e. something is very wrong.
 #[cfg(feature = "ring-crypto")]
-pub(crate) fn build_from_system_random() -> crate::egress::error::Result<MaskRng> {
-    use crate::egress::error::fmt;
+pub(crate) fn build_from_system_random() -> Result<MaskRng, EntropyUnavailable> {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut seed_bytes = [0u8; 8];
     SystemRandom::new()
         .fill(&mut seed_bytes)
-        .map_err(|e| fmt!(ConfigError, "system entropy source unavailable: {:?}", e))?;
+        .map_err(|e| EntropyUnavailable(format!("system entropy source unavailable: {e:?}")))?;
     Ok(MaskRng::from_seed(u64::from_ne_bytes(seed_bytes)))
 }
 
 #[cfg(all(feature = "aws-lc-crypto", not(feature = "ring-crypto")))]
-pub(crate) fn build_from_system_random() -> crate::egress::error::Result<MaskRng> {
-    use crate::egress::error::fmt;
+pub(crate) fn build_from_system_random() -> Result<MaskRng, EntropyUnavailable> {
     use aws_lc_rs::rand::{SecureRandom, SystemRandom};
     let mut seed_bytes = [0u8; 8];
     SystemRandom::new()
         .fill(&mut seed_bytes)
-        .map_err(|e| fmt!(ConfigError, "system entropy source unavailable: {:?}", e))?;
+        .map_err(|e| EntropyUnavailable(format!("system entropy source unavailable: {e:?}")))?;
     Ok(MaskRng::from_seed(u64::from_ne_bytes(seed_bytes)))
 }
-
-// If neither crypto provider feature is on, `sync-reader-ws` cannot
-// build anyway — `tls.rs` requires one of them for rustls. The
-// `cfg_attr` here ensures a clear compile error rather than a silent
-// fallback.
-#[cfg(not(any(feature = "ring-crypto", feature = "aws-lc-crypto")))]
-compile_error!(
-    "`sync-reader-ws` requires one of `ring-crypto` or `aws-lc-crypto` for TLS \
-     and WebSocket mask-key entropy"
-);
 
 /// XOR `buf` against the 4-byte mask key. `start_offset` is the position
 /// in the conceptual payload where `buf` starts — used when masking is

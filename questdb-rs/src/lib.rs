@@ -28,6 +28,13 @@ mod error;
 #[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-qwp-udp"))]
 mod gai;
 
+// Shared RFC 6455 WebSocket plumbing. Compiled whenever either side
+// needs it (ingress QWP/WS sender or egress QWP/WS reader). Each side
+// keeps its own transport-specific state machine on top of these
+// primitives.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+mod ws;
+
 pub mod ingress;
 
 #[cfg(feature = "_egress")]

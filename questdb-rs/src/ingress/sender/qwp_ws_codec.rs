@@ -29,16 +29,20 @@
 
 use crate::error;
 use crate::ingress::QwpWsRoleReject;
+#[cfg(test)]
+use crate::ws::crypto;
+use crate::ws::frame::{self, Opcode};
 
-pub(super) const SEC_WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+// Re-export opcode constants from the shared `ws::frame` module so existing
+// `WS_OPCODE_*` call sites in qwp_ws.rs and qwp_ws_driver.rs keep working
+// with zero churn after the Phase A consolidation.
+pub(super) use crate::ws::frame::{
+    OPCODE_BINARY as WS_OPCODE_BINARY, OPCODE_CLOSE as WS_OPCODE_CLOSE,
+    OPCODE_CONTINUATION as WS_OPCODE_CONTINUATION, OPCODE_PING as WS_OPCODE_PING,
+    OPCODE_PONG as WS_OPCODE_PONG, OPCODE_TEXT as WS_OPCODE_TEXT,
+};
+
 pub(super) const WS_PATH: &str = "/api/v4/write";
-
-pub(super) const WS_OPCODE_CONTINUATION: u8 = 0x0;
-pub(super) const WS_OPCODE_TEXT: u8 = 0x1;
-pub(super) const WS_OPCODE_BINARY: u8 = 0x2;
-pub(super) const WS_OPCODE_CLOSE: u8 = 0x8;
-pub(super) const WS_OPCODE_PING: u8 = 0x9;
-pub(super) const WS_OPCODE_PONG: u8 = 0xA;
 
 pub(super) const WS_STATUS_OK: u8 = 0x00;
 pub(super) const WS_STATUS_DURABLE_ACK: u8 = 0x02;
@@ -52,83 +56,30 @@ pub(super) const WS_STATUS_WRITE_ERROR: u8 = 0x09;
 /// but small enough to refuse obviously bogus declared lengths early.
 pub(super) const MAX_INBOUND_FRAME_BYTES: u64 = 256 * 1024 * 1024;
 
-// ---------- SHA-1 / Sec-WebSocket-Accept ----------
+// ---------- Sec-WebSocket-Accept (delegating to shared `ws::crypto`) ----------
 
-fn sha1(input: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xEFCDAB89;
-    let mut h2: u32 = 0x98BADCFE;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xC3D2E1F0;
-
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut padded = Vec::with_capacity(input.len() + 64);
-    padded.extend_from_slice(input);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    let mut w = [0u32; 80];
-    for chunk in padded.chunks_exact(64) {
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
-                _ => (b ^ c ^ d, 0xCA62C1D6u32),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
-    let mut out = [0u8; 20];
-    for (i, h) in [h0, h1, h2, h3, h4].iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&h.to_be_bytes());
-    }
-    out
-}
-
-pub(super) fn b64_encode(input: &[u8]) -> String {
-    use base64ct::{Base64, Encoding};
-    Base64::encode_string(input)
-}
-
+/// Compute the Sec-WebSocket-Accept value per RFC 6455 §4.2.2. Thin wrapper
+/// over [`crate::ws::crypto::compute_accept`] kept here so existing
+/// `codec::compute_accept` call sites in qwp_ws.rs / qwp_ws_driver.rs keep
+/// working with no churn.
+///
+/// Test-only: production code now drives `crate::ws::handshake::upgrade`
+/// directly, which validates the accept value internally. Test fixtures
+/// in qwp_ws / qwp_ws_driver still need to sign mocked responses, so the
+/// wrapper stays available under `cfg(test)`.
+#[cfg(test)]
 pub(super) fn compute_accept(key_b64: &str) -> String {
-    let mut combined = String::with_capacity(key_b64.len() + SEC_WS_GUID.len());
-    combined.push_str(key_b64);
-    combined.push_str(SEC_WS_GUID);
-    b64_encode(&sha1(combined.as_bytes()))
+    crypto::compute_accept(key_b64)
 }
 
 // ---------- frame builder (pure bytes) ----------
 
-/// Format a complete (FIN-set) WebSocket frame into `out`. The frame is masked
-/// per RFC 6455 client → server requirements; the mask is sourced from `mask`,
-/// which the caller chooses (random in production, deterministic in tests).
+/// Format a complete (FIN-set) WebSocket frame into `out`. Thin wrapper over
+/// [`crate::ws::frame::encode_client_frame`] that preserves the legacy
+/// (`fin`, raw-`u8` opcode) signature so existing ingress call sites stay
+/// untouched. The shared encoder always sets FIN=1; ingress never sends
+/// fragmented frames, so `fin=false` is rejected with a clear panic rather
+/// than silently emitting a malformed header.
 pub(super) fn write_frame_to_buf(
     out: &mut Vec<u8>,
     fin: bool,
@@ -136,185 +87,58 @@ pub(super) fn write_frame_to_buf(
     payload: &[u8],
     mask: [u8; 4],
 ) {
+    if !fin {
+        panic!("write_frame_to_buf: fin=false is not supported by encode_client_frame");
+    }
+    let opcode = match opcode {
+        WS_OPCODE_BINARY => Opcode::Binary,
+        WS_OPCODE_CLOSE => Opcode::Close,
+        WS_OPCODE_PING => Opcode::Ping,
+        WS_OPCODE_PONG => Opcode::Pong,
+        other => panic!("write_frame_to_buf: unsupported opcode 0x{other:02x}"),
+    };
     out.clear();
-    let fin_bit: u8 = if fin { 0x80 } else { 0x00 };
-    out.push(fin_bit | (opcode & 0x0F));
-
-    let mask_bit: u8 = 0x80;
-    let plen = payload.len();
-    if plen <= 125 {
-        out.push(mask_bit | (plen as u8));
-    } else if plen <= 0xFFFF {
-        out.push(mask_bit | 126);
-        out.extend_from_slice(&(plen as u16).to_be_bytes());
-    } else {
-        out.push(mask_bit | 127);
-        out.extend_from_slice(&(plen as u64).to_be_bytes());
-    }
-
-    out.extend_from_slice(&mask);
-    let masked_start = out.len();
-    out.extend_from_slice(payload);
-    for (i, b) in out[masked_start..].iter_mut().enumerate() {
-        *b ^= mask[i & 3];
-    }
+    frame::encode_client_frame(out, opcode, mask, payload);
 }
 
-// ---------- HTTP upgrade request builder ----------
+// ---------- HTTP upgrade request: extra QWP-specific headers ----------
 
-pub(super) fn build_upgrade_request(
-    host_header: &str,
-    key_b64: &str,
+/// X-QWP-* + Authorization headers the ingress sender appends to the RFC
+/// 6455 baseline. Pass the result as `extra_headers` to
+/// [`crate::ws::handshake::upgrade`].
+pub(super) fn qwp_extra_headers(
     auth_header: Option<&str>,
     max_version: u32,
     client_id: Option<&str>,
     request_durable_ack: bool,
-) -> String {
-    let mut req = String::new();
-    req.push_str(&format!("GET {WS_PATH} HTTP/1.1\r\n"));
-    req.push_str(&format!("Host: {host_header}\r\n"));
-    req.push_str("Upgrade: websocket\r\n");
-    req.push_str("Connection: Upgrade\r\n");
-    req.push_str(&format!("Sec-WebSocket-Key: {key_b64}\r\n"));
-    req.push_str("Sec-WebSocket-Version: 13\r\n");
-    req.push_str(&format!("X-QWP-Max-Version: {max_version}\r\n"));
+) -> Vec<(&'static str, String)> {
+    let mut extras = Vec::with_capacity(4);
+    extras.push(("X-QWP-Max-Version", max_version.to_string()));
     if let Some(cid) = client_id {
-        req.push_str(&format!("X-QWP-Client-Id: {cid}\r\n"));
+        extras.push(("X-QWP-Client-Id", cid.to_owned()));
     }
     if request_durable_ack {
-        req.push_str("X-QWP-Request-Durable-Ack: true\r\n");
+        extras.push(("X-QWP-Request-Durable-Ack", "true".to_owned()));
     }
     if let Some(auth) = auth_header {
-        req.push_str(&format!("Authorization: {auth}\r\n"));
+        extras.push(("Authorization", auth.to_owned()));
     }
-    req.push_str("\r\n");
-    req
+    extras
 }
 
-// ---------- HTTP response parsing (header block already in memory) ----------
+// ---------- HTTP response validation (post-shared-handshake) ----------
 
-pub(super) struct ParsedHttpHeaders {
-    pub(super) status: u16,
-    pub(super) headers: Vec<(String, String)>,
-}
-
-pub(super) fn parse_http_header_block(block: &[u8]) -> crate::Result<ParsedHttpHeaders> {
-    let header_text = std::str::from_utf8(block)
-        .map_err(|_| error::fmt!(SocketError, "Upgrade response headers are not UTF-8"))?;
-    let mut lines = header_text.split("\r\n");
-    let status_line = lines.next().ok_or_else(|| {
-        error::fmt!(
-            SocketError,
-            "WebSocket upgrade response missing status line"
-        )
-    })?;
-    let mut parts = status_line.splitn(3, ' ');
-    let _http_ver = parts.next();
-    let status: u16 = parts
-        .next()
-        .ok_or_else(|| error::fmt!(SocketError, "Missing HTTP status code"))?
-        .parse()
-        .map_err(|_| error::fmt!(SocketError, "Invalid HTTP status code"))?;
-
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
-        }
-    }
-    Ok(ParsedHttpHeaders { status, headers })
-}
-
-pub(super) fn validate_upgrade_response(
-    parsed: &ParsedHttpHeaders,
-    expected_accept: &str,
+/// QWP-specific post-validation on a successful 101 response. Returns the
+/// negotiated protocol version (defaults to 1 when the server omits
+/// X-QWP-Version, matching the spec). Errors when the server returns an
+/// out-of-range version or fails to echo `X-QWP-Durable-Ack: enabled`
+/// after the client requested it.
+pub(super) fn validate_qwp_handshake_headers(
+    headers: &crate::ws::handshake::Headers,
     max_version: u32,
     request_durable_ack: bool,
 ) -> crate::Result<u8> {
-    if parsed.status == 401 || parsed.status == 403 {
-        return Err(error::fmt!(
-            AuthError,
-            "WebSocket upgrade authentication failed: HTTP status {}",
-            parsed.status
-        ));
-    }
-    if parsed.status == 421
-        && let Some((_, role)) = parsed
-            .headers
-            .iter()
-            .find(|(k, v)| k.eq_ignore_ascii_case("x-questdb-role") && !v.trim().is_empty())
-    {
-        let zone = parsed
-            .headers
-            .iter()
-            .find(|(k, v)| k.eq_ignore_ascii_case("x-questdb-zone") && !v.trim().is_empty())
-            .map(|(_, v)| v.trim());
-        let role = role.trim();
-        let role_reject = QwpWsRoleReject::new(role, zone);
-        let err = match zone {
-            Some(zone) => error::fmt!(
-                SocketError,
-                "QWP/WebSocket upgrade rejected by role={} zone={}",
-                role,
-                zone
-            ),
-            None => error::fmt!(
-                SocketError,
-                "QWP/WebSocket upgrade rejected by role={}",
-                role
-            ),
-        };
-        return Err(err.with_qwp_ws_role_reject(role_reject));
-    }
-    if parsed.status != 101 {
-        return Err(error::fmt!(
-            SocketError,
-            "WebSocket upgrade failed: HTTP status {}",
-            parsed.status
-        ));
-    }
-    let upgrade_ok = parsed
-        .headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket"));
-    if !upgrade_ok {
-        return Err(error::fmt!(
-            SocketError,
-            "WebSocket upgrade failed: missing or invalid Upgrade header"
-        ));
-    }
-    let connection_upgrade = parsed.headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("connection")
-            && v.split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
-    });
-    if !connection_upgrade {
-        return Err(error::fmt!(
-            SocketError,
-            "WebSocket upgrade failed: missing or invalid Connection header"
-        ));
-    }
-    let accept_ok = parsed
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-accept"))
-        .map(|(_, v)| v.trim() == expected_accept)
-        .unwrap_or(false);
-    if !accept_ok {
-        return Err(error::fmt!(
-            SocketError,
-            "WebSocket upgrade failed: invalid Sec-WebSocket-Accept"
-        ));
-    }
-    let version_str = parsed
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("x-qwp-version"))
-        .map(|(_, v)| v.trim().to_string());
-    let version: u8 = match version_str {
+    let version: u8 = match headers.find_ci("x-qwp-version") {
         Some(v) => v.parse().map_err(|_| {
             error::fmt!(
                 SocketError,
@@ -339,10 +163,10 @@ pub(super) fn validate_upgrade_response(
         ));
     }
     if request_durable_ack {
-        let durable_ack_enabled = parsed.headers.iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case("x-qwp-durable-ack") && v.eq_ignore_ascii_case("enabled")
-        });
-        if !durable_ack_enabled {
+        let enabled = headers
+            .find_ci("x-qwp-durable-ack")
+            .is_some_and(|v| v.eq_ignore_ascii_case("enabled"));
+        if !enabled {
             return Err(error::fmt!(
                 ProtocolVersionError,
                 "WebSocket upgrade failed: server did not enable durable ACK"
@@ -352,8 +176,82 @@ pub(super) fn validate_upgrade_response(
     Ok(version)
 }
 
-pub(super) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// Map a non-101 HTTP response (from
+/// [`crate::ws::handshake::HandshakeError::HttpStatus`]) to the matching
+/// ingress error code. Handles QWP-specific 421 role rejection (carries
+/// X-QuestDB-Role / X-QuestDB-Zone hints), 401/403 auth failure, and
+/// falls back to a generic SocketError for everything else.
+pub(super) fn classify_qwp_handshake_reject(
+    reject: crate::ws::handshake::HttpReject,
+) -> crate::Error {
+    if reject.status == 401 || reject.status == 403 {
+        return error::fmt!(
+            AuthError,
+            "WebSocket upgrade authentication failed: HTTP status {}",
+            reject.status
+        );
+    }
+    if reject.status == 421
+        && let Some(role) = reject
+            .headers
+            .find_ci("x-questdb-role")
+            .filter(|v| !v.is_empty())
+    {
+        let zone = reject
+            .headers
+            .find_ci("x-questdb-zone")
+            .filter(|v| !v.is_empty());
+        let role_reject = QwpWsRoleReject::new(role, zone);
+        let err = match zone {
+            Some(zone) => error::fmt!(
+                SocketError,
+                "QWP/WebSocket upgrade rejected by role={} zone={}",
+                role,
+                zone
+            ),
+            None => error::fmt!(
+                SocketError,
+                "QWP/WebSocket upgrade rejected by role={}",
+                role
+            ),
+        };
+        return err.with_qwp_ws_role_reject(role_reject);
+    }
+    error::fmt!(
+        SocketError,
+        "WebSocket upgrade failed: HTTP status {}",
+        reject.status
+    )
+}
+
+/// Map a [`crate::ws::handshake::HandshakeError`] from the shared handshake
+/// module to the matching ingress error.
+pub(super) fn handshake_error_to_ingress(e: crate::ws::handshake::HandshakeError) -> crate::Error {
+    use crate::ws::handshake::HandshakeError;
+    match e {
+        HandshakeError::Io(io) => {
+            // macOS reports SO_RCVTIMEO expiry as `WouldBlock` (EAGAIN, os
+            // error 35), Linux/Windows report `TimedOut`. Surface both as
+            // the same explicit timeout error so the failure mode does not
+            // look platform-specific to the caller.
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                error::fmt!(SocketError, "WebSocket upgrade response read timed out")
+            } else {
+                error::fmt!(SocketError, "WebSocket upgrade IO failed: {}", io)
+            }
+        }
+        HandshakeError::Protocol(msg) => {
+            error::fmt!(SocketError, "WebSocket upgrade failed: {}", msg)
+        }
+        HandshakeError::HttpStatus(reject) => classify_qwp_handshake_reject(reject),
+        HandshakeError::BadAccept => error::fmt!(
+            SocketError,
+            "WebSocket upgrade failed: invalid Sec-WebSocket-Accept"
+        ),
+    }
 }
 
 /// Parse a CLOSE frame payload per RFC 6455 §5.5.1 and §7.4.
@@ -613,53 +511,57 @@ fn map_error_status(status: u8, msg: &str) -> crate::Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn sec_websocket_accept_matches_rfc6455_example() {
-        let key = "dGhlIHNhbXBsZSBub25jZQ==";
-        let expected = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
-        assert_eq!(compute_accept(key), expected);
-    }
+    use crate::ws::handshake::{Headers, HttpReject};
 
     #[test]
-    fn upgrade_request_includes_durable_ack_opt_in_header_when_requested() {
-        let request = build_upgrade_request("localhost:9000", "key", None, 1, None, true);
-
-        assert!(request.contains("X-QWP-Request-Durable-Ack: true\r\n"));
-    }
-
-    #[test]
-    fn upgrade_response_requires_durable_ack_echo_when_requested() {
-        let expected_accept = "accept";
-        let mut parsed = valid_upgrade_headers(expected_accept);
-
-        validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap();
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
+    fn qwp_extra_headers_includes_durable_ack_when_requested() {
+        let extras = qwp_extra_headers(None, 1, None, true);
         assert!(
-            err.msg().contains("server did not enable durable ACK"),
-            "got: {}",
-            err.msg()
+            extras
+                .iter()
+                .any(|(name, value)| *name == "X-QWP-Request-Durable-Ack" && value == "true"),
+            "{:?}",
+            extras
         );
-
-        parsed
-            .headers
-            .push(("X-QWP-Durable-Ack".to_string(), "enabled".to_string()));
-        validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap();
     }
 
     #[test]
-    fn upgrade_response_validates_qwp_version_before_durable_ack_echo() {
-        let expected_accept = "accept";
-        let mut parsed = valid_upgrade_headers(expected_accept);
-        parsed
-            .headers
-            .iter_mut()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-qwp-version"))
-            .unwrap()
-            .1 = "2".to_string();
+    fn qwp_extra_headers_omits_durable_ack_by_default() {
+        let extras = qwp_extra_headers(None, 1, None, false);
+        assert!(
+            !extras
+                .iter()
+                .any(|(name, _)| *name == "X-QWP-Request-Durable-Ack"),
+            "{:?}",
+            extras
+        );
+    }
 
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, true).unwrap_err();
+    #[test]
+    fn qwp_extra_headers_includes_authorization_when_provided() {
+        let extras = qwp_extra_headers(Some("Basic dXNlcjpwYXNz"), 1, None, false);
+        assert!(
+            extras
+                .iter()
+                .any(|(name, value)| *name == "Authorization" && value == "Basic dXNlcjpwYXNz"),
+            "{:?}",
+            extras
+        );
+    }
 
+    #[test]
+    fn validate_qwp_handshake_headers_negotiates_version() {
+        let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
+        assert_eq!(
+            validate_qwp_handshake_headers(&headers, 1, false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn validate_qwp_handshake_headers_rejects_version_above_max() {
+        let headers = Headers::from_pairs([("X-QWP-Version", "2")]);
+        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(
             err.msg().contains("unsupported X-QWP-Version"),
@@ -669,115 +571,139 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_response_classifies_role_reject_and_retryable_status() {
-        let expected_accept = "accept";
-        let mut parsed = valid_upgrade_headers(expected_accept);
+    fn validate_qwp_handshake_headers_rejects_zero_version() {
+        let headers = Headers::from_pairs([("X-QWP-Version", "0")]);
+        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg().contains("invalid X-QWP-Version"),
+            "got: {}",
+            err.msg()
+        );
+    }
 
-        parsed.status = 421;
-        parsed
-            .headers
-            .push(("X-QuestDB-Role".to_string(), "PRIMARY_CATCHUP".to_string()));
-        parsed
-            .headers
-            .push(("X-QuestDB-Zone".to_string(), "az-a".to_string()));
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
+    #[test]
+    fn validate_qwp_handshake_headers_rejects_invalid_version_string() {
+        let headers = Headers::from_pairs([("X-QWP-Version", "not-a-version")]);
+        let err = validate_qwp_handshake_headers(&headers, 1, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg().contains("invalid X-QWP-Version"),
+            "got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn validate_qwp_handshake_headers_defaults_to_v1_when_missing() {
+        let headers = Headers::default();
+        assert_eq!(
+            validate_qwp_handshake_headers(&headers, 1, false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn validate_qwp_handshake_headers_requires_durable_ack_echo_when_requested() {
+        let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
+        let err = validate_qwp_handshake_headers(&headers, 1, true).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ProtocolVersionError);
+        assert!(
+            err.msg().contains("server did not enable durable ACK"),
+            "got: {}",
+            err.msg()
+        );
+
+        let headers =
+            Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", "enabled")]);
+        assert_eq!(
+            validate_qwp_handshake_headers(&headers, 1, true).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn validate_qwp_handshake_headers_allows_missing_durable_ack_by_default() {
+        let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
+        assert_eq!(
+            validate_qwp_handshake_headers(&headers, 1, false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn classify_qwp_handshake_reject_extracts_role_with_zone_hint_for_421() {
+        let reject = HttpReject {
+            status: 421,
+            headers: Headers::from_pairs([
+                ("X-QuestDB-Role", "PRIMARY_CATCHUP"),
+                ("X-QuestDB-Zone", "az-a"),
+            ]),
+            body: vec![],
+        };
+        let err = classify_qwp_handshake_reject(reject);
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
         assert!(err.msg().contains("role=PRIMARY_CATCHUP"));
+        assert!(err.msg().contains("zone=az-a"));
         let role_reject = err.qwp_ws_role_reject().unwrap();
         assert_eq!(role_reject.role, "PRIMARY_CATCHUP");
         assert_eq!(role_reject.zone.as_deref(), Some("az-a"));
         assert!(role_reject.is_transient());
-
-        parsed
-            .headers
-            .retain(|(name, _)| !name.eq_ignore_ascii_case("x-questdb-role"));
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(err.qwp_ws_role_reject().is_none());
-        assert!(err.msg().contains("HTTP status 421"));
-
-        parsed.status = 500;
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(err.msg().contains("HTTP status 500"));
     }
 
     #[test]
-    fn upgrade_response_rejects_invalid_or_unsupported_versions_as_socket_errors() {
-        let expected_accept = "accept";
-        for (version, expected_msg) in [
-            ("not-a-version", "invalid X-QWP-Version"),
-            ("0", "invalid X-QWP-Version"),
-            ("2", "unsupported X-QWP-Version"),
-        ] {
-            let mut parsed = valid_upgrade_headers(expected_accept);
-            parsed
-                .headers
-                .iter_mut()
-                .find(|(name, _)| name.eq_ignore_ascii_case("x-qwp-version"))
-                .unwrap()
-                .1 = version.to_string();
+    fn classify_qwp_handshake_reject_extracts_role_without_zone_for_421() {
+        let reject = HttpReject {
+            status: 421,
+            headers: Headers::from_pairs([("X-QuestDB-Role", "PRIMARY_CATCHUP")]),
+            body: vec![],
+        };
+        let err = classify_qwp_handshake_reject(reject);
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(err.msg().contains("role=PRIMARY_CATCHUP"));
+        assert!(!err.msg().contains("zone="));
+        let role_reject = err.qwp_ws_role_reject().unwrap();
+        assert_eq!(role_reject.role, "PRIMARY_CATCHUP");
+        assert!(role_reject.zone.is_none());
+    }
 
-            let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-            assert_eq!(err.code(), crate::ErrorCode::SocketError);
-            assert!(err.msg().contains(expected_msg), "got: {}", err.msg());
+    #[test]
+    fn classify_qwp_handshake_reject_returns_auth_error_for_401_403() {
+        for status in [401u16, 403u16] {
+            let reject = HttpReject {
+                status,
+                headers: Headers::default(),
+                body: vec![],
+            };
+            let err = classify_qwp_handshake_reject(reject);
+            assert_eq!(err.code(), crate::ErrorCode::AuthError);
+            assert!(
+                err.msg().contains(&format!("HTTP status {status}")),
+                "got: {}",
+                err.msg()
+            );
         }
     }
 
     #[test]
-    fn upgrade_response_requires_connection_upgrade_header() {
-        let expected_accept = "accept";
-        let mut parsed = valid_upgrade_headers(expected_accept);
-        parsed
-            .headers
-            .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
-
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(
-            err.msg().contains("missing or invalid Connection header"),
-            "got: {}",
-            err.msg()
-        );
-
-        parsed
-            .headers
-            .push(("Connection".to_string(), "keep-alive".to_string()));
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(
-            err.msg().contains("missing or invalid Connection header"),
-            "got: {}",
-            err.msg()
-        );
-
-        parsed.headers.last_mut().unwrap().1 = "keep-alive, Upgrade".to_string();
-        validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap();
-    }
-
-    #[test]
-    fn malformed_101_upgrade_headers_are_socket_errors() {
-        let expected_accept = "accept";
-        let mut parsed = valid_upgrade_headers(expected_accept);
-        parsed
-            .headers
-            .retain(|(name, _)| !name.eq_ignore_ascii_case("upgrade"));
-
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(err.msg().contains("missing or invalid Upgrade header"));
-
-        let mut parsed = valid_upgrade_headers(expected_accept);
-        parsed
-            .headers
-            .iter_mut()
-            .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-accept"))
-            .unwrap()
-            .1 = "wrong".to_string();
-
-        let err = validate_upgrade_response(&parsed, expected_accept, 1, false).unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(err.msg().contains("invalid Sec-WebSocket-Accept"));
+    fn classify_qwp_handshake_reject_returns_socket_error_for_other_status() {
+        // 421 without an X-QuestDB-Role hint must NOT be classified as a
+        // role reject; it falls through to the generic socket-error path.
+        for status in [421u16, 500u16, 503u16] {
+            let reject = HttpReject {
+                status,
+                headers: Headers::default(),
+                body: vec![],
+            };
+            let err = classify_qwp_handshake_reject(reject);
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(err.qwp_ws_role_reject().is_none());
+            assert!(
+                err.msg().contains(&format!("HTTP status {status}")),
+                "got: {}",
+                err.msg()
+            );
+        }
     }
 
     #[test]
@@ -973,21 +899,6 @@ mod tests {
             payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
             payload.extend_from_slice(table.as_bytes());
             payload.extend_from_slice(&seq_txn.to_le_bytes());
-        }
-    }
-
-    fn valid_upgrade_headers(expected_accept: &str) -> ParsedHttpHeaders {
-        ParsedHttpHeaders {
-            status: 101,
-            headers: vec![
-                ("Upgrade".to_string(), "websocket".to_string()),
-                ("Connection".to_string(), "Upgrade".to_string()),
-                (
-                    "Sec-WebSocket-Accept".to_string(),
-                    expected_accept.to_string(),
-                ),
-                ("X-QWP-Version".to_string(), "1".to_string()),
-            ],
         }
     }
 }

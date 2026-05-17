@@ -46,8 +46,8 @@ use std::net::{Shutdown, TcpStream};
 
 use bytes::{Bytes, BytesMut};
 
-use super::frame::{FrameError, FrameHeader, Opcode, encode_client_frame};
-use super::mask::MaskRng;
+use crate::ws::frame::{FrameError, FrameHeader, Opcode, encode_client_frame};
+use crate::ws::mask::MaskRng;
 
 /// Initial recv buffer capacity. Sized for our 600 KB raw batches +
 /// some headroom so the first batch fits in a single syscall. Smaller
@@ -328,7 +328,7 @@ impl AdvanceTo for BytesMut {
 
 #[cfg(test)]
 mod tests {
-    use crate::egress::ws::frame::Opcode;
+    use crate::ws::frame::Opcode;
 
     // Exercising the frame-read state machine end-to-end requires
     // either a generic Stream type parameter (and we don't want to
@@ -366,7 +366,7 @@ mod tests {
     fn server_frame_helper_round_trips() {
         // Sanity check: the helper produces parser-acceptable bytes.
         let bytes = server_frame(0x02, b"hello");
-        let header = crate::egress::ws::frame::FrameHeader::parse(&bytes).unwrap();
+        let header = crate::ws::frame::FrameHeader::parse(&bytes).unwrap();
         assert_eq!(header.opcode, Opcode::Binary);
         assert_eq!(header.payload_len, 5);
     }

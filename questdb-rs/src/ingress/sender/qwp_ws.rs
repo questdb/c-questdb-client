@@ -1982,7 +1982,20 @@ fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::
 }
 
 // ---------- HTTP/1.1 upgrade ----------
+//
+// The actual RFC 6455 §4 client handshake (request build, response read,
+// Sec-WebSocket-Accept validation) lives in `crate::ws::handshake`. The
+// connect paths below drive `crate::ws::handshake::upgrade` directly and
+// then apply the QWP-specific overlay (X-QWP-Version negotiation,
+// durable-ack echo, role-reject classification) via the helpers in
+// `codec::{qwp_extra_headers, validate_qwp_handshake_headers,
+// handshake_error_to_ingress}`.
 
+/// Test-only convenience wrapper used by the QWP replay / protocol probes
+/// in `crate::tests::qwp_ws_*`. Mirrors the inline upgrade sequence the
+/// connect paths use below, but in a single call so the probes don't need
+/// to thread the extras-builder + validate-headers + error-mapper boilerplate
+/// through every test harness.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_upgrade<S: Read + Write>(
@@ -1993,104 +2006,15 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     client_id: Option<&str>,
     request_durable_ack: bool,
 ) -> crate::Result<(u8, Vec<u8>)> {
-    let key_b64 = write_upgrade_request(
-        stream,
-        host_header,
-        auth_header,
-        max_version,
-        client_id,
-        request_durable_ack,
-    )?;
-    read_upgrade_response(stream, &key_b64, max_version, request_durable_ack)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_upgrade_request<W: Write>(
-    stream: &mut W,
-    host_header: &str,
-    auth_header: Option<&str>,
-    max_version: u32,
-    client_id: Option<&str>,
-    request_durable_ack: bool,
-) -> crate::Result<String> {
-    // RFC 6455 only requires a 16-byte random nonce that the client base64-
-    // encodes. It is not a security boundary.
-    let mut key_bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut key_bytes);
-    let key_b64 = codec::b64_encode(&key_bytes);
-
-    let req = codec::build_upgrade_request(
-        host_header,
-        &key_b64,
-        auth_header,
-        max_version,
-        client_id,
-        request_durable_ack,
-    );
-
-    stream.write_all(req.as_bytes()).map_err(|io| {
-        error::fmt!(
-            SocketError,
-            "Could not send WebSocket upgrade request: {}",
-            io
-        )
-    })?;
-
-    Ok(key_b64)
-}
-
-fn read_upgrade_response<R: Read>(
-    stream: &mut R,
-    key_b64: &str,
-    max_version: u32,
-    request_durable_ack: bool,
-) -> crate::Result<(u8, Vec<u8>)> {
-    let (header_block, leftover) = read_http_header_block(stream)?;
-    let parsed = codec::parse_http_header_block(&header_block)?;
-    let expected_accept = codec::compute_accept(key_b64);
-    let negotiated_version = codec::validate_upgrade_response(
-        &parsed,
-        &expected_accept,
+    let extras = codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
+    let handshake = crate::ws::handshake::upgrade(stream, host_header, codec::WS_PATH, &extras)
+        .map_err(codec::handshake_error_to_ingress)?;
+    let version = codec::validate_qwp_handshake_headers(
+        &handshake.headers,
         max_version,
         request_durable_ack,
     )?;
-    Ok((negotiated_version, leftover))
-}
-
-fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<(Vec<u8>, Vec<u8>)> {
-    let mut buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 512];
-    loop {
-        let n = stream.read(&mut tmp).map_err(|io| {
-            // macOS reports SO_RCVTIMEO expiry as `WouldBlock` (EAGAIN,
-            // os error 35), Linux/Windows report `TimedOut`. Surface
-            // both as the same explicit timeout error so the failure
-            // mode does not look platform-specific to the caller.
-            if matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
-                error::fmt!(SocketError, "WebSocket upgrade response read timed out")
-            } else {
-                error::fmt!(SocketError, "Could not read upgrade response: {}", io)
-            }
-        })?;
-        if n == 0 {
-            return Err(error::fmt!(
-                SocketError,
-                "Connection closed before WebSocket upgrade completed"
-            ));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = codec::find_subsequence(&buf, b"\r\n\r\n") {
-            let leftover = buf.split_off(pos + 4);
-            buf.truncate(pos);
-            return Ok((buf, leftover));
-        }
-        if buf.len() > 8192 {
-            return Err(error::fmt!(
-                SocketError,
-                "WebSocket upgrade response exceeds 8 KiB header limit"
-            ));
-        }
-    }
+    Ok((version, handshake.leftover))
 }
 
 // ---------- connect ----------
@@ -2414,20 +2338,25 @@ pub(crate) fn establish_connection(
             .get_ref()
             .set_write_timeout(Some(request_timeout))
             .ok();
-        let key_b64 = write_upgrade_request(
-            &mut tls_stream,
-            &host_header,
-            auth_header,
-            max_version,
-            client_id,
-            request_durable_ack,
-        )?;
+        // The shared `upgrade()` does both the request write and the
+        // response read in one call. Switch SO_RCVTIMEO to `auth_timeout`
+        // first: the write happens immediately (doesn't depend on
+        // read_timeout), and the response read is what auth_timeout bounds.
         tls_stream
             .get_ref()
             .set_read_timeout(Some(auth_timeout))
             .ok();
-        let (negotiated_version, leftover) =
-            read_upgrade_response(&mut tls_stream, &key_b64, max_version, request_durable_ack)?;
+        let extras =
+            codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
+        let handshake =
+            crate::ws::handshake::upgrade(&mut tls_stream, &host_header, codec::WS_PATH, &extras)
+                .map_err(codec::handshake_error_to_ingress)?;
+        let negotiated_version = codec::validate_qwp_handshake_headers(
+            &handshake.headers,
+            max_version,
+            request_durable_ack,
+        )?;
+        let leftover = handshake.leftover;
         (
             WsStream::Tls(Box::new(tls_stream)),
             negotiated_version,
@@ -2435,21 +2364,18 @@ pub(crate) fn establish_connection(
         )
     } else {
         let mut plain_stream = tcp;
-        let key_b64 = write_upgrade_request(
-            &mut plain_stream,
-            &host_header,
-            auth_header,
-            max_version,
-            client_id,
-            request_durable_ack,
-        )?;
         plain_stream.set_read_timeout(Some(auth_timeout)).ok();
-        let (negotiated_version, leftover) = read_upgrade_response(
-            &mut plain_stream,
-            &key_b64,
+        let extras =
+            codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
+        let handshake =
+            crate::ws::handshake::upgrade(&mut plain_stream, &host_header, codec::WS_PATH, &extras)
+                .map_err(codec::handshake_error_to_ingress)?;
+        let negotiated_version = codec::validate_qwp_handshake_headers(
+            &handshake.headers,
             max_version,
             request_durable_ack,
         )?;
+        let leftover = handshake.leftover;
         (WsStream::Plain(plain_stream), negotiated_version, leftover)
     };
 
@@ -3527,10 +3453,18 @@ mod tests {
 
     #[test]
     fn perform_upgrade_preserves_coalesced_websocket_frame() {
+        // Server coalesces a WS data frame onto the tail of the upgrade
+        // response. The shared `handshake::upgrade` MUST surface those
+        // bytes via `Handshake.leftover` so the ingress frame reader can
+        // consume them without losing the leading frame.
         let mut stream = UpgradeResponseWithFrame::new(b"\x02\x00");
 
-        let (version, leftover) =
-            perform_upgrade(&mut stream, "localhost:9000", None, 1, None, false).unwrap();
+        let extras = codec::qwp_extra_headers(None, 1, None, false);
+        let handshake =
+            crate::ws::handshake::upgrade(&mut stream, "localhost:9000", codec::WS_PATH, &extras)
+                .unwrap();
+        let version = codec::validate_qwp_handshake_headers(&handshake.headers, 1, false).unwrap();
+        let leftover = handshake.leftover;
 
         assert_eq!(version, 1);
         let mut reader = WsFrameReader::with_initial_input(leftover);

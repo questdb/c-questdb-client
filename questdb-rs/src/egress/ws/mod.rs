@@ -22,35 +22,15 @@
  *
  ******************************************************************************/
 
-//! Minimal WebSocket client for QWP egress.
+//! Egress-specific WebSocket layer on top of the shared
+//! [`crate::ws`] primitives.
 //!
-//! Replaces the previous `tungstenite` dependency with a hand-rolled
-//! RFC 6455 client tuned for streaming binary frames. The general-purpose
-//! library defaults (128 KiB recv buffer, eager `BytesMut::resize` with
-//! zero-fill before every syscall, full opcode-dispatch state machine)
-//! are not what high-throughput QWP wants — see the perf investigation
-//! in PR 140 for the measurement that motivated the rewrite.
-//!
-//! Surface (all `pub(crate)`):
-//! - [`handshake::upgrade`]: HTTP/1.1 Upgrade client. Connects on a
-//!   caller-provided TCP/TLS stream, sends the request with our
-//!   X-QWP-* headers, validates the 101 response (status, Upgrade,
-//!   Connection, Sec-WebSocket-Accept), surfaces 4xx as
-//!   `UpgradeReject`.
-//! - [`frame::FrameHeader`] / [`frame::Opcode`]: RFC 6455 frame header
-//!   parser and outbound-frame writer with masking.
-//! - [`client::WsClient`]: owns the stream plus a recv buffer, hides
-//!   control-frame dispatch from callers, exposes
-//!   `read_binary_frame()` / `write_binary_frame()`.
-//!
-//! Out of scope (by design):
-//! - Async runtime support — the crate's reader is sync.
-//! - Fragmentation: QWP frames are always FIN=1 in both directions.
-//! - WS extensions (permessage-deflate): we have zstd at the protocol
-//!   layer.
-//! - Text frames: QWP is binary-only.
+//! The pure RFC 6455 plumbing — frame encode/decode, the HTTP/1.1
+//! Upgrade dance, the masking transform, Sec-WebSocket-Accept — lives
+//! in [`crate::ws`] and is shared with the ingress sender. The egress
+//! reader keeps its own [`client::WsClient`] here because the
+//! post-handshake frame dispatch policy (recv buffer sizing tuned for
+//! batches, inline Ping/Pong echo, no fragmentation) is specific to the
+//! streaming-binary read path.
 
 pub(crate) mod client;
-pub(crate) mod frame;
-pub(crate) mod handshake;
-pub(crate) mod mask;
