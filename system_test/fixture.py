@@ -467,6 +467,8 @@ class QuestDbFixture(QuestDbFixtureBase):
                 line.tcp.min.idle.ms.before.writer.release=300
                 telemetry.enabled=false
                 cairo.commit.lag=100
+                cairo.writer.data.append.page.size=64k
+                cairo.writer.data.index.value.append.page.size=64k
                 line.tcp.commit.interval.fraction=0.1
                 {auth_config}
                 {http_auth_config}
