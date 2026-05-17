@@ -50,6 +50,18 @@ bigdecimal = { version = "0.4.8", optional = true }
 crc32c = "0.6"
 memmap2 = "0.9"
 
+# Java KeyStore readers. Pulled in only for the QWP transports
+# (ingress qwp-ws and egress reader) when `tls_roots_password` is
+# used to unlock a JKS/PKCS#12 trust store. Other ILP transports
+# stick to PEM (rustls' native input).
+#
+# `jks` ships with its own PKCS#12 support via the (pre-release)
+# `p12-keystore` 0.3 line, which is currently broken in the lock
+# (`from_pkcs12` ABI mismatch). Turn that off and bind PKCS#12
+# directly through the stable `p12-keystore` 0.2.x.
+jks = { version = "0.3", default-features = false, optional = true }
+p12-keystore = { version = "0.2", optional = true }
+
 zstd = { version = "0.13", optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -108,7 +120,7 @@ sync-sender-http = [
 sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
 
 ## Sync QWP/WebSocket
-sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand"]
+sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand", "_keystore-roots"]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
@@ -155,7 +167,7 @@ bigdecimal = ["dep:bigdecimal"]
 ## pull in `compression-zstd`: zstd is opt-in. Without it, the decoder
 ## still compiles but rejects `FLAG_ZSTD` batches at runtime with an
 ## `UnsupportedServer` error.
-sync-reader-ws = ["_egress"]
+sync-reader-ws = ["_egress", "_keystore-roots"]
 
 ## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
 compression-zstd = ["_egress", "dep:zstd"]
@@ -172,6 +184,7 @@ _sender-qwp-udp = []
 _sender-qwp-ws = []
 _sync-sender = []
 _egress = ["dep:bytes"]
+_keystore-roots = ["dep:jks", "dep:p12-keystore"]
 
 ## Enable all cross-compatible features.
 ## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,

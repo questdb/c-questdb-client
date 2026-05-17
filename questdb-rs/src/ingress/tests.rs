@@ -1010,6 +1010,10 @@ fn tcps_tls_roots_file_missing() {
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn tcps_tls_roots_file_with_password() {
+    // `tls_roots_password` is QWP/WebSocket-only — ILP/TCP and
+    // ILP/HTTP still read PEM only (rustls' native input), so a
+    // password set on TCP must surface a precise diagnostic
+    // pointing the user at the right transport.
     use std::io::Write;
 
     let tmp_dir = TempDir::new().unwrap();
@@ -1020,7 +1024,48 @@ fn tcps_tls_roots_file_with_password() {
         "tcps::addr=localhost;tls_roots={};tls_roots_password=extremely_secure;",
         path.to_str().unwrap()
     ));
-    assert_conf_err(builder_or_err, "\"tls_roots_password\" is not supported.");
+    assert_conf_err(
+        builder_or_err,
+        "\"tls_roots_password\" is only supported for QWP/WebSocket \
+         (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read unencrypted \
+         PEM via rustls.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpwss_tls_roots_password_accepted() {
+    // Smoke-test that the QWP/WebSocket path accepts the pair
+    // without erroring at parse time. Actually loading the keystore
+    // is deferred to `build()`, so we don't need a real JKS file
+    // here.
+    use std::io::Write;
+
+    let tmp_dir = TempDir::new().unwrap();
+    let path = tmp_dir.path().join("trust.jks");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"placeholder").unwrap();
+    let builder = SenderBuilder::from_conf(format!(
+        "qwpwss::addr=localhost;tls_roots={};tls_roots_password=secret;",
+        path.to_str().unwrap()
+    ))
+    .unwrap();
+    assert_specified_eq(&builder.tls_roots_password, Some("secret".to_string()));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpwss_tls_roots_password_without_path_rejected() {
+    // Java enforces the same pairing: setting the password without
+    // pointing at the file makes the password name nothing.
+    let builder_or_err =
+        SenderBuilder::from_conf("qwpwss::addr=localhost;tls_roots_password=secret;").unwrap();
+    let err = builder_or_err.build().unwrap_err();
+    assert!(
+        err.msg().contains("tls_roots_password") && err.msg().contains("tls_roots"),
+        "msg: {}",
+        err.msg()
+    );
 }
 
 #[cfg(feature = "sync-sender-http")]

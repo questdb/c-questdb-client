@@ -609,6 +609,12 @@ pub struct SenderBuilder {
     tls_ca: ConfigSetting<CertificateAuthority>,
     tls_roots: ConfigSetting<Option<PathBuf>>,
 
+    /// Password unlocking a JKS / PKCS#12 keystore named by
+    /// `tls_roots`. QWP/WebSocket only — other transports keep PEM
+    /// as the sole `tls_roots` format.
+    #[cfg(feature = "_sender-qwp-ws")]
+    tls_roots_password: ConfigSetting<Option<String>>,
+
     #[cfg(feature = "_sender-http")]
     http: Option<conf::HttpConfig>,
 
@@ -918,10 +924,19 @@ impl SenderBuilder {
                 }
 
                 "tls_roots_password" => {
-                    return Err(error::fmt!(
-                        ConfigError,
-                        "\"tls_roots_password\" is not supported."
-                    ));
+                    #[cfg(feature = "_sender-qwp-ws")]
+                    {
+                        builder.tls_roots_password(val.to_string())?
+                    }
+                    #[cfg(not(feature = "_sender-qwp-ws"))]
+                    {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "\"tls_roots_password\" is only supported for QWP/WebSocket \
+                             (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                             unencrypted PEM via rustls."
+                        ));
+                    }
                 }
 
                 #[cfg(feature = "sync-sender-http")]
@@ -1025,6 +1040,9 @@ impl SenderBuilder {
 
             tls_ca: ConfigSetting::new_default(tls_ca),
             tls_roots: ConfigSetting::new_default(None),
+
+            #[cfg(feature = "_sender-qwp-ws")]
+            tls_roots_password: ConfigSetting::new_default(None),
 
             #[cfg(feature = "sync-sender-http")]
             http: if protocol.is_httpx() {
@@ -1758,6 +1776,11 @@ impl SenderBuilder {
     /// Set the path to a custom root certificate `.pem` file.
     /// This is used to validate the server's certificate during the TLS handshake.
     ///
+    /// On QWP/WebSocket (`qwpws::` / `qwpwss::`) the same path key
+    /// also accepts a JKS or PKCS#12 keystore — see
+    /// [`tls_roots_password`](SenderBuilder::tls_roots_password) for
+    /// the unlock password.
+    ///
     /// See notes on how to test with [self-signed
     /// certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
     pub fn tls_roots<P: Into<PathBuf>>(self, path: P) -> Result<Self> {
@@ -1774,6 +1797,31 @@ impl SenderBuilder {
         })?;
         builder.tls_roots.set_specified("tls_roots", Some(path))?;
         Ok(builder)
+    }
+
+    /// Set the password unlocking the JKS / PKCS#12 keystore named by
+    /// [`tls_roots`](SenderBuilder::tls_roots). QWP/WebSocket only —
+    /// other transports keep PEM as the sole `tls_roots` format.
+    ///
+    /// With this set, the `tls_roots` file is read as a Java
+    /// KeyStore (auto-detected: JKS magic `0xFEEDFEED`, or PKCS#12
+    /// ASN.1 SEQUENCE) and trusted-certificate entries become the
+    /// rustls root store. Mirrors the Java reference client's
+    /// `tls_roots_password` connect-string key.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn tls_roots_password<S: Into<String>>(mut self, password: S) -> Result<Self> {
+        if !self.protocol.is_qwp_ws() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"tls_roots_password\" is only supported for QWP/WebSocket \
+                 (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                 unencrypted PEM via rustls."
+            ));
+        }
+        self.ensure_tls_enabled("tls_roots_password")?;
+        self.tls_roots_password
+            .set_specified("tls_roots_password", Some(password.into()))?;
+        Ok(self)
     }
 
     /// The initial buffered size that the client will pre-allocate for new
@@ -2046,6 +2094,23 @@ impl SenderBuilder {
         #[cfg(feature = "insecure-skip-verify")]
         let tls_verify = *self.tls_verify;
 
+        #[cfg(feature = "_sender-qwp-ws")]
+        let tls_roots_password = self.tls_roots_password.deref().as_deref();
+        #[cfg(not(feature = "_sender-qwp-ws"))]
+        let tls_roots_password: Option<&str> = None;
+
+        // Pair validation: the password unlocks the keystore at
+        // `tls_roots`. Without `tls_roots`, the password names no
+        // file, so the trust source falls back to the default — not
+        // what the caller asked for. Java enforces the same pairing.
+        if tls_roots_password.is_some() && self.tls_roots.deref().is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"tls_roots_password\" requires \"tls_roots\" \
+                 (the password unlocks the keystore at that path)"
+            ));
+        }
+
         #[allow(unused_variables)]
         let tls_settings = tls::TlsSettings::build(
             self.protocol.tls_enabled(),
@@ -2053,6 +2118,7 @@ impl SenderBuilder {
             tls_verify,
             *self.tls_ca,
             self.tls_roots.deref().as_deref(),
+            tls_roots_password,
         )?;
 
         let auth = self.build_auth()?;

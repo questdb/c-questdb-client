@@ -214,7 +214,15 @@ pub(crate) fn build_client_config(
                         "\"tls_roots\" is required when \"tls_ca=pem_file\""
                     )
                 })?;
-                let der_certs = load_pem_file(Path::new(path))?;
+                let der_certs = match config.tls_roots_password.as_deref() {
+                    // No password -> PEM bundle (rustls' native input).
+                    None => load_pem_file(Path::new(path))?,
+                    // Password -> JKS / PKCS#12 trust store, matching
+                    // the Java reference's `KeyStore.getInstance(...)`
+                    // surface. Auto-detect by magic.
+                    Some(pwd) => crate::keystore_roots::load_truststore_certs(Path::new(path), pwd)
+                        .map_err(|e| fmt!(TlsError, "{}", e))?,
+                };
                 let total = der_certs.len();
                 let (added, ignored) = root_store.add_parsable_certificates(der_certs);
                 if added == 0 {

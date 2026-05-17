@@ -1483,12 +1483,37 @@ bool line_sender_opts_tls_ca(
  * This is used to validate the server's certificate during the TLS
  * handshake.
  *
+ * On QWP/WebSocket (`qwpwss::`) the same path may instead point at a
+ * JKS or PKCS#12 keystore; pair it with
+ * `line_sender_opts_tls_roots_password` to unlock it.
+ *
  * See notes on how to test with self-signed certificates:
  * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
  */
 LINESENDER_API
 bool line_sender_opts_tls_roots(
     line_sender_opts* opts, line_sender_utf8 path, line_sender_error** err_out);
+
+/**
+ * Set the password unlocking the JKS / PKCS#12 keystore named by
+ * `line_sender_opts_tls_roots`.
+ *
+ * QWP/WebSocket only (`qwpwss::`). Calling this on an ILP/TCP or
+ * ILP/HTTP sender returns an `invalid_api_call` error: those
+ * transports read unencrypted PEM via rustls and have no keystore
+ * concept.
+ *
+ * The file's format is auto-detected: JKS magic `0xFEEDFEED`, or
+ * PKCS#12 (ASN.1 SEQUENCE). Trusted-certificate entries become
+ * rustls roots; private-key entries are ignored — this is the trust
+ * store half of the Java reference's
+ * `KeyStore.getInstance(...).load(stream, pwd)` flow.
+ */
+LINESENDER_API
+bool line_sender_opts_tls_roots_password(
+    line_sender_opts* opts,
+    line_sender_utf8 password,
+    line_sender_error** err_out);
 
 /**
  * Set the maximum buffered size that the client will flush to the server.

@@ -2485,6 +2485,10 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
 /// Set the path to a custom root certificate `.pem` file.
 /// This is used to validate the server's certificate during the TLS handshake.
 ///
+/// On QWP/WebSocket (`qwpwss::`) the same path may instead point at a JKS
+/// or PKCS#12 keystore; pair it with `line_sender_opts_tls_roots_password`
+/// to unlock it.
+///
 /// See notes on how to test with [self-signed
 /// certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
 #[unsafe(no_mangle)]
@@ -2496,6 +2500,30 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots(
     unsafe {
         let path = PathBuf::from(path.as_str());
         upd_opts!(opts, err_out, tls_roots, path)
+    }
+}
+
+/// Set the password unlocking the JKS / PKCS#12 keystore named by
+/// `line_sender_opts_tls_roots`.
+///
+/// QWP/WebSocket only (`qwpwss::`). Setting this on an ILP/TCP or
+/// ILP/HTTP sender returns an `InvalidApiCall` error: those transports
+/// read unencrypted PEM via rustls and have no keystore concept.
+///
+/// With this set, the `tls_roots` file is interpreted as a Java
+/// KeyStore (auto-detected: JKS magic `0xFEEDFEED`, or PKCS#12
+/// ASN.1 SEQUENCE) and its trusted-certificate entries become the
+/// rustls root store. Mirrors the Java reference client's
+/// `tls_roots_password` connect-string key.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_tls_roots_password(
+    opts: *mut line_sender_opts,
+    password: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let password = password.as_str().to_string();
+        upd_opts!(opts, err_out, tls_roots_password, password)
     }
 }
 

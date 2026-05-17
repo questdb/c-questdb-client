@@ -53,11 +53,16 @@
 //! | `auth`             | verbatim Authorization value                             |
 //! | `tls_verify`       | `on`/`unsafe_off` (`on`)                                 |
 //! | `tls_ca`           | `webpki_roots` / `os_roots` / `webpki_and_os_roots` / `pem_file` (depends on enabled features) |
-//! | `tls_roots`        | path to a PEM bundle (also implies `tls_ca=pem_file`)    |
+//! | `tls_roots`        | path to a PEM bundle, JKS keystore, or PKCS#12 keystore (also implies `tls_ca=pem_file`) |
+//! | `tls_roots_password` | password unlocking the `tls_roots` keystore (JKS / PKCS#12) |
 //!
-//! `tls_roots_password` is intentionally not supported — rustls reads
-//! unencrypted PEM-encoded bundles, and the password concept only
-//! applies to JKS/PKCS12 keystores. Setting it produces a config error.
+//! `tls_roots_password` switches the `tls_roots` file format: with
+//! no password, the file is read as an (unencrypted) PEM bundle —
+//! rustls' native input. With a password set, the file is read as a
+//! Java KeyStore — JKS magic `0xFEEDFEED` or PKCS#12 ASN.1
+//! SEQUENCE — and trusted-certificate entries are extracted, matching
+//! the Java reference client's `tls_roots` / `tls_roots_password`
+//! pair.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -262,15 +267,13 @@ pub const MAX_FAILOVER_MAX_ATTEMPTS: u32 = 1024;
 
 /// Hard upper bound on the parsed address-list length. Real connect
 /// strings target a single cluster (a handful of endpoints); this
-/// cap exists so the [`HostHealthTracker`]'s per-host state arrays
+/// cap exists so the host-health tracker's per-host state arrays
 /// (state × zone × host classification bits) and the
 /// `walk_via_tracker` dial budget per outer failover attempt stay
 /// bounded by a constant rather than user input. Combined with
 /// [`MAX_FAILOVER_MAX_ATTEMPTS`] it pins the worst-case behaviour of
 /// the whole failover cycle — see that constant's docstring for the
 /// arithmetic.
-///
-/// [`HostHealthTracker`]: crate::egress::tracker::HostHealthTracker
 pub const MAX_ADDRS: usize = 1024;
 
 /// Hard upper bound on `failover_backoff_max_ms`. Caps a misconfigured
@@ -471,6 +474,16 @@ pub struct ReaderConfig {
     pub tls_verify: TlsVerify,
     pub tls_ca: CertificateAuthority,
     pub tls_roots: Option<PathBuf>,
+    /// Password unlocking the `tls_roots` keystore.
+    ///
+    /// When set, `tls_roots` is interpreted as a JKS or PKCS#12
+    /// keystore (auto-detected by magic) rather than a PEM bundle.
+    /// Trusted-certificate entries are extracted into the rustls
+    /// root store; private-key entries are ignored — this is a
+    /// trust store, not a client-identity store. Mirrors the Java
+    /// reference's `KeyStore.getInstance(...).load(stream, pwd)`
+    /// flow.
+    pub tls_roots_password: Option<String>,
 }
 
 impl ReaderConfig {
@@ -657,6 +670,7 @@ impl ReaderConfig {
         let mut tls_ca = default_tls_ca();
         let mut tls_ca_explicit = false;
         let mut tls_roots: Option<PathBuf> = None;
+        let mut tls_roots_password: Option<String> = None;
 
         let mut username: Option<String> = None;
         let mut password: Option<String> = None;
@@ -771,10 +785,7 @@ impl ReaderConfig {
                     tls_roots = Some(path);
                 }
                 "tls_roots_password" => {
-                    return Err(fmt!(
-                        ConfigError,
-                        "\"tls_roots_password\" is not supported (rustls reads unencrypted PEM)"
-                    ));
+                    tls_roots_password = Some(val.to_string());
                 }
 
                 "failover" => {
@@ -841,10 +852,23 @@ impl ReaderConfig {
         // be lost.
 
         // tls_* knobs only make sense with TLS scheme.
-        if !tls && (tls_roots.is_some() || tls_ca_explicit) {
+        if !tls && (tls_roots.is_some() || tls_ca_explicit || tls_roots_password.is_some()) {
             return Err(fmt!(
                 ConfigError,
                 "TLS-related keys require the \"qwps\" scheme"
+            ));
+        }
+
+        // `tls_roots_password` only makes sense paired with `tls_roots`
+        // (the password unlocks the file named there). Java enforces
+        // the same pairing — see `QwpQueryClient.java`'s
+        // "tls_roots and tls_roots_password must be provided together"
+        // check.
+        if tls_roots_password.is_some() && tls_roots.is_none() {
+            return Err(fmt!(
+                ConfigError,
+                "\"tls_roots_password\" requires \"tls_roots\" \
+                 (the password unlocks the keystore at that path)"
             ));
         }
 
@@ -890,6 +914,7 @@ impl ReaderConfig {
             tls_verify,
             tls_ca,
             tls_roots,
+            tls_roots_password,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1499,17 +1524,39 @@ mod tests {
     }
 
     #[test]
-    fn tls_roots_password_rejected() {
-        // PEM bundles are unencrypted under rustls; the JKS/PKCS12
-        // password concept doesn't translate. Setting it must fail
-        // loudly rather than silently doing nothing.
+    fn tls_roots_password_without_tls_roots_rejected() {
+        // The password unlocks the keystore at `tls_roots`. Setting
+        // the password without naming the file is meaningless and
+        // would silently fall back to the default trust source —
+        // not what the caller asked for.
         let err = ReaderConfig::from_conf("wss::addr=h:1;tls_roots_password=secret").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(
-            err.msg().contains("tls_roots_password"),
+            err.msg().contains("tls_roots_password") && err.msg().contains("tls_roots"),
             "msg: {}",
             err.msg()
         );
+    }
+
+    #[test]
+    fn tls_roots_password_without_tls_scheme_rejected() {
+        // `ws::` is plaintext — no TLS to configure. Reject all TLS
+        // knobs (`tls_roots`, `tls_roots_password`, etc.) the same
+        // way, with the same scheme-mismatch diagnostic.
+        let err =
+            ReaderConfig::from_conf("ws::addr=h:1;tls_roots=/tmp/r;tls_roots_password=secret")
+                .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn tls_roots_password_with_tls_roots_accepted() {
+        let c = ReaderConfig::from_conf(
+            "wss::addr=h:1;tls_roots=/path/to/store.jks;tls_roots_password=secret",
+        )
+        .unwrap();
+        assert_eq!(c.tls_ca, CertificateAuthority::PemFile);
+        assert_eq!(c.tls_roots_password.as_deref(), Some("secret"));
     }
 
     #[test]

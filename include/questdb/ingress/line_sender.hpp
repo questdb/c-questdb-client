@@ -1499,6 +1499,10 @@ public:
      * This is used to validate the server's certificate during the TLS
      * handshake.
      *
+     * On QWP/WebSocket (`qwpwss::`) the same path may instead point at
+     * a JKS or PKCS#12 keystore; pair it with `tls_roots_password()` to
+     * unlock it.
+     *
      * See notes on how to test with self-signed certificates:
      * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
      */
@@ -1506,6 +1510,22 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_tls_roots, _impl, path._impl);
+        return *this;
+    }
+
+    /**
+     * Password unlocking the JKS / PKCS#12 keystore named by
+     * `tls_roots()`. QWP/WebSocket only — calling on an ILP/TCP or
+     * ILP/HTTP sender throws.
+     *
+     * The file's format is auto-detected (JKS magic `0xFEEDFEED` or
+     * PKCS#12 ASN.1 SEQUENCE). Mirrors the Java reference client's
+     * `tls_roots_password` connect-string key.
+     */
+    opts& tls_roots_password(utf8_view password)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_tls_roots_password, _impl, password._impl);
         return *this;
     }
 
