@@ -120,6 +120,7 @@ pub struct Sender {
     descr: String,
     handler: SyncProtocolHandler,
     connected: bool,
+    init_buf_size: usize,
     max_buf_size: usize,
     protocol: Protocol,
     protocol_version: ProtocolVersion,
@@ -135,9 +136,11 @@ impl Debug for Sender {
 }
 
 impl Sender {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         descr: String,
         handler: SyncProtocolHandler,
+        init_buf_size: usize,
         max_buf_size: usize,
         protocol: Protocol,
         protocol_version: ProtocolVersion,
@@ -148,6 +151,7 @@ impl Sender {
             descr,
             handler,
             connected: true,
+            init_buf_size,
             max_buf_size,
             protocol,
             protocol_version,
@@ -213,7 +217,11 @@ impl Sender {
             return Buffer::qwp_ws_with_max_name_len(self.max_name_len);
         }
 
-        Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
+        Buffer::with_init_capacity_and_max_name_len(
+            self.protocol_version,
+            self.init_buf_size,
+            self.max_name_len,
+        )
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]

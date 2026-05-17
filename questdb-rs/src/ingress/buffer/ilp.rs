@@ -492,6 +492,24 @@ impl Buffer {
         }
     }
 
+    /// Same as [`Self::with_max_name_len`] but pre-allocates the underlying
+    /// byte storage to `init_capacity`. The buffer is still allowed to grow
+    /// beyond `init_capacity` — it is purely a starting-size hint.
+    pub fn with_init_capacity_and_max_name_len(
+        protocol_version: ProtocolVersion,
+        init_capacity: usize,
+        max_name_len: usize,
+    ) -> Self {
+        Self {
+            output: Vec::with_capacity(init_capacity),
+            state: BufferState::new(),
+            bookmark_meta: BufferBookmarkMeta::new(),
+            bookmark: StoredBookmark::new(),
+            max_name_len,
+            protocol_version,
+        }
+    }
+
     pub fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
     }

@@ -212,6 +212,24 @@ impl Buffer {
         }
     }
 
+    /// Creates a new ILP buffer that pre-allocates its byte storage to
+    /// `init_capacity` and accepts table / column names up to `max_name_len`.
+    /// The buffer is allowed to grow past `init_capacity`; it is purely a
+    /// starting-size hint to avoid early reallocations.
+    pub fn with_init_capacity_and_max_name_len(
+        protocol_version: ProtocolVersion,
+        init_capacity: usize,
+        max_name_len: usize,
+    ) -> Self {
+        Self {
+            inner: BufferInner::Ilp(IlpBuffer::with_init_capacity_and_max_name_len(
+                protocol_version,
+                init_capacity,
+                max_name_len,
+            )),
+        }
+    }
+
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
     /// Creates a new QWP/UDP buffer with default parameters.
     pub fn new_qwp() -> Self {

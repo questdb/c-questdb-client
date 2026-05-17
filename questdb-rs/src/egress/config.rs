@@ -477,7 +477,25 @@ impl ReaderConfig {
     /// Construct from a connect-string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf_str = conf.as_ref();
-        let conf = questdb_confstr::parse_conf_str(conf_str)
+
+        // Pre-scan the raw conf to collect every `addr=...` param. This
+        // accepts both the comma-separated form (`addr=h1,h2,...`) and the
+        // repeated-key form (`addr=h1;addr=h2;...`), matching the ingress
+        // multi-host parser. The sanitized conf string has duplicate
+        // `addr=` params removed so the standard `questdb_confstr` parser
+        // doesn't see them twice.
+        // The scan helper is shared with ingress and returns the crate-level
+        // `Error` type; remap onto the egress error here. The only failure
+        // mode is a malformed conf, which the helper actually signals as
+        // `Ok(None)` rather than `Err`, so the remap is defensive.
+        let addr_scan = crate::ingress::scan_qwp_ws_addr_params(conf_str)
+            .map_err(|e| fmt!(ConfigError, "{}", e.msg()))?;
+        let conf_to_parse = addr_scan
+            .as_ref()
+            .map(|s| s.sanitized_conf.as_str())
+            .unwrap_or(conf_str);
+
+        let conf = questdb_confstr::parse_conf_str(conf_to_parse)
             .map_err(|e| fmt!(ConfigError, "Config parse error: {}", e))?;
         let scheme = conf.service();
         let tls = match scheme {
@@ -493,103 +511,119 @@ impl ReaderConfig {
         };
         let params = conf.params();
 
-        // Required: addr (single `host[:port]` or comma-separated list)
-        let addr = params
-            .get("addr")
-            .ok_or_else(|| fmt!(ConfigError, "Missing \"addr\" parameter in config string"))?;
+        // Required: addr (single `host[:port]`, comma-separated list, or
+        // repeated-key form). `addr_scan.is_some()` is guaranteed because
+        // the scheme passed the ws/wss check above, but fall back to a
+        // single `params.get("addr")` lookup defensively.
+        let addr_values: Vec<&str> = match &addr_scan {
+            Some(s) if !s.addr_values.is_empty() => {
+                s.addr_values.iter().map(String::as_str).collect()
+            }
+            _ => {
+                let addr = params.get("addr").ok_or_else(|| {
+                    fmt!(ConfigError, "Missing \"addr\" parameter in config string")
+                })?;
+                vec![addr.as_str()]
+            }
+        };
+
         let default_port = if tls {
             DEFAULT_TLS_PORT
         } else {
             DEFAULT_PLAIN_PORT
         };
         let mut addrs: Vec<Endpoint> = Vec::new();
-        for (i, entry) in addr.split(',').map(str::trim).enumerate() {
-            if entry.is_empty() {
-                return Err(fmt!(ConfigError, "Empty entry {} in \"addr\" list", i));
-            }
-            // IPv6 literals must be bracketed per RFC 3986 §3.2.2 to
-            // disambiguate the authority's port colon from the address's
-            // own colons. Strip the brackets here so the canonical stored
-            // form is bare; `Endpoint::Display` re-introduces them when
-            // formatting any host that contains `:`. Without this the
-            // brackets get re-applied on top of the stored ones,
-            // producing `ws://[[::1]]:9000/...` and a URL parse error.
-            let (host, port_str) = if let Some(rest) = entry.strip_prefix('[') {
-                let close = rest.find(']').ok_or_else(|| {
+        let mut i: usize = 0;
+        for addr in addr_values {
+            for entry in addr.split(',').map(str::trim) {
+                if entry.is_empty() {
+                    return Err(fmt!(ConfigError, "Empty entry {} in \"addr\" list", i));
+                }
+                // IPv6 literals must be bracketed per RFC 3986 §3.2.2 to
+                // disambiguate the authority's port colon from the address's
+                // own colons. Strip the brackets here so the canonical stored
+                // form is bare; `Endpoint::Display` re-introduces them when
+                // formatting any host that contains `:`. Without this the
+                // brackets get re-applied on top of the stored ones,
+                // producing `ws://[[::1]]:9000/...` and a URL parse error.
+                let (host, port_str) = if let Some(rest) = entry.strip_prefix('[') {
+                    let close = rest.find(']').ok_or_else(|| {
+                        fmt!(
+                            ConfigError,
+                            "Bracketed addr entry {} missing closing ']': {:?}",
+                            i,
+                            entry
+                        )
+                    })?;
+                    let host = rest[..close].to_string();
+                    let after = &rest[close + 1..];
+                    let port_str = if after.is_empty() {
+                        default_port.to_string()
+                    } else if let Some(p) = after.strip_prefix(':') {
+                        p.to_string()
+                    } else {
+                        return Err(fmt!(
+                            ConfigError,
+                            "Unexpected characters after ']' in addr entry {}: {:?}",
+                            i,
+                            entry
+                        ));
+                    };
+                    (host, port_str)
+                } else {
+                    // Reject unbracketed multi-colon entries. `rsplit_once(':')`
+                    // would otherwise treat `::1` as host=`::`, port=`1` and
+                    // `2001:db8::1` as host=`2001:db8:`, port=`1` — surprising
+                    // misparses for users who omit the required brackets on an
+                    // IPv6 literal.
+                    if entry.bytes().filter(|&b| b == b':').count() > 1 {
+                        return Err(fmt!(
+                            ConfigError,
+                            "addr entry {} contains multiple ':' — IPv6 literals \
+                         must be bracketed (e.g. [::1]:9000): {:?}",
+                            i,
+                            entry
+                        ));
+                    }
+                    match entry.rsplit_once(':') {
+                        Some((h, p)) => (h.to_string(), p.to_string()),
+                        None => (entry.to_string(), default_port.to_string()),
+                    }
+                };
+                if host.is_empty() {
+                    return Err(fmt!(
+                        ConfigError,
+                        "Empty host in \"addr\" entry {}: {:?}",
+                        i,
+                        entry
+                    ));
+                }
+                let port: u16 = port_str.parse().map_err(|_| {
                     fmt!(
                         ConfigError,
-                        "Bracketed addr entry {} missing closing ']': {:?}",
+                        "Invalid port in \"addr\" entry {}: {:?}",
                         i,
                         entry
                     )
                 })?;
-                let host = rest[..close].to_string();
-                let after = &rest[close + 1..];
-                let port_str = if after.is_empty() {
-                    default_port.to_string()
-                } else if let Some(p) = after.strip_prefix(':') {
-                    p.to_string()
-                } else {
+                // Port 0 is the "ephemeral pick" sentinel for *listeners*;
+                // for an outbound connect target it's meaningless. The
+                // kernel rejects it as `EADDRNOTAVAIL` / `ECONNREFUSED`,
+                // which the egress code would surface as a `SocketError`
+                // — but with a confusing message ("connection refused")
+                // that hides the actual misconfiguration. Reject at parse
+                // so the diagnostic names the real cause.
+                if port == 0 {
                     return Err(fmt!(
                         ConfigError,
-                        "Unexpected characters after ']' in addr entry {}: {:?}",
-                        i,
-                        entry
-                    ));
-                };
-                (host, port_str)
-            } else {
-                // Reject unbracketed multi-colon entries. `rsplit_once(':')`
-                // would otherwise treat `::1` as host=`::`, port=`1` and
-                // `2001:db8::1` as host=`2001:db8:`, port=`1` — surprising
-                // misparses for users who omit the required brackets on an
-                // IPv6 literal.
-                if entry.bytes().filter(|&b| b == b':').count() > 1 {
-                    return Err(fmt!(
-                        ConfigError,
-                        "addr entry {} contains multiple ':' — IPv6 literals \
-                         must be bracketed (e.g. [::1]:9000): {:?}",
+                        "Port 0 is not a valid connect target in \"addr\" entry {}: {:?}",
                         i,
                         entry
                     ));
                 }
-                match entry.rsplit_once(':') {
-                    Some((h, p)) => (h.to_string(), p.to_string()),
-                    None => (entry.to_string(), default_port.to_string()),
-                }
-            };
-            if host.is_empty() {
-                return Err(fmt!(
-                    ConfigError,
-                    "Empty host in \"addr\" entry {}: {:?}",
-                    i,
-                    entry
-                ));
+                addrs.push(Endpoint { host, port });
+                i += 1;
             }
-            let port: u16 = port_str.parse().map_err(|_| {
-                fmt!(
-                    ConfigError,
-                    "Invalid port in \"addr\" entry {}: {:?}",
-                    i,
-                    entry
-                )
-            })?;
-            // Port 0 is the "ephemeral pick" sentinel for *listeners*;
-            // for an outbound connect target it's meaningless. The
-            // kernel rejects it as `EADDRNOTAVAIL` / `ECONNREFUSED`,
-            // which the egress code would surface as a `SocketError`
-            // — but with a confusing message ("connection refused")
-            // that hides the actual misconfiguration. Reject at parse
-            // so the diagnostic names the real cause.
-            if port == 0 {
-                return Err(fmt!(
-                    ConfigError,
-                    "Port 0 is not a valid connect target in \"addr\" entry {}: {:?}",
-                    i,
-                    entry
-                ));
-            }
-            addrs.push(Endpoint { host, port });
         }
         if addrs.is_empty() {
             return Err(fmt!(ConfigError, "\"addr\" parameter is empty"));
@@ -2109,5 +2143,75 @@ mod tests {
             token: "benign.token.value".into(),
         };
         c.validate().expect("clean string fields must validate");
+    }
+
+    #[test]
+    fn addr_comma_list_collects_all_endpoints() {
+        let c = ReaderConfig::from_conf("ws::addr=h1:9000,h2:9001,h3:9002").unwrap();
+        assert_eq!(
+            c.addrs,
+            vec![
+                Endpoint::new("h1", 9000),
+                Endpoint::new("h2", 9001),
+                Endpoint::new("h3", 9002),
+            ]
+        );
+    }
+
+    #[test]
+    fn addr_repeated_key_collects_all_endpoints() {
+        // Matches ingress: `addr=h1;addr=h2;...` must accumulate identically
+        // to the comma form.
+        let c = ReaderConfig::from_conf("ws::addr=h1:9000;addr=h2:9001;addr=h3:9002;").unwrap();
+        assert_eq!(
+            c.addrs,
+            vec![
+                Endpoint::new("h1", 9000),
+                Endpoint::new("h2", 9001),
+                Endpoint::new("h3", 9002),
+            ]
+        );
+    }
+
+    #[test]
+    fn addr_mixed_comma_and_repeated_key_collects_all_endpoints() {
+        // The two forms must compose: a repeated key whose value is itself
+        // a comma list flattens left-to-right.
+        let c = ReaderConfig::from_conf("ws::addr=h1:9000,h2:9001;addr=h3:9002,h4:9003;").unwrap();
+        assert_eq!(
+            c.addrs,
+            vec![
+                Endpoint::new("h1", 9000),
+                Endpoint::new("h2", 9001),
+                Endpoint::new("h3", 9002),
+                Endpoint::new("h4", 9003),
+            ]
+        );
+    }
+
+    #[test]
+    fn addr_repeated_key_rejects_empty_entry() {
+        // Empty entries inside an addr= value must error per the
+        // single-list contract.
+        let err = ReaderConfig::from_conf("ws::addr=h1:9000;addr=,;addr=h2:9001;").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("Empty entry"),
+            "unexpected msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn addr_repeated_key_propagates_invalid_port() {
+        // Diagnostic must still name the offending entry by its global
+        // index across all addr= values, not per-value.
+        let err = ReaderConfig::from_conf("ws::addr=h1:9000;addr=h2:notaport;").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("Invalid port in \"addr\" entry 1"),
+            "unexpected msg: {}",
+            err.msg()
+        );
     }
 }

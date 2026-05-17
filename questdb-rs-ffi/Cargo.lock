@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "questdb-rs"
-version = "6.1.0"
+version = "7.0.0"
 dependencies = [
  "base64ct",
  "bytes",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "questdb-rs-ffi"
-version = "6.1.0"
+version = "7.0.0"
 dependencies = [
  "libc",
  "questdb-confstr-ffi",

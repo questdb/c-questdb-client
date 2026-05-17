@@ -378,14 +378,22 @@ impl Protocol {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
-struct QwpWsAddrScan {
-    addr_values: Vec<String>,
-    sanitized_conf: String,
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+pub(crate) struct QwpWsAddrScan {
+    pub(crate) addr_values: Vec<String>,
+    pub(crate) sanitized_conf: String,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
-fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan>> {
+/// Pre-scan a raw connect string for repeated `addr=...` params. Returns the
+/// full list of addr values and a sanitized conf with duplicate `addr=` params
+/// removed (the first one is kept so the downstream `questdb_confstr` parser
+/// still sees a value).
+///
+/// Triggered when the schema is one of `qwpws`, `qwpwss`, `ws`, or `wss`; for
+/// any other schema (or a malformed conf), returns `None` and the caller
+/// should fall back to the standard `params.get("addr")` flow.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+pub(crate) fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan>> {
     let Some((service, params)) = conf.split_once("::") else {
         return Ok(None);
     };
@@ -574,6 +582,7 @@ pub struct SenderBuilder {
     host: ConfigSetting<String>,
     port: ConfigSetting<String>,
     net_interface: ConfigSetting<Option<String>>,
+    init_buf_size: ConfigSetting<usize>,
     max_buf_size: ConfigSetting<usize>,
     max_name_len: ConfigSetting<usize>,
     auth_timeout: ConfigSetting<Duration>,
@@ -805,12 +814,7 @@ impl SenderBuilder {
                 },
                 "max_name_len" => builder.max_name_len(parse_conf_value(key, val)?)?,
 
-                "init_buf_size" => {
-                    return Err(error::fmt!(
-                        ConfigError,
-                        "\"init_buf_size\" is not supported in config string"
-                    ));
-                }
+                "init_buf_size" => builder.init_buf_size(parse_conf_value(key, val)?)?,
 
                 "max_buf_size" => builder.max_buf_size(parse_conf_value(key, val)?)?,
 
@@ -995,6 +999,7 @@ impl SenderBuilder {
             host: ConfigSetting::new_specified(host),
             port: ConfigSetting::new_specified(port),
             net_interface: ConfigSetting::new_default(None),
+            init_buf_size: ConfigSetting::new_default(64 * 1024),
             max_buf_size: ConfigSetting::new_default(100 * 1024 * 1024),
             max_name_len: ConfigSetting::new_default(MAX_NAME_LEN_DEFAULT),
             auth_timeout: ConfigSetting::new_default(Duration::from_secs(15)),
@@ -1766,6 +1771,29 @@ impl SenderBuilder {
         Ok(builder)
     }
 
+    /// The initial buffered size that the client will pre-allocate for new
+    /// [`Buffer`] instances returned by [`Sender::new_buffer`].
+    /// The default is 64 KiB.
+    ///
+    /// For ILP / HTTP this pre-allocates the underlying byte vector to this
+    /// size; the buffer then grows up to [`Self::max_buf_size`].
+    /// For QWP/WebSocket the value is accepted and cross-validated against
+    /// `max_buf_size`, but no flat byte buffer exists to pre-allocate
+    /// — the columnar buffer allocates per-table on first row.
+    /// For QWP/UDP the value is accepted but has no effect: datagrams are
+    /// bounded by `max_datagram_size`.
+    pub fn init_buf_size(mut self, value: usize) -> Result<Self> {
+        let min = 1024;
+        if value < min {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"init_buf_size\" must be at least {min} bytes."
+            ));
+        }
+        self.init_buf_size.set_specified("init_buf_size", value)?;
+        Ok(self)
+    }
+
     /// The maximum buffered size that the client will flush to the server.
     /// The default is 100 MiB.
     ///
@@ -1989,6 +2017,19 @@ impl SenderBuilder {
     /// requires authentication or TLS, these will also be completed before
     /// returning.
     pub fn build(&self) -> Result<Sender> {
+        // Fail fast on misconfigured buffer sizes before opening any sockets.
+        // Only enforce the init-vs-max relationship when the user explicitly
+        // set init_buf_size; a defaulted init_buf_size silently clamps to
+        // max_buf_size below.
+        if self.init_buf_size.is_specified() && *self.init_buf_size > *self.max_buf_size {
+            return Err(error::fmt!(
+                ConfigError,
+                "init_buf_size ({}) cannot exceed max_buf_size ({})",
+                *self.init_buf_size,
+                *self.max_buf_size
+            ));
+        }
+
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
         if self.protocol.tls_enabled() {
@@ -2199,9 +2240,15 @@ impl SenderBuilder {
             descr.push_str("auth=off]");
         }
 
+        // Defaulted init_buf_size clamps to max_buf_size when the cap is
+        // smaller. The explicit-init-too-big check fires at the top of
+        // build(); reaching here means init_buf_size is in range.
+        let effective_init_buf_size = (*self.init_buf_size).min(*self.max_buf_size);
+
         let sender = Sender::new(
             descr,
             handler,
+            effective_init_buf_size,
             *self.max_buf_size,
             self.protocol,
             protocol_version,
