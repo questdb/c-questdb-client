@@ -261,7 +261,7 @@ impl Buffer {
         }
     }
 
-    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    #[cfg(feature = "_sender-qwp-udp")]
     pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
         match &self.inner {
             BufferInner::Ilp(_) => None,
@@ -1038,6 +1038,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         let _ = &name;
+        let _ = (lo, hi);
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
@@ -1137,6 +1138,7 @@ impl Buffer {
     {
         let _ = (&name, value);
         let packed = u32::from(value);
+        let _ = packed;
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,

@@ -22,6 +22,13 @@
  *
  ******************************************************************************/
 
+// Shared QWP encoding primitives — used by qwp-udp's flat
+// row-encoding path and by qwp-ws's columnar buffer. When only
+// qwp-ws is enabled, the udp-only helpers naturally go dead.
+// Suppress only in that exact configuration so future drift on a
+// build that DOES enable qwp-udp still surfaces.
+#![cfg_attr(not(feature = "_sender-qwp-udp"), allow(dead_code))]
+
 use crate::Error;
 #[cfg(test)]
 use crate::ErrorCode;

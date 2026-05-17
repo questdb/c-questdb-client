@@ -26,7 +26,8 @@
 //!
 //! Used by the various message decoders so each one can stay focused on
 //! the layout instead of repeating bounds-check boilerplate. All reads
-//! return [`Error`](crate::egress::Error) with [`ErrorCode::ProtocolError`]
+//! return [`Error`](crate::egress::Error) with
+//! [`ErrorCode::ProtocolError`](crate::egress::ErrorCode::ProtocolError)
 //! on underrun.
 
 use crate::egress::error::{Result, fmt};

@@ -22,6 +22,20 @@
  *
  ******************************************************************************/
 
+// `SyncProtocolHandler` is cfg-pruned: with only `sync-sender-qwp-ws`
+// enabled, the enum has just the two `*QwpWs` variants and a number
+// of `_ =>` fallbacks here become unreachable. Suppress only in that
+// exact configuration so a regression in the multi-handler builds
+// still surfaces.
+#![cfg_attr(
+    not(any(
+        feature = "sync-sender-tcp",
+        feature = "sync-sender-http",
+        feature = "sync-sender-qwp-udp"
+    )),
+    allow(unreachable_patterns)
+)]
+
 use crate::error::{self, Result};
 #[cfg(feature = "_sync-sender")]
 use crate::ingress::SenderBuilder;

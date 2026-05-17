@@ -193,7 +193,7 @@ impl Reader {
         Self::from_conf(conf)
     }
 
-    /// Walk `cfg.addrs` via the per-client [`HostHealthTracker`], opening
+    /// Walk `cfg.addrs` via the per-client host-health tracker, opening
     /// the highest-priority unattempted endpoint and eagerly consuming
     /// the v2 `SERVER_INFO` frame. Accepts the first endpoint whose role
     /// matches `cfg.target`. Returns:
@@ -774,7 +774,7 @@ impl<'r> ReaderQuery<'r> {
     /// handle replay-after-data-delivered correctly."** Without it,
     /// [`Cursor::next_batch`] refuses to fail over once any batch has
     /// been yielded — returning
-    /// [`ErrorCode::FailoverWouldDuplicate`](crate::egress::ErrorCode::FailoverWouldDuplicate)
+    /// [`crate::egress::ErrorCode::FailoverWouldDuplicate`]
     /// instead — to avoid silently doubling up rows in the caller's
     /// accumulator. Initial-connect failover (before any batch is
     /// yielded) is transparent and does not require this callback.
@@ -1169,7 +1169,7 @@ impl<'r> Cursor<'r> {
     /// **Silent-duplicate guard.** If a batch has already been
     /// yielded to the caller and no `on_failover_reset` callback was
     /// installed, the cursor refuses to fail over and returns
-    /// [`ErrorCode::FailoverWouldDuplicate`](crate::egress::ErrorCode::FailoverWouldDuplicate)
+    /// [`crate::egress::ErrorCode::FailoverWouldDuplicate`]
     /// instead. Replay would otherwise re-deliver rows the caller
     /// already consumed — with no signal — because the server
     /// restarts streaming from `batch_seq=0` on the new connection.
@@ -1419,7 +1419,7 @@ impl<'r> Cursor<'r> {
     /// endpoint did the last batch come from?". After mid-query
     /// failover, this reflects the new endpoint (matching the
     /// `new_addr` from the most recent
-    /// [`FailoverEvent`](crate::egress::FailoverEvent)).
+    /// [`crate::egress::FailoverEvent`]).
     pub fn current_addr(&self) -> &Endpoint {
         self.reader.current_addr()
     }
@@ -1557,7 +1557,7 @@ impl<'r> Cursor<'r> {
     /// Blocking, but bounded. The CANCEL write inherits the transport's
     /// `WRITE_TIMEOUT`; immediately after the CANCEL is accepted by
     /// the kernel send buffer, the read timeout is tightened to
-    /// [`CANCEL_DRAIN_READ_TIMEOUT`] and the write timeout to
+    /// `CANCEL_DRAIN_READ_TIMEOUT` and the write timeout to
     /// `CLOSE_TIMEOUT` for the duration of the credit-nudge + drain.
     /// That bounds the worst-case latency at one `WRITE_TIMEOUT`
     /// (CANCEL) + `CLOSE_TIMEOUT` (nudge) + `CANCEL_DRAIN_READ_TIMEOUT`

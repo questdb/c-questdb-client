@@ -72,7 +72,7 @@ impl<'a> Validity<'a> {
     /// Construct a bitmap-backed validity view.
     ///
     /// Returns `Err(InvalidApiCall)` if `bytes.len() < row_count.div_ceil(8)`
-    /// — a too-short bitmap would otherwise cause [`is_null`] to silently
+    /// — a too-short bitmap would otherwise cause [`Self::is_null`] to silently
     /// report null rows as non-null (the bytes beyond the buffer end are
     /// indistinguishable from "this row's bit is 0"). The decoder always
     /// sizes the bitmap exactly to `row_count.div_ceil(8)`

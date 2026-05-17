@@ -160,7 +160,7 @@ struct IlpBookmarkState {
 ///
 /// This type simply wraps a `&str`.
 ///
-/// When you pass a `TableName` instead of a plain string to a [`Buffer`] method,
+/// When you pass a `TableName` instead of a plain string to a `Buffer` method,
 /// it doesn't have to validate it again. This saves CPU cycles.
 #[derive(Clone, Copy)]
 pub struct TableName<'a> {
@@ -258,7 +258,7 @@ impl AsRef<str> for TableName<'_> {
 ///
 /// This type simply wraps a `&str`.
 ///
-/// When you pass a `ColumnName` instead of a plain string to a [`Buffer`] method,
+/// When you pass a `ColumnName` instead of a plain string to a `Buffer` method,
 /// it doesn't have to validate it again. This saves CPU cycles.
 #[derive(Clone, Copy)]
 pub struct ColumnName<'a> {

@@ -33,6 +33,13 @@
 //! masked per RFC 6455 §5.3). Mask key generation is the caller's job
 //! (see [`crate::ws::mask::MaskRng`]).
 
+// Egress is the only side that parses incoming frames; the ingress
+// QWP/WS sender uses just the writer. Suppress the avalanche of
+// dead-code warnings on the writer-only builds (`questdb-rs-ffi`
+// without `sync-reader-ws`, for example) — the items are still
+// load-bearing for tests in this module.
+#![cfg_attr(not(feature = "_egress"), allow(dead_code))]
+
 use super::mask::apply_mask;
 
 /// Opcodes used by QWP. The byte values are fixed by RFC 6455 §5.2.
