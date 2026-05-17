@@ -31,11 +31,12 @@ use crate::error;
 use crate::ingress::QwpWsRoleReject;
 #[cfg(test)]
 use crate::ws::crypto;
-use crate::ws::frame::{self, Opcode};
+use crate::ws::frame;
 
 // Re-export opcode constants from the shared `ws::frame` module so existing
 // `WS_OPCODE_*` call sites in qwp_ws.rs and qwp_ws_driver.rs keep working
 // with zero churn after the Phase A consolidation.
+pub(super) use crate::ws::frame::Opcode;
 pub(super) use crate::ws::frame::{
     OPCODE_BINARY as WS_OPCODE_BINARY, OPCODE_CLOSE as WS_OPCODE_CLOSE,
     OPCODE_CONTINUATION as WS_OPCODE_CONTINUATION, OPCODE_PING as WS_OPCODE_PING,
@@ -74,29 +75,12 @@ pub(super) fn compute_accept(key_b64: &str) -> String {
 
 // ---------- frame builder (pure bytes) ----------
 
-/// Format a complete (FIN-set) WebSocket frame into `out`. Thin wrapper over
-/// [`crate::ws::frame::encode_client_frame`] that preserves the legacy
-/// (`fin`, raw-`u8` opcode) signature so existing ingress call sites stay
-/// untouched. The shared encoder always sets FIN=1; ingress never sends
-/// fragmented frames, so `fin=false` is rejected with a clear panic rather
-/// than silently emitting a malformed header.
-pub(super) fn write_frame_to_buf(
-    out: &mut Vec<u8>,
-    fin: bool,
-    opcode: u8,
-    payload: &[u8],
-    mask: [u8; 4],
-) {
-    if !fin {
-        panic!("write_frame_to_buf: fin=false is not supported by encode_client_frame");
-    }
-    let opcode = match opcode {
-        WS_OPCODE_BINARY => Opcode::Binary,
-        WS_OPCODE_CLOSE => Opcode::Close,
-        WS_OPCODE_PING => Opcode::Ping,
-        WS_OPCODE_PONG => Opcode::Pong,
-        other => panic!("write_frame_to_buf: unsupported opcode 0x{other:02x}"),
-    };
+/// Format a complete WebSocket client frame into `out`. Thin wrapper over
+/// [`crate::ws::frame::encode_client_frame`]; the shared encoder always
+/// sets FIN=1 and ingress never sends fragmented frames, so there is no
+/// `fin` parameter to get wrong. `opcode` is a typed [`Opcode`], so
+/// invalid values cannot be expressed at the call site.
+pub(super) fn write_frame_to_buf(out: &mut Vec<u8>, opcode: Opcode, payload: &[u8], mask: [u8; 4]) {
     out.clear();
     frame::encode_client_frame(out, opcode, mask, payload);
 }
@@ -711,7 +695,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0x12, 0x34, 0x56, 0x78];
         let payload = b"hello";
-        write_frame_to_buf(&mut out, true, WS_OPCODE_BINARY, payload, mask);
+        write_frame_to_buf(&mut out, Opcode::Binary, payload, mask);
         assert_eq!(out[0], 0x82); // FIN | binary
         assert_eq!(out[1] & 0x80, 0x80);
         assert_eq!(out[1] & 0x7F, 5);
@@ -726,12 +710,12 @@ mod tests {
     fn frame_extended_lengths() {
         let mut out = Vec::new();
         let mask = [0; 4];
-        write_frame_to_buf(&mut out, true, WS_OPCODE_BINARY, &[0u8; 200], mask);
+        write_frame_to_buf(&mut out, Opcode::Binary, &[0u8; 200], mask);
         assert_eq!(out[1] & 0x7F, 126);
 
         let mut out = Vec::new();
         let big = vec![0u8; 70_000];
-        write_frame_to_buf(&mut out, true, WS_OPCODE_BINARY, &big, mask);
+        write_frame_to_buf(&mut out, Opcode::Binary, &big, mask);
         assert_eq!(out[1] & 0x7F, 127);
     }
 

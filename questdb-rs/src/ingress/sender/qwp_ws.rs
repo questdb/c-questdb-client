@@ -43,7 +43,7 @@ use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, 
 use crate::ingress::tls::{TlsSettings, configure_tls};
 
 use super::qwp_ws_codec::{
-    self as codec, MAX_INBOUND_FRAME_BYTES, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
+    self as codec, MAX_INBOUND_FRAME_BYTES, Opcode, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
     WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
 };
 #[cfg(test)]
@@ -1388,7 +1388,7 @@ pub(crate) fn write_binary_frame<W: Write>(
     out: &mut Vec<u8>,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    codec::write_frame_to_buf(out, true, WS_OPCODE_BINARY, payload, random_mask());
+    codec::write_frame_to_buf(out, Opcode::Binary, payload, random_mask());
     stream.write_all(out)
 }
 
@@ -1397,7 +1397,7 @@ pub(crate) fn write_ping_frame<W: Write>(
     out: &mut Vec<u8>,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    codec::write_frame_to_buf(out, true, WS_OPCODE_PING, payload, random_mask());
+    codec::write_frame_to_buf(out, Opcode::Ping, payload, random_mask());
     stream.write_all(out)
 }
 
@@ -1471,7 +1471,7 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
         match header.opcode {
             WS_OPCODE_PING => {
                 let payload = read_control_frame_payload(stream, header, &mut control_payload)?;
-                codec::write_frame_to_buf(scratch, true, WS_OPCODE_PONG, payload, random_mask());
+                codec::write_frame_to_buf(scratch, Opcode::Pong, payload, random_mask());
                 stream.write_all(scratch).map_err(|io| {
                     WsMessageError::Error(error::fmt!(
                         SocketError,
@@ -1632,7 +1632,7 @@ impl WsFrameReader {
         match header.opcode {
             WS_OPCODE_PING => {
                 let payload = self.payload_slice(header);
-                codec::write_frame_to_buf(scratch, true, WS_OPCODE_PONG, payload, random_mask());
+                codec::write_frame_to_buf(scratch, Opcode::Pong, payload, random_mask());
                 writer.write_all(scratch).map_err(|io| {
                     WsMessageError::Error(error::fmt!(
                         SocketError,
@@ -3240,7 +3240,7 @@ mod tests {
     fn frame_short_payload_is_masked() {
         let mut out = Vec::new();
         let payload = b"hello";
-        codec::write_frame_to_buf(&mut out, true, WS_OPCODE_BINARY, payload, [0; 4]);
+        codec::write_frame_to_buf(&mut out, Opcode::Binary, payload, [0; 4]);
         assert_eq!(out[0], 0x82); // FIN | binary
         assert_eq!(out[1] & 0x80, 0x80); // masked
         assert_eq!(out[1] & 0x7F, 5); // length
@@ -3261,7 +3261,7 @@ mod tests {
     #[test]
     fn masked_server_frame_is_protocol_error() {
         let mut masked_frame = Vec::new();
-        codec::write_frame_to_buf(&mut masked_frame, true, WS_OPCODE_BINARY, b"hello", [0; 4]);
+        codec::write_frame_to_buf(&mut masked_frame, Opcode::Binary, b"hello", [0; 4]);
         let err = read_message(
             &mut std::io::Cursor::new(masked_frame),
             &mut Vec::new(),
