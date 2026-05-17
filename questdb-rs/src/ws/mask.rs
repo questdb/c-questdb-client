@@ -192,9 +192,7 @@ unsafe fn apply_mask_sse2(buf: &mut [u8], mask: [u8; 4]) {
     // Broadcast the 4-byte mask into all four 32-bit lanes. Stored as a
     // little-endian u32 so the in-memory byte pattern is exactly
     // `[mask[0], mask[1], mask[2], mask[3]]` repeated four times.
-    // SAFETY: SSE2 is baseline on x86_64; the function is marked with
-    // `#[target_feature(enable = "sse2")]` to be explicit.
-    let mask_vec = unsafe { _mm_set1_epi32(i32::from_le_bytes(mask)) };
+    let mask_vec = _mm_set1_epi32(i32::from_le_bytes(mask));
     let len = buf.len();
     let mut i = 0;
     while i + 16 <= len {
@@ -220,9 +218,8 @@ unsafe fn apply_mask_avx2(buf: &mut [u8], mask: [u8; 4]) {
         _mm256_loadu_si256, _mm256_set1_epi32, _mm256_storeu_si256, _mm256_xor_si256,
     };
     let mask_u32 = i32::from_le_bytes(mask);
-    // SAFETY: AVX2 detected at the dispatch site; SSE2 is baseline.
-    let mask256 = unsafe { _mm256_set1_epi32(mask_u32) };
-    let mask128 = unsafe { _mm_set1_epi32(mask_u32) };
+    let mask256 = _mm256_set1_epi32(mask_u32);
+    let mask128 = _mm_set1_epi32(mask_u32);
 
     let len = buf.len();
     let mut i = 0;

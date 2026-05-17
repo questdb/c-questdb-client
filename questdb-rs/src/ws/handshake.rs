@@ -320,7 +320,14 @@ fn read_response_prefix<S: Read>(
     // force us into one giant allocation before we even see the first
     // CRLF. Real responses fit comfortably in the first chunk; this
     // only matters for adversarial peers.
-    let mut buf = Vec::with_capacity(4096);
+    let mut buf = Vec::new();
+    // `try_reserve` returns an error on allocator OOM rather than
+    // aborting the host process — meaningful here because this Vec
+    // can grow to MAX_RESPONSE_HEADER_BYTES (32 KiB) under a
+    // slow-trickle peer.
+    buf.try_reserve(4096).map_err(|e| {
+        HandshakeError::Protocol(format!("handshake recv buffer allocation failed: {e}"))
+    })?;
     let mut chunk = [0u8; 4096];
     let mut search_from: usize = 0;
     loop {
@@ -331,6 +338,11 @@ fn read_response_prefix<S: Read>(
                 buf.len()
             )));
         }
+        // Reserve before the copy so the OOM surfaces as Protocol,
+        // not as an abort inside `extend_from_slice`.
+        buf.try_reserve(n).map_err(|e| {
+            HandshakeError::Protocol(format!("handshake recv buffer growth failed: {e}"))
+        })?;
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > MAX_RESPONSE_HEADER_BYTES {
             return Err(HandshakeError::Protocol(format!(
@@ -459,7 +471,7 @@ fn read_response_body<S: Read>(
             // Read up to the cap, then stop. The body byte count we
             // return is best-effort: enough for diagnostics, capped to
             // avoid amplification on a misbehaving server.
-            let mut tail = vec![0u8; target - buf.len()];
+            let mut tail = try_alloc_zeroed(target - buf.len())?;
             let n = read_to_fill(stream, &mut tail)?;
             buf.extend_from_slice(&tail[..n]);
         }
@@ -470,10 +482,23 @@ fn read_response_body<S: Read>(
     }
     let mut buf = leftover;
     let want = content_length - buf.len();
-    let mut tail = vec![0u8; want];
+    let mut tail = try_alloc_zeroed(want)?;
     let n = read_to_fill(stream, &mut tail)?;
     buf.extend_from_slice(&tail[..n]);
     Ok(buf)
+}
+
+/// Allocate `n` zeroed bytes via `try_reserve_exact` so an allocator
+/// OOM surfaces as a `HandshakeError::Protocol` rather than aborting
+/// the host process. `Vec::resize` does not reallocate after the
+/// successful `try_reserve_exact`, so the `0` fill stays cheap.
+fn try_alloc_zeroed(n: usize) -> std::result::Result<Vec<u8>, HandshakeError> {
+    let mut v: Vec<u8> = Vec::new();
+    v.try_reserve_exact(n).map_err(|e| {
+        HandshakeError::Protocol(format!("handshake body buffer allocation failed: {e}"))
+    })?;
+    v.resize(n, 0u8);
+    Ok(v)
 }
 
 /// Read repeatedly into `buf` until full or EOF. Returns the number of

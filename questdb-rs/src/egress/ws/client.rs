@@ -294,6 +294,23 @@ impl WsClient {
     /// `Err(Io(UnexpectedEof))` if the stream returns 0 bytes
     /// (peer closed mid-frame).
     fn fill_more(&mut self) -> Result<(), WsReadError> {
+        // Defence-in-depth bound on cumulative recv-buffer growth.
+        // The upstream `payload_len > max_payload` check in
+        // `read_binary_frame` already rejects single oversized frames,
+        // so the steady-state buffer should never exceed roughly one
+        // frame-in-flight plus one read chunk. Cap at `2 * max_payload`
+        // to bound any future parser bug that lets state accumulate
+        // (e.g. a regression that fails to consume a frame after
+        // splitting its payload). `BytesMut::reserve` aborts on
+        // allocator OOM and `bytes` doesn't expose `try_reserve`, so
+        // this is the only place we can intercept runaway growth.
+        let target = self.recv.len().saturating_add(READ_CHUNK);
+        if target > self.max_payload.saturating_mul(2) {
+            return Err(WsReadError::Protocol(format!(
+                "WS recv buffer would grow to {target} bytes, exceeds {} (2 * max_payload)",
+                self.max_payload * 2
+            )));
+        }
         self.recv.reserve(READ_CHUNK);
         let spare = self.recv.spare_capacity_mut();
         // SAFETY: we never read from `slice` (only write through
