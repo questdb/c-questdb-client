@@ -11,7 +11,14 @@ steps:
   - script: |
       python -m pip install --upgrade pip
       pip install numpy
-    condition: ne(variables['imageName'], 'macos-latest')
+    # hetzner-incus provisions numpy via apt (python3-numpy) before this
+    # template runs because Ubuntu 24.04+ enforces PEP 668 and rejects
+    # pip into the system interpreter.
+    condition: |
+      and(
+        ne(variables['imageName'], 'macos-latest'),
+        ne(variables['imageName'], 'hetzner-incus')
+      )
     displayName: "Install Python Dependencies"
   - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
     env:

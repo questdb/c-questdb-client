@@ -124,33 +124,83 @@ stages:
               cd failover_clients
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "failover_clients: clippy"
+      # Runs the full system_test/test.py against a fresh build of
+      # QuestDB master. Moved off Microsoft-hosted ubuntu-latest because
+      # the QWP/WS fuzz portion of the run filled the agent disk ("No
+      # space left", SIGBUS); the hetzner-incus pool — already used by
+      # TestQwpWsFuzzLinux below and by the cron-time fuzz pipeline —
+      # has enough headroom. Pool image is built from
+      # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
+      # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
+      # zip, curl, gh, and rustup; only cmake and python3-numpy are
+      # apt-installed per job. imageName='hetzner-incus' tells
+      # compile.yaml to skip its pip step.
       - job: TestVsQuestDBMaster
-        displayName: "Vs QuestDB 'master'"
+        displayName: "Vs QuestDB master"
         pool:
-          vmImage: "ubuntu-latest"
-        timeoutInMinutes: 60
+          name: hetzner-incus
+        timeoutInMinutes: 90
+        variables:
+          imageName: hetzner-incus
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
+          - bash: |
+              rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
+            displayName: "Cleanup /tmp leftovers"
+          - bash: |
+              set -eux
+              sudo apt-get update
+              # Ubuntu 24.04's python3-numpy is 1.26 which caps NPY_MAXDIMS at 32;
+              # the >32-dim sender-rejection test (TestSender.test_f64_arr_max_dims)
+              # needs numpy >= 2.0 to construct the input array. Install numpy
+              # only via pip (apt would pull in 1.26 and pip refuses to replace
+              # debian-installed packages because the wheel RECORD file is
+              # missing). --break-system-packages overrides PEP 668.
+              sudo apt-get install -y --no-install-recommends cmake python3-pip
+              sudo python3 -m pip install --break-system-packages 'numpy>=2'
+              JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
+              JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
+              for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
+                if [ ! -x "$p/bin/javac" ]; then
+                  echo "Expected JDK missing at $p" >&2
+                  ls /usr/lib/jvm/ >&2 || true
+                  exit 1
+                fi
+              done
+              echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
+            displayName: "Install missing deps + resolve JDKs"
+          - bash: |
+              set -eux
+              # `|| true` lets the fallback path take over if the file
+              # references something the build user can't read (e.g.
+              # /etc/profile.d/rust.sh sources /root/.cargo/env).
+              if [ -f /etc/profile.d/rust.sh ]; then . /etc/profile.d/rust.sh || true; fi
+              if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env" || true; fi
+              if ! command -v cargo >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --default-toolchain stable --profile minimal
+                . "$HOME/.cargo/env"
+              fi
+              CARGO_BIN="$(dirname "$(command -v cargo)")"
+              echo "Using cargo from: $CARGO_BIN"
+              echo "##vso[task.prependpath]$CARGO_BIN"
+            displayName: "Resolve Rust toolchain"
           - template: compile.yaml
           - script: |
               git clone --depth 1 https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
             displayName: git clone questdb
-          - script: |
-              set -euo pipefail
-              JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
-              sudo mkdir -p /opt/jdk25
-              curl -fsSL "$JDK_URL" | sudo tar -xz -C /opt/jdk25 --strip-components=1
-              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/jdk25"
-              echo "##vso[task.prependpath]/opt/jdk25/bin"
-            displayName: "Install JDK 25 (required by QuestDB master)"
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
-              jdkVersionOption: "default"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
               options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
@@ -158,6 +208,191 @@ stages:
           - script: |
               python3 system_test/test_egress_failover.py run --repo ./questdb -v
             displayName: "egress integration test"
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
+              artifactName: qdb-log-vs-master-$(Agent.OS)
+      - job: TestQwpWsFuzz
+        displayName: "QWP/WS fuzz suite (mac/windows hosted)"
+        strategy:
+          matrix:
+            mac:
+              imageName: "macos-latest"
+            windows-2022:
+              imageName: "windows-2022"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          # Linux and Windows runners ship with JDK 25 at $JAVA_HOME_25_X64.
+          # macOS-latest doesn't, so we brew-install openjdk@25 there and
+          # discover its install location with `brew --prefix`. Both
+          # paths set JAVA_HOME via a single bash step so the Windows
+          # version doesn't trip on cmd.exe's quote handling
+          # (`echo "##vso[...]$x"` in cmd preserves the surrounding
+          # quotes, which previously made Maven@3 see a stray `"` at
+          # the end of the JDK path).
+          - bash: |
+              set -e
+              if [[ "$AGENT_OS" == "Darwin" ]]; then
+                brew install openjdk@25
+                JDK_HOME="$(brew --prefix openjdk@25)/libexec/openjdk.jdk/Contents/Home"
+                if [ ! -d "$JDK_HOME" ]; then
+                  JDK_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+                fi
+                if [ ! -d "$JDK_HOME" ]; then
+                  echo "JDK 25 not found after brew install" >&2
+                  exit 1
+                fi
+              else
+                JDK_HOME="$JAVA_HOME_25_X64"
+              fi
+              echo "Resolved JDK 25: $JDK_HOME"
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
+            displayName: "Resolve JDK 25"
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
+            displayName: "TestQwpWsFuzz"
+          # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
+          # publish the QuestDB server log so PR reviewers don't have to
+          # repro locally. Path comes from system_test/fixture.py:_log_path.
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              artifactName: qdb-log-$(Agent.OS)
+
+      # Linux leg on self-hosted hetzner-incus — mirrors the equivalent
+      # job in ci/run_fuzz_pipeline.yaml. Pool image is built from
+      # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
+      # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
+      # zip, curl, gh, and rustup; only cmake and python3-numpy are
+      # apt-installed per job. imageName='hetzner-incus' tells
+      # compile.yaml to skip its pip step (PEP 668 / EXTERNALLY-MANAGED
+      # on Ubuntu 24.04+).
+      - job: TestQwpWsFuzzLinux
+        displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
+        pool:
+          name: hetzner-incus
+        timeoutInMinutes: 90
+        variables:
+          imageName: hetzner-incus
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - bash: |
+              rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
+            displayName: "Cleanup /tmp leftovers"
+          - bash: |
+              set -eux
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends cmake python3-numpy
+              JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
+              JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
+              for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
+                if [ ! -x "$p/bin/javac" ]; then
+                  echo "Expected JDK missing at $p" >&2
+                  ls /usr/lib/jvm/ >&2 || true
+                  exit 1
+                fi
+              done
+              echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
+            displayName: "Install missing deps + resolve JDKs"
+          - bash: |
+              set -eux
+              # `|| true` lets the fallback path take over if the file
+              # references something the build user can't read (e.g.
+              # /etc/profile.d/rust.sh sources /root/.cargo/env).
+              if [ -f /etc/profile.d/rust.sh ]; then . /etc/profile.d/rust.sh || true; fi
+              if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env" || true; fi
+              if ! command -v cargo >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --default-toolchain stable --profile minimal
+                . "$HOME/.cargo/env"
+              fi
+              CARGO_BIN="$(dirname "$(command -v cargo)")"
+              echo "Using cargo from: $CARGO_BIN"
+              echo "##vso[task.prependpath]$CARGO_BIN"
+            displayName: "Resolve Rust toolchain"
+          - template: compile.yaml
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
+            displayName: "TestQwpWsFuzz"
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              artifactName: qdb-log-$(Agent.OS)-linux
+
       # Live-server fuzz coverage for the OSS-questdb tests that need a
       # real server (bind / fragmentation / random-schema / ALTER
       # orchestration). `--test NAME` selectors limit the build to the

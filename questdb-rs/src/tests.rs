@@ -27,7 +27,33 @@ mod f64_serializer;
 #[cfg(feature = "sync-sender-http")]
 mod http;
 
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 mod mock;
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+mod qwp;
+
+#[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+pub(crate) mod qwp_decode;
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+mod qwp_mock;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod qwp_ws;
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
+mod qwp_ws_replay_probe;
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
+mod qwp_ws_protocol_probe;
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
+mod qwp_ws_publication_probe;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod qwp_ws_java_golden;
+
 mod sender;
 
 mod decimal;

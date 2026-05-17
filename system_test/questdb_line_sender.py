@@ -60,6 +60,7 @@ from ctypes import (
     c_double,
     c_uint8,
     c_uint16,
+    c_uint32,
     c_uint64,
     c_void_p,
     c_ssize_t)
@@ -83,6 +84,16 @@ class Protocol(Enum):
     TCPS = (c_line_sender_protocol(1), 'tcps')
     HTTP = (c_line_sender_protocol(2), 'http')
     HTTPS = (c_line_sender_protocol(3), 'https')
+    QWPUDP = (c_line_sender_protocol(4), 'qwpudp')
+    QWPWS = (c_line_sender_protocol(5), 'qwpws')
+    QWPWSS = (c_line_sender_protocol(6), 'qwpwss')
+
+    @classmethod
+    def from_int(cls, value: c_line_sender_protocol):
+        for member in cls:
+            if member.value[0].value == value:
+                return member
+        raise ValueError(f"invalid protocol: {value}")
 
 
 c_line_sender_ca = ctypes.c_int
@@ -122,11 +133,44 @@ class ProtocolVersion(Enum):
         return self.value[0].value == other.value[0].value
 
 
+class QwpWsErrorCategory(Enum):
+    SCHEMA_MISMATCH = 0
+    PARSE_ERROR = 1
+    INTERNAL_ERROR = 2
+    SECURITY_ERROR = 3
+    WRITE_ERROR = 4
+    PROTOCOL_VIOLATION = 5
+    UNKNOWN = 6
+
+    @classmethod
+    def from_int(cls, value: int):
+        for member in cls:
+            if member.value == value:
+                return member
+        return cls.UNKNOWN
+
+
+class QwpWsErrorPolicy(Enum):
+    DROP_AND_CONTINUE = 0
+    HALT = 1
+
+    @classmethod
+    def from_int(cls, value: int):
+        for member in cls:
+            if member.value == value:
+                return member
+        return cls.HALT
+
+
 class c_line_sender_opts(ctypes.Structure):
     pass
 
 
 class c_line_sender_error(ctypes.Structure):
+    pass
+
+
+class c_line_sender_qwpws_error(ctypes.Structure):
     pass
 
 
@@ -137,6 +181,8 @@ c_line_sender_buffer_p = ctypes.POINTER(c_line_sender_buffer)
 c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
+c_line_sender_qwpws_error_p = ctypes.POINTER(c_line_sender_qwpws_error)
+c_line_sender_qwpws_error_p_p = ctypes.POINTER(c_line_sender_qwpws_error_p)
 c_uint8_p = ctypes.POINTER(c_uint8)
 c_double_p = ctypes.POINTER(c_double)
 
@@ -157,6 +203,24 @@ class c_line_sender_table_name(ctypes.Structure):
 class line_sender_buffer_view(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_uint8_p)]
+
+
+class line_sender_qwpws_fsn(ctypes.Structure):
+    _fields_ = [("has_value", c_bool),
+                ("value", c_uint64)]
+
+
+class line_sender_qwpws_error_view(ctypes.Structure):
+    _fields_ = [("category", c_int),
+                ("applied_policy", c_int),
+                ("has_status", c_bool),
+                ("status", c_uint8),
+                ("has_message_sequence", c_bool),
+                ("message_sequence", c_uint64),
+                ("from_fsn", c_uint64),
+                ("to_fsn", c_uint64),
+                ("message", c_void_p),
+                ("message_len", c_size_t)]
 
 
 c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
@@ -232,6 +296,10 @@ def _setup_cdll():
         c_protocol_version,
         c_size_t)
     set_sig(
+        dll.line_sender_buffer_new_for_sender,
+        c_line_sender_buffer_p,
+        c_line_sender_p)
+    set_sig(
         dll.line_sender_buffer_free,
         None,
         c_line_sender_buffer_p)
@@ -249,6 +317,20 @@ def _setup_cdll():
         c_line_sender_buffer_p)
     set_sig(
         dll.line_sender_buffer_clear,
+        None,
+        c_line_sender_buffer_p)
+    set_sig(
+        dll.line_sender_buffer_set_marker,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_rewind_to_marker,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_clear_marker,
         None,
         c_line_sender_buffer_p)
     set_sig(
@@ -279,6 +361,152 @@ def _setup_cdll():
         c_int64,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_buffer_column_i8,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_int8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i16,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_int16,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i32,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_int32,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f32,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_float,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec64_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec64,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint32,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec128_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec128,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint32,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_uuid,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_long256,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_ipv4,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint32,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_date,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_char,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint16,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_binary,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_geohash,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        ctypes.c_uint64,
+        ctypes.c_uint8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i64_arr_c_major,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        ctypes.POINTER(c_int64),
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i64_arr_byte_strides,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_ssize_t_p,
+        ctypes.POINTER(c_int64),
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i64_arr_elem_strides,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_ssize_t_p,
+        ctypes.POINTER(c_int64),
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_buffer_column_f64,
         c_bool,
         c_line_sender_buffer_p,
@@ -302,6 +530,17 @@ def _setup_cdll():
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_f64_arr_byte_strides,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_ssize_t_p,
+        c_double_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f64_arr_elem_strides,
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
@@ -374,6 +613,18 @@ def _setup_cdll():
         c_bool,
         c_line_sender_opts_p,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_max_datagram_size,
+        c_bool,
+        c_line_sender_opts_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_multicast_ttl,
+        c_bool,
+        c_line_sender_opts_p,
+        c_uint32,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_opts_username,
@@ -509,6 +760,10 @@ def _setup_cdll():
         c_bool,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_get_protocol,
+        c_line_sender_protocol,
+        c_line_sender_p)
+    set_sig(
         dll.line_sender_get_protocol_version,
         c_protocol_version,
         c_line_sender_p)
@@ -516,6 +771,63 @@ def _setup_cdll():
         dll.line_sender_get_max_name_len,
         c_size_t,
         c_line_sender_p)
+    set_sig(
+        dll.line_sender_qwpws_flush_and_get_fsn,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_buffer_p,
+        ctypes.POINTER(line_sender_qwpws_fsn),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_published_fsn,
+        c_bool,
+        c_line_sender_p,
+        ctypes.POINTER(line_sender_qwpws_fsn),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_acked_fsn,
+        c_bool,
+        c_line_sender_p,
+        ctypes.POINTER(line_sender_qwpws_fsn),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_await_acked_fsn,
+        c_bool,
+        c_line_sender_p,
+        c_uint64,
+        c_uint64,
+        ctypes.POINTER(c_bool),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_poll_error,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_qwpws_error_p_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_error_get_view,
+        line_sender_qwpws_error_view,
+        c_line_sender_qwpws_error_p)
+    set_sig(
+        dll.line_sender_error_qwpws_get_view,
+        c_bool,
+        c_line_sender_error_p,
+        ctypes.POINTER(line_sender_qwpws_error_view))
+    set_sig(
+        dll.line_sender_qwpws_error_free,
+        None,
+        c_line_sender_qwpws_error_p)
+    set_sig(
+        dll.line_sender_qwpws_errors_dropped,
+        c_bool,
+        c_line_sender_p,
+        ctypes.POINTER(c_uint64),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_close_drain,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_error_p_p)
     return dll
 
 
@@ -528,9 +840,66 @@ _PY_DLL.PyBytes_FromStringAndSize.restype = ctypes.py_object
 _PY_DLL.PyBytes_FromStringAndSize.argtypes = [ctypes.c_char_p, ctypes.c_ssize_t]
 
 
+class QwpWsError:
+    def __init__(
+            self,
+            category: QwpWsErrorCategory,
+            applied_policy: QwpWsErrorPolicy,
+            status: Optional[int],
+            message_sequence: Optional[int],
+            from_fsn: int,
+            to_fsn: int,
+            message: str):
+        self.category = category
+        self.applied_policy = applied_policy
+        self.status = status
+        self.message_sequence = message_sequence
+        self.from_fsn = from_fsn
+        self.to_fsn = to_fsn
+        self.message = message
+
+    def __repr__(self):
+        return (
+            'QwpWsError('
+            f'category={self.category}, '
+            f'applied_policy={self.applied_policy}, '
+            f'status={self.status}, '
+            f'message_sequence={self.message_sequence}, '
+            f'from_fsn={self.from_fsn}, '
+            f'to_fsn={self.to_fsn}, '
+            f'message={self.message!r})')
+
+
 class SenderError(Exception):
     """An error whilst using the line sender."""
-    pass
+    def __init__(self, message: str, qwp_ws_error: Optional[QwpWsError] = None):
+        super().__init__(message)
+        self.qwp_ws_error = qwp_ws_error
+
+
+def _qwpws_error_view_to_py(view):
+    if view.message and view.message_len:
+        message = _PY_DLL.PyUnicode_FromKindAndData(
+            1,  # PyUnicode_1BYTE_KIND
+            c_void_p(view.message),
+            c_ssize_t(view.message_len))
+    else:
+        message = ''
+    return QwpWsError(
+        QwpWsErrorCategory.from_int(view.category),
+        QwpWsErrorPolicy.from_int(view.applied_policy),
+        view.status if view.has_status else None,
+        view.message_sequence if view.has_message_sequence else None,
+        view.from_fsn,
+        view.to_fsn,
+        message)
+
+
+def _qwpws_error_from_sender_error(err_p):
+    view = line_sender_qwpws_error_view()
+    if _DLL.line_sender_error_qwpws_get_view(err_p, ctypes.byref(view)):
+        return _qwpws_error_view_to_py(view)
+    return None
 
 
 def _c_err_to_py(err_p):
@@ -541,7 +910,7 @@ def _c_err_to_py(err_p):
             1,  # PyUnicode_1BYTE_KIND
             msg_p,
             c_ssize_t(c_len.value))
-        return SenderError(py_msg)
+        return SenderError(py_msg, _qwpws_error_from_sender_error(err_p))
     finally:
         _DLL.line_sender_error_free(err_p)
 
@@ -647,7 +1016,20 @@ class Buffer:
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
             protocol_version.value[0],
             c_size_t(max_name_len))
-        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_reserve,
+            self._impl,
+            c_size_t(init_buf_size))
+
+    @classmethod
+    def from_sender(cls, sender_impl, init_buf_size=65536):
+        self = cls.__new__(cls)
+        self._impl = _DLL.line_sender_buffer_new_for_sender(sender_impl)
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_reserve,
+            self._impl,
+            c_size_t(init_buf_size))
+        return self
 
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)
@@ -662,7 +1044,10 @@ class Buffer:
             return ''
 
     def reserve(self, additional):
-        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(additional))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_reserve,
+            self._impl,
+            c_size_t(additional))
 
     @property
     def capacity(self):
@@ -670,6 +1055,22 @@ class Buffer:
 
     def clear(self):
         _DLL.line_sender_buffer_clear(self._impl)
+
+    def set_marker(self):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_set_marker,
+            self._impl)
+        return self
+
+    def rewind_to_marker(self):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_rewind_to_marker,
+            self._impl)
+        return self
+
+    def clear_marker(self):
+        _DLL.line_sender_buffer_clear_marker(self._impl)
+        return self
 
     def table(self, table: str):
         table_name = _table_name(table)
@@ -695,6 +1096,183 @@ class Buffer:
             _column_name(name),
             c_utf8,
             len(c_utf8))
+
+    def column_i8(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i8,
+            self._impl,
+            _column_name(name),
+            int(value))
+        return self
+
+    def column_i16(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i16,
+            self._impl,
+            _column_name(name),
+            int(value))
+        return self
+
+    def column_i32(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i32,
+            self._impl,
+            _column_name(name),
+            int(value))
+        return self
+
+    def column_f32(self, name: str, value: float):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_f32,
+            self._impl,
+            _column_name(name),
+            ctypes.c_float(value))
+        return self
+
+    def column_dec64_str(self, name: str, value: str):
+        c_utf8 = value.encode('utf-8')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec64_str,
+            self._impl,
+            _column_name(name),
+            c_utf8,
+            len(c_utf8))
+        return self
+
+    def column_dec64(self, name: str, scale: int, le_bytes: bytes):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec64,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint32(scale),
+            le_bytes,
+            len(le_bytes))
+        return self
+
+    def column_dec128_str(self, name: str, value: str):
+        c_utf8 = value.encode('utf-8')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec128_str,
+            self._impl,
+            _column_name(name),
+            c_utf8,
+            len(c_utf8))
+        return self
+
+    def column_dec128(self, name: str, scale: int, le_bytes: bytes):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec128,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint32(scale),
+            le_bytes,
+            len(le_bytes))
+        return self
+
+    def column_uuid(self, name: str, lo: int, hi: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_uuid,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint64(lo),
+            ctypes.c_uint64(hi))
+        return self
+
+    def column_long256(self, name: str, value: bytes):
+        if len(value) != 32:
+            raise ValueError('column_long256 value must be exactly 32 bytes')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_long256,
+            self._impl,
+            _column_name(name),
+            value)
+        return self
+
+    def column_ipv4(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_ipv4,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint32(value))
+        return self
+
+    def column_date(self, name: str, millis: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_date,
+            self._impl,
+            _column_name(name),
+            int(millis))
+        return self
+
+    def column_char(self, name: str, value: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_char,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint16(value))
+        return self
+
+    def column_binary(self, name: str, value: bytes):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_binary,
+            self._impl,
+            _column_name(name),
+            value,
+            len(value))
+        return self
+
+    def column_geohash(self, name: str, bits: int, precision_bits: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_geohash,
+            self._impl,
+            _column_name(name),
+            ctypes.c_uint64(bits),
+            ctypes.c_uint8(precision_bits))
+        return self
+
+    def column_i64_arr(self, name: str, array):
+        arr = numpy.ascontiguousarray(array, dtype=numpy.int64)
+        c_shape = (c_size_t * arr.ndim)(*arr.shape)
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i64_arr_c_major,
+            self._impl,
+            _column_name(name),
+            c_size_t(arr.ndim),
+            c_shape,
+            arr.ctypes.data_as(ctypes.POINTER(c_int64)),
+            c_size_t(arr.size))
+        return self
+
+    def column_i64_arr_byte_strides(self, name: str, array):
+        arr = numpy.asarray(array, dtype=numpy.int64)
+        c_shape = (c_size_t * arr.ndim)(*arr.shape)
+        c_strides = (c_ssize_t * arr.ndim)(*arr.strides)
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i64_arr_byte_strides,
+            self._impl,
+            _column_name(name),
+            c_size_t(arr.ndim),
+            c_shape,
+            c_strides,
+            arr.ctypes.data_as(ctypes.POINTER(c_int64)),
+            c_size_t(arr.size))
+        return self
+
+    def column_i64_arr_elem_strides(self, name: str, array):
+        arr = numpy.asarray(array, dtype=numpy.int64)
+        c_shape = (c_size_t * arr.ndim)(*arr.shape)
+        c_strides = (c_ssize_t * arr.ndim)(
+            *(s // arr.itemsize for s in arr.strides))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_i64_arr_elem_strides,
+            self._impl,
+            _column_name(name),
+            c_size_t(arr.ndim),
+            c_shape,
+            c_strides,
+            arr.ctypes.data_as(ctypes.POINTER(c_int64)),
+            c_size_t(arr.size))
+        return self
 
     def column(
             self, name: str,
@@ -855,7 +1433,7 @@ class Sender:
             port: Union[str, int],
             **kwargs):
 
-        if protocol in (Protocol.TCPS, Protocol.HTTPS):
+        if protocol in (Protocol.TCPS, Protocol.HTTPS, Protocol.QWPWSS):
             if host == '127.0.0.1':
                 host = 'localhost'  # for TLS connections we need a hostname
 
@@ -877,6 +1455,15 @@ class Sender:
 
         self._conf = ''.join(self._conf)
         self._opts = opts
+
+    @classmethod
+    def from_conf(cls, conf: str):
+        sender = cls.__new__(cls)
+        sender._build_mode = BuildMode.CONF
+        sender._impl = None
+        sender._conf = conf
+        sender._opts = None
+        return sender
 
     @property
     def buffer(self):
@@ -906,14 +1493,17 @@ class Sender:
 
     def __enter__(self):
         self.connect()
-        self._buffer = Buffer(
-            protocol_version=self.protocol_version,
-            max_name_len=self.max_name_len)
+        self._buffer = Buffer.from_sender(self._impl)
         return self
 
     def _check_connected(self):
         if not self._impl:
             raise SenderError('Not connected.')
+
+    @property
+    def protocol(self):
+        self._check_connected()
+        return Protocol.from_int(_DLL.line_sender_get_protocol(self._impl))
 
     @property
     def protocol_version(self):
@@ -944,6 +1534,78 @@ class Sender:
             self, name: str,
             value: str):
         self._buffer.column_dec_str(name, value)
+        return self
+
+    def column_i8(self, name: str, value: int):
+        self._buffer.column_i8(name, value)
+        return self
+
+    def column_i16(self, name: str, value: int):
+        self._buffer.column_i16(name, value)
+        return self
+
+    def column_i32(self, name: str, value: int):
+        self._buffer.column_i32(name, value)
+        return self
+
+    def column_f32(self, name: str, value: float):
+        self._buffer.column_f32(name, value)
+        return self
+
+    def column_dec64_str(self, name: str, value: str):
+        self._buffer.column_dec64_str(name, value)
+        return self
+
+    def column_dec64(self, name: str, scale: int, le_bytes: bytes):
+        self._buffer.column_dec64(name, scale, le_bytes)
+        return self
+
+    def column_dec128_str(self, name: str, value: str):
+        self._buffer.column_dec128_str(name, value)
+        return self
+
+    def column_dec128(self, name: str, scale: int, le_bytes: bytes):
+        self._buffer.column_dec128(name, scale, le_bytes)
+        return self
+
+    def column_uuid(self, name: str, lo: int, hi: int):
+        self._buffer.column_uuid(name, lo, hi)
+        return self
+
+    def column_long256(self, name: str, value: bytes):
+        self._buffer.column_long256(name, value)
+        return self
+
+    def column_ipv4(self, name: str, value: int):
+        self._buffer.column_ipv4(name, value)
+        return self
+
+    def column_date(self, name: str, millis: int):
+        self._buffer.column_date(name, millis)
+        return self
+
+    def column_char(self, name: str, value: int):
+        self._buffer.column_char(name, value)
+        return self
+
+    def column_binary(self, name: str, value: bytes):
+        self._buffer.column_binary(name, value)
+        return self
+
+    def column_geohash(self, name: str, bits: int, precision_bits: int):
+        self._buffer.column_geohash(name, bits, precision_bits)
+        return self
+
+    def column_i64_arr(self, name: str, array):
+        self._buffer.column_i64_arr(name, array)
+        return self
+
+    def column_i64_arr_byte_strides(self, name: str, array):
+        self._buffer.column_i64_arr_byte_strides(name, array)
+        return self
+
+    def column_i64_arr_elem_strides(self, name: str, array):
+        self._buffer.column_i64_arr_elem_strides(name, array)
         return self
 
     def column_f64_arr(
@@ -1003,12 +1665,88 @@ class Sender:
                 self._buffer.clear()
             raise
 
+    def flush_and_get_fsn(self, buffer: Optional[Buffer] = None) -> Optional[int]:
+        buffer = buffer or self._buffer
+        self._check_connected()
+        fsn = line_sender_qwpws_fsn()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_flush_and_get_fsn,
+            self._impl,
+            buffer._impl,
+            ctypes.byref(fsn))
+        if fsn.has_value:
+            return fsn.value
+        return None
+
+    def published_fsn(self) -> Optional[int]:
+        self._check_connected()
+        fsn = line_sender_qwpws_fsn()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_published_fsn,
+            self._impl,
+            ctypes.byref(fsn))
+        if fsn.has_value:
+            return fsn.value
+        return None
+
+    def acked_fsn(self) -> Optional[int]:
+        self._check_connected()
+        fsn = line_sender_qwpws_fsn()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_acked_fsn,
+            self._impl,
+            ctypes.byref(fsn))
+        if fsn.has_value:
+            return fsn.value
+        return None
+
+    def await_acked_fsn(self, fsn: int, timeout_millis: int) -> bool:
+        self._check_connected()
+        reached = c_bool(False)
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_await_acked_fsn,
+            self._impl,
+            c_uint64(fsn),
+            c_uint64(timeout_millis),
+            ctypes.byref(reached))
+        return bool(reached.value)
+
+    def poll_qwp_ws_error(self) -> Optional[QwpWsError]:
+        self._check_connected()
+        qwp_error = c_line_sender_qwpws_error_p()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_poll_error,
+            self._impl,
+            ctypes.byref(qwp_error))
+        if not qwp_error:
+            return None
+        try:
+            view = _DLL.line_sender_qwpws_error_get_view(qwp_error)
+            return _qwpws_error_view_to_py(view)
+        finally:
+            _DLL.line_sender_qwpws_error_free(qwp_error)
+
+    def qwp_ws_errors_dropped(self) -> int:
+        self._check_connected()
+        dropped = c_uint64(0)
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_errors_dropped,
+            self._impl,
+            ctypes.byref(dropped))
+        return dropped.value
+
     def close(self, flush=True):
         if self._impl and not _DLL.line_sender_must_close(self._impl) and flush:
             self.flush()
         if self._impl:
             _DLL.line_sender_close(self._impl)
             self._impl = None
+
+    def close_drain(self):
+        self._check_connected()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_close_drain,
+            self._impl)
 
     def __exit__(self, exc_type, _exc_val, _exc_tb):
         self.close(not exc_type)

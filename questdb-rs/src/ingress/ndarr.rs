@@ -85,17 +85,37 @@ where
     }
 
     // For non-contiguous memory layouts, direct raw pointer operations are preferred.
+    if buf.len() < expect_size {
+        return Err(error::fmt!(
+            ArrayError,
+            "Buffer capacity {} < required {}",
+            buf.len(),
+            expect_size
+        ));
+    }
+
     let elem_size = size_of::<T>();
-    let mut total_len = 0;
-    for (i, &element) in array.iter().enumerate() {
+    let mut total_len = 0usize;
+    for &element in array.iter() {
+        let end = total_len
+            .checked_add(elem_size)
+            .ok_or_else(|| error::fmt!(ArrayError, "Array write buffer length overflow"))?;
+        if end > expect_size {
+            return Err(error::fmt!(
+                ArrayError,
+                "Array write buffer length mismatch (actual: {}, expected: {})",
+                end,
+                expect_size
+            ));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &element as *const T as *const u8,
-                buf.as_mut_ptr().add(i * elem_size),
+                buf.as_mut_ptr().add(total_len),
                 elem_size,
             )
         }
-        total_len += elem_size;
+        total_len = end;
     }
     if total_len != expect_size {
         return Err(error::fmt!(
@@ -127,7 +147,13 @@ where
             ));
         }
         // following dimension's length may be zero, so check the size in out of loop
-        size *= dim;
+        size = size.checked_mul(dim).ok_or_else(|| {
+            error::fmt!(
+                ArrayError,
+                "Array buffer size overflow: maximum: {}",
+                MAX_ARRAY_BUFFER_SIZE
+            )
+        })?;
     }
 
     if size > MAX_ARRAY_BUFFER_SIZE {
@@ -158,6 +184,14 @@ impl ArrayElement for f64 {}
 impl ArrayElementSealed for f64 {
     fn type_tag() -> u8 {
         10 // Double
+    }
+}
+
+impl ArrayElement for i64 {}
+
+impl ArrayElementSealed for i64 {
+    fn type_tag() -> u8 {
+        6 // Long
     }
 }
 

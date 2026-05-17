@@ -39,3 +39,21 @@ For API usage:
   and [`tls`](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/struct.SenderBuilder.html#method.tls) methods.
 * C: [examples/line_sender_c_example_auth.c](../examples/line_sender_c_example_auth.c)
 * C++: [examples/line_sender_cpp_example_auth.cpp](../examples/line_sender_cpp_example_auth.cpp)
+
+## QWP/UDP security posture
+
+The `qwpudp::` transport carries **no authentication and no TLS**. UDP is
+connectionless, so the server cannot verify client identity at the protocol
+layer, and datagram contents travel unencrypted.
+
+Passing `username`, `password`, `token`, `token_x`, `token_y`, or
+`auth_timeout` to a `qwpudp::` sender is rejected when the setting is applied,
+either while parsing a config string or while calling the corresponding builder
+method. The error names the unsupported setting, for example
+`The "username" setting is not supported for QWP/UDP.` There is no `qwpudps://`
+(TLS) scheme.
+
+QWP/UDP is therefore intended for **trusted private networks only** —
+typically a co-located client and server, or a network segment under your
+administrative control. For public or untrusted networks, use ILP/HTTP with
+authentication and TLS.

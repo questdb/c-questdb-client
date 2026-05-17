@@ -4,7 +4,9 @@
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
 This client library implements the QuestDB's variant of the [InfluxDB Line Protocol](
-https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over HTTP and TCP.
+https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over HTTP and TCP,
+and the QuestDB Wire Protocol (QWP) over UDP for high-throughput ingestion
+on trusted networks.
 
 When connecting to QuestDB over HTTP, the library will auto-detect the server's
 latest supported version and use it. Version 1 is compatible with
@@ -22,19 +24,27 @@ the [InfluxDB Database](https://docs.influxdata.com/influxdb/v2/reference/syntax
 
 Inserting data into QuestDB can be done in several ways.
 
-This library supports ILP/HTTP (default-recommended) and ILP/TCP (specific
-streaming use cases).
+This library supports three ingestion transports:
+
+* **ILP/HTTP** (default-recommended): request-response, server errors returned
+  to the client, supports authentication and TLS.
+* **ILP/TCP**: streaming, legacy; errors cause disconnect and surface only in
+  server logs.
+* **QWP/UDP**: best-effort datagram transport for high-throughput ingestion on
+  trusted networks; no acknowledgements, no authentication, no TLS.
 
 | Protocol | Record Insertion Reporting | Data Insertion Performance |
 | -------- | -------------------------- | -------------------------- |
 | **[ILP/HTTP](https://questdb.io/docs/reference/api/ilp/overview/)** | Transaction-level (on flush) | **Excellent** |
-| [ILP/TCP](https://questdb.io/docs/reference/api/ilp/overview/)| Errors in logs; Disconnect on error | **Best** (tolerates higher-latency networks) |
+| [ILP/TCP](https://questdb.io/docs/reference/api/ilp/overview/) | Errors in logs; Disconnect on error | **Best** (tolerates higher-latency networks) |
+| QWP/UDP | None (best-effort, unacknowledged) | **Best** (lowest overhead; datagrams may be dropped) |
 | [CSV Upload via HTTP](https://questdb.io/docs/reference/api/rest/#imp---import-data) | Configurable | Very Good |
 | [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
 
-Server errors are only reported back to the client for ILP/HTTP.
-See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for more details on
-how to debug ILP/TCP.
+Server errors are reported back to the client only for ILP/HTTP. ILP/TCP
+surfaces errors via server-side disconnect; QWP/UDP has no error-reporting
+path at all. See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for
+more details on how to debug ILP/TCP and QWP/UDP.
 
 For an overview and code examples, see the
 [Ingestion overview page of the developer docs](https://questdb.io/docs/ingestion-overview/). 
@@ -44,9 +54,9 @@ To understand the protocol in more depth, consult the
 
 ## Protocol Versions
 
-The library supports the following ILP protocol versions.
-
-These protocol versions are supported over both HTTP and TCP.
+The library supports the following ILP protocol versions. These apply to
+ILP/HTTP and ILP/TCP only — QWP/UDP uses its own wire format and is not
+versioned through this mechanism.
 
 * If you use HTTP and `protocol_version=auto` or unset, the library will
   automatically detect the server's

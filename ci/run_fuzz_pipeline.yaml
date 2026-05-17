@@ -2,27 +2,220 @@ trigger: none
 
 pr: none
 
-# Cron against the default branch (and the open egress feature branches),
-# always run even if there were no changes since the previous run. Keeps
-# the paid-minutes bill bounded by running on Microsoft-hosted images
-# while the pull-request-time fuzz coverage stays in
-# run_tests_pipeline.yaml. This pipeline is the always-on stability
-# watchdog for the QWP egress proptest suites and the source of Slack
-# #builds alerts.
+# Hourly cron against the default branch (and active egress feature
+# branches), always run even if there were no changes since the previous
+# run. The Linux leg of the QWP/WS fuzz runs on the self-hosted
+# hetzner-incus pool (matching questdb/questdb's ci/test-fuzz.yml) — the
+# Microsoft-hosted ubuntu-latest agents were hitting "Free disk space on /
+# is lower than 5%" and OOM-killing the test with SIGBUS mid-run. The
+# mac/windows legs stay on Microsoft-hosted images. The pure-Rust QWP
+# egress proptest fuzz runs cross-platform on hosted images (no JDK / no
+# server). Equivalent PR-time jobs live in run_tests_pipeline.yaml
+# (TestQwpWsFuzz / TestQwpEgressLiveServerFuzz); this pipeline is the
+# always-on stability watchdog and the source of Slack #builds alerts.
 schedules:
-  - cron: "10,40 * * * *"
-    displayName: Run QWP egress fuzz every 30 minutes
+  - cron: "0 * * * *"
+    displayName: Run QWP/WS + QWP egress fuzz every hour
     branches:
       include:
         - main
         - vi_egress
-        - sm_egress_fuzz
     always: true
 
 stages:
   - stage: ScheduledFuzz
-    displayName: "Scheduled QWP egress fuzz"
+    displayName: "Scheduled QWP/WS + QWP egress fuzz"
     jobs:
+      - job: TestQwpWsFuzz
+        displayName: "QWP/WS fuzz suite (mac/windows hosted)"
+        strategy:
+          matrix:
+            mac:
+              imageName: "macos-latest"
+            windows-2022:
+              imageName: "windows-2022"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
+          # Same JDK 25 dance as the PR-time fuzz job in
+          # run_tests_pipeline.yaml — Linux/Windows hosted agents ship JDK
+          # 25 at $JAVA_HOME_25_X64; macos-latest does not, so we brew it
+          # in. Resolution stays in a single bash step so the Windows
+          # leg's cmd.exe quote handling doesn't leave a stray `"` on
+          # the resolved path.
+          - bash: |
+              set -e
+              if [[ "$AGENT_OS" == "Darwin" ]]; then
+                brew install openjdk@25
+                JDK_HOME="$(brew --prefix openjdk@25)/libexec/openjdk.jdk/Contents/Home"
+                if [ ! -d "$JDK_HOME" ]; then
+                  JDK_HOME="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+                fi
+                if [ ! -d "$JDK_HOME" ]; then
+                  echo "JDK 25 not found after brew install" >&2
+                  exit 1
+                fi
+              else
+                JDK_HOME="$JAVA_HOME_25_X64"
+              fi
+              echo "Resolved JDK 25: $JDK_HOME"
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
+            displayName: "Resolve JDK 25"
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
+            displayName: "TestQwpWsFuzz"
+          # On failure, archive the QuestDB server log so reviewers don't
+          # have to repro locally to see why the fuzz step blew up. Path
+          # comes from system_test/fixture.py:_log_path
+          # ($BUILD_DIR/questdb/repo/data/log/log.txt). continueOnError
+          # keeps a missing log directory (e.g., server never started)
+          # from masking the real test failure with an archive-step
+          # failure.
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              artifactName: qdb-log-$(Agent.OS)
+
+      # Linux leg on self-hosted hetzner-incus. The pool image is built
+      # from questdb/azure-ci-runners' roles/incus/files/provision.sh,
+      # which already installs openjdk-17-jdk, openjdk-25-jdk, maven,
+      # build-essential, zip, curl, gh, and rustup (system-wide, with
+      # /etc/profile.d/rust.sh sourcing the env). Only cmake and
+      # python3-numpy are missing for this job.
+      # imageName='hetzner-incus' tells compile.yaml to skip its
+      # "Install Python Dependencies" pip step — numpy comes from the
+      # apt step below, and PEP 668 / EXTERNALLY-MANAGED on recent
+      # Ubuntu would otherwise reject pip-into-system-python.
+      - job: TestQwpWsFuzzLinux
+        displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
+        pool:
+          name: hetzner-incus
+        timeoutInMinutes: 90
+        variables:
+          imageName: hetzner-incus
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          # Match questdb's templates/steps.yml: incus containers can be
+          # reused across jobs, so wipe known leftover artifacts before
+          # we start.
+          - bash: |
+              rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
+            displayName: "Cleanup /tmp leftovers"
+          - bash: |
+              set -eux
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends cmake python3-numpy
+              # Image-provided JDK paths (see provision.sh's
+              # `apt-get install -y openjdk-17-jdk openjdk-25-jdk maven`).
+              JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
+              JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
+              for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
+                if [ ! -x "$p/bin/javac" ]; then
+                  echo "Expected JDK missing at $p" >&2
+                  ls /usr/lib/jvm/ >&2 || true
+                  exit 1
+                fi
+              done
+              echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
+              echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
+            displayName: "Install missing deps + resolve JDKs"
+          - bash: |
+              set -eux
+              # provision.sh installs rustup as root into /root/.cargo
+              # and drops /etc/profile.d/rust.sh that `source`s
+              # /root/.cargo/env. Azure bash tasks don't always run as a
+              # login shell, so source what's there explicitly. Fall
+              # back to a user-local rustup install if the build user
+              # can't see the system one.
+              # Both sources may fail under `set -e` if the file references
+              # a path the build user can't read (e.g. /etc/profile.d/rust.sh
+              # contains `source /root/.cargo/env`). `|| true` lets the
+              # fallback rustup-install path below take over.
+              if [ -f /etc/profile.d/rust.sh ]; then . /etc/profile.d/rust.sh || true; fi
+              if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env" || true; fi
+              if ! command -v cargo >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --default-toolchain stable --profile minimal
+                . "$HOME/.cargo/env"
+              fi
+              CARGO_BIN="$(dirname "$(command -v cargo)")"
+              echo "Using cargo from: $CARGO_BIN"
+              echo "##vso[task.prependpath]$CARGO_BIN"
+            displayName: "Resolve Rust toolchain"
+          - template: compile.yaml
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME)"
+              options: "-DskipTests -Pbuild-web-console"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
+            displayName: "TestQwpWsFuzz"
+          - task: ArchiveFiles@2
+            displayName: "Compress QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              quiet: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish QuestDB server log on failure"
+            condition: failed()
+            continueOnError: true
+            inputs:
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
+              artifactName: qdb-log-$(Agent.OS)-linux
+
+      # Pure-Rust proptest fuzz for the QWP egress codec. No server, no
+      # JDK — runs cross-platform on Microsoft-hosted images. Crank
+      # PROPTEST_CASES well above the in-source default so the scheduled
+      # cron actually explores beyond what a standard `cargo test`
+      # would. Failures replay locally via the regression seeds checked
+      # in under questdb-rs/proptest-regressions/egress/.
       - job: TestQwpEgressFuzz
         displayName: "QWP egress fuzz suite (cross-platform)"
         strategy:
@@ -42,12 +235,6 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
-          # The egress fuzz suites are pure-Rust proptest harnesses
-          # (no server, no JDK). Crank PROPTEST_CASES well above the
-          # in-source default so the scheduled cron actually explores
-          # beyond what a standard `cargo test` would. Failures replay
-          # locally via the regression seeds checked in under
-          # questdb-rs/proptest-regressions/egress/.
           - bash: |
               set -euxo pipefail
               cd questdb-rs
@@ -121,14 +308,16 @@ stages:
                 -- --nocapture
             displayName: "QWP egress live-server fuzz (varying seed)"
 
-      # Slack notification on fuzz failure. BUILDS_SLACK_HOOK_URL must
-      # be configured as a secret pipeline variable (or attached via a
-      # shared variable group) before this pipeline is enabled —
-      # otherwise the curl POSTs to an empty URL and the failure message
-      # is lost.
+      # Mirrors questdb/questdb's docker-release-pipeline.yml NotifyOnFailure
+      # pattern. BUILDS_SLACK_HOOK_URL must be configured as a secret
+      # pipeline variable (or attached via a shared variable group) before
+      # this pipeline is enabled — otherwise the curl will POST to an
+      # empty URL and the failure message is lost.
       - job: NotifyOnFailure
         displayName: "Notify Slack on failure"
         dependsOn:
+          - TestQwpWsFuzz
+          - TestQwpWsFuzzLinux
           - TestQwpEgressFuzz
           - TestQwpEgressLiveServerFuzz
         condition: failed()
@@ -141,7 +330,7 @@ stages:
             inputs:
               script: |
                 curl -X POST -H 'Content-type: application/json' \
-                  --data '{"text":"🚨 *c-questdb-client QWP egress fuzz failed*\n\nBranch: `$(Build.SourceBranchName)`\nBuild: <$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|#$(Build.BuildId)>\nCommit: `$(Build.SourceVersion)`"}' \
+                  --data '{"text":"🚨 *c-questdb-client QWP/WS + egress fuzz failed*\n\nBranch: `$(Build.SourceBranchName)`\nBuild: <$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|#$(Build.BuildId)>\nCommit: `$(Build.SourceVersion)`"}' \
                   "$(BUILDS_SLACK_HOOK_URL)"
             env:
               BUILDS_SLACK_HOOK_URL: $(BUILDS_SLACK_HOOK_URL)

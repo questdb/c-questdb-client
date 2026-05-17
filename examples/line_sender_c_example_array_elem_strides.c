@@ -33,7 +33,8 @@ static bool example(const char* host, const char* port)
     conf_str = NULL;
 
     buffer = line_sender_buffer_new_for_sender(sender);
-    line_sender_buffer_reserve(buffer, 64 * 1024);
+    if (!line_sender_buffer_reserve(buffer, 64 * 1024, &err))
+        goto on_error;
 
     line_sender_table_name table_name =
         QDB_TABLE_NAME_LITERAL("market_orders_elem_strides");

@@ -23,13 +23,14 @@
  ******************************************************************************/
 
 use crate::ErrorCode;
-use crate::ingress::{ARRAY_BINARY_FORMAT_TYPE, Buffer, NdArrayView, ProtocolVersion};
+use crate::ingress::ndarr::{check_and_get_array_bytes_size, write_array_data};
+use crate::ingress::{
+    ARRAY_BINARY_FORMAT_TYPE, Buffer, MAX_ARRAY_DIM_LEN, NdArrayView, ProtocolVersion,
+};
 use crate::tests::TestResult;
 
 #[cfg(feature = "ndarray")]
 use crate::ingress::MAX_ARRAY_DIMS;
-#[cfg(feature = "ndarray")]
-use crate::ingress::ndarr::write_array_data;
 #[cfg(feature = "ndarray")]
 use ndarray::{ArrayD, arr1, arr2, arr3, s};
 #[cfg(feature = "ndarray")]
@@ -65,6 +66,81 @@ impl TryFrom<u8> for ArrayColumnTypeTag {
             _ => Err(format!("Unsupported column type tag {value} for arrays")),
         }
     }
+}
+
+struct OverflowingArrayShape;
+
+impl NdArrayView<f64> for OverflowingArrayShape {
+    type Iter<'a> = std::iter::Empty<&'a f64>;
+
+    fn ndim(&self) -> usize {
+        4
+    }
+
+    fn dim(&self, _index: usize) -> crate::Result<usize> {
+        Ok(MAX_ARRAY_DIM_LEN)
+    }
+
+    fn as_slice(&self) -> Option<&[f64]> {
+        None
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        std::iter::empty()
+    }
+}
+
+struct ExtraIteratorElementArray([f64; 2]);
+
+impl NdArrayView<f64> for ExtraIteratorElementArray {
+    type Iter<'a>
+        = std::slice::Iter<'a, f64>
+    where
+        Self: 'a;
+
+    fn ndim(&self) -> usize {
+        1
+    }
+
+    fn dim(&self, index: usize) -> crate::Result<usize> {
+        if index == 0 {
+            Ok(1)
+        } else {
+            Err(crate::error::fmt!(
+                ArrayError,
+                "Dimension index out of bounds"
+            ))
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[f64]> {
+        None
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.0.iter()
+    }
+}
+
+#[test]
+fn test_array_byte_size_overflow_is_error() {
+    let err = check_and_get_array_bytes_size(&OverflowingArrayShape).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ArrayError);
+    assert!(err.msg().contains("Array buffer size"));
+}
+
+#[test]
+fn test_write_array_data_rejects_extra_iterator_elements() {
+    let elem_size = std::mem::size_of::<f64>();
+    let view = ExtraIteratorElementArray([1.0, 2.0]);
+    let mut buf = vec![0xa5; elem_size * 2];
+
+    let err = write_array_data(&view, &mut buf, elem_size).unwrap_err();
+
+    assert_eq!(err.code(), ErrorCode::ArrayError);
+    assert!(err.msg().contains("Array write buffer length mismatch"));
+    assert_eq!(&buf[..elem_size], &1.0f64.to_ne_bytes());
+    assert!(buf[elem_size..].iter().all(|&byte| byte == 0xa5));
 }
 
 #[test]

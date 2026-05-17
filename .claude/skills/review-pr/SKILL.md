@@ -16,11 +16,11 @@ You are a senior QuestDB engineer performing a blocking code review. The QuestDB
 - **Flag every issue you find**, no matter how small. Do not soften language or hedge. Say "this is wrong" not "this might be an issue".
 - **Do not praise the code.** Skip "looks good", "nice work", "clever approach". Focus entirely on problems and risks.
 - **Think adversarially.** For each change, work through:
-    - Inputs: which values break this? Consider empty buffers, zero-length strings, boundary integers, max-length symbols.
-    - Encoding: how does the code behave when a string contains invalid UTF-8, embedded NUL bytes, or oversized lengths?
-    - Concurrency: what happens under concurrent access or interleaved calls from a host language?
-    - Failure modes: connection dropping mid-flush, partial write, TLS handshake failure, auth rejection.
-    - FFI callers: what happens when the caller passes NULL, an unaligned pointer, a freed handle, a buffer length lying about its actual size?
+  - Inputs: which values break this? Consider empty buffers, zero-length strings, boundary integers, max-length symbols.
+  - Encoding: how does the code behave when a string contains invalid UTF-8, embedded NUL bytes, or oversized lengths?
+  - Concurrency: what happens under concurrent access or interleaved calls from a host language?
+  - Failure modes: connection dropping mid-flush, partial write, TLS handshake failure, auth rejection.
+  - FFI callers: what happens when the caller passes NULL, an unaligned pointer, a freed handle, a buffer length lying about its actual size?
 - **Check what's missing**, not just what's there. Missing tests, missing error handling, missing edge cases, missing documentation for public API changes, C header out of sync with Rust impl.
 - **Verify every claim.** If the PR title says "fix", verify the bug actually existed and the fix is correct. If it says "improve performance", look for benchmarks or reason about the algorithmic change. If it says "simplify", verify the new code is actually simpler and doesn't drop behavior. Treat the PR description as an unverified hypothesis.
 - **Read the full context of changed files** when the diff alone is ambiguous. Use Read/Grep/Glob to inspect surrounding code, callers, and related tests.
@@ -35,7 +35,7 @@ The level controls how much of the review below actually runs. Lower levels keep
 
 | Level | What runs |
 |-------|-----------|
-| **0 (default)** | Steps 1, 2, 4. Skip Step 2.5. Skip Step 3 — no agent spawn; review the diff inline in the main loop, using Read/Grep on demand to resolve ambiguities. Skip Step 3b — verify each finding inline as you write it. Single-pass review covering correctness, FFI safety, panics, tests, and coding standards on the diff itself. |Collapse commentComment on line R38coderabbitai[bot] commented on May 14, 2026 coderabbitai[bot]on May 14, 2026More actions⚠️ Potential issue | 🟡 Minor | ⚡ Quick win
+| **0 (default)** | Steps 1, 2, 4. Skip Step 2.5. Skip Step 3 — no agent spawn; review the diff inline in the main loop, using Read/Grep on demand to resolve ambiguities. Skip Step 3b — verify each finding inline as you write it. Single-pass review covering correctness, FFI safety, panics, tests, and coding standards on the diff itself. |
 | **1** | Adds Step 2.5a (semantic delta only — skip 2.5b/2.5c/2.5d). In Step 3, launch only Agent 1 (correctness), Agent 2 (Rust safety), and Agent 7 (tests) in parallel. Skip all other agents. Skip Step 3b — verify findings inline as you draft the report. |
 | **2** | Full Step 2.5, but in 2.5b restrict the callsite inventory to `pub`/`pub(crate)` Rust symbols plus every `#[no_mangle]`/`extern "C"` export. In Step 3, launch Agents 1-8. Skip Agent 9 (cross-context) and Agent 10 (adversarial fresh-context). Step 3b uses a single batched verification agent for all findings instead of one per finding. |
 | **3** | Every step below as written, all 10 agents, per-finding verification. The full mission-critical pass. |
@@ -314,9 +314,9 @@ Anything that aborts the Rust side aborts the host process. Beyond panics, check
 
 ### Unresolved TODOs and FIXMEs
 - Scan the diff for `TODO`, `FIXME`, `HACK`, `XXX`, and `WORKAROUND` comments. For each one found:
-    - Is it a pre-existing comment that was just moved/reformatted, or newly introduced in this PR?
-    - If newly introduced: does it represent unfinished work that should block the merge, or a known limitation that is acceptable to ship? Flag any that look like deferred bugs or incomplete implementations.
-    - If the TODO references a ticket/issue number, verify the reference exists.
+  - Is it a pre-existing comment that was just moved/reformatted, or newly introduced in this PR?
+  - If newly introduced: does it represent unfinished work that should block the merge, or a known limitation that is acceptable to ship? Flag any that look like deferred bugs or incomplete implementations.
+  - If the TODO references a ticket/issue number, verify the reference exists.
 
 ### Commit messages
 - Plain English titles, under 50 chars

@@ -94,6 +94,9 @@ To determine the buffer size, call:
 * C++: `buffer.size()`
 * Rust: `buffer.len()`
 
+For ILP buffers this is the exact pending byte length. For QWP buffers this is
+a buffered size hint rather than the exact size of any eventual UDP datagram.
+
 *Closing the connection will not auto-flush.*
 
 ### Disconnections, Data Errors and troubleshooting
@@ -121,7 +124,29 @@ column, the QuestDB server would disconnect the client.
 To determine the root cause of a disconnect, inspect the
 [server logs](https://questdb.io/docs/troubleshooting/log/).
 
+#### QWP/UDP
+
+QWP/UDP is a best-effort datagram transport and provides **no
+acknowledgements**. A successful return from `flush` only means the datagrams
+were handed to the operating system — it is not a confirmation that the
+server received or accepted them. Datagrams may be lost or reordered by the
+network or dropped by the server if its receive buffers fill up.
+
+There are also **no transactional guarantees**. A single `flush` can produce
+multiple datagrams, and each is delivered independently — the server may
+apply some and miss others.
+
+When rows do not appear server-side, inspect the
+[server logs](https://questdb.io/docs/troubleshooting/log/) and confirm that
+`qwp.udp.enabled=true` (and the matching bind address) are set on the
+server. The Rust module docs for `Protocol::QwpUdp` cover the full set of
+configuration parameters and their semantics.
+
 You can inspect the contents of a constructed buffer at any time calling:
 * C: `line_sender_buffer_peek`
 * C++: `buffer.peek()`
-* Rust: `buffer.as_str()`
+* Rust: `buffer.as_bytes()` (wrap in `std::str::from_utf8(..)` for ILP)
+
+This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
+encoded into UDP datagrams during `flush`, so `peek` / `as_bytes` are not
+useful there — `as_bytes` returns an empty slice for QWP buffers.

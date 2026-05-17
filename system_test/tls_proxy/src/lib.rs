@@ -30,9 +30,9 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 use tokio::io as tio;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::select;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -64,14 +64,12 @@ pub fn tls_config() -> Arc<ServerConfig> {
 }
 
 async fn handle_conn(
-    listener: &TcpListener,
-    acceptor: &TlsAcceptor,
-    dest_addr: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (inbound_conn, _) = listener.accept().await?;
+    inbound_conn: TcpStream,
+    acceptor: TlsAcceptor,
+    dest_addr: String,
+) -> anyhow::Result<()> {
     inbound_conn.set_nodelay(true)?;
-    let outbound_conn = TcpStream::connect(dest_addr);
-    let acceptor = acceptor.clone();
+    let outbound_conn = TcpStream::connect(&dest_addr);
     let inbound_conn = acceptor.accept(inbound_conn).await?;
     let outbound_conn = outbound_conn.await?;
     outbound_conn.set_nodelay(true)?;
@@ -79,13 +77,22 @@ async fn handle_conn(
     let (mut in_read, mut in_write) = tio::split(inbound_conn);
     let (mut out_read, mut out_write) = outbound_conn.into_split();
 
-    let in_to_out = tokio::spawn(async move { tio::copy(&mut in_read, &mut out_write).await });
-    let out_to_in = tokio::spawn(async move { tio::copy(&mut out_read, &mut in_write).await });
+    let in_to_out = tokio::spawn(async move {
+        let result = tio::copy(&mut in_read, &mut out_write).await;
+        let _ = out_write.shutdown().await;
+        result
+    });
+    let out_to_in = tokio::spawn(async move {
+        let result = tio::copy(&mut out_read, &mut in_write).await;
+        let _ = in_write.shutdown().await;
+        result
+    });
 
-    select! {
-        _ = in_to_out => eprintln!("[TLS PROXY] in_to_out shut down."),
-        _ = out_to_in => eprintln!("[TLS PROXY] out_to_in shut down."),
-    }
+    let (in_to_out, out_to_in) = tokio::join!(in_to_out, out_to_in);
+    eprintln!(
+        "[TLS PROXY] connection shut down [in_to_out={:?}, out_to_in={:?}].",
+        in_to_out?, out_to_in?
+    );
 
     Ok(())
 }
@@ -106,9 +113,14 @@ async fn loop_server(
     listen_port_sender.send(listen_port).unwrap();
 
     loop {
-        if let Err(err) = handle_conn(&listener, &acceptor, &dest_addr).await {
-            eprintln!("[TLS PROXY] Error handling connection: {err}");
-        }
+        let (inbound_conn, _) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let dest_addr = dest_addr.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_conn(inbound_conn, acceptor, dest_addr).await {
+                eprintln!("[TLS PROXY] Error handling connection: {err}");
+            }
+        });
     }
 }
 

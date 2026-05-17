@@ -29,7 +29,8 @@ static bool example(const char* host, const char* port)
     conf_str = NULL;
 
     buffer = line_sender_buffer_new_for_sender(sender);
-    line_sender_buffer_reserve(buffer, 64 * 1024); // 64KB buffer initial size.
+    if (!line_sender_buffer_reserve(buffer, 64 * 1024, &err)) // 64KB initial.
+        goto on_error;
 
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
