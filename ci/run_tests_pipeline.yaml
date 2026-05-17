@@ -143,7 +143,12 @@ stages:
           - bash: |
               set -eux
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cmake python3-numpy
+              sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
+              # Ubuntu 24.04's python3-numpy is 1.26 which caps NPY_MAXDIMS at 32;
+              # the >32-dim sender-rejection test (TestSender.test_f64_arr_max_dims)
+              # needs numpy >= 2.0 to construct the input array. Upgrade in place;
+              # --break-system-packages overrides PEP 668 / EXTERNALLY-MANAGED.
+              sudo python3 -m pip install --break-system-packages -U 'numpy>=2'
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
               JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
               for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
