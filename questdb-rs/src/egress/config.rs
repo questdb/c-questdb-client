@@ -39,7 +39,7 @@
 //! | `path`             | endpoint path (`/read/v1`)                               |
 //! | `max_version`      | QWP version to advertise (`2`)                           |
 //! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
-//! | `compression_level`| `zstd` level advertised in `X-QWP-Accept-Encoding` as `zstd;level=N`; `[1,22]`, default `3` (server clamps to `[1,9]`); ignored when `compression=raw` |
+//! | `compression_level`| `zstd` level advertised in `X-QWP-Accept-Encoding` as `zstd;level=N`; `[1,22]`, default `1` (server clamps to `[1,9]`); ignored when `compression=raw` |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
 //! | `client_id`        | optional; sent only when set                             |
 //! | `target`           | `any`/`primary`/`replica` (default `any`)                |
@@ -318,11 +318,22 @@ pub const DEFAULT_FAILOVER_MAX_DURATION_MS: u64 = 30_000;
 pub const MAX_FAILOVER_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 
 /// Default `zstd` compression level advertised in `X-QWP-Accept-Encoding`
-/// as `zstd;level=N`. Wire-egress.md §3 fixes the server default at `3`
-/// and clamps any advertised value to `[1, 9]`; we match the Java
-/// reference (`compression_level=N`, default 3) so a connect string ports
-/// across clients.
-pub const DEFAULT_COMPRESSION_LEVEL: u8 = 3;
+/// as `zstd;level=N`.
+///
+/// This controls the **server-side** encoder: the server honors the
+/// client's requested level when emitting response batches, clamping
+/// anything outside `[1, 9]` into that range (so e.g. level 22 lands
+/// as 9 on the wire). Client-side decode cost is essentially
+/// level-independent, so the trade-off is server CPU per batch vs.
+/// payload size on the wire.
+///
+/// We **diverge from the Java reference** (`compression_level=N`,
+/// default 3) and ship `1` here: level 1 cuts per-batch encoder CPU
+/// substantially with only a modest hit to compression ratio, which is
+/// the better default for the QuestDB workloads we care about. Users who
+/// care more about bytes-on-wire can opt back in with
+/// `compression_level=3` (or anything up to 9 on the effective range).
+pub const DEFAULT_COMPRESSION_LEVEL: u8 = 1;
 
 /// Minimum accepted `compression_level`. Matches zstd's documented range
 /// and the Java reference. `0` is rejected because the spec uses absence
@@ -394,7 +405,7 @@ pub struct ReaderConfig {
     /// [`compression`](Self::compression) is `Zstd` or `Auto`. Ignored
     /// for `Raw`. Range `[MIN_COMPRESSION_LEVEL, MAX_COMPRESSION_LEVEL]`;
     /// the server clamps to `[1, 9]` per wire-egress.md §3. Default
-    /// [`DEFAULT_COMPRESSION_LEVEL`] (= 3).
+    /// [`DEFAULT_COMPRESSION_LEVEL`] (= 1).
     pub compression_level: u8,
     pub max_batch_rows: u64,
     pub client_id: Option<String>,
@@ -1224,10 +1235,10 @@ mod tests {
     }
 
     #[test]
-    fn compression_level_default_is_three() {
+    fn compression_level_default_is_one() {
         let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
         assert_eq!(c.compression_level, DEFAULT_COMPRESSION_LEVEL);
-        assert_eq!(c.compression_level, 3);
+        assert_eq!(c.compression_level, 1);
     }
 
     #[cfg(feature = "compression-zstd")]
