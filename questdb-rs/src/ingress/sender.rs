@@ -728,11 +728,28 @@ impl Sender {
 
     /// Tell whether the sender is no longer usable and must be dropped.
     ///
-    /// This happens when there was an earlier failure.
+    /// Returns `true` after an unrecoverable failure. For ILP-over-TCP this
+    /// is any socket error. For QWP/WebSocket this also covers a server
+    /// rejection or protocol violation that latches the publication
+    /// lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
+    /// transition into a permanently-unusable state and always return
+    /// `false`.
     ///
-    /// This method is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
+    /// In QWP/WebSocket manual progress mode the answer only refreshes when
+    /// the user drives the sender (`drive_once` / `flush`), since no
+    /// background thread is observing the transport.
+    #[must_use]
     pub fn must_close(&self) -> bool {
-        !self.connected
+        if !self.connected {
+            return true;
+        }
+        #[cfg(feature = "sync-sender-qwp-ws")]
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => return qwp_ws_is_terminal_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => return qwp_ws_is_terminal_manual(state),
+            _ => {}
+        }
+        false
     }
 
     /// Returns the sender's configured transport protocol.

@@ -439,8 +439,16 @@ loop:
 `BlockingQwpWsTransport` carries the multi-endpoint list and a
 `QwpWsHostHealthTracker` so reconnect walks endpoints in a round-robin
 fashion, preferring healthy ones. After a successful reconnect, the
-unresolved FSN window is replayed from `wire_seq=0`; the QWP server is
-expected to dedupe by FSN.
+unresolved FSN window is replayed from `wire_seq=0`. The server applies
+every frame it accepts; it performs no frame-level deduplication, and
+its per-connection sequence bookkeeping is reset on disconnect. Any
+frame the server had accepted on the previous connection whose ACK was
+not delivered to the client before the disconnect will therefore be
+applied a second time when the client replays it. **Delivery on
+reconnect is at-least-once.** Applications that need exactly-once row
+counts after disruptions must use QuestDB table-level dedup
+(`DEDUP UPSERT KEYS(...)`); this matches the Java client's documented
+behavior.
 
 `initial_connect_retry` is `QwpWsInitialConnectMode` (`Off | Sync | Async`,
 default `Off`). `Async` lets the runner start before the first connection
@@ -565,10 +573,17 @@ isolation:
 - **Strict mutex discipline.** The runner releases the publication mutex
   around every transport call and around storage-task `perform()` work; user
   threads never touch transport state.
-- **FSN as the durable identifier.** Wire sequences are connection-local;
-  reconnect replays from the oldest unresolved FSN as `wire_seq=0`, so the
-  server side handles dedupe. The `.ack-watermark` sidecar makes the
-  cumulative completion watermark durable across process restarts.
+- **FSN as the client-side durable identifier.** Wire sequences are
+  connection-local; reconnect replays from the oldest unresolved FSN as
+  `wire_seq=0`. The server applies every accepted frame and does not
+  perform frame-level deduplication, so replay after reconnect can
+  re-apply frames whose original ACK was lost — delivery on reconnect
+  is at-least-once. The `.ack-watermark` sidecar makes the client's
+  cumulative completion watermark durable across client process
+  restarts (so the post-restart replay span starts from the last
+  durably-acked FSN, not zero), which narrows but does not eliminate
+  the duplicate window. Applications needing exactly-once row counts
+  must enable QuestDB table-level dedup.
 - **Bounded everything.** Frames, segments, in-flight window, events, and the
   sender-error diagnostic log are all bounded with explicit overflow
   accounting.
