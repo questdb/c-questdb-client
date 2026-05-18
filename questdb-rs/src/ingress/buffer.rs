@@ -36,7 +36,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) use self::ilp::Buffer as IlpBuffer;
 #[allow(unused_imports)]
 pub(crate) use self::ilp::F64Serializer;
-pub use self::ilp::{ColumnName, TableName};
 
 #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
 pub(crate) use self::qwp::QwpBuffer;
@@ -174,6 +173,191 @@ impl<S: Copy> StoredBookmark<S> {
 
     pub(super) fn clear(&mut self) {
         self.state = None;
+    }
+}
+
+/// A validated table name.
+///
+/// This type simply wraps a `&str`.
+///
+/// When you pass a `TableName` instead of a plain string to a [`Buffer`] method,
+/// it doesn't have to validate it again. This saves CPU cycles.
+#[derive(Clone, Copy)]
+pub struct TableName<'a> {
+    name: &'a str,
+}
+
+impl<'a> TableName<'a> {
+    /// Construct a validated table name.
+    pub fn new(name: &'a str) -> crate::Result<Self> {
+        if name.is_empty() {
+            return Err(error::fmt!(
+                InvalidName,
+                "Table names must have a non-zero length."
+            ));
+        }
+
+        let mut prev = '\0';
+        for (byte_idx, c) in name.char_indices() {
+            match c {
+                '.' if byte_idx == 0 || byte_idx + c.len_utf8() == name.len() || prev == '.' => {
+                    return Err(error::fmt!(
+                        InvalidName,
+                        concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
+                        name,
+                        byte_idx
+                    ));
+                }
+                '.' => {}
+                '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '*' | '%' | '~'
+                | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}'
+                | '\u{0005}' | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}'
+                | '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
+                    return Err(error::fmt!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Table names can't contain ",
+                            "a {:?} character, which was found at ",
+                            "byte position {}."
+                        ),
+                        name,
+                        c,
+                        byte_idx
+                    ));
+                }
+                '\u{feff}' => {
+                    // Reject Unicode char 'ZERO WIDTH NO-BREAK SPACE',
+                    // aka UTF-8 BOM if it appears anywhere in the string.
+                    return Err(error::fmt!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Table names can't contain ",
+                            "a UTF-8 BOM character, which was found at ",
+                            "byte position {}."
+                        ),
+                        name,
+                        byte_idx
+                    ));
+                }
+                _ => (),
+            }
+            prev = c;
+        }
+
+        Ok(Self { name })
+    }
+
+    /// Construct a table name without validating it.
+    ///
+    /// This breaks API encapsulation and is only intended for use
+    /// when the string was already previously validated.
+    ///
+    /// The QuestDB server will reject an invalid table name.
+    pub fn new_unchecked(name: &'a str) -> Self {
+        Self { name }
+    }
+}
+
+impl<'a> TryFrom<&'a str> for TableName<'a> {
+    type Error = Error;
+
+    fn try_from(name: &'a str) -> crate::Result<Self> {
+        Self::new(name)
+    }
+}
+
+impl AsRef<str> for TableName<'_> {
+    fn as_ref(&self) -> &str {
+        self.name
+    }
+}
+
+/// A validated column name.
+///
+/// This type simply wraps a `&str`.
+///
+/// When you pass a `ColumnName` instead of a plain string to a [`Buffer`] method,
+/// it doesn't have to validate it again. This saves CPU cycles.
+#[derive(Clone, Copy)]
+pub struct ColumnName<'a> {
+    name: &'a str,
+}
+
+impl<'a> ColumnName<'a> {
+    /// Construct a validated column name.
+    pub fn new(name: &'a str) -> crate::Result<Self> {
+        if name.is_empty() {
+            return Err(error::fmt!(
+                InvalidName,
+                "Column names must have a non-zero length."
+            ));
+        }
+
+        for (byte_idx, c) in name.char_indices() {
+            match c {
+                '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '-' | '*'
+                | '%' | '~' | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}'
+                | '\u{0004}' | '\u{0005}' | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}'
+                | '\u{000b}' | '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
+                    return Err(error::fmt!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Column names can't contain ",
+                            "a {:?} character, which was found at ",
+                            "byte position {}."
+                        ),
+                        name,
+                        c,
+                        byte_idx
+                    ));
+                }
+                '\u{FEFF}' => {
+                    // Reject Unicode char 'ZERO WIDTH NO-BREAK SPACE',
+                    // aka UTF-8 BOM if it appears anywhere in the string.
+                    return Err(error::fmt!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Column names can't contain ",
+                            "a UTF-8 BOM character, which was found at ",
+                            "byte position {}."
+                        ),
+                        name,
+                        byte_idx
+                    ));
+                }
+                _ => (),
+            }
+        }
+
+        Ok(Self { name })
+    }
+
+    /// Construct a column name without validating it.
+    ///
+    /// This breaks API encapsulation and is only intended for use
+    /// when the string was already previously validated.
+    ///
+    /// The QuestDB server will reject an invalid column name.
+    pub fn new_unchecked(name: &'a str) -> Self {
+        Self { name }
+    }
+}
+
+impl<'a> TryFrom<&'a str> for ColumnName<'a> {
+    type Error = Error;
+
+    fn try_from(name: &'a str) -> crate::Result<Self> {
+        Self::new(name)
+    }
+}
+
+impl AsRef<str> for ColumnName<'_> {
+    fn as_ref(&self) -> &str {
+        self.name
     }
 }
 
@@ -1470,7 +1654,7 @@ impl Buffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bookmark, Buffer, StoredBookmark};
+    use super::{Bookmark, Buffer, ColumnName, StoredBookmark, TableName};
     use crate::ErrorCode;
     use crate::ingress::ProtocolVersion;
 
@@ -1614,5 +1798,44 @@ mod tests {
         let err = buf.column_f32("v", 1.5_f32).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("column_f32"), "{}", err.msg());
+    }
+
+    #[test]
+    fn name_validation_table_name_uses_byte_offset_for_invalid_char() {
+        let err = match TableName::new("é?") {
+            Ok(_) => panic!("expected invalid table name"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+        assert_eq!(
+            err.msg(),
+            r#"Bad string "é?": Table names can't contain a '?' character, which was found at byte position 2."#
+        );
+    }
+
+    #[test]
+    fn name_validation_table_name_rejects_trailing_dot_at_byte_offset() {
+        let err = match TableName::new("é.") {
+            Ok(_) => panic!("expected invalid table name"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+        assert_eq!(
+            err.msg(),
+            r#"Bad string "é.": Found invalid dot `.` at position 2."#
+        );
+    }
+
+    #[test]
+    fn name_validation_column_name_uses_byte_offset_for_invalid_char() {
+        let err = match ColumnName::new("é?") {
+            Ok(_) => panic!("expected invalid column name"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+        assert_eq!(
+            err.msg(),
+            r#"Bad string "é?": Column names can't contain a '?' character, which was found at byte position 2."#
+        );
     }
 }

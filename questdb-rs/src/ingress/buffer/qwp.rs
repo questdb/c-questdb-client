@@ -35,9 +35,8 @@ use std::fmt::Debug;
 use std::hash::BuildHasherDefault;
 use std::hash::{BuildHasher, Hash, Hasher};
 
-use super::ilp::{ColumnName, TableName};
 use super::op_state::{Op, OpState};
-use super::{Bookmark, BufferBookmarkMeta, StoredBookmark};
+use super::{Bookmark, BufferBookmarkMeta, ColumnName, StoredBookmark, TableName};
 
 /// Wire layout of a QWP datagram header.
 ///
