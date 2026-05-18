@@ -85,6 +85,47 @@ When one logical flush spans multiple datagrams, some datagrams may already
 have been emitted before a later send fails. In that case, retrying the same
 buffer may duplicate rows that were already sent.
 
+## QWP/WebSocket
+
+QWP/WebSocket is a reliable, in-order transport. Each published frame is
+assigned a frame sequence number (FSN) and tracked through a publication
+lifecycle until the server acknowledges or rejects it. Transient socket
+errors and reconnects are absorbed by the driver and do not surface to the
+caller; only server rejections and terminal protocol violations are
+reported.
+
+Server rejections fall into two categories:
+
+- *Drop-and-continue* rejections (e.g. schema mismatch, write error) affect
+  only the rejected frame; the sender continues processing subsequent frames.
+  Retrieve structured diagnostics with
+  [`sender.poll_qwp_ws_error()`](Sender::poll_qwp_ws_error), or install a
+  callback via [`SenderBuilder::qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler).
+
+- *Halt* rejections (e.g. parse error, internal error, security error) and
+  terminal WebSocket protocol violations latch the sender into a
+  permanently-unusable state. The next `flush()` call returns
+  `ErrorCode::ServerRejection` carrying the structured diagnostic, and
+  [`sender.must_close()`](Sender::must_close) returns `true`. The sender
+  must be dropped and a new one constructed. The buffer passed to that
+  final `flush()` is left unmodified, so its contents can be recovered
+  before dropping the sender.
+
+`flush()` returns once the frame has been appended to the local publication
+log; the FSN is also available via
+[`flush_and_get_fsn()`](Sender::flush_and_get_fsn). To wait for the server
+to durably acknowledge a specific FSN, call
+[`sender.await_acked_fsn()`](Sender::await_acked_fsn).
+[`sender.published_fsn()`](Sender::published_fsn) and
+[`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
+
+In `manual` progress mode no background thread observes the transport.
+Server-side state — including halts — only becomes visible when the user
+calls [`sender.drive_once()`](Sender::drive_once) or any sender method
+that drives the transport (such as `flush` or `await_acked_fsn`). As a
+consequence, `must_close()` on an otherwise-idle manual sender does not
+reflect a halt until the next drive.
+
 ## HTTP
 
 HTTP distinguishes between recoverable and non-recoverable errors. For

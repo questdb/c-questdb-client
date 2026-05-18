@@ -1139,6 +1139,8 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
             .at_now()
             .unwrap();
 
+        assert!(!sender.must_close(), "mode={}", progress.name());
+
         let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
         assert_eq!(fsn, 0, "mode={}", progress.name());
         assert!(buf.is_empty(), "mode={}", progress.name());
@@ -1149,6 +1151,7 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
         );
         assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+        assert!(!sender.must_close(), "mode={}", progress.name());
 
         let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
@@ -1285,6 +1288,7 @@ fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
             later_err.msg()
         );
         assert!(!later.is_empty(), "mode={}", progress.name());
+        assert!(sender.must_close(), "mode={}", progress.name());
     }
 }
 
@@ -2708,6 +2712,7 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
         !buf.is_empty(),
         "terminal async error must not clear a newly prepared buffer"
     );
+    assert!(sender.must_close());
 }
 
 fn assert_server_protocol_violation<F>(write_bad_response: F, expected_message: &'static str)
@@ -2775,6 +2780,7 @@ where
         "expected protocol violation in terminal message, got: {}",
         err.msg()
     );
+    assert!(sender.must_close());
 }
 
 #[test]

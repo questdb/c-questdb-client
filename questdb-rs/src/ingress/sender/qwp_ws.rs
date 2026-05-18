@@ -463,6 +463,10 @@ where
         Ok(store.terminal_sender_error().cloned())
     }
 
+    fn lifecycle_is_terminal(&self) -> bool {
+        self.lifecycle.is_terminal()
+    }
+
     fn sender_errors_dropped_total(&self) -> crate::Result<u64> {
         let store = self.lock_shared()?;
         Ok(store.sender_errors_dropped_total())
@@ -2879,6 +2883,14 @@ pub(crate) fn qwp_ws_terminal_sender_error_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<QwpWsSenderError>> {
     Ok(state.store.terminal_sender_error().cloned())
+}
+
+pub(crate) fn qwp_ws_is_terminal_background(state: &SyncQwpWsHandlerState) -> bool {
+    state.runner.lifecycle_is_terminal()
+}
+
+pub(crate) fn qwp_ws_is_terminal_manual(state: &ManualQwpWsHandlerState) -> bool {
+    state.store.is_terminal()
 }
 
 pub(crate) fn qwp_ws_sender_errors_dropped_background(

@@ -2560,6 +2560,12 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         conf = self._sender_conf(
             sender_id,
             sf_root,
+            # Bounce tests can SIGTERM the server before every producer has
+            # finished its initial connect. Without retry on the initial
+            # connect, the producer that races the bounce fails fast with
+            # an upgrade-response read error. `sync` makes the constructor
+            # wait through the bounce up to reconnect_max_duration_millis.
+            initial_connect_retry='sync',
             reconnect_max_duration_millis=120000,
             # 2 min on close_drain — bounce-test variants need a long
             # enough budget for SFA to replay queued frames into a
