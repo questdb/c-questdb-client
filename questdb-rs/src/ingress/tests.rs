@@ -294,13 +294,20 @@ fn ingress_accepts_full_egress_connect_string_unchanged() {
     // string with multiple egress-only keys interleaved with shared
     // ones parses cleanly on the ingress sender without losing the
     // shared knobs along the way.
+    // Note: `tls_verify` is intentionally omitted — it's a shared key,
+    // but `http::` is plain (no TLS), and under feature combos that
+    // include `insecure-skip-verify` the `tls_verify` arm routes through
+    // `ensure_tls_enabled` and rejects it. The portability claim is
+    // about *egress-only* keys riding alongside genuinely-shared ones
+    // (`addr`, `username`, `password`), not about smuggling TLS knobs
+    // into a non-TLS connect string.
     let conf = "http::addr=127.0.0.1:9000\
         ;username=u;password=p\
         ;path=/exec;max_version=2;compression=zstd;compression_level=3\
         ;max_batch_rows=10000;client_id=svc-a;target=primary\
         ;failover=on;failover_max_attempts=3\
         ;on_schema_error=drop;on_parse_error=halt\
-        ;buffer_pool_size=8;tls_verify=on";
+        ;buffer_pool_size=8";
     let builder = SenderBuilder::from_conf(conf).unwrap();
     assert_eq!(builder.protocol, Protocol::Http);
     assert_specified_eq(&builder.host, "127.0.0.1");
