@@ -45,24 +45,23 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const PING_PATH: &str = "/ping";
 const PING_TIMEOUT: Duration = Duration::from_secs(45);
 const PING_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_BIND_ATTEMPTS: u32 = 5;
 
-#[derive(Debug)]
-enum StartError {
-    /// JVM logged an `EADDRINUSE` while binding one of the configured
-    /// listeners — a TOCTOU race between `allocate_ports` releasing the
-    /// port and the JVM rebinding it. Caller should retry with fresh
-    /// ports.
-    BindRace,
-    /// `/ping` never came up within `PING_TIMEOUT` for some other
-    /// reason. Caller should dump the JVM log and panic.
-    Timeout,
-}
+/// Serialises the allocate-then-spawn critical section across `#[test]`
+/// threads in this `cargo test` binary. `allocate_ports` releases its
+/// bound listeners before the JVM gets a chance to rebind, so without
+/// this mutex two concurrent tests can be handed the same port by the
+/// kernel: thread A drops the listener, thread B's `allocate_ports` is
+/// assigned the freshly-freed port, and thread A's JVM then loses the
+/// race when it tries to bind. Held only until `/ping` returns 204 — by
+/// that point the JVM owns its three sockets and other tests can boot in
+/// parallel.
+static STARTUP: Mutex<()> = Mutex::new(());
 
 /// Locate the QuestDB jar built from the `questdb/` submodule. We walk up
 /// from `questdb-rs/` to the workspace root and look for the jar there.
@@ -102,11 +101,11 @@ fn locate_jar() -> PathBuf {
 }
 
 /// Allocate `n` free TCP ports on 127.0.0.1 by binding briefly to port 0.
-/// The close-then-rebind dance leaves a TOCTOU window between us
-/// dropping the listener and the JVM rebinding; the kernel may hand the
-/// port to anything else in between. `start_with_config` mitigates by
-/// detecting an `EADDRINUSE` in the JVM log and retrying with a fresh
-/// port triple.
+/// `start_with_config` serialises the allocate-then-spawn critical
+/// section via a process-local mutex ([`STARTUP`]), so the
+/// close→rebind window cannot collide with another test thread in this
+/// same `cargo test` binary. Externally visible parallelism (test
+/// bodies running after `/ping` returns 204) is unaffected.
 fn allocate_ports(n: usize) -> Vec<u16> {
     let mut listeners = Vec::with_capacity(n);
     let mut ports = Vec::with_capacity(n);
@@ -234,143 +233,111 @@ impl QuestDbServer {
     /// JVM — `Drop` kills it at end of test, so each per-test instance
     /// costs one ~15 s boot.
     pub fn start_with_config(extra_conf: &[(&str, &str)]) -> Self {
+        // Hold the startup mutex across allocate_ports + spawn +
+        // wait_for_ping so the port triple we picked is still ours when
+        // the JVM finally binds. `into_inner` defuses mutex poisoning
+        // from a panicking earlier test — the lock guards no shared
+        // state, only ordering. See [`STARTUP`] for the full rationale.
+        let _startup_guard = STARTUP.lock().unwrap_or_else(|e| e.into_inner());
+
         let jar = locate_jar();
         let java = locate_java();
+        let ports = allocate_ports(3);
+        let (http_port, ilp_port, pg_port) = (ports[0], ports[1], ports[2]);
 
-        let mut last_ports = (0u16, 0u16, 0u16);
-        for attempt in 1..=MAX_BIND_ATTEMPTS {
-            let ports = allocate_ports(3);
-            let (http_port, ilp_port, pg_port) = (ports[0], ports[1], ports[2]);
-            last_ports = (http_port, ilp_port, pg_port);
-
-            let data_dir = tempfile::tempdir().expect("tempdir");
-            let conf_dir = data_dir.path().join("conf");
-            std::fs::create_dir_all(&conf_dir).expect("conf dir");
-            let mut conf = format!(
-                "http.bind.to=127.0.0.1:{http}\n\
-                 line.tcp.net.bind.to=127.0.0.1:{ilp}\n\
-                 pg.net.bind.to=127.0.0.1:{pg}\n\
-                 http.min.enabled=false\n\
-                 line.udp.enabled=false\n\
-                 line.http.enabled=true\n\
-                 telemetry.enabled=false\n",
-                http = http_port,
-                ilp = ilp_port,
-                pg = pg_port,
-            );
-            for (k, v) in extra_conf {
-                conf.push_str(k);
-                conf.push('=');
-                conf.push_str(v);
-                conf.push('\n');
-            }
-            std::fs::write(conf_dir.join("server.conf"), conf).expect("server.conf");
-
-            let log_path = data_dir.path().join("jvm.log");
-            let log_file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .expect("open jvm.log");
-            let log_file_clone = log_file.try_clone().expect("clone log handle");
-
-            let mut cmd = Command::new(&java);
-            cmd.args([
-                "-DQuestDB-Runtime-0",
-                "-ea",
-                "-Dnoebug",
-                "-XX:+UnlockExperimentalVMOptions",
-                "-XX:+AlwaysPreTouch",
-                "-p",
-            ])
-            .arg(&jar)
-            .args(["-m", "io.questdb/io.questdb.ServerMain", "-d"])
-            .arg(data_dir.path())
-            .current_dir(data_dir.path())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_clone));
-
-            eprintln!(
-                "[live-server] launching {} -p {} ... (data={}, http={}, attempt={}/{})",
-                java.display(),
-                jar.display(),
-                data_dir.path().display(),
-                http_port,
-                attempt,
-                MAX_BIND_ATTEMPTS,
-            );
-            let child = cmd
-                .spawn()
-                .unwrap_or_else(|e| panic!("failed to spawn QuestDB JVM: {e}"));
-
-            let host = "127.0.0.1".to_string();
-            let server = Self {
-                child,
-                host,
-                http_port,
-                ilp_port,
-                pg_port,
-                log_path: log_path.clone(),
-                _data_dir: data_dir,
-            };
-            match server.wait_for_ping(&log_path) {
-                Ok(()) => {
-                    eprintln!("[live-server] /ping is up on {}:{}", server.host, http_port);
-                    return server;
-                }
-                Err(StartError::BindRace) => {
-                    eprintln!(
-                        "[live-server] port-bind race on attempt {}/{}, retrying...",
-                        attempt, MAX_BIND_ATTEMPTS,
-                    );
-                    // `server`'s `Drop` SIGKILLs the partially-started
-                    // JVM and the `TempDir` cleans up the data dir.
-                    drop(server);
-                    continue;
-                }
-                Err(StartError::Timeout) => {
-                    eprintln!(
-                        "[live-server] /ping did not respond on http://{}:{} within {:?}; dumping JVM log:",
-                        server.host, server.http_port, PING_TIMEOUT,
-                    );
-                    if let Ok(log) = std::fs::read_to_string(&log_path) {
-                        eprintln!("--- begin jvm.log ---\n{}\n--- end jvm.log ---", log);
-                    } else {
-                        eprintln!("(jvm.log unreadable at {})", log_path.display());
-                    }
-                    panic!(
-                        "QuestDB did not respond on http://{}:{}{} within {:?}",
-                        server.host, server.http_port, PING_PATH, PING_TIMEOUT,
-                    );
-                }
-            }
-        }
-        panic!(
-            "QuestDB failed to start after {} attempts due to port-bind races; \
-             last attempted ports http={} ilp={} pg={}",
-            MAX_BIND_ATTEMPTS, last_ports.0, last_ports.1, last_ports.2,
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let conf_dir = data_dir.path().join("conf");
+        std::fs::create_dir_all(&conf_dir).expect("conf dir");
+        let mut conf = format!(
+            "http.bind.to=127.0.0.1:{http}\n\
+             line.tcp.net.bind.to=127.0.0.1:{ilp}\n\
+             pg.net.bind.to=127.0.0.1:{pg}\n\
+             http.min.enabled=false\n\
+             line.udp.enabled=false\n\
+             line.http.enabled=true\n\
+             telemetry.enabled=false\n",
+            http = http_port,
+            ilp = ilp_port,
+            pg = pg_port,
         );
+        for (k, v) in extra_conf {
+            conf.push_str(k);
+            conf.push('=');
+            conf.push_str(v);
+            conf.push('\n');
+        }
+        std::fs::write(conf_dir.join("server.conf"), conf).expect("server.conf");
+
+        let log_path = data_dir.path().join("jvm.log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open jvm.log");
+        let log_file_clone = log_file.try_clone().expect("clone log handle");
+
+        let mut cmd = Command::new(&java);
+        cmd.args([
+            "-DQuestDB-Runtime-0",
+            "-ea",
+            "-Dnoebug",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+AlwaysPreTouch",
+            "-p",
+        ])
+        .arg(&jar)
+        .args(["-m", "io.questdb/io.questdb.ServerMain", "-d"])
+        .arg(data_dir.path())
+        .current_dir(data_dir.path())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_clone));
+
+        eprintln!(
+            "[live-server] launching {} -p {} ... (data={}, http={})",
+            java.display(),
+            jar.display(),
+            data_dir.path().display(),
+            http_port
+        );
+        let child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn QuestDB JVM: {e}"));
+
+        let host = "127.0.0.1".to_string();
+        let server = Self {
+            child,
+            host,
+            http_port,
+            ilp_port,
+            pg_port,
+            log_path: log_path.clone(),
+            _data_dir: data_dir,
+        };
+        server.wait_for_ping(&log_path);
+        eprintln!("[live-server] /ping is up on {}:{}", server.host, http_port);
+        server
     }
 
-    fn wait_for_ping(&self, log_path: &Path) -> Result<(), StartError> {
+    fn wait_for_ping(&self, log_path: &Path) {
         let host = self.host.clone();
         let port = self.http_port;
-        let deadline = Instant::now() + PING_TIMEOUT;
-        while Instant::now() < deadline {
-            if http_status(&host, port, PING_PATH) == 204 {
-                return Ok(());
+        let up = poll_until(|| http_status(&host, port, PING_PATH) == 204, PING_TIMEOUT);
+        if !up {
+            eprintln!(
+                "[live-server] /ping did not respond on http://{}:{} within {:?}; dumping JVM log:",
+                self.host, self.http_port, PING_TIMEOUT
+            );
+            if let Ok(log) = std::fs::read_to_string(log_path) {
+                eprintln!("--- begin jvm.log ---\n{}\n--- end jvm.log ---", log);
+            } else {
+                eprintln!("(jvm.log unreadable at {})", log_path.display());
             }
-            // Detect a bind race fast — the JVM logs an EADDRINUSE
-            // before exiting, and waiting the full 45 s `/ping` timeout
-            // for that case wastes time on every affected run.
-            if let Ok(log) = std::fs::read_to_string(log_path)
-                && (log.contains("NetworkError: [98]") || log.contains("could not bind socket"))
-            {
-                return Err(StartError::BindRace);
-            }
-            std::thread::sleep(PING_INTERVAL);
         }
-        Err(StartError::Timeout)
+        assert!(
+            up,
+            "QuestDB did not respond on http://{}:{}{} within {:?}",
+            self.host, self.http_port, PING_PATH, PING_TIMEOUT
+        );
     }
 
     /// `ws::` connect string for the egress reader. The function name
