@@ -2401,6 +2401,24 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             name = qwp_ws_fuzz.canonical_table_name(i)
             tables[name] = qwp_ws_fuzz.TableData(name)
             self._drop_table_if_exists(name)
+            # Pre-create the table with the designated TIMESTAMP column and
+            # DEDUP enabled on it. QWP/WebSocket is at-least-once on
+            # reconnect: after a fixture bounce the client correctly
+            # replays unacked frames from its local low-water mark, and
+            # the server applies every accepted frame without frame-level
+            # dedup, so replays can re-apply rows whose original ACK was
+            # lost. The test's strict expected-vs-actual row-count
+            # comparison only holds if those duplicate rows are filtered
+            # at the WAL level. Per-row timestamps are globally unique
+            # (monotonic `next_ts()` below), so DEDUP UPSERT KEYS on the
+            # designated timestamp filters exactly the duplicates without
+            # touching distinct rows. Other columns are auto-added by
+            # QuestDB on the first row that contains them.
+            sql_query(
+                f'CREATE TABLE IF NOT EXISTS "{name}" '
+                '(timestamp TIMESTAMP) '
+                'TIMESTAMP(timestamp) PARTITION BY DAY WAL '
+                'DEDUP UPSERT KEYS(timestamp)')
             self._created_tables.append(name)
 
         run_id = uuid.uuid4().hex[:8]
@@ -2535,6 +2553,12 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         conf = self._sender_conf(
             sender_id,
             sf_root,
+            # Bounce tests can SIGTERM the server before every producer has
+            # finished its initial connect. Without retry on the initial
+            # connect, the producer that races the bounce fails fast with
+            # an upgrade-response read error. `sync` makes the constructor
+            # wait through the bounce up to reconnect_max_duration_millis.
+            initial_connect_retry='sync',
             reconnect_max_duration_millis=120000,
             # 2 min on close_drain — bounce-test variants need a long
             # enough budget for SFA to replay queued frames into a
