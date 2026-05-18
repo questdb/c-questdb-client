@@ -486,6 +486,67 @@ pub struct ReaderConfig {
     pub tls_roots_password: Option<String>,
 }
 
+/// Connect-string keys that the Rust ingress sender
+/// (`crate::ingress::SenderBuilder::from_conf`) recognizes but the
+/// egress reader has no use for. Silently accepted so a single connect
+/// string can be shared between a sender and a reader process; new
+/// ingress keys MUST be added here or the cross-role portability
+/// guarantee drifts.
+///
+/// Shared keys (`addr`, `username`, `password`, `token`, `tls_verify`,
+/// `tls_ca`, `tls_roots`, `tls_roots_password`, `auth_timeout_ms`,
+/// `zone`) are NOT listed here — both parsers have explicit arms.
+pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
+    // ILP TCP auth
+    "token_x",
+    "token_y",
+    // ILP transport
+    "bind_interface",
+    // ILP UDP
+    "max_datagram_size",
+    "multicast_ttl",
+    // ILP auto-flush (sender accumulates rows; reader is pull-based)
+    "auto_flush",
+    "auto_flush_rows",
+    "auto_flush_bytes",
+    // ILP buffer sizing & wire-protocol selection
+    "init_buf_size",
+    "max_buf_size",
+    "max_name_len",
+    "protocol_version",
+    // ILP HTTP transport
+    "request_min_throughput",
+    "request_timeout",
+    "retry_timeout",
+    // Generic auth timeout (Duration in millis; distinct from the
+    // shared `auth_timeout_ms` which is QWP-WS-specific on ingress).
+    "auth_timeout",
+    // QWP-WS pacing / in-flight
+    "in_flight_window",
+    "max_in_flight",
+    "qwp_ws_progress",
+    // QWP-WS store-and-forward
+    "sf_dir",
+    "sender_id",
+    "sf_max_bytes",
+    "sf_max_total_bytes",
+    "sf_durability",
+    "sf_append_deadline_millis",
+    // QWP-WS reconnect / connect retry
+    "reconnect_max_duration_millis",
+    "reconnect_initial_backoff_millis",
+    "reconnect_max_backoff_millis",
+    "initial_connect_retry",
+    // QWP-WS lifecycle / observability
+    "close_flush_timeout_millis",
+    "request_durable_ack",
+    "max_schemas_per_connection",
+    "durable_ack_keepalive_interval_millis",
+    "drain_orphans",
+    "max_background_drainers",
+    "error_inbox_capacity",
+];
+
 impl ReaderConfig {
     /// Construct from a connect-string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
@@ -819,6 +880,32 @@ impl ReaderConfig {
                         Some(trimmed.to_string())
                     };
                 }
+
+                // Per-category server-error policy knobs reserved by the
+                // QWP spec (see java-questdb-client
+                // design/qwp-cursor-error-api.md). Parsed but ignored so
+                // the same connect string works against clients that have
+                // already wired the policy resolver; the egress reader's
+                // ingest-side error model is independent.
+                "on_server_error" | "on_schema_error" | "on_parse_error" | "on_internal_error"
+                | "on_security_error" | "on_write_error" => {}
+
+                // Java sizes a decoded-batch pool that buffers between
+                // its I/O thread and the user's `onBatch` callback. The
+                // Rust egress is synchronous and pull-based (`next_batch`
+                // reads inline into the cursor's own scratch), so there
+                // is no pool to size. Accept the key without inspecting
+                // the value so a connect string tuned for the Java
+                // client still parses here.
+                "buffer_pool_size" => {}
+
+                // Connect-string portability: keys recognized by the
+                // Rust ingress sender but meaningless to the egress
+                // reader. See the comment on `INGRESS_ONLY_CONFIG_KEYS`
+                // for the rationale and the canonical list. Truly
+                // unknown keys (typos) still hit the error branch
+                // below, so the typo-detection safety net is intact.
+                other if INGRESS_ONLY_CONFIG_KEYS.contains(&other) => {}
 
                 other => {
                     return Err(fmt!(ConfigError, "Unknown config key \"{}\"", other));
@@ -1841,6 +1928,196 @@ mod tests {
             "msg: {}",
             err.msg()
         );
+    }
+
+    // --- reserved per-category server-error policy keys ---
+    //
+    // Java parity (design/qwp-cursor-error-api.md): `on_server_error`,
+    // `on_schema_error`, `on_parse_error`, `on_internal_error`,
+    // `on_security_error`, `on_write_error` are reserved so the same
+    // connect string can be shared between language clients regardless
+    // of which side has wired the policy resolver. The reader parser
+    // accepts the keys without inspecting the values.
+
+    const RESERVED_ON_ERROR_KEYS: &[&str] = &[
+        "on_server_error",
+        "on_schema_error",
+        "on_parse_error",
+        "on_internal_error",
+        "on_security_error",
+        "on_write_error",
+    ];
+
+    #[test]
+    fn reserved_on_error_policy_keys_all_together_are_accepted_silently() {
+        let conf = "ws::addr=h:1\
+            ;on_server_error=halt\
+            ;on_schema_error=drop\
+            ;on_parse_error=halt\
+            ;on_internal_error=halt\
+            ;on_security_error=halt\
+            ;on_write_error=drop";
+        let c = ReaderConfig::from_conf(conf).unwrap();
+        assert_eq!(c.addrs.len(), 1);
+        assert_eq!(c.addrs[0].host, "h");
+        assert_eq!(c.addrs[0].port, 1);
+    }
+
+    #[test]
+    fn reserved_on_error_policy_keys_each_accepted_individually() {
+        for key in RESERVED_ON_ERROR_KEYS {
+            let conf = format!("ws::addr=h:1;{key}=halt");
+            ReaderConfig::from_conf(&conf)
+                .unwrap_or_else(|e| panic!("expected {key:?} to parse, got {}", e.msg()));
+        }
+    }
+
+    #[test]
+    fn reserved_on_error_policy_keys_accept_any_value_without_validation() {
+        // The spec value alphabet is `halt|drop` (plus `auto` for the
+        // global `on_server_error`), but the reader does not validate
+        // because validation would defeat the cross-language
+        // forward-compat purpose: a newer client may use values this
+        // reader has never heard of (e.g. `dlq`) and we must still
+        // accept the connect string.
+        for key in RESERVED_ON_ERROR_KEYS {
+            for val in ["halt", "drop", "auto", "anything", ""] {
+                let conf = format!("ws::addr=h:1;{key}={val}");
+                ReaderConfig::from_conf(&conf)
+                    .unwrap_or_else(|e| panic!("expected {key}={val:?} to parse, got {}", e.msg()));
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_on_error_policy_keys_do_not_swallow_other_settings() {
+        // Make sure adding the reserved keys does not interfere with
+        // the surrounding parser state (e.g. by accidentally consuming
+        // the next key/value pair).
+        let conf = "ws::addr=h:1;on_schema_error=drop;target=primary;zone=eu-1";
+        let c = ReaderConfig::from_conf(conf).unwrap();
+        assert_eq!(c.target, Target::Primary);
+        assert_eq!(c.zone.as_deref(), Some("eu-1"));
+    }
+
+    #[test]
+    fn reserved_on_error_policy_keys_typo_still_rejected() {
+        // Guard against accidentally widening the match to a prefix:
+        // a near-miss must still hit the "unknown config key" branch.
+        for typo in [
+            "on_server_err",
+            "on_schema_errors",
+            "on_parse",
+            "On_Write_Error",
+        ] {
+            let conf = format!("ws::addr=h:1;{typo}=halt");
+            let err = ReaderConfig::from_conf(&conf)
+                .err()
+                .unwrap_or_else(|| panic!("expected {typo:?} to be rejected"));
+            assert_eq!(err.code(), ErrorCode::ConfigError);
+            assert!(
+                err.msg().contains("Unknown config key"),
+                "typo {typo:?}: msg: {}",
+                err.msg()
+            );
+        }
+    }
+
+    // --- reserved `buffer_pool_size` key ---
+    //
+    // Java parity (QwpQueryClient.java:505-512): sizes the I/O thread's
+    // decoded-batch pool. Rust egress is sync/pull-based and has no
+    // such pool, so the key is accepted without inspecting the value
+    // (see comment in `from_conf`).
+
+    #[test]
+    fn reserved_buffer_pool_size_accepts_any_value_without_validation() {
+        // Spec range is `>= 1`, but a stricter reader would defeat the
+        // forward-compat purpose: refuse nothing the Java side would
+        // accept, and refuse nothing it would reject either (the
+        // ignored knob is the user's contract).
+        for val in ["1", "4", "1024", "0", "-1", "not-a-number", ""] {
+            let conf = format!("ws::addr=h:1;buffer_pool_size={val}");
+            ReaderConfig::from_conf(&conf).unwrap_or_else(|e| {
+                panic!(
+                    "expected buffer_pool_size={val:?} to parse, got {}",
+                    e.msg()
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn reserved_buffer_pool_size_does_not_swallow_other_settings() {
+        let conf = "ws::addr=h:1;buffer_pool_size=8;target=replica;zone=us-2";
+        let c = ReaderConfig::from_conf(conf).unwrap();
+        assert_eq!(c.target, Target::Replica);
+        assert_eq!(c.zone.as_deref(), Some("us-2"));
+    }
+
+    // --- cross-role connect-string portability ---
+
+    #[test]
+    fn egress_silently_accepts_every_ingress_only_key() {
+        // A connect string tuned for the ingress sender (or written
+        // for both roles in a multi-role app) must parse on the egress
+        // reader. We do not inspect values — the egress role doesn't
+        // care what the sender will eventually do with them.
+        for key in INGRESS_ONLY_CONFIG_KEYS {
+            for val in ["1", "off", "anything", ""] {
+                let conf = format!("ws::addr=h:1;{key}={val}");
+                ReaderConfig::from_conf(&conf).unwrap_or_else(|e| {
+                    panic!(
+                        "expected egress to silently accept ingress-only \
+                         key {key}={val:?}, got {}",
+                        e.msg()
+                    )
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn egress_accepts_full_ingress_connect_string_unchanged() {
+        // End-to-end portability smoke test: a representative
+        // ingress-flavoured connect string with multiple ingress-only
+        // keys interleaved with shared ones parses cleanly on the
+        // egress reader without losing the shared knobs along the way.
+        let conf = "ws::addr=h:9000\
+            ;username=u;password=p\
+            ;init_buf_size=65536;max_buf_size=1048576;max_name_len=127\
+            ;auto_flush=off;auto_flush_rows=1000\
+            ;protocol_version=2\
+            ;tls_verify=on\
+            ;target=primary;zone=eu-west-1a";
+        let c = ReaderConfig::from_conf(conf).unwrap();
+        assert_eq!(c.addrs.len(), 1);
+        assert_eq!(c.addrs[0], Endpoint::new("h", 9000));
+        assert_eq!(c.target, Target::Primary);
+        assert_eq!(c.zone.as_deref(), Some("eu-west-1a"));
+        // Shared auth knobs survive the ingress-only key mixture.
+        assert!(matches!(c.auth, AuthMode::Basic { .. }));
+    }
+
+    #[test]
+    fn reserved_buffer_pool_size_typo_still_rejected() {
+        for typo in [
+            "buffer_pool",
+            "buffer_pool_sizes",
+            "Buffer_Pool_Size",
+            "buffer_size",
+        ] {
+            let conf = format!("ws::addr=h:1;{typo}=4");
+            let err = ReaderConfig::from_conf(&conf)
+                .err()
+                .unwrap_or_else(|| panic!("expected {typo:?} to be rejected"));
+            assert_eq!(err.code(), ErrorCode::ConfigError);
+            assert!(
+                err.msg().contains("Unknown config key"),
+                "typo {typo:?}: msg: {}",
+                err.msg()
+            );
+        }
     }
 
     #[test]

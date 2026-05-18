@@ -227,6 +227,112 @@ fn qwpws_config_accepts_java_in_flight_window_alias() {
     assert_specified_eq(&qwp_ws.max_in_flight, 1usize);
 }
 
+/// Connect-string keys that the Rust egress reader
+/// (`crate::egress::config::ReaderConfig::from_conf`) recognizes but
+/// the ingress sender has no use for. Today the sender's catch-all
+/// silently accepts unknown keys, so each of these falls through that
+/// branch — this list pins the behavior with a regression test so a
+/// future tightening of the catch-all can't break cross-role
+/// portability of a shared connect string.
+const EGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
+    // Egress-only protocol / decoder knobs
+    "path",
+    "max_version",
+    "compression",
+    "compression_level",
+    "max_batch_rows",
+    "client_id",
+    "target",
+    "auth",
+    // Egress-only failover policy
+    "failover",
+    "failover_max_attempts",
+    "failover_backoff_initial_ms",
+    "failover_backoff_max_ms",
+    "failover_max_duration_ms",
+    // Java-egress-only decoded-batch pool size (Rust egress is sync/pull,
+    // see comment in `egress/config.rs`); still ignored on ingress
+    // because that's an egress-side concern either way.
+    "buffer_pool_size",
+    // Reserved per-category server-error policy keys
+    // (java-questdb-client design/qwp-cursor-error-api.md). Both roles
+    // silently accept them so the resolver can be wired without
+    // breaking older clients.
+    "on_server_error",
+    "on_schema_error",
+    "on_parse_error",
+    "on_internal_error",
+    "on_security_error",
+    "on_write_error",
+];
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn ingress_silently_accepts_every_egress_only_key() {
+    // Cross-role portability: a connect string tuned for the egress
+    // reader (or written for both roles) must parse on the ingress
+    // sender. Values are not inspected — the ingress role doesn't
+    // care what the reader would have done with them.
+    for key in EGRESS_ONLY_CONFIG_KEYS {
+        for val in ["1", "primary", "halt", ""] {
+            let conf = format!("http::addr=127.0.0.1;{key}={val};");
+            SenderBuilder::from_conf(&conf).unwrap_or_else(|e| {
+                panic!(
+                    "expected ingress to silently accept egress-only \
+                     key {key}={val:?}, got {}",
+                    e.msg()
+                )
+            });
+        }
+    }
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn ingress_accepts_full_egress_connect_string_unchanged() {
+    // End-to-end portability smoke test: an egress-flavoured connect
+    // string with multiple egress-only keys interleaved with shared
+    // ones parses cleanly on the ingress sender without losing the
+    // shared knobs along the way.
+    let conf = "http::addr=127.0.0.1:9000\
+        ;username=u;password=p\
+        ;path=/exec;max_version=2;compression=zstd;compression_level=3\
+        ;max_batch_rows=10000;client_id=svc-a;target=primary\
+        ;failover=on;failover_max_attempts=3\
+        ;on_schema_error=drop;on_parse_error=halt\
+        ;buffer_pool_size=8;tls_verify=on";
+    let builder = SenderBuilder::from_conf(conf).unwrap();
+    assert_eq!(builder.protocol, Protocol::Http);
+    assert_specified_eq(&builder.host, "127.0.0.1");
+    assert_specified_eq(&builder.port, "9000");
+    assert_specified_eq(&builder.username, Some("u".to_string()));
+    assert_specified_eq(&builder.password, Some("p".to_string()));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_config_silently_accepts_reserved_on_error_policy_keys() {
+    // Java parity (design/qwp-cursor-error-api.md): the per-category
+    // server-error policy keys are reserved so the same connect string
+    // can be shared across language clients regardless of which side
+    // has wired the resolver. Today the sender catches them via the
+    // generic unknown-key fallthrough — this guard locks that in.
+    for key in [
+        "on_server_error",
+        "on_schema_error",
+        "on_parse_error",
+        "on_internal_error",
+        "on_security_error",
+        "on_write_error",
+    ] {
+        for val in ["halt", "drop", "auto", "anything", ""] {
+            let conf = format!("qwpws::addr=localhost:9000;{key}={val};");
+            SenderBuilder::from_conf(&conf)
+                .unwrap_or_else(|e| panic!("expected {key}={val:?} to parse, got {}", e.msg()));
+        }
+    }
+}
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
