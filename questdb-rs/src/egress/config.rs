@@ -509,6 +509,7 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "auto_flush",
     "auto_flush_rows",
     "auto_flush_bytes",
+    "auto_flush_interval",
     // ILP buffer sizing & wire-protocol selection
     "init_buf_size",
     "max_buf_size",

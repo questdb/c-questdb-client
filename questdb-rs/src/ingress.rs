@@ -190,7 +190,7 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
         ));
     }
 
-    for &param in ["auto_flush_rows", "auto_flush_bytes"].iter() {
+    for &param in ["auto_flush_rows", "auto_flush_bytes", "auto_flush_interval"].iter() {
         if params.contains_key(param) {
             return Err(error::fmt!(
                 ConfigError,

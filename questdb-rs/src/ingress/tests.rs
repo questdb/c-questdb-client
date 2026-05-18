@@ -1281,6 +1281,15 @@ fn auto_flush_bytes_unsupported() {
     );
 }
 
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn auto_flush_interval_unsupported() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;auto_flush_interval=500;"),
+        "Invalid configuration parameter \"auto_flush_interval\". This client does not support auto-flush",
+    );
+}
+
 // `reconnect_*` knobs are documented as the reconnect budget but were
 // silently ignored on the *initial* connect because `initial_connect_retry`
 // defaulted to `off`. A user setting `reconnect_max_duration_millis=120000`
