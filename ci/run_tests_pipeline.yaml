@@ -379,3 +379,35 @@ stages:
             inputs:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
               artifactName: qdb-log-$(Agent.OS)-linux
+
+      # =====================================================================
+      # TEMPORARY — DELETE BEFORE MERGE.
+      # Standalone Slack notify so PR pushes verify BUILDS_SLACK_HOOK_URL is
+      # wired correctly without waiting for the hourly fuzz pipeline to fail.
+      # No dependsOn so it runs in parallel with the test/fuzz matrix and
+      # finishes quickly. The fuzz pipeline's real `failed()`-gated notify
+      # is untouched.
+      #
+      # Requires BUILDS_SLACK_HOOK_URL configured as a secret on THIS
+      # pipeline (it's per-pipeline, not per-repo) — or attach a Library
+      # variable group containing it via a top-level `variables: - group:`.
+      # =====================================================================
+      - job: TempSlackWebhookCheck
+        displayName: "TEMP: Slack webhook verification"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - checkout: none
+          - task: CmdLine@2
+            displayName: Post Slack test message
+            inputs:
+              script: |
+                if [ -z "$BUILDS_SLACK_HOOK_URL" ]; then
+                  echo "##vso[task.logissue type=error]BUILDS_SLACK_HOOK_URL is not set on this pipeline — add it as a secret variable."
+                  exit 1
+                fi
+                curl -X POST -H 'Content-type: application/json' \
+                  --data '{"text":"✅ *c-questdb-client Slack webhook test*\n\nThis is a verification message from the PR pipeline, not a real failure.\nBranch: `$(Build.SourceBranchName)`\nBuild: <$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|#$(Build.BuildId)>\nCommit: `$(Build.SourceVersion)`"}' \
+                  "$BUILDS_SLACK_HOOK_URL"
+            env:
+              BUILDS_SLACK_HOOK_URL: $(BUILDS_SLACK_HOOK_URL)
