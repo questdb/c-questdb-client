@@ -953,6 +953,7 @@ impl SenderBuilder {
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
+                #[cfg(feature = "sync-sender-http")]
                 "retry_max_backoff_millis" => {
                     builder.retry_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
