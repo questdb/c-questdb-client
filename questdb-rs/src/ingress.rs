@@ -953,6 +953,9 @@ impl SenderBuilder {
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
+                "retry_max_backoff_millis" => {
+                    builder.retry_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?
+                }
 
                 // Ignore other parameters.
                 // We don't want to fail on unknown keys as this would require releasing different
@@ -1891,6 +1894,35 @@ impl SenderBuilder {
             return Err(error::fmt!(
                 ConfigError,
                 "retry_timeout is supported only in ILP over HTTP."
+            ));
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "sync-sender-http")]
+    /// Cap on per-attempt backoff in the HTTP retry loop.
+    ///
+    /// The retry loop starts at 10 ms, doubles each attempt with ±5 ms
+    /// jitter, and is bounded by this value (default: 1 second). Total
+    /// retry budget is independently capped by
+    /// [`SenderBuilder::retry_timeout`]; this knob shapes how aggressively
+    /// the loop hits the server while waiting out a transient failure.
+    ///
+    /// Mirrors Java's `LineSenderBuilder.maxBackoffMillis(int)`.
+    pub fn retry_max_backoff(mut self, value: Duration) -> Result<Self> {
+        if value.is_zero() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"retry_max_backoff_millis\" must be greater than 0."
+            ));
+        }
+        if let Some(http) = &mut self.http {
+            http.retry_max_backoff
+                .set_specified("retry_max_backoff_millis", value)?;
+        } else {
+            return Err(error::fmt!(
+                ConfigError,
+                "retry_max_backoff_millis is supported only in ILP over HTTP."
             ));
         }
         Ok(self)

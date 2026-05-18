@@ -1216,6 +1216,37 @@ fn http_retry_timeout() {
     assert_defaulted_eq(&http_config.request_min_throughput, 102400u64);
     assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(10000));
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
+    assert_defaulted_eq(&http_config.retry_max_backoff, Duration::from_millis(1000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn http_retry_max_backoff() {
+    let builder =
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=250;").unwrap();
+    let Some(http_config) = builder.http else {
+        panic!("Expected Some(HttpConfig)");
+    };
+    assert_specified_eq(&http_config.retry_max_backoff, Duration::from_millis(250));
+    assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn http_retry_max_backoff_zero_rejected() {
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=0;"),
+        "\"retry_max_backoff_millis\" must be greater than 0.",
+    );
+}
+
+#[cfg(all(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+#[test]
+fn retry_max_backoff_rejected_on_non_http() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;retry_max_backoff_millis=250;"),
+        "retry_max_backoff_millis is supported only in ILP over HTTP.",
+    );
 }
 
 #[cfg(feature = "sync-sender-http")]

@@ -338,11 +338,13 @@ fn retry_http_send(
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
+    retry_max_backoff: Duration,
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
-    let mut retry_interval_ms = 10;
+    let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
+    let mut retry_interval_ms = 10i32;
     let mut need_retry;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
@@ -361,8 +363,15 @@ fn retry_http_send(
         if !need_retry {
             return last_rep;
         }
-        retry_interval_ms = (retry_interval_ms * 2).min(1000);
+        retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
     }
+}
+
+/// Clamp the user-configured retry backoff cap into the `i32` range the
+/// loop uses internally (saturating, so absurdly large values just pin
+/// at `i32::MAX` ms ≈ 24.8 days rather than overflowing).
+fn clamp_backoff_ms(d: Duration) -> i32 {
+    i32::try_from(d.as_millis()).unwrap_or(i32::MAX)
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
@@ -371,13 +380,21 @@ pub(super) fn http_send_with_retries(
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
+    retry_max_backoff: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
     let (need_retry, last_rep) = state.send_request(buf, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }
 
-    retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
+    retry_http_send(
+        state,
+        buf,
+        request_timeout,
+        retry_timeout,
+        retry_max_backoff,
+        last_rep,
+    )
 }
 
 /// Read the server settings from the `/settings` endpoint.
@@ -399,6 +416,7 @@ pub(crate) fn read_server_settings(
         settings_url,
         *state.config.request_timeout,
         Duration::from_secs(1),
+        *state.config.retry_max_backoff,
     ) {
         Ok(res) => {
             if res.status().is_client_error() || res.status().is_server_error() {
@@ -496,11 +514,13 @@ fn retry_http_get(
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
+    retry_max_backoff: Duration,
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
-    let mut retry_interval_ms = 10;
+    let max_backoff_ms = clamp_backoff_ms(retry_max_backoff);
+    let mut retry_interval_ms = 10i32;
     let mut need_retry;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
@@ -519,7 +539,7 @@ fn retry_http_get(
         if !need_retry {
             return last_rep;
         }
-        retry_interval_ms = (retry_interval_ms * 2).min(1000);
+        retry_interval_ms = retry_interval_ms.saturating_mul(2).min(max_backoff_ms);
     }
 }
 
@@ -529,11 +549,19 @@ fn http_get_with_retries(
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
+    retry_max_backoff: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
     let (need_retry, last_rep) = state.get_request(url, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }
 
-    retry_http_get(state, url, request_timeout, retry_timeout, last_rep)
+    retry_http_get(
+        state,
+        url,
+        request_timeout,
+        retry_timeout,
+        retry_max_backoff,
+        last_rep,
+    )
 }

@@ -90,6 +90,7 @@ pub(crate) struct HttpConfig {
     pub(crate) request_min_throughput: ConfigSetting<u64>,
     pub(crate) user_agent: String,
     pub(crate) retry_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) retry_max_backoff: ConfigSetting<std::time::Duration>,
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
 }
 
@@ -100,6 +101,7 @@ impl Default for HttpConfig {
             request_min_throughput: ConfigSetting::new_default(102400), // 100 KiB/s
             user_agent: concat!("questdb/rust/", env!("CARGO_PKG_VERSION")).to_string(),
             retry_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
+            retry_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(1)),
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
         }
     }

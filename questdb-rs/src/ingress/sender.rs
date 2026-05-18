@@ -427,6 +427,7 @@ impl Sender {
                     bytes,
                     *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
                     *state.config.retry_timeout,
+                    *state.config.retry_max_backoff,
                 ) {
                     Ok(res) => {
                         if res.status().is_client_error() || res.status().is_server_error() {

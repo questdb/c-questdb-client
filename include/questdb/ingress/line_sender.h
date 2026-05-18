@@ -1544,6 +1544,16 @@ bool line_sender_opts_retry_timeout(
     line_sender_opts* opts, uint64_t millis, line_sender_error** err_out);
 
 /**
+ * Cap on per-attempt backoff in the HTTP retry loop, in milliseconds.
+ * Default is 1000 ms. The retry loop starts at 10 ms and doubles each
+ * attempt up to this cap; the total retry budget is independently
+ * bounded by `line_sender_opts_retry_timeout()`. ILP-over-HTTP only.
+ */
+LINESENDER_API
+bool line_sender_opts_retry_max_backoff(
+    line_sender_opts* opts, uint64_t millis, line_sender_error** err_out);
+
+/**
  * Set the minimum acceptable throughput while sending a buffer to the
  * server. The sender will divide the payload size by this number to
  * determine for how long to keep sending the payload before timing out. The

@@ -2567,6 +2567,22 @@ pub unsafe extern "C" fn line_sender_opts_retry_timeout(
     }
 }
 
+/// Cap on per-attempt backoff in the HTTP retry loop, in milliseconds.
+/// Default is 1000 ms. The retry loop starts at 10 ms and doubles each
+/// attempt up to this cap; the total retry budget is independently
+/// bounded by `line_sender_opts_retry_timeout`. ILP-over-HTTP only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_retry_max_backoff(
+    opts: *mut line_sender_opts,
+    millis: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let retry_max_backoff = std::time::Duration::from_millis(millis);
+        upd_opts!(opts, err_out, retry_max_backoff, retry_max_backoff)
+    }
+}
+
 /// Set the minimum acceptable throughput while sending a buffer to the server.
 /// The sender will divide the payload size by this number to determine for how
 /// long to keep sending the payload before timing out.

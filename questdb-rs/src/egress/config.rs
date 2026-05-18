@@ -519,6 +519,7 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "request_min_throughput",
     "request_timeout",
     "retry_timeout",
+    "retry_max_backoff_millis",
     // Generic auth timeout (Duration in millis; distinct from the
     // shared `auth_timeout_ms` which is QWP-WS-specific on ingress).
     "auth_timeout",
