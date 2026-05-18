@@ -210,8 +210,16 @@ stages:
       # Mirrors questdb/questdb's docker-release-pipeline.yml NotifyOnFailure
       # pattern. BUILDS_SLACK_HOOK_URL must be configured as a secret
       # pipeline variable (or attached via a shared variable group) before
-      # this pipeline is enabled — otherwise the curl will POST to an
-      # empty URL and the failure message is lost.
+      # this pipeline is enabled — otherwise the guard below trips and
+      # the failure message is lost.
+      #
+      # Note the env: mapping plus shell-var (`"$BUILDS_SLACK_HOOK_URL"`)
+      # rather than pipeline-var (`"$(BUILDS_SLACK_HOOK_URL)"`) reference
+      # in the curl: Azure deliberately does NOT inline secret variables
+      # into script bodies, so `$(BUILDS_SLACK_HOOK_URL)` would be left
+      # literal in the rendered bash, where `$( )` is command
+      # substitution — bash then tries to run `BUILDS_SLACK_HOOK_URL` as
+      # a command and curl gets an empty URL.
       - job: NotifyOnFailure
         displayName: "Notify Slack on failure"
         dependsOn:
@@ -226,8 +234,12 @@ stages:
             displayName: Notify Slack on Failure
             inputs:
               script: |
+                if [ -z "$BUILDS_SLACK_HOOK_URL" ]; then
+                  echo "##vso[task.logissue type=error]BUILDS_SLACK_HOOK_URL is not set — configure it as a secret pipeline variable so fuzz failures reach Slack."
+                  exit 1
+                fi
                 curl -X POST -H 'Content-type: application/json' \
                   --data '{"text":"🚨 *c-questdb-client QWP/WS fuzz failed*\n\nBranch: `$(Build.SourceBranchName)`\nBuild: <$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)|#$(Build.BuildId)>\nCommit: `$(Build.SourceVersion)`"}' \
-                  "$(BUILDS_SLACK_HOOK_URL)"
+                  "$BUILDS_SLACK_HOOK_URL"
             env:
               BUILDS_SLACK_HOOK_URL: $(BUILDS_SLACK_HOOK_URL)
