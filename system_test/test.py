@@ -2391,6 +2391,24 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         except Exception as e:  # noqa: BLE001 — table may already be absent
             self._log(f'DROP TABLE IF EXISTS {table_name!r} ignored: {e}')
 
+    @staticmethod
+    def _create_dedup_fuzz_table(table_name: str):
+        # Failover tests bounce the server mid-stream, which forces the
+        # QWP/WS sender to replay any sent-but-not-yet-acked FSN range
+        # after reconnect. The protocol is at-least-once on the wire,
+        # so the server can see byte-identical re-transmits of rows it
+        # already persisted. Pre-create with DEDUP UPSERT KEYS on the
+        # designated TIMESTAMP column — every fuzz row gets a globally
+        # unique µs timestamp from the harness's locked counter, so
+        # dedup-by-timestamp collapses retransmits while leaving
+        # legitimate rows untouched. Additional columns are added by
+        # ILP on first sight.
+        sql_query(
+            f'CREATE TABLE \'{table_name}\' '
+            '(timestamp TIMESTAMP) '
+            'TIMESTAMP(timestamp) PARTITION BY DAY WAL '
+            'DEDUP UPSERT KEYS(timestamp)')
+
     def _run_fuzz(self, load: 'qwp_ws_fuzz.LoadParams',
                   fuzz: 'qwp_ws_fuzz.FuzzParams'):
         # Pre-create per-table buffers. Java keys by lowercase name (case-
@@ -2401,6 +2419,8 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             name = qwp_ws_fuzz.canonical_table_name(i)
             tables[name] = qwp_ws_fuzz.TableData(name)
             self._drop_table_if_exists(name)
+            if fuzz.max_bounces > 0:
+                self._create_dedup_fuzz_table(name)
             self._created_tables.append(name)
 
         run_id = uuid.uuid4().hex[:8]
