@@ -124,6 +124,27 @@ stages:
               cd failover_clients
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "failover_clients: clippy"
+      - job: SanitizeCppTests
+        displayName: "C/C++ tests under ASan + UBSan"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: |
+              cmake -S . -B build_sanitize \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DQUESTDB_TESTS_AND_EXAMPLES=ON \
+                -DQUESTDB_SANITIZE=ON
+            displayName: "Configure (ASan + UBSan)"
+          - script: cmake --build build_sanitize --config Release
+            displayName: "Build"
+          - script: ctest --output-on-failure -E rust_tests
+            workingDirectory: build_sanitize
+            displayName: "ctest under ASan + UBSan"
       # Runs the full system_test/test.py against a fresh build of
       # QuestDB master. Moved off Microsoft-hosted ubuntu-latest because
       # the QWP/WS fuzz portion of the run filled the agent disk ("No

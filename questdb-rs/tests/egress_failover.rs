@@ -1159,7 +1159,7 @@ fn failover_disabled_surfaces_socket_error() {
 fn attempts_exhausted_surfaces_error() {
     // A is healthy for the initial connect, then drops mid-query. B
     // is broken at connect-time (drops before SERVER_INFO). With
-    // max_attempts=2, the cursor's first failure should burn 3 outer
+    // max_attempts=4, the cursor's first failure should burn 3 outer
     // reconnect attempts, all of which fail.
     //
     // Dial accounting:
@@ -1182,7 +1182,7 @@ fn attempts_exhausted_surfaces_error() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
@@ -1504,11 +1504,11 @@ fn single_endpoint_failover_exhausts_budget() {
     // stays dead, the cursor MUST eventually surface a hard error
     // rather than retry indefinitely.
     //
-    // Dial accounting with `failover_max_attempts=2`:
+    // Dial accounting with `failover_max_attempts=4`:
     //   - Initial connect: 1 dial (success — serves the query, then drops).
     //   - Mid-stream failure on the single host triggers
     //     `reconnect_with_failover`, which runs
-    //     `attempts_total = max_attempts + 1 = 3` outer reconnect attempts.
+    //     `attempts_total = max_attempts - 1 = 3` outer reconnect attempts.
     //   - Each outer attempt invokes `walk_via_tracker(allow_reset_pass=true)`:
     //     pick the host → fail → fall-through reset → re-pick the
     //     same host → fail. That's 2 dials per outer attempt against
@@ -1526,7 +1526,7 @@ fn single_endpoint_failover_exhausts_budget() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
@@ -2184,7 +2184,7 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -2435,7 +2435,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
     //     failover budget would exhaust, and the final-endpoint
     //     assertion would fail.
     //
-    // `failover_max_attempts=1` (so `attempts_total=2`) keeps the
+    // `failover_max_attempts=3` (so `attempts_total=2`) keeps the
     // budget tight: only ONE failover dial is permitted to land,
     // forcing the rotation to be correct on the first try.
     let s0 = MockServer::start(vec![
@@ -2456,7 +2456,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&s0, &s1, &s2, &s3])
     );
 
@@ -3094,7 +3094,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
     // A: happy initial + drops mid-stream + recovers on the 3rd accept.
     // B: drop_at_connect on accept #1, then recovers.
     //
-    // With `failover_max_attempts=1` (attempts_total=2), the test
+    // With `failover_max_attempts=3` (attempts_total=2), the test
     // forces the fall-through reset to be the path that recovers.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
@@ -3110,7 +3110,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
         happy_script(ServerRole::Standalone, "b-recovered"),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -3147,9 +3147,9 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
 /// be re-walked indefinitely inside a single outer attempt.
 #[test]
 fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
-    // 1 host, max_attempts=0 (attempts_total=1). Single outer attempt.
-    // Each outer attempt: walk (1 dial) + fall-through reset walk (1
-    // dial) = 2 dials.
+    // 1 host, failover_max_attempts=3 (attempts_total=2 outer
+    // reconnect attempts). Each outer attempt: walk (1 dial) +
+    // fall-through reset walk (1 dial) = 2 dials.
     let srv = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "x"),
         // Every subsequent accept: TCP drop. Even unlimited resets
@@ -3157,12 +3157,9 @@ fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=0;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         srv.url()
     );
-    // `failover_max_attempts=0` is rejected at config parse
-    // (validate() asserts >= 1); use 1 instead and account for that.
-    let conf = conf.replace("failover_max_attempts=0", "failover_max_attempts=1");
     let mut reader = Reader::from_conf(&conf).expect("connect");
     let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let _ = cursor.next_batch(); // Will fail.
@@ -3585,7 +3582,7 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
 /// Regression for `reconnect_with_failover`'s exhaustion-error counter:
 /// when `failover_max_duration_ms` cuts the loop short, the surfaced
 /// message must report the **actual** number of attempts that ran, not
-/// the configured `failover_max_attempts + 1` cap. Otherwise an
+/// the configured `failover_max_attempts - 1` cap. Otherwise an
 /// operator reading the log sees a number that overstates the real
 /// dial pressure and points at the wrong knob to tune.
 #[test]
