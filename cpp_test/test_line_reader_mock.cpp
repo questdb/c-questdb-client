@@ -3055,17 +3055,27 @@ TEST_CASE(
     qm::ColumnSpec col{
         "v", qm::COL_INT,
         qm::fixed_column_bytes(4, pack_le<int32_t>({1, 2, 3, 4}))};
+    // `emplace_back` (not `push_back`) forwards the alternative directly
+    // to `qm::Action`'s converting variant constructor, constructing in
+    // place inside the vector slot. `push_back(qm::ActionXxx{})` would
+    // first move-construct an `Action` temporary and then move it into
+    // the slot — and GCC 13's `-Wmaybe-uninitialized` flags the
+    // variant move-ctor's union storage on the non-active alternatives
+    // as a false positive (combined with `-Werror`, this breaks the
+    // CMake build). Reserving up-front also avoids any vector growth
+    // re-relocation walking back through the same move-ctor path.
     qm::Script s;
-    s.push_back(qm::ActionSendServerInfo{});
-    s.push_back(qm::ActionAwaitQueryRequest{});
+    s.reserve(static_cast<size_t>(kBatches) + 3);
+    s.emplace_back(qm::ActionSendServerInfo{});
+    s.emplace_back(qm::ActionAwaitQueryRequest{});
     for (int i = 0; i < kBatches; ++i)
     {
-        s.push_back(qm::ActionSendBuilt{
+        s.emplace_back(qm::ActionSendBuilt{
             [col, i](int64_t rid)
             { return qm::result_batch_frame(
                   rid, static_cast<uint64_t>(i), 1, 4, {col}); }});
     }
-    s.push_back(qm::ActionSendResultEnd{});
+    s.emplace_back(qm::ActionSendResultEnd{});
 
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
