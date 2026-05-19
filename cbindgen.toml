@@ -40,10 +40,17 @@ includes = []  # ["my_great_lib.h"]
 no_includes = true
 
 after_includes = """
-#if defined(LINESENDER_DYN_LIB) && defined(_MSC_VER)
-#    define LINESENDER_API __declspec(dllimport)
+/* `LINESENDER_DYN_LIB` is the historical name of this toggle, from when the
+   library shipped only the line sender. Accepted as an alias so consumers
+   predating the `QUESTDB_CLIENT_*` naming keep linking unchanged. */
+#if defined(LINESENDER_DYN_LIB) && !defined(QUESTDB_CLIENT_DYN_LIB)
+#    define QUESTDB_CLIENT_DYN_LIB
+#endif
+
+#if defined(QUESTDB_CLIENT_DYN_LIB) && defined(_MSC_VER)
+#    define QUESTDB_CLIENT_API __declspec(dllimport)
 #else
-#    define LINESENDER_API
+#    define QUESTDB_CLIENT_API
 #endif
 """
 
@@ -64,5 +71,5 @@ style = "type"
 usize_is_size_t = true
 
 [fn]
-prefix = "LINESENDER_API"
+prefix = "QUESTDB_CLIENT_API"
 args = "vertical"

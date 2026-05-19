@@ -93,7 +93,7 @@ if(WIN32)
     set_target_properties(
         questdb_client-shared
         PROPERTIES
-        DEFINE_SYMBOL "LINESENDER_DYN_LIB")
+        DEFINE_SYMBOL "QUESTDB_CLIENT_DYN_LIB")
     target_link_libraries(
         questdb_client-shared
         INTERFACE wsock32 ws2_32 ntdll crypt32 Secur32 Ncrypt)

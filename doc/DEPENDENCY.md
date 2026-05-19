@@ -235,12 +235,13 @@ If you use a build system other than CMake, the following tips should help you:
 
 * Add `include/` to the include path.
 
-* Define `LINESENDER_DYN_LIB` when *building* or *using* this code as a dynamic
-  library. This is especially important on Windows to mark
+* Define `QUESTDB_CLIENT_DYN_LIB` when *building* or *using* this code as a
+  dynamic library. This is especially important on Windows to mark
   `__declspec(dllimport)`.
-  On Linux and Mac the `LINESENDER_DYN_LIB` is used to mark
+  On Linux and Mac the `QUESTDB_CLIENT_DYN_LIB` is used to mark
   `__attribute__ ((visibility("default")))` and should be enabled in conjunction
   with the `-fvisibility=hidden` flag to GCC/Clang.
+  The historical name `LINESENDER_DYN_LIB` is still accepted as an alias.
 
 * Whilst *building* the library on Windows also define `LINESENDER_EXPORTS`
   to mark `__declspec(dllexport)`:
