@@ -46,6 +46,7 @@ use std::net::{Shutdown, TcpStream};
 
 use bytes::{Bytes, BytesMut};
 
+use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::frame::{FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::MaskRng;
 
@@ -77,10 +78,14 @@ const READ_CHUNK: usize = 4 * 1024 * 1024;
 /// the TLS feature, while still letting us reach the underlying
 /// `TcpStream` for `set_read_timeout` / `set_write_timeout` /
 /// `shutdown`. The `Tls` arm holds a `rustls::StreamOwned` that
-/// internally owns the `ClientConnection` + `TcpStream`.
+/// internally owns the `ClientConnection` + [`NoSigpipeTcp`].
+///
+/// The TCP half is wrapped in [`NoSigpipeTcp`] so multi-write teardown
+/// paths (e.g. `Cursor::Drop` emitting `CANCEL` then `Close`) cannot
+/// kill an FFI host process with `SIGPIPE` — see `nosigpipe.rs`.
 pub(crate) enum Stream {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(NoSigpipeTcp),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>>),
 }
 
 impl Stream {
@@ -88,8 +93,8 @@ impl Stream {
     /// (timeouts, `shutdown`) that aren't exposed on the rustls wrapper.
     pub(crate) fn tcp_mut(&mut self) -> &mut TcpStream {
         match self {
-            Stream::Plain(s) => s,
-            Stream::Tls(s) => &mut s.sock,
+            Stream::Plain(s) => s.tcp_mut(),
+            Stream::Tls(s) => s.sock.tcp_mut(),
         }
     }
 

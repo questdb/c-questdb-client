@@ -55,6 +55,7 @@ use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
 use crate::egress::ws::client::{Stream, WsClient, WsReadError};
+use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
 use crate::ws::mask::build_from_system_random;
 
@@ -148,6 +149,20 @@ impl WsTransport {
             }
         };
 
+        // Wrap in `NoSigpipeTcp` immediately so every subsequent write
+        // (including teardown `CANCEL`/`Close` from `Cursor::Drop`) is
+        // SIGPIPE-safe — see `ws::nosigpipe`. On macOS/BSD this also
+        // performs the single `SO_NOSIGPIPE` setsockopt before the
+        // socket reaches the rustls handshake path.
+        let tcp = NoSigpipeTcp::new(tcp).map_err(|e| {
+            fmt!(
+                SocketError,
+                "could not configure SO_NOSIGPIPE on {}: {}",
+                endpoint,
+                e
+            )
+        })?;
+
         // Bound the upgrade-response read with `auth_timeout_ms` per
         // failover.md §1.1. Catches the "TCP accepts but server never
         // replies" blackhole that the OS connect timeout misses — a
@@ -161,7 +176,9 @@ impl WsTransport {
         // supported targets), the upgrade still proceeds with the OS
         // default. Surfacing the SetTimeout error as a connect failure
         // would be more obstructive than helpful.
-        let _ = tcp.set_read_timeout(Some(Duration::from_millis(config.auth_timeout_ms)));
+        let _ = tcp
+            .tcp()
+            .set_read_timeout(Some(Duration::from_millis(config.auth_timeout_ms)));
 
         // Build the framed stream: plain TCP or rustls-over-TCP. The
         // rustls handshake runs lazily on the first read/write — i.e.
@@ -377,10 +394,13 @@ impl Drop for WsTransport {
     }
 }
 
-fn build_stream(tcp: &TcpStream, host: &str, config: &ReaderConfig) -> Result<Stream> {
+fn build_stream(tcp: &NoSigpipeTcp, host: &str, config: &ReaderConfig) -> Result<Stream> {
     // Clone the TCP socket so the stream owns its own handle for the
     // rustls wrapper without losing the original; both halves point at
     // the same FD, so timeouts set on one apply to the other.
+    // `NoSigpipeTcp::try_clone` `dup`s the underlying fd — the kernel
+    // socket (and its `SO_NOSIGPIPE` flag, where applicable) is shared
+    // across both handles, so no re-setsockopt is needed.
     let owned = tcp
         .try_clone()
         .map_err(|e| fmt!(SocketError, "could not clone TCP socket: {}", e))?;
