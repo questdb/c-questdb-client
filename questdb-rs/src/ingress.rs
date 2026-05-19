@@ -807,10 +807,7 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "max_background_drainers" => builder.max_background_drainers(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "error_inbox_capacity" => builder.reject_unsupported_qwp_ws_setting(
-                    "error_inbox_capacity",
-                    "Java-style async error inbox configuration is not implemented",
-                )?,
+                "error_inbox_capacity" => builder.error_inbox_capacity(val)?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -1691,6 +1688,28 @@ impl SenderBuilder {
         qwp_ws
             .max_background_drainers
             .set_specified("max_background_drainers", value as usize)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn error_inbox_capacity(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"error_inbox_capacity\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let value: usize = parse_conf_value("error_inbox_capacity", value)?;
+        if value < conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be >= {}: {value}",
+                conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY
+            ));
+        }
+        qwp_ws
+            .error_inbox_capacity
+            .set_specified("error_inbox_capacity", value)?;
         Ok(self)
     }
 

@@ -137,6 +137,10 @@ pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY: usize = 256;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_MIN_ERROR_INBOX_CAPACITY: usize = 16;
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +224,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
     pub(crate) drain_orphans: ConfigSetting<bool>,
     pub(crate) max_background_drainers: ConfigSetting<usize>,
+    pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
 }
 
@@ -254,6 +259,7 @@ impl Default for QwpWsConfig {
             max_background_drainers: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS,
             ),
+            error_inbox_capacity: ConfigSetting::new_default(QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
         }
     }

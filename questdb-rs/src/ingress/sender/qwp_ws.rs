@@ -49,8 +49,8 @@ use super::qwp_ws_codec::{
 #[cfg(test)]
 use super::qwp_ws_driver::QwpWsCoreTestHarness;
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, CloseOutcome, DEFAULT_EVENT_CAPACITY, DriveOutcome, DriverError,
-    DriverEvent, PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport,
+    BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, DriverEvent,
+    PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport,
     QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore, QwpWsReconnectStep,
     QwpWsSendCore, QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure,
     TransportPoll, TransportResponse, reconnect_error_is_terminal, reconnect_sleep_duration,
@@ -312,8 +312,9 @@ where
         queue: Q,
         pending_connect: QwpWsPendingConnect,
         append_deadline: Duration,
+        event_capacity: usize,
     ) -> Self {
-        let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+        let mut store = QwpWsPublicationStore::new(queue, event_capacity);
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
@@ -2527,6 +2528,7 @@ pub(crate) fn connect_qwp_ws(
                 queue,
                 pending_connect,
                 *qwp_ws.sf_append_deadline,
+                *qwp_ws.error_inbox_capacity,
             ),
             QwpWsReplayEncoder::new(1),
         )
@@ -2615,7 +2617,7 @@ fn open_qwp_ws_parts(
         connect_blocking_transport(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
     let negotiated_version = transport.negotiated_version();
     let max_in_flight = queue.max_in_flight();
-    let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+    let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
     let send_core = QwpWsSendCore::new_with_durable_ack(
         transport,
         max_in_flight,

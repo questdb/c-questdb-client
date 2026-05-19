@@ -450,18 +450,17 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
     )
     .unwrap();
-    for (conf, expected) in [
-        (
-            "qwpws::addr=localhost:9000;max_schemas_per_connection=1024;",
-            "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
-        ),
-        (
-            "qwpws::addr=localhost:9000;error_inbox_capacity=64;",
-            "\"error_inbox_capacity\" is not supported by the Rust QWP/WebSocket sync sender yet; Java-style async error inbox configuration is not implemented.",
-        ),
-    ] {
-        assert_conf_err(SenderBuilder::from_conf(conf), expected);
-    }
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_schemas_per_connection=1024;"),
+        "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
+    );
+
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=16;").unwrap();
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=15;"),
+        "error_inbox_capacity must be >= 16: 15",
+    );
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]

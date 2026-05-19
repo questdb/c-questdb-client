@@ -217,7 +217,7 @@ impl SfaSegment {
             options.create(true).truncate(true);
         }
         let file = options.open(path)?;
-        if let Err(err) = file.set_len(size_bytes) {
+        if let Err(err) = reserve_segment_blocks(&file, size_bytes) {
             if create_new {
                 let _ = fs::remove_file(path);
             }
@@ -707,6 +707,58 @@ fn crc32c_update(seed: u32, bytes: &[u8]) -> u32 {
     crc32c::crc32c_append(seed, bytes)
 }
 
+/// Reserve real disk blocks for the whole segment up front. A plain
+/// `set_len`/`ftruncate` leaves the file sparse, so a later store into the
+/// mmap'd region faults with `SIGBUS` once the filesystem fills up, turning a
+/// recoverable `ENOSPC` into a process kill. Falls back to `set_len` on
+/// filesystems that do not support block reservation.
+#[cfg(target_os = "linux")]
+fn reserve_segment_blocks(file: &File, size_bytes: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let len = libc::off_t::try_from(size_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "segment size exceeds off_t"))?;
+    match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) } {
+        0 => Ok(()),
+        libc::EOPNOTSUPP | libc::ENOSYS => file.set_len(size_bytes),
+        errno => Err(io::Error::from_raw_os_error(errno)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reserve_segment_blocks(file: &File, size_bytes: u64) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let len = libc::off_t::try_from(size_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "segment size exceeds off_t"))?;
+    let fd = file.as_raw_fd();
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len,
+        fst_bytesalloc: 0,
+    };
+    let mut rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+    if rc == -1 {
+        // Retry without the contiguity constraint before giving up.
+        store.fst_flags = libc::F_ALLOCATEALL;
+        rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+    }
+    if rc == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOTSUP) {
+            return file.set_len(size_bytes);
+        }
+        return Err(err);
+    }
+    // F_PREALLOCATE reserves blocks past EOF; set_len extends the logical size.
+    file.set_len(size_bytes)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn reserve_segment_blocks(file: &File, size_bytes: u64) -> io::Result<()> {
+    file.set_len(size_bytes)
+}
+
 fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
     let len = usize::try_from(size_bytes)
         .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
@@ -809,6 +861,27 @@ mod tests {
                     payload: b"two-two".to_vec(),
                 },
             ]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn create_reserves_real_disk_blocks_not_a_sparse_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = initial_segment_path(dir.path());
+        let size_bytes: u64 = 1 << 20;
+        let _segment = SfaSegment::create(&path, 1, size_bytes, 1).unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), size_bytes);
+        // An `ftruncate`-only file is sparse and reports near-zero allocated
+        // blocks; block reservation backs the whole logical size.
+        assert!(
+            meta.blocks() * 512 >= size_bytes,
+            "segment file is sparse: {} allocated bytes for {size_bytes} logical bytes",
+            meta.blocks() * 512,
         );
     }
 
