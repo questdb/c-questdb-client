@@ -681,6 +681,27 @@ impl Sender {
         }
     }
 
+    /// Snapshot the QWP/WebSocket sender's lifetime totals.
+    ///
+    /// Mirrors the `getTotal*` counters on Java's `QwpWebSocketSender` so the
+    /// QuestDB Enterprise e2e harness (questdb-ent/e2e) can read identical
+    /// signals across language bindings. See [`QwpWsTotals`] for the field
+    /// list. Returns `InvalidApiCall` for non-QWP/WebSocket senders.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn qwp_ws_totals(&self) -> Result<QwpWsTotals> {
+        let counters = match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_counters_background(state)?,
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_counters_manual(state)?,
+            _ => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "qwp_ws_totals is only supported for QWP/WebSocket senders."
+                ));
+            }
+        };
+        Ok(counters.into())
+    }
+
     /// Drive one QWP/WebSocket progress step when the sender was built with
     /// [`QwpWsProgress::Manual`].
     ///
