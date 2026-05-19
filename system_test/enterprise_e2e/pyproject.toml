@@ -1,0 +1,32 @@
+[project]
+name = "c-questdb-client-enterprise-e2e"
+version = "0.1.0"
+description = "End-to-end tests that drive c-questdb-client sidecar bindings against a real QuestDB Enterprise primary."
+requires-python = ">=3.10"
+dependencies = [
+    "pytest>=8.0",
+    "pytest-randomly>=3.15",
+    "psycopg[binary]>=3.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]
+markers = [
+    # Top-level marker for every test that drives a c-questdb-client
+    # binding's sidecar. The dispatched Enterprise CI selects with
+    # `-m c_client`. Each test ALSO carries a sub-binding marker
+    # (`c_client_rust`, `c_client_c`, `c_client_cpp`) so a single
+    # binding can be exercised in isolation when iterating.
+    "c_client: tests driving any c-questdb-client binding sidecar",
+    "c_client_rust: c-questdb-client Rust binding subset",
+    "c_client_c: c-questdb-client C binding subset (no tests yet)",
+    "c_client_cpp: c-questdb-client C++ binding subset (no tests yet)",
+]
+log_cli = true
+log_cli_level = "INFO"

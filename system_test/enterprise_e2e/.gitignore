@@ -1,0 +1,6 @@
+# Local venv + caches from `pip install -e .` and pytest. The package
+# is meant to be installed into a fresh venv per run, never built
+# in-place into the repo.
+.venv/
+.pytest_cache/
+*.egg-info/

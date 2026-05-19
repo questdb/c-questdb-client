@@ -480,3 +480,119 @@ stages:
                 --test egress_live_server_alter_fuzz \
                 -- --nocapture
             displayName: "QWP egress live-server fuzz"
+
+      # Cross-repo trigger: fire the questdb-enterprise
+      # build-and-test-e2e-c-client pipeline with this build's SHA so
+      # the c_client-marked failover tests (Rust today; C / C++ as
+      # those sidecars land) run against an Enterprise primary. The
+      # Enterprise pipeline posts a status check back on the PR
+      # (`enterprise-e2e-c-client` context); this job fire-and-forgets
+      # and does not block the PR.
+      #
+      # Fork PRs are intentionally skipped: System.AccessToken is not
+      # exposed to fork builds, so the dispatch call would fail with
+      # 401. We'd rather skip silently than spam fork PRs with
+      # spurious red checks.
+      #
+      # Prerequisites the questdb infra team needs to have configured
+      # (one-time, in the Azure DevOps project UI):
+      #   1. Register ci/build-and-test-e2e-c-client.yaml in the
+      #      questdb-enterprise project as a pipeline. Note its name
+      #      — it must match `enterprisePipelineName` below.
+      #   2. Ensure the c-questdb-client and questdb-enterprise
+      #      pipelines live in the same Azure DevOps project, OR set
+      #      `enterpriseProject` below to the project that hosts
+      #      questdb-enterprise's pipelines and grant the c-questdb-
+      #      client pipeline's build identity "Queue builds"
+      #      permission there.
+      - job: TriggerEnterpriseCClientE2E
+        displayName: "Trigger questdb-enterprise c_client e2e"
+        pool:
+          vmImage: ubuntu-latest
+        # Skip on fork PRs: $(System.AccessToken) is empty there and
+        # the REST POST would return 401.
+        condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'))
+        variables:
+          enterpriseProject: '$(System.TeamProject)'
+          enterprisePipelineName: 'build-and-test-e2e-c-client'
+        steps:
+          - checkout: none
+          - bash: |
+              set -euo pipefail
+
+              ORG_URL="$(System.TeamFoundationCollectionUri)"
+              PROJECT="$(enterpriseProject)"
+              PIPELINE_NAME="$(enterprisePipelineName)"
+
+              # Resolve pipeline ID by name. The pipelines list API
+              # returns every pipeline in the project; we filter
+              # client-side because the $filter query parameter on
+              # this endpoint is limited.
+              echo "Looking up '${PIPELINE_NAME}' in '${PROJECT}'..."
+              PIPELINES=$(curl -fsS -u ":${SYSTEM_ACCESSTOKEN}" \
+                "${ORG_URL}${PROJECT}/_apis/pipelines?api-version=7.0")
+              PIPELINE_ID=$(echo "$PIPELINES" | jq -r --arg n "$PIPELINE_NAME" \
+                '.value[] | select(.name == $n) | .id' | head -1)
+
+              if [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" = "null" ]; then
+                echo "ERROR: pipeline '${PIPELINE_NAME}' not found in project '${PROJECT}'." >&2
+                echo "Register ci/build-and-test-e2e-c-client.yaml in" >&2
+                echo "the Azure DevOps UI under that name to enable the" >&2
+                echo "cross-repo c_client e2e check." >&2
+                exit 1
+              fi
+
+              CLIENT_PR_NUMBER="$(System.PullRequest.PullRequestNumber)"
+              if [ -z "${CLIENT_PR_NUMBER}" ] || [ "${CLIENT_PR_NUMBER}" = "None" ]; then
+                # Branch builds (e.g. nightly on main) still benefit
+                # from the cross-repo check, but there's no PR number
+                # to attach a status to. The Enterprise pipeline's
+                # report stage skips the GitHub-status POST when
+                # cClientPrNumber is empty.
+                CLIENT_PR_NUMBER=""
+              fi
+
+              # Forward the client branch name as a hint for the
+              # Enterprise side to try a same-name branch match
+              # (xyz → xyz, fallback to main). For a PR build,
+              # System.PullRequest.SourceBranch is `refs/heads/xyz`;
+              # for a direct branch build the branch name is in
+              # Build.SourceBranchName already. Strip refs/heads/ so
+              # the Enterprise step can use it directly as a git ref.
+              if [ "$(Build.Reason)" = "PullRequest" ]; then
+                CLIENT_BRANCH="$(System.PullRequest.SourceBranch)"
+                CLIENT_BRANCH="${CLIENT_BRANCH#refs/heads/}"
+              else
+                CLIENT_BRANCH="$(Build.SourceBranchName)"
+              fi
+              echo "Client branch hint: ${CLIENT_BRANCH}"
+
+              # `templateParameters` matches the `parameters:` block
+              # in build-and-test-e2e-c-client.yaml.
+              BODY=$(jq -n \
+                --arg commit "$(Build.SourceVersion)" \
+                --arg pr "${CLIENT_PR_NUMBER}" \
+                --arg branch "${CLIENT_BRANCH}" \
+                '{
+                  templateParameters: {
+                    cClientCommit: $commit,
+                    cClientPrNumber: $pr,
+                    clientBranch: $branch
+                  },
+                  resources: { repositories: { self: { refName: "refs/heads/main" } } }
+                }')
+
+              echo "POSTing pipeline run with body:"
+              echo "$BODY" | jq .
+
+              RESPONSE=$(curl -fsS -u ":${SYSTEM_ACCESSTOKEN}" \
+                -H "Content-Type: application/json" \
+                -X POST \
+                -d "$BODY" \
+                "${ORG_URL}${PROJECT}/_apis/pipelines/${PIPELINE_ID}/runs?api-version=7.0")
+
+              RUN_URL=$(echo "$RESPONSE" | jq -r '._links.web.href // ""')
+              echo "Enterprise build queued: ${RUN_URL}"
+            displayName: "Queue enterprise c_client e2e"
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
