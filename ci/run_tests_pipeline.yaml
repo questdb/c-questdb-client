@@ -495,16 +495,20 @@ stages:
       # spurious red checks.
       #
       # Prerequisites the questdb infra team needs to have configured
-      # (one-time, in the Azure DevOps project UI):
+      # (one-time, in the Azure DevOps UI):
       #   1. Register ci/build-and-test-e2e-c-client.yaml in the
       #      `questdb-enterprise` ADO project as a pipeline. Name must
       #      match `enterprisePipelineName` below.
-      #   2. The Enterprise pipeline lives in a different ADO project
-      #      from this one (this one is `questdb`, Enterprise is
-      #      `questdb-enterprise`). For cross-project queueing,
-      #      `questdb-enterprise` project settings must grant the
-      #      `questdb Build Service` identity "Queue builds" +
-      #      "View build pipeline" permissions.
+      #   2. Create a PAT in the `questdb-enterprise` ADO project
+      #      with `Build (Read & execute)` scope (User settings →
+      #      Personal access tokens → New). Add it as a secret
+      #      variable on THIS pipeline named ENT_DISPATCH_PAT
+      #      (Pipelines → questdb.c-questdb-client → Edit →
+      #      Variables → +, mark as secret). PAT-based auth is used
+      #      rather than $(System.AccessToken) because the two
+      #      pipelines live in different ADO projects, and tokens
+      #      issued for this project can't see the Enterprise
+      #      project's pipelines API without it.
       - job: TriggerEnterpriseCClientE2E
         displayName: "Trigger questdb-enterprise c_client e2e"
         # Use the hetzner-incus self-hosted pool: the Microsoft-hosted
@@ -514,8 +518,10 @@ stages:
         # ReportToOssPr stage uses both).
         pool:
           name: hetzner-incus
-        # Skip on fork PRs: $(System.AccessToken) is empty there and
-        # the REST POST would return 401.
+        # Skip on fork PRs: secret pipeline variables (and System
+        # tokens) are not exposed to fork builds, so the REST POST
+        # would 401. Skipping rather than failing keeps fork-PR CI
+        # clean.
         condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'))
         variables:
           # Hardcoded because the Enterprise pipeline lives in its own
@@ -531,12 +537,20 @@ stages:
               PROJECT="$(enterpriseProject)"
               PIPELINE_NAME="$(enterprisePipelineName)"
 
+              if [ -z "${ENT_DISPATCH_PAT:-}" ]; then
+                echo "ERROR: ENT_DISPATCH_PAT secret pipeline variable is not set." >&2
+                echo "Create a PAT in the questdb-enterprise ADO project with" >&2
+                echo "'Build (Read & execute)' scope and add it as a secret" >&2
+                echo "variable named ENT_DISPATCH_PAT on this pipeline." >&2
+                exit 1
+              fi
+
               # Resolve pipeline ID by name. The pipelines list API
               # returns every pipeline in the project; we filter
               # client-side because the $filter query parameter on
               # this endpoint is limited.
               echo "Looking up '${PIPELINE_NAME}' in '${PROJECT}'..."
-              PIPELINES=$(curl -fsS -u ":${SYSTEM_ACCESSTOKEN}" \
+              PIPELINES=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
                 "${ORG_URL}${PROJECT}/_apis/pipelines?api-version=7.0")
               PIPELINE_ID=$(echo "$PIPELINES" | jq -r --arg n "$PIPELINE_NAME" \
                 '.value[] | select(.name == $n) | .id' | head -1)
@@ -592,7 +606,7 @@ stages:
               echo "POSTing pipeline run with body:"
               echo "$BODY" | jq .
 
-              RESPONSE=$(curl -fsS -u ":${SYSTEM_ACCESSTOKEN}" \
+              RESPONSE=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
                 -H "Content-Type: application/json" \
                 -X POST \
                 -d "$BODY" \
@@ -602,4 +616,9 @@ stages:
               echo "Enterprise build queued: ${RUN_URL}"
             displayName: "Queue enterprise c_client e2e"
             env:
-              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              # The PAT is a secret pipeline variable that must be set
+              # on this pipeline in the ADO UI (Variables → +, name
+              # ENT_DISPATCH_PAT, mark as secret). Secret variables
+              # aren't auto-exposed to script env; the explicit
+              # `env:` mapping below is required.
+              ENT_DISPATCH_PAT: $(ENT_DISPATCH_PAT)
