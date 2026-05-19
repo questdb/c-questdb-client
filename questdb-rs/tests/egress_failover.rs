@@ -3633,3 +3633,123 @@ fn deadline_exhaustion_reports_actual_attempt_count_not_configured_cap() {
         assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reader-migration + concurrent-stats-read contract.
+//
+// The Reader API documents (reader.rs:140-150) that its stat getters take
+// `&self`, touch only atomics on `Arc<ReaderStats>`, and "may be invoked
+// concurrently from a monitoring thread while another thread is driving a
+// cursor." A compile-time assertion in `egress/reader.rs` pins `Send +
+// Sync` on `Reader`/`ReaderStats`/`HostHealthTracker` so a future
+// structural change can't silently invalidate that bound. This runtime
+// test exercises the migration itself: the Reader is moved to a worker
+// thread, the worker drives several sequential queries, and the main
+// thread polls the `Arc<ReaderStats>` clone in parallel. Under TSan this
+// surfaces any non-atomic access on the same memory the stat getters
+// touch; under the default test runner it pins the API shape (Reader is
+// `Send`, the stats Arc is share-by-clone).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reader_migrates_to_worker_thread_with_concurrent_stats_polling() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering as AOrd;
+
+    // Each query: server-info handshake (once), then await query / sleep /
+    // result-end repeated. The Sleep stretches the inter-frame window so
+    // the main thread's poll loop catches the cursor mid-flight rather
+    // than after it's already drained.
+    let script = vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::Sleep(Duration::from_millis(40)),
+        Action::SendResultEnd,
+        Action::AwaitQueryRequest,
+        Action::Sleep(Duration::from_millis(40)),
+        Action::SendResultEnd,
+        Action::AwaitQueryRequest,
+        Action::Sleep(Duration::from_millis(40)),
+        Action::SendResultEnd,
+    ];
+    let srv = MockServer::start(vec![script]);
+    let conf = format!("ws::addr={}", srv.url());
+
+    let reader = Reader::from_conf(&conf).expect("connect");
+    // Clone the stats Arc on main BEFORE the Reader migrates, so the
+    // monitor thread reads counters via its own Arc handle — exactly
+    // what the FFI does (`line_reader` stashes an `Arc<ReaderStats>`
+    // clone next to the `UnsafeCell<Reader>` for the same reason).
+    let stats = std::sync::Arc::clone(reader.stats());
+
+    let worker_done = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_done_cloned = std::sync::Arc::clone(&worker_done);
+
+    let worker = thread::spawn(move || {
+        // `Reader` moves into this thread — exercises `Send`.
+        let mut reader = reader;
+        for _ in 0..3 {
+            let mut cursor = reader
+                .prepare("select 1")
+                .execute()
+                .expect("execute on worker thread");
+            // Drain the cursor to terminus; each query bumps
+            // `bytes_received` by the SERVER_INFO/handshake-or-RESULT_END
+            // wire bytes so the monitor sees movement.
+            while cursor.next_batch().expect("next_batch").is_some() {}
+        }
+        worker_done_cloned.store(true, AOrd::Release);
+    });
+
+    // Spin reading every getter the FFI exposes. No sleep — we want to
+    // hammer the atomic load path concurrently with the worker's
+    // transport reads/writes, so a regression that drops `Sync` or that
+    // routes a getter through a non-atomic field is caught by TSan.
+    let mut last_bytes = 0u64;
+    let mut max_bytes = 0u64;
+    let mut poll_count = 0u64;
+    while !worker_done.load(AOrd::Acquire) {
+        let b = stats.bytes_received.load(AOrd::Relaxed);
+        let r = stats.read_ns.load(AOrd::Relaxed);
+        let d = stats.decode_ns.load(AOrd::Relaxed);
+        let c = stats.credit_granted_total.load(AOrd::Relaxed);
+        // Monotonicity: a `&self` reader from a different thread MUST
+        // observe non-decreasing counters under the Relaxed/Release
+        // shape the producers use (`fetch_add(Relaxed)` on the worker).
+        // A drop here would mean someone introduced a non-atomic
+        // overwrite path on the same counter.
+        assert!(
+            b >= last_bytes,
+            "bytes_received went backwards: {last_bytes} -> {b}"
+        );
+        last_bytes = b;
+        max_bytes = max_bytes.max(b);
+        // Touch every counter so all four paths are exercised.
+        let _ = (r, d, c);
+        poll_count += 1;
+    }
+
+    worker.join().expect("worker panicked");
+
+    // Final stat read from main — happens-after the worker's atomic
+    // store-Release on `worker_done`, so this MUST observe at least as
+    // many bytes as any in-flight poll did.
+    let final_bytes = stats.bytes_received.load(AOrd::Relaxed);
+    assert!(
+        final_bytes > 0,
+        "expected bytes_received > 0 after three round-trips"
+    );
+    assert!(
+        final_bytes >= max_bytes,
+        "post-join bytes_received {final_bytes} < pre-join max {max_bytes} — \
+         a poll observed a future state, or the store-Release happens-before \
+         is broken"
+    );
+    assert!(
+        poll_count > 0,
+        "monitor thread didn't poll at all — worker drained before any read"
+    );
+}

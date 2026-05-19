@@ -2804,6 +2804,349 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
 }
 
 // ---------------------------------------------------------------------------
+// FFI ABI smoke for every supported `line_reader_query_bind_*`.
+//
+// Each bind goes through the C ABI (`questdb::egress::query::bind_*` ->
+// `line_reader_query_bind_*` -> `mutate_query` -> upstream `bind_*`), so
+// the captured QUERY_REQUEST is a byte-level snapshot of the marshalling.
+// Sentinel values are chosen so a wrong argument order, sign-extension
+// bug, or off-by-one width on any single bind produces a localised diff
+// rather than a silent payload corruption that masks itself across
+// neighbouring binds.
+//
+// Phase-1-rejected binds (`bind_binary`, `bind_ipv4`, `bind_null_binary`,
+// `bind_null` with `ipv4` kind) are not on this happy path — they're
+// rejected by upstream `check_bindable` before the request hits the
+// wire (see `egress/binds.rs`, "PHASE 1 SERVER COMPATIBILITY"). Their
+// FFI shape is exercised by `prepare(...).bind_X(...).execute()`
+// throwing `invalid_bind`; the wire bytes can't be asserted because no
+// frame is sent.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "mock: every supported bind variant marshals through the FFI ABI")
+{
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+
+    const std::array<uint8_t, 16> kUuid = {
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF,
+    };
+    const std::array<uint8_t, 32> kLong256 = {
+        0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+        0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F,
+        0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+        0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
+    };
+    const std::array<uint8_t, 32> kDecimal256 = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+    };
+
+    auto cur = reader.prepare("X"_utf8)
+                   .bind_bool(true)
+                   .bind_i8(static_cast<int8_t>(-13))
+                   .bind_i16(static_cast<int16_t>(0x1234))
+                   .bind_i32(static_cast<int32_t>(0x01020304))
+                   .bind_i64(static_cast<int64_t>(0x0102030405060708LL))
+                   .bind_f32(1.0f)
+                   .bind_f64(1.0)
+                   .bind_timestamp_micros(
+                       static_cast<int64_t>(0x1100AABBCCDDEEFFLL))
+                   .bind_timestamp_nanos(
+                       static_cast<int64_t>(0x2200AABBCCDDEEFFLL))
+                   .bind_date_millis(
+                       static_cast<int64_t>(0x3300AABBCCDDEEFFLL))
+                   .bind_uuid(kUuid)
+                   .bind_long256(kLong256)
+                   .bind_char(static_cast<uint16_t>(0xCAFE))
+                   .bind_decimal64(
+                       static_cast<int64_t>(0x4400AABBCCDDEEFFLL),
+                       static_cast<int8_t>(5))
+                   // `mantissa_lo` is u64 (low limb), `mantissa_hi` is i64
+                   // (sign-extends into the i128). The wire form is the
+                   // i128 in little-endian, so the captured bytes are
+                   // `lo_le` followed by `hi_le`.
+                   .bind_decimal128(
+                       static_cast<uint64_t>(0x1122334455667788ULL),
+                       static_cast<int64_t>(0x6655443322110000LL),
+                       static_cast<int8_t>(7))
+                   .bind_decimal256(kDecimal256, static_cast<int8_t>(9))
+                   .bind_geohash(
+                       static_cast<uint64_t>(0x1F),
+                       static_cast<uint8_t>(5))
+                   .bind_varchar("hello"_utf8)
+                   .bind_null(::questdb::egress::column_kind::int_)
+                   .bind_null_varchar()
+                   .bind_null_decimal64(static_cast<int8_t>(3))
+                   .bind_null_decimal128(static_cast<int8_t>(11))
+                   .bind_null_decimal256(static_cast<int8_t>(13))
+                   .bind_null_geohash(static_cast<uint8_t>(7))
+                   .execute();
+    while (cur.next_batch()) {}
+
+    auto reqs = srv.captured_requests();
+    REQUIRE(reqs.size() == 1);
+    const auto& req = reqs[0];
+
+    // Build the expected bind payload incrementally. Each helper appends
+    // to `exp`; the captured request is then matched starting at the
+    // post-preamble offset.
+    std::vector<uint8_t> exp;
+    auto put = [&](std::initializer_list<uint8_t> bs) {
+        for (auto b : bs) exp.push_back(b);
+    };
+    auto put_bytes = [&](const uint8_t* p, size_t n) {
+        exp.insert(exp.end(), p, p + n);
+    };
+    auto put_u16_le = [&](uint16_t v) {
+        exp.push_back(static_cast<uint8_t>(v & 0xFF));
+        exp.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    };
+    auto put_u32_le = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i)
+            exp.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    };
+    auto put_u64_le = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i)
+            exp.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    };
+    auto put_f32_le = [&](float f) {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        put_u32_le(bits);
+    };
+    auto put_f64_le = [&](double f) {
+        uint64_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        put_u64_le(bits);
+    };
+
+    // Type codes mirror `ColumnKind::as_u8` in `column_kind.rs`.
+    constexpr uint8_t kBool = 0x01, kByte = 0x02, kShort = 0x03,
+                      kInt = 0x04, kLong = 0x05, kFloat = 0x06,
+                      kDouble = 0x07, kTimestamp = 0x0A, kDate = 0x0B,
+                      kUuidKind = 0x0C, kLong256Kind = 0x0D,
+                      kGeohash = 0x0E, kVarchar = 0x0F,
+                      kTimestampNanos = 0x10, kDecimal64 = 0x13,
+                      kDecimal128 = 0x14, kDecimal256Kind = 0x15,
+                      kChar = 0x16;
+
+    // 1. bool(true) -> [kBool, 0x00, 0x01]
+    put({kBool, 0x00, 0x01});
+    // 2. i8(-13)
+    put({kByte, 0x00, static_cast<uint8_t>(int8_t(-13))});
+    // 3. i16(0x1234)
+    put({kShort, 0x00}); put_u16_le(0x1234);
+    // 4. i32(0x01020304)
+    put({kInt, 0x00}); put_u32_le(0x01020304U);
+    // 5. i64(0x0102030405060708)
+    put({kLong, 0x00}); put_u64_le(0x0102030405060708ULL);
+    // 6. f32(1.0)
+    put({kFloat, 0x00}); put_f32_le(1.0f);
+    // 7. f64(1.0)
+    put({kDouble, 0x00}); put_f64_le(1.0);
+    // 8. timestamp_micros
+    put({kTimestamp, 0x00}); put_u64_le(0x1100AABBCCDDEEFFULL);
+    // 9. timestamp_nanos
+    put({kTimestampNanos, 0x00}); put_u64_le(0x2200AABBCCDDEEFFULL);
+    // 10. date_millis
+    put({kDate, 0x00}); put_u64_le(0x3300AABBCCDDEEFFULL);
+    // 11. uuid (16 raw bytes, verbatim)
+    put({kUuidKind, 0x00}); put_bytes(kUuid.data(), kUuid.size());
+    // 12. long256 (32 raw bytes, verbatim)
+    put({kLong256Kind, 0x00}); put_bytes(kLong256.data(), kLong256.size());
+    // 13. char(0xCAFE) - u16 LE
+    put({kChar, 0x00}); put_u16_le(0xCAFE);
+    // 14. decimal64(value, scale=5): [type, 0x00, scale, ...8 LE...]
+    put({kDecimal64, 0x00, 0x05}); put_u64_le(0x4400AABBCCDDEEFFULL);
+    // 15. decimal128(lo, hi, scale=7): [type, 0x00, scale, lo_le(8), hi_le(8)]
+    put({kDecimal128, 0x00, 0x07});
+    put_u64_le(0x1122334455667788ULL);
+    put_u64_le(0x6655443322110000ULL);
+    // 16. decimal256(bytes, scale=9): [type, 0x00, scale, ...32 raw bytes...]
+    put({kDecimal256Kind, 0x00, 0x09});
+    put_bytes(kDecimal256.data(), kDecimal256.size());
+    // 17. geohash(0x1F, prec=5): [type, 0x00, varint(5), ceil(5/8)=1 byte LE]
+    put({kGeohash, 0x00, 0x05, 0x1F});
+    // 18. varchar("hello"): [type, 0x00, u32_le(0), u32_le(5), 'h','e','l','l','o']
+    put({kVarchar, 0x00});
+    put_u32_le(0);
+    put_u32_le(5);
+    exp.insert(exp.end(), {'h', 'e', 'l', 'l', 'o'});
+    // 19. bind_null(int_): simple-null body, no extra args
+    put({kInt, 0x01, 0x01});
+    // 20. bind_null_varchar: same simple-null body for Varchar kind
+    put({kVarchar, 0x01, 0x01});
+    // 21..23. null_decimal{64,128,256} carry the scale even on null.
+    put({kDecimal64, 0x01, 0x01, 0x03});
+    put({kDecimal128, 0x01, 0x01, 0x0B});
+    put({kDecimal256Kind, 0x01, 0x01, 0x0D});
+    // 24. null_geohash carries the precision_bits varint even on null.
+    put({kGeohash, 0x01, 0x01, 0x07});
+
+    constexpr size_t kBindCount = 24;
+    // Preamble layout: 0x10 | i64 rid | varint sql_len=1 | 'X' |
+    //                   varint credit=0 | varint bind_count
+    // bind_count is < 128, so its varint is a single byte.
+    constexpr size_t kPreambleLen = 1 + 8 + 1 + 1 + 1 + 1; // = 13
+    REQUIRE(req.size() == kPreambleLen + exp.size());
+    CHECK(req[0] == qm::MSG_QUERY_REQUEST);
+    // req[1..9] is the request_id (i64 LE); non-deterministic, skip.
+    CHECK(req[9] == 0x01);           // sql_len varint
+    CHECK(req[10] == 'X');           // sql byte
+    CHECK(req[11] == 0x00);          // initial_credit varint
+    CHECK(req[12] == kBindCount);    // bind_count varint
+
+    for (size_t i = 0; i < exp.size(); ++i)
+    {
+        // Per-byte CHECK so a diff localises to the failing bind.
+        CHECK_MESSAGE(req[kPreambleLen + i] == exp[i],
+                      "bind payload mismatch at byte " << i);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FFI thread-safety contract: Reader migration + concurrent stats reads.
+//
+// `line_reader_bytes_received` / `_read_ns` / `_decode_ns` /
+// `_credit_granted_total` are documented at `questdb-rs-ffi/src/egress.rs`
+// as safe to call from a monitoring thread while another thread is
+// driving a cursor through `line_reader_query_execute`. The Reader is
+// stored in an `UnsafeCell<Reader>` next to a cloned `Arc<ReaderStats>`
+// inside the C-side `line_reader` struct; the stat getters use
+// `ptr::addr_of!` to reach the Arc field without synthesising an
+// intermediate `&line_reader` reborrow that would otherwise cover the
+// cell and disturb the laundered `&mut Reader` held by an in-flight
+// query. This test exercises that exact shape from C++:
+//
+//  - The worker thread mutates the Reader via `reader.execute(...)` and
+//    drives a multi-batch cursor through `next_batch()`.
+//  - The main thread hammers `reader.bytes_received()` /
+//    `read_ns()` / `decode_ns()` / `credit_granted_total()` on the same
+//    `line_reader*` handle.
+//
+// Under `QUESTDB_SANITIZE` (ASan + UBSan today; TSan if/when wired in)
+// a regression that routes a stat getter through a non-atomic field, or
+// that drops the disjoint-fields invariant, surfaces as a sanitiser
+// report. Without sanitisers the test still pins the API shape and
+// catches a hang/crash, and the monotonicity assertion catches a
+// counter overwrite even on a clean build.
+// ---------------------------------------------------------------------------
+
+TEST_CASE(
+    "mock: reader migrates to worker thread with concurrent stats polling")
+{
+    // Drive a non-trivial wire window: many small RESULT_BATCH frames so
+    // the poll loop on main catches the cursor mid-flight rather than
+    // after it's already drained. Each batch is 4 rows × i32 = 16 value
+    // bytes plus framing — the exact size doesn't matter, only that the
+    // sequence stretches over enough time for the monitor thread to
+    // observe motion in `bytes_received`.
+    constexpr int kBatches = 32;
+    qm::ColumnSpec col{
+        "v", qm::COL_INT,
+        qm::fixed_column_bytes(4, pack_le<int32_t>({1, 2, 3, 4}))};
+    qm::Script s;
+    s.push_back(qm::ActionSendServerInfo{});
+    s.push_back(qm::ActionAwaitQueryRequest{});
+    for (int i = 0; i < kBatches; ++i)
+    {
+        s.push_back(qm::ActionSendBuilt{
+            [col, i](int64_t rid)
+            { return qm::result_batch_frame(
+                  rid, static_cast<uint64_t>(i), 1, 4, {col}); }});
+    }
+    s.push_back(qm::ActionSendResultEnd{});
+
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+
+    std::atomic<bool> done{false};
+    std::exception_ptr worker_err;
+
+    // Worker takes the reader by reference. Both threads read the
+    // `_impl` pointer; the worker mutates the C-side `Reader` inside
+    // the `UnsafeCell`, the main thread loads atomics on the disjoint
+    // `Arc<ReaderStats>` field — no overlapping non-atomic accesses,
+    // so the C++ object model permits concurrent const + non-const
+    // method calls on this specific reader.
+    std::thread worker(
+        [&reader, &done, &worker_err]()
+        {
+            try
+            {
+                auto cur = reader.execute("select v"_utf8);
+                // Drain every batch + the terminal RESULT_END.
+                while (cur.next_batch())
+                {
+                }
+            }
+            catch (...)
+            {
+                // doctest macros are reserved for the main thread;
+                // surface the failure by rethrowing post-join.
+                worker_err = std::current_exception();
+            }
+            done.store(true, std::memory_order_release);
+        });
+
+    uint64_t last_bytes = 0;
+    uint64_t max_observed_bytes = 0;
+    uint64_t poll_count = 0;
+    while (!done.load(std::memory_order_acquire))
+    {
+        // Every getter the FFI exposes — exercise all four paths so a
+        // regression localised to one of them still surfaces.
+        const uint64_t b = reader.bytes_received();
+        const uint64_t r = reader.read_ns();
+        const uint64_t d = reader.decode_ns();
+        const uint64_t cr = reader.credit_granted_total();
+        // Producer-side counter writes use `fetch_add(Relaxed)`, which
+        // is monotone-non-decreasing under happens-before. A foreign-
+        // thread Relaxed load MUST observe non-decreasing values; a
+        // backward step here means someone routed the writer through
+        // a non-atomic path.
+        CHECK_MESSAGE(
+            b >= last_bytes,
+            "bytes_received went backwards: " << last_bytes << " -> " << b);
+        last_bytes = b;
+        if (b > max_observed_bytes)
+            max_observed_bytes = b;
+        (void)r;
+        (void)d;
+        (void)cr;
+        ++poll_count;
+    }
+    worker.join();
+    if (worker_err)
+        std::rethrow_exception(worker_err);
+
+    // Post-join: a happens-after the worker's `done.store(Release)`.
+    // The final counter values reflect every wire byte the worker read.
+    const uint64_t final_bytes = reader.bytes_received();
+    CHECK(final_bytes > 0);
+    CHECK_MESSAGE(
+        final_bytes >= max_observed_bytes,
+        "post-join bytes_received "
+            << final_bytes << " < pre-join max " << max_observed_bytes
+            << " — store-Release happens-before is broken or counters "
+               "were rewound");
+    // Sanity: the poll loop ran at all. If the worker drained before
+    // main entered the loop, the rest of the assertions don't actually
+    // prove cross-thread concurrency.
+    CHECK(poll_count > 0);
+}
+
+// ---------------------------------------------------------------------------
 // Coverage gaps documented but not yet asserted in this suite — left as
 // breadcrumbs for the next contributor:
 //

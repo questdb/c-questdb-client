@@ -171,6 +171,25 @@ pub struct Reader {
     failover_rng: FailoverRng,
 }
 
+// Compile-time pin for the cross-thread contract the FFI and the public
+// Rust API both depend on: `Reader` may be migrated to a worker thread
+// while a monitoring thread reads `bytes_received` / `read_ns` /
+// `decode_ns` / `credit_granted_total` via the `Arc<ReaderStats>`.
+//
+// Without this assertion, a future field addition (`Rc<…>`, `RefCell<…>`,
+// `MutexGuard<'static, …>`, a custom `!Send`/`!Sync` type) would silently
+// flip Reader off `Send`/`Sync` and the PR description's claim that
+// "the reader handle may be migrated between threads" would turn false
+// without any signal — runtime tests would keep passing because nothing
+// actually exercises the migration. Pinning it here makes the bound
+// load-bearing: a regression breaks compilation.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Reader>();
+    assert_send_sync::<ReaderStats>();
+    assert_send_sync::<HostHealthTracker>();
+};
+
 impl Reader {
     /// Open a new connection from a connect string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
