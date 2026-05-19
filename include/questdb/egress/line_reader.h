@@ -103,7 +103,13 @@ extern "C" {
 // `line_reader_current_addr_host`, `line_reader_current_addr_port`, and
 // `line_reader_current_server_info` — read non-atomic state that the
 // cursor thread mutates during failover, and remain bound by the
-// one-thread-at-a-time rule.
+// one-thread-at-a-time rule. They additionally reject (error / NULL / 0,
+// see each function) while a `line_reader_query` or `line_reader_cursor`
+// produced by the reader is still live: the reader's connection state is
+// borrowed by that query/cursor. Either release it before reading
+// metadata, or read the same metadata through the cursor handle
+// (`line_reader_cursor_server_version`, `line_reader_cursor_current_server_info`,
+// `line_reader_cursor_current_addr_host` / `_port`).
 
 /////////// Pointer preconditions.
 //
@@ -358,10 +364,11 @@ LINEREADER_API void line_reader_reset_timing(line_reader*);
  * Get the negotiated QWP server version.
  *
  * Returns `false` and sets `*err_out` on failure: the connection is not
- * established yet (no `SERVER_INFO` received), or the `reader` handle is
- * NULL (surfaced as `line_reader_error_invalid_api_call` rather than
- * dereferenced). On success returns `true` and writes the version to
- * `*out_version`.
+ * established yet (no `SERVER_INFO` received), the `reader` handle is
+ * NULL, or a `line_reader_query` / `line_reader_cursor` produced by this
+ * reader is still live — all surfaced as
+ * `line_reader_error_invalid_api_call`. On success returns `true` and
+ * writes the version to `*out_version`.
  */
 LINEREADER_API
 bool line_reader_server_version(
@@ -372,6 +379,10 @@ bool line_reader_server_version(
 /**
  * Borrow the current endpoint host as a UTF-8 byte slice. The pointer is
  * invalidated by any reader operation that may reconnect.
+ *
+ * Writes an empty `(NULL, 0)` pair for a NULL handle, and also while a
+ * `line_reader_query` / `line_reader_cursor` produced by this reader is
+ * still live (release it first to read connection metadata).
  */
 LINEREADER_API
 void line_reader_current_addr_host(
@@ -379,7 +390,13 @@ void line_reader_current_addr_host(
     const char** out_buf,
     size_t* out_len);
 
-/** Port of the endpoint the reader is currently connected to. */
+/**
+ * Port of the endpoint the reader is currently connected to.
+ *
+ * Returns `0` for a NULL handle, and also `0` while a `line_reader_query`
+ * / `line_reader_cursor` produced by this reader is still live (release it
+ * first to read connection metadata).
+ */
 LINEREADER_API
 uint16_t line_reader_current_addr_port(const line_reader* reader);
 
@@ -408,6 +425,10 @@ typedef enum line_reader_server_role
 /**
  * Get the reader's last-seen `SERVER_INFO`, or NULL on v1 servers. The
  * pointer is invalidated by any reader operation that may reconnect.
+ *
+ * Also returns NULL while a `line_reader_query` / `line_reader_cursor`
+ * produced by this reader is still live (release it first to read
+ * connection metadata).
  */
 LINEREADER_API
 const line_reader_server_info* line_reader_current_server_info(const line_reader* reader);
@@ -1279,6 +1300,29 @@ LINEREADER_API void line_reader_cursor_current_addr_host(
 /** Port of the endpoint the cursor is currently connected to. */
 LINEREADER_API uint16_t line_reader_cursor_current_addr_port(
     const line_reader_cursor*);
+
+/**
+ * Negotiated QWP version of the cursor's underlying connection. The
+ * in-cursor counterpart to `line_reader_server_version` (which rejects
+ * while a cursor is live).
+ *
+ * Returns `false` and sets `*err_out` on failure: the cursor handle is
+ * NULL, or the underlying connection is poisoned after a failed mid-query
+ * failover. On success returns `true` and writes `*out_version`.
+ */
+LINEREADER_API bool line_reader_cursor_server_version(
+    const line_reader_cursor* cursor,
+    uint8_t* out_version,
+    line_reader_error** err_out);
+
+/**
+ * Last-seen `SERVER_INFO` of the cursor's currently connected endpoint, or
+ * NULL on v1 servers. The pointer is invalidated by any cursor operation
+ * that may reconnect. The in-cursor counterpart to
+ * `line_reader_current_server_info` (which rejects while a cursor is live).
+ */
+LINEREADER_API const line_reader_server_info* line_reader_cursor_current_server_info(
+    const line_reader_cursor* cursor);
 
 /**
  * `request_id` from the most recently decoded batch's frame header (the

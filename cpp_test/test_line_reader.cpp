@@ -497,6 +497,15 @@ TEST_CASE("cursor introspection: request_id, batch_seq, server info")
     REQUIRE_LIVE_BROKER();
 
     auto reader = make_reader();
+
+    // Captured before a cursor borrows the reader: the metadata getters
+    // reject while a query/cursor is live.
+    const uint8_t reader_version = reader.server_version();
+    const std::string reader_host{reader.current_host()};
+    const uint16_t reader_port = reader.current_port();
+    CHECK(reader_version >= 1);
+    CHECK_FALSE(reader_host.empty());
+
     auto cur = reader.execute("select x from long_sequence(2)"_utf8);
 
     // Before any batch, batch_* accessors return nullopt.
@@ -525,15 +534,10 @@ TEST_CASE("cursor introspection: request_id, batch_seq, server info")
     // batches monotonically increment.
     CHECK(*bseq == 0);
 
-    // Reader-level introspection: server version is non-zero on a real
-    // QuestDB; current_host returns a non-empty string.
-    CHECK(reader.server_version() >= 1);
-    CHECK_FALSE(reader.current_host().empty());
-
     // Cursor's view of the connected endpoint mirrors the reader's
     // (single endpoint, no failover involved on this happy path).
-    CHECK(cur.current_host() == reader.current_host());
-    CHECK(cur.current_port() == reader.current_port());
+    CHECK(cur.current_host() == reader_host);
+    CHECK(cur.current_port() == reader_port);
     CHECK(cur.failover_resets() == 0);
 }
 

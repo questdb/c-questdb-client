@@ -426,10 +426,11 @@ pub struct ReaderConfig {
     /// the parser (so configs aren't rejected on a partial enable/disable
     /// flip) but have no effect — transport failures surface immediately.
     pub failover: bool,
-    /// Number of retry attempts after a transport failure (default `8`).
-    /// Total of `1 + failover_max_attempts` connect attempts before the
-    /// failure is propagated. Must be `>= 1`. Ignored when
-    /// [`failover`](Self::failover) is `false`.
+    /// Cap on the total number of connect rounds (default `8`). The
+    /// total breaks down as `1` initial connect plus
+    /// `failover_max_attempts - 1` reconnect rounds after a transport
+    /// failure, before the failure is propagated. Must be `>= 1`.
+    /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_max_attempts: u32,
     /// Initial backoff between failover attempts, in milliseconds.
     /// Ignored when [`failover`](Self::failover) is `false`.
@@ -944,7 +945,7 @@ impl ReaderConfig {
         if !tls && (tls_roots.is_some() || tls_ca_explicit || tls_roots_password.is_some()) {
             return Err(fmt!(
                 ConfigError,
-                "TLS-related keys require the \"qwps\" scheme"
+                "TLS-related keys require the \"wss\" scheme"
             ));
         }
 

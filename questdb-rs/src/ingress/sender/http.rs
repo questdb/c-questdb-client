@@ -348,8 +348,7 @@ fn retry_http_send(
     let mut need_retry;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep_ms = retry_interval_ms + jitter_ms;
-        let to_sleep = Duration::from_millis(to_sleep_ms as u64);
+        let to_sleep = retry_sleep(retry_interval_ms, jitter_ms);
         if (std::time::Instant::now() + to_sleep) > retry_end {
             return last_rep;
         }
@@ -372,6 +371,13 @@ fn retry_http_send(
 /// at `i32::MAX` ms ≈ 24.8 days rather than overflowing).
 fn clamp_backoff_ms(d: Duration) -> i32 {
     i32::try_from(d.as_millis()).unwrap_or(i32::MAX)
+}
+
+/// Floored at 0: a small `retry_max_backoff` can make interval+jitter
+/// negative, and `(-n) as u64` wraps to a near-`u64::MAX` ms count that
+/// panics `Instant + Duration`.
+fn retry_sleep(retry_interval_ms: i32, jitter_ms: i32) -> Duration {
+    Duration::from_millis(retry_interval_ms.saturating_add(jitter_ms).max(0) as u64)
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
@@ -524,8 +530,7 @@ fn retry_http_get(
     let mut need_retry;
     loop {
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep_ms = retry_interval_ms + jitter_ms;
-        let to_sleep = Duration::from_millis(to_sleep_ms as u64);
+        let to_sleep = retry_sleep(retry_interval_ms, jitter_ms);
         if (std::time::Instant::now() + to_sleep) > retry_end {
             return last_rep;
         }
@@ -564,4 +569,21 @@ fn http_get_with_retries(
         retry_max_backoff,
         last_rep,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_sleep_floors_negative_at_zero() {
+        assert_eq!(retry_sleep(1, -5), Duration::ZERO);
+        assert_eq!(retry_sleep(4, -5), Duration::ZERO);
+        assert_eq!(retry_sleep(10, -5), Duration::from_millis(5));
+        assert_eq!(retry_sleep(10, 4), Duration::from_millis(14));
+        assert_eq!(
+            retry_sleep(i32::MAX, 4),
+            Duration::from_millis(i32::MAX as u64)
+        );
+    }
 }

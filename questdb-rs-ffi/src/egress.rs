@@ -737,12 +737,27 @@ pub unsafe extern "C" fn line_reader_reset_timing(reader: *mut line_reader) {
     }
 }
 
+/// `true` while a `line_reader_query` / `line_reader_cursor` produced by
+/// this reader holds a lifetime-laundered `&mut Reader` taken out of the
+/// `UnsafeCell`. The connection-metadata getters consult this before
+/// synthesising a shared `&Reader`, which would otherwise alias that
+/// `&mut` — aliasing UB the `UnsafeCell` does not sanction.
+#[inline]
+unsafe fn reader_active(reader: *const line_reader) -> bool {
+    // `addr_of!` avoids a `&line_reader` reborrow over the cell — see
+    // `line_reader_has_active_query`.
+    let active: &AtomicBool = unsafe { &*std::ptr::addr_of!((*reader).1) };
+    active.load(Ordering::Acquire)
+}
+
 /// Get the negotiated QWP server version (1..=`HIGHEST_KNOWN_VERSION`).
 ///
 /// Returns `false` and sets `*err_out` on failure: the connection is not
-/// established yet (no `SERVER_INFO` received), or the `reader` handle is
-/// NULL (a contract violation we surface as `InvalidApiCall` instead of
-/// dereferencing).
+/// established yet (no `SERVER_INFO` received), the `reader` handle is
+/// NULL, or a `line_reader_query` / `line_reader_cursor` produced by this
+/// reader is still live — all surfaced as `InvalidApiCall`. The
+/// query/cursor rejection prevents the synthesised `&Reader` from aliasing
+/// the laundered `&mut Reader` that handle holds.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_server_version(
     reader: *const line_reader,
@@ -750,12 +765,36 @@ pub unsafe extern "C" fn line_reader_server_version(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_version.is_null() {
+            // Defensive: a NULL out-param is a contract violation. Report
+            // it via `err_out` (if non-NULL) rather than dereferencing.
+            if !err_out.is_null() {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_reader_server_version called with NULL out_version",
+                );
+            }
+            return false;
+        }
         if reader.is_null() {
             if !err_out.is_null() {
                 set_reader_err(
                     err_out,
                     ErrorCode::InvalidApiCall,
                     "line_reader_server_version called with NULL reader handle",
+                );
+            }
+            return false;
+        }
+        if reader_active(reader) {
+            if !err_out.is_null() {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_reader_server_version called while a query or \
+                     cursor produced by this reader is still live; release \
+                     it before reading connection metadata",
                 );
             }
             return false;
@@ -777,14 +816,21 @@ pub unsafe extern "C" fn line_reader_server_version(
 /// the server hasn't sent one (v1 protocol). The returned pointer is
 /// invalidated by any subsequent reader operation that may reconnect or
 /// receive a new `SERVER_INFO` (`line_reader_query_execute`,
-/// `line_reader_cursor_next_batch`, `line_reader_close`). Returns NULL for
-/// a NULL handle.
+/// `line_reader_cursor_next_batch`, `line_reader_close`).
+///
+/// Returns NULL for a NULL handle, and also NULL while a `line_reader_query`
+/// / `line_reader_cursor` produced by this reader is still live — reading
+/// the metadata then would alias that handle's laundered `&mut Reader`.
+/// Release the query/cursor first to read connection metadata.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_current_server_info(
     reader: *const line_reader,
 ) -> *const line_reader_server_info {
     unsafe {
         if reader.is_null() {
+            return ptr::null();
+        }
+        if reader_active(reader) {
             return ptr::null();
         }
         match (*(*reader).0.get()).server_info() {
@@ -795,8 +841,12 @@ pub unsafe extern "C" fn line_reader_current_server_info(
 }
 
 /// Host of the endpoint the reader is currently connected to. The buffer
-/// is borrowed; valid until any reader operation that may reconnect. For a
-/// NULL handle, writes an empty `(NULL, 0)` pair.
+/// is borrowed; valid until any reader operation that may reconnect.
+///
+/// Writes an empty `(NULL, 0)` pair for a NULL handle, and also while a
+/// `line_reader_query` / `line_reader_cursor` produced by this reader is
+/// still live — reading the metadata then would alias that handle's
+/// laundered `&mut Reader`. Release the query/cursor first.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_current_addr_host(
     reader: *const line_reader,
@@ -804,7 +854,17 @@ pub unsafe extern "C" fn line_reader_current_addr_host(
     out_len: *mut size_t,
 ) {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
         if reader.is_null() {
+            *out_buf = ptr::null();
+            *out_len = 0;
+            return;
+        }
+        if reader_active(reader) {
             *out_buf = ptr::null();
             *out_len = 0;
             return;
@@ -815,12 +875,19 @@ pub unsafe extern "C" fn line_reader_current_addr_host(
     }
 }
 
-/// Port of the endpoint the reader is currently connected to. Returns `0`
-/// for a NULL handle.
+/// Port of the endpoint the reader is currently connected to.
+///
+/// Returns `0` for a NULL handle, and also `0` while a `line_reader_query`
+/// / `line_reader_cursor` produced by this reader is still live — reading
+/// the metadata then would alias that handle's laundered `&mut Reader`.
+/// Release the query/cursor first.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_current_addr_port(reader: *const line_reader) -> u16 {
     unsafe {
         if reader.is_null() {
+            return 0;
+        }
+        if reader_active(reader) {
             return 0;
         }
         (*(*reader).0.get()).current_addr().port
@@ -957,6 +1024,11 @@ pub unsafe extern "C" fn line_reader_server_info_cluster_id(
     out_len: *mut size_t,
 ) {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
         match server_info_ref(si) {
             Some(s) => {
                 let cid = s.cluster_id.as_str();
@@ -979,6 +1051,11 @@ pub unsafe extern "C" fn line_reader_server_info_node_id(
     out_len: *mut size_t,
 ) {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
         match server_info_ref(si) {
             Some(s) => {
                 let nid = s.node_id.as_str();
@@ -1027,6 +1104,11 @@ pub unsafe extern "C" fn line_reader_failover_event_failed_host(
     out_len: *mut size_t,
 ) {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
         match ev_ref(ev) {
             Some(e) => {
                 let h = e.failed_addr.host.as_str();
@@ -1057,6 +1139,11 @@ pub unsafe extern "C" fn line_reader_failover_event_new_host(
     out_len: *mut size_t,
 ) {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
         match ev_ref(ev) {
             Some(e) => {
                 let h = e.new_addr.host.as_str();
@@ -1134,6 +1221,11 @@ pub unsafe extern "C" fn line_reader_failover_event_trigger_msg(
     out_len: *mut size_t,
 ) {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
         match ev_ref(ev) {
             Some(e) => {
                 let m = e.trigger.msg();
@@ -1701,8 +1793,10 @@ pub unsafe extern "C" fn line_reader_query_bind_binary(
     }
 }
 
-/// Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and point
-/// to at least 16 readable bytes. A NULL `value` aborts the process via
+/// Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and
+/// point to at least 16 readable bytes; passing a smaller buffer is a
+/// buffer over-read (undefined behaviour) — exactly 16 bytes are read
+/// unconditionally. A NULL `value` aborts the process via
 /// `process::abort()` to surface the bug instead of silently substituting
 /// zero bytes (which would produce a valid-looking `00000000-0000-0000-
 /// 0000-000000000000` UUID and corrupt the query). Use
@@ -1730,8 +1824,10 @@ pub unsafe extern "C" fn line_reader_query_bind_uuid(
 }
 
 /// Bind a 32-byte LONG256 value (raw little-endian bytes). `value` MUST be
-/// non-NULL and point to at least 32 readable bytes. A NULL `value` aborts
-/// the process — see `line_reader_query_bind_uuid` for the rationale. Use
+/// non-NULL and point to at least 32 readable bytes; passing a smaller
+/// buffer is a buffer over-read (undefined behaviour) — exactly 32 bytes
+/// are read unconditionally. A NULL `value` aborts the process — see
+/// `line_reader_query_bind_uuid` for the rationale. Use
 /// `line_reader_query_bind_null` with `line_reader_column_kind_long256` to
 /// bind SQL NULL.
 #[unsafe(no_mangle)]
@@ -1791,9 +1887,11 @@ pub unsafe extern "C" fn line_reader_query_bind_decimal128(
 }
 
 /// Bind a DECIMAL256 value as 32 little-endian raw bytes plus column scale.
-/// `value` MUST be non-NULL and point to at least 32 readable bytes. A NULL
-/// `value` aborts the process — see `line_reader_query_bind_uuid` for the
-/// rationale. Use `line_reader_query_bind_null_decimal256` to bind SQL NULL.
+/// `value` MUST be non-NULL and point to at least 32 readable bytes;
+/// passing a smaller buffer is a buffer over-read (undefined behaviour) —
+/// exactly 32 bytes are read unconditionally. A NULL `value` aborts the
+/// process — see `line_reader_query_bind_uuid` for the rationale. Use
+/// `line_reader_query_bind_null_decimal256` to bind SQL NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_bind_decimal256(
     query: *mut line_reader_query,
@@ -2117,6 +2215,17 @@ pub unsafe extern "C" fn line_reader_cursor_column_kind(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_kind.is_null() {
+            // Defensive: a NULL out-param is a contract violation.
+            if !err_out.is_null() {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_reader_cursor_column_kind called with NULL out_kind",
+                );
+            }
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2143,6 +2252,17 @@ pub unsafe extern "C" fn line_reader_cursor_column_name(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            // Defensive: a NULL out-param is a contract violation.
+            if !err_out.is_null() {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_reader_cursor_column_name called with NULL out_buf/out_len",
+                );
+            }
+            return false;
+        }
         if cursor.is_null() {
             set_reader_err(err_out, ErrorCode::InvalidApiCall, "cursor handle is NULL");
             return false;
@@ -2200,6 +2320,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_bool(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_bool");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2239,6 +2363,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_i64(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_i64");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2282,6 +2410,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_f64(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_f64");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2318,6 +2450,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_i8(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_i8");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2354,6 +2490,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_i16(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_i16");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2394,6 +2534,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_i32(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_i32");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2434,6 +2578,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_ipv4(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_ipv4");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2470,6 +2618,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_f32(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_f32");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2506,6 +2658,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_char(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_char");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2531,8 +2687,11 @@ pub unsafe extern "C" fn line_reader_cursor_get_char(
     }
 }
 
-/// Read a `UUID` value as 16 raw bytes. `out_value` must point to at least
-/// 16 writable bytes.
+/// Read a `UUID` value as 16 raw bytes. On success `out_value` is filled
+/// with exactly 16 bytes, so `out_value` MUST be non-NULL and point to at
+/// least 16 writable bytes; passing a smaller buffer is a buffer overflow
+/// (undefined behaviour). A NULL `out_value` or `out_is_null` is reported
+/// as `InvalidApiCall` via `err_out` and no bytes are written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_get_uuid(
     cursor: *const line_reader_cursor,
@@ -2543,6 +2702,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_uuid(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_uuid");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2572,7 +2735,12 @@ pub unsafe extern "C" fn line_reader_cursor_get_uuid(
     }
 }
 
-/// Read a `LONG256` value as 32 raw little-endian bytes.
+/// Read a `LONG256` value as 32 raw little-endian bytes. On success
+/// `out_value` is filled with exactly 32 bytes, so `out_value` MUST be
+/// non-NULL and point to at least 32 writable bytes; passing a smaller
+/// buffer is a buffer overflow (undefined behaviour). A NULL `out_value`
+/// or `out_is_null` is reported as `InvalidApiCall` via `err_out` and no
+/// bytes are written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_get_long256(
     cursor: *const line_reader_cursor,
@@ -2583,6 +2751,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_long256(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_long256");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2627,6 +2799,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_varchar(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_buf.is_null() || out_len.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_varchar");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2674,6 +2850,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_binary(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_buf.is_null() || out_len.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_binary");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2722,6 +2902,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_symbol(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_buf.is_null() || out_len.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_symbol");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2768,6 +2952,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal64(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_mantissa.is_null() || out_scale.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_decimal64");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2808,6 +2996,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal128(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_low.is_null() || out_high.is_null() || out_scale.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_decimal128");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2837,8 +3029,12 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal128(
     }
 }
 
-/// Read a `DECIMAL256` mantissa as 32 raw little-endian bytes plus column scale.
-/// `out_value` must point to at least 32 writable bytes.
+/// Read a `DECIMAL256` mantissa as 32 raw little-endian bytes plus column
+/// scale. On success `out_value` is filled with exactly 32 bytes, so
+/// `out_value` MUST be non-NULL and point to at least 32 writable bytes;
+/// passing a smaller buffer is a buffer overflow (undefined behaviour). A
+/// NULL `out_value`, `out_scale`, or `out_is_null` is reported as
+/// `InvalidApiCall` via `err_out` and no bytes are written.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_get_decimal256(
     cursor: *const line_reader_cursor,
@@ -2850,6 +3046,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal256(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_scale.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_decimal256");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2940,6 +3140,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_view.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_double_array");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3047,6 +3251,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array_element(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_double_array_element");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3106,6 +3314,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_view.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_long_array");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3206,6 +3418,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array_element(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_long_array_element");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3271,6 +3487,10 @@ pub unsafe extern "C" fn line_reader_cursor_column_validity(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_column_validity");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3361,6 +3581,11 @@ pub unsafe extern "C" fn line_reader_cursor_current_addr_host(
     out_len: *mut size_t,
 ) {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip the
+        // write rather than dereferencing NULL.
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
         if cursor.is_null() {
             *out_buf = ptr::null();
             *out_len = 0;
@@ -3386,6 +3611,78 @@ pub unsafe extern "C" fn line_reader_cursor_current_addr_port(
     }
 }
 
+/// Negotiated QWP version of the cursor's underlying connection. The
+/// in-cursor counterpart to `line_reader_server_version`, which rejects
+/// while a cursor is live.
+///
+/// Returns `false` and sets `*err_out` on failure: the cursor handle is
+/// NULL, or the underlying connection is poisoned after a failed
+/// mid-query failover. On success returns `true` and writes the version
+/// to `*out_version`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_cursor_server_version(
+    cursor: *const line_reader_cursor,
+    out_version: *mut u8,
+    err_out: *mut *mut line_reader_error,
+) -> bool {
+    unsafe {
+        if out_version.is_null() {
+            // Defensive: a NULL out-param is a contract violation.
+            if !err_out.is_null() {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_reader_cursor_server_version called with NULL out_version",
+                );
+            }
+            return false;
+        }
+        if cursor.is_null() {
+            if !err_out.is_null() {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_reader_cursor_server_version called with NULL cursor handle",
+                );
+            }
+            return false;
+        }
+        match (*cursor).cursor.server_version() {
+            Ok(v) => {
+                *out_version = v;
+                true
+            }
+            Err(e) => {
+                write_err_box(err_out, e);
+                false
+            }
+        }
+    }
+}
+
+/// Borrowed `SERVER_INFO` of the cursor's currently connected endpoint, or
+/// NULL when the server hasn't sent one (v1 protocol). The returned
+/// pointer is invalidated by any subsequent cursor operation that may
+/// reconnect (`line_reader_cursor_next_batch`, `line_reader_cursor_free`).
+/// Returns NULL for a NULL handle.
+///
+/// The in-cursor counterpart to `line_reader_current_server_info`, which
+/// rejects while a cursor is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_cursor_current_server_info(
+    cursor: *const line_reader_cursor,
+) -> *const line_reader_server_info {
+    unsafe {
+        if cursor.is_null() {
+            return ptr::null();
+        }
+        match (*cursor).cursor.server_info() {
+            Some(si) => si as *const ServerInfo as *const line_reader_server_info,
+            None => ptr::null(),
+        }
+    }
+}
+
 /// `request_id` from the most recently decoded batch's frame header. Only
 /// meaningful after a successful `next_batch` and before the next call.
 ///
@@ -3398,10 +3695,13 @@ pub unsafe extern "C" fn line_reader_cursor_batch_request_id(
     out_request_id: *mut i64,
 ) -> bool {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip every
+        // write below rather than dereferencing NULL.
+        if out_request_id.is_null() {
+            return false;
+        }
         if cursor.is_null() {
-            if !out_request_id.is_null() {
-                *out_request_id = 0;
-            }
+            *out_request_id = 0;
             return false;
         }
         match (*cursor).current_batch.as_ref() {
@@ -3429,10 +3729,13 @@ pub unsafe extern "C" fn line_reader_cursor_batch_seq(
     out_batch_seq: *mut u64,
 ) -> bool {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip every
+        // write below rather than dereferencing NULL.
+        if out_batch_seq.is_null() {
+            return false;
+        }
         if cursor.is_null() {
-            if !out_batch_seq.is_null() {
-                *out_batch_seq = 0;
-            }
+            *out_batch_seq = 0;
             return false;
         }
         match (*cursor).current_batch.as_ref() {
@@ -3459,10 +3762,13 @@ pub unsafe extern "C" fn line_reader_cursor_batch_flags(
     out_flags: *mut u8,
 ) -> bool {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip every
+        // write below rather than dereferencing NULL.
+        if out_flags.is_null() {
+            return false;
+        }
         if cursor.is_null() {
-            if !out_flags.is_null() {
-                *out_flags = 0;
-            }
+            *out_flags = 0;
             return false;
         }
         match (*cursor).current_batch.as_ref() {
@@ -3528,13 +3834,14 @@ pub unsafe extern "C" fn line_reader_cursor_terminal_end(
     out_total_rows: *mut u64,
 ) -> bool {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip every
+        // write below rather than dereferencing NULL.
+        if out_final_seq.is_null() || out_total_rows.is_null() {
+            return false;
+        }
         if cursor.is_null() {
-            if !out_final_seq.is_null() {
-                *out_final_seq = 0;
-            }
-            if !out_total_rows.is_null() {
-                *out_total_rows = 0;
-            }
+            *out_final_seq = 0;
+            *out_total_rows = 0;
             return false;
         }
         match (*cursor).cursor.terminal() {
@@ -3565,13 +3872,14 @@ pub unsafe extern "C" fn line_reader_cursor_terminal_exec_done(
     out_rows_affected: *mut u64,
 ) -> bool {
     unsafe {
+        // Defensive: a NULL out-param is a contract violation. Skip every
+        // write below rather than dereferencing NULL.
+        if out_op_type.is_null() || out_rows_affected.is_null() {
+            return false;
+        }
         if cursor.is_null() {
-            if !out_op_type.is_null() {
-                *out_op_type = 0;
-            }
-            if !out_rows_affected.is_null() {
-                *out_rows_affected = 0;
-            }
+            *out_op_type = 0;
+            *out_rows_affected = 0;
             return false;
         }
         match (*cursor).cursor.terminal() {
@@ -3676,6 +3984,10 @@ pub unsafe extern "C" fn line_reader_cursor_get_geohash(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if out_value.is_null() || out_precision_bits.is_null() || out_is_null.is_null() {
+            null_out_param_err(err_out, "line_reader_cursor_get_geohash");
+            return false;
+        }
         let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3781,6 +4093,24 @@ unsafe fn get_column_view<'a>(
             &'static ColumnView<'static>,
             &'a ColumnView<'a>,
         >(view_static))
+    }
+}
+
+/// Report a NULL out-param contract violation through `err_out`.
+///
+/// Called by the per-kind cursor getters before any out-param write when
+/// a caller-supplied out pointer is NULL. Surfaces a clean
+/// `InvalidApiCall` instead of dereferencing NULL. `err_out` itself is
+/// NULL-checked inside `set_reader_err` → `write_err_box`, so passing a
+/// NULL `err_out` simply swallows the report.
+#[inline]
+unsafe fn null_out_param_err(err_out: *mut *mut line_reader_error, fn_name: &str) {
+    unsafe {
+        set_reader_err(
+            err_out,
+            ErrorCode::InvalidApiCall,
+            format!("{fn_name} called with a NULL out-param pointer"),
+        );
     }
 }
 

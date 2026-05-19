@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -219,7 +220,16 @@ private:
         const auto c_code = ::line_reader_error_get_code(c_err);
         size_t c_len = 0;
         const char* c_msg = ::line_reader_error_msg(c_err, &c_len);
-        std::string msg{c_msg, c_len};
+        std::string msg;
+        try
+        {
+            msg.assign(c_msg, c_len);
+        }
+        catch (...)
+        {
+            ::line_reader_error_free(c_err);
+            throw;
+        }
         ::line_reader_error_free(c_err);
         return line_reader_error{static_cast<error_code>(c_code), msg};
     }
@@ -296,7 +306,7 @@ struct geohash
 /**
  * Borrowed view over a single `DOUBLE_ARRAY` row. Same lifetime contract
  * as `binary_view`. `data` is concatenated little-endian `double` bytes.
- * The `element(idx)` helper does the LE decode safely via `std::memcpy`.
+ * The `element(idx)` helper does the LE decode via `std::memcpy`.
  */
 struct double_array_view
 {
@@ -306,8 +316,14 @@ struct double_array_view
     size_t data_len;
     size_t element_count;
 
+    /** Decode the `double` element at flat row-major index `flat_idx`.
+     *  An out-of-range index (`flat_idx >= element_count`), or a NULL-data
+     *  array (`data == nullptr`, which the C contract uses for a non-null
+     *  but empty array), returns the NULL sentinel `quiet_NaN()`. */
     double element(size_t flat_idx) const noexcept
     {
+        if (data == nullptr || flat_idx >= element_count)
+            return std::numeric_limits<double>::quiet_NaN();
         double v = 0.0;
         std::memcpy(&v, data + flat_idx * sizeof(double), sizeof(double));
         return v;
@@ -324,8 +340,14 @@ struct long_array_view
     size_t data_len;
     size_t element_count;
 
+    /** Decode the `int64_t` element at flat row-major index `flat_idx`.
+     *  An out-of-range index (`flat_idx >= element_count`), or a NULL-data
+     *  array (`data == nullptr`, which the C contract uses for a non-null
+     *  but empty array), returns the NULL sentinel `INT64_MIN`. */
     int64_t element(size_t flat_idx) const noexcept
     {
+        if (data == nullptr || flat_idx >= element_count)
+            return std::numeric_limits<int64_t>::min();
         int64_t v = 0;
         std::memcpy(&v, data + flat_idx * sizeof(int64_t), sizeof(int64_t));
         return v;
@@ -418,6 +440,12 @@ class failover_event_view
 public:
     explicit failover_event_view(const ::line_reader_failover_event* impl) noexcept
         : _impl{impl} {}
+
+    // Non-copyable: `_impl` is borrowed, valid only during the callback.
+    failover_event_view(const failover_event_view&) = delete;
+    failover_event_view& operator=(const failover_event_view&) = delete;
+    failover_event_view(failover_event_view&&) = delete;
+    failover_event_view& operator=(failover_event_view&&) = delete;
 
     std::string_view failed_host() const noexcept
     {
@@ -821,6 +849,10 @@ public:
     query& bind_binary(const uint8_t* buf, size_t len)
     {
         ensure_impl();
+        if (buf == nullptr && len != 0)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "bind_binary: NULL buffer with non-zero length"};
         ::line_reader_query_bind_binary(_impl, buf, len);
         return *this;
     }
@@ -1512,6 +1544,26 @@ public:
     {
         ensure_impl();
         return ::line_reader_cursor_current_addr_port(_impl);
+    }
+    /** Negotiated QWP version of the cursor's underlying connection.
+     *  @throws line_reader_error if the connection is poisoned after a
+     *          failed failover, or this cursor has been moved from. */
+    uint8_t server_version() const
+    {
+        ensure_impl();
+        uint8_t v = 0;
+        line_reader_error::wrapped_call(
+            ::line_reader_cursor_server_version, _impl, &v);
+        return v;
+    }
+    /** Last-seen `SERVER_INFO`, or empty for v1 servers. The view is
+     *  invalidated by any cursor operation that may reconnect.
+     *  @throws line_reader_error if this cursor has been moved from. */
+    server_info_view server_info() const
+    {
+        ensure_impl();
+        return server_info_view{
+            ::line_reader_cursor_current_server_info(_impl)};
     }
 
     /** `request_id` of the current batch; `std::nullopt` if no batch loaded.

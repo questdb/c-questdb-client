@@ -445,7 +445,7 @@ impl Buffer {
         }
     }
 
-    #[cfg(feature = "_sender-qwp-udp")]
+    #[cfg(any(feature = "_sender-qwp-udp", all(test, feature = "_sender-qwp-ws")))]
     pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
         match &self.inner {
             BufferInner::Ilp(_) => None,

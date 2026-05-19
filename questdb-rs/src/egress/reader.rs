@@ -383,7 +383,8 @@ impl Reader {
     /// next walk.
     fn reconnect_with_failover(&mut self, failed_idx: usize) -> Result<u32> {
         let cfg = Arc::clone(&self.cfg);
-        let attempts_total = cfg.failover_max_attempts.saturating_add(1);
+        // 1 initial connect + N-1 reconnect rounds = `failover_max_attempts` total.
+        let attempts_total = cfg.failover_max_attempts.saturating_sub(1);
         let mut backoff_ms = cfg.failover_backoff_initial_ms;
         let mut last_err: Option<Error> = None;
         // Failover.md §11.9.1 wall-clock budget. `0` is the documented
@@ -1422,6 +1423,23 @@ impl<'r> Cursor<'r> {
     /// [`crate::egress::FailoverEvent`]).
     pub fn current_addr(&self) -> &Endpoint {
         self.reader.current_addr()
+    }
+
+    /// Negotiated QWP version of the cursor's underlying connection. The
+    /// in-cursor accessor for [`Reader::server_version`], unreachable from
+    /// user code while the cursor holds the `Reader`'s mutable borrow.
+    /// Reflects the renegotiated version after mid-query failover.
+    pub fn server_version(&self) -> Result<u8> {
+        self.reader.server_version()
+    }
+
+    /// `SERVER_INFO` of the cursor's currently connected endpoint, or
+    /// `None` on v1 servers. The in-cursor accessor for
+    /// [`Reader::server_info`], unreachable from user code while the
+    /// cursor holds the `Reader`'s mutable borrow. Reflects the new
+    /// endpoint after mid-query failover.
+    pub fn server_info(&self) -> Option<&ServerInfo> {
+        self.reader.server_info()
     }
 
     /// Read one raw frame (header + payload) off the transport, with

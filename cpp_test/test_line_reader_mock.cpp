@@ -970,11 +970,11 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
     CHECK(cur.failover_resets() == 1);
     CHECK(cap->count.load() == 1);
     CHECK(cap->failed_host == "127.0.0.1");
-    // After failover the reader is on B; the failed endpoint was A — so
+    // After failover the cursor is on B; the failed endpoint was A — so
     // the captured failed_port must differ from the captured new_port,
-    // and the reader's now-current port must match new_port.
+    // and the cursor's now-current port must match new_port.
     CHECK(cap->failed_port != cap->new_port);
-    CHECK(cap->new_port == reader.current_port());
+    CHECK(cap->new_port == cur.current_port());
     CHECK(cap->new_host == "127.0.0.1");
     CHECK(cap->attempts >= 1);
     // Trigger is a transport-class error.
@@ -1303,9 +1303,12 @@ TEST_CASE("mock: stats and cursor introspection getters return live values")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
 
-    // current_addr — reader side.
-    CHECK(reader.current_host() == "127.0.0.1");
-    CHECK(reader.current_port() != 0);
+    // Captured before the cursor borrows the reader: the reader-side
+    // getters reject while a query/cursor is live.
+    const std::string reader_host{reader.current_host()};
+    const uint16_t reader_port = reader.current_port();
+    CHECK(reader_host == "127.0.0.1");
+    CHECK(reader_port != 0);
 
     // Pre-batch timing should be definite (could be zero on a very fast
     // host but never negative; saturating semantics).
@@ -1327,8 +1330,8 @@ TEST_CASE("mock: stats and cursor introspection getters return live values")
     CHECK(*bseq == 0);
 
     // Cursor's current_addr_* mirror the reader (single endpoint).
-    CHECK(cur.current_host() == reader.current_host());
-    CHECK(cur.current_port() == reader.current_port());
+    CHECK(cur.current_host() == reader_host);
+    CHECK(cur.current_port() == reader_port);
 
     // No failover happened on this happy-path script.
     CHECK(cur.failover_resets() == 0);
@@ -2741,6 +2744,63 @@ TEST_CASE("mock: reader move-assign succeeds once cursor is dropped")
     // No throw; reader_a now talks to srv_b's handshake.
     reader_a = std::move(reader_b);
     CHECK(reader_a.server_version() == 2);
+}
+
+// A live cursor holds a laundered `&mut Reader`; the reader-side metadata
+// getters must refuse rather than synthesise an aliasing `&Reader`. The
+// cursor handle owns the borrow, so its mirror getters stay readable. The
+// reader-side getters work again once the cursor drops.
+TEST_CASE("mock: reader metadata getters reject while a cursor is live")
+{
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+
+    const uint8_t version = reader.server_version();
+    const std::string host{reader.current_host()};
+    const uint16_t port = reader.current_port();
+    CHECK(version == 2);
+    CHECK_FALSE(host.empty());
+    CHECK(port != 0);
+    CHECK(static_cast<bool>(reader.server_info()));
+
+    {
+        auto cur = reader.execute("select 1"_utf8);
+
+        bool threw = false;
+        try
+        {
+            (void)reader.server_version();
+        }
+        catch (const questdb::egress::line_reader_error& e)
+        {
+            threw = true;
+            CHECK(e.code() == line_reader_error_invalid_api_call);
+        }
+        CHECK(threw);
+
+        CHECK_FALSE(static_cast<bool>(reader.server_info()));
+        CHECK(reader.current_host().empty());
+        CHECK(reader.current_port() == 0);
+
+        // The cursor handle owns the borrow — its mirror getters are the
+        // sound path for the same metadata.
+        CHECK(cur.server_version() == version);
+        CHECK(cur.current_host() == host);
+        CHECK(cur.current_port() == port);
+        CHECK(static_cast<bool>(cur.server_info()));
+
+        CHECK_FALSE(cur.next_batch());
+    }
+
+    CHECK(reader.server_version() == version);
+    CHECK(reader.current_host() == host);
+    CHECK(reader.current_port() == port);
+    CHECK(static_cast<bool>(reader.server_info()));
 }
 
 // ---------------------------------------------------------------------------

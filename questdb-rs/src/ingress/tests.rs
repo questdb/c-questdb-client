@@ -25,7 +25,7 @@
 use super::*;
 use crate::ErrorCode;
 
-#[cfg(feature = "sync-sender-tcp")]
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-qwp-ws"))]
 use tempfile::TempDir;
 
 #[cfg(feature = "sync-sender-http")]
@@ -1233,10 +1233,15 @@ fn http_retry_max_backoff() {
 
 #[cfg(feature = "sync-sender-http")]
 #[test]
-fn http_retry_max_backoff_zero_rejected() {
+fn http_retry_max_backoff_below_min_rejected() {
+    let msg = "\"retry_max_backoff_millis\" must be at least 10.";
     assert_conf_err(
         SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=0;"),
-        "\"retry_max_backoff_millis\" must be greater than 0.",
+        msg,
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=3;"),
+        msg,
     );
 }
 

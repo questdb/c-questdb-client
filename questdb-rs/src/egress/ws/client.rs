@@ -231,7 +231,14 @@ impl WsClient {
             let payload = self.recv.split_to(payload_len).freeze();
 
             match header.opcode {
-                Opcode::Binary => return Ok(payload),
+                Opcode::Binary => {
+                    if !header.fin {
+                        return Err(WsReadError::Protocol(
+                            "fragmented binary frame; QWP frames are never fragmented".to_string(),
+                        ));
+                    }
+                    return Ok(payload);
+                }
                 Opcode::Ping => {
                     // RFC 6455 §5.5.2: A Pong frame sent in response to a
                     // Ping frame must have identical "Application data".

@@ -1904,17 +1904,18 @@ impl SenderBuilder {
     /// Cap on per-attempt backoff in the HTTP retry loop.
     ///
     /// The retry loop starts at 10 ms, doubles each attempt with ±5 ms
-    /// jitter, and is bounded by this value (default: 1 second). Total
+    /// jitter, and is bounded by this value (default: 1 second; minimum
+    /// 10 ms — a cap below the initial interval is incoherent). Total
     /// retry budget is independently capped by
     /// [`SenderBuilder::retry_timeout`]; this knob shapes how aggressively
     /// the loop hits the server while waiting out a transient failure.
     ///
     /// Mirrors Java's `LineSenderBuilder.maxBackoffMillis(int)`.
     pub fn retry_max_backoff(mut self, value: Duration) -> Result<Self> {
-        if value.is_zero() {
+        if value < Duration::from_millis(10) {
             return Err(error::fmt!(
                 ConfigError,
-                "\"retry_max_backoff_millis\" must be greater than 0."
+                "\"retry_max_backoff_millis\" must be at least 10."
             ));
         }
         if let Some(http) = &mut self.http {
