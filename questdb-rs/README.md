@@ -3,141 +3,166 @@
 Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
 database designed to process time-series data, faster.
 
-The client library is designed for fast ingestion of data into QuestDB. It
-supports three transports: the InfluxDB Line Protocol (ILP) over HTTP
-(recommended) or TCP, and the QuestDB Wire Protocol (QWP) over UDP for
-high-throughput ingestion on trusted networks.
+The client library is designed for fast ingestion of data into QuestDB. The
+recommended transport is the
+**QuestDB Wire Protocol over WebSocket (QWP/WebSocket)**: a columnar binary
+protocol with explicit asynchronous server acknowledgements, multi-host
+failover, optional on-disk durability, and a structured error model.
+
+Legacy InfluxDB Line Protocol (ILP) transports — over HTTP or TCP — remain
+supported for backwards compatibility but are not recommended for new code.
 
 * [QuestDB Database docs](https://questdb.io/docs/)
-* [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+* [`ingress` module docs](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/) —
+  protocol details, configuration parameters, and patterns.
 
 ## Transports
 
 The transport is selected by the scheme in the configuration string:
 
-* `http::addr=...` / `https::addr=...` — request-response, errors returned
-  to the client, supports authentication and TLS. Recommended for most
-  workloads.
-* `tcp::addr=...` / `tcps::addr=...` — streaming, legacy; errors cause
-  server-side disconnect and surface only in server logs.
-* `qwpudp::addr=...` — best-effort UDP datagrams (IPv4-only); no
-  acknowledgements, no authentication, no TLS, no transactional guarantees.
-  See the [`ingress`](https://docs.rs/questdb-rs/latest/questdb/ingress/)
-  module docs (in particular `Protocol::QwpUdp`) for semantics and
-  configuration parameters.
+* `ws::addr=...` / `wss::addr=...` — **QWP/WebSocket**, the recommended
+  transport. Columnar binary frames, asynchronous server ACKs with explicit
+  frame-sequence-number watermarks, multi-host failover, optional
+  store-and-forward durability. Supports HTTP basic and bearer-token auth,
+  plus TLS via `wss::`. The long-form aliases `qwpws::` / `qwpwss::` are
+  also accepted.
+* `http::addr=...` / `https::addr=...` — **ILP/HTTP** (legacy).
+  Request-response with error returns and per-request retry, no
+  asynchronous ACKs or multi-host failover. Suitable for existing
+  deployments and one-shot batches.
+* `tcp::addr=...` / `tcps::addr=...` — **ILP/TCP** (legacy). Streaming with
+  no error reporting to the client; the server logs failures and silently
+  disconnects. Lowest overhead, lowest observability.
 
-## Protocol Versions
-
-The library supports the following ILP protocol versions. These apply to
-ILP/HTTP and ILP/TCP only — QWP/UDP uses its own wire format and is not
-versioned through this mechanism.
-
-* If you use HTTP and `protocol_version=auto` or unset, the library will
-  automatically detect the server's
-  latest supported protocol version and use it (recommended).
-* If you use TCP, you can specify the
-  `protocol_version=N` parameter when constructing the `Sender` object
-  (TCP defaults to `protocol_version=1`).
-
-| Version | Description                                             | Server Compatibility   |
-| ------- | ------------------------------------------------------- | --------------------- |
-| **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
-| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 9.0.0+ (2023-10-30)   |
-
-**Note**: QuestDB server version 9.0.0 or later is required for `protocol_version=2` support.
+See the [`ingress` module docs](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/)
+for the full configuration-parameter reference, including the
+QWP-specific keys (`sf_dir`, `sender_id`, `reconnect_*`,
+`request_durable_ack`, `qwp_ws_progress`, `max_in_flight`).
 
 ## Quick Start
 
-To start using `questdb-rs`, add it as a dependency of your project:
+Add `questdb-rs` to your project:
 
 ```bash
 cargo add questdb-rs
 ```
 
-Then you can try out this quick example, which connects to a QuestDB server
-running on your local machine:
+A minimal ingest using QWP/WebSocket:
 
 ```rust ignore
 use questdb::{
     Result,
-    ingress::{
-        Sender,
-        Buffer,
-        TimestampNanos}};
+    ingress::{Sender, TimestampNanos}};
 
 fn main() -> Result<()> {
-   let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-  let mut buffer = sender.new_buffer();
-   buffer
-       .table("trades")?
-       .symbol("symbol", "ETH-USD")?
-       .symbol("side", "sell")?
-       .column_f64("price", 2615.54)?
-       .column_f64("amount", 0.00044)?
-
-       // Array ingestion (QuestDB 9.0.0+). Slices and ndarray supported through trait
-       .column_arr("price_history", &[2615.54f64, 2615.10, 2614.80])?
-       .column_arr("volatility", &ndarray::arr1(&[0.012f64, 0.011, 0.013]).view())?
-       .at(TimestampNanos::now())?;
-   sender.flush(&mut buffer)?;
-   Ok(())
+    let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("trades")?
+        .symbol("symbol", "ETH-USD")?
+        .symbol("side", "sell")?
+        .column_f64("price", 2615.54)?
+        .column_f64("amount", 0.00044)?
+        .at(TimestampNanos::now())?;
+    sender.flush(&mut buffer)?;
+    sender.close_drain()?;
+    Ok(())
 }
 ```
 
+`flush` returns once the frame has been appended to the local publication
+log. `close_drain` waits for already-published frames to be acknowledged
+by the server (bounded by `close_flush_timeout_millis`, default 5s) before
+the sender is dropped.
+
+## Protocol Versions
+
+QWP/WebSocket negotiates its protocol version during the WebSocket upgrade;
+the client requires no `protocol_version` configuration. Arrays
+(`column_arr`) and decimals (`column_dec`) work natively over QWP.
+
+The ILP transports use a separate, ILP-specific protocol-version mechanism
+that gates array and decimal ingestion. Over ILP/HTTP, `protocol_version`
+defaults to `auto` (server-negotiated). Over ILP/TCP, the default is `1`
+and you must set `protocol_version=2` (arrays) or `=3` (decimals)
+explicitly in the configuration string.
+
+| Version | Description                                                | Server Compatibility |
+| ------- | ---------------------------------------------------------- | -------------------- |
+| **1**   | Compatible InfluxDB Line Protocol over ILP transports      | All QuestDB versions |
+| **2**   | 64-bit floats as binary, n-dimensional arrays              | 9.0.0+               |
+| **3**   | Adds DECIMAL64/DECIMAL128/DECIMAL256                       | 9.2.0+               |
+
 ## Docs
 
-Most of the client documentation is on the
-[`ingress`](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/) module page.
+The main client documentation is on the
+[`ingress`](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/) module
+page: configuration keys, the QWP error model, FSN-based completion,
+progress modes, multi-host failover, store-and-forward, authentication,
+TLS, the `Buffer` API, and the legacy ILP transports.
 
 ## Examples
 
-A selection of usage examples is available in the [examples directory](https://github.com/questdb/c-questdb-client/tree/6.1.0/questdb-rs/examples):
+A selection of usage examples is available in the
+[examples directory](https://github.com/questdb/c-questdb-client/tree/6.1.0/questdb-rs/examples):
 
 | Example | Description |
 |---------|-------------|
-| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/basic.rs) | Minimal TCP ingestion example; shows basic row and array ingestion. |
-| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/auth.rs) | Adds authentication (user/password, token) to basic ingestion. |
-| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/auth_tls.rs) | Like `auth.rs`, but uses TLS for encrypted TCP connections. |
-| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/from_conf.rs) | Configures client via connection string instead of builder pattern. |
-| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
-| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
-| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
+| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/basic.rs) | Minimal ILP/TCP ingestion (legacy transport). |
+| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/auth.rs) | ILP/TCP with ECDSA authentication. |
+| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/auth_tls.rs) | ILP/TCP with TLS plus ECDSA auth. |
+| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/http.rs) | ILP/HTTP transport with array ingestion. |
+| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/from_conf.rs) | Configures a sender from a connection string. |
+| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/from_env.rs) | Reads configuration from `QDB_CLIENT_CONF`. |
+| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/protocol_version.rs) | ILP protocol-version selection. |
+| [`qwp_ws_unified_sfa_bench.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_unified_sfa_bench.rs) | QWP/WebSocket throughput benchmark with store-and-forward. |
 
 ## Crate features
 
-The crate provides several optional features to enable additional functionality. You can enable features using Cargo's `--features` flag or in your `Cargo.toml`.
+The crate provides optional features. Enable them via Cargo's
+`--features` flag or in your `Cargo.toml`.
 
 ### Default features
-- **sync-sender**: Enables both `sync-sender-tcp` and `sync-sender-http`.
-- **sync-sender-tcp**: Enables ILP/TCP (legacy). Depends on the `socket2` crate.
-- **sync-sender-http**: Enables ILP/HTTP support. Depends on the `ureq` crate.
-- **tls-webpki-certs**: Uses a snapshot of the [Common CA Database](https://www.ccadb.org/) as root TLS certificates. Depends on the `webpki-roots` crate.
-- **ring-crypto**: Uses the `ring` crate as the cryptography backend for TLS (default crypto backend).
+
+* **sync-sender** — umbrella for the synchronous sender transports.
+* **sync-sender-qwp-ws** — QWP over WebSocket. Recommended transport.
+* **sync-sender-http** — ILP over HTTP (legacy).
+* **sync-sender-tcp** — ILP over TCP (legacy).
+* **tls-webpki-certs** — bundled TLS roots from the
+  [Common CA Database](https://www.ccadb.org/) via
+  [`webpki-roots`](https://crates.io/crates/webpki-roots).
+* **ring-crypto** — default TLS crypto backend, via the `ring` crate.
 
 ### Optional features
 
-- **chrono_timestamp**: Allows specifying timestamps as `chrono::DateTime` objects. Depends on the `chrono` crate.
-- **tls-native-certs**: Uses OS-provided root TLS certificates for secure connections. Depends on the `rustls-native-certs` crate.
-- **insecure-skip-verify**: Allows skipping verification of insecure certificates (not recommended for production).
-- **ndarray**: Enables integration with the `ndarray` crate for working with n-dimensional arrays. Without this feature, you can still send slices or implement custom array types via the `NdArrayView` trait.
-- **aws-lc-crypto**: Uses `aws-lc-rs` as the cryptography backend for TLS. Mutually exclusive with the `ring-crypto` feature.
+* **chrono_timestamp** — accept timestamps as `chrono::DateTime`.
+* **tls-native-certs** — OS-provided root TLS certificates via
+  `rustls-native-certs`.
+* **insecure-skip-verify** — disable TLS verification (test-only,
+  not for production).
+* **ndarray** — integrate with the `ndarray` crate for N-dimensional
+  arrays. Without this feature, slices and custom types via the
+  `NdArrayView` trait still work.
+* **aws-lc-crypto** — alternative TLS backend via `aws-lc-rs`. Mutually
+  exclusive with `ring-crypto`.
+* **almost-all-features** — dev/test convenience: enables most features
+  except mutually exclusive crypto backends.
 
-- **almost-all-features**: Convenience feature for development and testing. Enables most features except mutually exclusive crypto backends.
-
-> See the `Cargo.toml` for the full list and details on feature interactions.
+> See `Cargo.toml` for the full list and feature interactions.
 
 ## C, C++ and Python APIs
 
-This crate is also exposed as a C and C++ API and in turn exposed to Python.
+This crate is also exposed as a C and C++ API and in turn exposed to
+Python.
 
-* This project's [GitHub page](https://github.com/questdb/c-questdb-client)
-  for the C and C++ API.
-* [Python bindings](https://github.com/questdb/py-questdb-client).
+* [c-questdb-client](https://github.com/questdb/c-questdb-client) — the C
+  and C++ API.
+* [py-questdb-client](https://github.com/questdb/py-questdb-client) —
+  Python bindings.
 
 ## Community
 
-If you need help, have additional questions or want to provide feedback, you
-may find us on [Slack](https://slack.questdb.io/).
-
-You can also sign up to our [mailing list](https://questdb.io/community/) to
-get notified of new releases.
+If you need help, have questions, or want to provide feedback,
+[join us on Slack](https://slack.questdb.io/). You can also sign up to
+the [mailing list](https://questdb.io/community/) to get notified of new
+releases.

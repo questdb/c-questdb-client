@@ -374,8 +374,11 @@ enum BufferInner {
 
 /// A reusable row buffer.
 ///
-/// For ILP senders this exposes the existing byte-oriented buffer implementation.
-/// For QWP/UDP senders it dispatches to the QWP-specific row buffer.
+/// The same `Buffer` type is shared across all transports; the underlying
+/// representation is chosen by the sender at construction time. For
+/// QWP senders (WebSocket or UDP) it dispatches to the QWP-specific
+/// columnar row buffer; for ILP senders (HTTP or TCP) it exposes the
+/// byte-oriented ILP buffer.
 #[derive(Clone, Debug)]
 pub struct Buffer {
     inner: BufferInner,
