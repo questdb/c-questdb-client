@@ -136,7 +136,7 @@ stages:
             submodules: false
           - script: |
               cmake -S . -B build_sanitize \
-                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
                 -DQUESTDB_TESTS_AND_EXAMPLES=ON \
                 -DQUESTDB_SANITIZE=ON
             displayName: "Configure (ASan + UBSan)"

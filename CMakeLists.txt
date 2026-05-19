@@ -142,9 +142,8 @@ function(apply_sanitizers TARGET_NAME)
     endif()
     if(MSVC)
         message(WARNING
-            "QUESTDB_SANITIZE: only AddressSanitizer is available on MSVC; "
-            "UndefinedBehaviorSanitizer is skipped.")
-        target_compile_options(${TARGET_NAME} PRIVATE /fsanitize=address)
+            "QUESTDB_SANITIZE is not supported on MSVC (its ASan runtime is "
+            "not validated against the rustc-built library); skipping.")
     else()
         target_compile_options(
             ${TARGET_NAME} PRIVATE
