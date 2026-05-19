@@ -507,8 +507,13 @@ stages:
       #      permission there.
       - job: TriggerEnterpriseCClientE2E
         displayName: "Trigger questdb-enterprise c_client e2e"
+        # Use the hetzner-incus self-hosted pool: the Microsoft-hosted
+        # queue is consistently deeper than incus, and this is a
+        # ~10-second curl+jq job so it picks up a slot quickly here.
+        # The hetzner image already ships curl + jq (the Enterprise
+        # ReportToOssPr stage uses both).
         pool:
-          vmImage: ubuntu-latest
+          name: hetzner-incus
         # Skip on fork PRs: $(System.AccessToken) is empty there and
         # the REST POST would return 401.
         condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'))
