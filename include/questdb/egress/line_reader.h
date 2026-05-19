@@ -551,6 +551,175 @@ QUESTDB_CLIENT_API void line_reader_failover_event_trigger_msg(
 QUESTDB_CLIENT_API const line_reader_server_info*
 line_reader_failover_event_server_info(const line_reader_failover_event*);
 
+/////////// Failover progress callback.
+
+/**
+ * Phase discriminant on `line_reader_failover_progress_event`. The
+ * same callback fires for every phase of a mid-query failover
+ * lifecycle — operators can route on the phase to feed SLO dashboards
+ * ("unreachable for N seconds" alerts), per-attempt retry telemetry,
+ * or a one-shot "gave up" notifier.
+ *
+ * Discriminants are explicit and append-only across releases —
+ * inserting a new phase in the middle would silently renumber later
+ * ones across recompiles, breaking ABI for shared-library consumers.
+ */
+typedef enum line_reader_failover_phase
+{
+    /** The cursor's connection just died. Fires once, BEFORE the retry
+     *  loop runs, so observers see the outage "now" rather than
+     *  retroactively when reconnect lands. */
+    line_reader_failover_phase_disconnected = 0,
+    /** A reconnect dial is about to be attempted. Fires once per
+     *  outer-loop iteration of the retry walk, AFTER the inter-attempt
+     *  backoff sleep, so `_elapsed_ns` already includes the backoff
+     *  wall-clock cost. */
+    line_reader_failover_phase_retrying = 1,
+    /** A reconnect succeeded; replayed batches will start arriving on
+     *  the new connection. Fires immediately BEFORE the
+     *  `line_reader_failover_callback` registered via
+     *  `line_reader_query_on_failover_reset` (when both are installed)
+     *  so a single sink sees the entire lifecycle in order. */
+    line_reader_failover_phase_reset = 2,
+    /** The retry budget is exhausted. The cursor is terminal; the
+     *  error returned to the caller is available via
+     *  `line_reader_failover_progress_event_final_error_*`. */
+    line_reader_failover_phase_gave_up = 3,
+} line_reader_failover_phase;
+
+/**
+ * Opaque borrowed handle to a failover-progress event. The pointer
+ * passed to your callback is valid only for the duration of that
+ * callback invocation.
+ */
+typedef struct line_reader_failover_progress_event line_reader_failover_progress_event;
+
+/**
+ * User callback fired at every phase of a mid-query failover
+ * lifecycle. The `event` pointer is valid only for the duration of
+ * the call.
+ *
+ * Reentrancy contract — identical to `line_reader_failover_callback`.
+ * The callback MUST NOT:
+ *
+ *  - Call any function on the originating `line_reader`, the
+ *    `line_reader_query` it produced, or the `line_reader_cursor`
+ *    whose operation is in flight. The trampoline runs synchronously
+ *    inside `line_reader_cursor_next_batch` (or `_cursor_cancel` /
+ *    `_cursor_add_credit`) while the upstream code is mid-mutation of
+ *    the underlying `Reader` and `Cursor`. Any reentrant FFI call
+ *    would alias the in-flight `&mut Reader` and corrupt internal
+ *    state — this is undefined behaviour. Read-only stat getters are
+ *    NOT safe from inside the callback for the same aliasing reason.
+ *
+ *  - Throw a C++ exception, `longjmp`, or otherwise unwind out of the
+ *    callback. The trampoline wraps the user callback in
+ *    `catch_unwind` and `abort()`s the process if an unwind escapes.
+ *
+ *  - Block indefinitely or perform long-running work. The callback
+ *    runs synchronously on the thread driving the in-flight cursor
+ *    operation; while it is executing, no batch is being read, no
+ *    CREDIT is being granted to the server, and the failover loop
+ *    cannot make progress. Keep the callback bounded — clear an
+ *    accumulator, set a flag, signal a condition variable — and do
+ *    any heavy work outside the cursor's drive thread.
+ *
+ * The callback runs on the thread driving the in-flight cursor
+ * operation.
+ */
+typedef void (*line_reader_failover_progress_callback)(
+    const line_reader_failover_progress_event* event,
+    void* user_data);
+
+/** Phase of this event. NULL-safe: returns
+ *  `line_reader_failover_phase_disconnected` for a NULL handle. */
+QUESTDB_CLIENT_API line_reader_failover_phase
+line_reader_failover_progress_event_phase(
+    const line_reader_failover_progress_event*);
+
+/** Host of the endpoint that died. UTF-8 byte slice borrowed for the
+ *  duration of the callback. Set on every phase. */
+QUESTDB_CLIENT_API void line_reader_failover_progress_event_failed_host(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
+
+/** Port of the endpoint that died. Set on every phase. */
+QUESTDB_CLIENT_API uint16_t line_reader_failover_progress_event_failed_port(
+    const line_reader_failover_progress_event*);
+
+/** Host of the new endpoint (Reset phase only). UTF-8 byte slice
+ *  borrowed for the duration of the callback. Writes `(NULL, 0)` in
+ *  every other phase. */
+QUESTDB_CLIENT_API void line_reader_failover_progress_event_new_host(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
+
+/** Port of the new endpoint (Reset phase only). Returns `0` in every
+ *  other phase. */
+QUESTDB_CLIENT_API uint16_t line_reader_failover_progress_event_new_port(
+    const line_reader_failover_progress_event*);
+
+/** New `request_id` (Reset phase only). Returns `true` and writes the
+ *  id to `*out_request_id` on Reset; returns `false` and writes `0` in
+ *  every other phase. */
+QUESTDB_CLIENT_API bool line_reader_failover_progress_event_new_request_id(
+    const line_reader_failover_progress_event*,
+    int64_t* out_request_id);
+
+/** 1-based attempt counter:
+ *  - `0` on Disconnected (no attempt yet).
+ *  - `N >= 1` on Retrying for the Nth dial.
+ *  - On Reset, the attempt that landed.
+ *  - On GaveUp, the total number of attempts burned. May be `0` when
+ *    the wall-clock deadline was already exhausted before any dial. */
+QUESTDB_CLIENT_API uint32_t line_reader_failover_progress_event_attempt(
+    const line_reader_failover_progress_event*);
+
+/** Error code that triggered the failover (the original cause-of-
+ *  death). Preserved across every phase so subscribers see consistent
+ *  context regardless of when they latch on. */
+QUESTDB_CLIENT_API line_reader_error_code
+line_reader_failover_progress_event_trigger_code(
+    const line_reader_failover_progress_event*);
+
+/** Trigger error message (UTF-8). Borrowed for the duration of the
+ *  callback. */
+QUESTDB_CLIENT_API void line_reader_failover_progress_event_trigger_msg(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
+
+/** Wall-clock nanoseconds since the disconnect was observed (the
+ *  start of the failover cycle). Monotonically non-decreasing across
+ *  phases of the same event. Saturating. */
+QUESTDB_CLIENT_API uint64_t line_reader_failover_progress_event_elapsed_ns(
+    const line_reader_failover_progress_event*);
+
+/** `SERVER_INFO` for the new endpoint, or NULL outside the Reset
+ *  phase / on v1 servers. */
+QUESTDB_CLIENT_API const line_reader_server_info*
+line_reader_failover_progress_event_server_info(
+    const line_reader_failover_progress_event*);
+
+/** Final error code (GaveUp phase only). Returns `true` and writes
+ *  the code to `*out_code` on GaveUp; returns `false` and writes
+ *  `line_reader_error_invalid_api_call` in every other phase. The
+ *  code matches what the cursor's next `_next_batch` / `_add_credit`
+ *  call will surface. */
+QUESTDB_CLIENT_API bool line_reader_failover_progress_event_final_error_code(
+    const line_reader_failover_progress_event*,
+    line_reader_error_code* out_code);
+
+/** Final error message (GaveUp phase only). Returns `true` and writes
+ *  the borrowed UTF-8 message on GaveUp; returns `false` and writes
+ *  `(NULL, 0)` in every other phase. */
+QUESTDB_CLIENT_API bool line_reader_failover_progress_event_final_error_msg(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
+
 /////////// Query builder.
 
 /**
@@ -815,6 +984,32 @@ QUESTDB_CLIENT_API void line_reader_query_initial_credit(
 QUESTDB_CLIENT_API void line_reader_query_on_failover_reset(
     line_reader_query* query,
     line_reader_failover_callback callback,
+    void* user_data);
+
+/**
+ * Install a failover-progress callback on the query. Replaces any
+ * previously installed progress callback. `user_data` is opaque to
+ * the library; pass NULL if not needed. The callback fires at every
+ * phase of a mid-query failover lifecycle — see
+ * `line_reader_failover_phase`.
+ *
+ * Installing this callback also opts the cursor in to "I will handle
+ * replay-after-data-delivered correctly," the same way
+ * `line_reader_query_on_failover_reset` does — either being installed
+ * clears the silent-duplicate guard documented on
+ * `line_reader_cursor_next_batch`. If you only want telemetry and not
+ * replay semantics, set `failover=off` instead.
+ *
+ * See `line_reader_failover_progress_callback` for the full
+ * reentrancy contract: the callback MUST NOT call back into the
+ * originating reader / query / cursor, MUST NOT throw or `longjmp`
+ * (an escaping unwind aborts the process), and MUST NOT block — it
+ * runs synchronously in the cursor's drive thread and stalls the
+ * whole failover loop while it executes.
+ */
+QUESTDB_CLIENT_API void line_reader_query_on_failover_progress(
+    line_reader_query* query,
+    line_reader_failover_progress_callback callback,
     void* user_data);
 
 /////////// Cursor.

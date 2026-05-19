@@ -3157,6 +3157,262 @@ TEST_CASE(
 }
 
 // ---------------------------------------------------------------------------
+// failover_progress_event_view: full lifecycle coverage. Mirrors the
+// Rust progress-callback tests in `tests/egress_failover.rs` but
+// additionally exercises the post-data-delivered replay path that the
+// Rust mock can't drive (no synthetic RESULT_BATCH helper).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mock: progress callback observes Disconnected -> Retrying -> Reset on successful failover")
+{
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionHardDrop{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "b"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+
+    const std::string conf =
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
+    questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
+
+    struct Capture
+    {
+        questdb::egress::failover_phase phase;
+        uint32_t attempt;
+        std::string failed_host;
+        uint16_t failed_port;
+        std::string new_host;
+        uint16_t new_port;
+        std::optional<int64_t> new_request_id;
+        bool has_final_error;
+    };
+    auto events = std::make_shared<std::vector<Capture>>();
+
+    auto cur = reader.prepare("select 1"_utf8)
+                   .on_failover_progress(
+                       [events](const questdb::egress::failover_progress_event_view& ev)
+                       {
+                           events->push_back({
+                               ev.phase(),
+                               ev.attempt(),
+                               std::string(ev.failed_host()),
+                               ev.failed_port(),
+                               std::string(ev.new_host()),
+                               ev.new_port(),
+                               ev.new_request_id(),
+                               ev.final_error_code().has_value(),
+                           });
+                       })
+                   .execute();
+    CHECK_FALSE(cur.next_batch());
+    CHECK(cur.failover_resets() == 1);
+
+    REQUIRE(events->size() >= 3);
+    // First event: Disconnected with attempt=0, no new_addr.
+    CHECK(events->front().phase == questdb::egress::failover_phase::disconnected);
+    CHECK(events->front().attempt == 0);
+    CHECK(events->front().new_port == 0);
+    CHECK_FALSE(events->front().new_request_id.has_value());
+    CHECK_FALSE(events->front().has_final_error);
+
+    // At least one Retrying event with attempt >= 1.
+    bool saw_retry = false;
+    for (const auto& e : *events)
+    {
+        if (e.phase == questdb::egress::failover_phase::retrying)
+        {
+            saw_retry = true;
+            CHECK(e.attempt >= 1);
+            CHECK(e.new_port == 0);
+            CHECK_FALSE(e.has_final_error);
+        }
+    }
+    CHECK(saw_retry);
+
+    // Reset: last event, with new_addr populated.
+    const auto& last = events->back();
+    CHECK(last.phase == questdb::egress::failover_phase::reset);
+    CHECK(last.attempt >= 1);
+    CHECK(last.new_host == "127.0.0.1");
+    // After failover the cursor is on B; the Reset event's new_port
+    // must match the cursor's now-current port.
+    CHECK(last.new_port == cur.current_port());
+    // And distinct from the failed_port (which was A).
+    CHECK(last.failed_port != last.new_port);
+    CHECK(last.new_request_id.has_value());
+    CHECK_FALSE(last.has_final_error);
+
+    // No GaveUp on the successful path.
+    for (const auto& e : *events)
+    {
+        CHECK(e.phase != questdb::egress::failover_phase::gave_up);
+    }
+}
+
+TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhaustion")
+{
+    qm::Script s_initial = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "lonely"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionHardDrop{},
+    };
+    qm::Script s_dead = {qm::ActionHardDrop{}};
+    qm::MockServer srv({s_initial, s_dead});
+
+    const std::string conf = "ws::addr=" + srv.addr() +
+        ";failover_max_attempts=3;failover_backoff_initial_ms=1;"
+        "failover_backoff_max_ms=2";
+    questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
+
+    struct GaveUp
+    {
+        bool fired{false};
+        uint32_t attempt{0};
+        std::optional<line_reader_error_code> final_code;
+        std::string final_msg;
+        uint64_t elapsed_ns{0};
+    };
+    auto cap = std::make_shared<GaveUp>();
+
+    auto cur = reader.prepare("select 1"_utf8)
+                   .on_failover_progress(
+                       [cap](const questdb::egress::failover_progress_event_view& ev)
+                       {
+                           if (ev.phase() ==
+                               questdb::egress::failover_phase::gave_up)
+                           {
+                               cap->fired = true;
+                               cap->attempt = ev.attempt();
+                               if (auto c = ev.final_error_code())
+                                   cap->final_code =
+                                       static_cast<line_reader_error_code>(*c);
+                               cap->final_msg = std::string(ev.final_error_msg());
+                               cap->elapsed_ns = ev.elapsed_ns();
+                           }
+                       })
+                   .execute();
+    bool threw = false;
+    try
+    {
+        while (cur.next_batch()) {}
+    }
+    catch (const questdb::egress::line_reader_error&)
+    {
+        threw = true;
+    }
+    CHECK(threw);
+
+    CHECK(cap->fired);
+    CHECK(cap->attempt >= 1);
+    REQUIRE(cap->final_code.has_value());
+    CHECK((*cap->final_code == line_reader_error_socket_error ||
+           *cap->final_code == line_reader_error_protocol_error));
+    CHECK_FALSE(cap->final_msg.empty());
+    CHECK(cap->elapsed_ns > 0);
+}
+
+TEST_CASE("mock: progress callback alone unlocks replay-after-data-delivered")
+{
+    // The Rust mock has no helper to emit a synthetic RESULT_BATCH; the
+    // C++ mock does. This is the only place the
+    // "on_failover_progress installed, on_failover_reset absent, batch
+    // already delivered" branch is exercised end-to-end.
+    qm::ColumnSpec col{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({42}))};
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[col](int64_t rid)
+                            { return qm::result_batch_frame(rid, 0, 1, 1, {col}); }},
+        qm::ActionHardDrop{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "b"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+
+    const std::string conf =
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
+    questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
+
+    std::atomic<int> reset_phase_count{0};
+    auto cur = reader.prepare("select v"_utf8)
+                   .on_failover_progress(
+                       [&reset_phase_count](
+                           const questdb::egress::failover_progress_event_view& ev)
+                       {
+                           if (ev.phase() ==
+                               questdb::egress::failover_phase::reset)
+                           {
+                               reset_phase_count.fetch_add(1);
+                           }
+                       })
+                   .execute();
+    // First batch lands cleanly on A.
+    REQUIRE(cur.next_batch());
+    // Second next_batch sees A drop, fails over to B. Without ANY
+    // callback installed this would surface FailoverWouldDuplicate; the
+    // progress callback alone must unlock replay.
+    bool threw = false;
+    try
+    {
+        CHECK_FALSE(cur.next_batch());
+    }
+    catch (const questdb::egress::line_reader_error& e)
+    {
+        threw = true;
+        FAIL_CHECK("unexpected error: " << e.what());
+    }
+    CHECK_FALSE(threw);
+    CHECK(cur.failover_resets() == 1);
+    CHECK(reset_phase_count.load() == 1);
+}
+
+TEST_CASE("mock: progress callback noexcept trampoline swallows user exceptions")
+{
+    qm::Script s_a = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionHardDrop{},
+    };
+    qm::Script s_b = {
+        qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "b"},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv_a({s_a});
+    qm::MockServer srv_b({s_b});
+
+    const std::string conf =
+        "ws::addr=" + srv_a.addr() + "," + srv_b.addr() +
+        ";failover_backoff_initial_ms=1;failover_backoff_max_ms=10";
+    questdb::egress::reader reader{questdb::ingress::utf8_view{conf}};
+
+    // Throwing from inside the callback would unwind into the Rust FFI
+    // frame and abort the process if the trampoline didn't swallow it.
+    // Asserting we reach the post-execute code proves the swallow ran.
+    auto cur = reader.prepare("select 1"_utf8)
+                   .on_failover_progress(
+                       [](const questdb::egress::failover_progress_event_view&)
+                       { throw std::runtime_error("boom"); })
+                   .execute();
+    CHECK_FALSE(cur.next_batch());
+    CHECK(cur.failover_resets() == 1);
+}
+
+// ---------------------------------------------------------------------------
 // Coverage gaps documented but not yet asserted in this suite — left as
 // breadcrumbs for the next contributor:
 //

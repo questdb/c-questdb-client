@@ -40,8 +40,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
-    BatchView, ColumnKind, ColumnView, Cursor, Error, ErrorCode, FailoverEvent, Reader,
-    ReaderQuery, ReaderStats, ServerInfo, ServerRole, SimpleNullKind, Terminal, Validity,
+    BatchView, ColumnKind, ColumnView, Cursor, Error, ErrorCode, FailoverEvent, FailoverPhase,
+    FailoverProgressEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole,
+    SimpleNullKind, Terminal, Validity,
 };
 
 use crate::line_sender_utf8;
@@ -1300,6 +1301,364 @@ pub unsafe extern "C" fn line_reader_query_on_failover_reset(
             }
         };
         mutate_query(query, |q| q.on_failover_reset(trampoline));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FailoverProgressEvent + on_failover_progress callback
+// ---------------------------------------------------------------------------
+
+/// Phase discriminant on `line_reader_failover_progress_event`.
+///
+/// Numeric values match the Rust [`FailoverPhase`] discriminants and
+/// are append-only across releases — inserting a new variant in the
+/// middle would silently renumber later ones across recompiles,
+/// breaking ABI for shared-library consumers.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
+pub enum line_reader_failover_phase {
+    line_reader_failover_phase_disconnected = 0,
+    line_reader_failover_phase_retrying = 1,
+    line_reader_failover_phase_reset = 2,
+    line_reader_failover_phase_gave_up = 3,
+}
+
+impl From<FailoverPhase> for line_reader_failover_phase {
+    fn from(p: FailoverPhase) -> Self {
+        match p {
+            FailoverPhase::Disconnected => {
+                line_reader_failover_phase::line_reader_failover_phase_disconnected
+            }
+            FailoverPhase::Retrying => {
+                line_reader_failover_phase::line_reader_failover_phase_retrying
+            }
+            FailoverPhase::Reset => line_reader_failover_phase::line_reader_failover_phase_reset,
+            FailoverPhase::GaveUp => line_reader_failover_phase::line_reader_failover_phase_gave_up,
+            // `FailoverPhase` is `#[non_exhaustive]` so the upstream
+            // crate can add variants without breaking downstream
+            // matches. When that happens the FFI surface needs an
+            // explicit discriminant for the new phase — fall through
+            // to a panic so callers don't silently misclassify it.
+            _ => panic!(
+                "unrecognised FailoverPhase variant {:?}: questdb-rs-ffi needs an FFI discriminant",
+                p
+            ),
+        }
+    }
+}
+
+/// Opaque borrowed handle to a failover-progress event. The pointer is
+/// valid only for the duration of the user's progress callback
+/// invocation.
+#[repr(C)]
+pub struct line_reader_failover_progress_event {
+    _private: [u8; 0],
+}
+
+/// User callback fired at every phase of a mid-query failover
+/// lifecycle. The `event` pointer is valid only for the duration of
+/// the call.
+pub type line_reader_failover_progress_callback = Option<
+    unsafe extern "C" fn(event: *const line_reader_failover_progress_event, user_data: *mut c_void),
+>;
+
+/// NULL-safe borrow of the opaque `FailoverProgressEvent`. Returns
+/// `None` when the caller passes a NULL pointer.
+unsafe fn pev_ref<'a>(
+    ev: *const line_reader_failover_progress_event,
+) -> Option<&'a FailoverProgressEvent> {
+    if ev.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(ev as *const FailoverProgressEvent) })
+    }
+}
+
+/// Phase discriminant. NULL-safe: returns
+/// `line_reader_failover_phase_disconnected` (the zero variant) when
+/// `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_phase(
+    ev: *const line_reader_failover_progress_event,
+) -> line_reader_failover_phase {
+    unsafe {
+        match pev_ref(ev) {
+            Some(e) => e.phase.into(),
+            None => line_reader_failover_phase::line_reader_failover_phase_disconnected,
+        }
+    }
+}
+
+/// NULL-safe: writes empty `(NULL, 0)` when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_failed_host(
+    ev: *const line_reader_failover_progress_event,
+    out_buf: *mut *const c_char,
+    out_len: *mut size_t,
+) {
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
+        match pev_ref(ev) {
+            Some(e) => {
+                let h = e.failed_addr.host.as_str();
+                *out_buf = h.as_ptr() as *const c_char;
+                *out_len = h.len();
+            }
+            None => {
+                *out_buf = ptr::null();
+                *out_len = 0;
+            }
+        }
+    }
+}
+
+/// NULL-safe: returns 0 when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_failed_port(
+    ev: *const line_reader_failover_progress_event,
+) -> u16 {
+    unsafe { pev_ref(ev).map(|e| e.failed_addr.port).unwrap_or(0) }
+}
+
+/// New-endpoint host (Reset phase only). Writes `(NULL, 0)` outside
+/// Reset, or when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_new_host(
+    ev: *const line_reader_failover_progress_event,
+    out_buf: *mut *const c_char,
+    out_len: *mut size_t,
+) {
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
+        match pev_ref(ev).and_then(|e| e.new_addr.as_ref()) {
+            Some(addr) => {
+                let h = addr.host.as_str();
+                *out_buf = h.as_ptr() as *const c_char;
+                *out_len = h.len();
+            }
+            None => {
+                *out_buf = ptr::null();
+                *out_len = 0;
+            }
+        }
+    }
+}
+
+/// New-endpoint port (Reset phase only). Returns `0` outside Reset, or
+/// when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_new_port(
+    ev: *const line_reader_failover_progress_event,
+) -> u16 {
+    unsafe {
+        pev_ref(ev)
+            .and_then(|e| e.new_addr.as_ref())
+            .map(|a| a.port)
+            .unwrap_or(0)
+    }
+}
+
+/// New `request_id` (Reset phase only). Returns `true` and writes the
+/// id to `*out_request_id` on Reset; returns `false` and writes `0` in
+/// every other phase or when `ev`/`out_request_id` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_new_request_id(
+    ev: *const line_reader_failover_progress_event,
+    out_request_id: *mut i64,
+) -> bool {
+    unsafe {
+        if out_request_id.is_null() {
+            return false;
+        }
+        match pev_ref(ev).and_then(|e| e.new_request_id) {
+            Some(rid) => {
+                *out_request_id = rid;
+                true
+            }
+            None => {
+                *out_request_id = 0;
+                false
+            }
+        }
+    }
+}
+
+/// 1-based attempt counter. See the Rust
+/// [`FailoverProgressEvent::attempt`] docs for per-phase semantics.
+/// NULL-safe: returns 0 when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_attempt(
+    ev: *const line_reader_failover_progress_event,
+) -> u32 {
+    unsafe { pev_ref(ev).map(|e| e.attempt).unwrap_or(0) }
+}
+
+/// Trigger error code (the cause-of-death of the previous connection).
+/// NULL-safe: returns `line_reader_error_invalid_api_call` when `ev`
+/// is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_trigger_code(
+    ev: *const line_reader_failover_progress_event,
+) -> line_reader_error_code {
+    unsafe {
+        match pev_ref(ev) {
+            Some(e) => e.trigger.code().into(),
+            None => line_reader_error_code::line_reader_error_invalid_api_call,
+        }
+    }
+}
+
+/// Trigger error message (UTF-8). NULL-safe: writes `(NULL, 0)` when
+/// `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_trigger_msg(
+    ev: *const line_reader_failover_progress_event,
+    out_buf: *mut *const c_char,
+    out_len: *mut size_t,
+) {
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            return;
+        }
+        match pev_ref(ev) {
+            Some(e) => {
+                let m = e.trigger.msg();
+                *out_buf = m.as_ptr() as *const c_char;
+                *out_len = m.len();
+            }
+            None => {
+                *out_buf = ptr::null();
+                *out_len = 0;
+            }
+        }
+    }
+}
+
+/// Wall-clock nanoseconds since the disconnect was observed.
+/// Saturates at `u64::MAX`. NULL-safe: returns 0 when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_elapsed_ns(
+    ev: *const line_reader_failover_progress_event,
+) -> u64 {
+    unsafe {
+        pev_ref(ev)
+            .map(|e| u128_to_u64_sat(e.elapsed.as_nanos()))
+            .unwrap_or(0)
+    }
+}
+
+/// `SERVER_INFO` for the new endpoint, or NULL outside the Reset phase
+/// / on QWP v1 servers. Borrowed for the duration of the call.
+/// NULL-safe: returns NULL when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_server_info(
+    ev: *const line_reader_failover_progress_event,
+) -> *const line_reader_server_info {
+    unsafe {
+        match pev_ref(ev).and_then(|e| e.new_server_info.as_ref()) {
+            Some(si) => si as *const ServerInfo as *const line_reader_server_info,
+            None => ptr::null(),
+        }
+    }
+}
+
+/// Final error code (GaveUp phase only). Returns `true` and writes the
+/// code to `*out_code` on GaveUp; returns `false` and writes
+/// `line_reader_error_invalid_api_call` outside GaveUp or when `ev`/
+/// `out_code` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_final_error_code(
+    ev: *const line_reader_failover_progress_event,
+    out_code: *mut line_reader_error_code,
+) -> bool {
+    unsafe {
+        if out_code.is_null() {
+            return false;
+        }
+        match pev_ref(ev).and_then(|e| e.final_error.as_ref()) {
+            Some(e) => {
+                *out_code = e.code().into();
+                true
+            }
+            None => {
+                *out_code = line_reader_error_code::line_reader_error_invalid_api_call;
+                false
+            }
+        }
+    }
+}
+
+/// Final error message (GaveUp phase only). Returns `true` and writes
+/// the borrowed UTF-8 message on GaveUp; returns `false` and writes
+/// `(NULL, 0)` outside GaveUp or when `ev` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_failover_progress_event_final_error_msg(
+    ev: *const line_reader_failover_progress_event,
+    out_buf: *mut *const c_char,
+    out_len: *mut size_t,
+) -> bool {
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            return false;
+        }
+        match pev_ref(ev).and_then(|e| e.final_error.as_ref()) {
+            Some(err) => {
+                let m = err.msg();
+                *out_buf = m.as_ptr() as *const c_char;
+                *out_len = m.len();
+                true
+            }
+            None => {
+                *out_buf = ptr::null();
+                *out_len = 0;
+                false
+            }
+        }
+    }
+}
+
+/// Install a failover-progress callback on the query. Replaces any
+/// previously installed progress callback. `user_data` is opaque to
+/// the library; pass NULL if not needed.
+///
+/// The callback fires at every phase of a mid-query failover — see
+/// `line_reader_failover_phase`. Installing this callback also opts
+/// the cursor in to "I will handle replay-after-data-delivered
+/// correctly," the same way `line_reader_query_on_failover_reset`
+/// does — either being installed clears the silent-duplicate guard.
+///
+/// Reentrancy contract — same as `line_reader_failover_callback`. In
+/// short: the trampoline runs synchronously inside the in-flight
+/// cursor op, so the user callback MUST NOT touch the originating
+/// reader, query, or cursor (including read-only stat getters — they
+/// would alias the upstream `&mut Reader` borrow), and MUST NOT throw
+/// / longjmp / unwind across the C boundary. The trampoline
+/// `catch_unwind`s and aborts on escape.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_query_on_failover_progress(
+    query: *mut line_reader_query,
+    callback: line_reader_failover_progress_callback,
+    user_data: *mut c_void,
+) {
+    unsafe {
+        let trampoline = move |event: &FailoverProgressEvent| {
+            if let Some(c_cb) = callback {
+                let opaque = event as *const FailoverProgressEvent
+                    as *const line_reader_failover_progress_event;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    c_cb(opaque, user_data)
+                }));
+                if result.is_err() {
+                    std::process::abort();
+                }
+            }
+        };
+        mutate_query(query, |q| q.on_failover_progress(trampoline));
     }
 }
 

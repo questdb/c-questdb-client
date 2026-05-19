@@ -506,6 +506,148 @@ private:
 /** User callback type for failover-reset notifications. */
 using failover_callback = std::function<void(const failover_event_view&)>;
 
+/**
+ * Lifecycle phase of a failover-progress event. Numeric values match
+ * `line_reader_failover_phase` and the Rust `FailoverPhase` enum.
+ */
+enum class failover_phase : int
+{
+    disconnected =
+        ::line_reader_failover_phase::line_reader_failover_phase_disconnected,
+    retrying =
+        ::line_reader_failover_phase::line_reader_failover_phase_retrying,
+    reset =
+        ::line_reader_failover_phase::line_reader_failover_phase_reset,
+    gave_up =
+        ::line_reader_failover_phase::line_reader_failover_phase_gave_up,
+};
+
+/**
+ * Borrowed view over a failover-progress event passed to the user's
+ * `on_failover_progress` callback. Valid only for the duration of the
+ * callback invocation.
+ *
+ * Several accessors are populated only in certain phases — see the
+ * per-method docs.
+ */
+class failover_progress_event_view
+{
+public:
+    explicit failover_progress_event_view(
+        const ::line_reader_failover_progress_event* impl) noexcept
+        : _impl{impl} {}
+
+    // Non-copyable: `_impl` is borrowed, valid only during the callback.
+    failover_progress_event_view(const failover_progress_event_view&) = delete;
+    failover_progress_event_view& operator=(
+        const failover_progress_event_view&) = delete;
+    failover_progress_event_view(failover_progress_event_view&&) = delete;
+    failover_progress_event_view& operator=(
+        failover_progress_event_view&&) = delete;
+
+    failover_phase phase() const noexcept
+    {
+        return static_cast<failover_phase>(
+            ::line_reader_failover_progress_event_phase(_impl));
+    }
+
+    /** Endpoint that died. Set on every phase. */
+    std::string_view failed_host() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_failed_host(_impl, &buf, &len);
+        return {buf, len};
+    }
+    uint16_t failed_port() const noexcept
+    {
+        return ::line_reader_failover_progress_event_failed_port(_impl);
+    }
+
+    /** New-endpoint host (Reset phase only). Returns empty otherwise. */
+    std::string_view new_host() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_new_host(_impl, &buf, &len);
+        return {buf, len};
+    }
+    /** New-endpoint port (Reset phase only). Returns 0 otherwise. */
+    uint16_t new_port() const noexcept
+    {
+        return ::line_reader_failover_progress_event_new_port(_impl);
+    }
+
+    /** New `request_id` (Reset phase only). `std::nullopt` otherwise. */
+    std::optional<int64_t> new_request_id() const noexcept
+    {
+        int64_t out = 0;
+        if (::line_reader_failover_progress_event_new_request_id(_impl, &out))
+            return out;
+        return std::nullopt;
+    }
+
+    /** 1-based attempt counter. See header docs for per-phase semantics. */
+    uint32_t attempt() const noexcept
+    {
+        return ::line_reader_failover_progress_event_attempt(_impl);
+    }
+
+    /** Trigger (original cause-of-death) error code. */
+    error_code trigger_code() const noexcept
+    {
+        return static_cast<error_code>(
+            ::line_reader_failover_progress_event_trigger_code(_impl));
+    }
+    /** Trigger error message (UTF-8). */
+    std::string_view trigger_msg() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_trigger_msg(_impl, &buf, &len);
+        return {buf, len};
+    }
+
+    /** Wall-clock nanoseconds since the disconnect. */
+    uint64_t elapsed_ns() const noexcept
+    {
+        return ::line_reader_failover_progress_event_elapsed_ns(_impl);
+    }
+
+    /** `SERVER_INFO` for the new endpoint (Reset phase only, v2+ servers). */
+    server_info_view server_info() const noexcept
+    {
+        return server_info_view{
+            ::line_reader_failover_progress_event_server_info(_impl)};
+    }
+
+    /** Final error code (GaveUp phase only). `std::nullopt` otherwise. */
+    std::optional<error_code> final_error_code() const noexcept
+    {
+        ::line_reader_error_code raw =
+            ::line_reader_error_code::line_reader_error_invalid_api_call;
+        if (::line_reader_failover_progress_event_final_error_code(_impl, &raw))
+            return static_cast<error_code>(raw);
+        return std::nullopt;
+    }
+    /** Final error message (GaveUp phase only). Empty otherwise. */
+    std::string_view final_error_msg() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_final_error_msg(
+            _impl, &buf, &len);
+        return {buf, len};
+    }
+
+private:
+    const ::line_reader_failover_progress_event* _impl;
+};
+
+/** User callback type for failover-progress notifications. */
+using failover_progress_callback =
+    std::function<void(const failover_progress_event_view&)>;
+
 inline ::line_sender_utf8 to_c_utf8(::questdb::ingress::utf8_view view) noexcept
 {
     ::line_sender_utf8 raw;
@@ -976,6 +1118,34 @@ public:
         return *this;
     }
 
+    /**
+     * Install a failover-progress callback. Fires at every phase of a
+     * mid-query failover lifecycle (Disconnected, Retrying, Reset,
+     * GaveUp). The view passed to the callback is borrowed and valid
+     * only for the duration of the call.
+     *
+     * Installing this callback also opts the cursor in to replay-after-
+     * data-delivered, the same way `on_failover_reset` does — either
+     * being installed clears the silent-duplicate guard.
+     *
+     * Reentrancy contract is identical to `on_failover_reset`: the
+     * callback MUST NOT touch the originating reader / query / cursor,
+     * MUST NOT block, and any thrown exception is swallowed (an
+     * unwind across the C boundary would be undefined behaviour).
+     */
+    query& on_failover_progress(failover_progress_callback cb)
+    {
+        ensure_impl();
+        auto new_callback =
+            std::make_unique<failover_progress_callback>(std::move(cb));
+        ::line_reader_query_on_failover_progress(
+            _impl,
+            &query::progress_trampoline,
+            new_callback.get());
+        _progress_callback = std::move(new_callback);
+        return *this;
+    }
+
     /** Consume the query and return a streaming cursor.
      *  @throws line_reader_error with `invalid_api_call` if the query has
      *  already been consumed (by a previous `execute()`) or moved from.
@@ -1018,8 +1188,27 @@ private:
         }
     }
 
+    static void progress_trampoline(
+        const ::line_reader_failover_progress_event* ev,
+        void* user_data) noexcept
+    {
+        auto* cb = static_cast<failover_progress_callback*>(user_data);
+        if (cb && *cb)
+        {
+            try
+            {
+                (*cb)(failover_progress_event_view{ev});
+            }
+            catch (...)
+            {
+                // Swallow exceptions — see `trampoline` above.
+            }
+        }
+    }
+
     ::line_reader_query* _impl;
     std::unique_ptr<failover_callback> _callback;
+    std::unique_ptr<failover_progress_callback> _progress_callback;
     friend class reader;
     friend class cursor;
 };
@@ -1041,6 +1230,8 @@ public:
     cursor(cursor&& other) noexcept
         : _impl{other._impl}
         , _failover_callback{std::move(other._failover_callback)}
+        , _failover_progress_callback{
+              std::move(other._failover_progress_callback)}
     {
         other._impl = nullptr;
     }
@@ -1052,6 +1243,8 @@ public:
             ::line_reader_cursor_free(_impl);
             _impl = other._impl;
             _failover_callback = std::move(other._failover_callback);
+            _failover_progress_callback =
+                std::move(other._failover_progress_callback);
             other._impl = nullptr;
         }
         return *this;
@@ -1670,6 +1863,9 @@ private:
     /// The C trampoline holds a raw pointer to this object via `user_data`,
     /// so it MUST live as long as the cursor.
     std::unique_ptr<failover_callback> _failover_callback;
+    /// Same lifetime contract as `_failover_callback` but for the
+    /// progress callback registered via `query::on_failover_progress`.
+    std::unique_ptr<failover_progress_callback> _failover_progress_callback;
     friend class reader;
     friend class query;
 };
@@ -1692,6 +1888,7 @@ inline cursor query::execute()
 {
     ensure_impl();
     auto cb = std::move(_callback); // transfer to cursor (or drop on error)
+    auto pcb = std::move(_progress_callback);
     ::line_reader_error* c_err = nullptr;
     // The C call consumes `_impl` regardless of outcome and sets it to
     // NULL on return — so a subsequent `~query()` calling `_query_free`
@@ -1700,6 +1897,7 @@ inline cursor query::execute()
     if (!c) throw line_reader_error::from_c(c_err);
     cursor result{c};
     result._failover_callback = std::move(cb);
+    result._failover_progress_callback = std::move(pcb);
     return result;
 }
 

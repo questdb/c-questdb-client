@@ -89,7 +89,10 @@ pub use config::{
 };
 pub use error::{Error, ErrorCode, Result};
 #[cfg(feature = "sync-reader-ws")]
-pub use reader::{BatchView, Cursor, FailoverEvent, Reader, ReaderQuery, ReaderStats, Terminal};
+pub use reader::{
+    BatchView, Cursor, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ReaderQuery,
+    ReaderStats, Terminal,
+};
 pub use server_event::{ServerInfo, ServerRole};
 
 /// Decoder internals re-exported for the in-crate criterion benchmark

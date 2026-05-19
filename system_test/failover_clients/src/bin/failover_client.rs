@@ -31,7 +31,7 @@
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-use questdb::egress::{FailoverEvent, Reader};
+use questdb::egress::{FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader};
 
 /// Initial byte-credit window. The server pauses streaming after this
 /// budget is exhausted, modulo the row floor (one extra batch
@@ -69,6 +69,29 @@ fn main() {
                 ev.trigger.msg(),
             );
             *rows_for_cb.lock().unwrap() = 0;
+        })
+        // Mirror every phase to stderr so the CI lane against a real
+        // QuestDB cluster exercises the new callback end-to-end (not
+        // just the mock-server tests). The Python harness ignores
+        // stderr for its pass/fail signal — these lines are diagnostic
+        // only, but a regression that broke phase ordering or skipped
+        // a phase would surface here.
+        .on_failover_progress(|ev: &FailoverProgressEvent| {
+            let phase = match ev.phase {
+                FailoverPhase::Disconnected => "disconnected",
+                FailoverPhase::Retrying => "retrying",
+                FailoverPhase::Reset => "reset",
+                FailoverPhase::GaveUp => "gave_up",
+                _ => "?",
+            };
+            eprintln!(
+                "[failover-progress] phase={} attempt={} failed={} elapsed={:?} trigger={:?}",
+                phase,
+                ev.attempt,
+                ev.failed_addr,
+                ev.elapsed,
+                ev.trigger.code(),
+            );
         })
         .execute()
         .expect("execute");
