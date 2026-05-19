@@ -497,14 +497,14 @@ stages:
       # Prerequisites the questdb infra team needs to have configured
       # (one-time, in the Azure DevOps project UI):
       #   1. Register ci/build-and-test-e2e-c-client.yaml in the
-      #      questdb-enterprise project as a pipeline. Note its name
-      #      — it must match `enterprisePipelineName` below.
-      #   2. Ensure the c-questdb-client and questdb-enterprise
-      #      pipelines live in the same Azure DevOps project, OR set
-      #      `enterpriseProject` below to the project that hosts
-      #      questdb-enterprise's pipelines and grant the c-questdb-
-      #      client pipeline's build identity "Queue builds"
-      #      permission there.
+      #      `questdb-enterprise` ADO project as a pipeline. Name must
+      #      match `enterprisePipelineName` below.
+      #   2. The Enterprise pipeline lives in a different ADO project
+      #      from this one (this one is `questdb`, Enterprise is
+      #      `questdb-enterprise`). For cross-project queueing,
+      #      `questdb-enterprise` project settings must grant the
+      #      `questdb Build Service` identity "Queue builds" +
+      #      "View build pipeline" permissions.
       - job: TriggerEnterpriseCClientE2E
         displayName: "Trigger questdb-enterprise c_client e2e"
         # Use the hetzner-incus self-hosted pool: the Microsoft-hosted
@@ -518,7 +518,9 @@ stages:
         # the REST POST would return 401.
         condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'))
         variables:
-          enterpriseProject: '$(System.TeamProject)'
+          # Hardcoded because the Enterprise pipeline lives in its own
+          # ADO project, not the one this pipeline runs in.
+          enterpriseProject: 'questdb-enterprise'
           enterprisePipelineName: 'build-and-test-e2e-c-client'
         steps:
           - checkout: none
