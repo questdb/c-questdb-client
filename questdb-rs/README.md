@@ -90,19 +90,8 @@ on the QuestDB documentation site.
 
 ## Examples
 
-A selection of usage examples is available in the
-[examples directory](https://github.com/questdb/c-questdb-client/tree/6.1.0/questdb-rs/examples):
-
-| Example | Description |
-|---------|-------------|
-| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/basic.rs) | Minimal ILP/TCP ingestion (legacy transport). |
-| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/auth.rs) | ILP/TCP with ECDSA authentication. |
-| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/auth_tls.rs) | ILP/TCP with TLS plus ECDSA auth. |
-| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/http.rs) | ILP/HTTP transport with array ingestion. |
-| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/from_conf.rs) | Configures a sender from a connection string. |
-| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/from_env.rs) | Reads configuration from `QDB_CLIENT_CONF`. |
-| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/protocol_version.rs) | ILP protocol-version selection. |
-| [`qwp_ws_unified_sfa_bench.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_unified_sfa_bench.rs) | QWP/WebSocket throughput benchmark with store-and-forward. |
+QWP/WebSocket throughput benchmark with store-and-forward:
+[`qwp_ws_unified_sfa_bench.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_unified_sfa_bench.rs).
 
 ## Crate features
 
