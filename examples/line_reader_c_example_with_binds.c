@@ -1,4 +1,5 @@
 #include <questdb/egress/line_reader.h>
+#include <questdb/egress/line_reader_helpers.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -35,39 +36,44 @@ int main(int argc, const char* argv[])
     if (!cursor)
         goto on_error;
 
-    int rc;
-    while ((rc = line_reader_cursor_next_batch(cursor, &err)) == 1)
+    const line_reader_batch* batch;
+    while ((batch = line_reader_cursor_next_batch(cursor, &err)) != NULL)
     {
-        const size_t rows = line_reader_cursor_row_count(cursor);
+        const size_t rows = line_reader_batch_row_count(batch);
+
+        line_reader_column_data d_scaled, d_label;
+        if (!line_reader_batch_column_data(batch, 0, &d_scaled, &err))
+            goto on_error;
+        if (!line_reader_batch_column_data(batch, 1, &d_label, &err))
+            goto on_error;
+
         for (size_t r = 0; r < rows; ++r)
         {
-            int32_t scaled = 0;
             bool n_null = false;
-            if (!line_reader_cursor_get_i32(cursor, 0, r, &scaled, &n_null, &err))
-                goto on_error;
+            const int64_t scaled =
+                line_reader_column_data_get_i64(&d_scaled, r, &n_null);
 
-            const char* label = NULL;
-            size_t label_len = 0;
             bool s_null = false;
-            if (!line_reader_cursor_get_varchar(
-                    cursor, 1, r, &label, &label_len, &s_null, &err))
-                goto on_error;
+            const uint8_t* label_buf = NULL;
+            size_t label_len = 0;
+            line_reader_column_data_get_varlen(
+                &d_label, r, &label_buf, &label_len, &s_null);
 
             // Print "NULL" rather than substituting a sentinel value:
-            // a literal `0` for an i32 column or an empty string for a
+            // a literal `0` for an i64 column or an empty string for a
             // varchar column would silently mask SQL NULLs in
             // production output. Always branch on the *_null flag.
             if (n_null)
                 printf("scaled=NULL");
             else
-                printf("scaled=%d", scaled);
+                printf("scaled=%lld", (long long)scaled);
             if (s_null)
                 printf(" label=NULL\n");
             else
-                printf(" label=%.*s\n", (int)label_len, label);
+                printf(" label=%.*s\n", (int)label_len, (const char*)label_buf);
         }
     }
-    if (rc < 0)
+    if (err)
         goto on_error;
 
     line_reader_cursor_free(cursor);

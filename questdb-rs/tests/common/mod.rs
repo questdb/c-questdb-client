@@ -45,11 +45,23 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const PING_PATH: &str = "/ping";
 const PING_TIMEOUT: Duration = Duration::from_secs(45);
 const PING_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Serialises the allocate-then-spawn critical section across `#[test]`
+/// threads in this `cargo test` binary. `allocate_ports` releases its
+/// bound listeners before the JVM gets a chance to rebind, so without
+/// this mutex two concurrent tests can be handed the same port by the
+/// kernel: thread A drops the listener, thread B's `allocate_ports` is
+/// assigned the freshly-freed port, and thread A's JVM then loses the
+/// race when it tries to bind. Held only until `/ping` returns 204 — by
+/// that point the JVM owns its three sockets and other tests can boot in
+/// parallel.
+static STARTUP: Mutex<()> = Mutex::new(());
 
 /// Locate the QuestDB jar built from the `questdb/` submodule. We walk up
 /// from `questdb-rs/` to the workspace root and look for the jar there.
@@ -89,8 +101,11 @@ fn locate_jar() -> PathBuf {
 }
 
 /// Allocate `n` free TCP ports on 127.0.0.1 by binding briefly to port 0.
-/// There's a small TOCTOU window before the JVM rebinds; in practice the
-/// startup is fast enough that collisions are rare in CI.
+/// `start_with_config` serialises the allocate-then-spawn critical
+/// section via a process-local mutex ([`STARTUP`]), so the
+/// close→rebind window cannot collide with another test thread in this
+/// same `cargo test` binary. Externally visible parallelism (test
+/// bodies running after `/ping` returns 204) is unaffected.
 fn allocate_ports(n: usize) -> Vec<u16> {
     let mut listeners = Vec::with_capacity(n);
     let mut ports = Vec::with_capacity(n);
@@ -218,6 +233,13 @@ impl QuestDbServer {
     /// JVM — `Drop` kills it at end of test, so each per-test instance
     /// costs one ~15 s boot.
     pub fn start_with_config(extra_conf: &[(&str, &str)]) -> Self {
+        // Hold the startup mutex across allocate_ports + spawn +
+        // wait_for_ping so the port triple we picked is still ours when
+        // the JVM finally binds. `into_inner` defuses mutex poisoning
+        // from a panicking earlier test — the lock guards no shared
+        // state, only ordering. See [`STARTUP`] for the full rationale.
+        let _startup_guard = STARTUP.lock().unwrap_or_else(|e| e.into_inner());
+
         let jar = locate_jar();
         let java = locate_java();
         let ports = allocate_ports(3);

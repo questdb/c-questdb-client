@@ -1567,6 +1567,19 @@ public:
     }
 
     /**
+     * Cap on per-attempt backoff in the HTTP retry loop, in milliseconds.
+     * Default is 1000 ms. The retry loop starts at 10 ms and doubles each
+     * attempt up to this cap; the total retry budget is independently
+     * bounded by `retry_timeout()`. ILP-over-HTTP only.
+     */
+    opts& retry_max_backoff(uint64_t millis)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_retry_max_backoff, _impl, millis);
+        return *this;
+    }
+
+    /**
      * Set the minimum acceptable throughput while sending a buffer to the
      * server. The sender will divide the payload size by this number to
      * determine for how long to keep sending the payload before timing out. The
@@ -2083,9 +2096,11 @@ public:
 
     /**
      * Check if an error occurred previously and the sender must be closed.
-     * This happens when there was an earlier failure.
-     * This method is specific to ILP-over-TCP and is not relevant for
-     * ILP-over-HTTP or QWP-over-UDP.
+     * Returns true after an unrecoverable failure. For ILP-over-TCP this is
+     * any socket error. For QWP/WebSocket this also covers a server
+     * rejection or protocol violation that latches the publication
+     * lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
+     * transition into a permanently-unusable state and always return false.
      * @return true if an error occurred with a sender and it must be
      * closed.
      */

@@ -49,8 +49,8 @@ use super::qwp_ws_codec::{
 #[cfg(test)]
 use super::qwp_ws_driver::QwpWsCoreTestHarness;
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, CloseOutcome, DEFAULT_EVENT_CAPACITY, DriveOutcome, DriverError,
-    DriverEvent, PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport,
+    BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, DriverEvent,
+    PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport, QwpWsCounters,
     QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore, QwpWsReconnectStep,
     QwpWsSendCore, QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure,
     TransportPoll, TransportResponse, reconnect_error_is_terminal, reconnect_sleep_duration,
@@ -312,8 +312,9 @@ where
         queue: Q,
         pending_connect: QwpWsPendingConnect,
         append_deadline: Duration,
+        event_capacity: usize,
     ) -> Self {
-        let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+        let mut store = QwpWsPublicationStore::new(queue, event_capacity);
         let lifecycle = store.lifecycle();
         let progress = store.progress_view();
         let producer = store.take_producer();
@@ -463,9 +464,18 @@ where
         Ok(store.terminal_sender_error().cloned())
     }
 
+    fn lifecycle_is_terminal(&self) -> bool {
+        self.lifecycle.is_terminal()
+    }
+
     fn sender_errors_dropped_total(&self) -> crate::Result<u64> {
         let store = self.lock_shared()?;
         Ok(store.sender_errors_dropped_total())
+    }
+
+    fn counters(&self) -> crate::Result<QwpWsCounters> {
+        let store = self.lock_shared()?;
+        Ok(store.counters())
     }
 
     fn close_drain(&self, timeout: Duration) -> crate::Result<()> {
@@ -1101,6 +1111,17 @@ where
             self.send_core
                 .begin_reconnect("QWP/WebSocket reconnect", reason, initial_error);
         while !stop.load(Ordering::Acquire) {
+            // Bump the cumulative attempt counter before each call.
+            // Brief lock — the reconnect path is the slow one (network
+            // I/O, backoff sleeps), so this lock isn't on the hot path
+            // and won't perceptibly contend with publishers.
+            {
+                let mut store = match shared.lock() {
+                    Ok(store) => store,
+                    Err(_) => return self.handle_poisoned_lock(),
+                };
+                store.record_reconnect_attempt();
+            }
             match self.send_core.reconnect_once(&mut reconnect) {
                 Ok(QwpWsReconnectStep::Reconnected { reason }) => {
                     let mut store = match shared.lock() {
@@ -2523,6 +2544,7 @@ pub(crate) fn connect_qwp_ws(
                 queue,
                 pending_connect,
                 *qwp_ws.sf_append_deadline,
+                *qwp_ws.error_inbox_capacity,
             ),
             QwpWsReplayEncoder::new(1),
         )
@@ -2611,7 +2633,7 @@ fn open_qwp_ws_parts(
         connect_blocking_transport(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
     let negotiated_version = transport.negotiated_version();
     let max_in_flight = queue.max_in_flight();
-    let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+    let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
     let send_core = QwpWsSendCore::new_with_durable_ack(
         transport,
         max_in_flight,
@@ -2881,6 +2903,14 @@ pub(crate) fn qwp_ws_terminal_sender_error_manual(
     Ok(state.store.terminal_sender_error().cloned())
 }
 
+pub(crate) fn qwp_ws_is_terminal_background(state: &SyncQwpWsHandlerState) -> bool {
+    state.runner.lifecycle_is_terminal()
+}
+
+pub(crate) fn qwp_ws_is_terminal_manual(state: &ManualQwpWsHandlerState) -> bool {
+    state.store.is_terminal()
+}
+
 pub(crate) fn qwp_ws_sender_errors_dropped_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<u64> {
@@ -2891,6 +2921,18 @@ pub(crate) fn qwp_ws_sender_errors_dropped_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<u64> {
     Ok(state.store.sender_errors_dropped_total())
+}
+
+pub(crate) fn qwp_ws_counters_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<QwpWsCounters> {
+    state.runner.counters()
+}
+
+pub(crate) fn qwp_ws_counters_manual(
+    state: &ManualQwpWsHandlerState,
+) -> crate::Result<QwpWsCounters> {
+    Ok(state.store.counters())
 }
 
 pub(crate) fn qwp_ws_close_drain_background(

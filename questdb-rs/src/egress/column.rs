@@ -1021,6 +1021,33 @@ impl<'a> DoubleArrayColumn<'a> {
         let chunk = bytes.get(s..s + 8)?;
         Some(f64::from_le_bytes(chunk.try_into().expect("8 bytes")))
     }
+
+    /// Concatenated little-endian `f64` element bytes for every row,
+    /// addressed per row by [`data_offsets`](Self::data_offsets).
+    #[inline]
+    pub fn data(&self) -> &'a [u8] {
+        self.inner.data
+    }
+
+    /// Per-row byte offsets into [`data`](Self::data); `len() + 1` entries,
+    /// row `r` spanning `[data_offsets[r], data_offsets[r + 1])`.
+    #[inline]
+    pub fn data_offsets(&self) -> &'a [u32] {
+        self.inner.data_offsets
+    }
+
+    /// Concatenated per-row shapes (dimension lengths), addressed per row
+    /// by [`shape_offsets`](Self::shape_offsets).
+    #[inline]
+    pub fn shapes(&self) -> &'a [u32] {
+        self.inner.shapes
+    }
+
+    /// Per-row offsets into [`shapes`](Self::shapes); `len() + 1` entries.
+    #[inline]
+    pub fn shape_offsets(&self) -> &'a [u32] {
+        self.inner.shape_offsets
+    }
 }
 
 /// `LONG_ARRAY` column: per-row n-D shape and flat little-endian `i64`
@@ -1093,6 +1120,33 @@ impl<'a> LongArrayColumn<'a> {
         let s = idx.checked_mul(8)?;
         let chunk = bytes.get(s..s + 8)?;
         Some(i64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+    }
+
+    /// Concatenated little-endian `i64` element bytes for every row,
+    /// addressed per row by [`data_offsets`](Self::data_offsets).
+    #[inline]
+    pub fn data(&self) -> &'a [u8] {
+        self.inner.data
+    }
+
+    /// Per-row byte offsets into [`data`](Self::data); `len() + 1` entries,
+    /// row `r` spanning `[data_offsets[r], data_offsets[r + 1])`.
+    #[inline]
+    pub fn data_offsets(&self) -> &'a [u32] {
+        self.inner.data_offsets
+    }
+
+    /// Concatenated per-row shapes (dimension lengths), addressed per row
+    /// by [`shape_offsets`](Self::shape_offsets).
+    #[inline]
+    pub fn shapes(&self) -> &'a [u32] {
+        self.inner.shapes
+    }
+
+    /// Per-row offsets into [`shapes`](Self::shapes); `len() + 1` entries.
+    #[inline]
+    pub fn shape_offsets(&self) -> &'a [u32] {
+        self.inner.shape_offsets
     }
 }
 

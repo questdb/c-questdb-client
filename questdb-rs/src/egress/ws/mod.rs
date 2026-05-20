@@ -34,3 +34,4 @@
 //! streaming-binary read path.
 
 pub(crate) mod client;
+pub(crate) mod nosigpipe;

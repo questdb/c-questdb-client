@@ -305,6 +305,31 @@ impl PublicationLifecycle {
     }
 }
 
+/// Lifetime counters mirroring the Java QwpWebSocketSender's total-* getters.
+/// Bumped at the same event sites the Java sidecar reports on so the QWP/WS
+/// e2e harness (questdb-enterprise/questdb-ent/e2e) can observe identical
+/// signals across language bindings.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct QwpWsCounters {
+    pub total_frames_sent: u64,
+    pub total_acks: u64,
+    pub total_reconnect_attempts: u64,
+    pub total_reconnects_succeeded: u64,
+    pub total_server_errors: u64,
+}
+
+impl From<QwpWsCounters> for super::qwp_ws_ownership::QwpWsTotals {
+    fn from(counters: QwpWsCounters) -> Self {
+        Self {
+            frames_sent: counters.total_frames_sent,
+            acks: counters.total_acks,
+            reconnect_attempts: counters.total_reconnect_attempts,
+            reconnects_succeeded: counters.total_reconnects_succeeded,
+            server_errors: counters.total_server_errors,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct QwpWsPublicationStore<Q = SfaFrameQueue> {
     queue: Q,
@@ -315,6 +340,7 @@ pub(crate) struct QwpWsPublicationStore<Q = SfaFrameQueue> {
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
     sender_errors: SenderErrorLog,
+    counters: QwpWsCounters,
 }
 
 impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
@@ -328,7 +354,16 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             last_server_error: None,
             rejected_frames: VecDeque::new(),
             sender_errors: SenderErrorLog::new(event_capacity),
+            counters: QwpWsCounters::default(),
         }
+    }
+
+    pub(crate) fn counters(&self) -> QwpWsCounters {
+        self.counters
+    }
+
+    pub(crate) fn record_reconnect_attempt(&mut self) {
+        self.counters.total_reconnect_attempts += 1;
     }
 
     pub(crate) fn lifecycle(&self) -> PublicationLifecycle {
@@ -369,6 +404,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     pub(crate) fn record_sent_event(&mut self, frame: SentFrame) {
+        self.counters.total_frames_sent += 1;
         self.push_event(DriverEvent::Sent {
             fsn: frame.fsn,
             wire_seq: frame.wire_seq,
@@ -638,11 +674,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         response: TransportResponse,
     ) -> Result<DriveOutcome, DriverError> {
         match response {
-            TransportResponse::Ack { wire_seq } => self.complete_ack_through(store, wire_seq),
+            TransportResponse::Ack { wire_seq } => {
+                store.counters.total_acks += 1;
+                self.complete_ack_through(store, wire_seq)
+            }
             TransportResponse::DurableOk {
                 wire_seq,
                 table_seq_txns,
             } => {
+                store.counters.total_acks += 1;
                 if self.durable_ack.is_some() {
                     self.apply_durable_ok(store, wire_seq, table_seq_txns)
                 } else {
@@ -650,6 +690,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 }
             }
             TransportResponse::DurableAck { table_seq_txns } => {
+                store.counters.total_acks += 1;
                 let Some(tracker) = self.durable_ack.as_mut() else {
                     return Ok(DriveOutcome::Idle);
                 };
@@ -657,6 +698,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 self.complete_ready_durable(store)
             }
             TransportResponse::Reject { wire_seq, error } => {
+                store.counters.total_server_errors += 1;
                 let policy = server_error_policy(error.status);
                 let Some((fsn, effect_wire_seq)) =
                     self.send_cursor.reject_fsn_for_wire_seq(wire_seq)?
@@ -1182,6 +1224,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if let Some(tracker) = self.durable_ack.as_mut() {
             tracker.reset();
         }
+        store.counters.total_reconnects_succeeded += 1;
         store.push_event(DriverEvent::Reconnected { reason });
         DriveOutcome::Reconnected { reason }
     }
@@ -1193,6 +1236,10 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         let Some(mut reconnect) = self.pending_reconnect.take() else {
             return Ok(DriveOutcome::Idle);
         };
+        // Mirrors the background runner's pre-attempt bump in
+        // reconnect_with_policy so manual-mode drivers expose the same
+        // cumulative counter.
+        store.record_reconnect_attempt();
         match self.reconnect_once(&mut reconnect)? {
             QwpWsReconnectStep::Reconnected { reason } => {
                 Ok(self.finish_reconnect_success(store, reason))
@@ -1763,6 +1810,10 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
 
     pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
         self.store.sender_errors_dropped_total()
+    }
+
+    pub(crate) fn counters(&self) -> QwpWsCounters {
+        self.store.counters()
     }
 
     pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {

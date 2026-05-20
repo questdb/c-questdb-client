@@ -56,17 +56,19 @@ pub(crate) const MAX_CONN_DICT_HEAP_BYTES: usize = 256 * 1024 * 1024;
 /// `MAX_CONN_DICT_SIZE` in the Java reference client.
 pub(crate) const MAX_CONN_DICT_SIZE: usize = 8_388_608;
 
+/// Byte range of one symbol string within [`SymbolDict::arena`].
 #[derive(Debug, Clone, Copy)]
-struct Entry {
-    offset: u32,
-    len: u32,
+#[repr(C)]
+pub struct SymbolEntry {
+    pub offset: u32,
+    pub len: u32,
 }
 
 /// Connection-scoped symbol dictionary.
 #[derive(Debug, Default, Clone)]
 pub struct SymbolDict {
     arena: Vec<u8>,
-    entries: Vec<Entry>,
+    entries: Vec<SymbolEntry>,
 }
 
 impl SymbolDict {
@@ -93,15 +95,35 @@ impl SymbolDict {
         let entry = self.entries.get(id as usize)?;
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
+        debug_assert!(
+            end <= self.arena.len(),
+            "entry {id} offset+len={end} exceeds arena len {}",
+            self.arena.len()
+        );
         // Safety: every byte slice that reaches the arena was UTF-8 validated
         // by `apply_delta` before being copied in.
         Some(unsafe { std::str::from_utf8_unchecked(&self.arena[start..end]) })
     }
 
+    /// Raw UTF-8 heap holding every entry's bytes back-to-back.
+    pub fn arena(&self) -> &[u8] {
+        &self.arena
+    }
+
+    /// Entry table: index `i` addresses the conn-id-`i` symbol's bytes
+    /// within [`arena`](Self::arena).
+    pub fn entries(&self) -> &[SymbolEntry] {
+        &self.entries
+    }
+
     /// Clear all state. Triggered by a `CACHE_RESET` with the dict bit.
+    /// Shrinks the backing allocations so a previously-saturated dict
+    /// doesn't keep its full heap reserved after the reset.
     pub fn reset(&mut self) {
         self.entries.clear();
         self.arena.clear();
+        self.entries.shrink_to(1024);
+        self.arena.shrink_to(64 * 1024);
     }
 
     /// Apply a delta whose first new id is `delta_start` and whose entries
@@ -249,7 +271,7 @@ impl SymbolDict {
         let len = u32::try_from(s.len())
             .map_err(|_| fmt!(ProtocolError, "symbol dict entry exceeds u32 length"))?;
         self.arena.extend_from_slice(s.as_bytes());
-        self.entries.push(Entry { offset, len });
+        self.entries.push(SymbolEntry { offset, len });
         Ok(())
     }
 }

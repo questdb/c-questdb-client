@@ -15,6 +15,9 @@ publish = false
 #   - failover_client    — synchronised helper for mid-query failover
 #   - simple_client      — minimal connect-and-drain (no kill needed)
 #   - exhaustion_client  — synchronised helper for poison-after-exhaustion
+#   - qwp_sidecar        — line-protocol ingress sender driven by the
+#                          questdb-enterprise e2e harness (Rust port of
+#                          com.questdb.e2e.QwpSidecarMain)
 
 [dependencies]
-questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-ws"] }
+questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-ws", "sync-sender-qwp-ws"] }

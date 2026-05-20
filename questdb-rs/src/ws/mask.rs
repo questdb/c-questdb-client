@@ -32,81 +32,91 @@
 //! of malicious applications from selecting the bytes that appear on
 //! the wire."
 //!
-//! We seed a per-connection xorshift64 PRNG from the crypto provider's
-//! `SystemRandom` (the same one rustls uses for TLS). The seed is the
-//! "strong source of entropy"; xorshift gives us a cheap stream of
-//! per-frame keys after that. Mask keys are not used for confidentiality
-//! — they exist to defeat cache-poisoning attacks against intermediary
-//! proxies that misparse WS bytes — so per-frame syscalls are not
-//! required. Tungstenite uses the same shape (seed once, generate fast).
+//! We draw a fresh 4-byte mask key from the crypto provider's
+//! `SystemRandom` (the same source rustls uses for TLS) on every
+//! outbound frame. A previous design seeded a per-connection xorshift64
+//! once and generated keys from it; xorshift64 is fully reversible
+//! (three consecutive 32-bit outputs are enough to recover state and
+//! predict every subsequent key), which violates the RFC's
+//! "MUST NOT make it simple … to predict" clause for `ws://` deployments
+//! where the mask key travels in plaintext in every frame header.
+//! Per-frame `SystemRandom::fill` adds ~30 ns of syscall overhead vs
+//! ~3 ns of xorshift — negligible relative to the surrounding WS
+//! framing + TCP write cost, and not on a tight loop (one call per
+//! frame, not per byte).
 
-/// Error returned by [`build_from_system_random`] when the OS entropy
-/// source itself fails. Callers usually surface this as a configuration
-/// error — at runtime there's nothing the user can do about it.
+/// Error returned when the OS entropy source itself fails. Callers
+/// usually surface this as an I/O error — at runtime there's nothing
+/// the user can do about it; the connection cannot continue producing
+/// valid WS frames.
 #[derive(Debug)]
 pub(crate) struct EntropyUnavailable(pub String);
 
-/// Per-connection mask key generator. Constructed once at WS upgrade
-/// time and consumed by every outbound frame.
+impl std::fmt::Display for EntropyUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EntropyUnavailable {}
+
+/// Per-connection mask key source. Holds the crypto provider's
+/// `SystemRandom`; draws a fresh key on every outbound frame.
 #[derive(Debug)]
-pub(crate) struct MaskRng {
-    state: u64,
+pub(crate) struct MaskKeySource {
+    #[cfg(feature = "ring-crypto")]
+    rng: ring::rand::SystemRandom,
+    #[cfg(all(feature = "aws-lc-crypto", not(feature = "ring-crypto")))]
+    rng: aws_lc_rs::rand::SystemRandom,
 }
 
-impl MaskRng {
-    /// Build a generator from a 64-bit seed. Caller is responsible for
-    /// drawing the seed from a strong entropy source. See
-    /// [`build_from_system_random`] for the production path.
-    pub(crate) fn from_seed(seed: u64) -> Self {
-        // xorshift64 stalls on all-zero state; force a non-zero seed.
-        let state = if seed == 0 {
-            0xDEAD_BEEF_CAFE_BABE
-        } else {
-            seed
-        };
-        Self { state }
+impl MaskKeySource {
+    pub(crate) fn new() -> Result<Self, EntropyUnavailable> {
+        let me = Self::new_uninit();
+        // Probe the entropy source at construction so a broken CSPRNG
+        // is caught before we've committed connection state.
+        let mut probe = [0u8; 4];
+        me.fill(&mut probe)?;
+        Ok(me)
     }
 
-    /// Draw a 32-bit key for the next frame. Cheap, branch-free.
-    pub(crate) fn next_key(&mut self) -> [u8; 4] {
-        // xorshift64 (Marsaglia) — passes BigCrush, no syscalls, ~3 ns.
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        // Take the high 32 bits — historically better statistical
-        // properties than the low 32 on xorshift64.
-        ((x >> 32) as u32).to_le_bytes()
+    #[cfg(feature = "ring-crypto")]
+    fn new_uninit() -> Self {
+        Self {
+            rng: ring::rand::SystemRandom::new(),
+        }
     }
-}
 
-/// Build a `MaskRng` whose seed is drawn from the crate's active
-/// crypto provider's `SystemRandom`. Both backends expose a
-/// `SecureRandom::fill(&mut [u8])` API; we ask for 8 bytes once and
-/// reinterpret as `u64`.
-///
-/// Fails only if the underlying entropy source itself fails — which on
-/// the supported targets means `getrandom`/`BCryptGenRandom` returned
-/// an error, i.e. something is very wrong.
-#[cfg(feature = "ring-crypto")]
-pub(crate) fn build_from_system_random() -> Result<MaskRng, EntropyUnavailable> {
-    use ring::rand::{SecureRandom, SystemRandom};
-    let mut seed_bytes = [0u8; 8];
-    SystemRandom::new()
-        .fill(&mut seed_bytes)
-        .map_err(|e| EntropyUnavailable(format!("system entropy source unavailable: {e:?}")))?;
-    Ok(MaskRng::from_seed(u64::from_ne_bytes(seed_bytes)))
-}
+    #[cfg(all(feature = "aws-lc-crypto", not(feature = "ring-crypto")))]
+    fn new_uninit() -> Self {
+        Self {
+            rng: aws_lc_rs::rand::SystemRandom::new(),
+        }
+    }
 
-#[cfg(all(feature = "aws-lc-crypto", not(feature = "ring-crypto")))]
-pub(crate) fn build_from_system_random() -> Result<MaskRng, EntropyUnavailable> {
-    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-    let mut seed_bytes = [0u8; 8];
-    SystemRandom::new()
-        .fill(&mut seed_bytes)
-        .map_err(|e| EntropyUnavailable(format!("system entropy source unavailable: {e:?}")))?;
-    Ok(MaskRng::from_seed(u64::from_ne_bytes(seed_bytes)))
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn next_key(&self) -> Result<[u8; 4], EntropyUnavailable> {
+        let mut key = [0u8; 4];
+        self.fill(&mut key)?;
+        Ok(key)
+    }
+
+    #[cfg(feature = "ring-crypto")]
+    pub(crate) fn fill(&self, buf: &mut [u8]) -> Result<(), EntropyUnavailable> {
+        use ring::rand::SecureRandom;
+        self.rng
+            .fill(buf)
+            .map_err(|e| EntropyUnavailable(format!("system entropy source unavailable: {e:?}")))
+    }
+
+    #[cfg(all(feature = "aws-lc-crypto", not(feature = "ring-crypto")))]
+    pub(crate) fn fill(&self, buf: &mut [u8]) -> Result<(), EntropyUnavailable> {
+        use aws_lc_rs::rand::SecureRandom;
+        self.rng
+            .fill(buf)
+            .map_err(|e| EntropyUnavailable(format!("system entropy source unavailable: {e:?}")))
+    }
 }
 
 /// XOR `buf` against the 4-byte mask key. `start_offset` is the position
@@ -286,36 +296,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xorshift_is_deterministic_for_same_seed() {
-        let mut a = MaskRng::from_seed(42);
-        let mut b = MaskRng::from_seed(42);
-        for _ in 0..1000 {
-            assert_eq!(a.next_key(), b.next_key());
+    fn mask_key_source_constructs() {
+        let _ = MaskKeySource::new().expect("system entropy must be available in tests");
+    }
+
+    #[test]
+    fn mask_keys_are_non_zero_in_aggregate() {
+        let rng = MaskKeySource::new().expect("system entropy");
+        let mut all_zero_streak = 0;
+        for _ in 0..10 {
+            if rng.next_key().expect("entropy draw") == [0; 4] {
+                all_zero_streak += 1;
+            }
         }
+        assert!(all_zero_streak < 10, "OS CSPRNG appears to be broken");
     }
 
     #[test]
-    fn xorshift_avoids_zero_seed_lockup() {
-        let mut rng = MaskRng::from_seed(0);
-        // First few keys must not all be the same — confirms we
-        // overrode the zero seed.
-        let k0 = rng.next_key();
-        let k1 = rng.next_key();
-        let k2 = rng.next_key();
-        assert!(k0 != k1 || k1 != k2);
-    }
-
-    #[test]
-    fn xorshift_does_not_repeat_quickly() {
-        // 10k consecutive keys should not contain a duplicate at typical
-        // mask-key cadence. Not a proof of uniformity — just a smoke
-        // check that we're not silently stuck.
-        let mut rng = MaskRng::from_seed(0xDEAD_BEEF);
+    fn mask_keys_are_independently_sampled() {
+        // 10k draws from a 32-bit space: birthday-paradox collision
+        // probability ~10^-3. Allow up to 5 collisions to avoid flakes;
+        // a stuck PRNG would still trip the assert.
+        let rng = MaskKeySource::new().expect("system entropy");
         let mut seen = std::collections::HashSet::new();
+        let mut collisions = 0;
         for _ in 0..10_000 {
-            let k = rng.next_key();
-            assert!(seen.insert(k), "duplicate mask key {k:?}");
+            if !seen.insert(rng.next_key().expect("entropy draw")) {
+                collisions += 1;
+            }
         }
+        assert!(collisions <= 5, "{collisions} duplicates in 10000");
     }
 
     #[test]

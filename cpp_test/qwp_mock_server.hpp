@@ -150,6 +150,22 @@ std::vector<uint8_t> result_batch_frame(
     int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
     size_t row_count, const std::vector<ColumnSpec>& columns);
 
+// `result_batch_frame` variant that ships a `FLAG_DELTA_SYMBOL_DICT` delta
+// section in the payload before the table block. `dict_delta_start` is the
+// conn-id of the first new entry — pass 0 on the first batch of a
+// connection (the client validates `delta_start == current dict size`).
+// Pair with `symbol_column_bytes` for any SYMBOL columns in `columns`.
+std::vector<uint8_t> result_batch_frame_with_dict(
+    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    size_t row_count, const std::vector<ColumnSpec>& columns,
+    uint64_t dict_delta_start,
+    const std::vector<std::string>& dict_entries);
+
+// SYMBOL column body for an all-non-null column: `[null_flag=0][varint code
+// per row]`. Pair with `result_batch_frame_with_dict` to also ship the
+// dictionary entries the codes index into.
+std::vector<uint8_t> symbol_column_bytes(const std::vector<uint32_t>& codes);
+
 // Build the per-column body for a fixed-width column where every row is
 // non-null. `elem_size` is bytes per row. `packed_values` must already
 // be `row_count × elem_size` bytes in little-endian wire order.

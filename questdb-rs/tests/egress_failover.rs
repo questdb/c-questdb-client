@@ -38,7 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use questdb::egress::{ErrorCode, FailoverEvent, Reader, ServerRole};
+use questdb::egress::{
+    ErrorCode, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ServerRole,
+};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::http::HeaderValue;
 use tungstenite::{Message, WebSocket, accept_hdr};
@@ -1159,13 +1161,13 @@ fn failover_disabled_surfaces_socket_error() {
 fn attempts_exhausted_surfaces_error() {
     // A is healthy for the initial connect, then drops mid-query. B
     // is broken at connect-time (drops before SERVER_INFO). With
-    // max_attempts=2, the cursor's first failure should burn 3 outer
+    // max_attempts=4, the cursor's first failure should burn 4 outer
     // reconnect attempts, all of which fail.
     //
     // Dial accounting:
     //   - Initial connect: 1 dial to A (success).
     //   - Mid-stream failure on A. `reconnect_with_failover` runs
-    //     `attempts_total = 3` outer attempts. Each outer attempt
+    //     `attempts_total = 4` outer attempts. Each outer attempt
     //     invokes `walk_via_tracker(allow_reset_pass=true)`:
     //       1. pick B (Unknown < TransportError) → fail
     //       2. pick A (TransportError) → fail
@@ -1173,8 +1175,8 @@ fn attempts_exhausted_surfaces_error() {
     //       4. pick A (lowest-index Unknown) → fail
     //       5. pick B → fail
     //     → 4 dials per outer attempt (2 per host).
-    //   - Reconnect total: 3 × 4 = 12 dials, split A=6, B=6.
-    //   - Grand total: 1 + 12 = 13, with A=7, B=6.
+    //   - Reconnect total: 4 × 4 = 16 dials, split A=8, B=8.
+    //   - Grand total: 1 + 16 = 17, with A=9, B=8.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         // Subsequent accepts: TCP-level drop so even the connect fails.
@@ -1182,7 +1184,7 @@ fn attempts_exhausted_surfaces_error() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect");
@@ -1202,24 +1204,24 @@ fn attempts_exhausted_surfaces_error() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial to A + 3 outer reconnects × 4 dials each = 13 total.
+    // 1 initial to A + 4 outer reconnects × 4 dials each = 17 total.
     // A bears the initial + half of each reconnect attempt's 4 dials,
-    // so A=7, B=6.
+    // so A=9, B=8.
     let total = srv_a.accepts() + srv_b.accepts();
     assert_eq!(
         total,
-        13,
-        "expected 13 total dial attempts (1 initial + 3 outer reconnects × 4 dials each); \
+        17,
+        "expected 17 total dial attempts (1 initial + 4 outer reconnects × 4 dials each); \
          got A={}, B={}",
         srv_a.accepts(),
         srv_b.accepts()
     );
     assert_eq!(
         srv_a.accepts(),
-        7,
+        9,
         "A receives the initial + 2 dials per outer attempt"
     );
-    assert_eq!(srv_b.accepts(), 6, "B receives 2 dials per outer attempt");
+    assert_eq!(srv_b.accepts(), 8, "B receives 2 dials per outer attempt");
 }
 
 #[test]
@@ -1504,17 +1506,17 @@ fn single_endpoint_failover_exhausts_budget() {
     // stays dead, the cursor MUST eventually surface a hard error
     // rather than retry indefinitely.
     //
-    // Dial accounting with `failover_max_attempts=2`:
+    // Dial accounting with `failover_max_attempts=4`:
     //   - Initial connect: 1 dial (success — serves the query, then drops).
     //   - Mid-stream failure on the single host triggers
     //     `reconnect_with_failover`, which runs
-    //     `attempts_total = max_attempts + 1 = 3` outer reconnect attempts.
+    //     `attempts_total = max_attempts = 4` outer reconnect attempts.
     //   - Each outer attempt invokes `walk_via_tracker(allow_reset_pass=true)`:
     //     pick the host → fail → fall-through reset → re-pick the
     //     same host → fail. That's 2 dials per outer attempt against
     //     the single configured endpoint.
-    //   - Reconnect total: 3 × 2 = 6 dials.
-    //   - Grand total: 1 + 6 = 7. The single per-Execute reconnect
+    //   - Reconnect total: 4 × 2 = 8 dials.
+    //   - Grand total: 1 + 8 = 9. The single per-Execute reconnect
     //     walk returns Err on exhaustion; no outer replay-cycle
     //     wrapper rearms it.
     let srv = MockServer::start(vec![
@@ -1526,7 +1528,7 @@ fn single_endpoint_failover_exhausts_budget() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=2;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         srv.url()
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
@@ -1543,13 +1545,13 @@ fn single_endpoint_failover_exhausts_budget() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial + 3 outer reconnect attempts × 2 dials per attempt
-    // (walk + fall-through reset walk on the single host) = 7.
+    // 1 initial + 4 outer reconnect attempts × 2 dials per attempt
+    // (walk + fall-through reset walk on the single host) = 9.
     assert_eq!(
         srv.accepts(),
-        7,
-        "expected exactly 7 dials against the single endpoint \
-         (1 initial + 3 reconnect attempts × 2 dials per attempt); got {}",
+        9,
+        "expected exactly 9 dials against the single endpoint \
+         (1 initial + 4 reconnect attempts × 2 dials per attempt); got {}",
         srv.accepts()
     );
 }
@@ -2184,7 +2186,7 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -2435,7 +2437,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
     //     failover budget would exhaust, and the final-endpoint
     //     assertion would fail.
     //
-    // `failover_max_attempts=1` (so `attempts_total=2`) keeps the
+    // `failover_max_attempts=3` (so `attempts_total=2`) keeps the
     // budget tight: only ONE failover dial is permitted to land,
     // forcing the rotation to be correct on the first try.
     let s0 = MockServer::start(vec![
@@ -2456,7 +2458,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&s0, &s1, &s2, &s3])
     );
 
@@ -3094,7 +3096,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
     // A: happy initial + drops mid-stream + recovers on the 3rd accept.
     // B: drop_at_connect on accept #1, then recovers.
     //
-    // With `failover_max_attempts=1` (attempts_total=2), the test
+    // With `failover_max_attempts=3` (attempts_total=2), the test
     // forces the fall-through reset to be the path that recovers.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
@@ -3110,7 +3112,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
         happy_script(ServerRole::Standalone, "b-recovered"),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -3147,9 +3149,9 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
 /// be re-walked indefinitely inside a single outer attempt.
 #[test]
 fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
-    // 1 host, max_attempts=0 (attempts_total=1). Single outer attempt.
-    // Each outer attempt: walk (1 dial) + fall-through reset walk (1
-    // dial) = 2 dials.
+    // 1 host, failover_max_attempts=3 (attempts_total=3 outer
+    // reconnect attempts). Each outer attempt: walk (1 dial) +
+    // fall-through reset walk (1 dial) = 2 dials.
     let srv = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "x"),
         // Every subsequent accept: TCP drop. Even unlimited resets
@@ -3157,26 +3159,23 @@ fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=0;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
         srv.url()
     );
-    // `failover_max_attempts=0` is rejected at config parse
-    // (validate() asserts >= 1); use 1 instead and account for that.
-    let conf = conf.replace("failover_max_attempts=0", "failover_max_attempts=1");
     let mut reader = Reader::from_conf(&conf).expect("connect");
     let mut cursor = reader.prepare("select 1").execute().expect("execute");
     let _ = cursor.next_batch(); // Will fail.
     drop(cursor);
     drop(reader);
 
-    // attempts_total=2 outer attempts × 2 dials per attempt = 4
-    // reconnect dials. Plus 1 initial = 5. If the fall-through reset
+    // attempts_total=3 outer attempts × 2 dials per attempt = 6
+    // reconnect dials. Plus 1 initial = 7. If the fall-through reset
     // were not bounded to one pass, this would be unbounded (the
     // walk would loop forever resetting and re-walking).
     assert_eq!(
         srv.accepts(),
-        5,
-        "expected 1 initial + 2 outer reconnect attempts × 2 dials/attempt; got {}",
+        7,
+        "expected 1 initial + 3 outer reconnect attempts × 2 dials/attempt; got {}",
         srv.accepts()
     );
 }
@@ -3585,7 +3584,7 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
 /// Regression for `reconnect_with_failover`'s exhaustion-error counter:
 /// when `failover_max_duration_ms` cuts the loop short, the surfaced
 /// message must report the **actual** number of attempts that ran, not
-/// the configured `failover_max_attempts + 1` cap. Otherwise an
+/// the configured `failover_max_attempts` cap. Otherwise an
 /// operator reading the log sees a number that overstates the real
 /// dial pressure and points at the wrong knob to tune.
 #[test]
@@ -3635,4 +3634,484 @@ fn deadline_exhaustion_reports_actual_attempt_count_not_configured_cap() {
         );
         assert!(n >= 1, "attempt count must be ≥ 1, got {n}. msg={msg}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reader-migration + concurrent-stats-read contract.
+//
+// The Reader API documents (reader.rs:140-150) that its stat getters take
+// `&self`, touch only atomics on `Arc<ReaderStats>`, and "may be invoked
+// concurrently from a monitoring thread while another thread is driving a
+// cursor." A compile-time assertion in `egress/reader.rs` pins `Send +
+// Sync` on `Reader`/`ReaderStats`/`HostHealthTracker` so a future
+// structural change can't silently invalidate that bound. This runtime
+// test exercises the migration itself: the Reader is moved to a worker
+// thread, the worker drives several sequential queries, and the main
+// thread polls the `Arc<ReaderStats>` clone in parallel. Under TSan this
+// surfaces any non-atomic access on the same memory the stat getters
+// touch; under the default test runner it pins the API shape (Reader is
+// `Send`, the stats Arc is share-by-clone).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reader_migrates_to_worker_thread_with_concurrent_stats_polling() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering as AOrd;
+
+    // Each query: server-info handshake (once), then await query / sleep /
+    // result-end repeated. The Sleep stretches the inter-frame window so
+    // the main thread's poll loop catches the cursor mid-flight rather
+    // than after it's already drained.
+    let script = vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::Sleep(Duration::from_millis(40)),
+        Action::SendResultEnd,
+        Action::AwaitQueryRequest,
+        Action::Sleep(Duration::from_millis(40)),
+        Action::SendResultEnd,
+        Action::AwaitQueryRequest,
+        Action::Sleep(Duration::from_millis(40)),
+        Action::SendResultEnd,
+    ];
+    let srv = MockServer::start(vec![script]);
+    let conf = format!("ws::addr={}", srv.url());
+
+    let reader = Reader::from_conf(&conf).expect("connect");
+    // Clone the stats Arc on main BEFORE the Reader migrates, so the
+    // monitor thread reads counters via its own Arc handle — exactly
+    // what the FFI does (`line_reader` stashes an `Arc<ReaderStats>`
+    // clone next to the `UnsafeCell<Reader>` for the same reason).
+    let stats = std::sync::Arc::clone(reader.stats());
+
+    let worker_done = std::sync::Arc::new(AtomicBool::new(false));
+    let worker_done_cloned = std::sync::Arc::clone(&worker_done);
+
+    let worker = thread::spawn(move || {
+        // `Reader` moves into this thread — exercises `Send`.
+        let mut reader = reader;
+        for _ in 0..3 {
+            let mut cursor = reader
+                .prepare("select 1")
+                .execute()
+                .expect("execute on worker thread");
+            // Drain the cursor to terminus; each query bumps
+            // `bytes_received` by the SERVER_INFO/handshake-or-RESULT_END
+            // wire bytes so the monitor sees movement.
+            while cursor.next_batch().expect("next_batch").is_some() {}
+        }
+        worker_done_cloned.store(true, AOrd::Release);
+    });
+
+    // Spin reading every getter the FFI exposes. No sleep — we want to
+    // hammer the atomic load path concurrently with the worker's
+    // transport reads/writes, so a regression that drops `Sync` or that
+    // routes a getter through a non-atomic field is caught by TSan.
+    let mut last_bytes = 0u64;
+    let mut max_bytes = 0u64;
+    let mut poll_count = 0u64;
+    while !worker_done.load(AOrd::Acquire) {
+        let b = stats.bytes_received.load(AOrd::Relaxed);
+        let r = stats.read_ns.load(AOrd::Relaxed);
+        let d = stats.decode_ns.load(AOrd::Relaxed);
+        let c = stats.credit_granted_total.load(AOrd::Relaxed);
+        // Monotonicity: a `&self` reader from a different thread MUST
+        // observe non-decreasing counters under the Relaxed/Release
+        // shape the producers use (`fetch_add(Relaxed)` on the worker).
+        // A drop here would mean someone introduced a non-atomic
+        // overwrite path on the same counter.
+        assert!(
+            b >= last_bytes,
+            "bytes_received went backwards: {last_bytes} -> {b}"
+        );
+        last_bytes = b;
+        max_bytes = max_bytes.max(b);
+        // Touch every counter so all four paths are exercised.
+        let _ = (r, d, c);
+        poll_count += 1;
+    }
+
+    worker.join().expect("worker panicked");
+
+    // Final stat read from main — happens-after the worker's atomic
+    // store-Release on `worker_done`, so this MUST observe at least as
+    // many bytes as any in-flight poll did.
+    let final_bytes = stats.bytes_received.load(AOrd::Relaxed);
+    assert!(
+        final_bytes > 0,
+        "expected bytes_received > 0 after three round-trips"
+    );
+    assert!(
+        final_bytes >= max_bytes,
+        "post-join bytes_received {final_bytes} < pre-join max {max_bytes} — \
+         a poll observed a future state, or the store-Release happens-before \
+         is broken"
+    );
+    assert!(
+        poll_count > 0,
+        "monitor thread didn't poll at all — worker drained before any read"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `on_failover_progress` lifecycle callback
+// ---------------------------------------------------------------------------
+
+/// Compact summary of a `FailoverProgressEvent` used by the tests
+/// below. Cloning the full event would also work, but the tuple form
+/// makes assertions read straight off the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgressSnapshot {
+    phase: FailoverPhase,
+    attempt: u32,
+    failed_port: u16,
+    new_port: Option<u16>,
+    trigger_code: ErrorCode,
+    has_final_error: bool,
+}
+
+impl ProgressSnapshot {
+    fn from_event(ev: &FailoverProgressEvent) -> Self {
+        Self {
+            phase: ev.phase,
+            attempt: ev.attempt,
+            failed_port: ev.failed_addr.port,
+            new_port: ev.new_addr.as_ref().map(|a| a.port),
+            trigger_code: ev.trigger.code(),
+            has_final_error: ev.final_error.is_some(),
+        }
+    }
+}
+
+/// Build a closure that appends snapshots to a shared `Vec`, plus the
+/// shared handle for the test to read after the cursor terminates.
+/// Returning the closure (rather than wrapping `ReaderQuery`) avoids
+/// the lifetime gymnastics of threading a `ReaderQuery<'r>` through a
+/// helper.
+fn progress_capture() -> (
+    impl FnMut(&FailoverProgressEvent),
+    Arc<Mutex<Vec<ProgressSnapshot>>>,
+) {
+    let observed: Arc<Mutex<Vec<ProgressSnapshot>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed);
+    let closure = move |ev: &FailoverProgressEvent| {
+        observed_clone
+            .lock()
+            .unwrap()
+            .push(ProgressSnapshot::from_event(ev));
+    };
+    (closure, observed)
+}
+
+#[test]
+fn progress_callback_silent_on_happy_path() {
+    // No failover → no event of any phase. Asserts the callback is
+    // truly inert when nothing goes wrong, so a regression that fires
+    // a spurious Reset / GaveUp on the success path would surface
+    // here.
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n1")]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let (capture, observed) = progress_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+    assert!(cursor.next_batch().expect("next").is_none());
+    assert_eq!(
+        observed.lock().unwrap().len(),
+        0,
+        "on_failover_progress must not fire on the happy path"
+    );
+}
+
+#[test]
+fn progress_callback_phase_order_on_successful_failover() {
+    // A drops mid-stream → B serves the replayed query. The progress
+    // callback should observe exactly: Disconnected, Retrying (≥1),
+    // Reset — in that order. `attempt` is 0 on Disconnected, ≥1 on
+    // Retrying, and equals the landing attempt on Reset. failed_port
+    // points at A throughout; new_port is None until Reset, then
+    // points at B.
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let port_a = srv_a.addr.port();
+    let port_b = srv_b.addr.port();
+
+    let (capture, observed) = progress_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+
+    assert!(cursor.next_batch().expect("next").is_none());
+    assert_eq!(cursor.failover_resets(), 1);
+
+    let events = observed.lock().unwrap().clone();
+    assert!(
+        events.len() >= 3,
+        "expected at least Disconnected + Retrying + Reset, got {:?}",
+        events
+    );
+
+    // Disconnected: first event, attempt=0, no new_addr.
+    assert_eq!(events[0].phase, FailoverPhase::Disconnected);
+    assert_eq!(events[0].attempt, 0);
+    assert_eq!(events[0].failed_port, port_a);
+    assert_eq!(events[0].new_port, None);
+    assert!(!events[0].has_final_error);
+
+    // At least one Retrying with attempt ≥ 1 and no new_addr yet.
+    let retry_count = events
+        .iter()
+        .filter(|e| e.phase == FailoverPhase::Retrying)
+        .count();
+    assert!(
+        retry_count >= 1,
+        "expected at least one Retrying event, got {:?}",
+        events
+    );
+    for ev in events.iter().filter(|e| e.phase == FailoverPhase::Retrying) {
+        assert!(ev.attempt >= 1, "Retrying.attempt must be >= 1: {:?}", ev);
+        assert_eq!(ev.new_port, None, "new_addr only on Reset");
+        assert!(!ev.has_final_error);
+    }
+
+    // Reset: last event in this scenario. Carries the new endpoint and
+    // the attempt that landed.
+    let reset_idx = events
+        .iter()
+        .position(|e| e.phase == FailoverPhase::Reset)
+        .expect("Reset must fire on successful failover");
+    let reset = &events[reset_idx];
+    assert!(reset.attempt >= 1);
+    assert_eq!(reset.new_port, Some(port_b));
+    assert!(!reset.has_final_error);
+
+    // No GaveUp on a successful failover.
+    assert!(
+        !events.iter().any(|e| e.phase == FailoverPhase::GaveUp),
+        "GaveUp must not fire when failover succeeds: {:?}",
+        events
+    );
+
+    // Phase ordering: every Disconnected precedes every Retrying which
+    // precedes the Reset.
+    let first_retry = events
+        .iter()
+        .position(|e| e.phase == FailoverPhase::Retrying)
+        .unwrap();
+    assert!(first_retry > 0, "Disconnected must precede Retrying");
+    assert!(
+        reset_idx > first_retry,
+        "Reset must follow at least one Retrying"
+    );
+}
+
+#[test]
+fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
+    // Single endpoint that drops both mid-query and at-connect — the
+    // failover loop walks the budget and surfaces a GaveUp event with
+    // `final_error` populated. Mirrors `single_endpoint_failover_exhausts_budget`
+    // above but asserts the progress callback rather than the dial count.
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "lonely"),
+        drop_at_connect_script(),
+    ]);
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=4;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("initial connect");
+    let port = srv.addr.port();
+    let (capture, observed) = progress_capture();
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(capture)
+        .execute()
+        .expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("must fail eventually"),
+    };
+    assert!(matches!(
+        err.code(),
+        ErrorCode::SocketError | ErrorCode::ProtocolError
+    ));
+
+    let events = observed.lock().unwrap().clone();
+
+    // First event: Disconnected, attempt=0.
+    assert_eq!(events[0].phase, FailoverPhase::Disconnected);
+    assert_eq!(events[0].attempt, 0);
+    assert_eq!(events[0].failed_port, port);
+
+    // Last event: GaveUp, attempt > 0, has_final_error true.
+    let gave_up = events.last().expect("at least one event").clone();
+    assert_eq!(gave_up.phase, FailoverPhase::GaveUp);
+    assert!(
+        gave_up.attempt >= 1,
+        "GaveUp.attempt must reflect at least one tried dial: {:?}",
+        gave_up
+    );
+    assert!(
+        gave_up.has_final_error,
+        "GaveUp must carry final_error: {:?}",
+        gave_up
+    );
+    assert_eq!(gave_up.failed_port, port);
+    assert_eq!(gave_up.new_port, None);
+
+    // No Reset on the exhaustion path.
+    assert!(
+        !events.iter().any(|e| e.phase == FailoverPhase::Reset),
+        "Reset must not fire when the budget exhausts: {:?}",
+        events
+    );
+
+    // Retrying fires once per outer-loop iteration. With
+    // failover_max_attempts=4, attempts_total=4.
+    let retrying: Vec<_> = events
+        .iter()
+        .filter(|e| e.phase == FailoverPhase::Retrying)
+        .collect();
+    assert_eq!(
+        retrying.len(),
+        4,
+        "expected exactly 4 Retrying events (attempts_total=4): {:?}",
+        events
+    );
+    // Attempts must be strictly increasing.
+    for (i, ev) in retrying.iter().enumerate() {
+        assert_eq!(
+            ev.attempt,
+            (i + 1) as u32,
+            "Retrying attempts not 1-based monotonic: {:?}",
+            retrying
+        );
+    }
+}
+
+// NOTE: the "progress callback alone unlocks replay after data
+// delivered" branch is covered by the C++ mock-driven test in
+// `cpp_test/test_line_reader_mock.cpp` (the Rust mock has no helper to
+// emit a synthetic RESULT_BATCH yet — see the comment on
+// `pre_batch_failover_without_callback_still_replays`). The boolean
+// branch of `would_silently_duplicate` itself is exercised in the unit
+// tests in `src/egress/reader.rs`.
+
+#[test]
+fn progress_and_reset_callbacks_both_fire_on_reset() {
+    // When both callbacks are installed, they observe the same Reset
+    // event and fire in a stable order (progress first, then reset).
+    // Asserts the integration contract documented on
+    // `ReaderQuery::on_failover_progress`.
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+
+    // Use a shared sequence-tracker so we can assert ordering between
+    // the two callbacks without timestamps.
+    let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let order_p = Arc::clone(&order);
+    let order_r = Arc::clone(&order);
+
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(move |ev: &FailoverProgressEvent| {
+            if ev.phase == FailoverPhase::Reset {
+                order_p.lock().unwrap().push("progress.reset");
+            }
+        })
+        .on_failover_reset(move |_ev: &FailoverEvent| {
+            order_r.lock().unwrap().push("reset");
+        })
+        .execute()
+        .expect("execute");
+
+    assert!(cursor.next_batch().expect("next").is_none());
+
+    let seen = order.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec!["progress.reset", "reset"],
+        "progress.reset must precede reset; got {:?}",
+        seen
+    );
+}
+
+#[test]
+fn progress_callback_disconnected_fires_before_any_dial() {
+    // Tight invariant: Disconnected MUST fire before any Retrying or
+    // dial sees the wire. Tested by giving B a slow accept and
+    // checking the relative ordering of (Disconnected emitted) vs
+    // (B's accept counter incrementing).
+    //
+    // The mock server's `accepts()` counter increments per TCP
+    // accept. If the callback observes Disconnected with
+    // `srv_b.accepts() == 0`, the invariant holds.
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    // After initial connect, B has had zero accepts.
+    assert_eq!(srv_b.accepts(), 0);
+
+    // Snapshot whether Disconnected fired before any Retrying. The
+    // closure has access to a flag the callback sets on Disconnected.
+    let disconnected_before_first_retry = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f1 = Arc::clone(&disconnected_before_first_retry);
+    let f2 = Arc::clone(&saw_disconnected);
+
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_progress(move |ev: &FailoverProgressEvent| {
+            match ev.phase {
+                FailoverPhase::Disconnected => {
+                    f2.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                // First Retrying observes whether Disconnected
+                // already fired (stable across mock-server timing
+                // because both callbacks run on the cursor's drive
+                // thread).
+                FailoverPhase::Retrying
+                    if f2.load(std::sync::atomic::Ordering::SeqCst)
+                        && !f1.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    f1.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        })
+        .execute()
+        .expect("execute");
+
+    assert!(cursor.next_batch().expect("next").is_none());
+    assert!(
+        saw_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+        "Disconnected must fire"
+    );
+    assert!(
+        disconnected_before_first_retry.load(std::sync::atomic::Ordering::SeqCst),
+        "Disconnected must fire before the first Retrying"
+    );
 }

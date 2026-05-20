@@ -426,9 +426,11 @@ pub struct ReaderConfig {
     /// the parser (so configs aren't rejected on a partial enable/disable
     /// flip) but have no effect — transport failures surface immediately.
     pub failover: bool,
-    /// Number of retry attempts after a transport failure (default `8`).
-    /// Total of `1 + failover_max_attempts` connect attempts before the
-    /// failure is propagated. Must be `>= 1`. Ignored when
+    /// Cap on the number of mid-stream reconnect rounds after a
+    /// transport failure (default `8`). The initial connect is counted
+    /// separately; the total connect rounds before a failure is
+    /// propagated is `1` initial connect plus `failover_max_attempts`
+    /// reconnect rounds. Must be `>= 1`. Ignored when
     /// [`failover`](Self::failover) is `false`.
     pub failover_max_attempts: u32,
     /// Initial backoff between failover attempts, in milliseconds.
@@ -519,6 +521,7 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "request_min_throughput",
     "request_timeout",
     "retry_timeout",
+    "retry_max_backoff_millis",
     // Generic auth timeout (Duration in millis; distinct from the
     // shared `auth_timeout_ms` which is QWP-WS-specific on ingress).
     "auth_timeout",
@@ -943,7 +946,7 @@ impl ReaderConfig {
         if !tls && (tls_roots.is_some() || tls_ca_explicit || tls_roots_password.is_some()) {
             return Err(fmt!(
                 ConfigError,
-                "TLS-related keys require the \"qwps\" scheme"
+                "TLS-related keys require the \"wss\" scheme"
             ));
         }
 

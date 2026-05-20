@@ -40,11 +40,12 @@
 //!   pulling in `ring` / `aws-lc-rs` on every code path that touches WS.
 //! - [`frame`]: `Opcode`, `FrameHeader::parse`, `encode_client_frame`,
 //!   `FrameError`, and the RFC 6455 frame-header bit constants.
-//! - [`mask`]: `apply_mask` (in-place XOR with phase tracking) plus the
-//!   per-connection xorshift PRNG `MaskRng`. The mask key is not used for
-//!   confidentiality — RFC 6455 §10.3 mandates unpredictability only to
-//!   defeat intermediary cache-poisoning attacks — so xorshift seeded
-//!   from `SystemRandom` is exactly what the spec asks for.
+//! - [`mask`]: `apply_mask` (in-place XOR with phase tracking) plus
+//!   `MaskKeySource`, a per-connection wrapper around the crypto
+//!   provider's `SystemRandom` that draws a fresh 4-byte mask key on
+//!   every outbound frame. RFC 6455 §10.3 forbids per-frame mask-key
+//!   predictability; we satisfy that by sampling directly from the OS
+//!   CSPRNG per frame rather than via a seeded user-space PRNG.
 //! - [`handshake`]: `upgrade`, `Headers`, `Handshake`, `HandshakeError`,
 //!   `HttpReject`. The HTTP/1.1 GET + 101 dance, including slow-loris
 //!   defence on the response prefix read.
@@ -63,8 +64,8 @@
 
 // Both crypto provider feature gates are checked here once, at the
 // shared module level, so neither ingress nor egress has to repeat the
-// check at their own callsite. `MaskRng::build_from_system_random` is
-// the only API in this module that needs the crypto provider; everything
+// check at their own callsite. `MaskKeySource::new` and `.fill` are
+// the only APIs in this module that need the crypto provider; everything
 // else (SHA-1, frame parser, HTTP parser) is implemented inline and
 // works under any feature combination.
 #[cfg(not(any(feature = "ring-crypto", feature = "aws-lc-crypto")))]

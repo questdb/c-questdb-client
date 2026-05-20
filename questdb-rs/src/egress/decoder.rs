@@ -654,6 +654,11 @@ fn decode_column(
 /// per row, which already exceeds the per-batch wire cap.
 const MAX_ARRAY_ELEMENTS_PER_ROW: u64 = 16 * 1024 * 1024;
 
+/// Maximum rank we accept for a single array row. Matches the QuestDB
+/// engine cap; rejects malformed `nDims` early instead of letting a
+/// hostile server force the decoder into a long per-row loop.
+const MAX_ARRAY_DIMS: usize = 32;
+
 /// DOUBLE_ARRAY / LONG_ARRAY column body (after validity).
 ///
 /// Per non-null row: `1B nDims` + `nDims × u32_le dim_lens` + `prod(dims) × 8 LE element bytes`.
@@ -683,6 +688,12 @@ fn decode_array(r: &mut ByteReader<'_>, parent: &Bytes, row_count: usize) -> Res
                 ProtocolError,
                 "array row {} has nDims=0 (must be >= 1)",
                 row
+            ));
+        }
+        if n_dims > MAX_ARRAY_DIMS {
+            return Err(fmt!(
+                ProtocolError,
+                "array row {row} has nDims={n_dims}; max {MAX_ARRAY_DIMS}"
             ));
         }
 
@@ -794,7 +805,12 @@ fn decode_decimal_wide(
         8 => &null_sentinel::I64_LE,
         16 => &null_sentinel::UUID_LE,
         32 => &null_sentinel::LONG256_LE,
-        _ => unreachable!("DECIMAL width must be 8, 16, or 32"),
+        other => {
+            return Err(fmt!(
+                ProtocolError,
+                "DECIMAL width must be 8/16/32, got {other}"
+            ));
+        }
     };
     let buffer = densify_fixed(r, parent, row_count, width, validity, Some(sentinel))?;
     Ok((scale, buffer))
@@ -899,6 +915,11 @@ fn allocate_dense_with_sentinel(
     elem_size: usize,
     sentinel: Option<&[u8]>,
 ) -> Vec<u8> {
+    debug_assert_eq!(
+        dense_len % elem_size,
+        0,
+        "dense_len {dense_len} not a multiple of elem_size {elem_size}"
+    );
     match sentinel {
         Some(s) if s.iter().any(|&b| b != 0) => {
             let mut dense = vec![0u8; dense_len];
@@ -1231,12 +1252,17 @@ fn decode_gorilla_temporal(
         let v = if filled < seed_count {
             seeds[filled]
         } else {
-            // `non_null > seed_count` here implies `non_null >= 3`,
-            // so `decoder` was built above.
-            decoder
-                .as_mut()
-                .expect("Gorilla decoder is Some when non_null > seed_count")
-                .decode_next()?
+            // `non_null > seed_count` here implies `non_null >= 3`, so
+            // `decoder` was built above. Return an error instead of
+            // `expect` so a future refactor that violates the invariant
+            // surfaces cleanly instead of aborting.
+            let dec = decoder.as_mut().ok_or_else(|| {
+                fmt!(
+                    ProtocolError,
+                    "Gorilla decoder state: non_null={non_null}, seed_count={seed_count}, filled={filled}"
+                )
+            })?;
+            dec.decode_next()?
         };
         dense[row * 8..row * 8 + 8].copy_from_slice(&v.to_le_bytes());
         filled += 1;
@@ -1403,7 +1429,14 @@ fn decode_codes_no_nulls(
             active_dict_size
         )
     })?;
-    if let Some((row, &bad)) = codes.iter().enumerate().find(|&(_, &c)| c >= dict_size_u32) {
+    // `any` lowers to a SIMD lane compare; `find` does not (the
+    // first-true short-circuit forbids horizontal reduction).
+    if codes.iter().any(|&c| c >= dict_size_u32) {
+        let (row, &bad) = codes
+            .iter()
+            .enumerate()
+            .find(|&(_, &c)| c >= dict_size_u32)
+            .expect("any() reported a match");
         return Err(fmt!(
             ProtocolError,
             "symbol id {} at row {} out of range (dict size {})",

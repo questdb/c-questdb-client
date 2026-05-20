@@ -386,6 +386,55 @@ std::vector<uint8_t> result_batch_frame(
     return framed(2, 0, 1, p);
 }
 
+std::vector<uint8_t> result_batch_frame_with_dict(
+    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    size_t row_count, const std::vector<ColumnSpec>& columns,
+    uint64_t dict_delta_start,
+    const std::vector<std::string>& dict_entries)
+{
+    std::vector<uint8_t> p;
+    p.push_back(MSG_RESULT_BATCH);
+    for (int i = 0; i < 8; ++i)
+        p.push_back(uint8_t(request_id >> (i * 8)));
+    encode_varint_u64(batch_seq, p);
+
+    // Delta symbol-dict section (FLAG_DELTA_SYMBOL_DICT in the header).
+    encode_varint_u64(dict_delta_start, p);
+    encode_varint_u64(uint64_t(dict_entries.size()), p);
+    for (const auto& s : dict_entries)
+    {
+        encode_varint_u64(uint64_t(s.size()), p);
+        p.insert(p.end(), s.begin(), s.end());
+    }
+
+    encode_varint_u64(0, p); // empty table name
+    encode_varint_u64(uint64_t(row_count), p);
+    encode_varint_u64(uint64_t(columns.size()), p);
+
+    p.push_back(0x00); // Schema: full mode
+    encode_varint_u64(schema_id, p);
+    for (const auto& c : columns)
+    {
+        encode_varint_u64(uint64_t(c.name.size()), p);
+        p.insert(p.end(), c.name.begin(), c.name.end());
+        p.push_back(c.kind);
+    }
+    for (const auto& c : columns)
+        p.insert(p.end(), c.data.begin(), c.data.end());
+
+    // flags = FLAG_DELTA_SYMBOL_DICT (0x08); table_count = 1.
+    return framed(2, 0x08, 1, p);
+}
+
+std::vector<uint8_t> symbol_column_bytes(const std::vector<uint32_t>& codes)
+{
+    std::vector<uint8_t> out;
+    out.push_back(0x00); // null_flag = no validity (all rows non-null)
+    for (uint32_t code : codes)
+        encode_varint_u64(uint64_t(code), out);
+    return out;
+}
+
 std::vector<uint8_t> fixed_column_bytes(
     size_t row_count, const std::vector<uint8_t>& packed_values)
 {

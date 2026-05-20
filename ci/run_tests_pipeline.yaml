@@ -122,8 +122,29 @@ stages:
           - script: |
               cd system_test
               cd failover_clients
-              cargo clippy --all-targets --all-features -- -D warnings
+              cargo clippy --all-targets --all-features
             displayName: "failover_clients: clippy"
+      - job: SanitizeCppTests
+        displayName: "C/C++ tests under ASan + UBSan"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: |
+              cmake -S . -B build_sanitize \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DQUESTDB_TESTS_AND_EXAMPLES=ON \
+                -DQUESTDB_SANITIZE=ON
+            displayName: "Configure (ASan + UBSan)"
+          - script: cmake --build build_sanitize --config Release
+            displayName: "Build"
+          - script: ctest --output-on-failure -E rust_tests
+            workingDirectory: build_sanitize
+            displayName: "ctest under ASan + UBSan"
       # Runs the full system_test/test.py against a fresh build of
       # QuestDB master. Moved off Microsoft-hosted ubuntu-latest because
       # the QWP/WS fuzz portion of the run filled the agent disk ("No
@@ -467,3 +488,145 @@ stages:
                 --test egress_pipelined \
                 -- --nocapture
             displayName: "QWP egress live-server fuzz + pipelined"
+
+      # Cross-repo trigger: fire the questdb-enterprise
+      # build-and-test-e2e-c-client pipeline with this build's SHA so
+      # the c_client-marked failover tests (Rust today; C / C++ as
+      # those sidecars land) run against an Enterprise primary. The
+      # Enterprise pipeline posts a status check back on the PR
+      # (`enterprise-e2e-c-client` context); this job fire-and-forgets
+      # and does not block the PR.
+      #
+      # Fork PRs are intentionally skipped: System.AccessToken is not
+      # exposed to fork builds, so the dispatch call would fail with
+      # 401. We'd rather skip silently than spam fork PRs with
+      # spurious red checks.
+      #
+      # Prerequisites the questdb infra team needs to have configured
+      # (one-time, in the Azure DevOps UI):
+      #   1. Register ci/build-and-test-e2e-c-client.yaml in the
+      #      `questdb-enterprise` ADO project as a pipeline. Name must
+      #      match `enterprisePipelineName` below.
+      #   2. Create a PAT in the `questdb-enterprise` ADO project
+      #      with `Build (Read & execute)` scope (User settings →
+      #      Personal access tokens → New). Add it as a secret
+      #      variable on THIS pipeline named ENT_DISPATCH_PAT
+      #      (Pipelines → questdb.c-questdb-client → Edit →
+      #      Variables → +, mark as secret). PAT-based auth is used
+      #      rather than $(System.AccessToken) because the two
+      #      pipelines live in different ADO projects, and tokens
+      #      issued for this project can't see the Enterprise
+      #      project's pipelines API without it.
+      - job: TriggerEnterpriseCClientE2E
+        displayName: "Trigger questdb-enterprise c_client e2e"
+        # Use the hetzner-incus self-hosted pool: the Microsoft-hosted
+        # queue is consistently deeper than incus, and this is a
+        # ~10-second curl+jq job so it picks up a slot quickly here.
+        # The hetzner image already ships curl + jq (the Enterprise
+        # ReportToOssPr stage uses both).
+        pool:
+          name: hetzner-incus
+        # Skip on fork PRs: secret pipeline variables (and System
+        # tokens) are not exposed to fork builds, so the REST POST
+        # would 401. Skipping rather than failing keeps fork-PR CI
+        # clean.
+        condition: and(succeeded(), ne(variables['System.PullRequest.IsFork'], 'True'))
+        variables:
+          # Hardcoded because the Enterprise pipeline lives in its own
+          # ADO project, not the one this pipeline runs in.
+          enterpriseProject: 'questdb-enterprise'
+          enterprisePipelineName: 'build-and-test-e2e-c-client'
+        steps:
+          - checkout: none
+          - bash: |
+              set -euo pipefail
+
+              ORG_URL="$(System.TeamFoundationCollectionUri)"
+              PROJECT="$(enterpriseProject)"
+              PIPELINE_NAME="$(enterprisePipelineName)"
+
+              if [ -z "${ENT_DISPATCH_PAT:-}" ]; then
+                echo "ERROR: ENT_DISPATCH_PAT secret pipeline variable is not set." >&2
+                echo "Create a PAT in the questdb-enterprise ADO project with" >&2
+                echo "'Build (Read & execute)' scope and add it as a secret" >&2
+                echo "variable named ENT_DISPATCH_PAT on this pipeline." >&2
+                exit 1
+              fi
+
+              # Resolve pipeline ID by name. The pipelines list API
+              # returns every pipeline in the project; we filter
+              # client-side because the $filter query parameter on
+              # this endpoint is limited.
+              echo "Looking up '${PIPELINE_NAME}' in '${PROJECT}'..."
+              PIPELINES=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
+                "${ORG_URL}${PROJECT}/_apis/pipelines?api-version=7.0")
+              PIPELINE_ID=$(echo "$PIPELINES" | jq -r --arg n "$PIPELINE_NAME" \
+                '.value[] | select(.name == $n) | .id' | head -1)
+
+              if [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" = "null" ]; then
+                echo "ERROR: pipeline '${PIPELINE_NAME}' not found in project '${PROJECT}'." >&2
+                echo "Register ci/build-and-test-e2e-c-client.yaml in" >&2
+                echo "the Azure DevOps UI under that name to enable the" >&2
+                echo "cross-repo c_client e2e check." >&2
+                exit 1
+              fi
+
+              CLIENT_PR_NUMBER="$(System.PullRequest.PullRequestNumber)"
+              if [ -z "${CLIENT_PR_NUMBER}" ] || [ "${CLIENT_PR_NUMBER}" = "None" ]; then
+                # Branch builds (e.g. nightly on main) still benefit
+                # from the cross-repo check, but there's no PR number
+                # to attach a status to. The Enterprise pipeline's
+                # report stage skips the GitHub-status POST when
+                # cClientPrNumber is empty.
+                CLIENT_PR_NUMBER=""
+              fi
+
+              # Forward the client branch name as a hint for the
+              # Enterprise side to try a same-name branch match
+              # (xyz → xyz, fallback to main). For a PR build,
+              # System.PullRequest.SourceBranch is `refs/heads/xyz`;
+              # for a direct branch build the branch name is in
+              # Build.SourceBranchName already. Strip refs/heads/ so
+              # the Enterprise step can use it directly as a git ref.
+              if [ "$(Build.Reason)" = "PullRequest" ]; then
+                CLIENT_BRANCH="$(System.PullRequest.SourceBranch)"
+                CLIENT_BRANCH="${CLIENT_BRANCH#refs/heads/}"
+              else
+                CLIENT_BRANCH="$(Build.SourceBranchName)"
+              fi
+              echo "Client branch hint: ${CLIENT_BRANCH}"
+
+              # `templateParameters` matches the `parameters:` block
+              # in build-and-test-e2e-c-client.yaml.
+              BODY=$(jq -n \
+                --arg commit "$(Build.SourceVersion)" \
+                --arg pr "${CLIENT_PR_NUMBER}" \
+                --arg branch "${CLIENT_BRANCH}" \
+                '{
+                  templateParameters: {
+                    cClientCommit: $commit,
+                    cClientPrNumber: $pr,
+                    clientBranch: $branch
+                  },
+                  resources: { repositories: { self: { refName: "refs/heads/main" } } }
+                }')
+
+              echo "POSTing pipeline run with body:"
+              echo "$BODY" | jq .
+
+              RESPONSE=$(curl -fsS -u ":${ENT_DISPATCH_PAT}" \
+                -H "Content-Type: application/json" \
+                -X POST \
+                -d "$BODY" \
+                "${ORG_URL}${PROJECT}/_apis/pipelines/${PIPELINE_ID}/runs?api-version=7.0")
+
+              RUN_URL=$(echo "$RESPONSE" | jq -r '._links.web.href // ""')
+              echo "Enterprise build queued: ${RUN_URL}"
+            displayName: "Queue enterprise c_client e2e"
+            env:
+              # The PAT is a secret pipeline variable that must be set
+              # on this pipeline in the ADO UI (Variables → +, name
+              # ENT_DISPATCH_PAT, mark as secret). Secret variables
+              # aren't auto-exposed to script env; the explicit
+              # `env:` mapping below is required.
+              ENT_DISPATCH_PAT: $(ENT_DISPATCH_PAT)

@@ -25,7 +25,7 @@
 use super::*;
 use crate::ErrorCode;
 
-#[cfg(feature = "sync-sender-tcp")]
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-qwp-ws"))]
 use tempfile::TempDir;
 
 #[cfg(feature = "sync-sender-http")]
@@ -450,18 +450,17 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
     )
     .unwrap();
-    for (conf, expected) in [
-        (
-            "qwpws::addr=localhost:9000;max_schemas_per_connection=1024;",
-            "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
-        ),
-        (
-            "qwpws::addr=localhost:9000;error_inbox_capacity=64;",
-            "\"error_inbox_capacity\" is not supported by the Rust QWP/WebSocket sync sender yet; Java-style async error inbox configuration is not implemented.",
-        ),
-    ] {
-        assert_conf_err(SenderBuilder::from_conf(conf), expected);
-    }
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_schemas_per_connection=1024;"),
+        "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
+    );
+
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=16;").unwrap();
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=15;"),
+        "error_inbox_capacity must be >= 16: 15",
+    );
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]
@@ -1216,6 +1215,42 @@ fn http_retry_timeout() {
     assert_defaulted_eq(&http_config.request_min_throughput, 102400u64);
     assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(10000));
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
+    assert_defaulted_eq(&http_config.retry_max_backoff, Duration::from_millis(1000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn http_retry_max_backoff() {
+    let builder =
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=250;").unwrap();
+    let Some(http_config) = builder.http else {
+        panic!("Expected Some(HttpConfig)");
+    };
+    assert_specified_eq(&http_config.retry_max_backoff, Duration::from_millis(250));
+    assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn http_retry_max_backoff_below_min_rejected() {
+    let msg = "\"retry_max_backoff_millis\" must be at least 10.";
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=0;"),
+        msg,
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=3;"),
+        msg,
+    );
+}
+
+#[cfg(all(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+#[test]
+fn retry_max_backoff_rejected_on_non_http() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;retry_max_backoff_millis=250;"),
+        "retry_max_backoff_millis is supported only in ILP over HTTP.",
+    );
 }
 
 #[cfg(feature = "sync-sender-http")]

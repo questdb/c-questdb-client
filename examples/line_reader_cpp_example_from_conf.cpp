@@ -11,24 +11,26 @@ int main()
         auto cur = reader.execute(
             "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)"_utf8);
 
-        while (cur.next_batch())
+        while (auto bo = cur.next_batch())
         {
-            const size_t rows = cur.row_count();
-            const size_t cols = cur.column_count();
+            auto& batch = *bo;
+            const size_t rows = batch.row_count();
+            const size_t cols = batch.column_count();
             for (size_t r = 0; r < rows; ++r)
             {
                 for (size_t c = 0; c < cols; ++c)
                 {
-                    const auto k = cur.column_kind(c);
-                    if (k == line_reader_column_kind_long)
+                    auto col = batch.column(c);
+                    const auto k = col.kind();
+                    if (k == questdb::egress::column_kind::long_)
                     {
-                        auto v = cur.get_i64(c, r);
+                        auto v = col.get<int64_t>(r);
                         if (v) std::cout << *v << " ";
                         else std::cout << "NULL ";
                     }
-                    else if (k == line_reader_column_kind_double)
+                    else if (k == questdb::egress::column_kind::double_)
                     {
-                        auto v = cur.get_f64(c, r);
+                        auto v = col.get<double>(r);
                         if (v) std::cout << *v << " ";
                         else std::cout << "NULL ";
                     }

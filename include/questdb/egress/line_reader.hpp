@@ -219,7 +219,16 @@ private:
         const auto c_code = ::line_reader_error_get_code(c_err);
         size_t c_len = 0;
         const char* c_msg = ::line_reader_error_msg(c_err, &c_len);
-        std::string msg{c_msg, c_len};
+        std::string msg;
+        try
+        {
+            msg.assign(c_msg, c_len);
+        }
+        catch (...)
+        {
+            ::line_reader_error_free(c_err);
+            throw;
+        }
         ::line_reader_error_free(c_err);
         return line_reader_error{static_cast<error_code>(c_code), msg};
     }
@@ -238,6 +247,7 @@ private:
     friend class reader;
     friend class cursor;
     friend class query;
+    friend class batch;
 };
 
 /**
@@ -247,8 +257,11 @@ private:
 template <typename T>
 using nullable = std::optional<T>;
 
-class cursor;  // fwd
-class query;   // fwd
+class cursor;           // fwd
+class query;            // fwd
+class batch;            // fwd
+class column;           // fwd
+class symbol_dict_view; // fwd
 
 // ---------------------------------------------------------------------------
 // Borrowed views and value types returned by `cursor` getters. These are
@@ -291,57 +304,6 @@ struct geohash
 {
     uint64_t value;
     uint8_t precision_bits;
-};
-
-/**
- * Borrowed view over a single `DOUBLE_ARRAY` row. Same lifetime contract
- * as `binary_view`. `data` is concatenated little-endian `double` bytes.
- * The `element(idx)` helper does the LE decode safely via `std::memcpy`.
- */
-struct double_array_view
-{
-    const uint32_t* shape;
-    size_t ndim;
-    const uint8_t* data;
-    size_t data_len;
-    size_t element_count;
-
-    double element(size_t flat_idx) const noexcept
-    {
-        double v = 0.0;
-        std::memcpy(&v, data + flat_idx * sizeof(double), sizeof(double));
-        return v;
-    }
-};
-
-/** Same shape as `double_array_view`; `data` holds little-endian
- *  `int64_t` bytes. */
-struct long_array_view
-{
-    const uint32_t* shape;
-    size_t ndim;
-    const uint8_t* data;
-    size_t data_len;
-    size_t element_count;
-
-    int64_t element(size_t flat_idx) const noexcept
-    {
-        int64_t v = 0;
-        std::memcpy(&v, data + flat_idx * sizeof(int64_t), sizeof(int64_t));
-        return v;
-    }
-};
-
-/**
- * Borrowed raw LSB-first validity bitmap (bit 1 = null) for a column.
- * Empty when the column has no nulls. Invalidated by `cursor::next_batch()`,
- * `cursor::cancel()`, `cursor::add_credit()`, and by closing the cursor.
- */
-struct validity_view
-{
-    const uint8_t* data;
-    size_t size;
-    bool empty() const noexcept { return size == 0; }
 };
 
 struct terminal_end_info
@@ -419,6 +381,12 @@ public:
     explicit failover_event_view(const ::line_reader_failover_event* impl) noexcept
         : _impl{impl} {}
 
+    // Non-copyable: `_impl` is borrowed, valid only during the callback.
+    failover_event_view(const failover_event_view&) = delete;
+    failover_event_view& operator=(const failover_event_view&) = delete;
+    failover_event_view(failover_event_view&&) = delete;
+    failover_event_view& operator=(failover_event_view&&) = delete;
+
     std::string_view failed_host() const noexcept
     {
         const char* buf = nullptr;
@@ -477,6 +445,148 @@ private:
 
 /** User callback type for failover-reset notifications. */
 using failover_callback = std::function<void(const failover_event_view&)>;
+
+/**
+ * Lifecycle phase of a failover-progress event. Numeric values match
+ * `line_reader_failover_phase` and the Rust `FailoverPhase` enum.
+ */
+enum class failover_phase : int
+{
+    disconnected =
+        ::line_reader_failover_phase::line_reader_failover_phase_disconnected,
+    retrying =
+        ::line_reader_failover_phase::line_reader_failover_phase_retrying,
+    reset =
+        ::line_reader_failover_phase::line_reader_failover_phase_reset,
+    gave_up =
+        ::line_reader_failover_phase::line_reader_failover_phase_gave_up,
+};
+
+/**
+ * Borrowed view over a failover-progress event passed to the user's
+ * `on_failover_progress` callback. Valid only for the duration of the
+ * callback invocation.
+ *
+ * Several accessors are populated only in certain phases — see the
+ * per-method docs.
+ */
+class failover_progress_event_view
+{
+public:
+    explicit failover_progress_event_view(
+        const ::line_reader_failover_progress_event* impl) noexcept
+        : _impl{impl} {}
+
+    // Non-copyable: `_impl` is borrowed, valid only during the callback.
+    failover_progress_event_view(const failover_progress_event_view&) = delete;
+    failover_progress_event_view& operator=(
+        const failover_progress_event_view&) = delete;
+    failover_progress_event_view(failover_progress_event_view&&) = delete;
+    failover_progress_event_view& operator=(
+        failover_progress_event_view&&) = delete;
+
+    failover_phase phase() const noexcept
+    {
+        return static_cast<failover_phase>(
+            ::line_reader_failover_progress_event_phase(_impl));
+    }
+
+    /** Endpoint that died. Set on every phase. */
+    std::string_view failed_host() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_failed_host(_impl, &buf, &len);
+        return {buf, len};
+    }
+    uint16_t failed_port() const noexcept
+    {
+        return ::line_reader_failover_progress_event_failed_port(_impl);
+    }
+
+    /** New-endpoint host (Reset phase only). Returns empty otherwise. */
+    std::string_view new_host() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_new_host(_impl, &buf, &len);
+        return {buf, len};
+    }
+    /** New-endpoint port (Reset phase only). Returns 0 otherwise. */
+    uint16_t new_port() const noexcept
+    {
+        return ::line_reader_failover_progress_event_new_port(_impl);
+    }
+
+    /** New `request_id` (Reset phase only). `std::nullopt` otherwise. */
+    std::optional<int64_t> new_request_id() const noexcept
+    {
+        int64_t out = 0;
+        if (::line_reader_failover_progress_event_new_request_id(_impl, &out))
+            return out;
+        return std::nullopt;
+    }
+
+    /** 1-based attempt counter. See header docs for per-phase semantics. */
+    uint32_t attempt() const noexcept
+    {
+        return ::line_reader_failover_progress_event_attempt(_impl);
+    }
+
+    /** Trigger (original cause-of-death) error code. */
+    error_code trigger_code() const noexcept
+    {
+        return static_cast<error_code>(
+            ::line_reader_failover_progress_event_trigger_code(_impl));
+    }
+    /** Trigger error message (UTF-8). */
+    std::string_view trigger_msg() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_trigger_msg(_impl, &buf, &len);
+        return {buf, len};
+    }
+
+    /** Wall-clock nanoseconds since the disconnect. */
+    uint64_t elapsed_ns() const noexcept
+    {
+        return ::line_reader_failover_progress_event_elapsed_ns(_impl);
+    }
+
+    /** `SERVER_INFO` for the new endpoint (Reset phase only, v2+ servers). */
+    server_info_view server_info() const noexcept
+    {
+        return server_info_view{
+            ::line_reader_failover_progress_event_server_info(_impl)};
+    }
+
+    /** Final error code (GaveUp phase only). `std::nullopt` otherwise. */
+    std::optional<error_code> final_error_code() const noexcept
+    {
+        ::line_reader_error_code raw =
+            ::line_reader_error_code::line_reader_error_invalid_api_call;
+        if (::line_reader_failover_progress_event_final_error_code(_impl, &raw))
+            return static_cast<error_code>(raw);
+        return std::nullopt;
+    }
+    /** Final error message (GaveUp phase only). Empty otherwise. */
+    std::string_view final_error_msg() const noexcept
+    {
+        const char* buf = nullptr;
+        size_t len = 0;
+        ::line_reader_failover_progress_event_final_error_msg(
+            _impl, &buf, &len);
+        return {buf, len};
+    }
+
+private:
+    const ::line_reader_failover_progress_event* _impl;
+};
+
+/** User callback type for failover-progress notifications. */
+using failover_progress_callback =
+    std::function<void(const failover_progress_event_view&)>;
 
 inline ::line_sender_utf8 to_c_utf8(::questdb::ingress::utf8_view view) noexcept
 {
@@ -821,6 +931,10 @@ public:
     query& bind_binary(const uint8_t* buf, size_t len)
     {
         ensure_impl();
+        if (buf == nullptr && len != 0)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "bind_binary: NULL buffer with non-zero length"};
         ::line_reader_query_bind_binary(_impl, buf, len);
         return *this;
     }
@@ -944,6 +1058,34 @@ public:
         return *this;
     }
 
+    /**
+     * Install a failover-progress callback. Fires at every phase of a
+     * mid-query failover lifecycle (Disconnected, Retrying, Reset,
+     * GaveUp). The view passed to the callback is borrowed and valid
+     * only for the duration of the call.
+     *
+     * Installing this callback also opts the cursor in to replay-after-
+     * data-delivered, the same way `on_failover_reset` does — either
+     * being installed clears the silent-duplicate guard.
+     *
+     * Reentrancy contract is identical to `on_failover_reset`: the
+     * callback MUST NOT touch the originating reader / query / cursor,
+     * MUST NOT block, and any thrown exception is swallowed (an
+     * unwind across the C boundary would be undefined behaviour).
+     */
+    query& on_failover_progress(failover_progress_callback cb)
+    {
+        ensure_impl();
+        auto new_callback =
+            std::make_unique<failover_progress_callback>(std::move(cb));
+        ::line_reader_query_on_failover_progress(
+            _impl,
+            &query::progress_trampoline,
+            new_callback.get());
+        _progress_callback = std::move(new_callback);
+        return *this;
+    }
+
     /** Consume the query and return a streaming cursor.
      *  @throws line_reader_error with `invalid_api_call` if the query has
      *  already been consumed (by a previous `execute()`) or moved from.
@@ -986,19 +1128,1173 @@ private:
         }
     }
 
+    static void progress_trampoline(
+        const ::line_reader_failover_progress_event* ev,
+        void* user_data) noexcept
+    {
+        auto* cb = static_cast<failover_progress_callback*>(user_data);
+        if (cb && *cb)
+        {
+            try
+            {
+                (*cb)(failover_progress_event_view{ev});
+            }
+            catch (...)
+            {
+                // Swallow exceptions — see `trampoline` above.
+            }
+        }
+    }
+
     ::line_reader_query* _impl;
     std::unique_ptr<failover_callback> _callback;
+    std::unique_ptr<failover_progress_callback> _progress_callback;
     friend class reader;
     friend class cursor;
+};
+
+// ---------------------------------------------------------------------------
+// Batch & column bulk access.
+//
+// `batch`, `column`, and `symbol_dict_view` form the columnar
+// counterpart to `cursor`'s per-cell `get_*` getters: project a whole column
+// to contiguous buffers in one call. Recommended path for any column-oriented
+// or perf-sensitive code (scans, dataframes, Cython zero-copy). The per-cell
+// getters on `cursor` remain the convenience path for scalar lookups.
+//
+// Every view here is BORROWED from the cursor's current batch and invalidated
+// by the next `cursor::next_batch()`, `cursor::cancel()`,
+// `cursor::add_credit()`, cursor destruction, or mid-query failover
+// (transparently triggered by `next_batch()`). Do not cache across batches —
+// re-derive after every `next_batch()`.
+//
+// Value bytes are wire-order little-endian. On a big-endian host, the caller
+// must byte-swap.
+// ---------------------------------------------------------------------------
+
+/**
+ * Snapshot of the connection-scoped symbol dictionary. Index by dictionary
+ * code (== entry index) to get the UTF-8 string for that symbol.
+ */
+class symbol_dict_view
+{
+public:
+    symbol_dict_view() noexcept
+        : _d{}
+    {
+    }
+    explicit symbol_dict_view(::line_reader_symbol_dict d) noexcept
+        : _d{d}
+    {
+    }
+
+    /** True when populated by a `batch::symbol_dict()` call (vs
+     * default-constructed). */
+    bool valid() const noexcept
+    {
+        return _d.entries != nullptr;
+    }
+
+    /** Number of entries; an entry's index is its dictionary code. */
+    size_t entry_count() const noexcept
+    {
+        return _d.entry_count;
+    }
+
+    /** Concatenated UTF-8 bytes; `heap_len()` long. */
+    const uint8_t* heap() const noexcept
+    {
+        return _d.heap;
+    }
+    size_t heap_len() const noexcept
+    {
+        return _d.heap_len;
+    }
+
+    /** Entry table: `entry_count()` entries addressing `heap()`. */
+    const ::line_reader_symbol_entry* entries() const noexcept
+    {
+        return _d.entries;
+    }
+
+    /** Decode entry `i` to a UTF-8 view. Throws on out-of-range `i`. */
+    std::string_view operator[](size_t i) const
+    {
+        if (i >= _d.entry_count)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "symbol_dict_view: index out of range"};
+        const auto& e = _d.entries[i];
+        return std::string_view{
+            reinterpret_cast<const char*>(_d.heap + e.offset), e.length};
+    }
+
+    const ::line_reader_symbol_dict& c_data() const noexcept
+    {
+        return _d;
+    }
+
+private:
+    ::line_reader_symbol_dict _d;
+};
+
+// Typed views handed to `column::visit`. `kind` disambiguates within a
+// group (e.g. `fixed_view<int64_t>` covers LONG / TIMESTAMP / DATE /
+// TIMESTAMP_NANOS).
+namespace detail
+{
+inline bool bitmap_is_null(
+    const uint8_t* validity, size_t row, size_t row_count) noexcept
+{
+    return validity && row < row_count &&
+           ((validity[row >> 3] >> (row & 7)) & 1);
+}
+} // namespace detail
+
+/** Fixed-width primitive view: BOOLEAN, BYTE, SHORT, CHAR, INT, IPV4,
+ *  LONG, FLOAT, DOUBLE, TIMESTAMP, DATE, TIMESTAMP_NANOS.
+ *
+ *  `values` may not be aligned to `alignof(T)` — densified column
+ *  slices may borrow from the wire payload at offsets that don't
+ *  satisfy `T`'s alignment. Use `value(row)` for safe per-row access;
+ *  for bulk reads use `std::memcpy` or unaligned-load intrinsics
+ *  rather than `values[row]`. */
+template <typename T>
+struct fixed_view
+{
+    egress::column_kind kind;
+    const T* values;
+    size_t row_count;
+    const uint8_t* validity; // null when no nulls
+
+    bool is_null(size_t row) const noexcept
+    {
+        return detail::bitmap_is_null(validity, row, row_count);
+    }
+    nullable<T> value(size_t row) const noexcept
+    {
+        if (row >= row_count || is_null(row))
+            return std::nullopt;
+        T v;
+        std::memcpy(&v, values + row, sizeof(T));
+        return v;
+    }
+};
+
+/** DECIMAL64 / DECIMAL128 / DECIMAL256 view. `values` is the dense raw
+ *  little-endian mantissa bytes; cast to `int64_t*` for DECIMAL64. */
+struct decimal_view
+{
+    egress::column_kind kind;
+    const uint8_t* values;
+    size_t value_stride; // 8 / 16 / 32
+    size_t row_count;
+    int8_t scale;
+    const uint8_t* validity;
+
+    bool is_null(size_t row) const noexcept
+    {
+        return detail::bitmap_is_null(validity, row, row_count);
+    }
+};
+
+/** UUID / LONG256 view. `values` is dense raw little-endian bytes;
+ *  `value_stride` is 16 (UUID) or 32 (LONG256). */
+struct bytes_view
+{
+    egress::column_kind kind;
+    const uint8_t* values;
+    size_t value_stride;
+    size_t row_count;
+    const uint8_t* validity;
+
+    bool is_null(size_t row) const noexcept
+    {
+        return detail::bitmap_is_null(validity, row, row_count);
+    }
+};
+
+/** GEOHASH view. `values` is dense raw little-endian bytes;
+ *  `value_stride` = `ceil(precision_bits / 8)`. */
+struct geohash_view
+{
+    const uint8_t* values;
+    size_t value_stride;
+    size_t row_count;
+    uint8_t precision_bits;
+    const uint8_t* validity;
+
+    bool is_null(size_t row) const noexcept
+    {
+        return detail::bitmap_is_null(validity, row, row_count);
+    }
+};
+
+/** VARCHAR / BINARY view. `kind` disambiguates. */
+struct varlen_view
+{
+    egress::column_kind kind;
+    const uint32_t* offsets; // row_count + 1 entries
+    const uint8_t* data;
+    size_t data_len;
+    size_t row_count;
+    const uint8_t* validity;
+
+    bool is_null(size_t row) const noexcept
+    {
+        return detail::bitmap_is_null(validity, row, row_count);
+    }
+
+    /** Row `row` as a borrowed `std::string_view` (interpret bytes as UTF-8).
+     */
+    nullable<std::string_view> as_string_view(size_t row) const
+    {
+        if (row >= row_count || is_null(row))
+            return std::nullopt;
+        const auto s = offsets[row];
+        const auto e = offsets[row + 1];
+        return std::string_view{
+            reinterpret_cast<const char*>(data + s),
+            static_cast<size_t>(e - s)};
+    }
+
+    /** Row `row` as a borrowed byte span. */
+    nullable<binary_view> as_binary(size_t row) const
+    {
+        if (row >= row_count || is_null(row))
+            return std::nullopt;
+        const auto s = offsets[row];
+        const auto e = offsets[row + 1];
+        return binary_view{data + s, static_cast<size_t>(e - s)};
+    }
+};
+
+/** SYMBOL view: dictionary-encoded UTF-8. */
+struct symbol_view
+{
+    const uint32_t* codes;
+    size_t row_count;
+    const uint8_t* validity;
+    symbol_dict_view dict;
+
+    bool is_null(size_t row) const noexcept
+    {
+        return detail::bitmap_is_null(validity, row, row_count);
+    }
+
+    nullable<std::string_view> resolve(size_t row) const
+    {
+        if (row >= row_count || is_null(row))
+            return std::nullopt;
+        const uint32_t code = codes[row];
+        if (code >= dict.entry_count())
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "symbol_view::resolve: code out of dictionary range"};
+        return dict[code];
+    }
+};
+
+/** Ragged array view (DOUBLE_ARRAY in this revision). `T == double`. */
+template <typename T>
+struct array_view
+{
+    egress::column_kind kind;
+    const T* data;                // flat row-major, all rows
+    const uint32_t* data_offsets; // row_count + 1, byte offsets into data
+    size_t data_len;              // bytes
+    const uint32_t* shapes;
+    const uint32_t* shape_offsets;
+    size_t row_count;
+    const uint8_t* validity;
+
+    bool is_null(size_t row) const noexcept
+    {
+        return detail::bitmap_is_null(validity, row, row_count);
+    }
+
+    /** Per-row shape (dimension lengths). Returns `nullopt` for out-of-range.
+     */
+    nullable<std::pair<const uint32_t*, size_t>> shape(size_t row) const
+    {
+        if (row >= row_count)
+            return std::nullopt;
+        const auto s = shape_offsets[row];
+        const auto e = shape_offsets[row + 1];
+        return std::make_pair(shapes + s, static_cast<size_t>(e - s));
+    }
+
+    /** Per-row typed elements (count). Returns `nullopt` for out-of-range. */
+    nullable<std::pair<const T*, size_t>> elements(size_t row) const
+    {
+        if (row >= row_count)
+            return std::nullopt;
+        const auto s = data_offsets[row];
+        const auto e = data_offsets[row + 1];
+        return std::make_pair(
+            reinterpret_cast<const T*>(
+                reinterpret_cast<const uint8_t*>(data) + s),
+            static_cast<size_t>((e - s) / sizeof(T)));
+    }
+};
+
+/**
+ * Borrowed projection of one column. Polymorphic over the column kinds:
+ * scalar / variable-width / SYMBOL / DOUBLE_ARRAY. `kind()` distinguishes.
+ *
+ * Scalar-family accessors (`values<T>()`, `varchar(row)`, `decimal_scale()`,
+ * `symbol(row)`, …) throw on array columns; array-family accessors
+ * (`shape(...)`, `elements<T>(...)`, `data_offsets()`, …) throw on scalar
+ * columns. `is_array()` lets callers probe in advance.
+ *
+ * Obtain from `batch::column(i)`. Every pointer reachable through this
+ * object borrows from the batch and shares its lifetime.
+ */
+class column
+{
+public:
+    egress::column_kind kind() const noexcept
+    {
+        return _is_array ? static_cast<egress::column_kind>(_array.kind)
+                         : static_cast<egress::column_kind>(_scalar.kind);
+    }
+    size_t row_count() const noexcept
+    {
+        return _is_array ? _array.row_count : _scalar.row_count;
+    }
+    bool is_array() const noexcept
+    {
+        return _is_array;
+    }
+
+    // ---- Validity (shared by both families) ----
+    /** Raw LSB-first validity bitmap (bit 1 = NULL); null when no nulls. */
+    const uint8_t* validity() const noexcept
+    {
+        return _is_array ? _array.validity : _scalar.validity;
+    }
+    size_t validity_bytes() const noexcept
+    {
+        return validity() ? (row_count() + 7) / 8 : 0;
+    }
+    bool has_nulls() const noexcept
+    {
+        return validity() != nullptr;
+    }
+    /** True if `row` is NULL. False for out-of-range rows. */
+    bool is_null(size_t row) const noexcept
+    {
+        const auto* v = validity();
+        return v && row < row_count() && ((v[row >> 3] >> (row & 7)) & 1);
+    }
+
+    // ---- Scalar family ----
+    /** DECIMAL64/128/256 shared scale; 0 otherwise. */
+    int8_t decimal_scale() const noexcept
+    {
+        return _is_array ? 0 : _scalar.decimal_scale;
+    }
+    /** GEOHASH precision (1..60); 0 otherwise. */
+    uint8_t geohash_precision_bits() const noexcept
+    {
+        return _is_array ? 0 : _scalar.geohash_precision_bits;
+    }
+    /** Dense little-endian value bytes; null for variable-width / SYMBOL /
+     *  array. */
+    const void* values_raw() const noexcept
+    {
+        return _is_array ? nullptr : _scalar.values;
+    }
+    /** Bytes per fixed-width value; 0 for variable-width / SYMBOL / array. */
+    size_t value_stride() const noexcept
+    {
+        return _is_array ? 0 : _scalar.value_stride;
+    }
+
+    /**
+     * Typed contiguous pointer over the column's `row_count()` dense values.
+     *
+     * Throws on (a) array columns, (b) `sizeof(T) != value_stride()`,
+     * (c) columns without dense values (variable-width / SYMBOL), or
+     * (d) `T` not in the kind whitelist for this column's `kind()`. The
+     * whitelist rejects same-stride / different-semantics combinations
+     * (e.g. `values<int64_t>()` on a DECIMAL64 column, or `values<int32_t>()`
+     * on an IPV4 column). Use the strict overload `values<T>(kind)` to
+     * bypass when you know what you're doing.
+     *
+     * **Alignment:** the returned pointer is NOT guaranteed to be aligned
+     * to `alignof(T)`. Densified column slices may borrow from the wire
+     * payload starting at an offset that doesn't satisfy `T`'s alignment
+     * (e.g. an INT column whose data begins right after a validity
+     * bitmap of odd byte length). Dereferencing the pointer as
+     * `base[row]` or forming a `const T&` from it is undefined behaviour.
+     * For per-row access use `get<T>(row)` (already alignment-safe). For
+     * bulk access read via `std::memcpy` or unaligned-load intrinsics
+     * (`_mm_loadu_si128`, `vld1q_u32`, ...).
+     */
+    template <typename T>
+    const T* values() const
+    {
+        ensure_scalar("column::values<T>");
+        if (!_scalar.values)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::values<T>: column has no dense values "
+                "(variable-width or SYMBOL)"};
+        if (sizeof(T) != _scalar.value_stride)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::values<T>: sizeof(T) != value_stride"};
+        if (!is_kind_compatible<T>(kind()))
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::values<T>: T is not in the kind whitelist for this "
+                "column kind (stride matches but semantics differ); use the "
+                "strict overload values<T>(kind) to bypass"};
+        return static_cast<const T*>(_scalar.values);
+    }
+
+    /**
+     * Strict overload: caller asserts an exact `required` kind, bypassing
+     * the whitelist. For deliberate reinterpretation (e.g. reading a
+     * DECIMAL64's raw mantissa as `int64_t`). Same alignment caveat as
+     * the whitelist overload: returned pointer may not be `alignof(T)`.
+     */
+    template <typename T>
+    const T* values(egress::column_kind required) const
+    {
+        ensure_scalar("column::values<T>(kind)");
+        if (kind() != required)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::values<T>(kind): column kind mismatch"};
+        if (!_scalar.values)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::values<T>(kind): column has no dense values"};
+        if (sizeof(T) != _scalar.value_stride)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::values<T>(kind): sizeof(T) != value_stride"};
+        return static_cast<const T*>(_scalar.values);
+    }
+
+    /** VARCHAR / BINARY offset table (`row_count + 1` entries); null
+     *  otherwise. */
+    const uint32_t* var_offsets() const noexcept
+    {
+        return _is_array ? nullptr : _scalar.var_offsets;
+    }
+    /** VARCHAR / BINARY concatenated data blob; null otherwise. */
+    const uint8_t* var_data() const noexcept
+    {
+        return _is_array ? nullptr : _scalar.var_data;
+    }
+    size_t var_data_len() const noexcept
+    {
+        return _is_array ? 0 : _scalar.var_data_len;
+    }
+
+    /** SYMBOL per-row dictionary codes (`row_count` entries); null
+     *  otherwise. */
+    const uint32_t* symbol_codes() const noexcept
+    {
+        return _is_array ? nullptr : _scalar.symbol_codes;
+    }
+
+    /** Snapshot of the symbol dictionary; populated only for SYMBOL columns. */
+    const symbol_dict_view& symbol_dict() const noexcept
+    {
+        return _dict;
+    }
+
+    /** Resolve a VARCHAR row to a borrowed UTF-8 view. */
+    nullable<std::string_view> varchar(size_t row) const
+    {
+        ensure_kind(column_kind::varchar, "column::varchar");
+        ensure_row_in_range(row, "column::varchar");
+        if (is_null(row))
+            return std::nullopt;
+        const auto s = _scalar.var_offsets[row];
+        const auto e = _scalar.var_offsets[row + 1];
+        return std::string_view{
+            reinterpret_cast<const char*>(_scalar.var_data + s),
+            static_cast<size_t>(e - s)};
+    }
+
+    /** Resolve a BINARY row to a borrowed byte view. */
+    nullable<binary_view> binary(size_t row) const
+    {
+        ensure_kind(column_kind::binary, "column::binary");
+        ensure_row_in_range(row, "column::binary");
+        if (is_null(row))
+            return std::nullopt;
+        const auto s = _scalar.var_offsets[row];
+        const auto e = _scalar.var_offsets[row + 1];
+        return binary_view{_scalar.var_data + s, static_cast<size_t>(e - s)};
+    }
+
+    /** Resolve a SYMBOL row through the dictionary. */
+    nullable<std::string_view> symbol(size_t row) const
+    {
+        ensure_kind(column_kind::symbol, "column::symbol");
+        ensure_row_in_range(row, "column::symbol");
+        if (is_null(row))
+            return std::nullopt;
+        const uint32_t code = _scalar.symbol_codes[row];
+        if (code >= _dict.entry_count())
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::symbol: code out of dictionary range"};
+        return _dict[code];
+    }
+
+    /** Fixed-width scalar row → `nullable<T>`. Same kind-whitelist as
+     *  `values<T>()`; use the strict overload to bypass. */
+    template <typename T>
+    nullable<T> get(size_t row) const
+    {
+        const T* base = values<T>();
+        ensure_row_in_range(row, "column::get");
+        if (is_null(row))
+            return std::nullopt;
+        T value;
+        std::memcpy(&value, base + row, sizeof(T));
+        return value;
+    }
+
+    /** Strict overload: explicit `required` kind, bypasses the whitelist. */
+    template <typename T>
+    nullable<T> get(size_t row, egress::column_kind required) const
+    {
+        const T* base = values<T>(required);
+        ensure_row_in_range(row, "column::get(kind)");
+        if (is_null(row))
+            return std::nullopt;
+        T value;
+        std::memcpy(&value, base + row, sizeof(T));
+        return value;
+    }
+
+    /** DECIMAL64 row → `nullable<decimal64>`. */
+    nullable<egress::decimal64> get_decimal64(size_t row) const
+    {
+        ensure_kind(column_kind::decimal64, "column::get_decimal64");
+        ensure_row_in_range(row, "column::get_decimal64");
+        if (is_null(row))
+            return std::nullopt;
+        int64_t mantissa = 0;
+        std::memcpy(
+            &mantissa,
+            static_cast<const uint8_t*>(_scalar.values) + row * 8,
+            8);
+        return egress::decimal64{mantissa, _scalar.decimal_scale};
+    }
+
+    /** DECIMAL128 row → `nullable<decimal128>`. */
+    nullable<egress::decimal128> get_decimal128(size_t row) const
+    {
+        ensure_kind(column_kind::decimal128, "column::get_decimal128");
+        ensure_row_in_range(row, "column::get_decimal128");
+        if (is_null(row))
+            return std::nullopt;
+        const auto* p = static_cast<const uint8_t*>(_scalar.values) + row * 16;
+        uint64_t lo = 0;
+        int64_t hi = 0;
+        std::memcpy(&lo, p, 8);
+        std::memcpy(&hi, p + 8, 8);
+        return egress::decimal128{lo, hi, _scalar.decimal_scale};
+    }
+
+    /** DECIMAL256 row → `nullable<decimal256>`. */
+    nullable<egress::decimal256> get_decimal256(size_t row) const
+    {
+        ensure_kind(column_kind::decimal256, "column::get_decimal256");
+        ensure_row_in_range(row, "column::get_decimal256");
+        if (is_null(row))
+            return std::nullopt;
+        std::array<uint8_t, 32> out{};
+        std::memcpy(
+            out.data(),
+            static_cast<const uint8_t*>(_scalar.values) + row * 32,
+            32);
+        return egress::decimal256{out, _scalar.decimal_scale};
+    }
+
+    /** UUID row → `nullable<array<uint8_t, 16>>` (LE bytes). */
+    nullable<std::array<uint8_t, 16>> get_uuid(size_t row) const
+    {
+        ensure_kind(column_kind::uuid, "column::get_uuid");
+        ensure_row_in_range(row, "column::get_uuid");
+        if (is_null(row))
+            return std::nullopt;
+        std::array<uint8_t, 16> out{};
+        std::memcpy(
+            out.data(),
+            static_cast<const uint8_t*>(_scalar.values) + row * 16,
+            16);
+        return out;
+    }
+
+    /** LONG256 row → `nullable<array<uint8_t, 32>>` (LE bytes). */
+    nullable<std::array<uint8_t, 32>> get_long256(size_t row) const
+    {
+        ensure_kind(column_kind::long256, "column::get_long256");
+        ensure_row_in_range(row, "column::get_long256");
+        if (is_null(row))
+            return std::nullopt;
+        std::array<uint8_t, 32> out{};
+        std::memcpy(
+            out.data(),
+            static_cast<const uint8_t*>(_scalar.values) + row * 32,
+            32);
+        return out;
+    }
+
+    /** GEOHASH row → `nullable<geohash>`. Decodes the LE stride bytes into
+     *  a `uint64_t`. */
+    nullable<egress::geohash> get_geohash(size_t row) const
+    {
+        ensure_kind(column_kind::geohash, "column::get_geohash");
+        ensure_row_in_range(row, "column::get_geohash");
+        if (is_null(row))
+            return std::nullopt;
+        const auto stride = _scalar.value_stride;
+        uint64_t v = 0;
+        std::memcpy(
+            &v,
+            static_cast<const uint8_t*>(_scalar.values) + row * stride,
+            stride);
+        return egress::geohash{
+            v, static_cast<uint8_t>(_scalar.geohash_precision_bits)};
+    }
+
+    // ---- Array family (throws on scalar columns) ----
+    /** Flat row-major little-endian element bytes for every row. */
+    const uint8_t* data() const noexcept
+    {
+        return _is_array ? _array.data : nullptr;
+    }
+    size_t data_len() const noexcept
+    {
+        return _is_array ? _array.data_len : 0;
+    }
+    /** Per-row byte offsets into `data()`, `row_count + 1` entries. */
+    const uint32_t* data_offsets() const noexcept
+    {
+        return _is_array ? _array.data_offsets : nullptr;
+    }
+    /** Concatenated per-row shapes (dimension lengths). */
+    const uint32_t* shapes() const noexcept
+    {
+        return _is_array ? _array.shapes : nullptr;
+    }
+    size_t shapes_len() const noexcept
+    {
+        return _is_array ? _array.shapes_len : 0;
+    }
+    /** Per-row offsets into `shapes()`, `row_count + 1` entries. */
+    const uint32_t* shape_offsets() const noexcept
+    {
+        return _is_array ? _array.shape_offsets : nullptr;
+    }
+
+    /**
+     * Per-row dimension lengths. `*out_rank` is set to the row's rank on
+     * success. Returns null and sets `*out_rank = 0` for out-of-range rows.
+     * For a null row the shape is empty (rank 0) — distinct from a
+     * non-null empty array (rank 0 with zero elements).
+     */
+    const uint32_t* shape(size_t row, size_t* out_rank) const
+    {
+        ensure_array("column::shape");
+        if (row >= _array.row_count)
+        {
+            if (out_rank)
+                *out_rank = 0;
+            return nullptr;
+        }
+        const auto s = _array.shape_offsets[row];
+        const auto e = _array.shape_offsets[row + 1];
+        if (out_rank)
+            *out_rank = static_cast<size_t>(e - s);
+        return _array.shapes + s;
+    }
+
+    /**
+     * Per-row flat element bytes. `*out_len` set to the byte length on
+     * success. Returns null / 0 for out-of-range rows.
+     */
+    const uint8_t* row_bytes(size_t row, size_t* out_len) const
+    {
+        ensure_array("column::row_bytes");
+        if (row >= _array.row_count)
+        {
+            if (out_len)
+                *out_len = 0;
+            return nullptr;
+        }
+        const auto s = _array.data_offsets[row];
+        const auto e = _array.data_offsets[row + 1];
+        if (out_len)
+            *out_len = static_cast<size_t>(e - s);
+        return _array.data + s;
+    }
+
+    /**
+     * Per-row typed element pointer. `*out_count` is set to the element
+     * count on success. Only `T == double` is supported in this revision
+     * (DOUBLE_ARRAY).
+     */
+    template <typename T>
+    const T* elements(size_t row, size_t* out_count) const;
+
+    /**
+     * Kind-dispatched visitor entry. Calls `v(view)` with the typed view
+     * matching `kind()`: `fixed_view<T>` for fixed-width primitives,
+     * `decimal_view` / `bytes_view` / `geohash_view` / `varlen_view` /
+     * `symbol_view` / `array_view<T>` for the rest. All overloads must
+     * return the same type, same contract as `std::visit`.
+     */
+    template <typename Visitor>
+    decltype(auto) visit(Visitor&& v) const
+    {
+        switch (kind())
+        {
+        case column_kind::boolean:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<uint8_t>(column_kind::boolean));
+        case column_kind::byte:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<int8_t>(column_kind::byte));
+        case column_kind::short_:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<int16_t>(column_kind::short_));
+        case column_kind::char_:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<uint16_t>(column_kind::char_));
+        case column_kind::int_:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<int32_t>(column_kind::int_));
+        case column_kind::ipv4:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<uint32_t>(column_kind::ipv4));
+        case column_kind::long_:
+        case column_kind::timestamp:
+        case column_kind::date:
+        case column_kind::timestamp_nanos:
+            return std::forward<Visitor>(v)(make_fixed_view<int64_t>(kind()));
+        case column_kind::float_:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<float>(column_kind::float_));
+        case column_kind::double_:
+            return std::forward<Visitor>(v)(
+                make_fixed_view<double>(column_kind::double_));
+        case column_kind::decimal64:
+        case column_kind::decimal128:
+        case column_kind::decimal256:
+            return std::forward<Visitor>(v)(make_decimal_view());
+        case column_kind::uuid:
+        case column_kind::long256:
+            return std::forward<Visitor>(v)(make_bytes_view());
+        case column_kind::geohash:
+            return std::forward<Visitor>(v)(make_geohash_view());
+        case column_kind::varchar:
+        case column_kind::binary:
+            return std::forward<Visitor>(v)(make_varlen_view());
+        case column_kind::symbol:
+            return std::forward<Visitor>(v)(make_symbol_view());
+        case column_kind::double_array:
+            return std::forward<Visitor>(v)(make_array_view<double>());
+        case column_kind::long_array:
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::visit: LONG_ARRAY is not supported in this revision"};
+        default:
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "column::visit: unknown column kind"};
+        }
+    }
+
+    // ---- Raw C-side data (escape hatches) ----
+    const ::line_reader_column_data& c_scalar_data() const noexcept
+    {
+        return _scalar;
+    }
+    const ::line_reader_array_data& c_array_data() const noexcept
+    {
+        return _array;
+    }
+
+private:
+    friend class batch;
+
+    static column make_scalar(
+        ::line_reader_column_data d, symbol_dict_view dict) noexcept
+    {
+        column c;
+        c._scalar = d;
+        c._dict = dict;
+        c._is_array = false;
+        return c;
+    }
+    static column make_array(::line_reader_array_data d) noexcept
+    {
+        column c;
+        c._array = d;
+        c._is_array = true;
+        return c;
+    }
+
+    template <typename T>
+    fixed_view<T> make_fixed_view(egress::column_kind k) const noexcept
+    {
+        return fixed_view<T>{
+            k,
+            static_cast<const T*>(_scalar.values),
+            _scalar.row_count,
+            _scalar.validity};
+    }
+    decimal_view make_decimal_view() const noexcept
+    {
+        return decimal_view{
+            kind(),
+            static_cast<const uint8_t*>(_scalar.values),
+            _scalar.value_stride,
+            _scalar.row_count,
+            _scalar.decimal_scale,
+            _scalar.validity};
+    }
+    bytes_view make_bytes_view() const noexcept
+    {
+        return bytes_view{
+            kind(),
+            static_cast<const uint8_t*>(_scalar.values),
+            _scalar.value_stride,
+            _scalar.row_count,
+            _scalar.validity};
+    }
+    geohash_view make_geohash_view() const noexcept
+    {
+        return geohash_view{
+            static_cast<const uint8_t*>(_scalar.values),
+            _scalar.value_stride,
+            _scalar.row_count,
+            _scalar.geohash_precision_bits,
+            _scalar.validity};
+    }
+    varlen_view make_varlen_view() const noexcept
+    {
+        return varlen_view{
+            kind(),
+            _scalar.var_offsets,
+            _scalar.var_data,
+            _scalar.var_data_len,
+            _scalar.row_count,
+            _scalar.validity};
+    }
+    symbol_view make_symbol_view() const noexcept
+    {
+        return symbol_view{
+            _scalar.symbol_codes, _scalar.row_count, _scalar.validity, _dict};
+    }
+    template <typename T>
+    array_view<T> make_array_view() const noexcept
+    {
+        static_assert(
+            alignof(T) <= 8,
+            "array_view<T>: alignment > 8 would exceed the Rust allocator's "
+            "de-facto alignment guarantee for the underlying buffer");
+        return array_view<T>{
+            static_cast<egress::column_kind>(_array.kind),
+            reinterpret_cast<const T*>(_array.data),
+            _array.data_offsets,
+            _array.data_len,
+            _array.shapes,
+            _array.shape_offsets,
+            _array.row_count,
+            _array.validity};
+    }
+
+    void ensure_scalar(const char* what) const
+    {
+        if (_is_array)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                std::string{what} +
+                    ": column is an array; use the array "
+                    "accessors (shape / elements / data_offsets / ...)"};
+    }
+    void ensure_array(const char* what) const
+    {
+        if (!_is_array)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                std::string{what} +
+                    ": column is not an array; use the "
+                    "scalar accessors (values<T> / varchar / symbol / ...)"};
+    }
+    void ensure_kind(egress::column_kind expected, const char* what) const
+    {
+        if (kind() != expected)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                std::string{what} + ": column kind mismatch"};
+    }
+    void ensure_row_in_range(size_t row, const char* what) const
+    {
+        if (row >= row_count())
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                std::string{what} + ": row index out of range"};
+    }
+
+    template <typename T>
+    static constexpr bool is_kind_compatible(egress::column_kind) noexcept
+    {
+        static_assert(
+            sizeof(T) == 0,
+            "column::values<T>: T is not a supported scalar type. "
+            "Supported: bool, uint8_t, int8_t, int16_t, uint16_t, int32_t, "
+            "uint32_t, int64_t, float, double. Use the strict overload "
+            "values<T>(kind) to bypass the whitelist with an explicit kind "
+            "assertion.");
+        return false;
+    }
+
+    ::line_reader_column_data _scalar{};
+    ::line_reader_array_data _array{};
+    symbol_dict_view _dict{};
+    bool _is_array{false};
+};
+
+// Whitelist of column kinds each scalar `T` may read via `values<T>()`. The
+// compatibility groups are deliberately tight: shared-stride / different-
+// semantics combinations (DECIMAL64 vs LONG; IPV4 unsigned vs INT signed)
+// are rejected here so a `values<int64_t>()` slip on a DECIMAL64 column
+// surfaces as a clean error instead of silently returning the scaled
+// mantissa as a "plain" i64. Use `values<T>(kind)` to opt out.
+template <>
+constexpr bool column::is_kind_compatible<bool>(column_kind k) noexcept
+{
+    return k == column_kind::boolean;
+}
+template <>
+constexpr bool column::is_kind_compatible<uint8_t>(column_kind k) noexcept
+{
+    return k == column_kind::boolean;
+}
+template <>
+constexpr bool column::is_kind_compatible<int8_t>(column_kind k) noexcept
+{
+    return k == column_kind::byte;
+}
+template <>
+constexpr bool column::is_kind_compatible<int16_t>(column_kind k) noexcept
+{
+    return k == column_kind::short_;
+}
+template <>
+constexpr bool column::is_kind_compatible<uint16_t>(column_kind k) noexcept
+{
+    return k == column_kind::char_;
+}
+template <>
+constexpr bool column::is_kind_compatible<int32_t>(column_kind k) noexcept
+{
+    return k == column_kind::int_;
+}
+template <>
+constexpr bool column::is_kind_compatible<uint32_t>(column_kind k) noexcept
+{
+    return k == column_kind::ipv4;
+}
+template <>
+constexpr bool column::is_kind_compatible<int64_t>(column_kind k) noexcept
+{
+    return k == column_kind::long_ || k == column_kind::timestamp ||
+           k == column_kind::date || k == column_kind::timestamp_nanos;
+}
+template <>
+constexpr bool column::is_kind_compatible<float>(column_kind k) noexcept
+{
+    return k == column_kind::float_;
+}
+template <>
+constexpr bool column::is_kind_compatible<double>(column_kind k) noexcept
+{
+    return k == column_kind::double_;
+}
+
+template <>
+inline const double* column::elements<double>(
+    size_t row, size_t* out_count) const
+{
+    ensure_array("column::elements<double>");
+    if (kind() != column_kind::double_array)
+        throw line_reader_error{
+            error_code::invalid_api_call,
+            "column::elements<double>: column is not DOUBLE_ARRAY"};
+    size_t bytes = 0;
+    const auto* p = row_bytes(row, &bytes);
+    if (out_count)
+        *out_count = bytes / sizeof(double);
+    return reinterpret_cast<const double*>(p);
+}
+
+/**
+ * Borrowed handle for the cursor's currently-loaded batch. The columnar
+ * entry point: `batch::column(i)` projects a column (scalar or array —
+ * the returned `column` is polymorphic).
+ *
+ * Obtain from `cursor::next_batch()`. Invalidated by the next
+ * `cursor::next_batch()`, `cursor::cancel()`, `cursor::add_credit()`, cursor
+ * destruction, or mid-query failover.
+ */
+class batch
+{
+public:
+    batch() noexcept
+        : _impl{nullptr}
+    {
+    }
+    explicit batch(const ::line_reader_batch* impl) noexcept
+        : _impl{impl}
+    {
+    }
+
+    bool valid() const noexcept
+    {
+        return _impl != nullptr;
+    }
+    explicit operator bool() const noexcept
+    {
+        return valid();
+    }
+
+    size_t row_count() const noexcept
+    {
+        return _impl ? ::line_reader_batch_row_count(_impl) : 0;
+    }
+    size_t column_count() const noexcept
+    {
+        return _impl ? ::line_reader_batch_column_count(_impl) : 0;
+    }
+    int64_t request_id() const noexcept
+    {
+        return _impl ? ::line_reader_batch_request_id(_impl) : 0;
+    }
+    uint64_t seq() const noexcept
+    {
+        return _impl ? ::line_reader_batch_seq(_impl) : 0;
+    }
+    uint8_t flags() const noexcept
+    {
+        return _impl ? ::line_reader_batch_flags(_impl) : 0;
+    }
+
+    egress::column_kind column_kind(size_t col_idx) const
+    {
+        ensure_impl();
+        ::line_reader_column_kind k{};
+        line_reader_error::wrapped_call(
+            ::line_reader_batch_column_kind, _impl, col_idx, &k);
+        return static_cast<egress::column_kind>(k);
+    }
+
+    std::string_view column_name(size_t col_idx) const
+    {
+        ensure_impl();
+        const char* buf = nullptr;
+        size_t len = 0;
+        line_reader_error::wrapped_call(
+            ::line_reader_batch_column_name, _impl, col_idx, &buf, &len);
+        return std::string_view{buf, len};
+    }
+
+    /**
+     * Project the column at `col_idx`. Works for every kind — including
+     * `DOUBLE_ARRAY`. The returned `column` is polymorphic; check
+     * `col.kind()` or `col.is_array()` before calling kind-specific
+     * accessors. Internally probes the kind once, then calls the
+     * appropriate descriptor-fill C function.
+     */
+    egress::column column(size_t col_idx) const
+    {
+        ensure_impl();
+        ::line_reader_column_kind k_raw{};
+        line_reader_error::wrapped_call(
+            ::line_reader_batch_column_kind, _impl, col_idx, &k_raw);
+        if (k_raw == ::line_reader_column_kind_double_array)
+        {
+            ::line_reader_array_data d{};
+            line_reader_error::wrapped_call(
+                ::line_reader_batch_array_column_data, _impl, col_idx, &d);
+            return egress::column::make_array(d);
+        }
+        if (k_raw == ::line_reader_column_kind_long_array)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "batch::column: LONG_ARRAY is not supported in this revision"};
+        ::line_reader_column_data d{};
+        line_reader_error::wrapped_call(
+            ::line_reader_batch_column_data, _impl, col_idx, &d);
+        symbol_dict_view dict{};
+        if (d.kind == ::line_reader_column_kind_symbol)
+            dict = symbol_dict();
+        return egress::column::make_scalar(d, dict);
+    }
+
+    /** Snapshot the connection-scoped symbol dictionary. */
+    egress::symbol_dict_view symbol_dict() const
+    {
+        ensure_impl();
+        ::line_reader_symbol_dict d{};
+        line_reader_error::wrapped_call(
+            ::line_reader_batch_symbol_dict, _impl, &d);
+        return egress::symbol_dict_view{d};
+    }
+
+    /**
+     * Resolve a SYMBOL `code` in `col_idx` to its UTF-8 view. Convenience
+     * for scalar use; for bulk categorical construction use `symbol_dict()`.
+     */
+    std::string_view symbol(size_t col_idx, uint32_t code) const
+    {
+        ensure_impl();
+        const char* buf = nullptr;
+        size_t len = 0;
+        line_reader_error::wrapped_call(
+            ::line_reader_batch_symbol, _impl, col_idx, code, &buf, &len);
+        return std::string_view{buf, len};
+    }
+
+    const ::line_reader_batch* c_impl() const noexcept
+    {
+        return _impl;
+    }
+
+private:
+    void ensure_impl() const
+    {
+        if (!_impl)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "batch handle is invalid (no batch loaded)"};
+    }
+
+    const ::line_reader_batch* _impl;
 };
 
 /**
  * RAII handle for a streaming cursor.
  *
- * Obtained from `reader::execute`. Iterate batches with `next_batch()`,
- * which returns `false` when the stream terminates. Per-row scalar values
- * are read with the typed getters; each getter returns `std::nullopt` for
- * NULL cells.
+ * Obtained from `reader::execute`. Iterate batches with
+ * `while (auto batch = cur.next_batch()) { ... }` — `next_batch()` returns
+ * `std::optional<batch>` (empty when the stream terminates). Per-row scalar
+ * values are read with the typed getters; each getter returns
+ * `std::nullopt` for NULL cells.
  */
 class cursor
 {
@@ -1009,6 +2305,8 @@ public:
     cursor(cursor&& other) noexcept
         : _impl{other._impl}
         , _failover_callback{std::move(other._failover_callback)}
+        , _failover_progress_callback{
+              std::move(other._failover_progress_callback)}
     {
         other._impl = nullptr;
     }
@@ -1020,6 +2318,8 @@ public:
             ::line_reader_cursor_free(_impl);
             _impl = other._impl;
             _failover_callback = std::move(other._failover_callback);
+            _failover_progress_callback =
+                std::move(other._failover_progress_callback);
             other._impl = nullptr;
         }
         return *this;
@@ -1029,446 +2329,28 @@ public:
 
     /**
      * Advance to the next batch.
-     * @return true if a new batch is available; false if the stream ended.
-     * @throws line_reader_error on failure.
+     *
+     * @return `std::nullopt` when the stream terminates normally.
+     * @return A borrowed `egress::batch` on success — the entry point to
+     *         the columnar bulk access API (`batch::column`,
+     *         `batch::symbol_dict`). Invalidated by the next `next_batch`,
+     *         `cancel`, `add_credit`, cursor destruction, or mid-query
+     *         failover; do not cache across batches.
+     * @throws line_reader_error on transport / protocol failure.
      */
-    bool next_batch()
+    std::optional<egress::batch> next_batch()
     {
         ensure_impl();
         ::line_reader_error* c_err{nullptr};
-        const int rc = ::line_reader_cursor_next_batch(_impl, &c_err);
-        if (rc < 0) throw line_reader_error::from_c(c_err);
-        return rc > 0;
-    }
-
-    /** @throws line_reader_error if this cursor has been moved from. */
-    size_t row_count() const
-    {
-        ensure_impl();
-        return ::line_reader_cursor_row_count(_impl);
-    }
-
-    /** @throws line_reader_error if this cursor has been moved from. */
-    size_t column_count() const
-    {
-        ensure_impl();
-        return ::line_reader_cursor_column_count(_impl);
-    }
-
-    egress::column_kind column_kind(size_t col_idx) const
-    {
-        ensure_impl();
-        ::line_reader_column_kind k{};
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_column_kind, _impl, col_idx, &k);
-        return static_cast<egress::column_kind>(k);
-    }
-
-    /**
-     * Borrowed UTF-8 column name for `col_idx` in the current batch's
-     * schema.
-     *
-     * The returned `string_view` is invalidated by `next_batch()`,
-     * `cancel()`, cursor destruction, and mid-query failover (which can
-     * be triggered transparently by `next_batch()`). Do not cache it
-     * across batches — re-derive on every batch.
-     *
-     * @throws line_reader_error if no batch is loaded or `col_idx` is out
-     *         of range.
-     */
-    std::string_view column_name(size_t col_idx) const
-    {
-        ensure_impl();
-        const char* buf = nullptr;
-        size_t len = 0;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_column_name, _impl, col_idx, &buf, &len);
-        return std::string_view{buf, len};
-    }
-
-    /** Read a `BOOLEAN` value; `std::nullopt` if NULL. */
-    nullable<bool> get_bool(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        bool v = false, is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_bool,
-            _impl,
-            col_idx,
-            row_idx,
-            &v,
-            &is_null);
-        return is_null ? std::nullopt : std::optional<bool>{v};
-    }
-
-    /**
-     * Read a 64-bit integer value; `std::nullopt` if NULL. Accepts `LONG`,
-     * `TIMESTAMP` (μs), `DATE` (ms), and `TIMESTAMP_NANOS` (ns) — call
-     * `column_kind` to disambiguate units.
-     */
-    nullable<int64_t> get_i64(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        int64_t v = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_i64,
-            _impl,
-            col_idx,
-            row_idx,
-            &v,
-            &is_null);
-        return is_null ? std::nullopt : std::optional<int64_t>{v};
-    }
-
-    /** Read a `DOUBLE` value; `std::nullopt` if NULL. */
-    nullable<double> get_f64(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        double v = 0.0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_f64,
-            _impl,
-            col_idx,
-            row_idx,
-            &v,
-            &is_null);
-        return is_null ? std::nullopt : std::optional<double>{v};
-    }
-
-    /** Read a `BYTE` value. */
-    nullable<int8_t> get_i8(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        int8_t v = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_i8, _impl, col_idx, row_idx, &v, &is_null);
-        return is_null ? std::nullopt : std::optional<int8_t>{v};
-    }
-
-    /** Read a `SHORT` value. */
-    nullable<int16_t> get_i16(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        int16_t v = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_i16, _impl, col_idx, row_idx, &v, &is_null);
-        return is_null ? std::nullopt : std::optional<int16_t>{v};
-    }
-
-    /** Read an `INT` value. Throws on `IPV4` — use `get_ipv4`. */
-    nullable<int32_t> get_i32(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        int32_t v = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_i32, _impl, col_idx, row_idx, &v, &is_null);
-        return is_null ? std::nullopt : std::optional<int32_t>{v};
-    }
-
-    /** Read an `IPV4` value as `uint32_t` packed
-     *  `(a<<24)|(b<<16)|(c<<8)|d`. */
-    nullable<uint32_t> get_ipv4(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        uint32_t v = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_ipv4, _impl, col_idx, row_idx, &v, &is_null);
-        return is_null ? std::nullopt : std::optional<uint32_t>{v};
-    }
-
-    /** Read a `FLOAT` value. */
-    nullable<float> get_f32(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        float v = 0.0f;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_f32, _impl, col_idx, row_idx, &v, &is_null);
-        return is_null ? std::nullopt : std::optional<float>{v};
-    }
-
-    /** Read a `CHAR` value (16-bit UTF-16 code unit). */
-    nullable<uint16_t> get_char(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        uint16_t v = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_char, _impl, col_idx, row_idx, &v, &is_null);
-        return is_null ? std::nullopt : std::optional<uint16_t>{v};
-    }
-
-    /** Read a `UUID` value as 16 raw bytes. */
-    nullable<std::array<uint8_t, 16>> get_uuid(
-        size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        std::array<uint8_t, 16> v{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_uuid,
-            _impl,
-            col_idx,
-            row_idx,
-            v.data(),
-            &is_null);
-        if (is_null) return std::nullopt;
-        return v;
-    }
-
-    /** Read a `LONG256` value as 32 raw little-endian bytes. */
-    nullable<std::array<uint8_t, 32>> get_long256(
-        size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        std::array<uint8_t, 32> v{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_long256,
-            _impl,
-            col_idx,
-            row_idx,
-            v.data(),
-            &is_null);
-        if (is_null) return std::nullopt;
-        return v;
-    }
-
-    /**
-     * Read a `VARCHAR` value as a borrowed UTF-8 view. The view is valid
-     * until the next `next_batch()`, `cancel()`, or `add_credit()` call,
-     * or until this cursor is closed.
-     */
-    nullable<std::string_view> get_varchar(
-        size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        const char* buf = nullptr;
-        size_t len = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_varchar,
-            _impl,
-            col_idx,
-            row_idx,
-            &buf,
-            &len,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return std::string_view{buf, len};
-    }
-
-    nullable<binary_view> get_binary(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        const uint8_t* buf = nullptr;
-        size_t len = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_binary,
-            _impl,
-            col_idx,
-            row_idx,
-            &buf,
-            &len,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return binary_view{buf, len};
-    }
-
-    /** Read a `SYMBOL` resolved through the dictionary. Same lifetime
-     *  contract as `get_varchar`. */
-    nullable<std::string_view> get_symbol(
-        size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        const char* buf = nullptr;
-        size_t len = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_symbol,
-            _impl,
-            col_idx,
-            row_idx,
-            &buf,
-            &len,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return std::string_view{buf, len};
-    }
-
-    /** Read a `DECIMAL64` value (mantissa + scale). */
-    nullable<decimal64> get_decimal64(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        decimal64 d{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_decimal64,
-            _impl,
-            col_idx,
-            row_idx,
-            &d.mantissa,
-            &d.scale,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return d;
-    }
-
-    /** Read a `DECIMAL128` value (i64 limbs low/high + scale). */
-    nullable<decimal128> get_decimal128(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        decimal128 d{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_decimal128,
-            _impl,
-            col_idx,
-            row_idx,
-            &d.low,
-            &d.high,
-            &d.scale,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return d;
-    }
-
-    /** Read a `DECIMAL256` value (32 LE bytes + scale). */
-    nullable<decimal256> get_decimal256(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        decimal256 d{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_decimal256,
-            _impl,
-            col_idx,
-            row_idx,
-            d.bytes.data(),
-            &d.scale,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return d;
-    }
-
-    /** Read a `GEOHASH` value (zero-extended u64 + precision_bits). */
-    nullable<geohash> get_geohash(size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        geohash g{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_geohash,
-            _impl,
-            col_idx,
-            row_idx,
-            &g.value,
-            &g.precision_bits,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return g;
-    }
-
-    /** Read a `DOUBLE_ARRAY` row; `std::nullopt` if NULL. */
-    nullable<double_array_view> get_double_array(
-        size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        ::line_reader_double_array_view raw{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_double_array,
-            _impl,
-            col_idx,
-            row_idx,
-            &raw,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return double_array_view{
-            raw.shape, raw.ndim, raw.data, raw.data_len, raw.element_count};
-    }
-
-    /** Read a single `double` element at flat row-major index `flat_idx`;
-     *  `std::nullopt` if the row is NULL. Throws on type mismatch or
-     *  out-of-range indices. */
-    nullable<double> get_double_array_element(
-        size_t col_idx, size_t row_idx, size_t flat_idx) const
-    {
-        ensure_impl();
-        double v = 0.0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_double_array_element,
-            _impl,
-            col_idx,
-            row_idx,
-            flat_idx,
-            &v,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return v;
-    }
-
-    /** Read a `LONG_ARRAY` row; `std::nullopt` if NULL. */
-    nullable<long_array_view> get_long_array(
-        size_t col_idx, size_t row_idx) const
-    {
-        ensure_impl();
-        ::line_reader_long_array_view raw{};
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_long_array,
-            _impl,
-            col_idx,
-            row_idx,
-            &raw,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return long_array_view{
-            raw.shape, raw.ndim, raw.data, raw.data_len, raw.element_count};
-    }
-
-    /** Read a single `int64_t` element at flat row-major index `flat_idx`;
-     *  `std::nullopt` if the row is NULL. Throws on type mismatch or
-     *  out-of-range indices. */
-    nullable<int64_t> get_long_array_element(
-        size_t col_idx, size_t row_idx, size_t flat_idx) const
-    {
-        ensure_impl();
-        int64_t v = 0;
-        bool is_null = false;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_get_long_array_element,
-            _impl,
-            col_idx,
-            row_idx,
-            flat_idx,
-            &v,
-            &is_null);
-        if (is_null) return std::nullopt;
-        return v;
-    }
-
-    /**
-     * Borrow the raw LSB-first validity bitmap (bit 1 = null) for a column.
-     * Empty when the column has no nulls. The view is invalidated by
-     * `next_batch()`, `cancel()`, `add_credit()`, and by closing the cursor.
-     */
-    validity_view column_validity(size_t col_idx) const
-    {
-        ensure_impl();
-        const uint8_t* buf = nullptr;
-        size_t len = 0;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_column_validity, _impl, col_idx, &buf, &len);
-        return {buf, len};
+        const ::line_reader_batch* p =
+            ::line_reader_cursor_next_batch(_impl, &c_err);
+        if (!p)
+        {
+            if (c_err)
+                throw line_reader_error::from_c(c_err);
+            return std::nullopt;
+        }
+        return egress::batch{p};
     }
 
     // ---- Introspection -----------------------------------------------------
@@ -1513,36 +2395,25 @@ public:
         ensure_impl();
         return ::line_reader_cursor_current_addr_port(_impl);
     }
-
-    /** `request_id` of the current batch; `std::nullopt` if no batch loaded.
-     *  @throws line_reader_error if this cursor has been moved from. */
-    nullable<int64_t> batch_request_id() const
-    {
-        ensure_impl();
-        int64_t v = 0;
-        if (!::line_reader_cursor_batch_request_id(_impl, &v))
-            return std::nullopt;
-        return v;
-    }
-    /** `batch_seq` of the current batch; `std::nullopt` if no batch loaded.
-     *  @throws line_reader_error if this cursor has been moved from. */
-    nullable<uint64_t> batch_seq() const
-    {
-        ensure_impl();
-        uint64_t v = 0;
-        if (!::line_reader_cursor_batch_seq(_impl, &v))
-            return std::nullopt;
-        return v;
-    }
-    /** Per-batch wire flags; `std::nullopt` if no batch loaded.
-     *  @throws line_reader_error if this cursor has been moved from. */
-    nullable<uint8_t> batch_flags() const
+    /** Negotiated QWP version of the cursor's underlying connection.
+     *  @throws line_reader_error if the connection is poisoned after a
+     *          failed failover, or this cursor has been moved from. */
+    uint8_t server_version() const
     {
         ensure_impl();
         uint8_t v = 0;
-        if (!::line_reader_cursor_batch_flags(_impl, &v))
-            return std::nullopt;
+        line_reader_error::wrapped_call(
+            ::line_reader_cursor_server_version, _impl, &v);
         return v;
+    }
+    /** Last-seen `SERVER_INFO`, or empty for v1 servers. The view is
+     *  invalidated by any cursor operation that may reconnect.
+     *  @throws line_reader_error if this cursor has been moved from. */
+    server_info_view server_info() const
+    {
+        ensure_impl();
+        return server_info_view{
+            ::line_reader_cursor_current_server_info(_impl)};
     }
 
     /** @throws line_reader_error if this cursor has been moved from. */
@@ -1618,6 +2489,9 @@ private:
     /// The C trampoline holds a raw pointer to this object via `user_data`,
     /// so it MUST live as long as the cursor.
     std::unique_ptr<failover_callback> _failover_callback;
+    /// Same lifetime contract as `_failover_callback` but for the
+    /// progress callback registered via `query::on_failover_progress`.
+    std::unique_ptr<failover_progress_callback> _failover_progress_callback;
     friend class reader;
     friend class query;
 };
@@ -1640,6 +2514,7 @@ inline cursor query::execute()
 {
     ensure_impl();
     auto cb = std::move(_callback); // transfer to cursor (or drop on error)
+    auto pcb = std::move(_progress_callback);
     ::line_reader_error* c_err = nullptr;
     // The C call consumes `_impl` regardless of outcome and sets it to
     // NULL on return — so a subsequent `~query()` calling `_query_free`
@@ -1648,6 +2523,7 @@ inline cursor query::execute()
     if (!c) throw line_reader_error::from_c(c_err);
     cursor result{c};
     result._failover_callback = std::move(cb);
+    result._failover_progress_callback = std::move(pcb);
     return result;
 }
 

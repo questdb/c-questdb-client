@@ -32,14 +32,9 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
-/* Reuse `line_sender_utf8` for validated UTF-8 strings. */
+/* Reuse `line_sender_utf8` for validated UTF-8 strings, and the
+   `QUESTDB_CLIENT_API` / `QUESTDB_CLIENT_DYN_LIB` linkage macros. */
 #include "../ingress/line_sender.h"
-
-#if defined(LINESENDER_DYN_LIB) && defined(_MSC_VER)
-#    define LINEREADER_API __declspec(dllimport)
-#else
-#    define LINEREADER_API
-#endif
 
 /////////// Thread safety.
 //
@@ -103,7 +98,13 @@ extern "C" {
 // `line_reader_current_addr_host`, `line_reader_current_addr_port`, and
 // `line_reader_current_server_info` — read non-atomic state that the
 // cursor thread mutates during failover, and remain bound by the
-// one-thread-at-a-time rule.
+// one-thread-at-a-time rule. They additionally reject (error / NULL / 0,
+// see each function) while a `line_reader_query` or `line_reader_cursor`
+// produced by the reader is still live: the reader's connection state is
+// borrowed by that query/cursor. Either release it before reading
+// metadata, or read the same metadata through the cursor handle
+// (`line_reader_cursor_server_version`, `line_reader_cursor_current_server_info`,
+// `line_reader_cursor_current_addr_host` / `_port`).
 
 /////////// Pointer preconditions.
 //
@@ -197,7 +198,7 @@ typedef enum line_reader_error_code
  * Error code categorising the error.
  * NULL-safe: returns `line_reader_error_invalid_api_call` for a NULL input.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 line_reader_error_code line_reader_error_get_code(const line_reader_error*);
 
 /**
@@ -211,18 +212,19 @@ line_reader_error_code line_reader_error_get_code(const line_reader_error*);
  * NULL-safety so the canonical "log + free" pattern stays sound even
  * if a caller's bookkeeping leaves `err` as NULL on a particular path.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 const char* line_reader_error_msg(const line_reader_error*, size_t* len_out);
 
 /** Free the error returned via an `err_out` parameter. Idempotent on NULL. */
-LINEREADER_API
+QUESTDB_CLIENT_API
 void line_reader_error_free(line_reader_error*);
 
 /////////// Column kinds.
 
 /**
  * Column kind discriminant. Numeric values match the QWP wire codes.
- * Returned by `line_reader_cursor_column_kind`.
+ * Returned in `line_reader_column_data.kind` /
+ * `line_reader_array_data.kind` and by `line_reader_batch_column_kind`.
  */
 typedef enum line_reader_column_kind
 {
@@ -249,6 +251,12 @@ typedef enum line_reader_column_kind
     line_reader_column_kind_char            = 0x16,
     line_reader_column_kind_binary          = 0x17,
     line_reader_column_kind_ipv4            = 0x18,
+    /** Sentinel for column kinds the running FFI build doesn't
+     *  recognise. Emitted when the upstream Rust crate adds a new
+     *  `ColumnKind` variant the C ABI hasn't been recompiled against
+     *  yet. Treat as opaque: skip / log / surface to ops rather than
+     *  route on it. */
+    line_reader_column_kind_unknown         = 0xFF,
 } line_reader_column_kind;
 
 /////////// Reader.
@@ -277,7 +285,7 @@ typedef struct line_reader_query line_reader_query;
  * @param[out] err_out Set on error.
  * @return Reader handle or NULL.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 line_reader* line_reader_from_conf(
     line_sender_utf8 config,
     line_reader_error** err_out);
@@ -300,7 +308,7 @@ line_reader* line_reader_from_conf(
  * @param[out] err_out Set on error.
  * @return Reader handle or NULL.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 line_reader* line_reader_from_env(
     line_reader_error** err_out);
 
@@ -319,7 +327,7 @@ line_reader* line_reader_from_env(
  * allocation alias the live cursor's reference and cause silent memory
  * corruption. Free the cursor / query first to avoid the leak.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 void line_reader_close(line_reader* reader);
 
 /**
@@ -334,36 +342,38 @@ void line_reader_close(line_reader* reader);
  * "close while a query/cursor is live" as a programmable error before it
  * silently triggers the leak-on-active branch in `line_reader_close`.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 uint8_t line_reader_has_active_query(const line_reader* reader);
 
 /////////// Reader stats and connection info.
 
 /** Cumulative bytes received from the wire (header + payload). */
-LINEREADER_API uint64_t line_reader_bytes_received(const line_reader*);
+QUESTDB_CLIENT_API uint64_t line_reader_bytes_received(const line_reader*);
 
 /** Cumulative CREDIT bytes granted to the server across this reader. */
-LINEREADER_API uint64_t line_reader_credit_granted_total(const line_reader*);
+QUESTDB_CLIENT_API uint64_t
+line_reader_credit_granted_total(const line_reader*);
 
 /** Cumulative wall-clock nanoseconds spent in `read` calls (saturating). */
-LINEREADER_API uint64_t line_reader_read_ns(const line_reader*);
+QUESTDB_CLIENT_API uint64_t line_reader_read_ns(const line_reader*);
 
 /** Cumulative wall-clock nanoseconds spent decoding (saturating). */
-LINEREADER_API uint64_t line_reader_decode_ns(const line_reader*);
+QUESTDB_CLIENT_API uint64_t line_reader_decode_ns(const line_reader*);
 
 /** Reset the cumulative `read_ns` / `decode_ns` counters to zero. */
-LINEREADER_API void line_reader_reset_timing(line_reader*);
+QUESTDB_CLIENT_API void line_reader_reset_timing(line_reader*);
 
 /**
  * Get the negotiated QWP server version.
  *
  * Returns `false` and sets `*err_out` on failure: the connection is not
- * established yet (no `SERVER_INFO` received), or the `reader` handle is
- * NULL (surfaced as `line_reader_error_invalid_api_call` rather than
- * dereferenced). On success returns `true` and writes the version to
- * `*out_version`.
+ * established yet (no `SERVER_INFO` received), the `reader` handle is
+ * NULL, or a `line_reader_query` / `line_reader_cursor` produced by this
+ * reader is still live — all surfaced as
+ * `line_reader_error_invalid_api_call`. On success returns `true` and
+ * writes the version to `*out_version`.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 bool line_reader_server_version(
     const line_reader* reader,
     uint8_t* out_version,
@@ -372,15 +382,25 @@ bool line_reader_server_version(
 /**
  * Borrow the current endpoint host as a UTF-8 byte slice. The pointer is
  * invalidated by any reader operation that may reconnect.
+ *
+ * Writes an empty `(NULL, 0)` pair for a NULL handle, and also while a
+ * `line_reader_query` / `line_reader_cursor` produced by this reader is
+ * still live (release it first to read connection metadata).
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 void line_reader_current_addr_host(
     const line_reader* reader,
     const char** out_buf,
     size_t* out_len);
 
-/** Port of the endpoint the reader is currently connected to. */
-LINEREADER_API
+/**
+ * Port of the endpoint the reader is currently connected to.
+ *
+ * Returns `0` for a NULL handle, and also `0` while a `line_reader_query`
+ * / `line_reader_cursor` produced by this reader is still live (release it
+ * first to read connection metadata).
+ */
+QUESTDB_CLIENT_API
 uint16_t line_reader_current_addr_port(const line_reader* reader);
 
 /////////// SERVER_INFO.
@@ -408,40 +428,44 @@ typedef enum line_reader_server_role
 /**
  * Get the reader's last-seen `SERVER_INFO`, or NULL on v1 servers. The
  * pointer is invalidated by any reader operation that may reconnect.
+ *
+ * Also returns NULL while a `line_reader_query` / `line_reader_cursor`
+ * produced by this reader is still live (release it first to read
+ * connection metadata).
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 const line_reader_server_info* line_reader_current_server_info(const line_reader* reader);
 
 /** Cluster role advertised by `SERVER_INFO`. */
-LINEREADER_API line_reader_server_role line_reader_server_info_role(
-    const line_reader_server_info*);
+QUESTDB_CLIENT_API line_reader_server_role
+line_reader_server_info_role(const line_reader_server_info*);
 
 /** Raw role byte (useful when role() returns OTHER). */
-LINEREADER_API uint8_t line_reader_server_info_role_byte(
-    const line_reader_server_info*);
+QUESTDB_CLIENT_API uint8_t
+line_reader_server_info_role_byte(const line_reader_server_info*);
 
 /** Monotonic generation counter advertised by the server. Increases on
  *  failover/role transitions; useful for fencing replayed batches. */
-LINEREADER_API uint64_t line_reader_server_info_epoch(
-    const line_reader_server_info*);
+QUESTDB_CLIENT_API uint64_t
+line_reader_server_info_epoch(const line_reader_server_info*);
 
 /** Bitset of QWP capability flags negotiated with the server. */
-LINEREADER_API uint32_t line_reader_server_info_capabilities(
-    const line_reader_server_info*);
+QUESTDB_CLIENT_API uint32_t
+line_reader_server_info_capabilities(const line_reader_server_info*);
 
 /** Server's wall-clock time at handshake, in nanoseconds since the Unix
  *  epoch. Useful for skew detection. */
-LINEREADER_API int64_t line_reader_server_info_server_wall_ns(
-    const line_reader_server_info*);
+QUESTDB_CLIENT_API int64_t
+line_reader_server_info_server_wall_ns(const line_reader_server_info*);
 
 /** Cluster identifier as a UTF-8 byte slice. The buffer is borrowed and
  *  invalidated by any reader operation that may reconnect. */
-LINEREADER_API void line_reader_server_info_cluster_id(
+QUESTDB_CLIENT_API void line_reader_server_info_cluster_id(
     const line_reader_server_info*, const char** out_buf, size_t* out_len);
 
 /** Node identifier as a UTF-8 byte slice. Same lifetime contract as
  *  `_cluster_id`. */
-LINEREADER_API void line_reader_server_info_node_id(
+QUESTDB_CLIENT_API void line_reader_server_info_node_id(
     const line_reader_server_info*, const char** out_buf, size_t* out_len);
 
 /////////// Failover callback.
@@ -499,40 +523,215 @@ typedef void (*line_reader_failover_callback)(
 
 /** Host of the previously-connected endpoint that failed. UTF-8 byte slice
  *  borrowed for the duration of the callback. */
-LINEREADER_API void line_reader_failover_event_failed_host(
+QUESTDB_CLIENT_API void line_reader_failover_event_failed_host(
     const line_reader_failover_event*, const char** out_buf, size_t* out_len);
 /** Port of the previously-connected endpoint that failed. */
-LINEREADER_API uint16_t line_reader_failover_event_failed_port(
-    const line_reader_failover_event*);
+QUESTDB_CLIENT_API uint16_t
+line_reader_failover_event_failed_port(const line_reader_failover_event*);
 /** Host of the new endpoint the cursor is reconnecting to. UTF-8 byte slice
  *  borrowed for the duration of the callback. */
-LINEREADER_API void line_reader_failover_event_new_host(
+QUESTDB_CLIENT_API void line_reader_failover_event_new_host(
     const line_reader_failover_event*, const char** out_buf, size_t* out_len);
 /** Port of the new endpoint the cursor is reconnecting to. */
-LINEREADER_API uint16_t line_reader_failover_event_new_port(
-    const line_reader_failover_event*);
+QUESTDB_CLIENT_API uint16_t
+line_reader_failover_event_new_port(const line_reader_failover_event*);
 /** Request_id reissued on the new connection (the original request_id is
  *  invalidated by the failover; the cursor's request_id is updated). */
-LINEREADER_API int64_t line_reader_failover_event_new_request_id(
-    const line_reader_failover_event*);
+QUESTDB_CLIENT_API int64_t
+line_reader_failover_event_new_request_id(const line_reader_failover_event*);
 /** Number of reconnect attempts that preceded this success (1 on the first
  *  retry, etc.). */
-LINEREADER_API uint32_t line_reader_failover_event_attempts(
-    const line_reader_failover_event*);
+QUESTDB_CLIENT_API uint32_t
+line_reader_failover_event_attempts(const line_reader_failover_event*);
 /** Wall-clock nanoseconds spent reconnecting — sleep + dial + handshake +
  *  `SERVER_INFO` read. Saturating. */
-LINEREADER_API uint64_t line_reader_failover_event_elapsed_ns(
-    const line_reader_failover_event*);
+QUESTDB_CLIENT_API uint64_t
+line_reader_failover_event_elapsed_ns(const line_reader_failover_event*);
 /** Error code that triggered the failover (cause-of-death of the previous
  *  connection). */
-LINEREADER_API line_reader_error_code line_reader_failover_event_trigger_code(
-    const line_reader_failover_event*);
+QUESTDB_CLIENT_API line_reader_error_code
+line_reader_failover_event_trigger_code(const line_reader_failover_event*);
 /** Trigger error message (UTF-8). Borrowed for the duration of the call. */
-LINEREADER_API void line_reader_failover_event_trigger_msg(
+QUESTDB_CLIENT_API void line_reader_failover_event_trigger_msg(
     const line_reader_failover_event*, const char** out_buf, size_t* out_len);
 /** `SERVER_INFO` for the new endpoint, or NULL on v1 servers. */
-LINEREADER_API const line_reader_server_info* line_reader_failover_event_server_info(
-    const line_reader_failover_event*);
+QUESTDB_CLIENT_API const line_reader_server_info*
+line_reader_failover_event_server_info(const line_reader_failover_event*);
+
+/////////// Failover progress callback.
+
+/**
+ * Phase discriminant on `line_reader_failover_progress_event`. The
+ * same callback fires for every phase of a mid-query failover
+ * lifecycle — operators can route on the phase to feed SLO dashboards
+ * ("unreachable for N seconds" alerts), per-attempt retry telemetry,
+ * or a one-shot "gave up" notifier.
+ *
+ * Discriminants are explicit and append-only across releases —
+ * inserting a new phase in the middle would silently renumber later
+ * ones across recompiles, breaking ABI for shared-library consumers.
+ */
+typedef enum line_reader_failover_phase
+{
+    /** The cursor's connection just died. Fires once, BEFORE the retry
+     *  loop runs, so observers see the outage "now" rather than
+     *  retroactively when reconnect lands. */
+    line_reader_failover_phase_disconnected = 0,
+    /** A reconnect dial is about to be attempted. Fires once per
+     *  outer-loop iteration of the retry walk, AFTER the inter-attempt
+     *  backoff sleep, so `_elapsed_ns` already includes the backoff
+     *  wall-clock cost. */
+    line_reader_failover_phase_retrying = 1,
+    /** A reconnect succeeded; replayed batches will start arriving on
+     *  the new connection. Fires immediately BEFORE the
+     *  `line_reader_failover_callback` registered via
+     *  `line_reader_query_on_failover_reset` (when both are installed)
+     *  so a single sink sees the entire lifecycle in order. */
+    line_reader_failover_phase_reset = 2,
+    /** The retry budget is exhausted. The cursor is terminal; the
+     *  error returned to the caller is available via
+     *  `line_reader_failover_progress_event_final_error_*`. */
+    line_reader_failover_phase_gave_up = 3,
+    /** Sentinel for phases the running FFI build doesn't recognise.
+     *  Emitted when the upstream Rust crate adds a new
+     *  `FailoverPhase` variant the C ABI hasn't been recompiled
+     *  against yet. Treat as opaque: skip / log / surface to ops
+     *  rather than route on it. */
+    line_reader_failover_phase_unknown = 0xFF,
+} line_reader_failover_phase;
+
+/**
+ * Opaque borrowed handle to a failover-progress event. The pointer
+ * passed to your callback is valid only for the duration of that
+ * callback invocation.
+ */
+typedef struct line_reader_failover_progress_event line_reader_failover_progress_event;
+
+/**
+ * User callback fired at every phase of a mid-query failover
+ * lifecycle. The `event` pointer is valid only for the duration of
+ * the call.
+ *
+ * Reentrancy contract — identical to `line_reader_failover_callback`.
+ * The callback MUST NOT:
+ *
+ *  - Call any function on the originating `line_reader`, the
+ *    `line_reader_query` it produced, or the `line_reader_cursor`
+ *    whose operation is in flight. The trampoline runs synchronously
+ *    inside `line_reader_cursor_next_batch` (or `_cursor_cancel` /
+ *    `_cursor_add_credit`) while the upstream code is mid-mutation of
+ *    the underlying `Reader` and `Cursor`. Any reentrant FFI call
+ *    would alias the in-flight `&mut Reader` and corrupt internal
+ *    state — this is undefined behaviour. Read-only stat getters are
+ *    NOT safe from inside the callback for the same aliasing reason.
+ *
+ *  - Throw a C++ exception, `longjmp`, or otherwise unwind out of the
+ *    callback. The trampoline wraps the user callback in
+ *    `catch_unwind` and `abort()`s the process if an unwind escapes.
+ *
+ *  - Block indefinitely or perform long-running work. The callback
+ *    runs synchronously on the thread driving the in-flight cursor
+ *    operation; while it is executing, no batch is being read, no
+ *    CREDIT is being granted to the server, and the failover loop
+ *    cannot make progress. Keep the callback bounded — clear an
+ *    accumulator, set a flag, signal a condition variable — and do
+ *    any heavy work outside the cursor's drive thread.
+ *
+ * The callback runs on the thread driving the in-flight cursor
+ * operation.
+ */
+typedef void (*line_reader_failover_progress_callback)(
+    const line_reader_failover_progress_event* event,
+    void* user_data);
+
+/** Phase of this event. NULL-safe: returns
+ *  `line_reader_failover_phase_disconnected` for a NULL handle. */
+QUESTDB_CLIENT_API line_reader_failover_phase
+line_reader_failover_progress_event_phase(
+    const line_reader_failover_progress_event*);
+
+/** Host of the endpoint that died. UTF-8 byte slice borrowed for the
+ *  duration of the callback. Set on every phase. */
+QUESTDB_CLIENT_API void line_reader_failover_progress_event_failed_host(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
+
+/** Port of the endpoint that died. Set on every phase. */
+QUESTDB_CLIENT_API uint16_t line_reader_failover_progress_event_failed_port(
+    const line_reader_failover_progress_event*);
+
+/** Host of the new endpoint (Reset phase only). UTF-8 byte slice
+ *  borrowed for the duration of the callback. Writes `(NULL, 0)` in
+ *  every other phase. */
+QUESTDB_CLIENT_API void line_reader_failover_progress_event_new_host(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
+
+/** Port of the new endpoint (Reset phase only). Returns `0` in every
+ *  other phase. */
+QUESTDB_CLIENT_API uint16_t line_reader_failover_progress_event_new_port(
+    const line_reader_failover_progress_event*);
+
+/** New `request_id` (Reset phase only). Returns `true` and writes the
+ *  id to `*out_request_id` on Reset; returns `false` and writes `0` in
+ *  every other phase. */
+QUESTDB_CLIENT_API bool line_reader_failover_progress_event_new_request_id(
+    const line_reader_failover_progress_event*,
+    int64_t* out_request_id);
+
+/** 1-based attempt counter:
+ *  - `0` on Disconnected (no attempt yet).
+ *  - `N >= 1` on Retrying for the Nth dial.
+ *  - On Reset, the attempt that landed.
+ *  - On GaveUp, the total number of attempts burned. May be `0` when
+ *    the wall-clock deadline was already exhausted before any dial. */
+QUESTDB_CLIENT_API uint32_t line_reader_failover_progress_event_attempt(
+    const line_reader_failover_progress_event*);
+
+/** Error code that triggered the failover (the original cause-of-
+ *  death). Preserved across every phase so subscribers see consistent
+ *  context regardless of when they latch on. */
+QUESTDB_CLIENT_API line_reader_error_code
+line_reader_failover_progress_event_trigger_code(
+    const line_reader_failover_progress_event*);
+
+/** Trigger error message (UTF-8). Borrowed for the duration of the
+ *  callback. */
+QUESTDB_CLIENT_API void line_reader_failover_progress_event_trigger_msg(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
+
+/** Wall-clock nanoseconds since the disconnect was observed (the
+ *  start of the failover cycle). Monotonically non-decreasing across
+ *  phases of the same event. Saturating. */
+QUESTDB_CLIENT_API uint64_t line_reader_failover_progress_event_elapsed_ns(
+    const line_reader_failover_progress_event*);
+
+/** `SERVER_INFO` for the new endpoint, or NULL outside the Reset
+ *  phase / on v1 servers. */
+QUESTDB_CLIENT_API const line_reader_server_info*
+line_reader_failover_progress_event_server_info(
+    const line_reader_failover_progress_event*);
+
+/** Final error code (GaveUp phase only). Returns `true` and writes
+ *  the code to `*out_code` on GaveUp; returns `false` and writes
+ *  `line_reader_error_invalid_api_call` in every other phase. The
+ *  code matches what the cursor's next `_next_batch` / `_add_credit`
+ *  call will surface. */
+QUESTDB_CLIENT_API bool line_reader_failover_progress_event_final_error_code(
+    const line_reader_failover_progress_event*,
+    line_reader_error_code* out_code);
+
+/** Final error message (GaveUp phase only). Returns `true` and writes
+ *  the borrowed UTF-8 message on GaveUp; returns `false` and writes
+ *  `(NULL, 0)` in every other phase. */
+QUESTDB_CLIENT_API bool line_reader_failover_progress_event_final_error_msg(
+    const line_reader_failover_progress_event*,
+    const char** out_buf,
+    size_t* out_len);
 
 /////////// Query builder.
 
@@ -560,7 +759,7 @@ LINEREADER_API const line_reader_server_info* line_reader_failover_event_server_
  *
  * @return Query handle, or NULL on error.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 line_reader_query* line_reader_prepare(
     line_reader* reader,
     line_sender_utf8 sql,
@@ -573,7 +772,7 @@ line_reader_query* line_reader_prepare(
  * `_query_execute` nulls the caller's `line_reader_query*` on
  * consumption, so `_query_free(query)` afterwards is a NULL no-op.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 void line_reader_query_free(line_reader_query* query);
 
 /**
@@ -590,7 +789,7 @@ void line_reader_query_free(line_reader_query* query);
  * On success, ownership transfers to the returned cursor; on failure,
  * `*err_out` is set and NULL is returned.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 line_reader_cursor* line_reader_query_execute(
     line_reader_query** query_inout,
     line_reader_error** err_out);
@@ -607,7 +806,7 @@ line_reader_cursor* line_reader_query_execute(
  * (`line_reader_error_invalid_api_call`), or the server rejects the
  * statement.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 line_reader_cursor* line_reader_execute(
     line_reader* reader,
     line_sender_utf8 sql,
@@ -627,51 +826,56 @@ line_reader_cursor* line_reader_execute(
  * caused by index drift. To recover, drop the query and rebuild. */
 
 /** Bind a BOOLEAN positional parameter. */
-LINEREADER_API void line_reader_query_bind_bool(line_reader_query*, bool v);
+QUESTDB_CLIENT_API void line_reader_query_bind_bool(line_reader_query*, bool v);
 
 /** Bind a BYTE (signed 8-bit) positional parameter. */
-LINEREADER_API void line_reader_query_bind_i8(line_reader_query*, int8_t v);
+QUESTDB_CLIENT_API void line_reader_query_bind_i8(line_reader_query*, int8_t v);
 
 /** Bind a SHORT (signed 16-bit) positional parameter. */
-LINEREADER_API void line_reader_query_bind_i16(line_reader_query*, int16_t v);
+QUESTDB_CLIENT_API void line_reader_query_bind_i16(
+    line_reader_query*, int16_t v);
 
 /** Bind an INT (signed 32-bit) positional parameter. */
-LINEREADER_API void line_reader_query_bind_i32(line_reader_query*, int32_t v);
+QUESTDB_CLIENT_API void line_reader_query_bind_i32(
+    line_reader_query*, int32_t v);
 
 /** Bind a LONG (signed 64-bit) positional parameter. */
-LINEREADER_API void line_reader_query_bind_i64(line_reader_query*, int64_t v);
+QUESTDB_CLIENT_API void line_reader_query_bind_i64(
+    line_reader_query*, int64_t v);
 
 /** Bind a FLOAT (32-bit IEEE-754) positional parameter. */
-LINEREADER_API void line_reader_query_bind_f32(line_reader_query*, float v);
+QUESTDB_CLIENT_API void line_reader_query_bind_f32(line_reader_query*, float v);
 
 /** Bind a DOUBLE (64-bit IEEE-754) positional parameter. */
-LINEREADER_API void line_reader_query_bind_f64(line_reader_query*, double v);
+QUESTDB_CLIENT_API void line_reader_query_bind_f64(
+    line_reader_query*, double v);
 
 /** Bind a TIMESTAMP positional parameter as microseconds since the Unix epoch. */
-LINEREADER_API void line_reader_query_bind_timestamp_micros(
+QUESTDB_CLIENT_API void line_reader_query_bind_timestamp_micros(
     line_reader_query*, int64_t v);
 
 /** Bind a TIMESTAMP_NANOS positional parameter as nanoseconds since the Unix epoch. */
-LINEREADER_API void line_reader_query_bind_timestamp_nanos(
+QUESTDB_CLIENT_API void line_reader_query_bind_timestamp_nanos(
     line_reader_query*, int64_t v);
 
 /** Bind a DATE positional parameter as milliseconds since the Unix epoch. */
-LINEREADER_API void line_reader_query_bind_date_millis(
+QUESTDB_CLIENT_API void line_reader_query_bind_date_millis(
     line_reader_query*, int64_t v);
 
 /** Bind a CHAR positional parameter as a UTF-16 code unit. */
-LINEREADER_API void line_reader_query_bind_char(line_reader_query*, uint16_t v);
+QUESTDB_CLIENT_API void line_reader_query_bind_char(
+    line_reader_query*, uint16_t v);
 
 /** Bind a DECIMAL64 positional parameter: signed 64-bit mantissa `v` and
  *  column `scale` (number of fractional digits). The decimal value is
  *  `v * 10^(-scale)`. */
-LINEREADER_API void line_reader_query_bind_decimal64(
+QUESTDB_CLIENT_API void line_reader_query_bind_decimal64(
     line_reader_query*, int64_t v, int8_t scale);
 
 /** Bind a GEOHASH positional parameter. `v` is the bit-packed geohash payload
  *  (LSB-aligned); `precision_bits` is the number of significant bits
  *  (1–60 inclusive, per the QuestDB type system). */
-LINEREADER_API void line_reader_query_bind_geohash(
+QUESTDB_CLIENT_API void line_reader_query_bind_geohash(
     line_reader_query*, uint64_t v, uint8_t precision_bits);
 
 /** Bind a UTF-8 VARCHAR value. The bytes are copied.
@@ -681,7 +885,7 @@ LINEREADER_API void line_reader_query_bind_geohash(
  *  surfaced from `line_reader_query_execute` as
  *  `line_reader_error_invalid_utf8` (first-error-wins; later binds and the
  *  builder state are not touched once a deferred error is set). */
-LINEREADER_API void line_reader_query_bind_varchar(
+QUESTDB_CLIENT_API void line_reader_query_bind_varchar(
     line_reader_query*, line_sender_utf8 v);
 
 /** Bind a BINARY value. The bytes are copied. `buf` may be NULL when
@@ -689,7 +893,7 @@ LINEREADER_API void line_reader_query_bind_varchar(
  *  must be non-NULL and point to at least `len` readable bytes — a NULL
  *  `buf` with non-zero `len` aborts the process, matching the policy of
  *  `line_reader_query_bind_uuid`. */
-LINEREADER_API void line_reader_query_bind_binary(
+QUESTDB_CLIENT_API void line_reader_query_bind_binary(
     line_reader_query*, const uint8_t* buf, size_t len);
 
 /** Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and point
@@ -698,7 +902,7 @@ LINEREADER_API void line_reader_query_bind_binary(
  *  `00000000-0000-0000-0000-000000000000` UUID and corrupt the query. To bind
  *  SQL NULL, call `line_reader_query_bind_null` with
  *  `line_reader_column_kind_uuid` instead. */
-LINEREADER_API void line_reader_query_bind_uuid(
+QUESTDB_CLIENT_API void line_reader_query_bind_uuid(
     line_reader_query*, const uint8_t value[16]);
 
 /** Bind a 32-byte LONG256 value (raw little-endian bytes). `value` MUST be
@@ -706,11 +910,11 @@ LINEREADER_API void line_reader_query_bind_uuid(
  *  process for the same reason as `line_reader_query_bind_uuid`. To bind SQL
  *  NULL, call `line_reader_query_bind_null` with
  *  `line_reader_column_kind_long256`. */
-LINEREADER_API void line_reader_query_bind_long256(
+QUESTDB_CLIENT_API void line_reader_query_bind_long256(
     line_reader_query*, const uint8_t value[32]);
 
 /** Bind an IPv4 address as a host-order `uint32_t`. */
-LINEREADER_API void line_reader_query_bind_ipv4(
+QUESTDB_CLIENT_API void line_reader_query_bind_ipv4(
     line_reader_query*, uint32_t host_order);
 
 /**
@@ -726,7 +930,7 @@ LINEREADER_API void line_reader_query_bind_ipv4(
  * Always pass the high limb as `int64_t` — using `uint64_t` zero-extends
  * and corrupts negative values.
  */
-LINEREADER_API void line_reader_query_bind_decimal128(
+QUESTDB_CLIENT_API void line_reader_query_bind_decimal128(
     line_reader_query*,
     uint64_t mantissa_lo,
     int64_t mantissa_hi,
@@ -737,46 +941,44 @@ LINEREADER_API void line_reader_query_bind_decimal128(
  *  `value` aborts the process for the same reason as
  *  `line_reader_query_bind_uuid`. To bind SQL NULL, call
  *  `line_reader_query_bind_null_decimal256(query, scale)`. */
-LINEREADER_API void line_reader_query_bind_decimal256(
-    line_reader_query*,
-    const uint8_t value[32],
-    int8_t scale);
+QUESTDB_CLIENT_API void line_reader_query_bind_decimal256(
+    line_reader_query*, const uint8_t value[32], int8_t scale);
 
 /**
  * Bind a typed NULL for one of the simple column kinds (numeric, temporal,
  * UUID, etc.). For VARCHAR / BINARY / DECIMAL* / GEOHASH use the
  * dedicated `_null_*` variants below since those carry extra column metadata.
  */
-LINEREADER_API void line_reader_query_bind_null(
+QUESTDB_CLIENT_API void line_reader_query_bind_null(
     line_reader_query*, line_reader_column_kind kind);
 
 /** Bind a SQL NULL of column kind VARCHAR. */
-LINEREADER_API void line_reader_query_bind_null_varchar(line_reader_query*);
+QUESTDB_CLIENT_API void line_reader_query_bind_null_varchar(line_reader_query*);
 
 /** Bind a SQL NULL of column kind BINARY. */
-LINEREADER_API void line_reader_query_bind_null_binary(line_reader_query*);
+QUESTDB_CLIENT_API void line_reader_query_bind_null_binary(line_reader_query*);
 
 /** Bind a SQL NULL of column kind DECIMAL64 with the given column `scale`. */
-LINEREADER_API void line_reader_query_bind_null_decimal64(
+QUESTDB_CLIENT_API void line_reader_query_bind_null_decimal64(
     line_reader_query*, int8_t scale);
 
 /** Bind a SQL NULL of column kind DECIMAL128 with the given column `scale`. */
-LINEREADER_API void line_reader_query_bind_null_decimal128(
+QUESTDB_CLIENT_API void line_reader_query_bind_null_decimal128(
     line_reader_query*, int8_t scale);
 
 /** Bind a SQL NULL of column kind DECIMAL256 with the given column `scale`. */
-LINEREADER_API void line_reader_query_bind_null_decimal256(
+QUESTDB_CLIENT_API void line_reader_query_bind_null_decimal256(
     line_reader_query*, int8_t scale);
 
 /** Bind a SQL NULL of column kind GEOHASH with the given `precision_bits`. */
-LINEREADER_API void line_reader_query_bind_null_geohash(
+QUESTDB_CLIENT_API void line_reader_query_bind_null_geohash(
     line_reader_query*, uint8_t precision_bits);
 
 /**
  * Set the initial CREDIT (in bytes; `0` = unbounded). Mirrors
  * `ReaderQuery::initial_credit`.
  */
-LINEREADER_API void line_reader_query_initial_credit(
+QUESTDB_CLIENT_API void line_reader_query_initial_credit(
     line_reader_query*, uint64_t credit);
 
 /**
@@ -792,9 +994,35 @@ LINEREADER_API void line_reader_query_initial_credit(
  * process), and MUST NOT block — it runs synchronously in the cursor's
  * drive thread and stalls the whole stream while it executes.
  */
-LINEREADER_API void line_reader_query_on_failover_reset(
+QUESTDB_CLIENT_API void line_reader_query_on_failover_reset(
     line_reader_query* query,
     line_reader_failover_callback callback,
+    void* user_data);
+
+/**
+ * Install a failover-progress callback on the query. Replaces any
+ * previously installed progress callback. `user_data` is opaque to
+ * the library; pass NULL if not needed. The callback fires at every
+ * phase of a mid-query failover lifecycle — see
+ * `line_reader_failover_phase`.
+ *
+ * Installing this callback also opts the cursor in to "I will handle
+ * replay-after-data-delivered correctly," the same way
+ * `line_reader_query_on_failover_reset` does — either being installed
+ * clears the silent-duplicate guard documented on
+ * `line_reader_cursor_next_batch`. If you only want telemetry and not
+ * replay semantics, set `failover=off` instead.
+ *
+ * See `line_reader_failover_progress_callback` for the full
+ * reentrancy contract: the callback MUST NOT call back into the
+ * originating reader / query / cursor, MUST NOT throw or `longjmp`
+ * (an escaping unwind aborts the process), and MUST NOT block — it
+ * runs synchronously in the cursor's drive thread and stalls the
+ * whole failover loop while it executes.
+ */
+QUESTDB_CLIENT_API void line_reader_query_on_failover_progress(
+    line_reader_query* query,
+    line_reader_failover_progress_callback callback,
     void* user_data);
 
 /////////// Cursor.
@@ -825,436 +1053,253 @@ LINEREADER_API void line_reader_query_on_failover_reset(
  * network transport is the reader, freed via `line_reader_close`; every
  * other handle, including this per-query cursor, uses `_free`.
  */
-LINEREADER_API
+QUESTDB_CLIENT_API
 void line_reader_cursor_free(line_reader_cursor* cursor);
+
+/////////// Batch and column access.
+//
+// `line_reader_batch` is a borrowed handle for the cursor's
+// currently-loaded batch. The columnar entry point: a caller projects a
+// whole column into a contiguous descriptor with a single FFI call, then
+// indexes the dense buffer by row. For casual single-cell reads, the
+// inline helpers in `line_reader_helpers.h` package the index + validity
+// probe + typed load over a filled descriptor.
+//
+// Lifetime: the handle and every pointer reachable through its descriptors
+// borrow from the batch. They are invalidated by the next
+// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`, or
+// `line_reader_cursor_free` on the owning cursor, and by mid-query failover
+// (transparently triggered by `line_reader_cursor_next_batch`). Do not
+// cache them across batches; re-derive after every `next_batch`. The handle
+// is never freed by the caller.
+
+/** Opaque handle for the batch currently loaded in a cursor. */
+typedef struct line_reader_batch line_reader_batch;
 
 /**
  * Advance to the next batch.
  *
- * @return  1 — a new batch is available; column accessors are now valid.
- * @return  0 — the stream has terminated normally; no batch is available.
- * @return -1 — an error occurred; `*err_out` is set and the cursor must be freed.
+ * @return Non-NULL borrowed batch handle on a new batch. The pointer is
+ *         invalidated by the next `line_reader_cursor_next_batch`,
+ *         `line_reader_cursor_cancel`, `line_reader_cursor_free`, or
+ *         mid-query failover.
+ * @return NULL with `*err_out` left untouched when the stream has
+ *         terminated normally — no batch is available.
+ * @return NULL with `*err_out` set on error; the cursor must be freed.
  */
-LINEREADER_API
-int line_reader_cursor_next_batch(
+QUESTDB_CLIENT_API
+const line_reader_batch* line_reader_cursor_next_batch(
     line_reader_cursor* cursor,
     line_reader_error** err_out);
 
-/** Number of rows in the current batch. Returns 0 when no batch is loaded. */
-LINEREADER_API
-size_t line_reader_cursor_row_count(const line_reader_cursor* cursor);
+/** Rows in the batch. Returns 0 on a NULL handle. */
+QUESTDB_CLIENT_API
+size_t line_reader_batch_row_count(const line_reader_batch* batch);
 
-/** Number of columns in the current batch. Returns 0 when no batch is loaded. */
-LINEREADER_API
-size_t line_reader_cursor_column_count(const line_reader_cursor* cursor);
+/** Columns in the batch. Returns 0 on a NULL handle. */
+QUESTDB_CLIENT_API
+size_t line_reader_batch_column_count(const line_reader_batch* batch);
+
+/** `request_id` echoed from the originating QUERY_REQUEST. 0 on a NULL handle.
+ */
+QUESTDB_CLIENT_API
+int64_t line_reader_batch_request_id(const line_reader_batch* batch);
+
+/** Monotonic per-request batch sequence number. 0 on a NULL handle. */
+QUESTDB_CLIENT_API
+uint64_t line_reader_batch_seq(const line_reader_batch* batch);
+
+/** Per-batch wire flags from the frame header. 0 on a NULL handle. */
+QUESTDB_CLIENT_API
+uint8_t line_reader_batch_flags(const line_reader_batch* batch);
 
 /**
- * Get the kind discriminant for a column in the current batch.
+ * Kind discriminant for the column at `col_idx`.
  *
- * @param[in] cursor Cursor with a loaded batch.
+ * @param[in] batch Batch handle.
  * @param[in] col_idx Column index in `[0, column_count)`.
  * @param[out] out_kind Set to the column kind on success.
  * @param[out] err_out Set on error.
- * @return true on success, false on error.
+ * @return true on success, false on a NULL handle / out-param or an
+ *         out-of-range index.
  */
-LINEREADER_API
-bool line_reader_cursor_column_kind(
-    const line_reader_cursor* cursor,
+QUESTDB_CLIENT_API
+bool line_reader_batch_column_kind(
+    const line_reader_batch* batch,
     size_t col_idx,
     line_reader_column_kind* out_kind,
     line_reader_error** err_out);
 
 /**
- * Borrowed UTF-8 column name for the column at `col_idx` in the current
- * batch's schema. The string is NOT null-terminated; use `*out_len`.
+ * Borrowed UTF-8 column name for `col_idx`. NOT null-terminated; use
+ * `*out_len`. Borrowed from the batch — see the section-level lifetime note.
  *
- * The pointer is borrowed from the currently-loaded batch and is invalidated
- * by any subsequent call to `line_reader_cursor_next_batch`,
- * `line_reader_cursor_cancel`, or `line_reader_cursor_free` on this cursor.
- * Mid-query failover (transparently triggered by `line_reader_cursor_next_batch`)
- * also invalidates the pointer, because the per-connection schema registry
- * is replaced with the reconnected endpoint's. Re-derive the pointer from
- * `line_reader_cursor_column_name` on every batch — do not cache it.
- *
- * @param[in] cursor Cursor with a loaded batch.
- * @param[in] col_idx Column index in `[0, column_count)`.
- * @param[out] out_buf Set to a pointer to the borrowed bytes on success.
- * @param[out] out_len Set to the byte length on success.
- * @param[out] err_out Set on error.
- * @return true on success, false on error (no batch loaded or
- *         out-of-range index).
+ * @return true on success, false on a NULL handle / out-param or an
+ *         out-of-range index.
  */
-LINEREADER_API
-bool line_reader_cursor_column_name(
-    const line_reader_cursor* cursor,
+QUESTDB_CLIENT_API
+bool line_reader_batch_column_name(
+    const line_reader_batch* batch,
     size_t col_idx,
     const char** out_buf,
     size_t* out_len,
     line_reader_error** err_out);
 
-/////////// Per-kind getters (vertical-slice subset).
-//
-// All getters return a (value, is_null) pair for `(col_idx, row_idx)`. They
-// fail with `line_reader_error_invalid_api_call` if the column kind doesn't
-// match, the cursor has no loaded batch, or the indices are out of range.
-
-/** Read a `BOOLEAN` value. */
-LINEREADER_API
-bool line_reader_cursor_get_bool(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    bool* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
 /**
- * Read a 64-bit integer value. Accepts `LONG`, `TIMESTAMP` (μs),
- * `DATE` (ms), and `TIMESTAMP_NANOS` (ns) — call
- * `line_reader_cursor_column_kind` to disambiguate units.
- */
-LINEREADER_API
-bool line_reader_cursor_get_i64(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    int64_t* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/** Read a `DOUBLE` value. */
-LINEREADER_API
-bool line_reader_cursor_get_f64(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    double* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/** Read a `BYTE` value. */
-LINEREADER_API
-bool line_reader_cursor_get_i8(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    int8_t* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/** Read a `SHORT` value. */
-LINEREADER_API
-bool line_reader_cursor_get_i16(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    int16_t* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read an `INT` (signed 32-bit) value. Rejects `IPV4` columns — use
- * `line_reader_cursor_get_ipv4` for those. Reinterpreting an IPv4
- * address through a signed 32-bit getter would silently flip the sign
- * for any address ≥ 128.0.0.0.
- */
-LINEREADER_API
-bool line_reader_cursor_get_i32(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    int32_t* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read an `IPV4` value as a `uint32_t` packed `(a<<24)|(b<<16)|(c<<8)|d`
- * for `a.b.c.d`. Round-trip safe with `line_reader_query_bind_ipv4`.
- */
-LINEREADER_API
-bool line_reader_cursor_get_ipv4(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    uint32_t* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/** Read a `FLOAT` value. */
-LINEREADER_API
-bool line_reader_cursor_get_f32(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    float* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/** Read a `CHAR` value (16-bit UTF-16 code unit, per QuestDB semantics). */
-LINEREADER_API
-bool line_reader_cursor_get_char(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    uint16_t* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `UUID` value as 16 raw bytes. `out_value` must point to at least
- * 16 writable bytes. On a NULL row, `out_value` is zeroed.
- */
-LINEREADER_API
-bool line_reader_cursor_get_uuid(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    uint8_t out_value[16],
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `LONG256` value as 32 raw little-endian bytes. `out_value` must
- * point to at least 32 writable bytes. On a NULL row, `out_value` is zeroed.
- */
-LINEREADER_API
-bool line_reader_cursor_get_long256(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    uint8_t out_value[32],
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `VARCHAR` value as a borrowed UTF-8 byte slice. The returned
- * pointer is valid until the next `line_reader_cursor_next_batch`,
- * `line_reader_cursor_cancel`, or `line_reader_cursor_add_credit` call,
- * or until the cursor is closed. The string is NOT null-terminated.
- * On a NULL row, `*out_buf` is set to NULL.
- */
-LINEREADER_API
-bool line_reader_cursor_get_varchar(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    const char** out_buf,
-    size_t* out_len,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `BINARY` value as a borrowed byte slice. Same lifetime contract
- * as `line_reader_cursor_get_varchar`.
- */
-LINEREADER_API
-bool line_reader_cursor_get_binary(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    const uint8_t** out_buf,
-    size_t* out_len,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `SYMBOL` value as a UTF-8 byte slice resolved through the
- * connection-scoped symbol dictionary. Same lifetime contract as
- * `line_reader_cursor_get_varchar`.
- */
-LINEREADER_API
-bool line_reader_cursor_get_symbol(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    const char** out_buf,
-    size_t* out_len,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/** Read a `DECIMAL64` mantissa plus the column's scale. */
-LINEREADER_API
-bool line_reader_cursor_get_decimal64(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    int64_t* out_mantissa,
-    int8_t* out_scale,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `DECIMAL128` mantissa as two limbs (`uint64_t` low + `int64_t`
- * high) plus column scale. The mantissa is split bit-for-bit: `*out_low`
- * is the low 64 bits, `*out_high` is the upper 64 bits reinterpreted as
- * `int64_t` so the sign of the original i128 is preserved by the C type
- * itself. Reconstruct as
- * `(int128_t)(((uint128_t)(uint64_t)*out_high << 64) | *out_low)` — the
- * cast-through-`uint64_t` avoids sign-extending the high limb a second
- * time during the shift.
- */
-LINEREADER_API
-bool line_reader_cursor_get_decimal128(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    uint64_t* out_low,
-    int64_t* out_high,
-    int8_t* out_scale,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `DECIMAL256` mantissa as 32 raw little-endian bytes plus column
- * scale. `out_value` must point to at least 32 writable bytes. On a NULL
- * row, `out_value` is zeroed.
- */
-LINEREADER_API
-bool line_reader_cursor_get_decimal256(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    uint8_t out_value[32],
-    int8_t* out_scale,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `GEOHASH` value zero-extended to a `uint64_t`, plus the column's
- * `precision_bits` (in `1..=60`).
- */
-LINEREADER_API
-bool line_reader_cursor_get_geohash(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    uint64_t* out_value,
-    uint8_t* out_precision_bits,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Borrowed view over a single `DOUBLE_ARRAY` row.
+ * Bulk descriptor for one scalar / variable-width column. Every pointer
+ * borrows from the batch (see the section-level lifetime note).
  *
- * All pointers are valid until the next `line_reader_cursor_next_batch`,
- * `line_reader_cursor_cancel`, or `line_reader_cursor_add_credit` call,
- * or until the cursor is closed. `shape` is row-major (innermost
- * dimension last). `data` is concatenated little-endian `double` bytes
- * (`element_count == data_len / 8`).
- *
- * Pointer/length symmetry: `data_len == 0` implies `data == NULL`, and
- * `ndim == 0` implies `shape == NULL` (so a defensive `if (view.data)`
- * check is sound). Both empty cases are unambiguous: a NULL row sets
- * `*out_is_null = true` and zeroes every field; a non-null row whose
- * shape produces zero elements (e.g. `[2, 0, 3]`) leaves `*out_is_null
- * = false` but still writes `data == NULL` and `data_len == 0`.
+ * `values` holds the wire's little-endian bytes — the decoder does not
+ * byte-swap. A fixed-width slot whose `validity` bit is set still contains
+ * a value (QuestDB's NULL sentinel); consult `validity` first.
  */
-typedef struct line_reader_double_array_view
+typedef struct line_reader_column_data
 {
-    const uint32_t* shape;
-    size_t ndim;
+    /** Wire kind of the column. */
+    line_reader_column_kind kind;
+    /** Rows in the batch (equals `line_reader_batch_row_count`). */
+    size_t row_count;
+    /** LSB-first null bitmap, `ceil(row_count / 8)` bytes; bit 1 = NULL.
+        NULL when the column carries no nulls. */
+    const uint8_t* validity;
+    /** Dense little-endian values, `row_count * value_stride` bytes.
+        NULL for variable-width kinds (VARCHAR / BINARY / SYMBOL). */
+    const void* values;
+    /** Bytes per fixed-width value; 0 for variable-width kinds. */
+    size_t value_stride;
+    /** VARCHAR / BINARY offset table, `row_count + 1` entries; value `r`
+        spans `[var_offsets[r], var_offsets[r + 1])`. NULL for other kinds. */
+    const uint32_t* var_offsets;
+    /** VARCHAR / BINARY concatenated data blob. NULL for other kinds. */
+    const uint8_t* var_data;
+    size_t var_data_len;
+    /** SYMBOL per-row dictionary codes, `row_count` entries; resolve with
+        `line_reader_batch_symbol`. NULL for other kinds. */
+    const uint32_t* symbol_codes;
+    /** DECIMAL64/128/256 shared scale; 0 otherwise. */
+    int8_t decimal_scale;
+    /** GEOHASH precision in bits (1..60); 0 otherwise. */
+    uint8_t geohash_precision_bits;
+} line_reader_column_data;
+
+/**
+ * Project a scalar / variable-width column at `col_idx` into `*out`.
+ *
+ * @return true on success, false on a NULL handle / out-param, an
+ *         out-of-range index, or an array column — use
+ *         `line_reader_batch_array_column_data` for those.
+ */
+QUESTDB_CLIENT_API
+bool line_reader_batch_column_data(
+    const line_reader_batch* batch,
+    size_t col_idx,
+    line_reader_column_data* out,
+    line_reader_error** err_out);
+
+/**
+ * Bulk descriptor for a `DOUBLE_ARRAY` column. Four-buffer ragged layout
+ * — each row's array may have a different shape. Every pointer borrows
+ * from the batch.
+ *
+ * Element-level NULLs inside an array are `NaN`; there is no per-element
+ * bitmap.
+ */
+typedef struct line_reader_array_data
+{
+    /** Always `line_reader_column_kind_double_array` in this revision. */
+    line_reader_column_kind kind;
+    size_t row_count;
+    /** Row-level null bitmap (the whole array cell is NULL),
+        `ceil(row_count / 8)` bytes. NULL if no row is a null array.
+        Distinct from a non-null empty array (zero-length / rank 0). */
+    const uint8_t* validity;
+    /** Flattened row-major little-endian `double` element bytes for every
+        row; 8 bytes per element. Row `r` spans
+        `[data_offsets[r], data_offsets[r + 1])`. */
     const uint8_t* data;
     size_t data_len;
-    size_t element_count;
-} line_reader_double_array_view;
+    /** Per-row byte offsets into `data`, `row_count + 1` entries. */
+    const uint32_t* data_offsets;
+    /** Concatenated per-row shapes; row `r`'s shape is
+        `shapes[shape_offsets[r] .. shape_offsets[r + 1])` — that slice's
+        length is the array rank, each entry one dimension length. */
+    const uint32_t* shapes;
+    size_t shapes_len;
+    /** Per-row offsets into `shapes`, `row_count + 1` entries. */
+    const uint32_t* shape_offsets;
+} line_reader_array_data;
 
 /**
- * Borrowed view over a single `LONG_ARRAY` row. Same layout, lifetime,
- * and pointer/length symmetry contract as `line_reader_double_array_view`;
- * `data` is concatenated little-endian `int64_t` bytes.
+ * Project a `DOUBLE_ARRAY` column at `col_idx` into `*out`.
+ *
+ * @return true on success, false on a NULL handle / out-param, an
+ *         out-of-range index, or a non-DOUBLE_ARRAY column.
  */
-typedef struct line_reader_long_array_view
+QUESTDB_CLIENT_API
+bool line_reader_batch_array_column_data(
+    const line_reader_batch* batch,
+    size_t col_idx,
+    line_reader_array_data* out,
+    line_reader_error** err_out);
+
+/** One symbol-dictionary entry: a byte range into
+ * `line_reader_symbol_dict.heap`. */
+typedef struct line_reader_symbol_entry
 {
-    const uint32_t* shape;
-    size_t ndim;
-    const uint8_t* data;
-    size_t data_len;
-    size_t element_count;
-} line_reader_long_array_view;
+    uint32_t offset;
+    uint32_t length;
+} line_reader_symbol_entry;
 
 /**
- * Read a `DOUBLE_ARRAY` row into a borrowed view. On a NULL row, all
- * `out_view` fields are zeroed and `*out_is_null` is set to true.
+ * Snapshot of the connection-scoped symbol dictionary, shared by every
+ * SYMBOL column in the batch. Code `i` (a `symbol_codes` entry) resolves to
+ * `heap[entries[i].offset .. entries[i].offset + entries[i].length]`.
+ * Borrowed from the batch.
  */
-LINEREADER_API
-bool line_reader_cursor_get_double_array(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    line_reader_double_array_view* out_view,
-    bool* out_is_null,
-    line_reader_error** err_out);
+typedef struct line_reader_symbol_dict
+{
+    /** Entry count; an entry's index is its dictionary code. */
+    size_t entry_count;
+    /** Concatenated UTF-8 bytes for every entry. */
+    const uint8_t* heap;
+    size_t heap_len;
+    /** `entry_count` entries addressing `heap`. */
+    const line_reader_symbol_entry* entries;
+} line_reader_symbol_dict;
 
 /**
- * Read a single `double` element at flat row-major index `flat_idx` of a
- * `DOUBLE_ARRAY` row.
+ * Resolve a SYMBOL dictionary `code` to its borrowed, non-null-terminated
+ * UTF-8 bytes. Convenience for scalar use; for bulk (categorical)
+ * construction use `line_reader_batch_symbol_dict`.
  *
- * On a NULL row sets `*out_is_null` to true, zeroes `*out_value`, and
- * returns true. On a non-null row in range writes `*out_value`, sets
- * `*out_is_null` to false, and returns true. Returns false and sets
- * `*err_out` only on real errors (type mismatch, out-of-range row, or
- * out-of-range `flat_idx`) — NULL rows are not treated as errors.
+ * @return true on success, false on a NULL handle / out-param, a non-SYMBOL
+ *         column, or a code outside the dictionary.
  */
-LINEREADER_API
-bool line_reader_cursor_get_double_array_element(
-    const line_reader_cursor* cursor,
+QUESTDB_CLIENT_API
+bool line_reader_batch_symbol(
+    const line_reader_batch* batch,
     size_t col_idx,
-    size_t row_idx,
-    size_t flat_idx,
-    double* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a `LONG_ARRAY` row into a borrowed view.
- */
-LINEREADER_API
-bool line_reader_cursor_get_long_array(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    line_reader_long_array_view* out_view,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Read a single `int64_t` element of a `LONG_ARRAY` row.
- *
- * On a NULL row sets `*out_is_null` to true, zeroes `*out_value`, and
- * returns true. On a non-null row in range writes `*out_value`, sets
- * `*out_is_null` to false, and returns true. Returns false and sets
- * `*err_out` only on real errors (type mismatch, out-of-range row, or
- * out-of-range `flat_idx`) — NULL rows are not treated as errors.
- */
-LINEREADER_API
-bool line_reader_cursor_get_long_array_element(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    size_t row_idx,
-    size_t flat_idx,
-    int64_t* out_value,
-    bool* out_is_null,
-    line_reader_error** err_out);
-
-/**
- * Borrow the raw LSB-first validity bitmap (bit `1` = null) for a column.
- * On a column with no nulls, `*out_buf` is set to NULL and `*out_len` to 0.
- * Otherwise the pointer is valid until the next `line_reader_cursor_next_batch`,
- * `line_reader_cursor_cancel`, or `line_reader_cursor_add_credit` call, or
- * until the cursor is closed.
- */
-LINEREADER_API
-bool line_reader_cursor_column_validity(
-    const line_reader_cursor* cursor,
-    size_t col_idx,
-    const uint8_t** out_buf,
+    uint32_t code,
+    const char** out_buf,
     size_t* out_len,
+    line_reader_error** err_out);
+
+/**
+ * Snapshot the connection-scoped symbol dictionary into `*out`.
+ *
+ * @return true on success, false on a NULL handle / out-param.
+ */
+QUESTDB_CLIENT_API
+bool line_reader_batch_symbol_dict(
+    const line_reader_batch* batch,
+    line_reader_symbol_dict* out,
     line_reader_error** err_out);
 
 /////////// Cursor introspection and lifecycle.
 
 /** The cursor's `request_id` (refreshed on failover). */
-LINEREADER_API int64_t line_reader_cursor_request_id(const line_reader_cursor*);
+QUESTDB_CLIENT_API int64_t
+line_reader_cursor_request_id(const line_reader_cursor*);
 
 /**
  * Bytes of CREDIT this cursor has granted via the underlying reader.
@@ -1265,48 +1310,43 @@ LINEREADER_API int64_t line_reader_cursor_request_id(const line_reader_cursor*);
  * on the reader handle instead — it reads the same connection-level
  * counter via an atomic and is explicitly cross-thread safe.
  */
-LINEREADER_API uint64_t line_reader_cursor_credit_granted_total(
-    const line_reader_cursor*);
+QUESTDB_CLIENT_API uint64_t
+line_reader_cursor_credit_granted_total(const line_reader_cursor*);
 
 /** Number of failover resets observed by this cursor since `execute()`. */
-LINEREADER_API uint32_t line_reader_cursor_failover_resets(
-    const line_reader_cursor*);
+QUESTDB_CLIENT_API uint32_t
+line_reader_cursor_failover_resets(const line_reader_cursor*);
 
 /** Host of the endpoint the cursor is currently connected to (borrowed). */
-LINEREADER_API void line_reader_cursor_current_addr_host(
+QUESTDB_CLIENT_API void line_reader_cursor_current_addr_host(
     const line_reader_cursor*, const char** out_buf, size_t* out_len);
 
 /** Port of the endpoint the cursor is currently connected to. */
-LINEREADER_API uint16_t line_reader_cursor_current_addr_port(
-    const line_reader_cursor*);
+QUESTDB_CLIENT_API uint16_t
+line_reader_cursor_current_addr_port(const line_reader_cursor*);
 
 /**
- * `request_id` from the most recently decoded batch's frame header (the
- * batch header's request_id may differ from the cursor's after failover
- * for already-buffered frames). Returns true and writes `*out_request_id`
- * if a batch is currently loaded; otherwise returns false and zeroes the
- * output.
+ * Negotiated QWP version of the cursor's underlying connection. The
+ * in-cursor counterpart to `line_reader_server_version` (which rejects
+ * while a cursor is live).
+ *
+ * Returns `false` and sets `*err_out` on failure: the cursor handle is
+ * NULL, or the underlying connection is poisoned after a failed mid-query
+ * failover. On success returns `true` and writes `*out_version`.
  */
-LINEREADER_API bool line_reader_cursor_batch_request_id(
+QUESTDB_CLIENT_API bool line_reader_cursor_server_version(
     const line_reader_cursor* cursor,
-    int64_t* out_request_id);
+    uint8_t* out_version,
+    line_reader_error** err_out);
 
 /**
- * `batch_seq` of the current batch (0-based, monotonically increasing within
- * a single cursor lifecycle). Returns true and writes `*out_batch_seq` if a
- * batch is currently loaded; otherwise returns false and zeroes the output.
+ * Last-seen `SERVER_INFO` of the cursor's currently connected endpoint, or
+ * NULL on v1 servers. The pointer is invalidated by any cursor operation
+ * that may reconnect. The in-cursor counterpart to
+ * `line_reader_current_server_info` (which rejects while a cursor is live).
  */
-LINEREADER_API bool line_reader_cursor_batch_seq(
-    const line_reader_cursor* cursor,
-    uint64_t* out_batch_seq);
-
-/**
- * Per-batch wire flags. Returns true and writes `*out_flags` if a batch is
- * currently loaded; otherwise returns false and zeroes the output.
- */
-LINEREADER_API bool line_reader_cursor_batch_flags(
-    const line_reader_cursor* cursor,
-    uint8_t* out_flags);
+QUESTDB_CLIENT_API const line_reader_server_info*
+line_reader_cursor_current_server_info(const line_reader_cursor* cursor);
 
 /** Discriminant of the cursor's terminal frame. */
 typedef enum line_reader_terminal_kind
@@ -1316,14 +1356,14 @@ typedef enum line_reader_terminal_kind
     line_reader_terminal_kind_exec_done = 2,
 } line_reader_terminal_kind;
 
-LINEREADER_API line_reader_terminal_kind line_reader_cursor_terminal_kind(
-    const line_reader_cursor*);
+QUESTDB_CLIENT_API line_reader_terminal_kind
+line_reader_cursor_terminal_kind(const line_reader_cursor*);
 
 /**
  * If the terminal is `RESULT_END`, fill the output parameters and return
  * true; otherwise zeroes both outputs and returns false.
  */
-LINEREADER_API bool line_reader_cursor_terminal_end(
+QUESTDB_CLIENT_API bool line_reader_cursor_terminal_end(
     const line_reader_cursor* cursor,
     uint64_t* out_final_seq,
     uint64_t* out_total_rows);
@@ -1332,7 +1372,7 @@ LINEREADER_API bool line_reader_cursor_terminal_end(
  * If the terminal is `EXEC_DONE`, fill the output parameters and return
  * true; otherwise zeroes both outputs and returns false.
  */
-LINEREADER_API bool line_reader_cursor_terminal_exec_done(
+QUESTDB_CLIENT_API bool line_reader_cursor_terminal_exec_done(
     const line_reader_cursor* cursor,
     uint8_t* out_op_type,
     uint64_t* out_rows_affected);
@@ -1342,15 +1382,14 @@ LINEREADER_API bool line_reader_cursor_terminal_exec_done(
  * reply. Idempotent once terminal. Returns false and sets `*err_out` on
  * transport failure.
  */
-LINEREADER_API bool line_reader_cursor_cancel(
-    line_reader_cursor* cursor,
-    line_reader_error** err_out);
+QUESTDB_CLIENT_API bool line_reader_cursor_cancel(
+    line_reader_cursor* cursor, line_reader_error** err_out);
 
 /**
  * Grant additional CREDIT to the server. Only valid when the cursor was
  * started with `initial_credit > 0`.
  */
-LINEREADER_API bool line_reader_cursor_add_credit(
+QUESTDB_CLIENT_API bool line_reader_cursor_add_credit(
     line_reader_cursor* cursor,
     uint64_t additional_bytes,
     line_reader_error** err_out);

@@ -807,10 +807,7 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "max_background_drainers" => builder.max_background_drainers(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "error_inbox_capacity" => builder.reject_unsupported_qwp_ws_setting(
-                    "error_inbox_capacity",
-                    "Java-style async error inbox configuration is not implemented",
-                )?,
+                "error_inbox_capacity" => builder.error_inbox_capacity(val)?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -952,6 +949,10 @@ impl SenderBuilder {
                 #[cfg(feature = "sync-sender-http")]
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
+                }
+                #[cfg(feature = "sync-sender-http")]
+                "retry_max_backoff_millis" => {
+                    builder.retry_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
 
                 // Ignore other parameters.
@@ -1691,6 +1692,28 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    fn error_inbox_capacity(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"error_inbox_capacity\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let value: usize = parse_conf_value("error_inbox_capacity", value)?;
+        if value < conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be >= {}: {value}",
+                conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY
+            ));
+        }
+        qwp_ws
+            .error_inbox_capacity
+            .set_specified("error_inbox_capacity", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     fn reject_unsupported_qwp_ws_setting(
         self,
         setting_name: &'static str,
@@ -1891,6 +1914,36 @@ impl SenderBuilder {
             return Err(error::fmt!(
                 ConfigError,
                 "retry_timeout is supported only in ILP over HTTP."
+            ));
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "sync-sender-http")]
+    /// Cap on per-attempt backoff in the HTTP retry loop.
+    ///
+    /// The retry loop starts at 10 ms, doubles each attempt with ±5 ms
+    /// jitter, and is bounded by this value (default: 1 second; minimum
+    /// 10 ms — a cap below the initial interval is incoherent). Total
+    /// retry budget is independently capped by
+    /// [`SenderBuilder::retry_timeout`]; this knob shapes how aggressively
+    /// the loop hits the server while waiting out a transient failure.
+    ///
+    /// Mirrors Java's `LineSenderBuilder.maxBackoffMillis(int)`.
+    pub fn retry_max_backoff(mut self, value: Duration) -> Result<Self> {
+        if value < Duration::from_millis(10) {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"retry_max_backoff_millis\" must be at least 10."
+            ));
+        }
+        if let Some(http) = &mut self.http {
+            http.retry_max_backoff
+                .set_specified("retry_max_backoff_millis", value)?;
+        } else {
+            return Err(error::fmt!(
+                ConfigError,
+                "retry_max_backoff_millis is supported only in ILP over HTTP."
             ));
         }
         Ok(self)

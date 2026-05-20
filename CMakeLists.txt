@@ -66,6 +66,11 @@ option(
     "Compile in support for tls_verify off. Allows downstream code to disable TLS certificate verification at runtime."
     ON)
 
+option(
+    QUESTDB_SANITIZE
+    "Build the C/C++ tests with -fsanitize=address,undefined."
+    OFF)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
@@ -93,7 +98,7 @@ if(WIN32)
     set_target_properties(
         questdb_client-shared
         PROPERTIES
-        DEFINE_SYMBOL "LINESENDER_DYN_LIB")
+        DEFINE_SYMBOL "QUESTDB_CLIENT_DYN_LIB")
     target_link_libraries(
         questdb_client-shared
         INTERFACE wsock32 ws2_32 ntdll crypt32 Secur32 Ncrypt)
@@ -128,6 +133,27 @@ function(set_compile_flags TARGET_NAME)
         target_compile_options(
             ${TARGET_NAME} PRIVATE
             -Wall -Wextra -Wpedantic -Werror)
+    endif()
+endfunction()
+
+function(apply_sanitizers TARGET_NAME)
+    if(NOT QUESTDB_SANITIZE)
+        return()
+    endif()
+    if(MSVC)
+        message(WARNING
+            "QUESTDB_SANITIZE is not supported on MSVC (its ASan runtime is "
+            "not validated against the rustc-built library); skipping.")
+    else()
+        target_compile_options(
+            ${TARGET_NAME} PRIVATE
+            -fsanitize=address,undefined
+            -fno-sanitize-recover=all
+            -fno-omit-frame-pointer
+            -g)
+        target_link_options(
+            ${TARGET_NAME} PRIVATE
+            -fsanitize=address,undefined)
     endif()
 endfunction()
 
@@ -248,6 +274,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_reader_cpp_example_with_binds
         examples/line_reader_cpp_example_with_binds.cpp)
+    compile_example(
+        line_reader_cpp_example_columns
+        examples/line_reader_cpp_example_columns.cpp)
+    compile_example(
+        line_reader_c_example_columns
+        examples/line_reader_c_example_columns.c)
 
     # Include Rust tests as part of the tests run
     add_test(
@@ -268,9 +300,21 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
             ${TARGET_NAME}
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
         set_compile_flags(${TARGET_NAME})
+        apply_sanitizers(${TARGET_NAME})
         add_test(
             NAME ${TARGET_NAME}
             COMMAND ${TARGET_NAME})
+        if(QUESTDB_SANITIZE AND NOT MSVC)
+            # Leak detection is off: the Rust library is not instrumented and
+            # legitimately retains process-global allocations at exit, which
+            # LSan cannot tell apart from an FFI leak without a suppression
+            # file. ASan's use-after-free / out-of-bounds / double-free checks
+            # stay active.
+            set_tests_properties(
+                ${TARGET_NAME} PROPERTIES
+                ENVIRONMENT
+                "ASAN_OPTIONS=detect_leaks=0;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+        endif()
     endfunction()
 
     compile_test(

@@ -182,6 +182,25 @@ pub struct Reader {
     failover_rng: FailoverRng,
 }
 
+// Compile-time pin for the cross-thread contract the FFI and the public
+// Rust API both depend on: `Reader` may be migrated to a worker thread
+// while a monitoring thread reads `bytes_received` / `read_ns` /
+// `decode_ns` / `credit_granted_total` via the `Arc<ReaderStats>`.
+//
+// Without this assertion, a future field addition (`Rc<…>`, `RefCell<…>`,
+// `MutexGuard<'static, …>`, a custom `!Send`/`!Sync` type) would silently
+// flip Reader off `Send`/`Sync` and the PR description's claim that
+// "the reader handle may be migrated between threads" would turn false
+// without any signal — runtime tests would keep passing because nothing
+// actually exercises the migration. Pinning it here makes the bound
+// load-bearing: a regression breaks compilation.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Reader>();
+    assert_send_sync::<ReaderStats>();
+    assert_send_sync::<HostHealthTracker>();
+};
+
 impl Reader {
     /// Open a new connection from a connect string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
@@ -388,13 +407,17 @@ impl Reader {
     /// registry reset on success, caller must re-issue the
     /// `QUERY_REQUEST` with a freshly-allocated `request_id`) lives on
     /// the cancellable variant below; consult it for the full story.
-    fn reconnect_with_failover(&mut self, failed_idx: usize) -> Result<u32> {
+    fn reconnect_with_failover(
+        &mut self,
+        failed_idx: usize,
+        on_attempt: &mut dyn FnMut(u32),
+    ) -> Result<u32> {
         // `Duration::MAX` makes the cancellable sleep loop's
         // `min(remaining, abort_tick)` always pick `remaining`, so a
         // single `thread::sleep` covers each backoff exactly as the
         // pre-cancellable code did. The no-op abort closure adds two
         // extra calls per backoff iteration; negligible.
-        self.reconnect_with_failover_cancellable(failed_idx, Duration::MAX, || None)
+        self.reconnect_with_failover_cancellable(failed_idx, Duration::MAX, || None, on_attempt)
     }
 
     /// Reconnect this Reader in place after a mid-query transport
@@ -428,11 +451,21 @@ impl Reader {
     /// `cancel_slot` poll here so `PipelinedCursor::Drop` and
     /// `PipelinedReader::close` do not have to wait for the failover
     /// budget to naturally exhaust before they can join the worker.
+    ///
+    /// `on_attempt` is invoked once per outer-loop iteration right
+    /// before the `walk_via_tracker` dial runs (after the inter-attempt
+    /// backoff sleep, so the wall-clock cost of the backoff is included
+    /// in the elapsed measurement the caller derives). Passed by `&mut
+    /// dyn` instead of generic `impl FnMut` so adding the hook doesn't
+    /// monomorphise this large function per call site — there is one
+    /// non-trivial caller (`Cursor::failover_reconnect_and_replay`); the
+    /// pipelined worker passes a no-op (no progress-callback surface).
     fn reconnect_with_failover_cancellable<F>(
         &mut self,
         failed_idx: usize,
         abort_tick: Duration,
         abort_check: F,
+        on_attempt: &mut dyn FnMut(u32),
     ) -> Result<u32>
     where
         F: Fn() -> Option<Error>,
@@ -454,7 +487,9 @@ impl Reader {
              cancellable sleeping",
         );
         let cfg = Arc::clone(&self.cfg);
-        let attempts_total = cfg.failover_max_attempts.saturating_add(1);
+        // Mid-query path: `failover_max_attempts` counts reconnect
+        // rounds (no initial connect to subtract — we already had one).
+        let attempts_total = cfg.failover_max_attempts.max(1);
         let mut backoff_ms = cfg.failover_backoff_initial_ms;
         let mut last_err: Option<Error> = None;
         // Failover.md §11.9.1 wall-clock budget. `0` is the documented
@@ -561,6 +596,13 @@ impl Reader {
             // let us through; otherwise we'd over-report attempts in
             // the wall-clock-exhausted message.
             attempts_made = attempts_made.saturating_add(1);
+            // Fire the per-attempt hook *after* the deadline gate (so
+            // the count we report matches the one the exhaustion errors
+            // report) and *before* the dial (so observers see "about
+            // to dial attempt N" rather than retroactive "dial N
+            // finished"). Pass the 1-based attempt number; the caller
+            // already knows the trigger and start time.
+            on_attempt(attempts_made);
             match walk_via_tracker(
                 &mut self.tracker,
                 &cfg,
@@ -757,6 +799,7 @@ impl Reader {
             reader: self,
             builder: QueryRequest::builder(sql),
             on_failover_reset: None,
+            on_failover_progress: None,
             _not_send: std::marker::PhantomData,
         }
     }
@@ -861,6 +904,92 @@ impl FailoverEvent {
 /// Boxed user callback type for failover-reset notifications.
 type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverEvent) + 'r>;
 
+/// Phase discriminant on [`FailoverProgressEvent`].
+///
+/// The same callback fires for every phase of a mid-query failover —
+/// from the moment the cursor's connection dies through to either a
+/// successful reconnect or an exhausted retry budget. Operators can
+/// route on the phase to feed SLO dashboards ("disconnected for N
+/// seconds" alerts), per-attempt retry telemetry, or a one-shot
+/// "gave up" notifier.
+///
+/// Marked `#[non_exhaustive]` so we can add phases (e.g. a hypothetical
+/// `Cancelled` for cancel-during-failover races) without breaking
+/// downstream matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FailoverPhase {
+    /// The cursor's connection just died. Fires once, *before* the
+    /// retry loop runs.
+    Disconnected = 0,
+    /// A reconnect dial is about to be attempted. Fires once per
+    /// outer-loop iteration of the retry walk, *after* the inter-
+    /// attempt backoff sleep has elapsed.
+    Retrying = 1,
+    /// A reconnect succeeded; replayed batches will start arriving on
+    /// the new connection. Fires immediately *before* the
+    /// [`ReaderQuery::on_failover_reset`] callback (when both are
+    /// installed) so a single sink sees the entire lifecycle.
+    Reset = 2,
+    /// The retry budget is exhausted. The cursor is terminal; the
+    /// error returned to the caller is in
+    /// [`FailoverProgressEvent::final_error`].
+    GaveUp = 3,
+}
+
+/// Notification delivered to the
+/// [`ReaderQuery::on_failover_progress`] callback at each transition
+/// of a mid-query failover lifecycle. See [`FailoverPhase`] for the
+/// per-variant semantics.
+///
+/// Several fields are populated only in certain phases — see the
+/// per-field docs. Marked `#[non_exhaustive]` so we can add fields
+/// without breaking downstream pattern matches.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FailoverProgressEvent {
+    /// Which lifecycle phase fired this event.
+    pub phase: FailoverPhase,
+    /// Endpoint that died. Set on every phase — even `Reset` keeps it
+    /// so a single sink can correlate the failed/new pair without
+    /// remembering state across calls.
+    pub failed_addr: Endpoint,
+    /// New endpoint the cursor is now bound to. `Some` only on
+    /// [`FailoverPhase::Reset`].
+    pub new_addr: Option<Endpoint>,
+    /// `SERVER_INFO` of the new endpoint. `Some` only on
+    /// [`FailoverPhase::Reset`] and only on QWP v2+ servers.
+    pub new_server_info: Option<ServerInfo>,
+    /// Newly-allocated `request_id`. `Some` only on
+    /// [`FailoverPhase::Reset`].
+    pub new_request_id: Option<i64>,
+    /// 1-based attempt counter:
+    ///
+    /// - `0` on `Disconnected` (no attempt yet).
+    /// - `N ≥ 1` on `Retrying` for the Nth dial.
+    /// - On `Reset`, the attempt that landed.
+    /// - On `GaveUp`, the total number of attempts burned. May be `0`
+    ///   when the wall-clock deadline was already exhausted before any
+    ///   walk fired.
+    pub attempt: u32,
+    /// The error that triggered the failover (the original
+    /// cause-of-death of the previous connection). Preserved across
+    /// every phase so subscribers see consistent context regardless of
+    /// when they latch on.
+    pub trigger: Error,
+    /// Wall-clock time since the disconnect was observed (the start of
+    /// the failover cycle). Monotonically non-decreasing across phases
+    /// of the same event.
+    pub elapsed: std::time::Duration,
+    /// Final error returned to the caller. `Some` only on
+    /// [`FailoverPhase::GaveUp`]; this is the value the next call to
+    /// [`Cursor::next_batch`] (or `add_credit`) will surface.
+    pub final_error: Option<Error>,
+}
+
+/// Boxed user callback type for failover-progress notifications.
+type FailoverProgressCallback<'r> = Box<dyn FnMut(&FailoverProgressEvent) + 'r>;
+
 /// Borrows a `Reader` exclusively while the query is being constructed and
 /// (eventually) the cursor is live.
 ///
@@ -878,6 +1007,10 @@ pub struct ReaderQuery<'r> {
     /// Optional handler called every time the cursor reconnects after a
     /// transport-level failure (see [`FailoverEvent`]).
     on_failover_reset: Option<FailoverResetCallback<'r>>,
+    /// Optional progress handler invoked at every phase of a mid-query
+    /// failover lifecycle — see [`FailoverProgressEvent`] /
+    /// [`FailoverPhase`].
+    on_failover_progress: Option<FailoverProgressCallback<'r>>,
     /// Pin `!Send` regardless of whether the callback is installed.
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -975,6 +1108,45 @@ impl<'r> ReaderQuery<'r> {
         F: FnMut(&FailoverEvent) + 'r,
     {
         self.on_failover_reset = Some(Box::new(callback));
+        self
+    }
+
+    /// Install a callback fired at every phase of a mid-query failover
+    /// lifecycle: `Disconnected` when the cursor's connection dies,
+    /// `Retrying` before each reconnect dial attempt, `Reset` after a
+    /// successful failover (immediately before
+    /// [`Self::on_failover_reset`] runs), and `GaveUp` when the retry
+    /// budget is exhausted.
+    ///
+    /// **Replay opt-in.** Installing this callback also opts the cursor
+    /// in to "I will handle replay-after-data-delivered correctly," the
+    /// same way [`Self::on_failover_reset`] does — both callbacks fire
+    /// on `Reset`, and either being installed clears the silent-
+    /// duplicate guard documented on [`Cursor::next_batch`]. If you
+    /// only want telemetry and not replay semantics, set
+    /// `failover=off` instead.
+    ///
+    /// Calling this method twice on the same `ReaderQuery` **replaces**
+    /// the previous closure — only the most recent callback is invoked.
+    ///
+    /// # Reentrancy
+    ///
+    /// The callback is invoked synchronously on the cursor's drive
+    /// thread, while [`Cursor::next_batch`] (or `add_credit`) is
+    /// mid-mutation of the underlying `Reader`. The same contract as
+    /// [`Self::on_failover_reset`] applies:
+    ///
+    /// - **Must not** call back into the originating reader, query, or
+    ///   cursor — including read-only stat getters.
+    /// - **Must not** panic / `longjmp` / unwind across the boundary
+    ///   (the FFI trampoline `catch_unwind` + `abort`s on escape).
+    /// - **Must not** block indefinitely — every batch read, CREDIT
+    ///   grant, and cancel waits until the callback returns.
+    pub fn on_failover_progress<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&FailoverProgressEvent) + 'r,
+    {
+        self.on_failover_progress = Some(Box::new(callback));
         self
     }
 
@@ -1133,6 +1305,7 @@ impl<'r> ReaderQuery<'r> {
             done: false,
             encoded_request,
             on_failover_reset: self.on_failover_reset,
+            on_failover_progress: self.on_failover_progress,
             failover_resets: 0,
             data_delivered: false,
             _not_send: std::marker::PhantomData,
@@ -1227,6 +1400,9 @@ pub struct Cursor<'r> {
     /// User callback fired right before replayed batches arrive on a
     /// new connection. See [`ReaderQuery::on_failover_reset`].
     on_failover_reset: Option<FailoverResetCallback<'r>>,
+    /// User callback fired at every phase of a mid-query failover
+    /// lifecycle. See [`ReaderQuery::on_failover_progress`].
+    on_failover_progress: Option<FailoverProgressCallback<'r>>,
     /// Number of successful failover resets observed by this cursor
     /// since `execute()`. Useful for tests and for asserting the
     /// query did not silently restart under the user's feet.
@@ -1372,13 +1548,13 @@ impl<'r> Cursor<'r> {
                     // re-classified the surface.
                     if would_silently_duplicate(
                         self.data_delivered,
-                        self.on_failover_reset.is_some(),
+                        self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
                     ) {
                         let err = fmt!(
                             FailoverWouldDuplicate,
                             "mid-query failover would replay rows already delivered to the caller \
-                             (no on_failover_reset callback installed); cursor terminated. \
-                             Trigger: {} ({:?})",
+                             (install on_failover_reset or on_failover_progress to opt in to replays); \
+                             cursor terminated. Trigger: {} ({:?})",
                             e.msg(),
                             e.code()
                         );
@@ -1571,6 +1747,23 @@ impl<'r> Cursor<'r> {
         self.reader.current_addr()
     }
 
+    /// Negotiated QWP version of the cursor's underlying connection. The
+    /// in-cursor accessor for [`Reader::server_version`], unreachable from
+    /// user code while the cursor holds the `Reader`'s mutable borrow.
+    /// Reflects the renegotiated version after mid-query failover.
+    pub fn server_version(&self) -> Result<u8> {
+        self.reader.server_version()
+    }
+
+    /// `SERVER_INFO` of the cursor's currently connected endpoint, or
+    /// `None` on v1 servers. The in-cursor accessor for
+    /// [`Reader::server_info`], unreachable from user code while the
+    /// cursor holds the `Reader`'s mutable borrow. Reflects the new
+    /// endpoint after mid-query failover.
+    pub fn server_info(&self) -> Option<&ServerInfo> {
+        self.reader.server_info()
+    }
+
     /// Read one raw frame (header + payload) off the transport, with
     /// no decode. Errors here are transport-level (socket closed,
     /// truncated WS frame, TLS reset, etc.) and are the only failures
@@ -1613,9 +1806,82 @@ impl<'r> Cursor<'r> {
         // surfaces it so callers can correlate pre- and
         // post-failover frames by `(failed, new)` pair.
         let failed_request_id = self.request_id;
-        let attempts = match self.reader.reconnect_with_failover(failed_idx) {
+
+        // Phase: Disconnected. Fires before the retry loop runs so an
+        // SLO dashboard sees the outage *now*, not retroactively when
+        // a reconnect lands or the budget exhausts.
+        if let Some(cb) = self.on_failover_progress.as_mut() {
+            let event = FailoverProgressEvent {
+                phase: FailoverPhase::Disconnected,
+                failed_addr: failed_addr.clone(),
+                new_addr: None,
+                new_server_info: None,
+                new_request_id: None,
+                attempt: 0,
+                trigger: trigger.clone(),
+                elapsed: started.elapsed(),
+                final_error: None,
+            };
+            cb(&event);
+        }
+
+        // Phase: Retrying. The closure fires once per outer-loop
+        // iteration of `reconnect_with_failover`. We split the borrow
+        // on `self` so the closure can mutate the progress callback
+        // while `reader.reconnect_with_failover` holds a `&mut Reader`.
+        // `last_attempt` is tracked outside the closure so the GaveUp
+        // event can report the final attempt count even when the
+        // reconnect loop breaks out via the wall-clock-deadline path
+        // (which doesn't surface the count in its `Err`).
+        let mut last_attempt: u32 = 0;
+        let reconnect_result = {
+            let Self {
+                reader,
+                on_failover_progress,
+                ..
+            } = self;
+            let failed_addr_ref = &failed_addr;
+            let trigger_ref = &trigger;
+            reader.reconnect_with_failover(failed_idx, &mut |attempt: u32| {
+                last_attempt = attempt;
+                if let Some(cb) = on_failover_progress.as_mut() {
+                    let event = FailoverProgressEvent {
+                        phase: FailoverPhase::Retrying,
+                        failed_addr: failed_addr_ref.clone(),
+                        new_addr: None,
+                        new_server_info: None,
+                        new_request_id: None,
+                        attempt,
+                        trigger: trigger_ref.clone(),
+                        elapsed: started.elapsed(),
+                        final_error: None,
+                    };
+                    cb(&event);
+                }
+            })
+        };
+        let attempts = match reconnect_result {
             Ok(n) => n,
             Err(e) => {
+                // Phase: GaveUp. Fire before mutating state / returning
+                // so the callback sees the cursor in its
+                // about-to-be-terminal form and can correlate against
+                // the error the caller is about to receive via
+                // `next_batch`.
+                if let Some(cb) = self.on_failover_progress.as_mut() {
+                    let event = FailoverProgressEvent {
+                        phase: FailoverPhase::GaveUp,
+                        failed_addr: failed_addr.clone(),
+                        new_addr: None,
+                        new_server_info: None,
+                        new_request_id: None,
+                        attempt: last_attempt,
+                        trigger: trigger.clone(),
+                        elapsed: started.elapsed(),
+                        final_error: Some(e.clone()),
+                    };
+                    cb(&event);
+                }
                 self.reader.cursor_active = false;
                 self.done = true;
                 // Surface the most diagnostic error. The original
@@ -1660,11 +1926,33 @@ impl<'r> Cursor<'r> {
         {
             Ok(()) => {
                 self.failover_resets = self.failover_resets.saturating_add(1);
+                let new_addr = self.reader.cfg.addrs[self.reader.addr_idx].clone();
+                let new_server_info = self.reader.server_info.clone();
+                // Phase: Reset. Fire BEFORE the legacy on_failover_reset
+                // so a single sink that subscribes to both sees a
+                // consistent ordering. The two callbacks carry the same
+                // logical event; on_failover_progress is the modern
+                // surface and on_failover_reset is preserved for
+                // backward compat.
+                if let Some(cb) = self.on_failover_progress.as_mut() {
+                    let event = FailoverProgressEvent {
+                        phase: FailoverPhase::Reset,
+                        failed_addr: failed_addr.clone(),
+                        new_addr: Some(new_addr.clone()),
+                        new_server_info: new_server_info.clone(),
+                        new_request_id: Some(new_rid),
+                        attempt: attempts,
+                        trigger: trigger.clone(),
+                        elapsed: started.elapsed(),
+                        final_error: None,
+                    };
+                    cb(&event);
+                }
                 if let Some(cb) = self.on_failover_reset.as_mut() {
                     let event = FailoverEvent {
                         failed_addr,
-                        new_addr: self.reader.cfg.addrs[self.reader.addr_idx].clone(),
-                        new_server_info: self.reader.server_info.clone(),
+                        new_addr,
+                        new_server_info,
                         failed_request_id,
                         new_request_id: new_rid,
                         attempts,
@@ -1694,6 +1982,27 @@ impl<'r> Cursor<'r> {
                 // failure (rather than spinning another inner cycle)
                 // keeps that budget honest as a per-Execute bound and
                 // mirrors the Java reference client.
+                //
+                // Phase: GaveUp. From the observer's perspective this
+                // is also a terminal exhaustion — the reconnect itself
+                // succeeded but the replay write failed, and we will
+                // not loop again. Fire the same terminal phase so a
+                // dashboard that watches GaveUp gets a single
+                // consistent event for "cursor is dead, won't recover."
+                if let Some(cb) = self.on_failover_progress.as_mut() {
+                    let event = FailoverProgressEvent {
+                        phase: FailoverPhase::GaveUp,
+                        failed_addr: failed_addr.clone(),
+                        new_addr: None,
+                        new_server_info: None,
+                        new_request_id: None,
+                        attempt: attempts,
+                        trigger: trigger.clone(),
+                        elapsed: started.elapsed(),
+                        final_error: Some(e.clone()),
+                    };
+                    cb(&event);
+                }
                 if let Some(dead) = self.reader.transport.take() {
                     drop(dead);
                 }
@@ -1879,12 +2188,15 @@ impl<'r> Cursor<'r> {
         // re-deliver those rows with no signal — violating the
         // exact-once contract. The trigger error is preserved in the
         // message so the caller still learns why the cursor died.
-        if would_silently_duplicate(self.data_delivered, self.on_failover_reset.is_some()) {
+        if would_silently_duplicate(
+            self.data_delivered,
+            self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
+        ) {
             let err = fmt!(
                 FailoverWouldDuplicate,
                 "mid-query failover would replay rows already delivered to the caller \
-                 (no on_failover_reset callback installed); cursor terminated. \
-                 Trigger: {} ({:?})",
+                 (install on_failover_reset or on_failover_progress to opt in to replays); \
+                 cursor terminated. Trigger: {} ({:?})",
                 first_err.msg(),
                 first_err.code()
             );
@@ -2074,6 +2386,12 @@ impl<'c> BatchView<'c> {
     pub fn column(&self, idx: usize) -> Result<ColumnView<'_>> {
         self.decoded.column_view(idx, self.dict)
     }
+
+    /// Connection-scoped symbol dictionary backing every SYMBOL column
+    /// in this batch; a `SymbolColumn`'s codes index into it.
+    pub fn dict(&self) -> &'c SymbolDict {
+        self.dict
+    }
 }
 
 /// Predicate for the failover trigger filter. Mirrors the Java
@@ -2089,17 +2407,20 @@ impl<'c> BatchView<'c> {
 /// Replay restarts at `batch_seq=0` against the new endpoint, so the
 /// caller's accumulator would see every previously-yielded row again.
 /// The opt-in for "I will discard partial state on each replay" is
-/// installing [`ReaderQuery::on_failover_reset`]; without that
-/// callback, the only safe response is to terminate the cursor and
-/// let the caller re-execute from scratch.
+/// installing either [`ReaderQuery::on_failover_reset`] or
+/// [`ReaderQuery::on_failover_progress`] — both fire immediately
+/// before the first replayed batch arrives on the new connection, so
+/// either signal gives the caller the chance to clear its accumulator.
+/// Without one of them, the only safe response is to terminate the
+/// cursor and let the caller re-execute from scratch.
 ///
 /// Extracted as a free function so the truth table is unit-testable
 /// without needing a live transport.
 pub(crate) fn would_silently_duplicate(
     data_delivered: bool,
-    has_failover_reset_callback: bool,
+    has_replay_aware_callback: bool,
 ) -> bool {
-    data_delivered && !has_failover_reset_callback
+    data_delivered && !has_replay_aware_callback
 }
 
 pub(crate) fn is_failover_eligible(code: ErrorCode) -> bool {
@@ -2667,7 +2988,10 @@ pub(crate) mod pipelined_internals {
     where
         F: Fn() -> Option<Error>,
     {
-        reader.reconnect_with_failover_cancellable(failed_idx, abort_tick, abort_check)
+        // The pipelined surface has no per-attempt progress callback
+        // (no `on_failover_progress` analogue on `PipelinedQuery`), so
+        // the `on_attempt` hook is a no-op here.
+        reader.reconnect_with_failover_cancellable(failed_idx, abort_tick, abort_check, &mut |_| {})
     }
 
     /// Mirrors [`Cursor::terminate_with_close`]: tear the transport
@@ -3007,14 +3331,17 @@ mod tests {
     /// Truth-table coverage for the silent-duplicate guard.
     ///
     /// The four input combinations cover every reachable cursor state
-    /// at the moment a failover-eligible transport error fires:
+    /// at the moment a failover-eligible transport error fires.
+    /// "Replay-aware callback" means *either* `on_failover_reset` or
+    /// `on_failover_progress` is installed — both fire on a successful
+    /// reset and either is enough to opt the cursor in to replays.
     ///
-    /// | data_delivered | callback installed | refuses replay? |
-    /// |----------------|--------------------|-----------------|
-    /// | false          | false              | no — initial-connect-style failover, transparent |
-    /// | false          | true               | no — caller will be notified anyway |
-    /// | true           | false              | **YES** — silent duplicates would otherwise reach the caller |
-    /// | true           | true               | no — caller opted in to replays |
+    /// | data_delivered | replay-aware cb installed | refuses replay? |
+    /// |----------------|---------------------------|-----------------|
+    /// | false          | false                     | no — initial-connect-style failover, transparent |
+    /// | false          | true                      | no — caller will be notified anyway |
+    /// | true           | false                     | **YES** — silent duplicates would otherwise reach the caller |
+    /// | true           | true                      | no — caller opted in to replays |
     ///
     /// A regression that flipped the predicate (e.g. inverted the
     /// callback check or removed the data-delivered latch) would fail

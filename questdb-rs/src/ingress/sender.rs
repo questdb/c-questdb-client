@@ -427,6 +427,7 @@ impl Sender {
                     bytes,
                     *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
                     *state.config.retry_timeout,
+                    *state.config.retry_max_backoff,
                 ) {
                     Ok(res) => {
                         if res.status().is_client_error() || res.status().is_server_error() {
@@ -680,6 +681,27 @@ impl Sender {
         }
     }
 
+    /// Snapshot the QWP/WebSocket sender's lifetime totals.
+    ///
+    /// Mirrors the `getTotal*` counters on Java's `QwpWebSocketSender` so the
+    /// QuestDB Enterprise e2e harness (questdb-ent/e2e) can read identical
+    /// signals across language bindings. See [`QwpWsTotals`] for the field
+    /// list. Returns `InvalidApiCall` for non-QWP/WebSocket senders.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn qwp_ws_totals(&self) -> Result<QwpWsTotals> {
+        let counters = match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_counters_background(state)?,
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_counters_manual(state)?,
+            _ => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "qwp_ws_totals is only supported for QWP/WebSocket senders."
+                ));
+            }
+        };
+        Ok(counters.into())
+    }
+
     /// Drive one QWP/WebSocket progress step when the sender was built with
     /// [`QwpWsProgress::Manual`].
     ///
@@ -750,11 +772,28 @@ impl Sender {
 
     /// Tell whether the sender is no longer usable and must be dropped.
     ///
-    /// This happens when there was an earlier failure.
+    /// Returns `true` after an unrecoverable failure. For ILP-over-TCP this
+    /// is any socket error. For QWP/WebSocket this also covers a server
+    /// rejection or protocol violation that latches the publication
+    /// lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
+    /// transition into a permanently-unusable state and always return
+    /// `false`.
     ///
-    /// This method is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
+    /// In QWP/WebSocket manual progress mode the answer only refreshes when
+    /// the user drives the sender (`drive_once` / `flush`), since no
+    /// background thread is observing the transport.
+    #[must_use]
     pub fn must_close(&self) -> bool {
-        !self.connected
+        if !self.connected {
+            return true;
+        }
+        #[cfg(feature = "sync-sender-qwp-ws")]
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => return qwp_ws_is_terminal_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => return qwp_ws_is_terminal_manual(state),
+            _ => {}
+        }
+        false
     }
 
     /// Returns the sender's configured transport protocol.
