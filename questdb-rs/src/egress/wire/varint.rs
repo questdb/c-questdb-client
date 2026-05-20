@@ -45,6 +45,25 @@ pub fn encode_u64(mut value: u64, out: &mut Vec<u8>) -> usize {
     out.len() - start
 }
 
+/// Encode `value` into the head of `out`, returning the number of bytes
+/// written. Slice-form counterpart of [`encode_u64`] for callers that
+/// build small fixed-shape frames on the stack and want to avoid the
+/// per-call `Vec` allocation. `out` must be at least
+/// [`MAX_VARINT_LEN_U64`] bytes long for any caller-provided value;
+/// shorter inputs panic with a slice-index-out-of-range — the contract
+/// is "size your buffer to the worst case", same as the `Vec` variant's
+/// implicit capacity requirement.
+pub fn encode_u64_into_slice(mut value: u64, out: &mut [u8]) -> usize {
+    let mut i = 0;
+    while value & !0x7F != 0 {
+        out[i] = ((value & 0x7F) as u8) | 0x80;
+        value >>= 7;
+        i += 1;
+    }
+    out[i] = value as u8;
+    i + 1
+}
+
 /// Decode a varint from `bytes`, returning `(value, bytes_consumed)`.
 ///
 /// Errors when:
@@ -172,5 +191,69 @@ mod tests {
         encode_u64(42, &mut buf);
         let (v, _) = decode_usize(&buf).unwrap();
         assert_eq!(v, 42);
+    }
+
+    /// Regression: the slice-form
+    /// `encode_u64_into_slice` and the Vec-form `encode_u64` MUST
+    /// produce byte-for-byte identical output for every input. The
+    /// slice form has a distinct failure mode (slice-OOB if the
+    /// caller under-sizes the buffer) and was previously
+    /// untested; pin the byte-equivalence at every documented
+    /// boundary so a future divergence (e.g. an "optimisation" that
+    /// drops the high bit on the last byte) fails this test.
+    #[test]
+    fn slice_form_matches_vec_form_at_boundaries() {
+        for value in [
+            0u64,
+            1,
+            0x7F,
+            0x80,
+            0x3FFF,
+            0x4000,
+            u32::MAX as u64,
+            u64::MAX,
+            300, // canonical LEB128 reference value
+        ] {
+            let mut vec_buf = Vec::new();
+            let vec_n = encode_u64(value, &mut vec_buf);
+
+            let mut slice_buf = [0u8; MAX_VARINT_LEN_U64];
+            let slice_n = encode_u64_into_slice(value, &mut slice_buf);
+
+            assert_eq!(
+                slice_n, vec_n,
+                "slice_form vs vec_form byte-count for value {}",
+                value,
+            );
+            assert_eq!(
+                &slice_buf[..slice_n],
+                vec_buf.as_slice(),
+                "slice_form vs vec_form bytes for value {}",
+                value,
+            );
+
+            // Round-trip via `decode_u64` against the slice-form
+            // output independently — guarantees the bytes the
+            // slice form emitted are themselves a valid varint and
+            // not just structurally identical to the Vec form's
+            // (which could equally be wrong if both shared a bug).
+            let (decoded, consumed) = decode_u64(&slice_buf[..slice_n]).expect("slice-form decode");
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, slice_n);
+        }
+    }
+
+    /// Regression for N3 (companion to `slice_form_matches_vec_form_at_boundaries`):
+    /// the docstring on `encode_u64_into_slice` promises "shorter
+    /// inputs panic with slice-index-out-of-range". Pin that
+    /// contract via `#[should_panic]` so a future refactor that
+    /// e.g. swaps the slice indexer for a `get_mut(i)?.write(b)`
+    /// shape fails this test (and surfaces the contract change).
+    #[test]
+    #[should_panic]
+    fn slice_form_panics_on_undersized_buffer() {
+        // `u64::MAX` requires 10 bytes; a 1-byte buffer must panic.
+        let mut buf = [0u8; 1];
+        let _ = encode_u64_into_slice(u64::MAX, &mut buf);
     }
 }

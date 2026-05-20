@@ -40,6 +40,7 @@
 //! collide with pre-reset ids.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::decoder::MAX_COLUMN_NAME_LENGTH;
@@ -129,10 +130,21 @@ pub struct DecodedSchema {
     pub bytes_consumed: usize,
 }
 
-/// Per-connection mapping `schema_id -> Schema`.
+/// Per-connection mapping `schema_id -> Arc<Schema>`.
+///
+/// `Arc<Schema>` (not `Schema`) so the user-thread snapshot shipped
+/// with every published `RESULT_BATCH` is a refcount bump rather
+/// than a deep clone of every `String` column name. For a wide
+/// schema (100+ columns) the previous by-value layout meant
+/// 100+ `String` heap allocations per batch — and `Schema` is
+/// immutable once registered, so the by-value layout never bought
+/// anything in return. See [`Self::get_arc`] for the cheap
+/// refcount-bump accessor; [`Self::get`] keeps the legacy
+/// `Option<&Schema>` shape via `Deref` so existing callers
+/// (decoder, sync `Cursor::next_batch`) don't need to change.
 #[derive(Debug, Default, Clone)]
 pub struct SchemaRegistry {
-    by_id: HashMap<u64, Schema>,
+    by_id: HashMap<u64, Arc<Schema>>,
 }
 
 impl SchemaRegistry {
@@ -148,17 +160,46 @@ impl SchemaRegistry {
         self.by_id.is_empty()
     }
 
+    /// Borrow the registered `Schema` directly. Caller pays nothing
+    /// (the entry stays owned by the registry). For the user-thread
+    /// snapshot path that needs to outlive the registry borrow, use
+    /// [`Self::get_arc`] and clone the returned `Arc`.
     pub fn get(&self, id: u64) -> Option<&Schema> {
+        self.by_id.get(&id).map(|arc| arc.as_ref())
+    }
+
+    /// Borrow the registered `Arc<Schema>` for refcount-cheap cloning
+    /// into a per-batch user-thread snapshot. The returned reference
+    /// is a `&Arc<Schema>` (not `&Schema`) precisely so the caller
+    /// can `.clone()` it for a refcount bump. Cloning the
+    /// dereferenced `Schema` would defeat the whole point — that
+    /// was the M1 hazard the Arc storage exists to remove.
+    pub fn get_arc(&self, id: u64) -> Option<&Arc<Schema>> {
         self.by_id.get(&id)
     }
 
     pub fn insert(&mut self, id: u64, schema: Schema) {
-        self.by_id.insert(id, schema);
+        self.by_id.insert(id, Arc::new(schema));
     }
 
-    pub fn remove(&mut self, id: u64) -> Option<Schema> {
-        self.by_id.remove(&id)
-    }
+    // The previous per-id `remove(id) -> Option<Schema>` accessor
+    // was deleted:
+    //
+    //   * The QWP protocol has no per-id schema-eviction message —
+    //     `CACHE_RESET` is all-or-nothing and routes through
+    //     `reset()` below; there was never a real caller.
+    //   * The `Arc<Schema>` storage refactor in `by_id` had
+    //     changed the return type from `Option<Schema>` to
+    //     `Option<Arc<Schema>>`, which would have been a silent
+    //     source-incompatible break for any external consumer
+    //     reaching through the `#[doc(hidden)] _bench_internals`
+    //     re-export (despite that surface's "may change without
+    //     notice" disclaimer).
+    //
+    // Deleting outright is cleaner than keeping a `pub(crate)`
+    // shim with no caller; if a future server message gains
+    // per-id eviction semantics, a new method can be added with
+    // the right return shape for that caller from day one.
 
     /// Triggered by `CACHE_RESET` with the schemas bit.
     pub fn reset(&mut self) {
@@ -263,7 +304,8 @@ impl SchemaRegistry {
                     cursor += 1;
                     cols.push(SchemaColumn { name, kind });
                 }
-                self.by_id.insert(schema_id, Schema::from_columns(cols));
+                self.by_id
+                    .insert(schema_id, Arc::new(Schema::from_columns(cols)));
                 Ok(DecodedSchema {
                     schema_id,
                     was_full: true,
@@ -395,5 +437,40 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         reg.decode_section(&build_full(0, &[]), 0).unwrap();
         assert!(reg.get(0).unwrap().is_empty());
+    }
+
+    /// Regression for M1: cloning a registered schema MUST be a
+    /// refcount bump, not a deep clone. The previous registry
+    /// stored `Schema` by value and the pipelined worker's
+    /// per-batch `schema_arc` did `Arc::new(s.clone())` — for a
+    /// wide schema that was N `String` heap clones per batch. The
+    /// fix is to store `Arc<Schema>` in the registry; this test
+    /// pins it via `Arc::ptr_eq` on consecutive `get_arc().clone()`
+    /// pairs (any reintroduction of a deep clone would mint a new
+    /// `Arc` and break pointer equality).
+    #[test]
+    fn get_arc_returns_shared_arc_not_a_fresh_clone() {
+        let mut reg = SchemaRegistry::new();
+        reg.decode_section(
+            &build_full(
+                42,
+                &[
+                    ("a", ColumnKind::Int),
+                    ("b", ColumnKind::Double),
+                    ("c", ColumnKind::Varchar),
+                ],
+            ),
+            3,
+        )
+        .unwrap();
+        let first = reg.get_arc(42).cloned().expect("schema 42 registered");
+        let second = reg.get_arc(42).cloned().expect("schema 42 still there");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "consecutive get_arc clones must share the registry's Arc",
+        );
+        // And the strong count reflects only the registry + our two
+        // clones — i.e. no hidden deep-clone is happening behind us.
+        assert_eq!(Arc::strong_count(&first), 3);
     }
 }
