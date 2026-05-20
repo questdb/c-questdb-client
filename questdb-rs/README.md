@@ -75,24 +75,6 @@ log. `close_drain` waits for already-published frames to be acknowledged
 by the server (bounded by `close_flush_timeout_millis`, default 5s) before
 the sender is dropped.
 
-## Protocol Versions
-
-QWP/WebSocket negotiates its protocol version during the WebSocket upgrade;
-the client requires no `protocol_version` configuration. Arrays
-(`column_arr`) and decimals (`column_dec`) work natively over QWP.
-
-The ILP transports use a separate, ILP-specific protocol-version mechanism
-that gates array and decimal ingestion. Over ILP/HTTP, `protocol_version`
-defaults to `auto` (server-negotiated). Over ILP/TCP, the default is `1`
-and you must set `protocol_version=2` (arrays) or `=3` (decimals)
-explicitly in the configuration string.
-
-| Version | Description                                                | Server Compatibility |
-| ------- | ---------------------------------------------------------- | -------------------- |
-| **1**   | Compatible InfluxDB Line Protocol over ILP transports      | All QuestDB versions |
-| **2**   | 64-bit floats as binary, n-dimensional arrays              | 9.0.0+               |
-| **3**   | Adds DECIMAL64/DECIMAL128/DECIMAL256                       | 9.2.0+               |
-
 ## Docs
 
 This crate's API reference is on the
