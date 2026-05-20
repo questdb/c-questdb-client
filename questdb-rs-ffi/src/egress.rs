@@ -1308,6 +1308,7 @@ pub unsafe extern "C" fn line_reader_query_on_failover_reset(
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
+#[allow(clippy::enum_variant_names)]
 pub enum line_reader_failover_phase {
     line_reader_failover_phase_disconnected = 0,
     line_reader_failover_phase_retrying = 1,

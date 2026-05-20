@@ -1639,7 +1639,9 @@ public:
         ensure_row_in_range(row, "column::get");
         if (is_null(row))
             return std::nullopt;
-        return base[row];
+        T value;
+        std::memcpy(&value, base + row, sizeof(T));
+        return value;
     }
 
     /** Strict overload: explicit `required` kind, bypasses the whitelist. */
@@ -1650,7 +1652,9 @@ public:
         ensure_row_in_range(row, "column::get(kind)");
         if (is_null(row))
             return std::nullopt;
-        return base[row];
+        T value;
+        std::memcpy(&value, base + row, sizeof(T));
+        return value;
     }
 
     /** DECIMAL64 row → `nullable<decimal64>`. */
