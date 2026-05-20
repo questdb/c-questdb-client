@@ -53,6 +53,14 @@ questdb::egress::reader connect_to(const qm::MockServer& srv)
     return questdb::egress::reader{questdb::ingress::utf8_view{conf}};
 }
 
+template <typename T>
+T load_le(const T* p)
+{
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    return v;
+}
+
 // Pack helpers for column data.
 template <typename T>
 std::vector<uint8_t> pack_le(const std::vector<T>& vs)
@@ -3504,7 +3512,7 @@ TEST_CASE("mock: batch::column<int32_t> dense values match get_i32 per cell")
     const int32_t* values = col.values<int32_t>();
     REQUIRE(values != nullptr);
     for (size_t r = 0; r < 4; ++r)
-        CHECK(values[r] == batch.column(0).get<int32_t>(r).value());
+        CHECK(load_le(values + r) == batch.column(0).get<int32_t>(r).value());
 }
 
 TEST_CASE("mock: batch::column<varchar> offsets/data match get_varchar per cell")
@@ -3600,8 +3608,8 @@ TEST_CASE("mock: batch::column INT validity bitmap matches is_null per cell")
     for (size_t r = 0; r < 4; ++r)
         CHECK(col.is_null(r) == !col.get<int32_t>(r).has_value());
     const int32_t* values = col.values<int32_t>();
-    CHECK(values[0] == 100);
-    CHECK(values[2] == 300);
+    CHECK(load_le(values + 0) == 100);
+    CHECK(load_le(values + 2) == 300);
 }
 
 TEST_CASE("mock: batch::column — every fixed-width scalar kind round-trip")
@@ -3693,76 +3701,76 @@ TEST_CASE("mock: batch::column — every fixed-width scalar kind round-trip")
         CHECK(col.kind() == eg::column_kind::byte);
         CHECK(col.value_stride() == 1);
         const auto* v = col.values<int8_t>();
-        CHECK(v[0] == -1);
-        CHECK(v[1] == 42);
+        CHECK(load_le(v + 0) == -1);
+        CHECK(load_le(v + 1) == 42);
     }
     // short
     {
         auto col = batch.column(2);
         CHECK(col.value_stride() == 2);
         const auto* v = col.values<int16_t>();
-        CHECK(v[0] == -1234);
-        CHECK(v[1] == 31000);
+        CHECK(load_le(v + 0) == -1234);
+        CHECK(load_le(v + 1) == 31000);
     }
     // char (UTF-16 code unit)
     {
         auto col = batch.column(3);
         CHECK(col.kind() == eg::column_kind::char_);
         const auto* v = col.values<uint16_t>();
-        CHECK(v[0] == 'A');
-        CHECK(v[1] == 0x4E2D);
+        CHECK(load_le(v + 0) == 'A');
+        CHECK(load_le(v + 1) == 0x4E2D);
     }
     // int
     {
         auto col = batch.column(4);
         const auto* v = col.values<int32_t>();
-        CHECK(v[0] == -7);
-        CHECK(v[1] == 2147483647);
+        CHECK(load_le(v + 0) == -7);
+        CHECK(load_le(v + 1) == 2147483647);
     }
     // ipv4
     {
         auto col = batch.column(5);
         CHECK(col.kind() == eg::column_kind::ipv4);
         const auto* v = col.values<uint32_t>();
-        CHECK(v[0] == 0x7F000001u);
-        CHECK(v[1] == 0xC0A80101u);
+        CHECK(load_le(v + 0) == 0x7F000001u);
+        CHECK(load_le(v + 1) == 0xC0A80101u);
     }
     // long
     {
         auto col = batch.column(6);
         const auto* v = col.values<int64_t>();
-        CHECK(v[0] == -1);
-        CHECK(v[1] == 9223372036854775807LL);
+        CHECK(load_le(v + 0) == -1);
+        CHECK(load_le(v + 1) == 9223372036854775807LL);
     }
     // float
     {
         auto col = batch.column(7);
         const auto* v = col.values<float>();
-        CHECK(v[0] == doctest::Approx(1.25f));
-        CHECK(v[1] == doctest::Approx(-0.5f));
+        CHECK(load_le(v + 0) == doctest::Approx(1.25f));
+        CHECK(load_le(v + 1) == doctest::Approx(-0.5f));
     }
     // double
     {
         auto col = batch.column(8);
         const auto* v = col.values<double>();
-        CHECK(v[0] == doctest::Approx(1.5));
-        CHECK(v[1] == doctest::Approx(-3.14));
+        CHECK(load_le(v + 0) == doctest::Approx(1.5));
+        CHECK(load_le(v + 1) == doctest::Approx(-3.14));
     }
     // timestamp / date / timestamp_nanos — all i64 LE, distinct kind tags.
     {
         auto col = batch.column(9);
         CHECK(col.kind() == eg::column_kind::timestamp);
-        CHECK(col.values<int64_t>()[0] == 1700000000000000LL);
+        CHECK(load_le(col.values<int64_t>() + 0) == 1700000000000000LL);
     }
     {
         auto col = batch.column(10);
         CHECK(col.kind() == eg::column_kind::date);
-        CHECK(col.values<int64_t>()[1] == 86400000LL);
+        CHECK(load_le(col.values<int64_t>() + 1) == 86400000LL);
     }
     {
         auto col = batch.column(11);
         CHECK(col.kind() == eg::column_kind::timestamp_nanos);
-        CHECK(col.values<int64_t>()[1] == 999999999LL);
+        CHECK(load_le(col.values<int64_t>() + 1) == 999999999LL);
     }
     // uuid — 16-byte stride, raw bytes match per-cell.
     {
@@ -3857,8 +3865,8 @@ TEST_CASE("mock: batch::column — binary + decimal64/128/256 + geohash bulk vs 
         CHECK(col.value_stride() == 8);
         CHECK(col.decimal_scale() == 3);
         const auto* v = col.values<int64_t>(eg::column_kind::decimal64);
-        CHECK(v[0] == 12345);
-        CHECK(v[1] == -67890);
+        CHECK(load_le(v + 0) == 12345);
+        CHECK(load_le(v + 1) == -67890);
     }
     // decimal128
     {
