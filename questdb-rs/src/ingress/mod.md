@@ -1,340 +1,359 @@
 # Fast Ingestion of Data into QuestDB
 
-The `ingress` module implements QuestDB's variant of the
-[InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
-(ILP).
+The `ingress` module sends rows of time-series data to a QuestDB server over
+the **QuestDB Wire Protocol over WebSocket (QWP/WebSocket)**: a columnar
+binary protocol with asynchronous server acknowledgements, multi-host
+failover, and optional on-disk durability.
 
 To get started:
 
-* Use [`Sender::from_conf()`] to get the [`Sender`] object
-* Populate a [`Buffer`] with one or more rows of data
-* Send the buffer using [`sender.flush()`](Sender::flush)
+* Use [`Sender::from_conf()`] to build a [`Sender`].
+* Populate a [`Buffer`] with one or more rows.
+* Call [`sender.flush()`](Sender::flush) to publish.
+* Call [`sender.close_drain()`](Sender::close_drain) before dropping the
+  sender so already-published frames complete on the wire.
 
 ```rust no_run
 use questdb::{
     Result,
-    ingress::{
-        Sender,
-        Buffer,
-        TimestampNanos}};
+    ingress::{Sender, TimestampNanos}};
 fn main() -> Result<()> {
-   let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-  let mut buffer = sender.new_buffer();
-   buffer
-       .table("trades")?
-       .symbol("symbol", "ETH-USD")?
-       .symbol("side", "sell")?
-       .column_f64("price", 2615.54)?
-       .column_f64("amount", 0.00044)?
-       .at(TimestampNanos::now())?;
-   sender.flush(&mut buffer)?;
-   Ok(())
+    let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("trades")?
+        .symbol("symbol", "ETH-USD")?
+        .symbol("side", "sell")?
+        .column_f64("price", 2615.54)?
+        .column_f64("amount", 0.00044)?
+        .at(TimestampNanos::now())?;
+    sender.flush(&mut buffer)?;
+    sender.close_drain()?;
+    Ok(())
 }
 ```
 
+For more depth — failover, store-and-forward, durable ACKs, troubleshooting —
+see the [Rust client documentation](https://questdb.com/docs/connect/clients/rust/).
+
 # Configuration String
 
-The easiest way to configure all the available parameters on a line sender is
-the configuration string. The general structure is:
+A sender is configured with a single string:
 
 ```plain
-<transport>::addr=host:port;param1=val1;param2=val2;...
+<transport>::addr=host:port;key1=val1;key2=val2;...
 ```
 
-`transport` can be `http`, `https`, `tcp`, or `tcps`. See the full details on
-supported parameters in a dedicated section below.
+For QWP/WebSocket the transport is `ws` (plain) or `wss` (TLS). The
+long-form aliases `qwpws` / `qwpwss` are also accepted. The default port
+is `9000` for both `ws` and `wss`.
+
+```plain
+ws::addr=localhost:9000;
+wss::addr=db.example.com:9000;username=admin;password=secret;
+ws::addr=node-a:9000,node-b:9000;sf_dir=/var/lib/myapp/qdb-sf;sender_id=ingest-1;
+```
+
+For the full key reference (TLS, auth, failover, store-and-forward,
+durable ACK, progress modes), see the
+[connect-string reference](https://questdb.com/docs/connect/clients/connect-string/)
+on the QuestDB documentation site. [`SenderBuilder`] exposes the same
+options programmatically.
 
 # Don't Forget to Flush
 
-The sender and buffer objects are entirely decoupled. This means that the sender
-won't get access to the data in the buffer until you explicitly call
-[`sender.flush(&mut buffer)`](Sender::flush) or a variant. This may lead to a
-pitfall where you drop a buffer that still has some data in it, resulting in
-permanent data loss.
+The sender and the buffer are decoupled: a buffer accumulates rows
+locally and the sender does not see them until you call
+[`sender.flush(&mut buffer)`](Sender::flush) (or
+[`sender.flush_and_keep(&mut buffer)`](Sender::flush_and_keep) to retain
+the buffer contents).
 
-A common technique is to flush periodically on a timer and/or once the buffer
-exceeds a certain size. You can check the buffer's size by the calling
-[`buffer.len()`](Buffer::len).
+**This client does not auto-flush, regardless of transport.** The
+configuration keys `auto_flush_rows`, `auto_flush_bytes`, and
+`auto_flush_interval` are rejected; `auto_flush=off` is accepted as a
+no-op for compatibility with older connect strings. A common pattern is
+to flush periodically on a timer and/or once the buffer size
+([`buffer.len()`](Buffer::len)) exceeds a threshold.
 
-The default `flush()` method clears the buffer after sending its data. If you
-want to preserve its contents (for example, to send the same data to multiple
-QuestDB instances), call
-[`sender.flush_and_keep(&mut buffer)`](Sender::flush_and_keep) instead.
+On QWP/WebSocket, `flush` returns once the frame has been appended to the
+local publication log. A successful flush clears the buffer; a failed
+flush retains the rows so you can retry. A typical ingest loop reuses one
+sender and one buffer:
 
-# Error Handling
+```rust no_run
+# use questdb::{Result, ingress::{Sender, TimestampNanos}};
+# use std::time::{Duration, Instant};
+# fn main() -> Result<()> {
+# let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
+# let mut buffer = sender.new_buffer();
+# let running = true;
+let flush_interval = Duration::from_secs(1);
+let max_buffer_bytes = 64 * 1024;
+let mut next_flush = Instant::now() + flush_interval;
 
-The supported transport modes handle errors very differently. In a nutshell,
-HTTP is much better at error handling.
+while running {
+    buffer
+        .table("trades")?
+        .symbol("symbol", "ETH-USD")?
+        .column_f64("price", 2615.54)?
+        .at(TimestampNanos::now())?;
 
-## TCP
+    let now = Instant::now();
+    if buffer.len() >= max_buffer_bytes || now >= next_flush {
+        sender.flush(&mut buffer)?;
+        next_flush = now + flush_interval;
+    }
+    // wait for or process the next row
+#   break;
+}
 
-TCP doesn't report errors at all to the sender; instead, the server quietly
-disconnects and you'll have to inspect the server logs to get more information
-on the reason. When this has happened, the sender transitions into an error
-state, and it is permanently unusable. You must drop it and create a new sender.
-You can inspect the sender's error state by calling
-[`sender.must_close()`](Sender::must_close).
+if buffer.len() > 0 {
+    sender.flush(&mut buffer)?;
+}
+# Ok(()) }
+```
 
-## QWP/UDP
+# Error Handling on QWP/WebSocket
 
-QWP/UDP is a best-effort datagram transport. A `flush()` call sends one or more
-UDP datagrams and can report only local socket errors. A successful return does
-not guarantee delivery, server-side processing, or flush-level atomicity.
+QWP/WebSocket is a reliable, in-order transport. Transient socket errors
+and reconnects are absorbed by the driver and do not surface to the
+caller. Two error surfaces are visible to user code:
 
-When one logical flush spans multiple datagrams, some datagrams may already
-have been emitted before a later send fails. In that case, retrying the same
-buffer may duplicate rows that were already sent.
+1. **Synchronous errors from `flush` and related calls** — local
+   failures or a terminal sender state. Returned as `Result::Err`.
+2. **Asynchronous server errors** — protocol or schema errors reported
+   by the server *after* `flush` has returned. Drain them with
+   [`sender.poll_qwp_ws_error()`](Sender::poll_qwp_ws_error) or install a
+   callback via
+   [`SenderBuilder::qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler).
 
-## QWP/WebSocket
+```rust no_run
+# use questdb::{Result, ingress::Sender};
+# fn main() -> Result<()> {
+# let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
+while let Some(err) = sender.poll_qwp_ws_error()? {
+    eprintln!("qwp error: {:?}", err);
+}
+# Ok(()) }
+```
 
-QWP/WebSocket is a reliable, in-order transport. Each published frame is
-assigned a frame sequence number (FSN) and tracked through a publication
-lifecycle until the server acknowledges or rejects it. Transient socket
-errors and reconnects are absorbed by the driver and do not surface to the
-caller; only server rejections and terminal protocol violations are
-reported.
+Server errors are classified by
+[`QwpWsErrorPolicy`]: `DropAndContinue` rejects only the affected
+frame, `Halt` latches the sender into a permanently-unusable state
+([`must_close()`](Sender::must_close) returns `true`). See
+[`QwpWsSenderError`] for the diagnostic fields and
+[`QwpWsErrorCategory`] for the categorisation. The
+[QuestDB documentation site](https://questdb.com/docs/connect/clients/rust/#asynchronous-error-handling)
+has the full protocol-level error model.
 
-Server rejections fall into two categories:
+# Completion Tracking, Progress Modes, Failover, Durability
 
-- *Drop-and-continue* rejections (e.g. schema mismatch, write error) affect
-  only the rejected frame; the sender continues processing subsequent frames.
-  Retrieve structured diagnostics with
-  [`sender.poll_qwp_ws_error()`](Sender::poll_qwp_ws_error), or install a
-  callback via [`SenderBuilder::qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler).
+These are QWP/WebSocket features whose protocol-level details live in the
+QuestDB documentation; the Rust API entry points are summarised here.
 
-- *Halt* rejections (e.g. parse error, internal error, security error) and
-  terminal WebSocket protocol violations latch the sender into a
-  permanently-unusable state. The next `flush()` call returns
-  `ErrorCode::ServerRejection` carrying the structured diagnostic, and
-  [`sender.must_close()`](Sender::must_close) returns `true`. The sender
-  must be dropped and a new one constructed. The buffer passed to that
-  final `flush()` is left unmodified, so its contents can be recovered
-  before dropping the sender.
+* **FSN-based completion** — every published frame is assigned a frame
+  sequence number. Use [`flush_and_get_fsn`](Sender::flush_and_get_fsn)
+  to capture it, then
+  [`await_acked_fsn`](Sender::await_acked_fsn) (or
+  [`published_fsn`](Sender::published_fsn) /
+  [`acked_fsn`](Sender::acked_fsn) non-blocking) to wait for server
+  acknowledgement.
+* **Progress modes** — `background` (default) runs a sender-owned thread
+  that drives the transport; `manual` requires the caller to drive
+  progress with [`drive_once`](Sender::drive_once) or any sender method
+  that progresses the loop. Select via the configuration string
+  (`qwp_ws_progress=manual`) or
+  [`SenderBuilder::qwp_ws_progress`](SenderBuilder::qwp_ws_progress).
+* **Multi-host failover** — pass a comma-separated address list
+  (`addr=a:9000,b:9000`) and tune `reconnect_max_duration_millis`,
+  `reconnect_initial_backoff_millis`, `reconnect_max_backoff_millis`.
+  Auth failures are terminal across all endpoints; transport errors are
+  retried.
+* **Store-and-forward** — set `sf_dir` to a writable directory and
+  `sender_id` to a stable identifier per sender process. Unacknowledged
+  frames are persisted and replayed across reconnects and process
+  restarts. Replay is at-least-once, so target tables should declare
+  `DEDUP UPSERT KEYS(...)`.
+* **Durable acknowledgement** — set `request_durable_ack=on` (QuestDB
+  Enterprise with primary replication) so `acked_fsn` advances only
+  after durable upload to object storage.
 
-`flush()` returns once the frame has been appended to the local publication
-log; the FSN is also available via
-[`flush_and_get_fsn()`](Sender::flush_and_get_fsn). To wait for the server
-to durably acknowledge a specific FSN, call
-[`sender.await_acked_fsn()`](Sender::await_acked_fsn).
-[`sender.published_fsn()`](Sender::published_fsn) and
-[`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
+See [QuestDB high-availability docs](https://questdb.com/docs/high-availability/overview/)
+for the full failover/SF/durable-ACK story and
+[delivery semantics](https://questdb.com/docs/concepts/delivery-semantics/)
+for the at-least-once/exactly-once model.
 
-In `manual` progress mode no background thread observes the transport.
-Server-side state — including halts — only becomes visible when the user
-calls [`sender.drive_once()`](Sender::drive_once) or any sender method
-that drives the transport (such as `flush` or `await_acked_fsn`). As a
-consequence, `must_close()` on an otherwise-idle manual sender does not
-reflect a halt until the next drive.
+# Authentication
 
-## HTTP
+QWP/WebSocket authenticates at the HTTP layer during the WebSocket
+upgrade. Credentials are sent once per connection and reused across
+reconnects.
 
-HTTP distinguishes between recoverable and non-recoverable errors. For
-recoverable ones, it enters a retry loop with exponential backoff, and reports
-the error to the caller only after it has exhausted the retry time budget
-(configuration parameter: `retry_timeout`).
+```rust no_run
+# use questdb::{Result, ingress::Sender};
+# fn main() -> Result<()> {
+// Bearer token (recommended for Enterprise)
+let _s = Sender::from_conf(
+    "wss::addr=db.example.com:9000;token=Yfym3fgMv0B9;")?;
 
-`sender.flush()` and variant methods communicate the error in the `Result`
-return value. The category of the error is signalled through the
-[`ErrorCode`](crate::error::ErrorCode) enum, and it's accompanied with an error
-message.
+// HTTP basic auth
+let _s = Sender::from_conf(
+    "wss::addr=db.example.com:9000;username=admin;password=Yfym3fgMv0B9;")?;
+# Ok(()) }
+```
 
-After the sender has signalled an error, it remains usable. You can handle the
-error as appropriate and continue using it.
+`auth_timeout` (milliseconds, default `15000`) bounds the handshake.
+`auth_timeout_ms` is accepted as a Java-compatible spelling.
+
+**Not supported by this client:** OIDC token acquisition / in-band
+refresh, mutual TLS (client certificates), token rotation mid-session.
+QuestDB itself supports OIDC server-side — see
+[OpenID Connect](https://questdb.com/docs/security/oidc/); acquire a
+token out-of-band from your IdP, pass it via `token=...`, and rebuild
+the sender when it nears expiry. mTLS is not negotiated by the
+QuestDB server regardless of client.
+
+# TLS
+
+Use the `wss` schema (or the alias `qwpwss`). Configuration parameters:
+
+* `tls_ca=webpki_roots` — bundled webpki roots (default).
+* `tls_ca=os_roots` — OS certificate store (requires the
+  `tls-native-certs` feature).
+* `tls_ca=webpki_and_os_roots` — both.
+* `tls_roots=/path/to/root-ca.pem` — load roots from a PEM file.
+  Implies `tls_ca=pem_file`.
+* `tls_verify=unsafe_off` — disable verification entirely. Requires
+  the `insecure-skip-verify` feature. **Never use in production.**
+
+See the notes on
+[how to generate a self-signed certificate](https://github.com/questdb/c-questdb-client/tree/6.1.0/tls_certs).
+
+# Closing the Sender
+
+For delivery-sensitive shutdown, call
+[`close_drain`](Sender::close_drain) before dropping the sender:
+
+```rust no_run
+# use questdb::{Result, ingress::Sender};
+# fn main() -> Result<()> {
+# let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
+sender.close_drain()?;
+# Ok(()) }
+```
+
+`close_drain` stops accepting new publications and waits up to
+`close_flush_timeout_millis` (default `5000`) for already-published
+frames to be acknowledged. With `sf_dir`, anything still un-acked is
+persisted to disk so a later sender can replay it. Dropping a sender
+without `close_drain` is best-effort: in-flight frames may not reach the
+server, and any delivery failure is silent.
 
 # Health Check
 
-The QuestDB server has a "ping" endpoint you can access to see if it's alive,
-and confirm the version of the InfluxDB that it is compatible with at a protocol
-level.
+The QuestDB server exposes a `/ping` endpoint on the same port as
+QWP/WebSocket (the HTTP listener; default `9000`):
 
 ```shell
 curl -I http://localhost:9000/ping
 ```
 
-Example of the expected response:
+# Sequential Coupling in the Buffer API
 
-```plain
-HTTP/1.1 204 OK
-Server: questDB/1.0
-Date: Fri, 2 Feb 2024 17:09:38 GMT
-Transfer-Encoding: chunked
-Content-Type: text/plain; charset=utf-8
-X-Influxdb-Version: v2.7.4
-```
+The fluent API of [`Buffer`] has sequential coupling: there's a certain
+order in which you are expected to call the methods. You must write the
+symbols before the columns, and you must terminate each row by calling
+either [`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the
+[`Buffer`] doc for the full rules and a flowchart.
 
-# Configuration Parameters
+# Optimization: Avoid Revalidating Names
 
-In the examples below, we'll use configuration strings. We also provide the
-[`SenderBuilder`] to programmatically configure the sender. The methods on
-[`SenderBuilder`] match one-for-one with the keys in the configuration string.
+The client validates every name you provide. To avoid re-validating the
+same names on every row, create pre-validated [`ColumnName`] and
+[`TableName`] values once:
 
-## Authentication
-
-To establish an
-[authenticated](https://questdb.io/docs/reference/api/ilp/overview/#authentication)
-and TLS-encrypted connection, use the `https` or `tcps` protocol, and use the
-configuration options appropriate for the authentication method.
-
-Here are quick examples of configuration strings for each authentication method
-we support:
-
-### HTTP Token Bearer Authentication
-
-```no_run
-# use questdb::{Result, ingress::Sender};
+```rust no_run
+# use questdb::Result;
+use questdb::ingress::{TableName, ColumnName, Sender, TimestampNanos};
 # fn main() -> Result<()> {
-let mut sender = Sender::from_conf(
-    "https::addr=localhost:9000;token=Yfym3fgMv0B9;"
-)?;
-# Ok(())
-# }
+let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
+let mut buffer = sender.new_buffer();
+let table_name = TableName::new("trades")?;
+let price_name = ColumnName::new("price")?;
+buffer.table(table_name)?.column_f64(price_name, 2615.54)?.at(TimestampNanos::now())?;
+buffer.table(table_name)?.column_f64(price_name, 39269.98)?.at(TimestampNanos::now())?;
+# Ok(()) }
 ```
 
-* `token`: the authentication token
+# Handling Optional Data (NULLs)
 
-### HTTP Basic Authentication
+In QuestDB, `NULL` values are represented by simply omitting the column
+for that specific row.
 
-```no_run
-# use questdb::{Result, ingress::Sender};
+To make working with Rust's `Option<T>` ergonomic and keep the fluent
+builder chain unbroken, the [`Buffer`] API provides `_opt` variants for
+all column methods (e.g.
+[`column_str_opt`](Buffer::column_str_opt),
+[`column_f64_opt`](Buffer::column_f64_opt)).
+
+If the provided value is `Some(v)`, the column is written normally. If
+the value is `None`, the method acts as a no-op and skips the column.
+
+**Note on ownership:** for types that implement `Copy` (like `i64`,
+`f64`, `bool`), you can pass the `Option` directly. For heap-allocated
+types like `String` or `Vec`, use `.as_ref()` or `.as_deref()` to pass a
+reference without consuming the original value.
+
+```rust no_run
+# use questdb::Result;
+use questdb::ingress::{Sender, TimestampNanos};
 # fn main() -> Result<()> {
-let mut sender = Sender::from_conf(
-    "https::addr=localhost:9000;username=testUser1;password=Yfym3fgMv0B9;"
-)?;
-# Ok(())
-# }
+let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
+let mut buffer = sender.new_buffer();
+let humidity: Option<f64> = None;
+buffer
+    .table("sensors")?
+    .symbol("location", "factory-1")?
+    .column_f64("temperature", 22.5)?
+    // Silently skips the humidity column (stored as NULL).
+    .column_f64_opt("humidity", humidity)?
+    .at(TimestampNanos::now())?;
+# Ok(()) }
 ```
 
-* `username`: the username
-* `password`: the password
+# Array Datatype
 
-### TCP Elliptic Curve Digital Signature Algorithm (ECDSA)
+[`Buffer::column_arr`](Buffer::column_arr) supports efficient ingestion
+of N-dimensional arrays using:
 
-```no_run
-# use questdb::{Result, ingress::Sender};
-# fn main() -> Result<()> {
-let mut sender = Sender::from_conf(
-    "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy;"
-)?;
-# Ok(())
-# }
-```
+* native Rust arrays and slices (up to 3-dimensional)
+* native Rust vectors (up to 3-dimensional)
+* arrays from the [`ndarray`](https://docs.rs/ndarray) crate
 
-The four ECDSA components are:
+QWP/WebSocket carries array types natively in the wire format and does
+not require a `protocol_version` setting. Requires QuestDB server
+9.0.0 or later.
 
-* `username`, aka. _kid_
-* `token`, aka. _d_
-* `token_x`, aka. _x_
-* `token_y`, aka. _y_
+# Decimal Datatype
 
-### Authentication Timeout
+[`Buffer::column_dec`](Buffer::column_dec) accepts:
 
-You can specify how long the client should wait for the authentication request
-to resolve. The configuration parameter is:
+* native Rust string slices
+* decimals from the [`rust_decimal`](https://docs.rs/rust_decimal) crate
+* decimals from the [`bigdecimal`](https://docs.rs/bigdecimal) crate
 
-* `auth_timeout` (milliseconds, default 15 seconds)
+QWP/WebSocket carries `DECIMAL64`, `DECIMAL128`, and `DECIMAL256`
+natively and does not require a `protocol_version` setting. Requires
+QuestDB server 9.2.0 or later. Pre-create decimal columns with
+`DECIMAL(precision, scale)` so the server enforces the expected
+precision.
 
-For QWP/WebSocket configuration strings, the Java-compatible spelling is also
-accepted:
+# Timestamp Column Name
 
-* `auth_timeout_ms` (milliseconds, default 15 seconds)
-
-## Encryption on the Wire: TLS
-
-To enable TLS on the QuestDB Enterprise server, refer to the [QuestDB Enterprise
-TLS documentation](https://questdb.io/docs/operations/tls/).
-
-*Note*: QuestDB Open Source does not support TLS natively. To use TLS with
-QuestDB Open Source, use a TLS proxy such as
-[HAProxy](http://www.haproxy.org/).
-
-We support several certification authorities (sources of PKI root certificates).
-To select one, use the `tls_ca` config option. These are the supported variants:
-
-* `tls_ca=webpki_roots;` use the roots provided in the standard Rust crate
-  [webpki-roots](https://crates.io/crates/webpki-roots)
-
-* `tls_ca=os_roots;` use the OS-provided certificate store
-
-* `tls_ca=webpki_and_os_roots;` combine both of the above
-
-* `tls_roots=/path/to/root-ca.pem;` get the root certificates from the specified
-  file. Main purpose is for testing with self-signed certificates. _Note:_ this
-  automatically sets `tls_ca=pem_file`.
-
-See our notes on [how to generate a self-signed
-certificate](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
-
-* `tls_verify=unsafe_off;` tells the QuestDB client to ignore all CA roots and
-  accept any server certificate without checking. You can use it as a last
-  resort, when you weren't able to apply the above approach with a self-signed
-  certificate. You should **never use it in production** as it defeats security
-  and allows a man-in-the middle attack.
-
-## HTTP Timeouts
-
-Instead of a fixed timeout value, we use a flexible timeout that depends on the
-size of the HTTP request payload (how much data is in the buffer that you're
-flushing). You can configure it using two options:
-
-* `request_min_throughput` (bytes per second, default 100 KiB/s): divide the
-  payload size by this number to determine for how long to keep sending the
-  payload before timing out.
-* `request_timeout` (milliseconds, default 10 seconds): additional time
-  allowance to account for the fixed latency of the request-response roundtrip.
-
-Finally, the client will keep retrying the request if it experiences errors. You
-can configure the total time budget for retrying:
-
-* `retry_timeout` (milliseconds, default 10 seconds)
-
-# Usage Considerations
-
-## Transactional Flush
-
-When using HTTP, you can arrange that each `flush()` call happens within its own
-transaction. For this to work, your buffer must contain data that targets only
-one table. This is because QuestDB doesn't support multi-table transactions.
-
-In order to ensure in advance that a flush will be transactional, call
-[`sender.flush_and_keep_with_flags(&mut buffer, true)`](Sender::flush_and_keep_with_flags).
-This call will refuse to flush a buffer if the flush wouldn't be transactional.
-
-## When to Choose the TCP Transport?
-
-As discussed above, the TCP transport mode is raw and simplistic: it doesn't
-report any errors to the caller (the server just disconnects), has no automatic
-retries, requires manual handling of connection failures, and doesn't support
-transactional flushing.
-
-However, TCP has a lower overhead than HTTP and it's worthwhile to try out as an
-alternative in a scenario where you have a constantly high data rate and/or deal
-with a high-latency network connection.
-
-## Array Datatype
-
-The [`Buffer::column_arr`](Buffer::column_arr) method supports efficient ingestion of N-dimensional
-arrays using several convenient types:
-
-- native Rust arrays and slices (up to 3-dimensional)
-- native Rust vectors (up to 3-dimensional)
-- arrays from the [`ndarray`](https://docs.rs/ndarray) crate
-
-You must use protocol version 2 to ingest arrays. The HTTP transport will
-automatically enable it as long as you're connecting to an up-to-date QuestDB
-server (version 9.0.0 or later), but with TCP you must explicitly specify it in
-the configuration string: `protocol_version=2;`.
-
-**Note**: QuestDB server version 9.0.0 or later is required for array support.
-
-## Timestamp Column Name
-
-The InfluxDB Line Protocol (ILP) does not give a name to the designated timestamp,
-so if you let this client auto-create the table, it will have the default `timestamp` name.
-To use a custom name, say `my_ts`, pre-create the table with the desired
-timestamp column name:
-
-To address this, issue a `CREATE TABLE` statement to create the table in advance.
-Note the `timestamp(my_ts)` clause at the end specifies the designated timestamp.
+The QuestDB ingest protocols do not give a name to the designated
+timestamp, so if you let this client auto-create the table, it will have
+the default `timestamp` name. To use a custom name, issue a
+`CREATE TABLE` in advance:
 
 ```sql
 CREATE TABLE IF NOT EXISTS 'trades' (
@@ -346,125 +365,89 @@ CREATE TABLE IF NOT EXISTS 'trades' (
 ) timestamp (my_ts) PARTITION BY DAY WAL;
 ```
 
-You can use the `CREATE TABLE IF NOT EXISTS` construct to make sure the table is
-created, but without raising an error if the table already exists.
+# Transactional Flush
 
-## Sequential Coupling in the Buffer API
+[`flush_and_keep_with_flags`](Sender::flush_and_keep_with_flags) with
+`transactional = true` refuses to flush a buffer that would span
+multiple tables, ensuring QuestDB treats the flush as a single
+transaction. The function is gated on the `sync-sender-http` Cargo
+feature; building with QWP/WebSocket only does not expose it.
 
-The fluent API of [`Buffer`] has sequential coupling: there's a certain order in
-which you are expected to call the methods. For example, you must write the
-symbols before the columns, and you must terminate each row by calling either
-[`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the [`Buffer`] doc
-for the full rules and a flowchart.
+# Check out the CONSIDERATIONS Document
 
-## Optimization: Avoid Revalidating Names
+The
+[library considerations](https://github.com/questdb/c-questdb-client/blob/6.1.0/doc/CONSIDERATIONS.md)
+covers threading, data quality, server errors, flushing, and
+disconnections.
 
-The client validates every name you provide. To avoid the redundant CPU work of
-re-validating the same names on every row, create pre-validated [`ColumnName`]
-and [`TableName`] values:
+# Troubleshooting
 
-```no_run
-# use questdb::Result;
-use questdb::ingress::{
-    TableName,
-    ColumnName,
-    Buffer,
-    SenderBuilder,
-    TimestampNanos};
-# fn main() -> Result<()> {
-let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-let mut buffer = sender.new_buffer();
-let table_name = TableName::new("trades")?;
-let price_name = ColumnName::new("price")?;
-buffer.table(table_name)?.column_f64(price_name, 2615.54)?.at(TimestampNanos::now())?;
-buffer.table(table_name)?.column_f64(price_name, 39269.98)?.at(TimestampNanos::now())?;
-# Ok(())
-# }
-```
+If data doesn't appear in the database in a timely manner, you may not
+be calling [`flush`](Sender::flush) often enough — this client has no
+auto-flush on any transport.
 
-## Handling Optional Data (NULLs)
+For QWP/WebSocket, drain
+[`poll_qwp_ws_error`](Sender::poll_qwp_ws_error) (or install a callback
+via
+[`qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler)) to see
+structured server diagnostics. The
+[server log](https://questdb.com/docs/troubleshooting/log/) carries
+additional context.
 
-In QuestDB, `NULL` values are represented by simply omitting the column for that specific row.
+# Legacy ILP Transports
 
-To make working with Rust's `Option<T>` ergonomic and keep the fluent builder chain unbroken, the [`Buffer`] API provides `_opt` variants for all column methods (e.g., [`column_str_opt`](Buffer::column_str_opt), [`column_f64_opt`](Buffer::column_f64_opt)).
+> **Legacy.** The ILP transports (`http`, `https`, `tcp`, `tcps`) remain
+> supported for backwards compatibility but are not recommended for new
+> code. Use QWP/WebSocket
+> ([top of this page](#fast-ingestion-of-data-into-questdb)) instead.
 
-If the provided value is `Some(v)`, the column is written normally. If the value is `None`, the method acts as a no-op and skips the column.
+The same [`Sender`] / [`Buffer`] API works across all transports — the
+difference is the configuration string and the error model.
 
-**Note on ownership:** For types that implement `Copy` (like `i64`, `f64`, `bool`), you can pass the `Option` directly. For heap-allocated types like `String` or `Vec`, use `.as_ref()` or `.as_deref()` to pass a reference without consuming the original value.
+## ILP/HTTP
+
+Configuration: `http::` or `https::`. Request-response. Recoverable
+errors are retried with exponential backoff and surface only after the
+retry budget is exhausted; the sender remains usable on signalled
+errors.
 
 ```rust no_run
-# use questdb::Result;
-use questdb::ingress::{Buffer, SenderBuilder, TimestampNanos};
-
+# use questdb::{Result, ingress::{Sender, TimestampNanos}};
 # fn main() -> Result<()> {
-  let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
-  let mut buffer = sender.new_buffer();
-  struct SensorData {
-      sensor_id: Option<String>,
-      temperature: Option<f64>,
-      humidity: Option<f64>,
-  }
-
-  let data = SensorData { sensor_id: Some("sensor-1".to_string()), temperature: Some(22.5), humidity: None };
-
-  buffer
-      .table("sensors")?
-      .symbol("location", "factory-1")?
-      // Writes the sensor_id column if it's Some, otherwise skips it (stored as NULL in QuestDB)
-      .symbol_opt("sensor_id", data.sensor_id.as_deref())?
-      // Writes the temperature column
-      .column_f64_opt("temperature", data.temperature)?
-      // Silently skips the humidity column (stored as NULL in QuestDB)
-      .column_f64_opt("humidity", data.humidity)?
-      .at(TimestampNanos::now())?;
-#   Ok(())
-# }
+let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
+# let mut buffer = sender.new_buffer();
+# buffer.table("trades")?.column_f64("price", 1.0)?.at(TimestampNanos::now())?;
+# sender.flush(&mut buffer)?;
+# Ok(()) }
 ```
 
-## Decimal Datatype
+HTTP-specific tuning: `request_min_throughput` (bytes/sec, default
+100 KiB/s), `request_timeout` (default 10 s), `retry_timeout` (default
+10 s). HTTP also supports
+[transactional flushes](#transactional-flush).
 
-The [`Buffer::column_dec`](Buffer::column_dec) method supports efficient ingestion of decimal values using several convenient types:
+For arrays and decimals on HTTP, `protocol_version=auto` (the default)
+negotiates the right version with the server.
 
-- native Rust String slices
-- decimals from the [`rust_decimal`](https://docs.rs/rust_decimal) crate
-- decimals from the [`bigdecimal`](https://docs.rs/bigdecimal) crate
+## ILP/TCP
 
-You must use protocol version 3 to ingest decimals. The HTTP transport will
-automatically enable it as long as you're connecting to an up-to-date QuestDB
-server (version 9.2.0 or later), but with TCP you must explicitly specify it in
-the configuration string: `protocol_version=3;`.
+Configuration: `tcp::` or `tcps::`. Streaming. Does not report errors to
+the sender — the server silently disconnects on error and the failure
+appears only in the server log. The sender transitions into a terminal
+state which you can detect via
+[`must_close`](Sender::must_close). TCP also has lower overhead than
+HTTP, which suits very high steady-state throughput on a high-latency
+network, at the cost of all observability.
 
-**Note**: QuestDB server version 9.2.0 or later is required for decimal support.
+TCP supports ECDSA authentication:
 
-## Check out the CONSIDERATIONS Document
+```rust no_run
+# use questdb::{Result, ingress::Sender};
+# fn main() -> Result<()> {
+let _s = Sender::from_conf(
+    "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy;")?;
+# Ok(()) }
+```
 
-The [Library
-considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
-document covers these topics:
-
-* Threading
-* Differences between the InfluxDB Line Protocol and QuestDB Data Types
-* Data Quality
-* Client-side checks and server errors
-* Flushing
-* Disconnections, data errors and troubleshooting
-
-# Troubleshooting Common Issues
-
-## Infrequent Flushing
-
-If the data doesn't appear in the database in a timely manner, you may not be
-calling [`flush()`](Sender::flush) often enough.
-
-## Debug disconnects and inspect errors
-
-If you're using ILP-over-TCP, it doesn't report any errors to the client.
-Instead, on error, the server terminates the connection, and logs any error
-messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
-
-To inspect or log a buffer's contents before you send it, call
-[`buffer.as_bytes()`](Buffer::as_bytes).
-
-This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
-encoded into UDP datagrams during [`flush()`](Sender::flush), so
-[`buffer.as_bytes()`](Buffer::as_bytes) is not useful there.
+TCP defaults to `protocol_version=1`. To send arrays or decimals over
+TCP you must specify `protocol_version=2` (or `=3`) explicitly.
