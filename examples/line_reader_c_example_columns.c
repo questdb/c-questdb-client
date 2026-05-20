@@ -59,47 +59,86 @@ static int print_scalar_column(
             printf("NULL\t");
             continue;
         }
+        /* `d.values` may not be aligned to the element type — densified
+         * column slices borrow from the wire payload at offsets that
+         * don't satisfy `alignof(T)`. Forming `((const T*)d.values)[r]`
+         * is undefined behaviour; copy via `memcpy` into an aligned
+         * local instead. Compilers lower the small fixed-size memcpy
+         * to a single unaligned MOV. */
+        const uint8_t* base = (const uint8_t*)d.values + r * d.value_stride;
         switch (d.kind)
         {
         case line_reader_column_kind_boolean:
-            printf("%s\t", ((const uint8_t*)d.values)[r] ? "true" : "false");
+            printf("%s\t", base[0] ? "true" : "false");
             break;
         case line_reader_column_kind_byte:
-            printf("%d\t", ((const int8_t*)d.values)[r]);
+        {
+            int8_t v;
+            memcpy(&v, base, sizeof(v));
+            printf("%d\t", v);
             break;
+        }
         case line_reader_column_kind_short:
-            printf("%d\t", ((const int16_t*)d.values)[r]);
+        {
+            int16_t v;
+            memcpy(&v, base, sizeof(v));
+            printf("%d\t", v);
             break;
+        }
         case line_reader_column_kind_char:
-            printf("U+%04X\t", ((const uint16_t*)d.values)[r]);
+        {
+            uint16_t v;
+            memcpy(&v, base, sizeof(v));
+            printf("U+%04X\t", v);
             break;
+        }
         case line_reader_column_kind_int:
-            printf("%" PRId32 "\t", ((const int32_t*)d.values)[r]);
+        {
+            int32_t v;
+            memcpy(&v, base, sizeof(v));
+            printf("%" PRId32 "\t", v);
             break;
+        }
         case line_reader_column_kind_ipv4:
         {
-            const uint32_t v = ((const uint32_t*)d.values)[r];
+            uint32_t v;
+            memcpy(&v, base, sizeof(v));
             printf("%u.%u.%u.%u\t",
                    (v >> 24) & 0xFF, (v >> 16) & 0xFF,
                    (v >> 8) & 0xFF, v & 0xFF);
             break;
         }
         case line_reader_column_kind_float:
-            printf("%g\t", (double)((const float*)d.values)[r]);
+        {
+            float v;
+            memcpy(&v, base, sizeof(v));
+            printf("%g\t", (double)v);
             break;
+        }
         case line_reader_column_kind_double:
-            printf("%g\t", ((const double*)d.values)[r]);
+        {
+            double v;
+            memcpy(&v, base, sizeof(v));
+            printf("%g\t", v);
             break;
+        }
         case line_reader_column_kind_long:
         case line_reader_column_kind_timestamp:
         case line_reader_column_kind_date:
         case line_reader_column_kind_timestamp_nanos:
-            printf("%" PRId64 "\t", ((const int64_t*)d.values)[r]);
+        {
+            int64_t v;
+            memcpy(&v, base, sizeof(v));
+            printf("%" PRId64 "\t", v);
             break;
+        }
         case line_reader_column_kind_decimal64:
-            printf("%" PRId64 "e%d\t",
-                   ((const int64_t*)d.values)[r], -(int)d.decimal_scale);
+        {
+            int64_t v;
+            memcpy(&v, base, sizeof(v));
+            printf("%" PRId64 "e%d\t", v, -(int)d.decimal_scale);
             break;
+        }
         case line_reader_column_kind_decimal128:
         case line_reader_column_kind_decimal256:
         case line_reader_column_kind_uuid:
