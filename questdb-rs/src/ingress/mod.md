@@ -82,22 +82,33 @@ sender and one buffer:
 
 ```rust no_run
 # use questdb::{Result, ingress::{Sender, TimestampNanos}};
+# use std::time::{Duration, Instant};
 # fn main() -> Result<()> {
 # let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
 # let mut buffer = sender.new_buffer();
 # let running = true;
+let flush_interval = Duration::from_secs(1);
+let max_buffer_bytes = 64 * 1024;
+let mut next_flush = Instant::now() + flush_interval;
+
 while running {
     buffer
         .table("trades")?
         .symbol("symbol", "ETH-USD")?
         .column_f64("price", 2615.54)?
         .at(TimestampNanos::now())?;
-    sender.flush(&mut buffer)?;
-    if buffer.len() > 64 * 1024 {
-        // also flush on size if you batch multiple rows per iteration
+
+    let now = Instant::now();
+    if buffer.len() >= max_buffer_bytes || now >= next_flush {
+        sender.flush(&mut buffer)?;
+        next_flush = now + flush_interval;
     }
-    // sleep until the next tick
+    // wait for or process the next row
 #   break;
+}
+
+if buffer.len() > 0 {
+    sender.flush(&mut buffer)?;
 }
 # Ok(()) }
 ```
