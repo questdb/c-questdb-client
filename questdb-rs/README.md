@@ -154,5 +154,5 @@ Python.
 
 If you need help, have questions, or want to provide feedback,
 [join us on Slack](https://slack.questdb.io/). You can also sign up to
-the [mailing list](https://questdb.io/community/) to get notified of new
+the [mailing list](https://questdb.com/community/) to get notified of new
 releases.
