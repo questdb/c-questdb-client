@@ -139,12 +139,6 @@ impl HostHealthTracker {
         }
     }
 
-    /// Diagnostic accessor — number of configured hosts.
-    #[cfg(test)]
-    pub(crate) fn count(&self) -> usize {
-        self.states.len()
-    }
-
     /// Diagnostic accessor — current state classification for one host.
     #[cfg(test)]
     pub(crate) fn state(&self, idx: usize) -> HostState {

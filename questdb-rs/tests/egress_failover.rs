@@ -1161,13 +1161,13 @@ fn failover_disabled_surfaces_socket_error() {
 fn attempts_exhausted_surfaces_error() {
     // A is healthy for the initial connect, then drops mid-query. B
     // is broken at connect-time (drops before SERVER_INFO). With
-    // max_attempts=4, the cursor's first failure should burn 3 outer
+    // max_attempts=4, the cursor's first failure should burn 4 outer
     // reconnect attempts, all of which fail.
     //
     // Dial accounting:
     //   - Initial connect: 1 dial to A (success).
     //   - Mid-stream failure on A. `reconnect_with_failover` runs
-    //     `attempts_total = 3` outer attempts. Each outer attempt
+    //     `attempts_total = 4` outer attempts. Each outer attempt
     //     invokes `walk_via_tracker(allow_reset_pass=true)`:
     //       1. pick B (Unknown < TransportError) → fail
     //       2. pick A (TransportError) → fail
@@ -1175,8 +1175,8 @@ fn attempts_exhausted_surfaces_error() {
     //       4. pick A (lowest-index Unknown) → fail
     //       5. pick B → fail
     //     → 4 dials per outer attempt (2 per host).
-    //   - Reconnect total: 3 × 4 = 12 dials, split A=6, B=6.
-    //   - Grand total: 1 + 12 = 13, with A=7, B=6.
+    //   - Reconnect total: 4 × 4 = 16 dials, split A=8, B=8.
+    //   - Grand total: 1 + 16 = 17, with A=9, B=8.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         // Subsequent accepts: TCP-level drop so even the connect fails.
@@ -1204,24 +1204,24 @@ fn attempts_exhausted_surfaces_error() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial to A + 3 outer reconnects × 4 dials each = 13 total.
+    // 1 initial to A + 4 outer reconnects × 4 dials each = 17 total.
     // A bears the initial + half of each reconnect attempt's 4 dials,
-    // so A=7, B=6.
+    // so A=9, B=8.
     let total = srv_a.accepts() + srv_b.accepts();
     assert_eq!(
         total,
-        13,
-        "expected 13 total dial attempts (1 initial + 3 outer reconnects × 4 dials each); \
+        17,
+        "expected 17 total dial attempts (1 initial + 4 outer reconnects × 4 dials each); \
          got A={}, B={}",
         srv_a.accepts(),
         srv_b.accepts()
     );
     assert_eq!(
         srv_a.accepts(),
-        7,
+        9,
         "A receives the initial + 2 dials per outer attempt"
     );
-    assert_eq!(srv_b.accepts(), 6, "B receives 2 dials per outer attempt");
+    assert_eq!(srv_b.accepts(), 8, "B receives 2 dials per outer attempt");
 }
 
 #[test]
@@ -1510,13 +1510,13 @@ fn single_endpoint_failover_exhausts_budget() {
     //   - Initial connect: 1 dial (success — serves the query, then drops).
     //   - Mid-stream failure on the single host triggers
     //     `reconnect_with_failover`, which runs
-    //     `attempts_total = max_attempts - 1 = 3` outer reconnect attempts.
+    //     `attempts_total = max_attempts = 4` outer reconnect attempts.
     //   - Each outer attempt invokes `walk_via_tracker(allow_reset_pass=true)`:
     //     pick the host → fail → fall-through reset → re-pick the
     //     same host → fail. That's 2 dials per outer attempt against
     //     the single configured endpoint.
-    //   - Reconnect total: 3 × 2 = 6 dials.
-    //   - Grand total: 1 + 6 = 7. The single per-Execute reconnect
+    //   - Reconnect total: 4 × 2 = 8 dials.
+    //   - Grand total: 1 + 8 = 9. The single per-Execute reconnect
     //     walk returns Err on exhaustion; no outer replay-cycle
     //     wrapper rearms it.
     let srv = MockServer::start(vec![
@@ -1545,13 +1545,13 @@ fn single_endpoint_failover_exhausts_budget() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial + 3 outer reconnect attempts × 2 dials per attempt
-    // (walk + fall-through reset walk on the single host) = 7.
+    // 1 initial + 4 outer reconnect attempts × 2 dials per attempt
+    // (walk + fall-through reset walk on the single host) = 9.
     assert_eq!(
         srv.accepts(),
-        7,
-        "expected exactly 7 dials against the single endpoint \
-         (1 initial + 3 reconnect attempts × 2 dials per attempt); got {}",
+        9,
+        "expected exactly 9 dials against the single endpoint \
+         (1 initial + 4 reconnect attempts × 2 dials per attempt); got {}",
         srv.accepts()
     );
 }
@@ -3149,7 +3149,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
 /// be re-walked indefinitely inside a single outer attempt.
 #[test]
 fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
-    // 1 host, failover_max_attempts=3 (attempts_total=2 outer
+    // 1 host, failover_max_attempts=3 (attempts_total=3 outer
     // reconnect attempts). Each outer attempt: walk (1 dial) +
     // fall-through reset walk (1 dial) = 2 dials.
     let srv = MockServer::start(vec![
@@ -3168,14 +3168,14 @@ fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
     drop(cursor);
     drop(reader);
 
-    // attempts_total=2 outer attempts × 2 dials per attempt = 4
-    // reconnect dials. Plus 1 initial = 5. If the fall-through reset
+    // attempts_total=3 outer attempts × 2 dials per attempt = 6
+    // reconnect dials. Plus 1 initial = 7. If the fall-through reset
     // were not bounded to one pass, this would be unbounded (the
     // walk would loop forever resetting and re-walking).
     assert_eq!(
         srv.accepts(),
-        5,
-        "expected 1 initial + 2 outer reconnect attempts × 2 dials/attempt; got {}",
+        7,
+        "expected 1 initial + 3 outer reconnect attempts × 2 dials/attempt; got {}",
         srv.accepts()
     );
 }
@@ -3584,7 +3584,7 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
 /// Regression for `reconnect_with_failover`'s exhaustion-error counter:
 /// when `failover_max_duration_ms` cuts the loop short, the surfaced
 /// message must report the **actual** number of attempts that ran, not
-/// the configured `failover_max_attempts - 1` cap. Otherwise an
+/// the configured `failover_max_attempts` cap. Otherwise an
 /// operator reading the log sees a number that overstates the real
 /// dial pressure and points at the wrong knob to tune.
 #[test]
@@ -3981,15 +3981,15 @@ fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
     );
 
     // Retrying fires once per outer-loop iteration. With
-    // failover_max_attempts=4, attempts_total=3.
+    // failover_max_attempts=4, attempts_total=4.
     let retrying: Vec<_> = events
         .iter()
         .filter(|e| e.phase == FailoverPhase::Retrying)
         .collect();
     assert_eq!(
         retrying.len(),
-        3,
-        "expected exactly 3 Retrying events (attempts_total=3): {:?}",
+        4,
+        "expected exactly 4 Retrying events (attempts_total=4): {:?}",
         events
     );
     // Attempts must be strictly increasing.
@@ -4089,16 +4089,15 @@ fn progress_callback_disconnected_fires_before_any_dial() {
                 FailoverPhase::Disconnected => {
                     f2.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                FailoverPhase::Retrying => {
-                    // First Retrying observes whether Disconnected
-                    // already fired (stable across mock-server
-                    // timing because both callbacks run on the
-                    // cursor's drive thread).
+                // First Retrying observes whether Disconnected
+                // already fired (stable across mock-server timing
+                // because both callbacks run on the cursor's drive
+                // thread).
+                FailoverPhase::Retrying
                     if f2.load(std::sync::atomic::Ordering::SeqCst)
-                        && !f1.load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        f1.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
+                        && !f1.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    f1.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 _ => {}
             }

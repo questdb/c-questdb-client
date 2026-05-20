@@ -785,8 +785,8 @@ fn reserve_segment_blocks(file: &File, size_bytes: u64) -> Result<(), SfaSegment
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn reserve_segment_blocks(_file: &File, _size_bytes: u64) -> Result<(), SfaSegmentError> {
-    Err(SfaSegmentError::PreallocationUnsupported)
+fn reserve_segment_blocks(file: &File, size_bytes: u64) -> Result<(), SfaSegmentError> {
+    file.set_len(size_bytes).map_err(SfaSegmentError::Io)
 }
 
 fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {

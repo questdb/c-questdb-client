@@ -426,11 +426,12 @@ pub struct ReaderConfig {
     /// the parser (so configs aren't rejected on a partial enable/disable
     /// flip) but have no effect — transport failures surface immediately.
     pub failover: bool,
-    /// Cap on the total number of connect rounds (default `8`). The
-    /// total breaks down as `1` initial connect plus
-    /// `failover_max_attempts - 1` reconnect rounds after a transport
-    /// failure, before the failure is propagated. Must be `>= 1`.
-    /// Ignored when [`failover`](Self::failover) is `false`.
+    /// Cap on the number of mid-stream reconnect rounds after a
+    /// transport failure (default `8`). The initial connect is counted
+    /// separately; the total connect rounds before a failure is
+    /// propagated is `1` initial connect plus `failover_max_attempts`
+    /// reconnect rounds. Must be `>= 1`. Ignored when
+    /// [`failover`](Self::failover) is `false`.
     pub failover_max_attempts: u32,
     /// Initial backoff between failover attempts, in milliseconds.
     /// Ignored when [`failover`](Self::failover) is `false`.
