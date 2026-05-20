@@ -1252,7 +1252,13 @@ inline bool bitmap_is_null(
 } // namespace detail
 
 /** Fixed-width primitive view: BOOLEAN, BYTE, SHORT, CHAR, INT, IPV4,
- *  LONG, FLOAT, DOUBLE, TIMESTAMP, DATE, TIMESTAMP_NANOS. */
+ *  LONG, FLOAT, DOUBLE, TIMESTAMP, DATE, TIMESTAMP_NANOS.
+ *
+ *  `values` may not be aligned to `alignof(T)` — densified column
+ *  slices may borrow from the wire payload at offsets that don't
+ *  satisfy `T`'s alignment. Use `value(row)` for safe per-row access;
+ *  for bulk reads use `std::memcpy` or unaligned-load intrinsics
+ *  rather than `values[row]`. */
 template <typename T>
 struct fixed_view
 {
@@ -1269,7 +1275,9 @@ struct fixed_view
     {
         if (row >= row_count || is_null(row))
             return std::nullopt;
-        return values[row];
+        T v;
+        std::memcpy(&v, values + row, sizeof(T));
+        return v;
     }
 };
 

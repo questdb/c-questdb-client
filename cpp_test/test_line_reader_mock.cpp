@@ -4156,7 +4156,7 @@ TEST_CASE(
         [](eg::fixed_view<int32_t> v) {
             REQUIRE(v.row_count == 1);
             REQUIRE_FALSE(v.is_null(0));
-            CHECK(v.values[0] == 42);
+            CHECK(load_le(v.values + 0) == 42);
         },
         [](auto&&) {
             FAIL("INT column did not dispatch to fixed_view<int32_t>");
@@ -4208,13 +4208,13 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
             const auto e = v.elements(0);
             REQUIRE(e);
             REQUIRE(e->second == 3);
-            CHECK(e->first[0] == doctest::Approx(1.5));
-            CHECK(e->first[1] == doctest::Approx(2.5));
-            CHECK(e->first[2] == doctest::Approx(3.5));
+            CHECK(load_le(e->first + 0) == doctest::Approx(1.5));
+            CHECK(load_le(e->first + 1) == doctest::Approx(2.5));
+            CHECK(load_le(e->first + 2) == doctest::Approx(3.5));
             const auto sh = v.shape(0);
             REQUIRE(sh);
             REQUIRE(sh->second == 1);
-            CHECK(sh->first[0] == 3);
+            CHECK(load_le(sh->first + 0) == 3u);
         },
         [](auto&&) {
             FAIL("DOUBLE_ARRAY did not dispatch to array_view<double>");
