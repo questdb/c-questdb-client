@@ -1123,6 +1123,15 @@ fn auto_flush_bytes_unsupported() {
     );
 }
 
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn auto_flush_interval_unsupported() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;auto_flush_interval=1000;"),
+        "Invalid configuration parameter \"auto_flush_interval\". This client does not support auto-flush",
+    );
+}
+
 fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(
     actual: &ConfigSetting<V>,
     expected: IntoV,

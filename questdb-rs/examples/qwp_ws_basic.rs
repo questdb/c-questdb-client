@@ -21,7 +21,9 @@ fn main() -> Result<()> {
     let host = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "localhost".to_string());
-    let port = std::env::args().nth(2).unwrap_or_else(|| "9000".to_string());
+    let port = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "9000".to_string());
     let conf = format!("ws::addr={host}:{port};");
 
     let mut sender = Sender::from_conf(conf.as_str())?;

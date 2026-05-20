@@ -190,7 +190,7 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
         ));
     }
 
-    for &param in ["auto_flush_rows", "auto_flush_bytes"].iter() {
+    for &param in ["auto_flush_rows", "auto_flush_bytes", "auto_flush_interval"].iter() {
         if params.contains_key(param) {
             return Err(error::fmt!(
                 ConfigError,
@@ -1708,9 +1708,9 @@ impl SenderBuilder {
     /// The maximum buffered size that the client will flush to the server.
     /// The default is 100 MiB.
     ///
-    /// For ILP this applies to the exact pending byte length.
-    /// For QWP/UDP this applies to the buffer size hint exposed by [`Buffer::len`].
     /// For QWP/WebSocket this applies to the encoded replay message size.
+    /// For QWP/UDP this applies to the buffer size hint exposed by [`Buffer::len`].
+    /// For ILP this applies to the exact pending byte length.
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
         let min = 1024;
         if value < min {
