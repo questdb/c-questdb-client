@@ -32,10 +32,14 @@ use questdb::{
 };
 
 fn main() -> Result<()> {
-    let conf = "ws::addr=db-primary:9000,db-replica-1:9000,db-replica-2:9000;\
-                sf_dir=/tmp/myapp-qdb-sf;\
-                sender_id=ingest-1;\
-                reconnect_max_duration_millis=300000;";
+    let sf_dir = std::env::temp_dir().join("myapp-qdb-sf");
+    let conf = format!(
+        "ws::addr=db-primary:9000,db-replica-1:9000,db-replica-2:9000;\
+         sf_dir={};\
+         sender_id=ingest-1;\
+         reconnect_max_duration_millis=300000;",
+        sf_dir.display()
+    );
 
     let mut sender = Sender::from_conf(conf)?;
     let mut buffer = sender.new_buffer();
