@@ -49,6 +49,12 @@
 //!     "existence-only" hashes in Java anyway — not bit-level oracles
 //!     — so they'd grow LOC without strengthening the regression
 //!     guarantee.
+//!   - BINARY can't slot into the SQL-literal-driven catalogue at all
+//!     (QuestDB SQL has no way to express arbitrary byte payloads as
+//!     a literal — only `rnd_bin(...)`, which the client can't
+//!     predict). Its bit-level e2e coverage instead lives in the
+//!     standalone `binary_qwp_ws_random_fuzz` test below, which seeds
+//!     payloads through the QWP/WS sender.
 //!   - Three `@Test` methods ported: `random_schema_roundtrip` (15
 //!     fresh-connection cases under fragmentation),
 //!     `back_to_back_queries_same_connection` (12 cases on one
@@ -1258,4 +1264,104 @@ fn wide_tables() {
         0,
         col_count,
     );
+}
+
+// ---------------------------------------------------------------------------
+// BINARY QWP/WS round-trip fuzz.
+//
+// QuestDB SQL doesn't have a literal form for arbitrary byte payloads,
+// so BINARY can't share the INSERT-VALUES path the schema fuzz uses
+// for every other type. Instead we drive ingress through the QWP/WS
+// `Sender::column_binary` API (the only client path that takes raw
+// bytes), then read back through the same egress reader the schema
+// fuzz uses. The point of the fuzz is to push enough rows and enough
+// size variety (empty, single-byte, sub-batch, multi-batch) that any
+// off-by-one in the offset-table or the byte-arena code path will
+// surface as a mismatched payload.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn binary_qwp_ws_random_fuzz() {
+    use questdb::ingress::{Sender, TimestampNanos};
+
+    let mut rng = SplitMix64::new(fuzz_seed_for("binary_qwp_ws_random_fuzz"));
+    let chunk = pick_chunk(&mut rng);
+    let compression = pick_compression(&mut rng);
+    eprintln!(
+        "[binary_qwp_ws_random_fuzz] chunk={chunk} compression={:?}",
+        if compression.is_empty() {
+            "default"
+        } else {
+            &compression
+        }
+    );
+    let srv = start_fragmented(chunk);
+    let table = "fuzz_binary_qwp_ws";
+    let create = format!(
+        "create table \"{table}\" (b BINARY, ts TIMESTAMP) \
+         timestamp(ts) partition by day wal"
+    );
+    let status = srv.http_exec(&create);
+    assert!((200..400).contains(&status), "create http={status}");
+
+    // Row count sweeps small (1-batch), batch-boundary, and multi-batch
+    // territory. Sizes cover empty, single byte, BLOB-sized, and a
+    // value that spans more than one TCP/WS frame at the chosen chunk.
+    let row_count = pick_row_count(&mut rng);
+    let mut expected: Vec<Vec<u8>> = Vec::with_capacity(row_count);
+    let conf_sender = format!("qwpws::addr={}:{}", srv.host, srv.http_port);
+    let mut sender = Sender::from_conf(&conf_sender).expect("qwp/ws sender");
+    let mut buf = sender.new_buffer();
+    for i in 0..row_count {
+        // Size distribution: 0, 1, [2..256], [256..4096]. Skew matters
+        // because the offset-table off-by-one bug categories differ
+        // between empty / 1-byte / cross-frame.
+        let size = match rng.gen_range_u32(4) {
+            0 => 0usize,
+            1 => 1usize,
+            2 => 2 + rng.gen_range_usize(254),
+            _ => 256 + rng.gen_range_usize(4096 - 256),
+        };
+        let mut payload = vec![0u8; size];
+        for b in payload.iter_mut() {
+            *b = (rng.next_u64() & 0xFF) as u8;
+        }
+        expected.push(payload.clone());
+        buf.table(table)
+            .unwrap()
+            .column_binary("b", payload.as_slice())
+            .unwrap()
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + (i as i64) * 1_000_000,
+            ))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(&srv, table, row_count);
+
+    let mut reader = make_reader_with(&srv, &compression);
+    let sql = format!("select b from \"{table}\" order by ts");
+    let mut cur = reader.prepare(sql).execute().expect("execute");
+    let mut out_row = 0usize;
+    while let Some(view) = cur.next_batch().expect("next_batch") {
+        let ColumnView::Binary(c) = view.column(0).unwrap() else {
+            panic!("col 0 not Binary");
+        };
+        for r in 0..view.row_count() {
+            let got = c
+                .value(r)
+                .unwrap_or_else(|| panic!("row {out_row} unexpected null"));
+            assert_eq!(
+                got,
+                expected[out_row].as_slice(),
+                "row {out_row} mismatched (len got={} expected={})",
+                got.len(),
+                expected[out_row].len()
+            );
+            out_row += 1;
+        }
+    }
+    assert_eq!(out_row, row_count, "row count drift");
+
+    let _ = srv.http_exec(&format!("drop table \"{table}\""));
 }

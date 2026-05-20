@@ -81,6 +81,15 @@ fn make_sender(srv: &QuestDbServer, version: ProtocolVersion) -> Sender {
         .expect("ingress sender")
 }
 
+/// QWP/WebSocket ingress sender. Used by the IPv4 / BINARY round-trip
+/// tests below: those wire types are QWP-only — the ILP/HTTP `Sender`
+/// has no `column_ipv4` / `column_binary` API at all — so the only
+/// way to exercise their ingress path is via `qwpws::`.
+fn make_qwp_ws_sender(srv: &QuestDbServer) -> Sender {
+    let conf = format!("qwpws::addr={}:{}", srv.host, srv.http_port);
+    Sender::from_conf(&conf).expect("qwp/ws sender")
+}
+
 fn make_reader(srv: &QuestDbServer) -> Reader {
     let conf = srv.qwp_conf();
     Reader::from_conf(&conf).expect("reader")
@@ -308,6 +317,55 @@ fn ipv4_round_trip() {
             assert_eq!(c.value(0), 0x7F00_0001);
             // 192.168.1.1 = 0xC0A80101
             assert_eq!(c.value(1), 0xC0A8_0101);
+        },
+    );
+}
+
+/// IPv4 ingress over QWP/WebSocket. The HTTP/ILP sender has no
+/// `column_ipv4` setter, so this is the only client API that can drive
+/// IPv4 ingress end-to-end against a real server.
+#[test]
+fn ipv4_qwp_ws_ingress_round_trip() {
+    use std::net::Ipv4Addr;
+
+    let srv = server();
+    let table = unique_table("ipv4_ws");
+    srv.http_exec(&format!(
+        "create table \"{}\" (a ipv4, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+
+    let mut sender = make_qwp_ws_sender(srv);
+    let mut buf = sender.new_buffer();
+    let addrs = [
+        Ipv4Addr::new(127, 0, 0, 1),
+        Ipv4Addr::new(192, 168, 1, 1),
+        Ipv4Addr::new(10, 0, 0, 42),
+    ];
+    for (i, addr) in addrs.iter().enumerate() {
+        buf.table(table.as_str())
+            .unwrap()
+            .column_ipv4("a", *addr)
+            .unwrap()
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + (i as i64) * 1_000_000,
+            ))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, addrs.len());
+
+    select_one_batch(
+        srv,
+        &format!("select a from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Ipv4(c) = view.column(0).unwrap() else {
+                panic!("col 0 not Ipv4: {:?}", view.column(0).unwrap().kind())
+            };
+            assert_eq!(view.row_count(), addrs.len());
+            for (i, addr) in addrs.iter().enumerate() {
+                assert_eq!(c.value(i), u32::from(*addr), "row {}", i);
+            }
         },
     );
 }
@@ -728,6 +786,58 @@ fn binary_round_trip() {
             };
             let bytes = c.value(0).expect("non-null");
             assert_eq!(bytes.len(), 8);
+        },
+    );
+}
+
+/// BINARY ingress over QWP/WebSocket. Unlike `binary_round_trip`, which
+/// seeds with `rnd_bin(...)` and can only check length, this drives
+/// exact byte payloads through the client and asserts the bytes come
+/// back unchanged — covering both empty and multi-row, varying-length
+/// payloads.
+#[test]
+fn binary_qwp_ws_ingress_round_trip() {
+    let srv = server();
+    let table = unique_table("binary_ws");
+    srv.http_exec(&format!(
+        "create table \"{}\" (b binary, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+
+    let payloads: &[&[u8]] = &[
+        &[],
+        &[0xDE, 0xAD, 0xBE, 0xEF],
+        &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09],
+        &[0xFF; 64],
+    ];
+
+    let mut sender = make_qwp_ws_sender(srv);
+    let mut buf = sender.new_buffer();
+    for (i, payload) in payloads.iter().enumerate() {
+        buf.table(table.as_str())
+            .unwrap()
+            .column_binary("b", payload)
+            .unwrap()
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + (i as i64) * 1_000_000,
+            ))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, payloads.len());
+
+    select_one_batch(
+        srv,
+        &format!("select b from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Binary(c) = view.column(0).unwrap() else {
+                panic!("col 0 not Binary: {:?}", view.column(0).unwrap().kind())
+            };
+            assert_eq!(view.row_count(), payloads.len());
+            for (i, expected) in payloads.iter().enumerate() {
+                let got = c.value(i).unwrap_or_else(|| panic!("row {} null", i));
+                assert_eq!(got, *expected, "row {}", i);
+            }
         },
     );
 }

@@ -72,6 +72,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import base64
 import datetime
 import os
 import random
@@ -134,10 +135,10 @@ COL_NAME_BASES = (
     ('amount128', 'AMOUNT128', 'amount_128', 'Amount128'),  # DECIMAL128
     ('trace_id', 'TRACE_ID', 'trace_Id', 'TraceID'),   # UUID
     ('hash256', 'HASH256', 'hash_256', 'Hash256'),     # LONG256
-    # ('src_ip', 'SRC_IP', 'Src_Ip', 'src_IP'),  # IPv4 — server dispatch missing
+    ('src_ip', 'SRC_IP', 'Src_Ip', 'src_IP'),          # IPv4
     ('event_ms', 'EVENT_MS', 'event_Ms', 'Event_MS'),  # DATE
     ('marker_c', 'MARKER_C', 'marker_C', 'Marker_C'),  # CHAR
-    # ('blob', 'BLOB', 'Blob', 'bLOB'),  # BINARY — server dispatch missing
+    ('blob', 'BLOB', 'Blob', 'bLOB'),                  # BINARY
     ('region', 'REGION', 'Region', 'reGION'),          # GEOHASH
     # ('counters', 'COUNTERS', 'Counters', 'CountER'),  # LONG_ARRAY — server WAL appender rejects
     ('frame_pos', 'FRAME_POS', 'frame_Pos', 'Frame_PoS'),  # FLOAT
@@ -151,8 +152,8 @@ COL_TYPES = (
     'TIMESTAMP_MICROS', 'TIMESTAMP_NANOS',
     'BYTE', 'SHORT', 'INT',
     'DECIMAL64', 'DECIMAL128',
-    'UUID', 'LONG256',  # 'IPV4' disabled until server supports type code 0x18
-    'DATE', 'CHAR',     # 'BINARY' disabled until server supports type code 0x17
+    'UUID', 'LONG256', 'IPV4',
+    'DATE', 'CHAR', 'BINARY',
     'GEOHASH',          # 'LONG_ARRAY' disabled until server WAL supports it
     'FLOAT',
 )
@@ -166,8 +167,8 @@ COL_VALUE_BASES = (
     '', '',
     '3', '5', '9',
     '11', '13',
-    '', '',         # UUID, LONG256
-    '', '',         # DATE, CHAR
+    '', '', '',     # UUID, LONG256, IPV4
+    '', '', '',     # DATE, CHAR, BINARY
     '',             # GEOHASH
     '',             # FLOAT
 )
@@ -435,6 +436,13 @@ def format_expected_cell(value, server_type: str) -> str:
     """Format an expected (producer-side) value to the comparison string."""
     if value is None:
         return _missing_default(server_type)
+    if server_type == 'BINARY':
+        # Producer emits `raw.hex()` (see BINARY generator below); the
+        # comparison string is lowercase hex on both sides so the failure
+        # log shows actual bytes rather than base64 / object-repr noise.
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).hex()
+        return str(value)
     if server_type == 'FLOAT':
         try:
             f = float(value)
@@ -491,6 +499,18 @@ def format_actual_cell(value, server_type: str) -> str:
     """Format an actual cell value (from /exec JSON) to the comparison string."""
     if value is None:
         return _missing_default(server_type)
+    if server_type == 'BINARY':
+        # /exec JSON renders BINARY columns as a base64 string. Decode it
+        # to bytes and stringify as lowercase hex so both sides of the
+        # oracle compare on the same canonical form.
+        if isinstance(value, str):
+            try:
+                return base64.b64decode(value).hex()
+            except (ValueError, TypeError):
+                return value
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value).hex()
+        return str(value)
     if server_type in _NUMERIC_FLOAT_TYPES:
         try:
             return _format_float(float(value))

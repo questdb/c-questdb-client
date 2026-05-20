@@ -175,7 +175,12 @@ compression-zstd = ["_egress", "dep:zstd"]
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
 ## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
-live-server-tests = ["sync-reader-ws", "compression-zstd", "sync-sender-http"]
+live-server-tests = [
+    "sync-reader-ws",
+    "compression-zstd",
+    "sync-sender-http",
+    "sync-sender-qwp-ws",
+]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []

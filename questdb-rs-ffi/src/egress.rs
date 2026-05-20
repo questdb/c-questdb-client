@@ -227,18 +227,40 @@ unsafe fn set_reader_err(
 }
 
 /// Panic-boundary helper for `extern "C"` entry points whose body
-/// could plausibly unwind. Catches any panic from `f` and aborts the
-/// process — Rust panics escaping into C are UB.
+/// could plausibly unwind.
 ///
-/// **Scope:** reserve this for entry points that run code that *can*
-/// panic — decoder drives, transport drives, allocator-heavy paths,
-/// and `Drop` chains. Today: `_from_conf`, `_from_env`, `_query_new`,
-/// `_query_execute`, `mutate_query`, `_cursor_next_batch` (those six
-/// are inline `catch_unwind` blocks, predate this helper) plus
-/// `_close`, `_query_free`, `_cursor_free` (which go through this
-/// wrapper because their `Drop` chains run `close_in_place` and the
-/// tungstenite write paths that can theoretically panic on allocator
-/// failure).
+/// **Status in shipped builds: no-op.** This crate sets
+/// `panic = "abort"` in both `[profile.release]` and `[profile.dev]`
+/// (see `Cargo.toml`, and the panic-policy note at the top of
+/// `lib.rs`). Under that policy the panic runtime aborts the process
+/// at the panic site, before `catch_unwind` ever observes anything,
+/// so the `Err(_) => abort()` arm here is unreachable in production
+/// cdylib / staticlib builds. The wrap is effectively a thin inline
+/// pass-through.
+///
+/// **Where the wrap is live:** cargo forces `[profile.test]` and
+/// `[profile.bench]` to `panic = "unwind"` so the test harness can
+/// catch panics and report failures. In those builds the guard
+/// converts a panic out of `f` into a hard abort, which matches
+/// production behaviour and — at the lifetime-launder / `Drop`-chain
+/// sites (`_close`, `_query_free`, `_cursor_free`, `mutate_query`) —
+/// prevents the harness from "recovering" past a panic that would
+/// leak resources or leave a slot in an inconsistent state.
+///
+/// **Why keep it at all:** (a) the structural barrier survives any
+/// future switch of the crate panic policy to `unwind`; (b) it
+/// documents at each call site that the body could panic and we want
+/// a hard abort if it does; (c) tests that exercise the
+/// lifetime-launder windows get production-equivalent abort semantics
+/// rather than an unwind that bypasses them. New entry points still
+/// earn the wrap when their body genuinely could panic.
+///
+/// **Scope at the time of writing:** `_from_conf`, `_from_env`,
+/// `_query_new`, `_query_execute`, `mutate_query`, `_cursor_next_batch`
+/// (inline `catch_unwind` blocks, predate this helper) plus `_close`,
+/// `_query_free`, `_cursor_free` (go through this wrapper because
+/// their `Drop` chains run `close_in_place` and the tungstenite write
+/// paths that can theoretically panic on allocator failure).
 ///
 /// **Explicitly do NOT wrap per-column bulk accessors** —
 /// `line_reader_batch_column_data`, `line_reader_batch_array_column_data`,
@@ -246,7 +268,7 @@ unsafe fn set_reader_err(
 /// integer compares against an already-decoded `ColumnView`, are
 /// statically panic-free in release for any input that passes their
 /// bounds checks, and are called per-column on Cython scan loops where
-/// the `catch_unwind` frame shows up at the top of profiles.
+/// even a no-op `catch_unwind` frame shows up at the top of profiles.
 #[inline]
 fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -480,10 +502,13 @@ pub unsafe extern "C" fn line_reader_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_reader_error,
 ) -> *mut line_reader {
-    // Wrap the entire body so allocator panics from `Box::into_raw`,
-    // `set_reader_err`, or any future fallible step can't unwind across
-    // the FFI boundary. Matches the policy used elsewhere in this file
-    // (`mutate_query`, `_query_execute`, `_cursor_next_batch`, etc.).
+    // Wrap the entire body to localize any unwind from allocator
+    // panics (`Box::into_raw`, `set_reader_err`, or any future
+    // fallible step). No-op in shipped cdylib / staticlib builds
+    // under `panic = abort`; active in test builds. See `panic_guard`
+    // docstring for the full rationale. Matches the wrap used
+    // elsewhere in this file (`mutate_query`, `_query_execute`,
+    // `_cursor_next_batch`, etc.).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         // Re-validate UTF-8 (see `validated_utf8` for the rationale).
         let conf = match validated_utf8(&config) {
@@ -615,9 +640,11 @@ pub unsafe extern "C" fn line_reader_close(reader: *mut line_reader) {
             );
             return;
         }
-        // The drop chain runs Reader → Option<WsTransport> → Drop. Wrapped
-        // in `panic_guard` because a panic from any allocator/transport
-        // Drop would otherwise unwind across the FFI boundary.
+        // The drop chain runs Reader -> Option<WsTransport> -> Drop.
+        // Wrapped in `panic_guard` so a panic out of any allocator /
+        // transport `Drop` is localized in test builds (and would
+        // localize if the crate ever moved off `panic = abort`).
+        // No-op in shipped builds; see `panic_guard` docstring.
         drop(Box::from_raw(reader));
     })
 }
@@ -1280,9 +1307,12 @@ pub unsafe extern "C" fn line_reader_query_on_failover_reset(
                 // The user callback is C code; it cannot itself panic, but it
                 // may re-enter Rust (e.g. by calling a stat getter — itself a
                 // contract violation but still possible) and that re-entrant
-                // path may panic. An unwind through this `extern "C"` frame
-                // would be UB, so catch and abort. C++ users get the same
-                // protection from the wrapper's noexcept trampoline.
+                // path may panic. The `catch_unwind` + abort below is a
+                // no-op under this crate's `panic = abort` policy (see
+                // `panic_guard` docstring) and active in test builds; the
+                // shipped binary aborts at the panic site directly. C++
+                // users get the unwind-into-C protection from the wrapper's
+                // noexcept trampoline.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     c_cb(opaque, user_data)
                 }));
@@ -1629,8 +1659,10 @@ pub unsafe extern "C" fn line_reader_failover_progress_event_final_error_msg(
 /// cursor op, so the user callback MUST NOT touch the originating
 /// reader, query, or cursor (including read-only stat getters — they
 /// would alias the upstream `&mut Reader` borrow), and MUST NOT throw
-/// / longjmp / unwind across the C boundary. The trampoline
-/// `catch_unwind`s and aborts on escape.
+/// / longjmp / unwind across the C boundary. The trampoline wraps the
+/// callback in `catch_unwind` and aborts on escape; under this crate's
+/// `panic = abort` policy that wrap is a no-op in shipped builds and
+/// active only in tests (see [`panic_guard`] docstring).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_on_failover_progress(
     query: *mut line_reader_query,
@@ -1761,21 +1793,21 @@ pub unsafe extern "C" fn line_reader_prepare(
         // Going through the cell's raw pointer tags this borrow as
         // `SharedReadWrite`, compatible with those temporary `&Reader`s.
         let r: &mut Reader = &mut *(*reader).0.get();
-        // Defense-in-depth: catch any unwind out of `r.prepare(sql_str)`
-        // AND the wrapper allocation that publishes the result, then
-        // abort. Upstream `Reader::prepare` is in practice infallible
-        // (it just builds a small `ReaderQuery` struct), and the
-        // default Rust allocator aborts on OOM rather than unwinds —
-        // but a future change, a custom unwinding allocator, or a
-        // panic in `Box::new` for any other reason would otherwise
-        // (a) propagate a Rust panic across the FFI boundary into C
-        // — instant UB — and (b) leave the `active` flag stuck `true`
-        // (no query was produced, but the early-claim of the flag
-        // wouldn't be undone). Aborting is strictly safer. Including
-        // the `Box::into_raw(Box::new(...))` inside the guarded
-        // closure closes the allocation gap left by the previous
-        // narrower `catch_unwind` that wrapped only the upstream
-        // call.
+        // Catch any unwind out of `r.prepare(sql_str)` AND the
+        // wrapper allocation that publishes the result, then abort.
+        // No-op under this crate's `panic = abort` policy (see
+        // `panic_guard` docstring); active in test builds.
+        // Upstream `Reader::prepare` is in practice infallible (it
+        // just builds a small `ReaderQuery` struct) and the default
+        // Rust allocator aborts on OOM rather than unwinds — but if
+        // the policy ever flipped to `unwind`, or a test panic is
+        // injected here, an escape would (a) leave the `active` flag
+        // stuck `true` (the early-claim of the flag would not be
+        // undone) and (b) violate the FFI no-unwind contract.
+        // Including the `Box::into_raw(Box::new(...))` inside the
+        // guarded closure closes the allocation gap left by the
+        // previous narrower `catch_unwind` that wrapped only the
+        // upstream call.
         //
         // The lifetime launder happens INSIDE the closure: a `FnMut`
         // closure cannot return a borrow of a variable it captured, so
@@ -1884,20 +1916,23 @@ pub unsafe extern "C" fn line_reader_query_execute(
             return ptr::null_mut();
         }
 
-        // Defense-in-depth: catch any unwind out of `q.execute()` AND
-        // out of the wrapper allocations that publish either the
-        // cursor handle or the error envelope. `q` was moved out of
-        // the now-dead `Box<line_reader_query>` via
-        // `ManuallyDrop::take`, so an unwind would otherwise (a) leave
-        // the reader's `active` flag stuck `true` on the success-arm
-        // path (no cursor produced, no Err arm taken to clear it) and
-        // (b) propagate a Rust panic across the FFI boundary into C
-        // — instant UB. Including both the success-side
-        // `Box::into_raw(Box::new(line_reader_cursor { .. }))` and the
-        // error-side `Box::into_raw(Box::new(line_reader_error(..)))`
-        // inside the guarded closure closes the two allocation gaps
-        // left by the previous narrower `catch_unwind` that wrapped
-        // only `q.execute()`.
+        // Catch any unwind out of `q.execute()` AND the wrapper
+        // allocations that publish either the cursor handle or the
+        // error envelope. No-op under this crate's `panic = abort`
+        // policy (see `panic_guard` docstring); active in test
+        // builds. `q` was moved out of the now-dead
+        // `Box<line_reader_query>` via `ManuallyDrop::take`, so if
+        // the policy ever flipped to `unwind`, an escape would (a)
+        // leave the reader's `active` flag stuck `true` on the
+        // success-arm path (no cursor produced, no Err arm taken to
+        // clear it) and (b) violate the FFI no-unwind contract.
+        // Including both the success-side
+        // `Box::into_raw(Box::new(line_reader_cursor { .. }))` and
+        // the error-side
+        // `Box::into_raw(Box::new(line_reader_error(..)))` inside
+        // the guarded closure closes the two allocation gaps left by
+        // the previous narrower `catch_unwind` that wrapped only
+        // `q.execute()`.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match q.execute() {
                 Ok(cursor) => {
@@ -1971,9 +2006,11 @@ pub unsafe extern "C" fn line_reader_execute(
         let r: &mut Reader = &mut *(*reader).0.get();
         // Single guarded closure covers `r.execute(...)`, the lifetime
         // launder, and both success/error Box allocations — same
-        // pattern as `_prepare` and `_query_execute`. Active flag is
-        // kept claimed on success (transferred to the cursor) and
-        // released on the error arm.
+        // pattern as `_prepare` and `_query_execute`. No-op under this
+        // crate's `panic = abort` policy (see `panic_guard`
+        // docstring); active in test builds. Active flag is kept
+        // claimed on success (transferred to the cursor) and released
+        // on the error arm.
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r.execute(sql_str) {
                 Ok(cursor) => {
@@ -2010,14 +2047,17 @@ pub unsafe extern "C" fn line_reader_execute(
 ///
 /// `f` is in practice infallible — the upstream `ReaderQuery::bind_*`
 /// methods just push into a `Vec`, and allocation failure under the default
-/// allocator aborts rather than unwinds. The `catch_unwind` here is
-/// defense-in-depth: between `ptr::read(inner_ptr)` and `ptr::write` the
-/// slot is logically uninitialised, so an unwind-style panic from a future
-/// upstream change (or a custom allocator that unwinds on OOM) would
-/// otherwise leak the stale value into `_query_free`'s drop. Aborting on
-/// unwind is stricter than the line_sender FFI's default behaviour, but
-/// the surface area here (lifetime-laundered `ReaderQuery<'static>`) makes
-/// it the safer choice.
+/// allocator aborts rather than unwinds. The `catch_unwind` here is a
+/// no-op under the crate's `panic = abort` policy (see [`panic_guard`])
+/// and is kept for two reasons: (a) in test builds, where cargo forces
+/// `panic = unwind`, it converts any unwind from `f` between
+/// `ptr::read(inner_ptr)` and `ptr::write` — the window during which the
+/// slot is logically uninitialised — into a hard abort, instead of
+/// letting the test harness recover and leak the stale value into
+/// `_query_free`'s drop; (b) it preserves the structural barrier if the
+/// crate ever moves off `panic = abort`. The line_sender FFI does not
+/// wrap its bind sites; the extra wrap here is justified by the
+/// lifetime-laundered `ReaderQuery<'static>` surface area.
 unsafe fn mutate_query<F>(query: *mut line_reader_query, f: F)
 where
     F: FnOnce(ReaderQuery<'static>) -> ReaderQuery<'static>,
@@ -2444,9 +2484,11 @@ pub unsafe extern "C" fn line_reader_cursor_free(cursor: *mut line_reader_cursor
         let mut boxed = Box::from_raw(cursor);
         // Drop the BatchView (it borrows from the cursor) before the
         // cursor itself. Wrapped in `panic_guard` because the cursor's
-        // Drop runs `close_in_place` which writes a Close frame and
-        // shuts down the TCP socket — any panic there would otherwise
-        // cross the FFI boundary.
+        // `Drop` runs `close_in_place`, which writes a Close frame
+        // and shuts down the TCP socket. No-op under this crate's
+        // `panic = abort` policy (the panic site aborts directly);
+        // active in test builds and a structural barrier if the
+        // policy ever moves to `unwind`. See `panic_guard` docstring.
         boxed.current_batch = None;
         ManuallyDrop::drop(&mut boxed.cursor);
         // Release the reader's active flag so a new query/cursor can be
@@ -2490,12 +2532,15 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
         // borrowck happy across the match.
         let inner: &mut Cursor<'static> = c.cursor_for_mut();
         // The decoder pipeline (varint parse, schema/dict bookkeeping,
-        // Gorilla decode, validity walks) contains panic sites that an
-        // unwind would propagate through this `extern "C"` frame — UB.
-        // Catch and abort, matching the policy in `_query_new` and
-        // `_query_execute`. The lifetime launder happens INSIDE the
-        // closure: `BatchView<'_>` borrows from `inner`, which the
-        // closure can't return as a borrow of a captured variable. The
+        // Gorilla decode, validity walks) contains panic sites; under
+        // this crate's `panic = abort` policy the panic site aborts
+        // directly, so the `catch_unwind` + abort below is a no-op in
+        // shipped builds. It is kept active for test builds (cargo
+        // forces `panic = unwind`) and to match the wrap pattern used
+        // by `_query_new` and `_query_execute`. See `panic_guard`
+        // docstring. The lifetime launder happens INSIDE the closure:
+        // `BatchView<'_>` borrows from `inner`, which the closure
+        // can't return as a borrow of a captured variable. The
         // launder is sound for the same reason as in `_query_new` —
         // the cursor (and therefore the batch's backing buffers) lives
         // at least as long as the FFI call sequence ends with
@@ -2833,8 +2878,10 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
         }
         // Routes through `cursor_for_mut` to maintain the BatchView /
         // &mut Cursor exclusion invariant — see line_reader_cursor docs.
-        // `cancel()` runs the drain loop which can panic (decoder paths);
-        // catch and abort to keep panics from crossing the FFI boundary.
+        // `cancel()` runs the drain loop which can panic (decoder paths).
+        // The `catch_unwind` + abort below is a no-op in shipped builds
+        // under `panic = abort` and active in test builds; see
+        // `panic_guard` docstring.
         let inner = (*cursor).cursor_for_mut();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.cancel()));
         let res = match result {
@@ -2869,8 +2916,9 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
             return false;
         }
         // Routes through `cursor_for_mut` — see line_reader_cursor docs.
-        // Catch any unwind out of `add_credit` to keep panics from crossing
-        // the FFI boundary.
+        // The `catch_unwind` + abort below is a no-op in shipped builds
+        // under `panic = abort` and active in test builds; see
+        // `panic_guard` docstring.
         let inner = (*cursor).cursor_for_mut();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             inner.add_credit(additional_bytes)
