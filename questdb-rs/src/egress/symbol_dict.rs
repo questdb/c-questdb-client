@@ -435,4 +435,76 @@ mod tests {
         assert_eq!(d.get(0), Some("café"));
         assert_eq!(d.get(1), Some("日本語"));
     }
+
+    /// Regression for the `Arc<SymbolDict>` + `Arc::make_mut` CoW
+    /// refactor: the pipelined worker now stores the live dict as
+    /// `Arc<SymbolDict>` and snapshots it per batch via `Arc::clone`,
+    /// then applies subsequent deltas via `Arc::make_mut`. The
+    /// invariants the refactor relies on:
+    ///
+    /// 1. Snapshotting via `Arc::clone` produces a pointer-equal
+    ///    handle to the live dict — no deep copy.
+    /// 2. Applying a delta via `Arc::make_mut` while a snapshot is
+    ///    alive clones-on-write, so the snapshot stays unchanged
+    ///    and the live dict picks up the new entry.
+    /// 3. Once the snapshot is dropped (strong count is back to 1),
+    ///    the next `Arc::make_mut` mutates in place — no copy.
+    ///
+    /// All three are stdlib `Arc` semantics, but pinning them in
+    /// this crate's tests guards against a future "innocent"
+    /// refactor (e.g. swapping `Arc` for a custom wrapper, or
+    /// taking an extra `Arc::clone` in a hot path that bumps the
+    /// steady-state refcount above 1) that would silently turn
+    /// every delta into a deep clone.
+    #[test]
+    fn arc_make_mut_cow_invariants_hold() {
+        use std::sync::Arc;
+        // Build a live dict with two entries.
+        let mut live: Arc<SymbolDict> = Arc::new(SymbolDict::new());
+        Arc::get_mut(&mut live)
+            .unwrap()
+            .apply_delta_from_bytes(&build_delta(0, &["alpha", "beta"]))
+            .unwrap();
+
+        // (1) Snapshot is pointer-equal — `Arc::clone` is a refcount
+        // bump, not a deep copy.
+        let snapshot = Arc::clone(&live);
+        assert!(Arc::ptr_eq(&live, &snapshot));
+        assert_eq!(Arc::strong_count(&live), 2);
+
+        // (2) Mutate the live dict via `make_mut` while the
+        // snapshot is alive. CoW clones once; the snapshot stays
+        // unchanged.
+        let live_ptr_before = Arc::as_ptr(&live);
+        Arc::make_mut(&mut live)
+            .apply_delta_from_bytes(&build_delta(2, &["gamma"]))
+            .unwrap();
+        let live_ptr_after_cow = Arc::as_ptr(&live);
+        assert!(
+            live_ptr_before != live_ptr_after_cow,
+            "make_mut with refcount > 1 must clone (allocate a fresh inner)",
+        );
+        assert_eq!(live.len(), 3);
+        assert_eq!(live.get(2), Some("gamma"));
+        // Snapshot must not have seen the new entry.
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.get(2), None);
+        assert!(!Arc::ptr_eq(&live, &snapshot));
+
+        // (3) Drop the snapshot; live's strong_count is back to 1.
+        // The next make_mut must mutate in place — no allocation.
+        drop(snapshot);
+        assert_eq!(Arc::strong_count(&live), 1);
+        let live_ptr_before_inplace = Arc::as_ptr(&live);
+        Arc::make_mut(&mut live)
+            .apply_delta_from_bytes(&build_delta(3, &["delta"]))
+            .unwrap();
+        let live_ptr_after_inplace = Arc::as_ptr(&live);
+        assert_eq!(
+            live_ptr_before_inplace, live_ptr_after_inplace,
+            "make_mut with refcount == 1 must mutate in place (no clone, no realloc)",
+        );
+        assert_eq!(live.len(), 4);
+        assert_eq!(live.get(3), Some("delta"));
+    }
 }

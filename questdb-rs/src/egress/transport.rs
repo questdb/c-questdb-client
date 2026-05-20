@@ -252,8 +252,18 @@ impl WsTransport {
     /// takes `&[u8]` so we deref the `Bytes` (zero-copy reference into the
     /// underlying buffer).
     pub fn write_message(&mut self, payload: Bytes) -> Result<()> {
+        self.write_message_slice(&payload)
+    }
+
+    /// Slice-form counterpart of [`Self::write_message`] for callers
+    /// that build their frame on the stack and want to avoid the
+    /// per-call `Bytes` / `Vec` allocation. Used by the per-batch
+    /// CREDIT and the per-cursor CANCEL helpers, where the frame
+    /// is fixed-shape and trivially fits in a `[u8; 32]` stack
+    /// buffer.
+    pub fn write_message_slice(&mut self, payload: &[u8]) -> Result<()> {
         self.socket
-            .write_binary_frame(&payload)
+            .write_binary_frame(payload)
             .map_err(|e| map_io_error(e, ErrorCode::SocketError))
     }
 
@@ -265,7 +275,48 @@ impl WsTransport {
             Ok(b) => b,
             Err(e) => return Err(map_ws_read_error(e)),
         };
+        self.finish_read_frame(bytes)
+    }
 
+    /// Like [`Self::read_frame`] but maps a TCP-level read timeout
+    /// (`io::ErrorKind::WouldBlock` / `TimedOut`) to `Ok(None)` instead
+    /// of a `SocketError`. Used by the async reader's I/O thread, which
+    /// sets a short [`set_read_timeout`] tick so it can poll its
+    /// cancel/shutdown atomics between reads without conflating "no
+    /// frame yet" with "connection died" (the latter would be
+    /// failover-eligible and would trigger an unwanted reconnect).
+    ///
+    /// No-bytes-lost property is inherited from
+    /// `WsClient::read_binary_frame`'s partial-frame recv-buffer
+    /// state machine — this function only adds the
+    /// `WouldBlock`/`TimedOut` → `Ok(None)` translation; the
+    /// underlying property is the WS client's, not this function's.
+    /// (TLS-level partial-record state
+    /// is the underlying stream's responsibility: `rustls`'s
+    /// `StreamOwned` / a plain `TcpStream` retry transparently on
+    /// `WouldBlock`; a future stream impl with eager-read semantics
+    /// could in principle violate the no-bytes-lost promise
+    /// without this function changing.)
+    pub(crate) fn read_frame_or_timeout(&mut self) -> Result<Option<(FrameHeader, Bytes)>> {
+        let bytes = match self.socket.read_binary_frame() {
+            Ok(b) => b,
+            Err(WsReadError::Io(io_err))
+                if matches!(
+                    io_err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(map_ws_read_error(e)),
+        };
+        self.finish_read_frame(bytes).map(Some)
+    }
+
+    /// Shared post-read validation extracted so [`Self::read_frame`] and
+    /// [`Self::read_frame_or_timeout`] agree on every length / version /
+    /// cap check without duplicating the logic.
+    fn finish_read_frame(&self, bytes: Bytes) -> Result<(FrameHeader, Bytes)> {
         if bytes.len() < HEADER_LEN {
             return Err(fmt!(
                 ProtocolError,
@@ -361,10 +412,11 @@ impl WsTransport {
     /// tear the socket down — this method only sends the frame.
     pub fn try_write_cancel(&mut self, request_id: i64) {
         set_tcp_write_timeout(self.socket.stream_mut().tcp_mut(), Some(CLOSE_TIMEOUT));
-        let mut payload = Vec::with_capacity(9);
-        payload.push(MsgKind::Cancel.as_u8());
-        payload.extend_from_slice(&request_id.to_le_bytes());
-        let _ = self.socket.write_binary_frame(&payload);
+        // Stack-buffer build (fixed 9 bytes: MsgKind + rid).
+        let mut buf = [0u8; 9];
+        buf[0] = MsgKind::Cancel.as_u8();
+        buf[1..9].copy_from_slice(&request_id.to_le_bytes());
+        let _ = self.socket.write_binary_frame(&buf);
     }
 }
 

@@ -449,13 +449,21 @@ stages:
           - script: |
               set -euxo pipefail
               cd questdb-rs
-              # `--test NAME` selectors limit the build to the fuzz
-              # binaries — other live-server tests stay out of this
-              # job's scope.
+              # `--test NAME` selectors keep the build scoped to the
+              # fuzz binaries plus the pipelined-reader integration
+              # suite. The pipelined tests share the same live-server
+              # fixture and exercise the only path that drives the
+              # background-IO worker end-to-end (worker startup,
+              # event-channel publication, terminal events, cancel
+              # drain, sync↔pipelined per-row equivalence). M9 of
+              # the level-3 review added `--test egress_pipelined`
+              # here; before that the integration tests never ran
+              # in CI even though they passed locally.
               cargo test --features live-server-tests \
                 --test egress_live_server_bind_fuzz \
                 --test egress_live_server_fragmentation_fuzz \
                 --test egress_live_server_fuzz \
                 --test egress_live_server_alter_fuzz \
+                --test egress_pipelined \
                 -- --nocapture
-            displayName: "QWP egress live-server fuzz"
+            displayName: "QWP egress live-server fuzz + pipelined"

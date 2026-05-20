@@ -49,6 +49,32 @@ pub mod egress;
 
 pub use error::*;
 
+/// Drop-/abort-safe `eprintln!`: swallows stderr write failures
+/// instead of panicking (which `eprintln!` does via stdlib's
+/// `std::io::stdio::print_to`'s `panic!("failed printing to
+/// {label}: {e}")` — `library/std/src/io/stdio.rs`). Required at
+/// every site that may run inside a `Drop` impl or a
+/// `panic = "abort"` FFI path, since a Drop-time
+/// panic-from-failed-stderr would kill the host process — wrong
+/// tradeoff for what is meant to be a best-effort diagnostic.
+/// Modelled on stdlib's own `attempt_print_to_stderr` (used by
+/// `Termination`).
+///
+/// Marked `#[doc(hidden)]` because it is workspace-internal — the
+/// FFI crate (`questdb-rs-ffi`) calls into it directly via the
+/// `questdb-rs` dependency rather than carrying a second copy. Not
+/// part of the public Rust API surface. The function lives at the
+/// crate root (not gated under any feature) so it is reachable
+/// from both feature-on and feature-off builds of the FFI crate
+/// without coupling features across crates. (The earlier
+/// cross-crate duplicate's "structural pin" claim was incorrect;
+/// collapsing to a single definition removes the drift hazard.)
+#[doc(hidden)]
+pub fn eprintln_lossy(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{args}");
+}
+
 #[cfg(test)]
 mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};

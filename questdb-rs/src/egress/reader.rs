@@ -120,7 +120,18 @@ pub struct Reader {
     /// this is always `Some`. Use [`Reader::transport`] /
     /// [`Reader::transport_mut`] to access — they assert this invariant.
     transport: Option<WsTransport>,
-    dict: SymbolDict,
+    /// Connection-scoped symbol dictionary.
+    ///
+    /// Stored as `Arc<SymbolDict>` so the per-batch snapshot shipped
+    /// to the user (via [`pipelined_internals::dict_snapshot`]) is a
+    /// refcount bump rather than a deep clone of the arena +
+    /// entries. Mutation goes through `Arc::make_mut(&mut self.dict)`,
+    /// which gives copy-on-write semantics: zero-copy in the steady
+    /// state (no outstanding user-thread snapshots), one clone per
+    /// delta when multiple batches are in flight on the user side.
+    /// See [`pipelined_internals::decode_frame`] for the mutator
+    /// chokepoint.
+    dict: Arc<SymbolDict>,
     registry: SchemaRegistry,
     next_request_id: i64,
     cursor_active: bool,
@@ -265,7 +276,7 @@ impl Reader {
             cfg,
             addr_idx: walk.session.idx,
             transport: Some(walk.session.transport),
-            dict: SymbolDict::new(),
+            dict: Arc::new(SymbolDict::new()),
             registry: SchemaRegistry::new(),
             next_request_id: 1,
             cursor_active: false,
@@ -367,6 +378,25 @@ impl Reader {
         })
     }
 
+    /// Convenience wrapper around [`Self::reconnect_with_failover_cancellable`]
+    /// for callers that have no cancellation handle to poll — the sync
+    /// `Cursor` path, which is driven from the user thread that would
+    /// be the one signalling a cancel in the first place.
+    ///
+    /// All the behavioural contract (endpoint walk via the per-client
+    /// [`HostHealthTracker`], `failed_idx` demotion, transport / dict /
+    /// registry reset on success, caller must re-issue the
+    /// `QUERY_REQUEST` with a freshly-allocated `request_id`) lives on
+    /// the cancellable variant below; consult it for the full story.
+    fn reconnect_with_failover(&mut self, failed_idx: usize) -> Result<u32> {
+        // `Duration::MAX` makes the cancellable sleep loop's
+        // `min(remaining, abort_tick)` always pick `remaining`, so a
+        // single `thread::sleep` covers each backoff exactly as the
+        // pre-cancellable code did. The no-op abort closure adds two
+        // extra calls per backoff iteration; negligible.
+        self.reconnect_with_failover_cancellable(failed_idx, Duration::MAX, || None)
+    }
+
     /// Reconnect this Reader in place after a mid-query transport
     /// failure. Walks the configured endpoint list via the per-client
     /// [`HostHealthTracker`] (failover.md §2 priority lattice — Healthy
@@ -381,7 +411,48 @@ impl Reader {
     /// — `record_mid_stream_failure` demotes it from `Healthy` to
     /// `TransportError` so the tracker won't reach for it first on the
     /// next walk.
-    fn reconnect_with_failover(&mut self, failed_idx: usize) -> Result<u32> {
+    ///
+    /// Cancellable: ticks the backoff sleep so a long-running
+    /// `failover_max_duration_ms=0` (unbounded) or large
+    /// `failover_max_attempts × failover_backoff_max_ms` budget does
+    /// not block a caller that needs to abort. `abort_check` is
+    /// polled once before the first walk, before each subsequent
+    /// backoff sleep, between every `abort_tick` slice of that
+    /// sleep, and once again after the sleep returns. The first
+    /// `Some(err)` returned from `abort_check` short-circuits the
+    /// reconnect and is propagated verbatim — the caller chooses
+    /// the error code + message (e.g. `Cancelled` for a cursor-side
+    /// cancel, `InvalidApiCall` for reader-close shutdown).
+    ///
+    /// The pipelined egress worker passes its `shutdown` /
+    /// `cancel_slot` poll here so `PipelinedCursor::Drop` and
+    /// `PipelinedReader::close` do not have to wait for the failover
+    /// budget to naturally exhaust before they can join the worker.
+    fn reconnect_with_failover_cancellable<F>(
+        &mut self,
+        failed_idx: usize,
+        abort_tick: Duration,
+        abort_check: F,
+    ) -> Result<u32>
+    where
+        F: Fn() -> Option<Error>,
+    {
+        // Guard against `abort_tick = Duration::ZERO` — the inner
+        // sleep loop computes `min(remaining, abort_tick)` and
+        // `thread::sleep(Duration::ZERO)` returns instantly, busy-
+        // spinning while polling `abort_check` until `sleep_dur`
+        // elapses. The non-cancellable wrapper passes
+        // `Duration::MAX` (single sleep covering the full backoff),
+        // and the pipelined worker passes `READ_POLL_TICK` (100ms);
+        // any future caller passing `ZERO` is almost certainly a
+        // bug. Debug-only so production stays branch-free.
+        debug_assert!(
+            !abort_tick.is_zero(),
+            "reconnect_with_failover_cancellable: abort_tick must be non-zero \
+             (Duration::ZERO would busy-spin in the inner sleep loop); pass \
+             Duration::MAX for unconditional sleeping or a non-zero tick for \
+             cancellable sleeping",
+        );
         let cfg = Arc::clone(&self.cfg);
         let attempts_total = cfg.failover_max_attempts.saturating_add(1);
         let mut backoff_ms = cfg.failover_backoff_initial_ms;
@@ -426,6 +497,14 @@ impl Reader {
         // error messages so diagnostics report real effort, not policy.
         let mut attempts_made: u32 = 0;
         for attempt in 0..attempts_total {
+            // Poll the abort check BEFORE the sleep + walk so a
+            // signal raised while the previous walk was running
+            // short-circuits the next backoff entirely. On the first
+            // iteration this also covers the "signalled before
+            // failover even started" case.
+            if let Some(err) = abort_check() {
+                return Err(err);
+            }
             if attempt > 0 {
                 // Failover.md §11.9 + §3.1: full-jitter `[0, base)`.
                 // Single-user egress benefits from the lowest expected
@@ -449,7 +528,31 @@ impl Reader {
                     },
                     None => Duration::from_millis(jittered_ms),
                 };
-                std::thread::sleep(sleep_dur);
+                // Cancellable sleep: chop `sleep_dur` into
+                // `abort_tick` slices and re-poll `abort_check`
+                // between them. With `failover_max_duration_ms=0`
+                // (unbounded) and a fully-down cluster the
+                // pre-cancellable code blocked the caller for the
+                // entire `failover_max_attempts × failover_backoff_max_ms`
+                // window; a single tick caps that to one
+                // `abort_tick` worst-case wakeup after the abort
+                // signal lands. The non-cancellable wrapper passes
+                // `abort_tick = Duration::MAX` so the inner sleep
+                // is a single call covering `sleep_dur` exactly.
+                let sleep_started = std::time::Instant::now();
+                while sleep_started.elapsed() < sleep_dur {
+                    if let Some(err) = abort_check() {
+                        return Err(err);
+                    }
+                    let remaining = sleep_dur.saturating_sub(sleep_started.elapsed());
+                    std::thread::sleep(std::cmp::min(remaining, abort_tick));
+                }
+                // Final poll after the sleep, so a signal raised
+                // during the last tick is observed before the walk
+                // burns more time on a now-irrelevant reconnect.
+                if let Some(err) = abort_check() {
+                    return Err(err);
+                }
                 backoff_ms = backoff_ms
                     .saturating_mul(2)
                     .min(cfg.failover_backoff_max_ms);
@@ -484,7 +587,7 @@ impl Reader {
                     // `read_ns`, `decode_ns`, `next_request_id`).
                     self.transport = Some(walk.session.transport);
                     self.server_info = walk.session.server_info;
-                    self.dict = SymbolDict::new();
+                    self.dict = Arc::new(SymbolDict::new());
                     self.registry = SchemaRegistry::new();
                     self.addr_idx = walk.session.idx;
                     return Ok(total_dials);
@@ -634,6 +737,10 @@ impl Reader {
 
     /// Connection-scoped symbol dictionary.
     pub fn symbol_dict(&self) -> &SymbolDict {
+        // Deref through the `Arc` — the storage type is
+        // `Arc<SymbolDict>` for refcount-cheap snapshotting, but the
+        // public accessor's contract is `&SymbolDict` and we keep
+        // that shape.
         &self.dict
     }
 
@@ -689,9 +796,15 @@ pub struct FailoverEvent {
     pub new_addr: Endpoint,
     /// `SERVER_INFO` of the new endpoint (`None` for v1 servers).
     pub new_server_info: Option<ServerInfo>,
+    /// `request_id` the cursor was issued under on the connection
+    /// that just failed. Captured immediately before the failover
+    /// replay re-allocates [`new_request_id`](Self::new_request_id),
+    /// so callers can correlate pre-failover frames / cancels /
+    /// logs against the post-failover stream by `(failed_request_id,
+    /// new_request_id)` pair.
+    pub failed_request_id: i64,
     /// Newly-allocated `request_id` the cursor will receive frames for
-    /// from now on. Different from `Cursor::request_id` *before* the
-    /// failover.
+    /// from now on. Different from [`failed_request_id`](Self::failed_request_id).
     pub new_request_id: i64,
     /// Count of reconnect attempts the failover machinery burned
     /// before this success — every dial inside the single
@@ -718,6 +831,31 @@ pub struct FailoverEvent {
     /// SERVER_INFO read). Excludes the time from the cursor's last
     /// successful read until the failure was observed.
     pub elapsed: std::time::Duration,
+}
+
+impl FailoverEvent {
+    /// Test-only constructor exposed for the `questdb-rs-ffi` failover-
+    /// reset trampoline test, which needs a synthetic `FailoverEvent`
+    /// to drive the trampoline closure in isolation (no live server,
+    /// no worker thread, no actual failover walk). `FailoverEvent` is
+    /// `#[non_exhaustive]` so struct-literal construction outside the
+    /// crate is forbidden; this helper provides a stable shim with
+    /// minimum required fields and benign defaults for the rest.
+    /// Stability footing matches `_bench_internals` — `#[doc(hidden)]`
+    /// and `_`-prefixed, subject to change without notice.
+    #[doc(hidden)]
+    pub fn _new_for_test(failed_request_id: i64, new_request_id: i64) -> Self {
+        FailoverEvent {
+            failed_addr: crate::egress::config::Endpoint::new("old.example", 1),
+            new_addr: crate::egress::config::Endpoint::new("new.example", 2),
+            new_server_info: None,
+            failed_request_id,
+            new_request_id,
+            attempts: 1,
+            trigger: Error::new(ErrorCode::SocketError, "synthetic test trigger"),
+            elapsed: std::time::Duration::from_millis(0),
+        }
+    }
 }
 
 /// Boxed user callback type for failover-reset notifications.
@@ -1261,10 +1399,19 @@ impl<'r> Cursor<'r> {
             // and silently retrying would mask it from the user. Bubble
             // it up as a hard failure with the cursor terminated.
             let t1 = std::time::Instant::now();
+            // `Arc::make_mut` is the CoW chokepoint: if no
+            // user-thread snapshot of the live dict is outstanding
+            // (the steady state), this is a strong-count read +
+            // direct mutable borrow — no allocation, no copy. If a
+            // previous `dict_snapshot` is still alive on the user
+            // side (refcount > 1), it clones the dict into a fresh
+            // `Arc` so the snapshot stays immutable. Either way the
+            // returned `&mut SymbolDict` keeps the decoder API
+            // unchanged.
             let decode_result = decode_frame(
                 header,
                 &payload,
-                &mut self.reader.dict,
+                Arc::make_mut(&mut self.reader.dict),
                 &mut self.reader.registry,
                 &mut self.reader.zstd_scratch,
             );
@@ -1461,6 +1608,11 @@ impl<'r> Cursor<'r> {
         // Snapshot the failing endpoint before reconnect mutates
         // `addr_idx` — `FailoverEvent` reports it back to the user.
         let failed_addr = self.reader.cfg.addrs[failed_idx].clone();
+        // Snapshot the failing rid before the replay re-allocates
+        // `self.request_id` below — `FailoverEvent::failed_request_id`
+        // surfaces it so callers can correlate pre- and
+        // post-failover frames by `(failed, new)` pair.
+        let failed_request_id = self.request_id;
         let attempts = match self.reader.reconnect_with_failover(failed_idx) {
             Ok(n) => n,
             Err(e) => {
@@ -1513,6 +1665,7 @@ impl<'r> Cursor<'r> {
                         failed_addr,
                         new_addr: self.reader.cfg.addrs[self.reader.addr_idx].clone(),
                         new_server_info: self.reader.server_info.clone(),
+                        failed_request_id,
                         new_request_id: new_rid,
                         attempts,
                         trigger,
@@ -1587,9 +1740,16 @@ impl<'r> Cursor<'r> {
         // off and the server stops generating new batches behind the
         // cancel.
         self.cancelling = true;
-        let mut payload = Vec::with_capacity(9);
-        payload.push(MsgKind::Cancel.as_u8());
-        payload.extend_from_slice(&self.request_id.to_le_bytes());
+        // Stack-buffer build (fixed 9 bytes: MsgKind + rid). This is
+        // in line with `try_write_cancel` /
+        // `pipelined_internals::cancel_in_place` — all three CANCEL
+        // helpers share the same stack-buffer pattern. The cancel
+        // path fires at most once per cursor so the per-call alloc
+        // cost was modest, but the shape symmetry keeps the three
+        // sites easy to audit together.
+        let mut buf = [0u8; 9];
+        buf[0] = MsgKind::Cancel.as_u8();
+        buf[1..9].copy_from_slice(&self.request_id.to_le_bytes());
 
         // Capture the CANCEL write error explicitly: a `?` here would
         // leave `cancelling=true, done=false, transport=Some(broken)`,
@@ -1598,7 +1758,7 @@ impl<'r> Cursor<'r> {
         // flags and the transport in lockstep with the other terminal
         // paths in `next_batch`.
         let write_outcome = match self.reader.transport_mut() {
-            Ok(t) => t.write_message(Bytes::from(payload)),
+            Ok(t) => t.write_message_slice(&buf),
             Err(e) => Err(e),
         };
         if let Err(e) = write_outcome {
@@ -1763,13 +1923,23 @@ impl<'r> Cursor<'r> {
     /// without a "modulo the 1-byte cancel nudge" caveat. Every other
     /// CREDIT path goes through `send_credit_frame` and is accounted for.
     fn write_credit_frame_raw(&mut self, additional_bytes: u64) -> Result<()> {
-        let mut payload = Vec::with_capacity(16);
-        payload.push(MsgKind::Credit.as_u8());
-        payload.extend_from_slice(&self.request_id.to_le_bytes());
-        varint::encode_u64(additional_bytes, &mut payload);
+        // Stack-buffer build: 1 byte MsgKind + 8 bytes rid + up to
+        // `MAX_VARINT_LEN_U64` (10) bytes of varint = 19 bytes max.
+        // Sized to the worst case so the slice indexer never
+        // bounds-panics. Eliminates the per-batch Vec + Bytes
+        // allocations the previous `Vec::with_capacity(16) +
+        // Bytes::from(payload)` shape paid on every CREDIT — the
+        // CREDIT frame is the only per-batch outbound message
+        // under credit-based flow control, and at "millions of
+        // batches per query" scale the alloc was a real (if small)
+        // recurring cost.
+        let mut buf = [0u8; 1 + 8 + varint::MAX_VARINT_LEN_U64];
+        buf[0] = MsgKind::Credit.as_u8();
+        buf[1..9].copy_from_slice(&self.request_id.to_le_bytes());
+        let varint_len = varint::encode_u64_into_slice(additional_bytes, &mut buf[9..]);
         self.reader
             .transport_mut()?
-            .write_message(Bytes::from(payload))?;
+            .write_message_slice(&buf[..9 + varint_len])?;
         Ok(())
     }
 
@@ -1864,8 +2034,26 @@ impl<'c> BatchView<'c> {
         self.decoded.batch_seq
     }
 
-    /// Per-batch wire flags from the frame header. Useful for asserting
-    /// that compression / Gorilla paths were actually exercised.
+    /// Per-batch wire flags from the frame header. Useful for
+    /// asserting that compression / Gorilla / delta-dict paths were
+    /// actually exercised on a given batch.
+    ///
+    /// Test each bit against the constants in
+    /// [`crate::egress::wire::header::flags`]:
+    ///
+    /// - `GORILLA` (`0x04`) — at least one timestamp / date /
+    ///   timestamp-nanos column in this batch is delta-of-delta
+    ///   (Gorilla) encoded.
+    /// - `DELTA_SYMBOL_DICT` (`0x08`) — the batch carries a
+    ///   symbol-dict delta section (new symbols extending the
+    ///   connection-scoped dict).
+    /// - `ZSTD` (`0x10`) — the payload after the
+    ///   `msg_kind`/`request_id`/`batch_seq` prefix is
+    ///   zstd-compressed (decoded transparently before this view
+    ///   was constructed).
+    ///
+    /// Bits not listed above are reserved and currently always
+    /// clear; treat them as "must be ignored" for forward compat.
     pub fn flags(&self) -> u8 {
         self.decoded.flags
     }
@@ -1907,11 +2095,14 @@ impl<'c> BatchView<'c> {
 ///
 /// Extracted as a free function so the truth table is unit-testable
 /// without needing a live transport.
-fn would_silently_duplicate(data_delivered: bool, has_failover_reset_callback: bool) -> bool {
+pub(crate) fn would_silently_duplicate(
+    data_delivered: bool,
+    has_failover_reset_callback: bool,
+) -> bool {
     data_delivered && !has_failover_reset_callback
 }
 
-fn is_failover_eligible(code: ErrorCode) -> bool {
+pub(crate) fn is_failover_eligible(code: ErrorCode) -> bool {
     matches!(
         code,
         ErrorCode::SocketError
@@ -1938,9 +2129,23 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
 ///
 /// Emit a stderr warning whenever a `ProtocolError` actually triggers
 /// failover so operators can spot masked corruption in logs.
-fn warn_on_protocol_error_failover(err: &Error, context: &str) {
+pub(crate) fn warn_on_protocol_error_failover(err: &Error, context: &str) {
     if err.code() == ErrorCode::ProtocolError {
-        eprintln!(
+        // Lossy stderr write — `eprintln!` panics on stderr-write
+        // failure (Rust stdlib `library/std/src/io/stdio.rs`'s
+        // `panic!("failed printing to ...")`). This helper is
+        // called from the pipelined worker thread on the
+        // failover-eligible-error path; under `panic = "abort"`
+        // (the `questdb-rs-ffi` cdylib profile) a closed-stderr
+        // panic would convert "warning about a recovered transient
+        // wire-corruption" into a process abort. The pipelined
+        // surface has its own `eprintln_lossy` in
+        // `pipelined_reader.rs` and the FFI crate has one at the
+        // crate root; this helper is in `questdb-rs` (a different
+        // crate) and inlines the same pattern.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
             "questdb-rs: warning: ProtocolError triggered failover ({}): {} — \
              reconnecting may mask transient wire-frame corruption \
              (truncated frames, malformed varints) or a deterministic \
@@ -1965,7 +2170,7 @@ fn warn_on_protocol_error_failover(err: &Error, context: &str) {
 /// `SocketError` trigger ("connection dropped") is far less
 /// actionable than the handshake/cert message that actually names
 /// the problem.
-fn prefer_over_trigger(code: ErrorCode) -> bool {
+pub(crate) fn prefer_over_trigger(code: ErrorCode) -> bool {
     matches!(
         code,
         ErrorCode::AuthError
@@ -2225,7 +2430,7 @@ fn read_server_info_frame(transport: &mut WsTransport, timeout: Duration) -> Res
     }
 }
 
-fn map_server_status(
+pub(crate) fn map_server_status(
     status: crate::egress::wire::msg_kind::StatusCode,
     message: String,
 ) -> crate::egress::Error {
@@ -2240,6 +2445,243 @@ fn map_server_status(
         S::LimitExceeded => C::ServerLimitExceeded,
     };
     crate::egress::Error::new(code, message)
+}
+
+/// Narrow `pub(crate)` accessors over [`Reader`]'s private fields and
+/// helper methods, exposed for the background I/O thread in
+/// [`super::pipelined_reader`].
+///
+/// Kept in a sub-module so the surface that escapes `Reader`'s
+/// encapsulation is enumerable in one place — every entry here is a
+/// shim that crosses the privacy boundary and is reviewed under those
+/// stricter eyes. Adding to this list commits the codebase to keeping
+/// the corresponding `Reader` internal stable for the pipelined path;
+/// trim aggressively if a helper becomes unused.
+pub(crate) mod pipelined_internals {
+    use super::*;
+    use crate::egress::config::Endpoint;
+    use crate::egress::schema::Schema;
+    use crate::egress::server_event::{ServerEvent, ServerInfo, decode_frame as decode_frame_impl};
+    use crate::egress::symbol_dict::SymbolDict;
+    use crate::egress::wire::header::FrameHeader;
+    use crate::egress::wire::msg_kind::MsgKind;
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Refcount-cheap handle to the address list for user-side
+    /// `current_addr` lookups without touching the worker's `Reader`.
+    /// Returns an `Arc::clone` of the existing `Arc<ReaderConfig>` —
+    /// a single strong-count bump, no deep clone of the `Vec<Endpoint>`
+    /// or the per-endpoint `String` host names. The previous shape
+    /// (`Arc::new(reader.cfg.addrs.clone())`) deep-cloned the Vec +
+    /// every host `String` per `PipelinedReader` construction, even
+    /// though the canonical `Arc<ReaderConfig>` was already trivially
+    /// shareable.
+    pub(crate) fn cfg_arc(reader: &Reader) -> Arc<ReaderConfig> {
+        Arc::clone(&reader.cfg)
+    }
+
+    pub(crate) fn addr_idx(reader: &Reader) -> usize {
+        reader.addr_idx
+    }
+
+    /// Borrow the configured endpoint at `idx`. Callers that need an
+    /// owned `Endpoint` (e.g. constructing a `FailoverEvent` for the
+    /// user-thread channel) clone explicitly at the call site so a
+    /// future read-only consumer doesn't pay the `String` heap
+    /// allocation just to inspect the host/port.
+    pub(crate) fn addr_at(reader: &Reader, idx: usize) -> &Endpoint {
+        &reader.cfg.addrs[idx]
+    }
+
+    pub(crate) fn transport_version(reader: &Reader) -> Result<u8> {
+        Ok(reader.transport_ref()?.server_version())
+    }
+
+    pub(crate) fn failover_enabled(reader: &Reader) -> bool {
+        reader.cfg.failover
+    }
+
+    pub(crate) fn server_info(reader: &Reader) -> Option<&ServerInfo> {
+        reader.server_info.as_ref()
+    }
+
+    pub(crate) fn mark_cursor_active(reader: &mut Reader, active: bool) {
+        reader.cursor_active = active;
+    }
+
+    pub(crate) fn set_read_timeout(reader: &mut Reader, timeout: Option<Duration>) {
+        if let Some(t) = reader.transport.as_mut() {
+            t.set_read_timeout(timeout);
+        }
+    }
+
+    pub(crate) fn read_frame_or_timeout(
+        reader: &mut Reader,
+    ) -> Result<Option<(FrameHeader, Bytes)>> {
+        reader.transport_mut()?.read_frame_or_timeout()
+    }
+
+    pub(crate) fn write_request_bytes(reader: &mut Reader, payload: Bytes) -> Result<()> {
+        reader.transport_mut()?.write_message(payload)
+    }
+
+    /// Emit a CREDIT frame on behalf of the async cursor + bump the
+    /// stat counter. Equivalent of `Cursor::send_credit_frame`.
+    pub(crate) fn send_credit_frame(
+        reader: &mut Reader,
+        request_id: i64,
+        additional_bytes: u64,
+    ) -> Result<()> {
+        // Stack-buffer build (1 + 8 + up to MAX_VARINT_LEN_U64 =
+        // 19 bytes). See `write_credit_frame_raw` for the
+        // rationale; this is the pipelined-worker counterpart on
+        // the same per-batch hot path.
+        use crate::egress::wire::varint;
+        let mut buf = [0u8; 1 + 8 + varint::MAX_VARINT_LEN_U64];
+        buf[0] = MsgKind::Credit.as_u8();
+        buf[1..9].copy_from_slice(&request_id.to_le_bytes());
+        let varint_len = varint::encode_u64_into_slice(additional_bytes, &mut buf[9..]);
+        reader
+            .transport_mut()?
+            .write_message_slice(&buf[..9 + varint_len])?;
+        reader
+            .stats
+            .credit_granted_total
+            .fetch_add(additional_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Send a CANCEL frame in place. Best-effort — errors are not
+    /// propagated because the user already declared intent to cancel;
+    /// whatever happens next will surface naturally (read timeout /
+    /// server's `QUERY_ERROR` / transport teardown).
+    ///
+    /// **Does not touch transport read/write timeouts.** The sync
+    /// `Cursor::cancel` path in this file tightens both timeouts
+    /// inline so its bounded drain loop can complete promptly; the
+    /// pipelined worker (the only caller of this helper) sets the
+    /// read timeout to [`super::pipelined_reader::READ_POLL_TICK`]
+    /// every iteration, so a tightened-here read deadline would be
+    /// clobbered on the very next loop tick and was therefore dead
+    /// code. If a future sync-side caller wants the
+    /// `CANCEL_DRAIN_READ_TIMEOUT` + `CLOSE_TIMEOUT` tightening,
+    /// have it call this helper to write the frame and then set the
+    /// timeouts itself — the split keeps each side honest about
+    /// what's actually live on its path.
+    pub(crate) fn cancel_in_place(reader: &mut Reader, request_id: i64) {
+        // Stack-buffer build (fixed 9 bytes: MsgKind + rid). Fires
+        // at most once per cursor lifetime, not per batch, so the
+        // alloc cost was modest — but the symmetry with
+        // `send_credit_frame` (same alloc shape, same fix) keeps
+        // both small outbound helpers honest.
+        let mut buf = [0u8; 9];
+        buf[0] = MsgKind::Cancel.as_u8();
+        buf[1..9].copy_from_slice(&request_id.to_le_bytes());
+        if let Some(t) = reader.transport.as_mut() {
+            let _ = t.write_message_slice(&buf);
+        }
+    }
+
+    /// Decode one frame, mutating the connection-scoped dict /
+    /// registry / zstd scratch the same way the sync `Cursor` does.
+    ///
+    /// The `Arc::make_mut` on `reader.dict` is the copy-on-write
+    /// chokepoint: in the steady state (no outstanding
+    /// [`dict_snapshot`] clones still alive on the user side) this
+    /// is a strong-count read + direct mutable borrow, no
+    /// allocation. When a previous batch's snapshot is still alive
+    /// (refcount > 1), one clone fires to keep the snapshot
+    /// immutable while the live dict picks up the delta. Either
+    /// way the decoder sees an unchanged `&mut SymbolDict`.
+    pub(crate) fn decode_frame(
+        reader: &mut Reader,
+        header: FrameHeader,
+        payload: &Bytes,
+    ) -> Result<ServerEvent> {
+        decode_frame_impl(
+            header,
+            payload,
+            Arc::make_mut(&mut reader.dict),
+            &mut reader.registry,
+            &mut reader.zstd_scratch,
+        )
+    }
+
+    /// Refcount-cheap snapshot of the live `SymbolDict` for shipping
+    /// with a published batch. The dict is owned by the worker via
+    /// `Arc<SymbolDict>`, so this is an `Arc::clone` (one atomic
+    /// strong-count bump) regardless of how big the arena / entry
+    /// list has grown. Combined with `Arc::make_mut` at the decoder
+    /// chokepoint above, the live dict is cloned-on-write at most
+    /// once per delta even when multiple batches are in flight on
+    /// the user side — and not at all in the steady state where no
+    /// delta has arrived. Same contract as the public
+    /// [`crate::egress::pipelined_reader::SymbolDictRef`] docstring.
+    pub(crate) fn dict_snapshot(reader: &Reader) -> Arc<SymbolDict> {
+        Arc::clone(&reader.dict)
+    }
+
+    /// Lookup-and-clone a schema into an `Arc`. `Schema` is small
+    /// (column names + kinds, no payload), so per-batch cloning is
+    /// negligible compared with the batch's value bytes.
+    pub(crate) fn schema_arc(reader: &Reader, schema_id: u64) -> Option<Arc<Schema>> {
+        // Refcount-bump clone of the registry's owning `Arc<Schema>`.
+        // The registry now stores `Arc<Schema>` directly (M1), so
+        // this is `O(1)` regardless of how many columns the schema
+        // has — replacing the per-batch `Arc::new(s.clone())` which
+        // deep-cloned every `String` column name on every batch.
+        reader.registry.get_arc(schema_id).cloned()
+    }
+
+    // `alloc_request_id` is intentionally NOT re-exported through
+    // this module: the pipelined worker now mints rids from the
+    // shared `Arc<AtomicI64>` it inherits from `PipelinedReader`
+    // (see [`super::super::pipelined_reader::alloc_request_id_atomic`]),
+    // not from `Reader::next_request_id`. Exposing the per-Reader
+    // allocator here would let a future caller silently re-introduce
+    // the two-independent-counters race the shared atomic exists to
+    // prevent.
+
+    /// Cancellable reconnect — see
+    /// [`Reader::reconnect_with_failover_cancellable`]. The pipelined
+    /// worker uses this so a [`super::super::pipelined_reader`]
+    /// shutdown / cursor cancel signalled while the worker is
+    /// mid-backoff aborts in bounded time instead of waiting for the
+    /// failover budget to exhaust.
+    ///
+    /// The non-cancellable [`Reader::reconnect_with_failover`] wrapper
+    /// is intentionally NOT re-exported through this module: the sync
+    /// `Cursor` path that needs it is in the same file and can call
+    /// it through `&mut self` directly. Exposing both via
+    /// `pipelined_internals` would let a future caller pick the
+    /// uncancellable variant and silently re-introduce the
+    /// `Drop`-can-block-for-hours bug this exists to fix.
+    pub(crate) fn reconnect_with_failover_cancellable<F>(
+        reader: &mut Reader,
+        failed_idx: usize,
+        abort_tick: Duration,
+        abort_check: F,
+    ) -> Result<u32>
+    where
+        F: Fn() -> Option<Error>,
+    {
+        reader.reconnect_with_failover_cancellable(failed_idx, abort_tick, abort_check)
+    }
+
+    /// Mirrors [`Cursor::terminate_with_close`]: tear the transport
+    /// down on every irrecoverable path so dict / registry / zstd
+    /// scratch stay coherent with "no transport bound" and a future
+    /// `IoCommand::Submit` returns a clean `SocketError` instead of
+    /// driving a dead connection.
+    pub(crate) fn terminate_with_close(reader: &mut Reader) {
+        if let Some(mut t) = reader.transport.take() {
+            t.close_in_place();
+            drop(t);
+        }
+        reader.cursor_active = false;
+    }
 }
 
 #[cfg(test)]
