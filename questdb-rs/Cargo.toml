@@ -178,3 +178,15 @@ required-features = ["sync-sender-http", "ndarray", "bigdecimal"]
 [[example]]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "qwp_ws_basic"
+required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "qwp_ws_failover"
+required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "qwp_ws_error_handling"
+required-features = ["sync-sender-qwp-ws"]

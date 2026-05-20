@@ -90,8 +90,21 @@ on the QuestDB documentation site.
 
 ## Examples
 
-QWP/WebSocket throughput benchmark with store-and-forward:
-[`qwp_ws_unified_sfa_bench.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_unified_sfa_bench.rs).
+QWP/WebSocket examples in the
+[examples directory](https://github.com/questdb/c-questdb-client/tree/6.1.0/questdb-rs/examples):
+
+| Example | Description |
+|---------|-------------|
+| [`qwp_ws_basic.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_basic.rs) | Minimal QWP/WebSocket ingestion: build a sender, flush a row, `close_drain`. |
+| [`qwp_ws_failover.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_failover.rs) | Multi-host `addr=` list with on-disk store-and-forward and `sender_id`. |
+| [`qwp_ws_error_handling.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_error_handling.rs) | Server-error handling via `poll_qwp_ws_error` and via the `qwp_ws_error_handler` callback. |
+| [`qwp_ws_unified_sfa_bench.rs`](https://github.com/questdb/c-questdb-client/blob/6.1.0/questdb-rs/examples/qwp_ws_unified_sfa_bench.rs) | Throughput benchmark with store-and-forward. |
+
+Build and run any of these with, for example:
+
+```sh
+cargo run --example qwp_ws_basic --features sync-sender-qwp-ws
+```
 
 ## Crate features
 
