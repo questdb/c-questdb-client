@@ -1,4 +1,5 @@
 #include <questdb/egress/line_reader.h>
+#include <questdb/egress/line_reader_helpers.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -12,8 +13,6 @@ int main(int argc, const char* argv[])
     line_reader* reader = NULL;
     line_reader_query* query = NULL;
     line_reader_cursor* cursor = NULL;
-
-    line_reader_column_kind kind;
 
     line_sender_utf8 conf = QDB_UTF8_LITERAL("ws::addr=localhost:9000;");
     reader = line_reader_from_conf(conf, &err);
@@ -30,59 +29,60 @@ int main(int argc, const char* argv[])
     if (!cursor)
         goto on_error;
 
-    int rc;
-    while ((rc = line_reader_cursor_next_batch(cursor, &err)) == 1)
+    const line_reader_batch* batch;
+    while ((batch = line_reader_cursor_next_batch(cursor, &err)) != NULL)
     {
-        const size_t rows = line_reader_cursor_row_count(cursor);
-        const size_t cols = line_reader_cursor_column_count(cursor);
+        const size_t rows = line_reader_batch_row_count(batch);
+        const size_t cols = line_reader_batch_column_count(batch);
+
+        /* Project every column once per batch; index per row below. */
+        line_reader_column_data d[2];
+        if (cols > sizeof(d) / sizeof(d[0]))
+        {
+            fprintf(stderr, "example expects at most 2 columns\n");
+            goto on_error;
+        }
+        for (size_t c = 0; c < cols; ++c)
+            if (!line_reader_batch_column_data(batch, c, &d[c], &err))
+                goto on_error;
 
         for (size_t r = 0; r < rows; ++r)
         {
             for (size_t c = 0; c < cols; ++c)
             {
-                if (!line_reader_cursor_column_kind(cursor, c, &kind, &err))
-                    goto on_error;
-
                 bool is_null = false;
-                if (kind == line_reader_column_kind_long)
+                switch (d[c].kind)
                 {
-                    int64_t v = 0;
-                    if (!line_reader_cursor_get_i64(
-                            cursor, c, r, &v, &is_null, &err))
-                        goto on_error;
+                case line_reader_column_kind_long:
+                {
+                    int64_t v =
+                        line_reader_column_data_get_i64(&d[c], r, &is_null);
                     if (is_null)
                         printf("NULL ");
                     else
                         printf("%lld ", (long long)v);
+                    break;
                 }
-                else if (kind == line_reader_column_kind_double)
+                case line_reader_column_kind_double:
                 {
-                    double v = 0.0;
-                    if (!line_reader_cursor_get_f64(
-                            cursor, c, r, &v, &is_null, &err))
-                        goto on_error;
+                    double v =
+                        line_reader_column_data_get_f64(&d[c], r, &is_null);
                     if (is_null)
                         printf("NULL ");
                     else
                         printf("%g ", v);
+                    break;
                 }
-                else
-                {
-                    // Illustrative fallback for this minimal example.
-                    // Production code should call the matching
-                    // `line_reader_cursor_get_*` for every column kind
-                    // returned by your query (timestamp, varchar, uuid,
-                    // decimal*, geohash, ipv4, etc.) — printing the
-                    // opaque hex byte here just keeps the example
-                    // short. See `line_reader_column_kind` in
-                    // `line_reader.h` for the full enumeration.
-                    printf("(kind=0x%02X) ", (unsigned)kind);
+                default:
+                    /* Real code dispatches every kind; printing the opaque
+                     * kind code keeps the example short. */
+                    printf("(kind=0x%02X) ", (unsigned)d[c].kind);
                 }
             }
             printf("\n");
         }
     }
-    if (rc < 0)
+    if (err)
         goto on_error;
 
     line_reader_cursor_free(cursor);

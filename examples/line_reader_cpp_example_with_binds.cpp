@@ -17,17 +17,20 @@ int main()
                        .bind_varchar("widgets"_utf8)
                        .execute();
 
-        while (cur.next_batch())
+        while (auto bo = cur.next_batch())
         {
-            const size_t rows = cur.row_count();
+            auto& batch = *bo;
+            auto col_scaled = batch.column(0);
+            auto col_label = batch.column(1);
+            const size_t rows = batch.row_count();
             for (size_t r = 0; r < rows; ++r)
             {
                 // Print "NULL" rather than a sentinel: `0` for an i32
                 // and an empty string for a varchar are valid values
                 // and would silently mask SQL NULLs in production
                 // output. Branch on the optional's engaged state.
-                auto scaled = cur.get_i32(0, r);
-                auto label = cur.get_varchar(1, r);
+                auto scaled = col_scaled.get<int64_t>(r);
+                auto label = col_label.varchar(r);
                 std::cout << "scaled=";
                 if (scaled) std::cout << *scaled; else std::cout << "NULL";
                 std::cout << " label=";

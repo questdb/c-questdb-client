@@ -94,6 +94,7 @@ pub use reader::{
     ReaderStats, Terminal,
 };
 pub use server_event::{ServerInfo, ServerRole};
+pub use symbol_dict::{SymbolDict, SymbolEntry};
 
 /// Decoder internals re-exported for the in-crate criterion benchmark
 /// at `benches/decoder.rs`. **Not** a public API surface: the names

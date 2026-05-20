@@ -42,7 +42,8 @@ use libc::{c_char, c_void, size_t};
 use questdb::egress::{
     BatchView, ColumnKind, ColumnView, Cursor, Error, ErrorCode, FailoverEvent, FailoverPhase,
     FailoverProgressEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole,
-    SimpleNullKind, Terminal, Validity,
+    SimpleNullKind, SymbolEntry, Terminal,
+    Validity,
 };
 
 use crate::line_sender_utf8;
@@ -247,13 +248,13 @@ unsafe fn set_reader_err(
 /// tungstenite write paths that can theoretically panic on allocator
 /// failure).
 ///
-/// **Explicitly do NOT wrap per-row / per-column accessors** —
-/// `line_reader_cursor_get_*`, `line_reader_cursor_column_*`. Those
-/// run pure pointer arithmetic and integer compares against an
-/// already-decoded `ColumnView`, are statically panic-free in release
-/// for any input that passes their bounds checks, and are called once
-/// per (row, col) on Cython scan loops where the `catch_unwind` frame
-/// shows up at the top of profiles.
+/// **Explicitly do NOT wrap per-column bulk accessors** —
+/// `line_reader_batch_column_data`, `line_reader_batch_array_column_data`,
+/// `line_reader_batch_symbol`. Those run pure pointer arithmetic and
+/// integer compares against an already-decoded `ColumnView`, are
+/// statically panic-free in release for any input that passes their
+/// bounds checks, and are called per-column on Cython scan loops where
+/// the `catch_unwind` frame shows up at the top of profiles.
 #[inline]
 fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -1914,7 +1915,6 @@ pub unsafe extern "C" fn line_reader_query_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
-                        column_view_cache: UnsafeCell::new(Vec::new()),
                         reader,
                     }))
                 }
@@ -1990,7 +1990,6 @@ pub unsafe extern "C" fn line_reader_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
-                        column_view_cache: UnsafeCell::new(Vec::new()),
                         reader,
                     }))
                 }
@@ -2381,25 +2380,6 @@ pub struct line_reader_cursor {
     /// for the same reason as `cursor`. See the struct-level safety note —
     /// this field MUST be `None` whenever `&mut self.cursor` is exposed.
     current_batch: Option<BatchView<'static>>,
-    /// Lazy per-column `ColumnView` cache. Sized to `column_count()` when
-    /// `current_batch` is set; cleared (drained) when the batch is dropped.
-    /// Avoids rebuilding the column-kind discriminant match and the
-    /// validity-bitmap length check on every per-row C getter call. The
-    /// stored views are laundered to `'static` for the same reason as
-    /// `cursor` / `current_batch`; the actual lifetime is bounded by the
-    /// owning batch.
-    ///
-    /// # Aliasing safety
-    ///
-    /// `UnsafeCell` is sound here because the cursor is single-threaded
-    /// by contract (see the thread-safety section in `line_reader.h`),
-    /// and the FFI getters serialise by virtue of being plain function
-    /// calls — no two getter invocations overlap. The Vec is pre-sized
-    /// at `next_batch` time and never grown mid-batch, so an `&` to a
-    /// slot returned by `get_column_view` is invalidated only by
-    /// `cursor_for_mut` (which the borrow checker prevents while any
-    /// `&` to the cursor is outstanding).
-    column_view_cache: UnsafeCell<Vec<Option<ColumnView<'static>>>>,
     /// Backpointer to the originating reader, used to clear its `active`
     /// flag on `_cursor_free`. Always non-NULL for a valid cursor.
     reader: *mut line_reader,
@@ -2413,11 +2393,6 @@ impl line_reader_cursor {
     /// instead of taking `&mut self.cursor` directly.
     fn cursor_for_mut(&mut self) -> &mut Cursor<'static> {
         self.current_batch = None;
-        // SAFETY: &mut self gives exclusive access; the column-view
-        // cache borrows from `current_batch`, which we just dropped.
-        unsafe {
-            (*self.column_view_cache.get()).clear();
-        }
         debug_assert!(self.current_batch.is_none());
         &mut self.cursor
     }
@@ -2446,13 +2421,11 @@ pub unsafe extern "C" fn line_reader_cursor_free(cursor: *mut line_reader_cursor
             return;
         }
         let mut boxed = Box::from_raw(cursor);
-        // Drop the cached column views (they borrow from the batch) and
-        // then the BatchView (it borrows from the cursor) before the
+        // Drop the BatchView (it borrows from the cursor) before the
         // cursor itself. Wrapped in `panic_guard` because the cursor's
         // Drop runs `close_in_place` which writes a Close frame and
         // shuts down the TCP socket — any panic there would otherwise
         // cross the FFI boundary.
-        (*boxed.column_view_cache.get()).clear();
         boxed.current_batch = None;
         ManuallyDrop::drop(&mut boxed.cursor);
         // Release the reader's active flag so a new query/cursor can be
@@ -2467,14 +2440,17 @@ pub unsafe extern "C" fn line_reader_cursor_free(cursor: *mut line_reader_cursor
 /// Advance to the next batch.
 ///
 /// Returns:
-///   * `1`  — a new batch is available; column accessors are now valid.
-///   * `0`  — the stream has terminated normally; no batch is available.
-///   * `-1` — an error occurred; `*err_out` is set and the cursor must be closed.
+///   * Non-NULL borrowed batch handle on success. Invalidated by the next
+///     `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
+///     `line_reader_cursor_free`, or mid-query failover.
+///   * NULL with `*err_out` left untouched when the stream has terminated
+///     normally (no batch available).
+///   * NULL with `*err_out` set on error; the cursor must be freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_next_batch(
     cursor: *mut line_reader_cursor,
     err_out: *mut *mut line_reader_error,
-) -> i32 {
+) -> *const line_reader_batch {
     unsafe {
         null_check_handle!(cursor, "line_reader_cursor_next_batch");
         let c = &mut *cursor;
@@ -2511,1369 +2487,21 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
         };
         match next {
             Ok(Some(batch_static)) => {
-                let col_count = batch_static.column_count();
                 c.current_batch = Some(batch_static);
-                // Pre-size the per-column view cache so column getters
-                // don't reallocate it mid-batch. `cursor_for_mut`
-                // (called by `next_batch`'s prelude) already cleared
-                // the previous batch's entries.
-                let cache = &mut *c.column_view_cache.get();
-                debug_assert!(cache.is_empty());
-                cache.resize_with(col_count, || None);
-                1
+                // SAFETY: `repr(transparent)` over `BatchView<'static>`; the
+                // pointer borrows the cursor's `current_batch` field and is
+                // valid until the next `cursor_for_mut` (i.e. next
+                // `next_batch` / `cancel` / `free`).
+                let bv: &BatchView<'static> = c.current_batch.as_ref().unwrap();
+                (bv as *const BatchView<'static>).cast()
             }
-            Ok(None) => 0,
+            Ok(None) => ptr::null(),
             Err(e) => {
                 write_err_box(err_out, e);
-                -1
+                ptr::null()
             }
         }
     }
-}
-
-/// Number of rows in the current batch. Returns `0` when no batch is loaded
-/// or for a NULL cursor handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_row_count(cursor: *const line_reader_cursor) -> size_t {
-    unsafe {
-        if cursor.is_null() {
-            return 0;
-        }
-        match (*cursor).current_batch.as_ref() {
-            Some(b) => b.row_count(),
-            None => 0,
-        }
-    }
-}
-
-/// Number of columns in the current batch. Returns `0` when no batch is
-/// loaded or for a NULL cursor handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_column_count(
-    cursor: *const line_reader_cursor,
-) -> size_t {
-    unsafe {
-        if cursor.is_null() {
-            return 0;
-        }
-        match (*cursor).current_batch.as_ref() {
-            Some(b) => b.column_count(),
-            None => 0,
-        }
-    }
-}
-
-/// Get the kind discriminant for a column in the current batch.
-/// Returns false and sets `*err_out` if no batch is loaded or `col_idx` is
-/// out of range.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_column_kind(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    out_kind: *mut line_reader_column_kind,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_kind.is_null() {
-            // Defensive: a NULL out-param is a contract violation.
-            if !err_out.is_null() {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    "line_reader_cursor_column_kind called with NULL out_kind",
-                );
-            }
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        *out_kind = view.kind().into();
-        true
-    }
-}
-
-/// Borrowed UTF-8 column name for the column at `col_idx` in the current
-/// batch's schema. The string is NOT null-terminated. The pointer is
-/// borrowed from the per-connection `SchemaRegistry`; it remains valid for
-/// at least as long as the cursor — schemas referenced by RESULT_BATCH
-/// frames are pinned for the cursor's lifetime.
-///
-/// Returns false and sets `*err_out` if no batch is loaded, `col_idx` is
-/// out of range, or the cursor's schema lookup fails.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_column_name(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    out_buf: *mut *const c_char,
-    out_len: *mut size_t,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_buf.is_null() || out_len.is_null() {
-            // Defensive: a NULL out-param is a contract violation.
-            if !err_out.is_null() {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    "line_reader_cursor_column_name called with NULL out_buf/out_len",
-                );
-            }
-            return false;
-        }
-        if cursor.is_null() {
-            set_reader_err(err_out, ErrorCode::InvalidApiCall, "cursor handle is NULL");
-            return false;
-        }
-        let batch = match (*cursor).current_batch.as_ref() {
-            Some(b) => b,
-            None => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    "no batch loaded; call line_reader_cursor_next_batch first",
-                );
-                return false;
-            }
-        };
-        let schema = batch.schema();
-        match schema.column(col_idx) {
-            Some(col) => {
-                *out_buf = col.name.as_ptr() as *const c_char;
-                *out_len = col.name.len();
-                true
-            }
-            None => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "column index {} out of range (column_count={})",
-                        col_idx,
-                        schema.len()
-                    ),
-                );
-                false
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-kind getters (vertical-slice subset: bool / i64 / f64)
-// ---------------------------------------------------------------------------
-
-/// Read a `BOOLEAN` value at `(col_idx, row_idx)` in the current batch.
-/// On success, `*out_value` is the row's value and `*out_is_null` indicates
-/// whether the row is null (in which case `*out_value` is undefined).
-/// Returns false and sets `*err_out` on type mismatch, missing batch, or
-/// out-of-range indices.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_bool(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut bool,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_bool");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Boolean(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not BOOLEAN", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = !is_null && col.value(row_idx) != 0;
-        true
-    }
-}
-
-/// Read an `LONG` / `TIMESTAMP` (μs) / `DATE` (ms) / `TIMESTAMP_NANOS` (ns)
-/// value at `(col_idx, row_idx)`. All four kinds are i64-typed under the
-/// hood and accepted by this getter — call `line_reader_cursor_column_kind`
-/// to disambiguate units.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_i64(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut i64,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_i64");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Long(c)
-            | ColumnView::Timestamp(c)
-            | ColumnView::Date(c)
-            | ColumnView::TimestampNanos(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "column {} is {:?}, not LONG/TIMESTAMP/DATE/TIMESTAMP_NANOS",
-                        col_idx,
-                        other.kind()
-                    ),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read a `DOUBLE` value at `(col_idx, row_idx)`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_f64(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut f64,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_f64");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Double(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not DOUBLE", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0.0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read a `BYTE` (signed 8-bit) value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_i8(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut i8,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_i8");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Byte(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not BYTE", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read a `SHORT` (signed 16-bit) value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_i16(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut i16,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_i16");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Short(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not SHORT", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read an `INT` (signed 32-bit) value. Rejects `IPV4` columns —
-/// use `line_reader_cursor_get_ipv4` for those. Reinterpreting an IPv4
-/// address through a signed 32-bit getter would silently flip the sign
-/// for any address ≥ 128.0.0.0, so the two are kept on separate
-/// accessors.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_i32(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut i32,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_i32");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Int(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not INT", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read an `IPV4` value as an unsigned 32-bit integer in the conventional
-/// big-endian-packed form: `(a << 24) | (b << 16) | (c << 8) | d` for
-/// `a.b.c.d`. This matches `line_reader_query_bind_ipv4`'s parameter
-/// (round-trip safe) and avoids the sign-flip that would occur if the
-/// value were reinterpreted as `int32_t`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_ipv4(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut u32,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_ipv4");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Ipv4(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not IPV4", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read a `FLOAT` (32-bit) value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_f32(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut f32,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_f32");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Float(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not FLOAT", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0.0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read a `CHAR` value (a 16-bit UTF-16 code unit, per QuestDB semantics).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_char(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut u16,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_char");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Char(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not CHAR", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0 } else { col.value(row_idx) };
-        true
-    }
-}
-
-/// Read a `UUID` value as 16 raw bytes. On success `out_value` is filled
-/// with exactly 16 bytes, so `out_value` MUST be non-NULL and point to at
-/// least 16 writable bytes; passing a smaller buffer is a buffer overflow
-/// (undefined behaviour). A NULL `out_value` or `out_is_null` is reported
-/// as `InvalidApiCall` via `err_out` and no bytes are written.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_uuid(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut u8,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_uuid");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Uuid(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not UUID", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        if is_null {
-            ptr::write_bytes(out_value, 0, 16);
-        } else {
-            ptr::copy_nonoverlapping(col.value(row_idx).as_ptr(), out_value, 16);
-        }
-        true
-    }
-}
-
-/// Read a `LONG256` value as 32 raw little-endian bytes. On success
-/// `out_value` is filled with exactly 32 bytes, so `out_value` MUST be
-/// non-NULL and point to at least 32 writable bytes; passing a smaller
-/// buffer is a buffer overflow (undefined behaviour). A NULL `out_value`
-/// or `out_is_null` is reported as `InvalidApiCall` via `err_out` and no
-/// bytes are written.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_long256(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut u8,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_long256");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Long256(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not LONG256", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.validity().is_null(row_idx);
-        *out_is_null = is_null;
-        if is_null {
-            ptr::write_bytes(out_value, 0, 32);
-        } else {
-            ptr::copy_nonoverlapping(col.value(row_idx).as_ptr(), out_value, 32);
-        }
-        true
-    }
-}
-
-/// Read a `VARCHAR` value as a borrowed UTF-8 byte slice. The returned
-/// pointer is valid until the next `line_reader_cursor_next_batch` call or
-/// until the cursor is closed. `*out_buf` is set to NULL when the row is
-/// null. The string is NOT null-terminated.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_varchar(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_buf: *mut *const c_char,
-    out_len: *mut size_t,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_buf.is_null() || out_len.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_varchar");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Varchar(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not VARCHAR", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        match col.value(row_idx) {
-            Some(s) => {
-                *out_is_null = false;
-                *out_buf = s.as_ptr() as *const c_char;
-                *out_len = s.len();
-            }
-            None => {
-                *out_is_null = true;
-                *out_buf = ptr::null();
-                *out_len = 0;
-            }
-        }
-        true
-    }
-}
-
-/// Read a `BINARY` value as a borrowed byte slice. Same lifetime contract
-/// as `line_reader_cursor_get_varchar`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_binary(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_buf: *mut *const u8,
-    out_len: *mut size_t,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_buf.is_null() || out_len.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_binary");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Binary(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not BINARY", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        match col.value(row_idx) {
-            Some(b) => {
-                *out_is_null = false;
-                *out_buf = b.as_ptr();
-                *out_len = b.len();
-            }
-            None => {
-                *out_is_null = true;
-                *out_buf = ptr::null();
-                *out_len = 0;
-            }
-        }
-        true
-    }
-}
-
-/// Read a `SYMBOL` value as a UTF-8 byte slice resolved through the
-/// connection-scoped symbol dictionary. Same lifetime contract as
-/// `line_reader_cursor_get_varchar` (valid until next batch or close).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_symbol(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_buf: *mut *const c_char,
-    out_len: *mut size_t,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_buf.is_null() || out_len.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_symbol");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Symbol(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not SYMBOL", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        match col.resolve(row_idx) {
-            Some(s) => {
-                *out_is_null = false;
-                *out_buf = s.as_ptr() as *const c_char;
-                *out_len = s.len();
-            }
-            None => {
-                *out_is_null = true;
-                *out_buf = ptr::null();
-                *out_len = 0;
-            }
-        }
-        true
-    }
-}
-
-/// Read a `DECIMAL64` mantissa plus the column's scale.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_decimal64(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_mantissa: *mut i64,
-    out_scale: *mut i8,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_mantissa.is_null() || out_scale.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_decimal64");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Decimal64(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not DECIMAL64", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.is_null(row_idx);
-        *out_is_null = is_null;
-        *out_mantissa = if is_null { 0 } else { col.value(row_idx) };
-        *out_scale = col.scale();
-        true
-    }
-}
-
-/// Read a `DECIMAL128` mantissa as `u64` low + `i64` high (the upper 64 bits
-/// reinterpreted to preserve the i128 sign in the C type), plus column scale.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_decimal128(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_low: *mut u64,
-    out_high: *mut i64,
-    out_scale: *mut i8,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_low.is_null() || out_high.is_null() || out_scale.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_decimal128");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Decimal128(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not DECIMAL128", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.is_null(row_idx);
-        *out_is_null = is_null;
-        let value: i128 = if is_null { 0 } else { col.value(row_idx) };
-        let bits = value as u128;
-        *out_low = bits as u64;
-        *out_high = (bits >> 64) as i64;
-        *out_scale = col.scale();
-        true
-    }
-}
-
-/// Read a `DECIMAL256` mantissa as 32 raw little-endian bytes plus column
-/// scale. On success `out_value` is filled with exactly 32 bytes, so
-/// `out_value` MUST be non-NULL and point to at least 32 writable bytes;
-/// passing a smaller buffer is a buffer overflow (undefined behaviour). A
-/// NULL `out_value`, `out_scale`, or `out_is_null` is reported as
-/// `InvalidApiCall` via `err_out` and no bytes are written.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_decimal256(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut u8,
-    out_scale: *mut i8,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_scale.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_decimal256");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Decimal256(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not DECIMAL256", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.is_null(row_idx);
-        *out_is_null = is_null;
-        if is_null {
-            ptr::write_bytes(out_value, 0, 32);
-        } else {
-            ptr::copy_nonoverlapping(col.value(row_idx).as_ptr(), out_value, 32);
-        }
-        *out_scale = col.scale();
-        true
-    }
-}
-
-/// Borrowed view over a single `DOUBLE_ARRAY` row.
-///
-/// All pointers are valid until the next `line_reader_cursor_next_batch`
-/// call or until the cursor is closed. `shape` is row-major (innermost
-/// dimension last). `data` is concatenated little-endian `f64` bytes
-/// (`element_count = data_len / 8`).
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct line_reader_double_array_view {
-    pub shape: *const u32,
-    pub ndim: size_t,
-    pub data: *const u8,
-    pub data_len: size_t,
-    pub element_count: size_t,
-}
-
-/// Borrowed view over a single `LONG_ARRAY` row. Same layout as the f64
-/// variant; `data` is concatenated little-endian `i64` bytes.
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct line_reader_long_array_view {
-    pub shape: *const u32,
-    pub ndim: size_t,
-    pub data: *const u8,
-    pub data_len: size_t,
-    pub element_count: size_t,
-}
-
-unsafe fn empty_array_view_f64(out: *mut line_reader_double_array_view) {
-    unsafe {
-        (*out).shape = ptr::null();
-        (*out).ndim = 0;
-        (*out).data = ptr::null();
-        (*out).data_len = 0;
-        (*out).element_count = 0;
-    }
-}
-
-unsafe fn empty_array_view_i64(out: *mut line_reader_long_array_view) {
-    unsafe {
-        (*out).shape = ptr::null();
-        (*out).ndim = 0;
-        (*out).data = ptr::null();
-        (*out).data_len = 0;
-        (*out).element_count = 0;
-    }
-}
-
-/// Read a `DOUBLE_ARRAY` row into a borrowed view. On a NULL row, all
-/// view fields are zeroed and `*out_is_null` is true.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_double_array(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_view: *mut line_reader_double_array_view,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_view.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_double_array");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::DoubleArray(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not DOUBLE_ARRAY", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        if col.is_null(row_idx) {
-            empty_array_view_f64(out_view);
-            *out_is_null = true;
-            return true;
-        }
-        // For a non-null row, `shape`/`raw` returning None indicates a wire
-        // invariant violation — surface it rather than fabricate a view
-        // with dangling-but-non-null pointers from `(&[]).as_ptr()`.
-        let (shape, raw) = match (col.shape(row_idx), col.raw(row_idx)) {
-            (Some(s), Some(r)) => (s, r),
-            _ => {
-                empty_array_view_f64(out_view);
-                set_reader_err(
-                    err_out,
-                    ErrorCode::ProtocolError,
-                    format!(
-                        "DOUBLE_ARRAY row {} of column {} has no shape/data \
-                         despite being non-null",
-                        row_idx, col_idx
-                    ),
-                );
-                return false;
-            }
-        };
-        // Defense-in-depth: a `raw` length that isn't a multiple of 8
-        // would mean the decoder produced a partial f64 element. Reject
-        // before exposing a view where `data_len` and `element_count`
-        // would disagree (truncating element_count silently would let
-        // the C caller read past the last whole element).
-        if !raw.len().is_multiple_of(8) {
-            empty_array_view_f64(out_view);
-            set_reader_err(
-                err_out,
-                ErrorCode::ProtocolError,
-                format!(
-                    "DOUBLE_ARRAY row {} of column {} has data_len {} \
-                     (not a multiple of 8 — partial f64 element)",
-                    row_idx,
-                    col_idx,
-                    raw.len()
-                ),
-            );
-            return false;
-        }
-        // Symmetry: `data_len == 0 ⇒ data == NULL`, `ndim == 0 ⇒ shape ==
-        // NULL`. Without these, an array row whose shape produces zero
-        // elements (e.g. `[2, 0, 3]`) would expose Rust's
-        // `(&[]).as_ptr()` dangling sentinel to C, breaking defensive
-        // checks like `if (view.data) { ... }`. `shape.is_empty()` is
-        // unreachable today (the decoder rejects `n_dims == 0`) but
-        // null-out is symmetric with the data path.
-        (*out_view).shape = if shape.is_empty() {
-            ptr::null()
-        } else {
-            shape.as_ptr()
-        };
-        (*out_view).ndim = shape.len();
-        (*out_view).data = if raw.is_empty() {
-            ptr::null()
-        } else {
-            raw.as_ptr()
-        };
-        (*out_view).data_len = raw.len();
-        (*out_view).element_count = raw.len() / 8;
-        *out_is_null = false;
-        true
-    }
-}
-
-/// Read a single `f64` element at flat row-major index `flat_idx` of a
-/// `DOUBLE_ARRAY` row. Useful for callers that don't want to handle
-/// little-endian byte reads themselves.
-///
-/// On a NULL row sets `*out_is_null = true`, zeroes `*out_value`, and
-/// returns true. On a non-null row in range writes `*out_value`, sets
-/// `*out_is_null = false`, and returns true. Returns false and sets
-/// `*err_out` for type mismatch, out-of-range `row_idx`, or out-of-range
-/// `flat_idx`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_double_array_element(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    flat_idx: size_t,
-    out_value: *mut f64,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_double_array_element");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::DoubleArray(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not DOUBLE_ARRAY", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        if col.is_null(row_idx) {
-            *out_is_null = true;
-            *out_value = 0.0;
-            return true;
-        }
-        match col.element(row_idx, flat_idx) {
-            Some(v) => {
-                *out_is_null = false;
-                *out_value = v;
-                true
-            }
-            None => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "flat index {} out of range for row {} of column {} \
-                         (element_count={})",
-                        flat_idx,
-                        row_idx,
-                        col_idx,
-                        col.element_count(row_idx)
-                    ),
-                );
-                false
-            }
-        }
-    }
-}
-
-/// Read a `LONG_ARRAY` row into a borrowed view.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_long_array(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_view: *mut line_reader_long_array_view,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_view.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_long_array");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::LongArray(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not LONG_ARRAY", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        if col.is_null(row_idx) {
-            empty_array_view_i64(out_view);
-            *out_is_null = true;
-            return true;
-        }
-        // For a non-null row, `shape`/`raw` returning None indicates a wire
-        // invariant violation — surface it rather than fabricate a view
-        // with dangling-but-non-null pointers from `(&[]).as_ptr()`.
-        let (shape, raw) = match (col.shape(row_idx), col.raw(row_idx)) {
-            (Some(s), Some(r)) => (s, r),
-            _ => {
-                empty_array_view_i64(out_view);
-                set_reader_err(
-                    err_out,
-                    ErrorCode::ProtocolError,
-                    format!(
-                        "LONG_ARRAY row {} of column {} has no shape/data \
-                         despite being non-null",
-                        row_idx, col_idx
-                    ),
-                );
-                return false;
-            }
-        };
-        // Defense-in-depth: see the matching check in
-        // `line_reader_cursor_get_double_array`. A `raw` length not
-        // divisible by 8 means the decoder produced a partial i64
-        // element; surface as ProtocolError rather than silently
-        // truncating element_count.
-        if !raw.len().is_multiple_of(8) {
-            empty_array_view_i64(out_view);
-            set_reader_err(
-                err_out,
-                ErrorCode::ProtocolError,
-                format!(
-                    "LONG_ARRAY row {} of column {} has data_len {} \
-                     (not a multiple of 8 — partial i64 element)",
-                    row_idx,
-                    col_idx,
-                    raw.len()
-                ),
-            );
-            return false;
-        }
-        // See `line_reader_cursor_get_double_array` for the empty-slice
-        // null-out rationale.
-        (*out_view).shape = if shape.is_empty() {
-            ptr::null()
-        } else {
-            shape.as_ptr()
-        };
-        (*out_view).ndim = shape.len();
-        (*out_view).data = if raw.is_empty() {
-            ptr::null()
-        } else {
-            raw.as_ptr()
-        };
-        (*out_view).data_len = raw.len();
-        (*out_view).element_count = raw.len() / 8;
-        *out_is_null = false;
-        true
-    }
-}
-
-/// Read a single `i64` element of a `LONG_ARRAY` row.
-///
-/// On a NULL row sets `*out_is_null = true`, zeroes `*out_value`, and
-/// returns true. On a non-null row in range writes `*out_value`, sets
-/// `*out_is_null = false`, and returns true. Returns false and sets
-/// `*err_out` for type mismatch, out-of-range `row_idx`, or out-of-range
-/// `flat_idx`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_long_array_element(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    flat_idx: size_t,
-    out_value: *mut i64,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_long_array_element");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::LongArray(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not LONG_ARRAY", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        if col.is_null(row_idx) {
-            *out_is_null = true;
-            *out_value = 0;
-            return true;
-        }
-        match col.element(row_idx, flat_idx) {
-            Some(v) => {
-                *out_is_null = false;
-                *out_value = v;
-                true
-            }
-            None => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "flat index {} out of range for row {} of column {} \
-                         (element_count={})",
-                        flat_idx,
-                        row_idx,
-                        col_idx,
-                        col.element_count(row_idx)
-                    ),
-                );
-                false
-            }
-        }
-    }
-}
-
-/// Get the raw validity bitmap for a column in the current batch.
-///
-/// On success: when the column has any nulls, `*out_buf` is set to a
-/// borrowed pointer to the LSB-first bitmap (bit `1` = null) and `*out_len`
-/// is its byte length. When the column has no nulls (`Validity::None` on
-/// the wire) `*out_buf` is set to NULL and `*out_len` to 0. The pointer is
-/// valid until the next `line_reader_cursor_next_batch` call or until the
-/// cursor is closed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_column_validity(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    out_buf: *mut *const u8,
-    out_len: *mut size_t,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_buf.is_null() || out_len.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_column_validity");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let validity = column_view_validity(view);
-        // A `Validity::None` wire variant and an empty bitmap both mean
-        // "no nulls present"; surface both as a NULL pointer so the
-        // documented "out_buf == NULL ⇔ no nulls" contract holds.
-        match validity.bytes() {
-            Some(bytes) if !bytes.is_empty() => {
-                *out_buf = bytes.as_ptr();
-                *out_len = bytes.len();
-            }
-            _ => {
-                *out_buf = ptr::null();
-                *out_len = 0;
-            }
-        }
-        true
-    }
-}
-
-fn column_view_validity<'a>(view: &'a ColumnView<'a>) -> Validity<'a> {
-    view.validity()
 }
 
 // ---------------------------------------------------------------------------
@@ -4038,107 +2666,6 @@ pub unsafe extern "C" fn line_reader_cursor_current_server_info(
         match (*cursor).cursor.server_info() {
             Some(si) => si as *const ServerInfo as *const line_reader_server_info,
             None => ptr::null(),
-        }
-    }
-}
-
-/// `request_id` from the most recently decoded batch's frame header. Only
-/// meaningful after a successful `next_batch` and before the next call.
-///
-/// Returns true and writes `*out_request_id` if a batch is currently loaded.
-/// Returns false and zeroes the output if no batch is loaded or the cursor
-/// handle is NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_batch_request_id(
-    cursor: *const line_reader_cursor,
-    out_request_id: *mut i64,
-) -> bool {
-    unsafe {
-        // Defensive: a NULL out-param is a contract violation. Skip every
-        // write below rather than dereferencing NULL.
-        if out_request_id.is_null() {
-            return false;
-        }
-        if cursor.is_null() {
-            *out_request_id = 0;
-            return false;
-        }
-        match (*cursor).current_batch.as_ref() {
-            Some(b) => {
-                *out_request_id = b.request_id();
-                true
-            }
-            None => {
-                *out_request_id = 0;
-                false
-            }
-        }
-    }
-}
-
-/// `batch_seq` of the current batch (0-based, monotonically increasing
-/// within a single cursor lifecycle on the same connection).
-///
-/// Returns true and writes `*out_batch_seq` if a batch is currently loaded.
-/// Returns false and zeroes the output if no batch is loaded or the cursor
-/// handle is NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_batch_seq(
-    cursor: *const line_reader_cursor,
-    out_batch_seq: *mut u64,
-) -> bool {
-    unsafe {
-        // Defensive: a NULL out-param is a contract violation. Skip every
-        // write below rather than dereferencing NULL.
-        if out_batch_seq.is_null() {
-            return false;
-        }
-        if cursor.is_null() {
-            *out_batch_seq = 0;
-            return false;
-        }
-        match (*cursor).current_batch.as_ref() {
-            Some(b) => {
-                *out_batch_seq = b.batch_seq();
-                true
-            }
-            None => {
-                *out_batch_seq = 0;
-                false
-            }
-        }
-    }
-}
-
-/// Per-batch wire flags from the current batch's frame header.
-///
-/// Returns true and writes `*out_flags` if a batch is currently loaded.
-/// Returns false and zeroes the output if no batch is loaded or the cursor
-/// handle is NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_batch_flags(
-    cursor: *const line_reader_cursor,
-    out_flags: *mut u8,
-) -> bool {
-    unsafe {
-        // Defensive: a NULL out-param is a contract violation. Skip every
-        // write below rather than dereferencing NULL.
-        if out_flags.is_null() {
-            return false;
-        }
-        if cursor.is_null() {
-            *out_flags = 0;
-            return false;
-        }
-        match (*cursor).current_batch.as_ref() {
-            Some(b) => {
-                *out_flags = b.flags();
-                true
-            }
-            None => {
-                *out_flags = 0;
-                false
-            }
         }
     }
 }
@@ -4330,138 +2857,7 @@ pub unsafe extern "C" fn line_reader_query_initial_credit(
     unsafe { mutate_query(query, |q| q.initial_credit(credit)) }
 }
 
-/// Read a `GEOHASH` value zero-extended to a `u64`, plus the column's
-/// `precision_bits` (in `1..=60`).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_cursor_get_geohash(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    row_idx: size_t,
-    out_value: *mut u64,
-    out_precision_bits: *mut u8,
-    out_is_null: *mut bool,
-    err_out: *mut *mut line_reader_error,
-) -> bool {
-    unsafe {
-        if out_value.is_null() || out_precision_bits.is_null() || out_is_null.is_null() {
-            null_out_param_err(err_out, "line_reader_cursor_get_geohash");
-            return false;
-        }
-        let view = match get_column_view(cursor, col_idx, err_out) {
-            Some(v) => v,
-            None => return false,
-        };
-        let col = match view {
-            ColumnView::Geohash(c) => c,
-            other => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    format!("column {} is {:?}, not GEOHASH", col_idx, other.kind()),
-                );
-                return false;
-            }
-        };
-        if !check_row(col_idx, row_idx, col.len(), err_out) {
-            return false;
-        }
-        let is_null = col.is_null(row_idx);
-        *out_is_null = is_null;
-        *out_value = if is_null { 0 } else { col.value(row_idx) };
-        *out_precision_bits = col.precision_bits();
-        true
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Lazily project the column at `col_idx` into a `ColumnView` and return a
-/// borrow of the cached projection. The first call for a given `col_idx`
-/// after `_cursor_next_batch` builds the view; subsequent calls hit the
-/// cache, skipping the discriminant match in `BatchView::column` and the
-/// validity-bitmap length check that goes with it.
-///
-/// SAFETY: `cursor` must be a valid, non-null pointer to a
-/// `line_reader_cursor` and `err_out` must be a valid pointer. The
-/// lifetime `'a` is bounded by the input borrow, which prevents the caller
-/// from outliving the cursor's `current_batch`. The internal lifetime
-/// launder is sound because (1) the cache is sized at `_cursor_next_batch`
-/// time and never grown again before the next `cursor_for_mut`, so an
-/// in-cache slot's address is stable for the lifetime of the batch; (2)
-/// `cursor_for_mut` is the only mutator that drains the cache, and the
-/// borrow checker prevents calling it while any `&` to the cursor is
-/// outstanding; (3) the FFI is documented as single-threaded per cursor,
-/// so no two getter calls overlap.
-unsafe fn get_column_view<'a>(
-    cursor: *const line_reader_cursor,
-    col_idx: size_t,
-    err_out: *mut *mut line_reader_error,
-) -> Option<&'a ColumnView<'a>> {
-    unsafe {
-        // NULL guard at the helper instead of every caller — the
-        // header contract disallows NULL but defense-in-depth matches
-        // the reader-side stat getters (`line_reader_bytes_received`
-        // et al.) and keeps the FFI from SIGSEGV-ing inside a `match
-        // (*cursor)`. Surfaces as a clean `InvalidApiCall` so the
-        // caller sees what they did wrong.
-        if cursor.is_null() {
-            set_reader_err(err_out, ErrorCode::InvalidApiCall, "cursor handle is NULL");
-            return None;
-        }
-        let cursor = &*cursor;
-        let batch = match cursor.current_batch.as_ref() {
-            Some(b) => b,
-            None => {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidApiCall,
-                    "no batch loaded; call line_reader_cursor_next_batch first",
-                );
-                return None;
-            }
-        };
-        if col_idx >= batch.column_count() {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                format!(
-                    "column index {} out of range (column_count={})",
-                    col_idx,
-                    batch.column_count()
-                ),
-            );
-            return None;
-        }
-        let cache = &mut *cursor.column_view_cache.get();
-        if cache[col_idx].is_none() {
-            match batch.column(col_idx) {
-                Ok(view) => {
-                    let view_static: ColumnView<'static> = std::mem::transmute(view);
-                    cache[col_idx] = Some(view_static);
-                }
-                Err(e) => {
-                    write_err_box(err_out, e);
-                    return None;
-                }
-            }
-        }
-        let view_static: &'static ColumnView<'static> = cache[col_idx].as_ref().unwrap();
-        Some(std::mem::transmute::<
-            &'static ColumnView<'static>,
-            &'a ColumnView<'a>,
-        >(view_static))
-    }
-}
-
 /// Report a NULL out-param contract violation through `err_out`.
-///
-/// Called by the per-kind cursor getters before any out-param write when
-/// a caller-supplied out pointer is NULL. Surfaces a clean
-/// `InvalidApiCall` instead of dereferencing NULL. `err_out` itself is
-/// NULL-checked inside `set_reader_err` → `write_err_box`, so passing a
-/// NULL `err_out` simply swallows the report.
 #[inline]
 unsafe fn null_out_param_err(err_out: *mut *mut line_reader_error, fn_name: &str) {
     unsafe {
@@ -4473,26 +2869,553 @@ unsafe fn null_out_param_err(err_out: *mut *mut line_reader_error, fn_name: &str
     }
 }
 
-unsafe fn check_row(
+// ---------------------------------------------------------------------------
+// Batch & column bulk access
+// ---------------------------------------------------------------------------
+
+/// Borrowed handle for the batch currently loaded in a cursor. Backed by
+/// the cursor's `current_batch`; invalidated by the next
+/// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
+/// `line_reader_cursor_free`, or mid-query failover. Never freed by the
+/// caller.
+#[repr(transparent)]
+pub struct line_reader_batch(BatchView<'static>);
+
+/// Bulk descriptor for one scalar / variable-width column. Every pointer
+/// borrows from the batch and shares its lifetime.
+#[repr(C)]
+pub struct line_reader_column_data {
+    pub kind: line_reader_column_kind,
+    pub row_count: size_t,
+    /// LSB-first null bitmap, `ceil(row_count / 8)` bytes; NULL if the
+    /// column carries no nulls.
+    pub validity: *const u8,
+    /// Dense little-endian values, `row_count * value_stride` bytes; NULL
+    /// for variable-width kinds.
+    pub values: *const c_void,
+    /// Bytes per fixed-width value; `0` for variable-width kinds.
+    pub value_stride: size_t,
+    /// VARCHAR / BINARY offset table, `row_count + 1` entries; NULL otherwise.
+    pub var_offsets: *const u32,
+    /// VARCHAR / BINARY concatenated data blob; NULL otherwise.
+    pub var_data: *const u8,
+    pub var_data_len: size_t,
+    /// SYMBOL per-row dictionary codes, `row_count` entries; NULL otherwise.
+    pub symbol_codes: *const u32,
+    /// DECIMAL64/128/256 shared scale; `0` otherwise.
+    pub decimal_scale: i8,
+    /// GEOHASH precision in bits (1..60); `0` otherwise.
+    pub geohash_precision_bits: u8,
+}
+
+/// Bulk descriptor for a `DOUBLE_ARRAY` / `LONG_ARRAY` column. Four-buffer
+/// ragged layout; every pointer borrows from the batch.
+#[repr(C)]
+pub struct line_reader_array_data {
+    pub kind: line_reader_column_kind,
+    pub row_count: size_t,
+    /// Row-level null bitmap (whole-array NULL); NULL if no row is null.
+    pub validity: *const u8,
+    /// Flattened row-major little-endian element bytes for every row.
+    pub data: *const u8,
+    pub data_len: size_t,
+    /// Per-row byte offsets into `data`, `row_count + 1` entries.
+    pub data_offsets: *const u32,
+    /// Concatenated per-row dimension lengths.
+    pub shapes: *const u32,
+    pub shapes_len: size_t,
+    /// Per-row offsets into `shapes`, `row_count + 1` entries.
+    pub shape_offsets: *const u32,
+}
+
+/// One symbol-dictionary entry: a byte range into `line_reader_symbol_dict::heap`.
+#[repr(C)]
+pub struct line_reader_symbol_entry {
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// Snapshot of the connection-scoped symbol dictionary.
+#[repr(C)]
+pub struct line_reader_symbol_dict {
+    /// Entry count; an entry's index is its dictionary code.
+    pub entry_count: size_t,
+    /// Concatenated UTF-8 bytes for every entry.
+    pub heap: *const u8,
+    pub heap_len: size_t,
+    /// `entry_count` entries addressing `heap`.
+    pub entries: *const line_reader_symbol_entry,
+}
+
+// `line_reader_batch_symbol_dict` hands out `questdb-rs`'s `SymbolEntry`
+// slice reinterpreted as `line_reader_symbol_entry`; both are `#[repr(C)]`
+// `{ u32, u32 }`, but assert it so a layout change upstream fails the
+// build instead of silently corrupting the offset table.
+const _: () = assert!(
+    std::mem::size_of::<line_reader_symbol_entry>() == std::mem::size_of::<SymbolEntry>()
+        && std::mem::align_of::<line_reader_symbol_entry>() == std::mem::align_of::<SymbolEntry>()
+);
+
+#[inline]
+fn validity_ptr(v: Validity<'_>) -> *const u8 {
+    v.bytes().map_or(ptr::null(), <[u8]>::as_ptr)
+}
+
+unsafe fn batch_or_err<'a>(
+    batch: *const line_reader_batch,
+    err_out: *mut *mut line_reader_error,
+    fn_name: &str,
+) -> Option<&'a BatchView<'static>> {
+    if batch.is_null() {
+        unsafe {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{fn_name}: batch handle is NULL"),
+            );
+        }
+        return None;
+    }
+    Some(unsafe { &(*batch).0 })
+}
+
+/// Rows in the batch. `0` on a NULL handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_row_count(batch: *const line_reader_batch) -> size_t {
+    unsafe {
+        if batch.is_null() {
+            return 0;
+        }
+        (*batch).0.row_count()
+    }
+}
+
+/// Columns in the batch. `0` on a NULL handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_column_count(batch: *const line_reader_batch) -> size_t {
+    unsafe {
+        if batch.is_null() {
+            return 0;
+        }
+        (*batch).0.column_count()
+    }
+}
+
+/// `request_id` echoed from the originating `QUERY_REQUEST`. `0` on a NULL
+/// handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_request_id(batch: *const line_reader_batch) -> i64 {
+    unsafe {
+        if batch.is_null() {
+            return 0;
+        }
+        (*batch).0.request_id()
+    }
+}
+
+/// Monotonic per-request batch sequence number. `0` on a NULL handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_seq(batch: *const line_reader_batch) -> u64 {
+    unsafe {
+        if batch.is_null() {
+            return 0;
+        }
+        (*batch).0.batch_seq()
+    }
+}
+
+/// Per-batch wire flags from the frame header. `0` on a NULL handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_flags(batch: *const line_reader_batch) -> u8 {
+    unsafe {
+        if batch.is_null() {
+            return 0;
+        }
+        (*batch).0.flags()
+    }
+}
+
+/// Kind discriminant for `col_idx`. Returns false and sets `*err_out` on a
+/// NULL handle, a NULL out-param, or an out-of-range index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_column_kind(
+    batch: *const line_reader_batch,
     col_idx: size_t,
-    row_idx: size_t,
-    row_count: size_t,
+    out_kind: *mut line_reader_column_kind,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    if row_idx >= row_count {
+    unsafe {
+        if out_kind.is_null() {
+            null_out_param_err(err_out, "line_reader_batch_column_kind");
+            return false;
+        }
+        let Some(batch) = batch_or_err(batch, err_out, "line_reader_batch_column_kind") else {
+            return false;
+        };
+        let Some(view) = column_view_or_err(batch, col_idx, err_out) else {
+            return false;
+        };
+        *out_kind = view.kind().into();
+        true
+    }
+}
+
+/// Borrowed, non-NUL-terminated UTF-8 column name for `col_idx`. The
+/// pointer borrows from the batch's schema; see the batch handle's
+/// invalidation rules. Returns false and sets `*err_out` on a NULL handle,
+/// a NULL out-param, or an out-of-range index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_column_name(
+    batch: *const line_reader_batch,
+    col_idx: size_t,
+    out_buf: *mut *const c_char,
+    out_len: *mut size_t,
+    err_out: *mut *mut line_reader_error,
+) -> bool {
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            null_out_param_err(err_out, "line_reader_batch_column_name");
+            return false;
+        }
+        let Some(batch) = batch_or_err(batch, err_out, "line_reader_batch_column_name") else {
+            return false;
+        };
+        let schema = batch.schema();
+        match schema.column(col_idx) {
+            Some(col) => {
+                *out_buf = col.name.as_ptr() as *const c_char;
+                *out_len = col.name.len();
+                true
+            }
+            None => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "column index {} out of range (column_count={})",
+                        col_idx,
+                        schema.len()
+                    ),
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Project a scalar / variable-width column into `*out`. Returns false and
+/// sets `*err_out` on a NULL handle, a NULL out-param, an out-of-range
+/// index, or an array column (use `line_reader_batch_array_column_data`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_column_data(
+    batch: *const line_reader_batch,
+    col_idx: size_t,
+    out: *mut line_reader_column_data,
+    err_out: *mut *mut line_reader_error,
+) -> bool {
+    unsafe {
+        if out.is_null() {
+            null_out_param_err(err_out, "line_reader_batch_column_data");
+            return false;
+        }
+        let Some(batch) = batch_or_err(batch, err_out, "line_reader_batch_column_data") else {
+            return false;
+        };
+        let Some(view) = column_view_or_err(batch, col_idx, err_out) else {
+            return false;
+        };
+        let mut d = line_reader_column_data {
+            kind: view.kind().into(),
+            row_count: batch.row_count(),
+            validity: ptr::null(),
+            values: ptr::null(),
+            value_stride: 0,
+            var_offsets: ptr::null(),
+            var_data: ptr::null(),
+            var_data_len: 0,
+            symbol_codes: ptr::null(),
+            decimal_scale: 0,
+            geohash_precision_bits: 0,
+        };
+        macro_rules! fixed {
+            ($c:expr, $stride:expr) => {{
+                d.values = $c.raw().as_ptr().cast();
+                d.value_stride = $stride;
+                d.validity = validity_ptr($c.validity());
+            }};
+        }
+        match &view {
+            ColumnView::Boolean(c) => fixed!(c, 1),
+            ColumnView::Byte(c) => fixed!(c, 1),
+            ColumnView::Short(c) => fixed!(c, 2),
+            ColumnView::Char(c) => fixed!(c, 2),
+            ColumnView::Int(c) => fixed!(c, 4),
+            ColumnView::Float(c) => fixed!(c, 4),
+            ColumnView::Ipv4(c) => fixed!(c, 4),
+            ColumnView::Long(c) => fixed!(c, 8),
+            ColumnView::Double(c) => fixed!(c, 8),
+            ColumnView::Timestamp(c) => fixed!(c, 8),
+            ColumnView::Date(c) => fixed!(c, 8),
+            ColumnView::TimestampNanos(c) => fixed!(c, 8),
+            ColumnView::Uuid(c) => fixed!(c, 16),
+            ColumnView::Long256(c) => fixed!(c, 32),
+            ColumnView::Decimal64(c) => {
+                fixed!(c, 8);
+                d.decimal_scale = c.scale();
+            }
+            ColumnView::Decimal128(c) => {
+                fixed!(c, 16);
+                d.decimal_scale = c.scale();
+            }
+            ColumnView::Decimal256(c) => {
+                fixed!(c, 32);
+                d.decimal_scale = c.scale();
+            }
+            ColumnView::Geohash(c) => {
+                d.values = c.raw().as_ptr().cast();
+                d.value_stride = c.byte_width() as size_t;
+                d.validity = validity_ptr(c.validity());
+                d.geohash_precision_bits = c.precision_bits();
+            }
+            ColumnView::Symbol(c) => {
+                d.symbol_codes = c.codes().as_ptr();
+                d.validity = validity_ptr(c.validity());
+            }
+            ColumnView::Varchar(c) => {
+                d.var_offsets = c.offsets().as_ptr();
+                d.var_data = c.data().as_ptr();
+                d.var_data_len = c.data().len();
+                d.validity = validity_ptr(c.validity());
+            }
+            ColumnView::Binary(c) => {
+                d.var_offsets = c.offsets().as_ptr();
+                d.var_data = c.data().as_ptr();
+                d.var_data_len = c.data().len();
+                d.validity = validity_ptr(c.validity());
+            }
+            ColumnView::DoubleArray(_) => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "column {col_idx} is a DOUBLE_ARRAY; use line_reader_batch_array_column_data"
+                    ),
+                );
+                return false;
+            }
+            ColumnView::LongArray(_) => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "column {col_idx} is a LONG_ARRAY; LONG_ARRAY is not supported in this revision"
+                    ),
+                );
+                return false;
+            }
+            _ => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "column {col_idx} has unsupported kind {:?}",
+                        view.kind()
+                    ),
+                );
+                return false;
+            }
+        }
+        *out = d;
+        true
+    }
+}
+
+/// Project a `DOUBLE_ARRAY` / `LONG_ARRAY` column into `*out`. Returns
+/// false and sets `*err_out` on a NULL handle, a NULL out-param, an
+/// out-of-range index, or a non-array column.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_array_column_data(
+    batch: *const line_reader_batch,
+    col_idx: size_t,
+    out: *mut line_reader_array_data,
+    err_out: *mut *mut line_reader_error,
+) -> bool {
+    unsafe {
+        if out.is_null() {
+            null_out_param_err(err_out, "line_reader_batch_array_column_data");
+            return false;
+        }
+        let Some(batch) = batch_or_err(batch, err_out, "line_reader_batch_array_column_data")
+        else {
+            return false;
+        };
+        let Some(view) = column_view_or_err(batch, col_idx, err_out) else {
+            return false;
+        };
+        let mut d = line_reader_array_data {
+            kind: view.kind().into(),
+            row_count: batch.row_count(),
+            validity: ptr::null(),
+            data: ptr::null(),
+            data_len: 0,
+            data_offsets: ptr::null(),
+            shapes: ptr::null(),
+            shapes_len: 0,
+            shape_offsets: ptr::null(),
+        };
+        macro_rules! array {
+            ($c:expr) => {{
+                d.validity = validity_ptr($c.validity());
+                d.data = $c.data().as_ptr();
+                d.data_len = $c.data().len();
+                d.data_offsets = $c.data_offsets().as_ptr();
+                d.shapes = $c.shapes().as_ptr();
+                d.shapes_len = $c.shapes().len();
+                d.shape_offsets = $c.shape_offsets().as_ptr();
+            }};
+        }
+        match &view {
+            ColumnView::DoubleArray(c) => array!(c),
+            ColumnView::LongArray(_) => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "column {col_idx} is a LONG_ARRAY; LONG_ARRAY is not supported in this revision"
+                    ),
+                );
+                return false;
+            }
+            _ => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "column {col_idx} is kind {:?}, not a DOUBLE_ARRAY \
+                         column; use line_reader_batch_column_data for \
+                         scalar / variable-width columns",
+                        view.kind()
+                    ),
+                );
+                return false;
+            }
+        }
+        *out = d;
+        true
+    }
+}
+
+/// Resolve a SYMBOL dictionary `code` to its borrowed, non-NUL-terminated
+/// UTF-8 bytes. Returns false and sets `*err_out` on a NULL handle, a NULL
+/// out-param, a non-SYMBOL column, or a code outside the dictionary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_symbol(
+    batch: *const line_reader_batch,
+    col_idx: size_t,
+    code: u32,
+    out_buf: *mut *const c_char,
+    out_len: *mut size_t,
+    err_out: *mut *mut line_reader_error,
+) -> bool {
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            null_out_param_err(err_out, "line_reader_batch_symbol");
+            return false;
+        }
+        let Some(batch) = batch_or_err(batch, err_out, "line_reader_batch_symbol") else {
+            return false;
+        };
+        let Some(view) = column_view_or_err(batch, col_idx, err_out) else {
+            return false;
+        };
+        if !matches!(view, ColumnView::Symbol(_)) {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("column {col_idx} is not a SYMBOL column"),
+            );
+            return false;
+        }
+        let dict = batch.dict();
+        match dict.get(code) {
+            Some(s) => {
+                *out_buf = s.as_ptr() as *const c_char;
+                *out_len = s.len();
+                true
+            }
+            None => {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "symbol code {code} out of range (dictionary size {})",
+                        dict.len()
+                    ),
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Snapshot the connection-scoped symbol dictionary into `*out` for bulk
+/// (e.g. categorical) construction. Returns false and sets `*err_out` on a
+/// NULL handle or a NULL out-param.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_batch_symbol_dict(
+    batch: *const line_reader_batch,
+    out: *mut line_reader_symbol_dict,
+    err_out: *mut *mut line_reader_error,
+) -> bool {
+    unsafe {
+        if out.is_null() {
+            null_out_param_err(err_out, "line_reader_batch_symbol_dict");
+            return false;
+        }
+        let Some(batch) = batch_or_err(batch, err_out, "line_reader_batch_symbol_dict") else {
+            return false;
+        };
+        let dict = batch.dict();
+        let entries = dict.entries();
+        let heap = dict.arena();
+        *out = line_reader_symbol_dict {
+            entry_count: entries.len(),
+            heap: heap.as_ptr(),
+            heap_len: heap.len(),
+            entries: entries.as_ptr().cast::<line_reader_symbol_entry>(),
+        };
+        true
+    }
+}
+
+/// Build a `ColumnView` for `col_idx`, reporting an out-of-range index or a
+/// projection failure through `err_out`.
+unsafe fn column_view_or_err<'a>(
+    batch: &'a BatchView<'a>,
+    col_idx: size_t,
+    err_out: *mut *mut line_reader_error,
+) -> Option<ColumnView<'a>> {
+    if col_idx >= batch.column_count() {
         unsafe {
             set_reader_err(
                 err_out,
                 ErrorCode::InvalidApiCall,
                 format!(
-                    "row index {} out of range for column {} (row_count={})",
-                    row_idx, col_idx, row_count
+                    "column index {} out of range (column_count={})",
+                    col_idx,
+                    batch.column_count()
                 ),
             );
         }
-        return false;
+        return None;
     }
-    true
+    match batch.column(col_idx) {
+        Ok(view) => Some(view),
+        Err(e) => {
+            unsafe { write_err_box(err_out, e) };
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4589,8 +3512,6 @@ mod tests {
     #[test]
     fn cursor_pure_return_getters_tolerate_null_handle() {
         unsafe {
-            assert_eq!(line_reader_cursor_row_count(ptr::null()), 0);
-            assert_eq!(line_reader_cursor_column_count(ptr::null()), 0);
             assert_eq!(line_reader_cursor_request_id(ptr::null()), 0);
             assert_eq!(line_reader_cursor_credit_granted_total(ptr::null()), 0);
             assert_eq!(line_reader_cursor_failover_resets(ptr::null()), 0);
@@ -4612,25 +3533,6 @@ mod tests {
             line_reader_cursor_current_addr_host(ptr::null(), &mut buf, &mut len);
             assert!(buf.is_null());
             assert_eq!(len, 0);
-        }
-    }
-
-    /// `batch_*` getters return false and zero their out-param on a
-    /// NULL handle.
-    #[test]
-    fn cursor_batch_getters_null_handle_return_false_and_zero() {
-        unsafe {
-            let mut rid: i64 = 0x1234_5678_9ABC_DEF0;
-            assert!(!line_reader_cursor_batch_request_id(ptr::null(), &mut rid));
-            assert_eq!(rid, 0);
-
-            let mut seq: u64 = 0xABCD;
-            assert!(!line_reader_cursor_batch_seq(ptr::null(), &mut seq));
-            assert_eq!(seq, 0);
-
-            let mut flags: u8 = 0xFF;
-            assert!(!line_reader_cursor_batch_flags(ptr::null(), &mut flags));
-            assert_eq!(flags, 0);
         }
     }
 
@@ -4658,81 +3560,6 @@ mod tests {
             ));
             assert_eq!(op, 0);
             assert_eq!(rows, 0);
-        }
-    }
-
-    /// Getters that take `err_out` route NULL handle through the
-    /// standard `InvalidApiCall` error surface (mirroring
-    /// `line_reader_server_version`). Pin one representative —
-    /// `_get_i64`, because it funnels through `get_column_view` where
-    /// the central NULL guard lives.
-    #[test]
-    fn cursor_get_i64_null_handle_sets_err_out() {
-        unsafe {
-            let mut value: i64 = 0;
-            let mut is_null: bool = false;
-            let mut err: *mut line_reader_error = ptr::null_mut();
-            let ok =
-                line_reader_cursor_get_i64(ptr::null(), 0, 0, &mut value, &mut is_null, &mut err);
-            assert!(!ok);
-            assert!(!err.is_null(), "err_out must be set on NULL cursor");
-            let code = line_reader_error_get_code(err) as u32;
-            let want = line_reader_error_code::line_reader_error_invalid_api_call as u32;
-            assert_eq!(code, want);
-            line_reader_error_free(err);
-        }
-    }
-
-    /// Same shape but with `err_out == NULL` — the helper must not
-    /// SIGSEGV on the diagnostic write.
-    #[test]
-    fn cursor_get_i64_null_handle_with_null_err_out_does_not_segv() {
-        unsafe {
-            let mut value: i64 = 0;
-            let mut is_null: bool = false;
-            let ok = line_reader_cursor_get_i64(
-                ptr::null(),
-                0,
-                0,
-                &mut value,
-                &mut is_null,
-                ptr::null_mut(),
-            );
-            assert!(!ok);
-        }
-    }
-
-    /// `_column_kind` and `_column_name` both go through paths that
-    /// touch the cursor; pin the NULL contract on both.
-    #[test]
-    fn cursor_column_kind_and_name_null_handle_set_err_out() {
-        unsafe {
-            // column_kind
-            let mut kind = line_reader_column_kind::line_reader_column_kind_boolean;
-            let mut err: *mut line_reader_error = ptr::null_mut();
-            let ok = line_reader_cursor_column_kind(ptr::null(), 0, &mut kind, &mut err);
-            assert!(!ok);
-            assert!(!err.is_null());
-            assert_eq!(
-                line_reader_error_get_code(err) as u32,
-                line_reader_error_code::line_reader_error_invalid_api_call as u32,
-            );
-            line_reader_error_free(err);
-
-            // column_name
-            let mut name_buf: *const c_char = ptr::null();
-            let mut name_len: size_t = 0;
-            let mut err2: *mut line_reader_error = ptr::null_mut();
-            let ok2 = line_reader_cursor_column_name(
-                ptr::null(),
-                0,
-                &mut name_buf,
-                &mut name_len,
-                &mut err2,
-            );
-            assert!(!ok2);
-            assert!(!err2.is_null());
-            line_reader_error_free(err2);
         }
     }
 

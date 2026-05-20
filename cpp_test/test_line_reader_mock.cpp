@@ -42,6 +42,7 @@
 
 using namespace questdb::ingress::literals;
 namespace qm = qwp_mock;
+namespace eg = questdb::egress;
 
 namespace
 {
@@ -125,13 +126,15 @@ TEST_CASE("mock: column getter — i32 (Int) round-trip")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select v from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.row_count() == 3);
-    REQUIRE(cur.column_kind(0) == line_reader_column_kind_int);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 3);
+    REQUIRE(batch.column_kind(0) == line_reader_column_kind_int);
 
-    auto v0 = cur.get_i32(0, 0);
-    auto v1 = cur.get_i32(0, 1);
-    auto v2 = cur.get_i32(0, 2);
+    auto v0 = batch.column(0).get<int32_t>(0);
+    auto v1 = batch.column(0).get<int32_t>(1);
+    auto v2 = batch.column(0).get<int32_t>(2);
     REQUIRE(v0.has_value());
     REQUIRE(v1.has_value());
     REQUIRE(v2.has_value());
@@ -179,21 +182,23 @@ TEST_CASE("mock: column getter — i64 / f64 / bool / i8 / i16 / f32")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select * from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.row_count() == 2);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 2);
 
-    REQUIRE(cur.get_i64(0, 0).value_or(0) == -1);
-    REQUIRE(cur.get_i64(0, 1).value_or(0) == 9223372036854775807LL);
-    CHECK(cur.get_f64(1, 0).value_or(0) == doctest::Approx(1.5));
-    CHECK(cur.get_f64(1, 1).value_or(0) == doctest::Approx(-3.14));
-    CHECK(cur.get_bool(2, 0).value_or(true) == false);
-    CHECK(cur.get_bool(2, 1).value_or(false) == true);
-    CHECK(cur.get_i8(3, 0).value_or(0) == -7);
-    CHECK(cur.get_i8(3, 1).value_or(0) == 42);
-    CHECK(cur.get_i16(4, 0).value_or(0) == -1234);
-    CHECK(cur.get_i16(4, 1).value_or(0) == 31000);
-    CHECK(cur.get_f32(5, 0).value_or(0.0f) == doctest::Approx(1.25f));
-    CHECK(cur.get_f32(5, 1).value_or(0.0f) == doctest::Approx(-0.5f));
+    REQUIRE(batch.column(0).get<int64_t>(0).value_or(0) == -1);
+    REQUIRE(batch.column(0).get<int64_t>(1).value_or(0) == 9223372036854775807LL);
+    CHECK(batch.column(1).get<double>(0).value_or(0) == doctest::Approx(1.5));
+    CHECK(batch.column(1).get<double>(1).value_or(0) == doctest::Approx(-3.14));
+    CHECK(batch.column(2).get<bool>(0).value_or(true) == false);
+    CHECK(batch.column(2).get<bool>(1).value_or(false) == true);
+    CHECK(batch.column(3).get<int8_t>(0).value_or(0) == -7);
+    CHECK(batch.column(3).get<int8_t>(1).value_or(0) == 42);
+    CHECK(batch.column(4).get<int16_t>(0).value_or(0) == -1234);
+    CHECK(batch.column(4).get<int16_t>(1).value_or(0) == 31000);
+    CHECK(batch.column(5).get<float>(0).value_or(0.0f) == doctest::Approx(1.25f));
+    CHECK(batch.column(5).get<float>(1).value_or(0.0f) == doctest::Approx(-0.5f));
 }
 
 TEST_CASE("mock: column getter — varchar")
@@ -211,10 +216,12 @@ TEST_CASE("mock: column getter — varchar")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select s from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.row_count() == 2);
-    auto v0 = cur.get_varchar(0, 0);
-    auto v1 = cur.get_varchar(0, 1);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 2);
+    auto v0 = batch.column(0).varchar(0);
+    auto v1 = batch.column(0).varchar(1);
     REQUIRE(v0.has_value());
     REQUIRE(v1.has_value());
     CHECK(*v0 == "hi");
@@ -239,8 +246,10 @@ TEST_CASE("mock: column getter — uuid (16 raw bytes, big-endian on wire)")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select u from t"_utf8);
-    REQUIRE(cur.next_batch());
-    auto u = cur.get_uuid(0, 0);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto u = batch.column(0).get_uuid(0);
     REQUIRE(u.has_value());
     for (int i = 0; i < 16; ++i)
         CHECK((*u)[i] == uint8_t(0xA0 + i));
@@ -261,9 +270,11 @@ TEST_CASE("mock: column getter — decimal64 with non-zero scale")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select d from t"_utf8);
-    REQUIRE(cur.next_batch());
-    auto d0 = cur.get_decimal64(0, 0);
-    auto d1 = cur.get_decimal64(0, 1);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto d0 = batch.column(0).get_decimal64(0);
+    auto d1 = batch.column(0).get_decimal64(1);
     REQUIRE(d0.has_value());
     REQUIRE(d1.has_value());
     CHECK(d0->mantissa == 12345);
@@ -290,8 +301,10 @@ TEST_CASE("mock: column getter — decimal128 with negative i128 mantissa")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select d from t"_utf8);
-    REQUIRE(cur.next_batch());
-    auto d = cur.get_decimal128(0, 0);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto d = batch.column(0).get_decimal128(0);
     REQUIRE(d.has_value());
     CHECK(d->low == static_cast<uint64_t>(-1LL));
     CHECK(d->high == -1);
@@ -304,7 +317,7 @@ TEST_CASE("mock: column getter — decimal128 with negative i128 mantissa")
 // agree.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mock: column_validity bitmap matches null pattern from server")
+TEST_CASE("mock: column validity bitmap matches null pattern from server")
 {
     // 5 rows, rows 1 and 3 null, others have values 10/30/50.
     std::vector<bool> is_null = {false, true, false, true, false};
@@ -322,20 +335,23 @@ TEST_CASE("mock: column_validity bitmap matches null pattern from server")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select v from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.row_count() == 5);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 5);
 
-    auto vv = cur.column_validity(0);
-    REQUIRE_FALSE(vv.empty());
-    REQUIRE(vv.size >= 1);
+    auto col = batch.column(0);
+    const uint8_t* vbits = col.validity();
+    REQUIRE(vbits != nullptr);
+    REQUIRE(col.validity_bytes() >= 1);
     // Bit pattern: rows 1 and 3 set, others clear → low 5 bits = 0b01010 = 0x0A.
-    CHECK((vv.data[0] & 0x1F) == 0x0A);
+    CHECK((vbits[0] & 0x1F) == 0x0A);
 
-    CHECK(cur.get_i64(0, 0).value_or(-1) == 10);
-    CHECK_FALSE(cur.get_i64(0, 1).has_value());
-    CHECK(cur.get_i64(0, 2).value_or(-1) == 30);
-    CHECK_FALSE(cur.get_i64(0, 3).has_value());
-    CHECK(cur.get_i64(0, 4).value_or(-1) == 50);
+    CHECK(col.get<int64_t>(0).value_or(-1) == 10);
+    CHECK_FALSE(col.get<int64_t>(1).has_value());
+    CHECK(col.get<int64_t>(2).value_or(-1) == 30);
+    CHECK_FALSE(col.get<int64_t>(3).has_value());
+    CHECK(col.get<int64_t>(4).value_or(-1) == 50);
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,7 +1025,7 @@ TEST_CASE("mock: failover callback NOT invoked on the happy path")
 // DOUBLE_ARRAY / LONG_ARRAY getters (whole-row + per-element).
 // ---------------------------------------------------------------------------
 
-TEST_CASE("mock: get_double_array round-trips shape and elements")
+TEST_CASE("mock: column::shape + elements<double> round-trip")
 {
     using Row = qm::ArrayRow;
     Row r0{{3}, pack_le<double>({1.5, 2.5, 3.5})};
@@ -1027,38 +1043,38 @@ TEST_CASE("mock: get_double_array round-trips shape and elements")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select a"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.row_count() == 2);
-    REQUIRE(cur.column_kind(0) == line_reader_column_kind_double_array);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 2);
+    REQUIRE(batch.column_kind(0) == line_reader_column_kind_double_array);
 
-    auto v0 = cur.get_double_array(0, 0);
-    REQUIRE(v0.has_value());
-    REQUIRE(v0->ndim == 1);
-    REQUIRE(v0->shape[0] == 3);
-    REQUIRE(v0->element_count == 3);
-    // Element accessor returns one f64 by row+flat index.
-    auto e0 = cur.get_double_array_element(0, 0, 0);
-    auto e1 = cur.get_double_array_element(0, 0, 1);
-    auto e2 = cur.get_double_array_element(0, 0, 2);
-    REQUIRE(e0.has_value());
-    CHECK(*e0 == doctest::Approx(1.5));
-    REQUIRE(e1.has_value());
-    CHECK(*e1 == doctest::Approx(2.5));
-    REQUIRE(e2.has_value());
-    CHECK(*e2 == doctest::Approx(3.5));
+    auto col = batch.column(0);
+    REQUIRE(col.is_array());
 
-    auto v1 = cur.get_double_array(0, 1);
-    REQUIRE(v1.has_value());
-    REQUIRE(v1->ndim == 2);
-    REQUIRE(v1->shape[0] == 2);
-    REQUIRE(v1->shape[1] == 2);
-    REQUIRE(v1->element_count == 4);
-    auto e_2_2 = cur.get_double_array_element(0, 1, 3);
-    REQUIRE(e_2_2.has_value());
-    CHECK(*e_2_2 == doctest::Approx(40.0));
+    size_t rank0 = 0;
+    const uint32_t* shape0 = col.shape(0, &rank0);
+    REQUIRE(rank0 == 1);
+    REQUIRE(shape0[0] == 3);
+    size_t cnt0 = 0;
+    const double* el0 = col.elements<double>(0, &cnt0);
+    REQUIRE(cnt0 == 3);
+    CHECK(el0[0] == doctest::Approx(1.5));
+    CHECK(el0[1] == doctest::Approx(2.5));
+    CHECK(el0[2] == doctest::Approx(3.5));
+
+    size_t rank1 = 0;
+    const uint32_t* shape1 = col.shape(1, &rank1);
+    REQUIRE(rank1 == 2);
+    CHECK(shape1[0] == 2);
+    CHECK(shape1[1] == 2);
+    size_t cnt1 = 0;
+    const double* el1 = col.elements<double>(1, &cnt1);
+    REQUIRE(cnt1 == 4);
+    CHECK(el1[3] == doctest::Approx(40.0));
 }
 
-TEST_CASE("mock: get_long_array round-trips shape and elements")
+TEST_CASE("mock: LONG_ARRAY column rejected (not supported in this revision)")
 {
     using Row = qm::ArrayRow;
     Row r0{{2}, pack_le<int64_t>({-1, 9223372036854775000LL})};
@@ -1075,26 +1091,18 @@ TEST_CASE("mock: get_long_array round-trips shape and elements")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select a"_utf8);
-    REQUIRE(cur.next_batch());
-    auto v = cur.get_long_array(0, 0);
-    REQUIRE(v.has_value());
-    REQUIRE(v->ndim == 1);
-    REQUIRE(v->element_count == 2);
-    auto e0 = cur.get_long_array_element(0, 0, 0);
-    auto e1 = cur.get_long_array_element(0, 0, 1);
-    REQUIRE(e0.has_value());
-    CHECK(*e0 == -1);
-    REQUIRE(e1.has_value());
-    CHECK(*e1 == 9223372036854775000LL);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    CHECK_THROWS_AS(
+        (void)batch.column(0), questdb::egress::line_reader_error);
 }
 
-TEST_CASE("mock: non-null empty-data array row exposes data == NULL")
+TEST_CASE("mock: non-null empty-data array row exposes data_offsets symmetry")
 {
-    // Shape [2, 0, 3] is legitimate: non-null row, zero elements, zero
-    // bytes of `data`. Without the pointer-symmetry guard, the FFI used
-    // to expose Rust's `(&[]).as_ptr()` dangling sentinel as a
-    // non-null `data` pointer to C consumers, breaking defensive checks
-    // like `if (view.data) memcpy(...)`. Pin the contract here.
+    // Shape [2, 0, 3]: non-null row, zero elements. The per-row byte slice
+    // is empty (data_offsets[r+1] - data_offsets[r] == 0). Pin the
+    // contract: the row is reported non-null but yields zero elements.
     using Row = qm::ArrayRow;
     Row r0{{2, 0, 3}, {}};                  // non-null, zero bytes of data
     auto body = qm::array_column_bytes({r0});
@@ -1110,19 +1118,23 @@ TEST_CASE("mock: non-null empty-data array row exposes data == NULL")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select a"_utf8);
-    REQUIRE(cur.next_batch());
-    auto v = cur.get_double_array(0, 0);
-    REQUIRE(v.has_value());                 // not a NULL row
-    CHECK(v->ndim == 3);
-    CHECK(v->shape[0] == 2);
-    CHECK(v->shape[1] == 0);
-    CHECK(v->shape[2] == 3);
-    CHECK(v->element_count == 0);
-    CHECK(v->data_len == 0);
-    CHECK(v->data == nullptr);              // M-3 contract: empty ⇒ NULL
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto col = batch.column(0);
+    CHECK_FALSE(col.is_null(0));            // non-null
+    size_t rank = 0;
+    const uint32_t* shape = col.shape(0, &rank);
+    REQUIRE(rank == 3);
+    CHECK(shape[0] == 2);
+    CHECK(shape[1] == 0);
+    CHECK(shape[2] == 3);
+    size_t cnt = 0;
+    (void)col.elements<double>(0, &cnt);
+    CHECK(cnt == 0);
 }
 
-TEST_CASE("mock: get_double_array surfaces NULL row via std::nullopt")
+TEST_CASE("mock: NULL array row surfaces via is_null")
 {
     using Row = qm::ArrayRow;
     Row r0{{1}, pack_le<double>({7.0})};
@@ -1139,15 +1151,17 @@ TEST_CASE("mock: get_double_array surfaces NULL row via std::nullopt")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select a"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.row_count() == 2);
-    auto v0 = cur.get_double_array(0, 0);
-    auto v1 = cur.get_double_array(0, 1);
-    REQUIRE(v0.has_value());
-    CHECK(v0->element_count == 1);
-    CHECK_FALSE(v1.has_value());
-    // Per-element getter on the null row also returns nullopt.
-    CHECK_FALSE(cur.get_double_array_element(0, 1, 0).has_value());
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 2);
+    auto col = batch.column(0);
+    CHECK_FALSE(col.is_null(0));
+    CHECK(col.is_null(1));
+    size_t cnt = 0;
+    const double* el = col.elements<double>(0, &cnt);
+    REQUIRE(cnt == 1);
+    CHECK(el[0] == doctest::Approx(7.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,9 +1183,11 @@ TEST_CASE("mock: get_char round-trip (u16 codepoint)")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select c"_utf8);
-    REQUIRE(cur.next_batch());
-    auto v0 = cur.get_char(0, 0);
-    auto v1 = cur.get_char(0, 1);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto v0 = batch.column(0).get<uint16_t>(0);
+    auto v1 = batch.column(0).get<uint16_t>(1);
     REQUIRE(v0.has_value());
     CHECK(*v0 == uint16_t(u'A'));
     REQUIRE(v1.has_value());
@@ -1194,8 +1210,10 @@ TEST_CASE("mock: get_long256 round-trip (32 raw bytes)")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select l"_utf8);
-    REQUIRE(cur.next_batch());
-    auto v = cur.get_long256(0, 0);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto v = batch.column(0).get_long256(0);
     REQUIRE(v.has_value());
     for (int i = 0; i < 32; ++i)
         CHECK((*v)[i] == uint8_t(i + 1));
@@ -1216,9 +1234,11 @@ TEST_CASE("mock: get_binary round-trip (zero-copy bytes)")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select b"_utf8);
-    REQUIRE(cur.next_batch());
-    auto v0 = cur.get_binary(0, 0);
-    auto v1 = cur.get_binary(0, 1);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto v0 = batch.column(0).binary(0);
+    auto v1 = batch.column(0).binary(1);
     REQUIRE(v0.has_value());
     REQUIRE(v0->size == 3);
     CHECK(v0->data[0] == 0x00);
@@ -1246,8 +1266,10 @@ TEST_CASE("mock: get_decimal256 round-trip (32-byte mantissa + scale)")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select d"_utf8);
-    REQUIRE(cur.next_batch());
-    auto v = cur.get_decimal256(0, 0);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto v = batch.column(0).get_decimal256(0);
     REQUIRE(v.has_value());
     CHECK(v->scale == 4);
     for (int i = 0; i < 32; ++i)
@@ -1271,9 +1293,11 @@ TEST_CASE("mock: get_geohash round-trip (precision_bits + bits)")
     qm::MockServer srv({s});
     auto reader = connect_to(srv);
     auto cur = reader.execute("select g"_utf8);
-    REQUIRE(cur.next_batch());
-    auto v0 = cur.get_geohash(0, 0);
-    auto v1 = cur.get_geohash(0, 1);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    auto v0 = batch.column(0).get_geohash(0);
+    auto v1 = batch.column(0).get_geohash(1);
     REQUIRE(v0.has_value());
     CHECK(v0->precision_bits == 8);
     CHECK(v0->value == 0xAB);
@@ -1317,17 +1341,15 @@ TEST_CASE("mock: stats and cursor introspection getters return live values")
     (void)r0; (void)d0;
 
     auto cur = reader.prepare("select v"_utf8).initial_credit(1024).execute();
-    REQUIRE(cur.next_batch());
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
 
-    // request_id is non-zero and matches batch_request_id of the batch.
+    // request_id is non-zero and matches the batch's request_id.
     const int64_t rid = cur.request_id();
     CHECK(rid != 0);
-    auto bri = cur.batch_request_id();
-    REQUIRE(bri.has_value());
-    CHECK(*bri == rid);
-    auto bseq = cur.batch_seq();
-    REQUIRE(bseq.has_value());
-    CHECK(*bseq == 0);
+    CHECK(batch.request_id() == rid);
+    CHECK(batch.seq() == 0);
 
     // Cursor's current_addr_* mirror the reader (single endpoint).
     CHECK(cur.current_host() == reader_host);
@@ -1725,10 +1747,12 @@ TEST_CASE("mock: column_name returns the schema's column name")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select * from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.column_count() == 2);
-    CHECK(cur.column_name(0) == "my_long");
-    CHECK(cur.column_name(1) == "another_col");
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_count() == 2);
+    CHECK(batch.column_name(0) == "my_long");
+    CHECK(batch.column_name(1) == "another_col");
     CHECK_FALSE(cur.next_batch());
 }
 
@@ -1750,14 +1774,16 @@ TEST_CASE("mock: column_name fails cleanly on out-of-range index")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select v from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.column_count() == 1);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_count() == 1);
 
     bool threw = false;
     questdb::egress::error_code code{};
     try
     {
-        (void)cur.column_name(99);
+        (void)batch.column_name(99);
     }
     catch (const questdb::egress::line_reader_error& e)
     {
@@ -1793,12 +1819,14 @@ TEST_CASE("mock: get_ipv4 round-trips high-bit IPs without sign-flipping")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select ip from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.column_kind(0) == line_reader_column_kind_ipv4);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_kind(0) == line_reader_column_kind_ipv4);
 
-    auto v0 = cur.get_ipv4(0, 0);
-    auto v1 = cur.get_ipv4(0, 1);
-    auto v2 = cur.get_ipv4(0, 2);
+    auto v0 = batch.column(0).get<uint32_t>(0);
+    auto v1 = batch.column(0).get<uint32_t>(1);
+    auto v2 = batch.column(0).get<uint32_t>(2);
     REQUIRE(v0.has_value());
     REQUIRE(v1.has_value());
     REQUIRE(v2.has_value());
@@ -1826,14 +1854,16 @@ TEST_CASE("mock: get_i32 rejects an IPV4 column with a type-mismatch error")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select ip from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.column_kind(0) == line_reader_column_kind_ipv4);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_kind(0) == line_reader_column_kind_ipv4);
 
     bool threw = false;
     questdb::egress::error_code code{};
     try
     {
-        (void)cur.get_i32(0, 0);
+        (void)batch.column(0).get<int32_t>(0);
     }
     catch (const questdb::egress::line_reader_error& e)
     {
@@ -1862,13 +1892,15 @@ TEST_CASE("mock: get_ipv4 rejects an INT column with a type-mismatch error")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select n from t"_utf8);
-    REQUIRE(cur.next_batch());
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
 
     bool threw = false;
     questdb::egress::error_code code{};
     try
     {
-        (void)cur.get_ipv4(0, 0);
+        (void)batch.column(0).get<uint32_t>(0);
     }
     catch (const questdb::egress::line_reader_error& e)
     {
@@ -1888,10 +1920,11 @@ TEST_CASE("mock: get_ipv4 rejects an INT column with a type-mismatch error")
 // would still be InvalidUtf8 (first-error-wins).
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Wrong-column-type rejection: each typed getter must reject a column
-// whose kind doesn't match. Drive this from a single INT column and call
-// every other getter once. Each must throw `invalid_api_call`. This pins
-// the type-mismatch branch in every `_cursor_get_*` (egress.rs:1367+).
+// Wrong-column-type rejection: each typed column accessor must reject a
+// column whose kind doesn't match. Drive this from a single INT column
+// and call every other accessor once. Each must throw `invalid_api_call`.
+// This pins the kind-whitelist + ensure_kind throws on `column::get<T>` /
+// `column::varchar` / `column::symbol` / etc.
 // ---------------------------------------------------------------------------
 TEST_CASE("mock: typed getters reject mismatched column kind")
 {
@@ -1908,7 +1941,9 @@ TEST_CASE("mock: typed getters reject mismatched column kind")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select n from t"_utf8);
-    REQUIRE(cur.next_batch());
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
 
     auto expect_throws = [&](auto&& fn) {
         bool threw = false;
@@ -1926,25 +1961,26 @@ TEST_CASE("mock: typed getters reject mismatched column kind")
         CHECK(code == line_reader_error_invalid_api_call);
     };
 
-    SUBCASE("get_bool")        { expect_throws([&]{ (void)cur.get_bool(0, 0); }); }
-    SUBCASE("get_i8")          { expect_throws([&]{ (void)cur.get_i8(0, 0); }); }
-    SUBCASE("get_i16")         { expect_throws([&]{ (void)cur.get_i16(0, 0); }); }
-    SUBCASE("get_i64")         { expect_throws([&]{ (void)cur.get_i64(0, 0); }); }
-    SUBCASE("get_f32")         { expect_throws([&]{ (void)cur.get_f32(0, 0); }); }
-    SUBCASE("get_f64")         { expect_throws([&]{ (void)cur.get_f64(0, 0); }); }
-    SUBCASE("get_char")        { expect_throws([&]{ (void)cur.get_char(0, 0); }); }
-    SUBCASE("get_uuid")        { expect_throws([&]{ (void)cur.get_uuid(0, 0); }); }
-    SUBCASE("get_long256")     { expect_throws([&]{ (void)cur.get_long256(0, 0); }); }
-    SUBCASE("get_varchar")     { expect_throws([&]{ (void)cur.get_varchar(0, 0); }); }
-    SUBCASE("get_binary")      { expect_throws([&]{ (void)cur.get_binary(0, 0); }); }
-    SUBCASE("get_symbol")      { expect_throws([&]{ (void)cur.get_symbol(0, 0); }); }
-    SUBCASE("get_decimal64")   { expect_throws([&]{ (void)cur.get_decimal64(0, 0); }); }
-    SUBCASE("get_decimal128")  { expect_throws([&]{ (void)cur.get_decimal128(0, 0); }); }
-    SUBCASE("get_decimal256")  { expect_throws([&]{ (void)cur.get_decimal256(0, 0); }); }
-    SUBCASE("get_geohash")     { expect_throws([&]{ (void)cur.get_geohash(0, 0); }); }
-    SUBCASE("get_double_array"){ expect_throws([&]{ (void)cur.get_double_array(0, 0); }); }
-    SUBCASE("get_long_array")  { expect_throws([&]{ (void)cur.get_long_array(0, 0); }); }
-    SUBCASE("get_ipv4")        { expect_throws([&]{ (void)cur.get_ipv4(0, 0); }); }
+    SUBCASE("get_bool")        { expect_throws([&]{ (void)batch.column(0).get<bool>(0); }); }
+    SUBCASE("get_i8")          { expect_throws([&]{ (void)batch.column(0).get<int8_t>(0); }); }
+    SUBCASE("get_i16")         { expect_throws([&]{ (void)batch.column(0).get<int16_t>(0); }); }
+    SUBCASE("get_i64")         { expect_throws([&]{ (void)batch.column(0).get<int64_t>(0); }); }
+    SUBCASE("get_f32")         { expect_throws([&]{ (void)batch.column(0).get<float>(0); }); }
+    SUBCASE("get_f64")         { expect_throws([&]{ (void)batch.column(0).get<double>(0); }); }
+    SUBCASE("get_char")        { expect_throws([&]{ (void)batch.column(0).get<uint16_t>(0); }); }
+    SUBCASE("get_uuid")        { expect_throws([&]{ (void)batch.column(0).get_uuid(0); }); }
+    SUBCASE("get_long256")     { expect_throws([&]{ (void)batch.column(0).get_long256(0); }); }
+    SUBCASE("get_varchar")     { expect_throws([&]{ (void)batch.column(0).varchar(0); }); }
+    SUBCASE("get_binary")      { expect_throws([&]{ (void)batch.column(0).binary(0); }); }
+    SUBCASE("get_symbol")      { expect_throws([&]{ (void)batch.column(0).symbol(0); }); }
+    SUBCASE("get_decimal64")   { expect_throws([&]{ (void)batch.column(0).get_decimal64(0); }); }
+    SUBCASE("get_decimal128")  { expect_throws([&]{ (void)batch.column(0).get_decimal128(0); }); }
+    SUBCASE("get_decimal256")  { expect_throws([&]{ (void)batch.column(0).get_decimal256(0); }); }
+    SUBCASE("get_geohash")     { expect_throws([&]{ (void)batch.column(0).get_geohash(0); }); }
+    SUBCASE("array shape on scalar col") {
+        expect_throws([&]{ size_t r=0; (void)batch.column(0).shape(0, &r); });
+    }
+    SUBCASE("get_ipv4")        { expect_throws([&]{ (void)batch.column(0).get<uint32_t>(0); }); }
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,9 +2001,11 @@ TEST_CASE("mock: column accessors reject out-of-range indices")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select n from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.column_count() == 1);
-    REQUIRE(cur.row_count() == 2);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_count() == 1);
+    REQUIRE(batch.row_count() == 2);
 
     auto expect_invalid_api = [](auto&& fn) {
         bool threw = false;
@@ -1987,19 +2025,19 @@ TEST_CASE("mock: column accessors reject out-of-range indices")
 
     SUBCASE("column_kind out-of-range column")
     {
-        expect_invalid_api([&]{ (void)cur.column_kind(99); });
+        expect_invalid_api([&]{ (void)batch.column_kind(99); });
     }
     SUBCASE("column_name out-of-range column")
     {
-        expect_invalid_api([&]{ (void)cur.column_name(99); });
+        expect_invalid_api([&]{ (void)batch.column_name(99); });
     }
     SUBCASE("get_i32 out-of-range column")
     {
-        expect_invalid_api([&]{ (void)cur.get_i32(99, 0); });
+        expect_invalid_api([&]{ (void)batch.column(99).get<int32_t>(0); });
     }
     SUBCASE("get_i32 out-of-range row")
     {
-        expect_invalid_api([&]{ (void)cur.get_i32(0, 99); });
+        expect_invalid_api([&]{ (void)batch.column(0).get<int32_t>(99); });
     }
 }
 
@@ -2038,15 +2076,17 @@ TEST_CASE("mock: get_i64 round-trips TIMESTAMP / DATE / TIMESTAMP_NANOS")
 
     auto reader = connect_to(srv);
     auto cur = reader.execute("select ts, d, tn from t"_utf8);
-    REQUIRE(cur.next_batch());
-    REQUIRE(cur.column_count() == 3);
-    CHECK(cur.column_kind(0) == line_reader_column_kind_timestamp);
-    CHECK(cur.column_kind(1) == line_reader_column_kind_date);
-    CHECK(cur.column_kind(2) == line_reader_column_kind_timestamp_nanos);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_count() == 3);
+    CHECK(batch.column_kind(0) == line_reader_column_kind_timestamp);
+    CHECK(batch.column_kind(1) == line_reader_column_kind_date);
+    CHECK(batch.column_kind(2) == line_reader_column_kind_timestamp_nanos);
 
-    auto v0 = cur.get_i64(0, 0);
-    auto v1 = cur.get_i64(1, 0);
-    auto v2 = cur.get_i64(2, 0);
+    auto v0 = batch.column(0).get<int64_t>(0);
+    auto v1 = batch.column(1).get<int64_t>(0);
+    auto v2 = batch.column(2).get<int64_t>(0);
     REQUIRE(v0.has_value());
     REQUIRE(v1.has_value());
     REQUIRE(v2.has_value());
@@ -2089,10 +2129,14 @@ TEST_CASE(
     questdb::egress::error_code code{};
     try
     {
-        // Either next_batch() (upstream frame-level check) or
-        // get_double_array (FFI per-row check) must throw.
-        if (cur.next_batch())
-            (void)cur.get_double_array(0, 0);
+        // Either next_batch() (upstream frame-level check) or column()
+        // (per-row decoder) must throw the protocol error.
+        if (auto bo = cur.next_batch())
+        {
+            auto col = bo->column(0);
+            size_t cnt = 0;
+            (void)col.elements<double>(0, &cnt);
+        }
     }
     catch (const questdb::egress::line_reader_error& e)
     {
@@ -2129,8 +2173,10 @@ TEST_CASE("mock: C++ wrapper move semantics — reader / cursor")
         // r1 is now empty; using its destructor must be a no-op.
         // r2 still owns the impl and must work normally.
         auto cur = r2.execute("select v from t"_utf8);
-        REQUIRE(cur.next_batch());
-        auto v = cur.get_i32(0, 0);
+        auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+        auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 1);
     }
@@ -2140,8 +2186,9 @@ TEST_CASE("mock: C++ wrapper move semantics — reader / cursor")
         auto r = connect_to(srv);
         auto cur1 = r.execute("select v from t"_utf8);
         auto cur2 = std::move(cur1);
-        REQUIRE(cur2.next_batch());
-        auto v = cur2.get_i32(0, 0);
+        auto bo = cur2.next_batch();
+        REQUIRE(bo);
+        auto v = bo->column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 1);
     }
@@ -2350,8 +2397,10 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         r = connect_to(srv2);  // move-assign — must close srv1's socket
         // The new reader works against srv2.
         auto cur = r.execute("select v from t"_utf8);
-        REQUIRE(cur.next_batch());
-        auto v = cur.get_i32(0, 0);
+        auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+        auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
     }
@@ -2381,8 +2430,10 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         q2.bind_i32(7);
         q1 = std::move(q2);  // move-assign — frees q1's old impl
         auto cur = q1.execute();
-        REQUIRE(cur.next_batch());
-        auto v = cur.get_i32(0, 0);
+        auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+        auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
     }
@@ -2409,8 +2460,10 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         q_a = std::move(q_b);        // assign into empty — must not crash
         q_a.bind_i32(7);
         auto cur = q_a.execute();
-        REQUIRE(cur.next_batch());
-        auto v = cur.get_i32(0, 0);
+        auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+        auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
     }
@@ -2443,8 +2496,10 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
         // observable).
         while (cur.next_batch()) {}
         cur = r2.execute("select v from t"_utf8);  // move-assign
-        REQUIRE(cur.next_batch());
-        auto v = cur.get_i32(0, 0);
+        auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+        auto v = batch.column(0).get<int32_t>(0);
         REQUIRE(v.has_value());
         CHECK(*v == 7);
     }
@@ -3412,16 +3467,771 @@ TEST_CASE("mock: progress callback noexcept trampoline swallows user exceptions"
     CHECK(cur.failover_resets() == 1);
 }
 
+// Batch / column bulk descriptor — cross-check the new columnar API
+// (`cursor::next_batch()` + `batch::column()` / `column::values<T>()`) against
+// the per-cell `cursor::get_*` path on the same emitted batch.
+
+TEST_CASE("mock: batch::column<int32_t> dense values match get_i32 per cell")
+{
+    qm::ColumnSpec c{
+        "v", qm::COL_INT,
+        qm::fixed_column_bytes(4, pack_le<int32_t>({-1, 0, 42, 2147483647}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid)
+                            { return qm::result_batch_frame(rid, 0, 1, 4, {c}); }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select v from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 4);
+    REQUIRE(batch.column_count() == 1);
+    REQUIRE(batch.column_kind(0) == eg::column_kind::int_);
+    CHECK(batch.column_name(0) == "v");
+
+    auto col = batch.column(0);
+    REQUIRE(col.kind() == eg::column_kind::int_);
+    REQUIRE(col.row_count() == 4);
+    REQUIRE(col.value_stride() == sizeof(int32_t));
+    REQUIRE_FALSE(col.has_nulls());
+
+    const int32_t* values = col.values<int32_t>();
+    REQUIRE(values != nullptr);
+    for (size_t r = 0; r < 4; ++r)
+        CHECK(values[r] == batch.column(0).get<int32_t>(r).value());
+}
+
+TEST_CASE("mock: batch::column<varchar> offsets/data match get_varchar per cell")
+{
+    std::string a = "alpha";
+    std::string bb = "beta-beta";
+    std::string c = "g\xC3\xA4mma"; // UTF-8 "gämma"
+    std::vector<uint8_t> body;
+    body.push_back(0x00); // no validity
+    std::vector<uint32_t> offsets{
+        0u,
+        static_cast<uint32_t>(a.size()),
+        static_cast<uint32_t>(a.size() + bb.size()),
+        static_cast<uint32_t>(a.size() + bb.size() + c.size())};
+    for (auto o : offsets)
+    {
+        for (int i = 0; i < 4; ++i)
+            body.push_back(static_cast<uint8_t>(o >> (i * 8)));
+    }
+    for (char ch : a) body.push_back(static_cast<uint8_t>(ch));
+    for (char ch : bb) body.push_back(static_cast<uint8_t>(ch));
+    for (char ch : c) body.push_back(static_cast<uint8_t>(ch));
+
+    qm::ColumnSpec col_spec{"s", qm::COL_VARCHAR, std::move(body)};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{
+            [col_spec](int64_t rid)
+            { return qm::result_batch_frame(rid, 0, 1, 3, {col_spec}); }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select s from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+
+    auto col = batch_opt->column(0);
+    REQUIRE(col.kind() == eg::column_kind::varchar);
+    REQUIRE(col.values_raw() == nullptr);
+    REQUIRE(col.value_stride() == 0);
+    REQUIRE(col.var_offsets() != nullptr);
+    REQUIRE(col.var_data() != nullptr);
+
+    for (size_t r = 0; r < 3; ++r)
+    {
+        auto via_bulk = col.varchar(r);
+        REQUIRE(via_bulk.has_value());
+    }
+    CHECK(col.varchar(0).value() == "alpha");
+    CHECK(col.varchar(1).value() == "beta-beta");
+    CHECK(col.varchar(2).value() == "g\xC3\xA4mma");
+}
+
+TEST_CASE("mock: batch::column INT validity bitmap matches is_null per cell")
+{
+    // BOOLEAN/BYTE/SHORT/CHAR cannot carry NULL on the wire (spec §11.5);
+    // INT can, so use it to exercise the validity-bitmap path. 4 rows,
+    // rows 1 and 3 NULL.
+    qm::ColumnSpec c{
+        "v", qm::COL_INT,
+        qm::fixed_column_bytes_nullable(
+            /*row_count=*/4,
+            /*is_null=*/std::vector<bool>{false, true, false, true},
+            /*packed_non_null=*/pack_le<int32_t>({100, 300}),
+            /*elem_size=*/sizeof(int32_t))};
+
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid)
+                            { return qm::result_batch_frame(rid, 0, 1, 4, {c}); }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select v from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+
+    auto col = batch_opt->column(0);
+    REQUIRE(col.kind() == eg::column_kind::int_);
+    REQUIRE(col.has_nulls());
+    REQUIRE(col.validity_bytes() == 1);
+    CHECK_FALSE(col.is_null(0));
+    CHECK(col.is_null(1));
+    CHECK_FALSE(col.is_null(2));
+    CHECK(col.is_null(3));
+
+    for (size_t r = 0; r < 4; ++r)
+        CHECK(col.is_null(r) == !col.get<int32_t>(r).has_value());
+    const int32_t* values = col.values<int32_t>();
+    CHECK(values[0] == 100);
+    CHECK(values[2] == 300);
+}
+
+TEST_CASE("mock: batch::column — every fixed-width scalar kind round-trip")
+{
+    // One batch carrying every fixed-width kind the mock can emit, each
+    // column 2 rows non-null. Cross-checks the bulk descriptor's dense
+    // dense values against the per-cell `column::get<T>` over the same batch.
+    using qm::ColumnSpec;
+    using qm::fixed_column_bytes;
+
+    const std::array<uint8_t, 16> u0{{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                       0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                                       0x0F, 0x10}};
+    const std::array<uint8_t, 16> u1{{0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9,
+                                       0xF8, 0xF7, 0xF6, 0xF5, 0xF4, 0xF3, 0xF2,
+                                       0xF1, 0xF0}};
+    std::vector<uint8_t> uuid_bytes;
+    uuid_bytes.insert(uuid_bytes.end(), u0.begin(), u0.end());
+    uuid_bytes.insert(uuid_bytes.end(), u1.begin(), u1.end());
+
+    std::vector<uint8_t> long256_bytes(64, 0);
+    for (size_t i = 0; i < 32; ++i) long256_bytes[i] = static_cast<uint8_t>(i);
+    for (size_t i = 0; i < 32; ++i) long256_bytes[32 + i] = static_cast<uint8_t>(0x80 + i);
+
+    // BOOLEAN: validity (1B: none) + bit-packed values (2 rows -> 1 byte).
+    std::vector<uint8_t> bool_body{0x00, 0b00000010}; // row0=false, row1=true
+    ColumnSpec c_bool{"b", qm::COL_BOOLEAN, std::move(bool_body)};
+    ColumnSpec c_byte{"by", qm::COL_BYTE,
+                      fixed_column_bytes(2, pack_le<int8_t>({-1, 42}))};
+    ColumnSpec c_short{"sh", qm::COL_SHORT,
+                       fixed_column_bytes(2, pack_le<int16_t>({-1234, 31000}))};
+    ColumnSpec c_char{"ch", qm::COL_CHAR,
+                      fixed_column_bytes(2, pack_le<uint16_t>({'A', 0x4E2D}))};
+    ColumnSpec c_int{"i", qm::COL_INT,
+                     fixed_column_bytes(2, pack_le<int32_t>({-7, 2147483647}))};
+    ColumnSpec c_ipv4{"ip", qm::COL_IPV4,
+                      fixed_column_bytes(2, pack_le<uint32_t>({0x7F000001u, 0xC0A80101u}))};
+    ColumnSpec c_long{"l", qm::COL_LONG,
+                      fixed_column_bytes(2, pack_le<int64_t>({-1, 9223372036854775807LL}))};
+    ColumnSpec c_f32{"f", qm::COL_FLOAT,
+                     fixed_column_bytes(2, pack_le<float>({1.25f, -0.5f}))};
+    ColumnSpec c_f64{"d", qm::COL_DOUBLE,
+                     fixed_column_bytes(2, pack_le<double>({1.5, -3.14}))};
+    ColumnSpec c_ts{"ts", qm::COL_TIMESTAMP,
+                    fixed_column_bytes(2, pack_le<int64_t>({1700000000000000LL, 1800000000000000LL}))};
+    ColumnSpec c_date{"dt", qm::COL_DATE,
+                      fixed_column_bytes(2, pack_le<int64_t>({0, 86400000LL}))};
+    ColumnSpec c_tsn{"tn", qm::COL_TIMESTAMP_NANOS,
+                     fixed_column_bytes(2, pack_le<int64_t>({1, 999999999LL}))};
+    ColumnSpec c_uuid{"u", qm::COL_UUID, fixed_column_bytes(2, uuid_bytes)};
+    ColumnSpec c_l256{"l256", qm::COL_LONG256,
+                      fixed_column_bytes(2, long256_bytes)};
+
+    std::vector<ColumnSpec> cols{c_bool, c_byte, c_short, c_char, c_int,
+                                  c_ipv4, c_long, c_f32, c_f64, c_ts,
+                                  c_date, c_tsn, c_uuid, c_l256};
+
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[cols](int64_t rid)
+                            {
+                                return qm::result_batch_frame(
+                                    rid, 0, 1, 2, cols);
+                            }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select * from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.row_count() == 2);
+    REQUIRE(batch.column_count() == cols.size());
+
+    // boolean — densified to 1 byte/row (0 = false, 1 = true).
+    {
+        auto col = batch.column(0);
+        REQUIRE(col.kind() == eg::column_kind::boolean);
+        REQUIRE(col.value_stride() == 1);
+        const auto* v = static_cast<const uint8_t*>(col.values_raw());
+        CHECK(v[0] == 0);
+        CHECK(v[1] == 1);
+    }
+    // byte
+    {
+        auto col = batch.column(1);
+        CHECK(col.kind() == eg::column_kind::byte);
+        CHECK(col.value_stride() == 1);
+        const auto* v = col.values<int8_t>();
+        CHECK(v[0] == -1);
+        CHECK(v[1] == 42);
+    }
+    // short
+    {
+        auto col = batch.column(2);
+        CHECK(col.value_stride() == 2);
+        const auto* v = col.values<int16_t>();
+        CHECK(v[0] == -1234);
+        CHECK(v[1] == 31000);
+    }
+    // char (UTF-16 code unit)
+    {
+        auto col = batch.column(3);
+        CHECK(col.kind() == eg::column_kind::char_);
+        const auto* v = col.values<uint16_t>();
+        CHECK(v[0] == 'A');
+        CHECK(v[1] == 0x4E2D);
+    }
+    // int
+    {
+        auto col = batch.column(4);
+        const auto* v = col.values<int32_t>();
+        CHECK(v[0] == -7);
+        CHECK(v[1] == 2147483647);
+    }
+    // ipv4
+    {
+        auto col = batch.column(5);
+        CHECK(col.kind() == eg::column_kind::ipv4);
+        const auto* v = col.values<uint32_t>();
+        CHECK(v[0] == 0x7F000001u);
+        CHECK(v[1] == 0xC0A80101u);
+    }
+    // long
+    {
+        auto col = batch.column(6);
+        const auto* v = col.values<int64_t>();
+        CHECK(v[0] == -1);
+        CHECK(v[1] == 9223372036854775807LL);
+    }
+    // float
+    {
+        auto col = batch.column(7);
+        const auto* v = col.values<float>();
+        CHECK(v[0] == doctest::Approx(1.25f));
+        CHECK(v[1] == doctest::Approx(-0.5f));
+    }
+    // double
+    {
+        auto col = batch.column(8);
+        const auto* v = col.values<double>();
+        CHECK(v[0] == doctest::Approx(1.5));
+        CHECK(v[1] == doctest::Approx(-3.14));
+    }
+    // timestamp / date / timestamp_nanos — all i64 LE, distinct kind tags.
+    {
+        auto col = batch.column(9);
+        CHECK(col.kind() == eg::column_kind::timestamp);
+        CHECK(col.values<int64_t>()[0] == 1700000000000000LL);
+    }
+    {
+        auto col = batch.column(10);
+        CHECK(col.kind() == eg::column_kind::date);
+        CHECK(col.values<int64_t>()[1] == 86400000LL);
+    }
+    {
+        auto col = batch.column(11);
+        CHECK(col.kind() == eg::column_kind::timestamp_nanos);
+        CHECK(col.values<int64_t>()[1] == 999999999LL);
+    }
+    // uuid — 16-byte stride, raw bytes match per-cell.
+    {
+        auto col = batch.column(12);
+        CHECK(col.value_stride() == 16);
+        const auto* base = static_cast<const uint8_t*>(col.values_raw());
+        const auto per_cell = batch.column(12).get_uuid(0);
+        REQUIRE(per_cell.has_value());
+        CHECK(std::memcmp(base, per_cell->data(), 16) == 0);
+    }
+    // long256 — 32-byte stride.
+    {
+        auto col = batch.column(13);
+        CHECK(col.value_stride() == 32);
+        const auto* base = static_cast<const uint8_t*>(col.values_raw());
+        const auto per_cell = batch.column(13).get_long256(1);
+        REQUIRE(per_cell.has_value());
+        CHECK(std::memcmp(base + 32, per_cell->data(), 32) == 0);
+    }
+}
+
+TEST_CASE("mock: batch::column — binary + decimal64/128/256 + geohash bulk vs per-cell")
+{
+    qm::ColumnSpec c_bin{
+        "bin", qm::COL_BINARY,
+        qm::varlen_column_bytes({{0xDE, 0xAD, 0xBE, 0xEF}, {0x00, 0x01, 0x02}})};
+
+    qm::ColumnSpec c_dec64{
+        "d64", qm::COL_DECIMAL64,
+        qm::decimal64_column_bytes({12345, -67890}, /*scale=*/3)};
+
+    // DECIMAL128 is the 16-byte two's-complement little-endian mantissa.
+    std::array<uint8_t, 16> dec128_a{};
+    dec128_a[0] = 0x39; dec128_a[1] = 0x30; // 12345 LE
+    std::array<uint8_t, 16> dec128_b{};
+    for (auto& b : dec128_b) b = 0xFF; // -1 LE
+    qm::ColumnSpec c_dec128{
+        "d128", qm::COL_DECIMAL128,
+        qm::decimal128_column_bytes({dec128_a, dec128_b}, /*scale=*/0)};
+
+    std::array<uint8_t, 32> dec256_a{};
+    dec256_a[0] = 0x39; dec256_a[1] = 0x30;
+    std::array<uint8_t, 32> dec256_b{};
+    dec256_b[0] = 0x01;
+    qm::ColumnSpec c_dec256{
+        "d256", qm::COL_DECIMAL256,
+        qm::decimal256_column_bytes({dec256_a, dec256_b}, /*scale=*/2)};
+
+    qm::ColumnSpec c_geo{
+        "g", qm::COL_GEOHASH,
+        qm::geohash_column_bytes(
+            std::vector<bool>{false, false},
+            std::vector<uint8_t>{0xAB, 0xCD},
+            /*precision_bits=*/8)};
+
+    qm::Script script = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{
+            [c_bin, c_dec64, c_dec128, c_dec256, c_geo](int64_t rid)
+            {
+                return qm::result_batch_frame(
+                    rid, 0, 1, 2,
+                    {c_bin, c_dec64, c_dec128, c_dec256, c_geo});
+            }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({script});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select * from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_count() == 5);
+
+    // binary
+    {
+        auto col = batch.column(0);
+        REQUIRE(col.kind() == eg::column_kind::binary);
+        const auto via_bulk = col.binary(0);
+        const auto via_cell = batch.column(0).binary(0);
+        REQUIRE(via_bulk.has_value());
+        REQUIRE(via_cell.has_value());
+        REQUIRE(via_bulk->size == via_cell->size);
+        CHECK(std::memcmp(via_bulk->data, via_cell->data, via_bulk->size) == 0);
+    }
+    // decimal64 — strict overload required: DECIMAL64 is i64-stride but
+    // semantically a scaled mantissa, so the whitelist rejects values<i64>().
+    {
+        auto col = batch.column(1);
+        REQUIRE(col.kind() == eg::column_kind::decimal64);
+        CHECK(col.value_stride() == 8);
+        CHECK(col.decimal_scale() == 3);
+        const auto* v = col.values<int64_t>(eg::column_kind::decimal64);
+        CHECK(v[0] == 12345);
+        CHECK(v[1] == -67890);
+    }
+    // decimal128
+    {
+        auto col = batch.column(2);
+        REQUIRE(col.kind() == eg::column_kind::decimal128);
+        CHECK(col.value_stride() == 16);
+        CHECK(col.decimal_scale() == 0);
+        const auto* base = static_cast<const uint8_t*>(col.values_raw());
+        CHECK(std::memcmp(base, dec128_a.data(), 16) == 0);
+        CHECK(std::memcmp(base + 16, dec128_b.data(), 16) == 0);
+    }
+    // decimal256
+    {
+        auto col = batch.column(3);
+        REQUIRE(col.kind() == eg::column_kind::decimal256);
+        CHECK(col.value_stride() == 32);
+        CHECK(col.decimal_scale() == 2);
+        const auto* base = static_cast<const uint8_t*>(col.values_raw());
+        CHECK(std::memcmp(base, dec256_a.data(), 32) == 0);
+        CHECK(std::memcmp(base + 32, dec256_b.data(), 32) == 0);
+    }
+    // geohash
+    {
+        auto col = batch.column(4);
+        REQUIRE(col.kind() == eg::column_kind::geohash);
+        CHECK(col.geohash_precision_bits() == 8);
+        CHECK(col.value_stride() == 1);
+        const auto* v = static_cast<const uint8_t*>(col.values_raw());
+        CHECK(v[0] == 0xAB);
+        CHECK(v[1] == 0xCD);
+    }
+}
+
+TEST_CASE("mock: batch::column — DOUBLE_ARRAY round-trip")
+{
+    // Row 0: 1-D [1.5, 2.5, 3.5]. Row 1: NULL array. Row 2: non-null empty
+    // (rank 1, shape[0] == 0).
+    std::vector<uint8_t> d_bytes;
+    for (double v : {1.5, 2.5, 3.5})
+    {
+        uint8_t buf[8];
+        std::memcpy(buf, &v, 8);
+        d_bytes.insert(d_bytes.end(), buf, buf + 8);
+    }
+    qm::ArrayRow row0{{3}, std::move(d_bytes)};
+    qm::ArrayRow row2{{0}, {}};
+    auto d_body = qm::array_column_bytes(
+        {std::optional<qm::ArrayRow>{std::move(row0)},
+         std::nullopt,
+         std::optional<qm::ArrayRow>{std::move(row2)}});
+    qm::ColumnSpec c_da{"da", qm::COL_DOUBLE_ARRAY, std::move(d_body)};
+
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{
+            [c_da](int64_t rid)
+            {
+                return qm::result_batch_frame(rid, 0, 1, 3, {c_da});
+            }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select * from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+
+    auto da = batch.column(0);
+    REQUIRE(da.is_array());
+    REQUIRE(da.kind() == eg::column_kind::double_array);
+    REQUIRE(da.row_count() == 3);
+    REQUIRE(da.has_nulls());
+    // Scalar accessors on an array column raise.
+    CHECK_THROWS_AS(da.values<double>(), eg::line_reader_error);
+    CHECK_FALSE(da.is_null(0));
+    CHECK(da.is_null(1));
+    CHECK_FALSE(da.is_null(2));
+
+    size_t da_rank = 0;
+    const uint32_t* da_shape = da.shape(0, &da_rank);
+    REQUIRE(da_rank == 1);
+    CHECK(da_shape[0] == 3);
+
+    size_t da_count = 0;
+    const double* da_elems = da.elements<double>(0, &da_count);
+    REQUIRE(da_count == 3);
+    CHECK(da_elems[0] == doctest::Approx(1.5));
+    CHECK(da_elems[1] == doctest::Approx(2.5));
+    CHECK(da_elems[2] == doctest::Approx(3.5));
+
+    // Empty non-null row: rank 1, shape[0] == 0, no elements.
+    size_t da2_rank = 0;
+    const uint32_t* da2_shape = da.shape(2, &da2_rank);
+    REQUIRE(da2_rank == 1);
+    CHECK(da2_shape[0] == 0);
+    size_t da2_count = 0;
+    (void)da.elements<double>(2, &da2_count);
+    CHECK(da2_count == 0);
+}
+
+TEST_CASE("mock: batch::symbol — column codes + dictionary bulk round-trip")
+{
+    qm::ColumnSpec c_sym{
+        "s", qm::COL_SYMBOL,
+        qm::symbol_column_bytes({0u, 1u, 2u, 1u})};
+
+    qm::Script script = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{
+            [c_sym](int64_t rid)
+            {
+                return qm::result_batch_frame_with_dict(
+                    rid, 0, 1, 4, {c_sym},
+                    /*delta_start=*/0,
+                    {"alpha", "beta", "gamma"});
+            }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({script});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select s from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+
+    // Bulk dict snapshot — the Cython categorical-categories path.
+    auto dict = batch.symbol_dict();
+    REQUIRE(dict.valid());
+    REQUIRE(dict.entry_count() == 3);
+    CHECK(dict[0] == "alpha");
+    CHECK(dict[1] == "beta");
+    CHECK(dict[2] == "gamma");
+    CHECK_THROWS_AS(dict[3], eg::line_reader_error);
+
+    auto col = batch.column(0);
+    REQUIRE(col.kind() == eg::column_kind::symbol);
+    REQUIRE(col.value_stride() == 0);
+    REQUIRE(col.values_raw() == nullptr);
+    const uint32_t* codes = col.symbol_codes();
+    REQUIRE(codes != nullptr);
+    CHECK(codes[0] == 0);
+    CHECK(codes[1] == 1);
+    CHECK(codes[2] == 2);
+    CHECK(codes[3] == 1);
+
+    // Per-row resolution via column.
+    CHECK(col.symbol(0).value() == "alpha");
+    CHECK(col.symbol(1).value() == "beta");
+    CHECK(col.symbol(2).value() == "gamma");
+    CHECK(col.symbol(3).value() == "beta");
+
+    // Per-cell getter equivalence on every row.
+    for (size_t r = 0; r < 4; ++r)
+    {
+        const auto via_bulk = col.symbol(r);
+        const auto via_cell = batch.column(0).symbol(r);
+        REQUIRE(via_bulk.has_value());
+        REQUIRE(via_cell.has_value());
+        CHECK(*via_bulk == *via_cell);
+    }
+
+    // Per-code resolution via batch (no col_idx dispatch on dict side).
+    CHECK(batch.symbol(0, 0) == "alpha");
+    CHECK(batch.symbol(0, 2) == "gamma");
+}
+
+TEST_CASE("mock: array accessors on a scalar column raise")
+{
+    qm::ColumnSpec c{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({7}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid)
+                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select v from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+
+    auto col = batch_opt->column(0);
+    REQUIRE_FALSE(col.is_array());
+    size_t dummy = 0;
+    CHECK_THROWS_AS(col.shape(0, &dummy), eg::line_reader_error);
+    CHECK_THROWS_AS(col.elements<double>(0, &dummy), eg::line_reader_error);
+}
+
+namespace
+{
+template <class... Fs> struct overload : Fs...
+{
+    using Fs::operator()...;
+};
+template <class... Fs> overload(Fs...) -> overload<Fs...>;
+} // namespace
+
+TEST_CASE(
+    "mock: column::visit dispatches to the matching typed view per kind")
+{
+    // One batch covering one representative column per view family. visit
+    // returns a stable discriminator string identifying which view branch
+    // ran — equality vs the expected per-column tag pins the dispatch.
+    using qm::ColumnSpec;
+    using qm::fixed_column_bytes;
+
+    std::vector<uint8_t> uuid_bytes(16, 0);
+    for (size_t i = 0; i < 16; ++i)
+        uuid_bytes[i] = static_cast<uint8_t>(i + 1);
+
+    ColumnSpec c_bool{
+        "b", qm::COL_BOOLEAN, std::vector<uint8_t>{0x00, 0b00000001}};
+    ColumnSpec c_int{
+        "i", qm::COL_INT, fixed_column_bytes(1, pack_le<int32_t>({42}))};
+    ColumnSpec c_long{
+        "l", qm::COL_LONG, fixed_column_bytes(1, pack_le<int64_t>({-1}))};
+    ColumnSpec c_double{
+        "d", qm::COL_DOUBLE, fixed_column_bytes(1, pack_le<double>({3.5}))};
+    ColumnSpec c_dec64{
+        "d64", qm::COL_DECIMAL64,
+        qm::decimal64_column_bytes({12345}, /*scale=*/3)};
+    ColumnSpec c_uuid{"u", qm::COL_UUID, fixed_column_bytes(1, uuid_bytes)};
+    ColumnSpec c_geo{
+        "g", qm::COL_GEOHASH,
+        qm::geohash_column_bytes(
+            std::vector<bool>{false},
+            std::vector<uint8_t>{0xAB},
+            /*precision_bits=*/8)};
+    ColumnSpec c_varchar{
+        "s", qm::COL_VARCHAR, qm::varlen_column_bytes({{'h', 'i'}})};
+    ColumnSpec c_sym{
+        "sym", qm::COL_SYMBOL, qm::symbol_column_bytes({0u})};
+
+    qm::Script script = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{
+            [=](int64_t rid) {
+                return qm::result_batch_frame_with_dict(
+                    rid, 0, 1, 1,
+                    {c_bool, c_int, c_long, c_double, c_dec64, c_uuid, c_geo,
+                     c_varchar, c_sym},
+                    /*delta_start=*/0,
+                    {"alpha"});
+            }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({script});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select * from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+    auto& batch = *batch_opt;
+    REQUIRE(batch.column_count() == 9);
+
+    auto tag_of = [](const eg::column& col) -> std::string {
+        return col.visit(overload{
+            [](eg::fixed_view<uint8_t>)  { return std::string{"bool"}; },
+            [](eg::fixed_view<int8_t>)   { return std::string{"byte"}; },
+            [](eg::fixed_view<int16_t>)  { return std::string{"short"}; },
+            [](eg::fixed_view<uint16_t>) { return std::string{"char"}; },
+            [](eg::fixed_view<int32_t>)  { return std::string{"i32"}; },
+            [](eg::fixed_view<uint32_t>) { return std::string{"ipv4"}; },
+            [](eg::fixed_view<int64_t>)  { return std::string{"i64"}; },
+            [](eg::fixed_view<float>)    { return std::string{"f32"}; },
+            [](eg::fixed_view<double>)   { return std::string{"f64"}; },
+            [](eg::decimal_view)         { return std::string{"decimal"}; },
+            [](eg::bytes_view)           { return std::string{"bytes"}; },
+            [](eg::geohash_view)         { return std::string{"geohash"}; },
+            [](eg::varlen_view)          { return std::string{"varlen"}; },
+            [](eg::symbol_view)          { return std::string{"symbol"}; },
+            [](eg::array_view<double>)   { return std::string{"darray"}; },
+        });
+    };
+
+    CHECK(tag_of(batch.column(0)) == "bool");
+    CHECK(tag_of(batch.column(1)) == "i32");
+    CHECK(tag_of(batch.column(2)) == "i64");
+    CHECK(tag_of(batch.column(3)) == "f64");
+    CHECK(tag_of(batch.column(4)) == "decimal");
+    CHECK(tag_of(batch.column(5)) == "bytes");
+    CHECK(tag_of(batch.column(6)) == "geohash");
+    CHECK(tag_of(batch.column(7)) == "varlen");
+    CHECK(tag_of(batch.column(8)) == "symbol");
+
+    // Sanity: the dispatched view actually yields the right value.
+    batch.column(1).visit(overload{
+        [](eg::fixed_view<int32_t> v) {
+            REQUIRE(v.row_count == 1);
+            REQUIRE_FALSE(v.is_null(0));
+            CHECK(v.values[0] == 42);
+        },
+        [](auto&&) {
+            FAIL("INT column did not dispatch to fixed_view<int32_t>");
+        },
+    });
+    batch.column(4).visit(overload{
+        [](eg::decimal_view v) {
+            CHECK(v.kind == eg::column_kind::decimal64);
+            CHECK(v.value_stride == 8);
+            CHECK(v.scale == 3);
+        },
+        [](auto&&) {
+            FAIL("DECIMAL64 column did not dispatch to decimal_view");
+        },
+    });
+    batch.column(8).visit(overload{
+        [](eg::symbol_view v) {
+            const auto x = v.resolve(0);
+            REQUIRE(x);
+            CHECK(*x == "alpha");
+        },
+        [](auto&&) { FAIL("SYMBOL column did not dispatch to symbol_view"); },
+    });
+}
+
+TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
+{
+    std::vector<uint8_t> d_bytes;
+    for (double v : {1.5, 2.5, 3.5})
+    {
+        uint8_t buf[8];
+        std::memcpy(buf, &v, 8);
+        d_bytes.insert(d_bytes.end(), buf, buf + 8);
+    }
+    qm::ArrayRow row0{{3}, std::move(d_bytes)};
+    auto body = qm::array_column_bytes(
+        {std::optional<qm::ArrayRow>{std::move(row0)}});
+    qm::ColumnSpec c_da{"da", qm::COL_DOUBLE_ARRAY, std::move(body)};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c_da](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 1, {c_da});
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select * from t"_utf8);
+    auto batch_opt = cur.next_batch();
+    REQUIRE(batch_opt);
+
+    batch_opt->column(0).visit(overload{
+        [](eg::array_view<double> v) {
+            REQUIRE(v.row_count == 1);
+            const auto e = v.elements(0);
+            REQUIRE(e);
+            REQUIRE(e->second == 3);
+            CHECK(e->first[0] == doctest::Approx(1.5));
+            CHECK(e->first[1] == doctest::Approx(2.5));
+            CHECK(e->first[2] == doctest::Approx(3.5));
+            const auto sh = v.shape(0);
+            REQUIRE(sh);
+            REQUIRE(sh->second == 1);
+            CHECK(sh->first[0] == 3);
+        },
+        [](auto&&) {
+            FAIL("DOUBLE_ARRAY did not dispatch to array_view<double>");
+        },
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Coverage gaps documented but not yet asserted in this suite — left as
 // breadcrumbs for the next contributor:
 //
-//  - SYMBOL column round-trip via `get_symbol`. The wrong-type rejection
-//    is covered (typed getters reject mismatched column kind), but the
-//    happy path requires symbol-dictionary support in the mock (the
-//    upstream wire format encodes dict updates inline within batches —
-//    see `questdb-rs/src/egress/symbol_dict.rs`). Adding it is a
-//    discrete piece of mock work.
 //  - `tls_error`: needs a real TLS terminator in front of the mock.
 //  - `unsupported_server`: the mock pins QWP version 2; triggering the
 //    upstream version-rejection path needs a higher-version SERVER_INFO.

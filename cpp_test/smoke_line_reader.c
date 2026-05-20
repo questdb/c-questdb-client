@@ -15,8 +15,9 @@
  *
  *  2. Lifecycle phase (gated on `QDB_LIVE_BROKER_ADDR`). When the env
  *     var is set, drives `_from_conf` → `_query_new` → `_query_execute`
- *     → `_cursor_next_batch` → `_cursor_column_kind` → `_cursor_get_i64`
- *     → `_cursor_free` → `_close` against a real broker. The whole
+ *     → `_cursor_next_batch` → `_batch_column_data` →
+ *     `line_reader_column_data_get_i64` → `_cursor_free` → `_close`
+ *     against a real broker. The whole
  *     point of the C ABI is Cython-consumability; the C++ doctest
  *     suite covers these symbols but doesn't prove they link or
  *     argument-marshal correctly under a plain C compiler. This
@@ -30,6 +31,7 @@
  */
 
 #include <questdb/egress/line_reader.h>
+#include <questdb/egress/line_reader_helpers.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,17 +138,18 @@ static int live_lifecycle_phase(const char* addr)
         goto fail;
 
     /*
-     * Drain. `select 1` is a SELECT, so we expect RESULT_END (rc==0)
+     * Drain. `select 1` is a SELECT, so we expect RESULT_END
      * after consuming the single one-row batch. Verify that we see
      * exactly that row with the expected value, exercising
-     * `_cursor_row_count`, `_cursor_column_count`, `_cursor_column_kind`,
-     * and `_cursor_get_i64` — the four most-used per-row accessors.
+     * `_batch_row_count`, `_batch_column_count`, `_batch_column_data`,
+     * and `line_reader_column_data_get_i64` — the four most-used
+     * per-row accessors on the bulk path.
      */
     int batch_count = 0;
     long long captured_value = 0;
     int captured_is_null = -1;
-    int next_rc;
-    while ((next_rc = line_reader_cursor_next_batch(cursor, &err)) == 1)
+    const line_reader_batch* batch;
+    while ((batch = line_reader_cursor_next_batch(cursor, &err)) != NULL)
     {
         ++batch_count;
         if (batch_count > 16)
@@ -158,8 +161,8 @@ static int live_lifecycle_phase(const char* addr)
             goto fail;
         }
 
-        size_t rows = line_reader_cursor_row_count(cursor);
-        size_t cols = line_reader_cursor_column_count(cursor);
+        const size_t rows = line_reader_batch_row_count(batch);
+        const size_t cols = line_reader_batch_column_count(batch);
         if (cols == 0)
         {
             fprintf(
@@ -168,22 +171,22 @@ static int live_lifecycle_phase(const char* addr)
             goto fail;
         }
 
-        line_reader_column_kind kind;
-        if (!line_reader_cursor_column_kind(cursor, 0, &kind, &err))
+        line_reader_column_data d;
+        if (!line_reader_batch_column_data(batch, 0, &d, &err))
             goto fail;
         /*
          * QuestDB returns `select 1` as a LONG (i64). Accept INT too
          * in case a future server emits it as INT — we just need the
-         * column-kind accessor to give us a usable discriminator.
+         * column-kind discriminant to give us a usable type.
          */
-        if (kind != line_reader_column_kind_long &&
-            kind != line_reader_column_kind_int)
+        if (d.kind != line_reader_column_kind_long &&
+            d.kind != line_reader_column_kind_int)
         {
             fprintf(
                 stderr,
                 "smoke live: `select 1` column[0] kind=0x%02X is not "
                 "LONG or INT\n",
-                (unsigned)kind);
+                (unsigned)d.kind);
             goto fail;
         }
 
@@ -191,25 +194,15 @@ static int live_lifecycle_phase(const char* addr)
         {
             bool is_null = false;
             int64_t v = 0;
-            if (kind == line_reader_column_kind_long)
-            {
-                if (!line_reader_cursor_get_i64(
-                        cursor, 0, r, &v, &is_null, &err))
-                    goto fail;
-            }
+            if (d.kind == line_reader_column_kind_long)
+                v = line_reader_column_data_get_i64(&d, r, &is_null);
             else
-            {
-                int32_t v32 = 0;
-                if (!line_reader_cursor_get_i32(
-                        cursor, 0, r, &v32, &is_null, &err))
-                    goto fail;
-                v = (int64_t)v32;
-            }
+                v = (int64_t)line_reader_column_data_get_i32(&d, r, &is_null);
             captured_value = (long long)v;
             captured_is_null = is_null ? 1 : 0;
         }
     }
-    if (next_rc < 0)
+    if (err)
         goto fail;
 
     if (batch_count == 0)

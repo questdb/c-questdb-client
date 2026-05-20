@@ -2194,6 +2194,12 @@ impl<'c> BatchView<'c> {
     pub fn column(&self, idx: usize) -> Result<ColumnView<'_>> {
         self.decoded.column_view(idx, self.dict)
     }
+
+    /// Connection-scoped symbol dictionary backing every SYMBOL column
+    /// in this batch; a `SymbolColumn`'s codes index into it.
+    pub fn dict(&self) -> &'c SymbolDict {
+        self.dict
+    }
 }
 
 /// Predicate for the failover trigger filter. Mirrors the Java

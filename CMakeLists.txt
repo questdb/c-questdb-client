@@ -274,6 +274,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_reader_cpp_example_with_binds
         examples/line_reader_cpp_example_with_binds.cpp)
+    compile_example(
+        line_reader_cpp_example_columns
+        examples/line_reader_cpp_example_columns.cpp)
+    compile_example(
+        line_reader_c_example_columns
+        examples/line_reader_c_example_columns.c)
 
     # Include Rust tests as part of the tests run
     add_test(

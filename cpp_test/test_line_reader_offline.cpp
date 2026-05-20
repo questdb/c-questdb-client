@@ -113,10 +113,10 @@ TEST_CASE("error accessors are NULL-safe (M-13)")
 //      a SIGSEGV here rather than returning the documented sentinel.
 //
 // Functions in the third bucket — "NULL is UB" (cursor / query lifecycle
-// ops, every `line_reader_cursor_get_*`, the bind family) — are NOT
-// exercised here. Their guard, when present, is `process::abort()`, which
-// can't be observed from a doctest TEST_CASE without subprocess isolation.
-// The C header explicitly forbids NULL on those entry points.
+// ops, the bind family) — are NOT exercised here. Their guard, when
+// present, is `process::abort()`, which can't be observed from a doctest
+// TEST_CASE without subprocess isolation. The C header explicitly
+// forbids NULL on those entry points.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
