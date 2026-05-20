@@ -51,17 +51,18 @@ fn main() -> Result<()> {
             .column_f64("amount", 0.00044)?
             .at(TimestampNanos::now())?;
 
-        // On flush failure, the buffer is retained so the next
-        // iteration retries the same payload. must_close() reports
-        // whether the sender has latched into a terminal state and
-        // must be dropped and recreated (e.g. auth failure, reconnect
-        // budget exhausted).
+        // For QWP/WebSocket, a successful flush publishes the batch
+        // to the local replay queue or Store-and-Forward storage.
+        // Delivery, ACKs, reconnect, and replay happen asynchronously.
+        // If flush returns an error, the buffer is still intact; do
+        // not append more rows until you have retried, cleared, or
+        // dropped it.
         if let Err(e) = sender.flush(&mut buffer) {
             eprintln!("flush error: {e}");
             if sender.must_close() {
                 eprintln!("sender is terminal; aborting");
-                return Err(e);
             }
+            return Err(e);
         }
 
         thread::sleep(Duration::from_secs(1));
