@@ -324,7 +324,8 @@ impl WsTransport {
 
     /// Like [`Self::read_frame`] but maps a TCP-level read timeout
     /// (`io::ErrorKind::WouldBlock` / `TimedOut`) to `Ok(None)` instead
-    /// of a `SocketError`. Used by the async reader's I/O thread, which
+    /// of a `SocketError`. Used by the pipelined reader's I/O thread
+    /// (a dedicated OS thread, **not** Rust `async`/`.await`), which
     /// sets a short [`set_read_timeout`] tick so it can poll its
     /// cancel/shutdown atomics between reads without conflating "no
     /// frame yet" with "connection died" (the latter would be

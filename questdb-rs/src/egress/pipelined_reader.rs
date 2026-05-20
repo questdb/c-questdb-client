@@ -290,8 +290,12 @@ pub type SymbolDictRef = Arc<SymbolDict>;
 /// One owned batch — the user-thread analogue of [`crate::egress::BatchView`].
 ///
 /// Holds the decoded column buffers (`bytes::Bytes` refcounted slices
-/// into the WS recv buffer of the I/O thread), a snapshot of the
-/// schema, and a snapshot of the symbol dict. Self-contained:
+/// into the per-frame payload that the I/O thread's
+/// `WsClient::read_binary_frame` split off the recv buffer via
+/// `split_to(..).freeze()` — independently owned, so a retained batch
+/// pins only its own frame's allocation, not the whole recv buffer),
+/// a snapshot of the schema, and a snapshot of the symbol dict.
+/// Self-contained:
 /// projecting columns does not require holding the PipelinedReader /
 /// PipelinedCursor borrow, so the user can keep an OwnedBatch alive
 /// across other `take_event` calls if their workflow needs to compare
