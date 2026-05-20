@@ -1513,6 +1513,16 @@ public:
      * (e.g. `values<int64_t>()` on a DECIMAL64 column, or `values<int32_t>()`
      * on an IPV4 column). Use the strict overload `values<T>(kind)` to
      * bypass when you know what you're doing.
+     *
+     * **Alignment:** the returned pointer is NOT guaranteed to be aligned
+     * to `alignof(T)`. Densified column slices may borrow from the wire
+     * payload starting at an offset that doesn't satisfy `T`'s alignment
+     * (e.g. an INT column whose data begins right after a validity
+     * bitmap of odd byte length). Dereferencing the pointer as
+     * `base[row]` or forming a `const T&` from it is undefined behaviour.
+     * For per-row access use `get<T>(row)` (already alignment-safe). For
+     * bulk access read via `std::memcpy` or unaligned-load intrinsics
+     * (`_mm_loadu_si128`, `vld1q_u32`, ...).
      */
     template <typename T>
     const T* values() const
@@ -1539,7 +1549,8 @@ public:
     /**
      * Strict overload: caller asserts an exact `required` kind, bypassing
      * the whitelist. For deliberate reinterpretation (e.g. reading a
-     * DECIMAL64's raw mantissa as `int64_t`).
+     * DECIMAL64's raw mantissa as `int64_t`). Same alignment caveat as
+     * the whitelist overload: returned pointer may not be `alignof(T)`.
      */
     template <typename T>
     const T* values(egress::column_kind required) const
