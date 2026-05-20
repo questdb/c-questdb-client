@@ -42,8 +42,7 @@ use libc::{c_char, c_void, size_t};
 use questdb::egress::{
     BatchView, ColumnKind, ColumnView, Cursor, Error, ErrorCode, FailoverEvent, FailoverPhase,
     FailoverProgressEvent, Reader, ReaderQuery, ReaderStats, ServerInfo, ServerRole,
-    SimpleNullKind, SymbolEntry, Terminal,
-    Validity,
+    SimpleNullKind, SymbolEntry, Terminal, Validity,
 };
 
 use crate::line_sender_utf8;
@@ -3217,10 +3216,7 @@ pub unsafe extern "C" fn line_reader_batch_column_data(
                 set_reader_err(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!(
-                        "column {col_idx} has unsupported kind {:?}",
-                        view.kind()
-                    ),
+                    format!("column {col_idx} has unsupported kind {:?}", view.kind()),
                 );
                 return false;
             }
