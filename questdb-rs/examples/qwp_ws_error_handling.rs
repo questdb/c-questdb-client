@@ -38,17 +38,17 @@ fn polling_style() -> Result<()> {
         .at(TimestampNanos::now())?;
     let published_fsn = sender.flush_and_get_fsn(&mut buffer)?;
 
-    let wait_error = if let Some(fsn) = published_fsn {
+    let wait_result = if let Some(fsn) = published_fsn {
         match sender.await_acked_fsn(fsn, Duration::from_secs(5)) {
-            Ok(true) => None,
+            Ok(true) => Ok(()),
             Ok(false) => {
                 eprintln!("timed out waiting for QWP/WebSocket frame {fsn} to complete");
-                None
+                Ok(())
             }
-            Err(err) => Some(err),
+            Err(err) => Err(err),
         }
     } else {
-        None
+        Ok(())
     };
 
     // Drain server-side diagnostics observed for completed frames.
@@ -64,12 +64,8 @@ fn polling_style() -> Result<()> {
         eprintln!("note: {dropped} diagnostic(s) were dropped from the log");
     }
 
-    if let Some(err) = wait_error {
-        return Err(err);
-    }
-
     sender.close_drain()?;
-    Ok(())
+    wait_result
 }
 
 fn callback_style() -> Result<()> {
