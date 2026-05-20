@@ -25,6 +25,7 @@ use questdb::{
     Result,
     ingress::{Sender, SenderBuilder, TimestampNanos},
 };
+use std::time::Duration;
 
 fn polling_style() -> Result<()> {
     let mut sender = Sender::from_conf("ws::addr=localhost:9000;")?;
@@ -35,9 +36,22 @@ fn polling_style() -> Result<()> {
         .symbol("symbol", "ETH-USD")?
         .column_f64("price", 2615.54)?
         .at(TimestampNanos::now())?;
-    sender.flush(&mut buffer)?;
+    let published_fsn = sender.flush_and_get_fsn(&mut buffer)?;
 
-    // Drain server-side diagnostics queued since the previous poll.
+    let wait_error = if let Some(fsn) = published_fsn {
+        match sender.await_acked_fsn(fsn, Duration::from_secs(5)) {
+            Ok(true) => None,
+            Ok(false) => {
+                eprintln!("timed out waiting for QWP/WebSocket frame {fsn} to complete");
+                None
+            }
+            Err(err) => Some(err),
+        }
+    } else {
+        None
+    };
+
+    // Drain server-side diagnostics observed for completed frames.
     while let Some(err) = sender.poll_qwp_ws_error()? {
         eprintln!(
             "qwp error (poll): category={:?} policy={:?} fsn=[{}..={}] msg={:?}",
@@ -48,6 +62,10 @@ fn polling_style() -> Result<()> {
     let dropped = sender.qwp_ws_errors_dropped()?;
     if dropped > 0 {
         eprintln!("note: {dropped} diagnostic(s) were dropped from the log");
+    }
+
+    if let Some(err) = wait_error {
+        return Err(err);
     }
 
     sender.close_drain()?;
