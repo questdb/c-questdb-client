@@ -26,7 +26,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "9000".to_string());
     let conf = format!("ws::addr={host}:{port};");
 
-    let mut sender = Sender::from_conf(conf.as_str())?;
+    let mut sender = Sender::from_conf(&conf)?;
     let mut buffer = sender.new_buffer();
 
     buffer
