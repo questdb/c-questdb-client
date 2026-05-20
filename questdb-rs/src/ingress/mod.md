@@ -38,6 +38,9 @@ fn main() -> Result<()> {
 }
 ```
 
+For more depth — failover, store-and-forward, durable ACKs, troubleshooting —
+see the [Rust client documentation](https://questdb.com/docs/connect/clients/rust/).
+
 # Configuration String
 
 A sender is configured with a single string:
@@ -58,7 +61,7 @@ ws::addr=node-a:9000,node-b:9000;sf_dir=/var/lib/myapp/qdb-sf;sender_id=ingest-1
 
 For the full key reference (TLS, auth, failover, store-and-forward,
 durable ACK, progress modes), see the
-[connect-string reference](https://questdb.io/docs/connect/clients/connect-string/)
+[connect-string reference](https://questdb.com/docs/connect/clients/connect-string/)
 on the QuestDB documentation site. [`SenderBuilder`] exposes the same
 options programmatically.
 
@@ -134,7 +137,7 @@ frame, `Halt` latches the sender into a permanently-unusable state
 ([`must_close()`](Sender::must_close) returns `true`). See
 [`QwpWsSenderError`] for the diagnostic fields and
 [`QwpWsErrorCategory`] for the categorisation. The
-[QuestDB documentation site](https://questdb.io/docs/connect/clients/c-and-cpp/#asynchronous-error-handling)
+[QuestDB documentation site](https://questdb.com/docs/connect/clients/rust/#asynchronous-error-handling)
 has the full protocol-level error model.
 
 # Completion Tracking, Progress Modes, Failover, Durability
@@ -169,9 +172,9 @@ QuestDB documentation; the Rust API entry points are summarised here.
   Enterprise with primary replication) so `acked_fsn` advances only
   after durable upload to object storage.
 
-See [QuestDB high-availability docs](https://questdb.io/docs/high-availability/overview/)
+See [QuestDB high-availability docs](https://questdb.com/docs/high-availability/overview/)
 for the full failover/SF/durable-ACK story and
-[delivery semantics](https://questdb.io/docs/concepts/delivery-semantics/)
+[delivery semantics](https://questdb.com/docs/concepts/delivery-semantics/)
 for the at-least-once/exactly-once model.
 
 # Authentication
@@ -199,7 +202,7 @@ let _s = Sender::from_conf(
 **Not supported by this client:** OIDC token acquisition / in-band
 refresh, mutual TLS (client certificates), token rotation mid-session.
 QuestDB itself supports OIDC server-side — see
-[OpenID Connect](https://questdb.io/docs/security/oidc/); acquire a
+[OpenID Connect](https://questdb.com/docs/security/oidc/); acquire a
 token out-of-band from your IdP, pass it via `token=...`, and rebuild
 the sender when it nears expiry. mTLS is not negotiated by the
 QuestDB server regardless of client.
@@ -382,7 +385,7 @@ For QWP/WebSocket, drain
 via
 [`qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler)) to see
 structured server diagnostics. The
-[server log](https://questdb.io/docs/troubleshooting/log/) carries
+[server log](https://questdb.com/docs/troubleshooting/log/) carries
 additional context.
 
 To inspect the bytes of an ILP buffer before sending, call

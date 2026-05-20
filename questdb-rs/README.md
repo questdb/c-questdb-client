@@ -12,7 +12,7 @@ failover, optional on-disk durability, and a structured error model.
 Legacy InfluxDB Line Protocol (ILP) transports — over HTTP or TCP — remain
 supported for backwards compatibility but are not recommended for new code.
 
-* [QuestDB Database docs](https://questdb.io/docs/)
+* [QuestDB Database docs](https://questdb.com/docs/)
 * [`ingress` module docs](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/) —
   protocol details, configuration parameters, and patterns.
 
@@ -95,11 +95,16 @@ explicitly in the configuration string.
 
 ## Docs
 
-The main client documentation is on the
+This crate's API reference is on the
 [`ingress`](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/) module
 page: configuration keys, the QWP error model, FSN-based completion,
 progress modes, multi-host failover, store-and-forward, authentication,
 TLS, the `Buffer` API, and the legacy ILP transports.
+
+For the full Rust client guide — failover, store-and-forward operations,
+migration from ILP, worked examples — see the
+[Rust client documentation](https://questdb.com/docs/connect/clients/rust/)
+on the QuestDB documentation site.
 
 ## Examples
 
