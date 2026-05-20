@@ -12,9 +12,13 @@ failover, optional on-disk durability, and a structured error model.
 Legacy InfluxDB Line Protocol (ILP) transports — over HTTP or TCP — remain
 supported for backwards compatibility but are not recommended for new code.
 
-* [QuestDB Database docs](https://questdb.com/docs/)
+* [Rust client documentation](https://questdb.com/docs/connect/clients/rust/) —
+  the full guide on the QuestDB documentation site.
 * [`ingress` module docs](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/) —
-  protocol details, configuration parameters, and patterns.
+  this crate's API reference: protocol details, configuration parameters,
+  and patterns.
+* [QuestDB Database docs](https://questdb.com/docs/) — the wider
+  documentation site (SQL reference, deployment, operations).
 
 ## Transports
 
