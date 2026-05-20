@@ -3896,14 +3896,7 @@ TEST_CASE("mock: batch::column — DOUBLE_ARRAY round-trip")
 {
     // Row 0: 1-D [1.5, 2.5, 3.5]. Row 1: NULL array. Row 2: non-null empty
     // (rank 1, shape[0] == 0).
-    std::vector<uint8_t> d_bytes;
-    for (double v : {1.5, 2.5, 3.5})
-    {
-        uint8_t buf[8];
-        std::memcpy(buf, &v, 8);
-        d_bytes.insert(d_bytes.end(), buf, buf + 8);
-    }
-    qm::ArrayRow row0{{3}, std::move(d_bytes)};
+    qm::ArrayRow row0{{3}, pack_le<double>({1.5, 2.5, 3.5})};
     qm::ArrayRow row2{{0}, {}};
     auto d_body = qm::array_column_bytes(
         {std::optional<qm::ArrayRow>{std::move(row0)},
@@ -4183,14 +4176,7 @@ TEST_CASE(
 
 TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 {
-    std::vector<uint8_t> d_bytes;
-    for (double v : {1.5, 2.5, 3.5})
-    {
-        uint8_t buf[8];
-        std::memcpy(buf, &v, 8);
-        d_bytes.insert(d_bytes.end(), buf, buf + 8);
-    }
-    qm::ArrayRow row0{{3}, std::move(d_bytes)};
+    qm::ArrayRow row0{{3}, pack_le<double>({1.5, 2.5, 3.5})};
     auto body = qm::array_column_bytes(
         {std::optional<qm::ArrayRow>{std::move(row0)}});
     qm::ColumnSpec c_da{"da", qm::COL_DOUBLE_ARRAY, std::move(body)};

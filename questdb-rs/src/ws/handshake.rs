@@ -43,7 +43,7 @@
 use std::io::{Read, Write};
 
 use super::crypto::{b64_encode, compute_accept};
-use super::mask::build_from_system_random;
+use super::mask::MaskKeySource;
 
 /// Cap on the bytes we read while looking for `\r\n\r\n`. Slow-loris
 /// defence: a server that dribbles a single byte at a time would
@@ -254,25 +254,17 @@ pub(crate) fn upgrade<S: Read + Write>(
 
 /// Sec-WebSocket-Key is "a randomly selected 16-byte value that has
 /// been base64-encoded" (RFC §4.1). We pull 16 bytes from
-/// SystemRandom, then base64-encode for the on-wire value. The 16-byte
-/// raw form is never used after that.
+/// SystemRandom in a single fill, then base64-encode for the on-wire
+/// value. The 16-byte raw form is never used after that.
 fn generate_client_key() -> Result<String, super::mask::EntropyUnavailable> {
     // Reuse the SystemRandom plumbing from mask.rs — same crypto
-    // provider feature-gate. We could call `SystemRandom::fill` here
-    // directly but reusing `build_from_system_random()` keeps the
-    // entropy-source surface in one place: one `cfg` block per crypto
-    // backend in mask.rs covers both the mask key and Sec-WebSocket-Key
-    // paths.
-    let mut rng = build_from_system_random()?;
-    // 16 bytes = four 4-byte draws. xorshift gives statistical
-    // unpredictability from a SystemRandom-seeded state — exactly the
-    // RFC's "randomly selected" requirement (no cryptographic
-    // unpredictability needed here either; the key only defeats
-    // upgrade-replay caching).
+    // provider feature-gate. Drawing all 16 bytes in one `fill` call
+    // keeps the entropy-source surface in one place (one `cfg` block
+    // per crypto backend in mask.rs covers both the mask key and
+    // Sec-WebSocket-Key paths).
+    let rng = MaskKeySource::new()?;
     let mut bytes = [0u8; 16];
-    for chunk in bytes.chunks_mut(4) {
-        chunk.copy_from_slice(&rng.next_key());
-    }
+    rng.fill(&mut bytes)?;
     Ok(b64_encode(&bytes))
 }
 

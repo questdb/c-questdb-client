@@ -26,7 +26,7 @@
 //!
 //! Owns the underlying byte stream (plain TCP or rustls-wrapped TCP),
 //! a single growing recv buffer with no zero-fill, and a per-connection
-//! [`MaskRng`]. Exposes `read_binary_frame` (transparently handling
+//! [`MaskKeySource`]. Exposes `read_binary_frame` (transparently handling
 //! Ping/Pong/Close) and `write_binary_frame` (mask + write in one
 //! `write_all`).
 //!
@@ -48,7 +48,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::frame::{FrameError, FrameHeader, Opcode, encode_client_frame};
-use crate::ws::mask::MaskRng;
+use crate::ws::mask::MaskKeySource;
 
 /// Initial recv buffer capacity. Sized to fit a typical multi-MB QWP
 /// `RESULT_BATCH` in a single `read()` syscall: the batch wire cap is
@@ -165,7 +165,7 @@ pub(crate) struct WsClient {
     /// `advance_mut` to avoid the `BytesMut::resize` zero-fill pattern
     /// that bit us in the tungstenite default config — see PR 140.
     recv: BytesMut,
-    mask_rng: MaskRng,
+    mask_keys: MaskKeySource,
     /// Hard ceiling on a single frame's payload length. Inherited
     /// from the transport-level `MAX_BATCH_WIRE_BYTES` cap; surfaces
     /// as a `Protocol` error rather than letting the buffer grow
@@ -181,7 +181,7 @@ impl WsClient {
     pub(crate) fn new(
         stream: Stream,
         leftover: Vec<u8>,
-        mask_rng: MaskRng,
+        mask_keys: MaskKeySource,
         max_payload: usize,
     ) -> Self {
         let mut recv = BytesMut::with_capacity(INITIAL_RECV_CAPACITY.max(leftover.len()));
@@ -189,7 +189,7 @@ impl WsClient {
         Self {
             stream,
             recv,
-            mask_rng,
+            mask_keys,
             max_payload,
         }
     }
@@ -296,7 +296,10 @@ impl WsClient {
 
     fn send_frame(&mut self, opcode: Opcode, payload: &[u8]) -> io::Result<()> {
         let mut out = Vec::with_capacity(payload.len() + 14);
-        let mask_key = self.mask_rng.next_key();
+        let mask_key = self
+            .mask_keys
+            .next_key()
+            .map_err(|e| io::Error::other(e.0))?;
         encode_client_frame(&mut out, opcode, mask_key, payload);
         self.stream.write_all(&out)?;
         Ok(())

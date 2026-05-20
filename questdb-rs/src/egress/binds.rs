@@ -63,8 +63,6 @@ use crate::egress::wire::varint;
 // references this block by the literal marker `PHASE 1 SERVER
 // COMPATIBILITY` so enabling a type later is one grep.
 //
-// TODO(phase-1-binds): link tracking issue.
-//
 // Reference: `core/src/main/java/io/questdb/cutlass/qwp/server/egress/QwpEgressRequestDecoder.java`
 // `decodeBind` switch.
 //

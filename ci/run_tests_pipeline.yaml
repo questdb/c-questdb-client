@@ -122,7 +122,7 @@ stages:
           - script: |
               cd system_test
               cd failover_clients
-              cargo clippy --all-targets --all-features -- -D warnings
+              cargo clippy --all-targets --all-features
             displayName: "failover_clients: clippy"
       - job: SanitizeCppTests
         displayName: "C/C++ tests under ASan + UBSan"

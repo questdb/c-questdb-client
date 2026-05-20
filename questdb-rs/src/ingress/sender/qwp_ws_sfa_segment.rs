@@ -49,17 +49,40 @@ pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
 #[derive(Debug)]
 pub(crate) enum SfaSegmentError {
     Io(io::Error),
-    FileTooShort { size: usize },
-    SizeTooSmall { size: u64 },
-    BadMagic { actual: u32 },
-    UnsupportedVersion { actual: u8 },
-    NonZeroFlags { actual: u8 },
-    NonZeroReserved { actual: u16 },
-    NegativeBaseSeq { actual: i64 },
-    BaseSeqTooLarge { base_seq: u64 },
-    SizeTooLargeForPlatform { size: u64 },
-    PayloadTooLarge { payload_len: usize },
+    FileTooShort {
+        size: usize,
+    },
+    SizeTooSmall {
+        size: u64,
+    },
+    BadMagic {
+        actual: u32,
+    },
+    UnsupportedVersion {
+        actual: u8,
+    },
+    NonZeroFlags {
+        actual: u8,
+    },
+    NonZeroReserved {
+        actual: u16,
+    },
+    NegativeBaseSeq {
+        actual: i64,
+    },
+    BaseSeqTooLarge {
+        base_seq: u64,
+    },
+    SizeTooLargeForPlatform {
+        size: u64,
+    },
+    PayloadTooLarge {
+        payload_len: usize,
+    },
     OffsetOverflow,
+    /// Filesystem rejected block-preallocation; the silent `set_len`
+    /// fallback would expose mmap'd writes to a SIGBUS-on-ENOSPC kill.
+    PreallocationUnsupported,
 }
 
 impl From<io::Error> for SfaSegmentError {
@@ -221,7 +244,7 @@ impl SfaSegment {
             if create_new {
                 let _ = fs::remove_file(path);
             }
-            return Err(err.into());
+            return Err(err);
         }
         let mapping = match map_file_mut(&file, size_bytes) {
             Ok(mapping) => mapping,
@@ -707,28 +730,35 @@ fn crc32c_update(seed: u32, bytes: &[u8]) -> u32 {
     crc32c::crc32c_append(seed, bytes)
 }
 
-/// Reserve real disk blocks for the whole segment up front. A plain
-/// `set_len`/`ftruncate` leaves the file sparse, so a later store into the
-/// mmap'd region faults with `SIGBUS` once the filesystem fills up, turning a
-/// recoverable `ENOSPC` into a process kill. Falls back to `set_len` on
-/// filesystems that do not support block reservation.
+/// Reserve real disk blocks for the segment up front. A plain
+/// `set_len`/`ftruncate` leaves the file sparse, so a later mmap'd
+/// store faults with `SIGBUS` once the filesystem fills up. We return
+/// `PreallocationUnsupported` rather than fall back to `set_len`.
 #[cfg(target_os = "linux")]
-fn reserve_segment_blocks(file: &File, size_bytes: u64) -> io::Result<()> {
+fn reserve_segment_blocks(file: &File, size_bytes: u64) -> Result<(), SfaSegmentError> {
     use std::os::unix::io::AsRawFd;
-    let len = libc::off_t::try_from(size_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "segment size exceeds off_t"))?;
+    let len = libc::off_t::try_from(size_bytes).map_err(|_| {
+        SfaSegmentError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "segment size exceeds off_t",
+        ))
+    })?;
     match unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) } {
         0 => Ok(()),
-        libc::EOPNOTSUPP | libc::ENOSYS => file.set_len(size_bytes),
-        errno => Err(io::Error::from_raw_os_error(errno)),
+        libc::EOPNOTSUPP | libc::ENOSYS => Err(SfaSegmentError::PreallocationUnsupported),
+        errno => Err(SfaSegmentError::Io(io::Error::from_raw_os_error(errno))),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn reserve_segment_blocks(file: &File, size_bytes: u64) -> io::Result<()> {
+fn reserve_segment_blocks(file: &File, size_bytes: u64) -> Result<(), SfaSegmentError> {
     use std::os::unix::io::AsRawFd;
-    let len = libc::off_t::try_from(size_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "segment size exceeds off_t"))?;
+    let len = libc::off_t::try_from(size_bytes).map_err(|_| {
+        SfaSegmentError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "segment size exceeds off_t",
+        ))
+    })?;
     let fd = file.as_raw_fd();
     let mut store = libc::fstore_t {
         fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
@@ -746,17 +776,17 @@ fn reserve_segment_blocks(file: &File, size_bytes: u64) -> io::Result<()> {
     if rc == -1 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ENOTSUP) {
-            return file.set_len(size_bytes);
+            return Err(SfaSegmentError::PreallocationUnsupported);
         }
-        return Err(err);
+        return Err(SfaSegmentError::Io(err));
     }
     // F_PREALLOCATE reserves blocks past EOF; set_len extends the logical size.
-    file.set_len(size_bytes)
+    file.set_len(size_bytes).map_err(SfaSegmentError::Io)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn reserve_segment_blocks(file: &File, size_bytes: u64) -> io::Result<()> {
-    file.set_len(size_bytes)
+fn reserve_segment_blocks(_file: &File, _size_bytes: u64) -> Result<(), SfaSegmentError> {
+    Err(SfaSegmentError::PreallocationUnsupported)
 }
 
 fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {

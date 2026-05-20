@@ -1005,10 +1005,10 @@ TEST_CASE("live: batch::column — DOUBLE_ARRAY round-trip")
             const size_t global_r = total_rows + r;
             const auto& expected = global_r == 0 ? row0 : row1;
 
-            size_t rank = 0;
-            const uint32_t* shape = ac.shape(r, &rank);
-            REQUIRE(rank == 1);
-            CHECK(shape[0] == 3);
+            size_t row_rank = 0;
+            const uint32_t* row_shape = ac.shape(r, &row_rank);
+            REQUIRE(row_rank == 1);
+            CHECK(row_shape[0] == 3);
 
             size_t count = 0;
             const double* elems = ac.elements<double>(r, &count);

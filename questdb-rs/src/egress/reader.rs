@@ -413,8 +413,9 @@ impl Reader {
         on_attempt: &mut dyn FnMut(u32),
     ) -> Result<u32> {
         let cfg = Arc::clone(&self.cfg);
-        // 1 initial connect + N-1 reconnect rounds = `failover_max_attempts` total.
-        let attempts_total = cfg.failover_max_attempts.saturating_sub(1);
+        // Mid-query path: `failover_max_attempts` counts reconnect
+        // rounds (no initial connect to subtract — we already had one).
+        let attempts_total = cfg.failover_max_attempts.max(1);
         let mut backoff_ms = cfg.failover_backoff_initial_ms;
         let mut last_err: Option<Error> = None;
         // Failover.md §11.9.1 wall-clock budget. `0` is the documented

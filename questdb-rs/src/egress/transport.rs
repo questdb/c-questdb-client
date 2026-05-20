@@ -57,7 +57,7 @@ use crate::egress::wire::roles;
 use crate::egress::ws::client::{Stream, WsClient, WsReadError};
 use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
-use crate::ws::mask::build_from_system_random;
+use crate::ws::mask::MaskKeySource;
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
 /// successful handshake. Caps any single `write()` syscall — including
@@ -134,18 +134,45 @@ impl WsTransport {
         // `SocketError`). `TcpStream::connect((host, port))` collapses
         // both into a single `io::Error` whose `kind()` is `Other` —
         // losing the user-actionable distinction.
-        let mut addrs = (endpoint.host.as_str(), endpoint.port)
+        // Try every resolved address before declaring the endpoint
+        // dead — Happy-Eyeballs-style. A dual-stack host with broken
+        // IPv6 routing would otherwise fail every dial even though
+        // IPv4 is reachable.
+        let resolved: Vec<_> = (endpoint.host.as_str(), endpoint.port)
             .to_socket_addrs()
-            .map_err(|e| fmt!(CouldNotResolveAddr, "could not resolve {}: {}", endpoint, e))?;
-        let tcp = match addrs.next() {
-            Some(addr) => TcpStream::connect(addr)
-                .map_err(|e| fmt!(SocketError, "could not connect to {}: {}", endpoint, e))?,
-            None => {
-                return Err(fmt!(
-                    CouldNotResolveAddr,
-                    "name resolution returned no addresses for {}",
-                    endpoint
-                ));
+            .map_err(|e| fmt!(CouldNotResolveAddr, "could not resolve {}: {}", endpoint, e))?
+            .collect();
+        if resolved.is_empty() {
+            return Err(fmt!(
+                CouldNotResolveAddr,
+                "name resolution returned no addresses for {}",
+                endpoint
+            ));
+        }
+        let tcp = {
+            let mut last_err: Option<std::io::Error> = None;
+            let mut connected: Option<TcpStream> = None;
+            for addr in &resolved {
+                match TcpStream::connect(addr) {
+                    Ok(s) => {
+                        connected = Some(s);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match connected {
+                Some(s) => s,
+                None => {
+                    let e = last_err.expect("non-empty addrs but no last_err");
+                    return Err(fmt!(
+                        SocketError,
+                        "could not connect to {} (tried {} address(es)): {}",
+                        endpoint,
+                        resolved.len(),
+                        e
+                    ));
+                }
             }
         };
 
@@ -245,8 +272,8 @@ impl WsTransport {
         // that interval of server silence (legitimate on slow queries).
         set_tcp_read_timeout(stream.tcp_mut(), None);
 
-        let mask_rng = build_from_system_random().map_err(|e| fmt!(ConfigError, "{}", e.0))?;
-        let socket = WsClient::new(stream, handshake.leftover, mask_rng, MAX_BATCH_WIRE_BYTES);
+        let mask_keys = MaskKeySource::new().map_err(|e| fmt!(ConfigError, "{}", e.0))?;
+        let socket = WsClient::new(stream, handshake.leftover, mask_keys, MAX_BATCH_WIRE_BYTES);
 
         Ok(WsTransport {
             socket,
@@ -417,12 +444,11 @@ fn build_stream(tcp: &NoSigpipeTcp, host: &str, config: &ReaderConfig) -> Result
     }
 }
 
-/// Set `set_write_timeout` on the `TcpStream`. Swallows errors per
-/// the same best-effort policy as the connect-time timeout: if the
-/// platform's socket layer rejects the call the OS default applies
-/// and subsequent writes will eventually error on their own.
-fn set_tcp_write_timeout(stream: &mut TcpStream, timeout: Option<Duration>) {
-    let _ = stream.set_write_timeout(timeout);
+/// Set `set_write_timeout` on the `TcpStream`. Best-effort: returns
+/// `false` on failure so callers can choose to skip the subsequent
+/// write rather than hang for the OS default.
+fn set_tcp_write_timeout(stream: &mut TcpStream, timeout: Option<Duration>) -> bool {
+    stream.set_write_timeout(timeout).is_ok()
 }
 
 fn set_tcp_read_timeout(stream: &mut TcpStream, timeout: Option<Duration>) {
@@ -434,11 +460,11 @@ fn set_tcp_read_timeout(stream: &mut TcpStream, timeout: Option<Duration>) {
 /// by `Drop`, `close_in_place`, and the `close` consuming variant so
 /// they share identical semantics.
 fn teardown_inplace(socket: &mut WsClient) {
-    set_tcp_write_timeout(socket.stream_mut().tcp_mut(), Some(CLOSE_TIMEOUT));
-    // 1000 = "Normal Closure" per RFC 6455 §7.4.1. We don't attach a
-    // reason — the body of close frames is ignored by every QWP
-    // server we've tested.
-    let _ = socket.send_close(1000);
+    // Skip `send_close` if we can't pin the write timeout — a hung
+    // peer would otherwise block for the kernel default.
+    if set_tcp_write_timeout(socket.stream_mut().tcp_mut(), Some(CLOSE_TIMEOUT)) {
+        let _ = socket.send_close(1000);
+    }
     socket.stream_mut().shutdown();
 }
 
@@ -684,8 +710,7 @@ fn is_tls_io_error(e: &std::io::Error) -> bool {
             cur = s.source();
         }
     }
-    let msg = e.to_string();
-    msg.contains("invalid peer certificate") || msg.contains("rustls")
+    false
 }
 
 // ---------------------------------------------------------------------------

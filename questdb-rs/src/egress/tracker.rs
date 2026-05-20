@@ -140,33 +140,26 @@ impl HostHealthTracker {
     }
 
     /// Diagnostic accessor — number of configured hosts.
-    /// Not consumed in the failover loop today, but useful in tests
-    /// and likely-future telemetry hooks.
-    #[allow(dead_code)]
-    pub fn count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> usize {
         self.states.len()
     }
 
     /// Diagnostic accessor — current state classification for one host.
-    /// Used in unit tests; held public for future introspection.
-    #[allow(dead_code)]
-    pub fn state(&self, idx: usize) -> HostState {
+    #[cfg(test)]
+    pub(crate) fn state(&self, idx: usize) -> HostState {
         self.states[idx]
     }
 
     /// Diagnostic accessor — current zone tier for one host.
-    /// Used in unit tests; held public for future introspection.
-    #[allow(dead_code)]
-    pub fn zone_tier(&self, idx: usize) -> ZoneTier {
+    #[cfg(test)]
+    pub(crate) fn zone_tier(&self, idx: usize) -> ZoneTier {
         self.zone_tiers[idx]
     }
 
     /// `true` iff every host has been attempted this round.
-    /// Not consumed by the walk loop directly (which uses `pick_next ==
-    /// None` as the exhaustion signal); kept for tests and future
-    /// diagnostics.
-    #[allow(dead_code)]
-    pub fn is_round_exhausted(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_round_exhausted(&self) -> bool {
         self.attempted_this_round.iter().all(|a| *a)
     }
 

@@ -155,29 +155,22 @@ impl From<ErrorCode> for line_reader_error_code {
     }
 }
 
-/// NULL-handle guard for opaque-handle FFI entry points whose contract
-/// disallows NULL. Calls match the policy already established in
-/// `mutate_query` (the bind path) — log and abort, rather than silently
-/// dereferencing into UB. Reserved for state-mutating cursor / reader
-/// operations where a NULL deref would corrupt the FFI lifecycle.
-///
-/// Read-only cursor / reader getters take a softer path: they NULL-check
-/// inline and return a benign sentinel (`0` / `NULL` / `false` / zeroed
-/// out-params) rather than aborting. This matches the reader-side stat
-/// getters' long-standing convention (`line_reader_bytes_received` et
-/// al.) and avoids inviting a SIGSEGV inside `match (*cursor)` when a
-/// caller learns the reader getters tolerate NULL and extends that
-/// habit to cursor getters.
-macro_rules! null_check_handle {
-    ($ptr:expr, $fn_name:literal) => {
-        if $ptr.is_null() {
-            eprintln!(
-                "{}: NULL handle. This is a contract violation; aborting.",
-                $fn_name
-            );
-            std::process::abort();
+/// Stash a deferred error on a `line_reader_query` (first-error-wins).
+/// NULL-safe: logs and drops the error when `query` is NULL since the
+/// bind family has no `err_out` channel.
+unsafe fn defer_query_err(query: *mut line_reader_query, fn_name: &str, err: Error) {
+    if query.is_null() {
+        eprintln!(
+            "{fn_name}: NULL query handle; dropping error: {}",
+            err.msg()
+        );
+        return;
+    }
+    unsafe {
+        if (*query).deferred_err.is_none() {
+            (*query).deferred_err = Some(err);
         }
-    };
+    }
 }
 
 macro_rules! reader_bubble {
@@ -389,6 +382,7 @@ pub enum line_reader_column_kind {
     line_reader_column_kind_char = 0x16,
     line_reader_column_kind_binary = 0x17,
     line_reader_column_kind_ipv4 = 0x18,
+    line_reader_column_kind_unknown = 0xFF,
 }
 
 impl From<ColumnKind> for line_reader_column_kind {
@@ -418,22 +412,12 @@ impl From<ColumnKind> for line_reader_column_kind {
             ColumnKind::Binary => line_reader_column_kind_binary,
             ColumnKind::Long256 => line_reader_column_kind_long256,
             ColumnKind::Ipv4 => line_reader_column_kind_ipv4,
-            // ColumnKind is `#[non_exhaustive]`. There's no semantic
-            // fallback for an unknown wire-type code on the C side —
-            // every column kind needs a paired C ABI mapping. This arm
-            // is a build-time guard: it fires only on a workspace
-            // version skew (a new ColumnKind variant added upstream
-            // without updating the FFI translation), which is
-            // impossible in same-workspace builds. Aborting is strictly
-            // safer than silently mapping to a wrong-typed C variant.
             _ => {
                 eprintln!(
-                    "ColumnKind→C ABI: unknown variant {:?}; the FFI translation is out of sync \
-                     with the upstream enum. Aborting to prevent silent type confusion in the C \
-                     caller.",
-                    k
+                    "questdb-rs-ffi: unrecognised ColumnKind variant {k:?}; \
+                     surfacing as line_reader_column_kind_unknown"
                 );
-                std::process::abort();
+                line_reader_column_kind_unknown
             }
         }
     }
@@ -615,12 +599,19 @@ pub unsafe extern "C" fn line_reader_close(reader: *mut line_reader) {
             // raced us); freeing the reader would leave a dangling
             // `&mut Reader` inside it. Leak the reader (and its socket)
             // rather than risk use-after-free.
+            // Project to the stats Arc via `addr_of!` so we don't form
+            // a `&line_reader` reborrow that would alias the in-flight
+            // `&mut Reader` held by the live query/cursor (same pattern
+            // as the stat getters below).
+            let stats_ptr = std::ptr::addr_of!((*reader).2);
+            let bytes_in_flight = (&*stats_ptr).bytes_received.load(Ordering::Relaxed);
             eprintln!(
                 "line_reader_close: a query or cursor is still live on this \
-                 reader. The reader has been LEAKED to avoid use-after-free; \
-                 close the cursor / free the query before closing the reader. \
-                 This is a contract violation — see the line_reader_close \
-                 docstring."
+                 reader. The reader has been LEAKED (TCP socket + TLS session + \
+                 ~{bytes_in_flight} bytes of in-flight buffers + up to the \
+                 symbol-dict heap cap) to avoid use-after-free. Close the \
+                 cursor / free the query before closing the reader. This is \
+                 a contract violation — see the line_reader_close docstring."
             );
             return;
         }
@@ -1322,6 +1313,8 @@ pub enum line_reader_failover_phase {
     line_reader_failover_phase_retrying = 1,
     line_reader_failover_phase_reset = 2,
     line_reader_failover_phase_gave_up = 3,
+    /// Sentinel for variants the FFI build doesn't know.
+    line_reader_failover_phase_unknown = 0xFF,
 }
 
 impl From<FailoverPhase> for line_reader_failover_phase {
@@ -1335,15 +1328,13 @@ impl From<FailoverPhase> for line_reader_failover_phase {
             }
             FailoverPhase::Reset => line_reader_failover_phase::line_reader_failover_phase_reset,
             FailoverPhase::GaveUp => line_reader_failover_phase::line_reader_failover_phase_gave_up,
-            // `FailoverPhase` is `#[non_exhaustive]` so the upstream
-            // crate can add variants without breaking downstream
-            // matches. When that happens the FFI surface needs an
-            // explicit discriminant for the new phase — fall through
-            // to a panic so callers don't silently misclassify it.
-            _ => panic!(
-                "unrecognised FailoverPhase variant {:?}: questdb-rs-ffi needs an FFI discriminant",
-                p
-            ),
+            _ => {
+                eprintln!(
+                    "questdb-rs-ffi: unrecognised FailoverPhase variant {p:?}; \
+                     surfacing as line_reader_failover_phase_unknown"
+                );
+                line_reader_failover_phase::line_reader_failover_phase_unknown
+            }
         }
     }
 }
@@ -2031,9 +2022,10 @@ where
     F: FnOnce(ReaderQuery<'static>) -> ReaderQuery<'static>,
 {
     unsafe {
-        // NULL handle is a contract violation; defer to the shared
-        // `null_check_handle!` policy.
-        null_check_handle!(query, "line_reader_query_bind_*");
+        if query.is_null() {
+            eprintln!("line_reader_query_bind_*: NULL query handle; bind dropped");
+            return;
+        }
         if (*query).deferred_err.is_some() {
             return;
         }
@@ -2092,17 +2084,9 @@ pub unsafe extern "C" fn line_reader_query_bind_varchar(
     v: line_sender_utf8,
 ) {
     unsafe {
-        // NULL handle is a contract violation. Match `mutate_query`'s
-        // policy so the success and failure branches behave identically
-        // — otherwise a NULL handle paired with malformed UTF-8 would
-        // SIGSEGV on the deferred-error deref below instead of aborting
-        // cleanly.
         if query.is_null() {
-            eprintln!(
-                "line_reader_query_bind_varchar: NULL query handle. \
-                 This is a contract violation; aborting."
-            );
-            std::process::abort();
+            eprintln!("line_reader_query_bind_varchar: NULL query handle; bind dropped");
+            return;
         }
         match validated_utf8(&v) {
             Ok(s) => {
@@ -2123,24 +2107,41 @@ pub unsafe extern "C" fn line_reader_query_bind_varchar(
 }
 
 /// Bind a BINARY value. The bytes are copied. `buf` may be NULL only when
-/// `len` is 0 (empty value). A NULL `buf` with non-zero `len` aborts the
-/// process — the same policy as `line_reader_query_bind_uuid`.
+/// `len` is 0 (empty value). A NULL `buf` with non-zero `len`, or a
+/// `len` exceeding `isize::MAX`, stashes a deferred `InvalidBind` error
+/// on the query that surfaces from `_query_execute`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_bind_binary(
     query: *mut line_reader_query,
     buf: *const u8,
     len: size_t,
 ) {
-    if buf.is_null() && len != 0 {
-        eprintln!(
-            "line_reader_query_bind_binary: `buf` is NULL but `len` is {} — \
-             pass a non-NULL buffer or set `len` to 0. Aborting to avoid \
-             undefined behaviour from `slice::from_raw_parts(NULL, len)`.",
-            len
-        );
-        std::process::abort();
-    }
     unsafe {
+        if buf.is_null() && len != 0 {
+            defer_query_err(
+                query,
+                "line_reader_query_bind_binary",
+                Error::new(
+                    ErrorCode::InvalidBind,
+                    format!("buf is NULL but len is {len}"),
+                ),
+            );
+            return;
+        }
+        // `slice::from_raw_parts` is UB for `len > isize::MAX`, and
+        // `Vec::to_vec` on such a length would trigger an allocator
+        // abort under panic=abort. Reject up front.
+        if len > isize::MAX as usize {
+            defer_query_err(
+                query,
+                "line_reader_query_bind_binary",
+                Error::new(
+                    ErrorCode::InvalidBind,
+                    format!("len {len} exceeds isize::MAX"),
+                ),
+            );
+            return;
+        }
         let bytes: Vec<u8> = if len == 0 {
             Vec::new()
         } else {
@@ -2153,27 +2154,27 @@ pub unsafe extern "C" fn line_reader_query_bind_binary(
 /// Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and
 /// point to at least 16 readable bytes; passing a smaller buffer is a
 /// buffer over-read (undefined behaviour) — exactly 16 bytes are read
-/// unconditionally. A NULL `value` aborts the process via
-/// `process::abort()` to surface the bug instead of silently substituting
-/// zero bytes (which would produce a valid-looking `00000000-0000-0000-
-/// 0000-000000000000` UUID and corrupt the query). Use
-/// `line_reader_query_bind_null` with `line_reader_column_kind_uuid` to bind
-/// SQL NULL.
+/// unconditionally. A NULL `value` stashes a deferred `InvalidBind`
+/// error on the query that surfaces from `_query_execute`. Use
+/// `line_reader_query_bind_null` with `line_reader_column_kind_uuid` to
+/// bind SQL NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_bind_uuid(
     query: *mut line_reader_query,
     value: *const u8,
 ) {
-    if value.is_null() {
-        eprintln!(
-            "line_reader_query_bind_uuid: `value` is NULL — \
-             pass a non-NULL 16-byte buffer or use \
-             line_reader_query_bind_null(query, line_reader_column_kind_uuid). \
-             Aborting to avoid silently binding all-zero bytes."
-        );
-        std::process::abort();
-    }
     unsafe {
+        if value.is_null() {
+            defer_query_err(
+                query,
+                "line_reader_query_bind_uuid",
+                Error::new(
+                    ErrorCode::InvalidBind,
+                    "value is NULL; use _bind_null(_, column_kind_uuid) for SQL NULL",
+                ),
+            );
+            return;
+        }
         let mut buf = [0u8; 16];
         buf.copy_from_slice(slice::from_raw_parts(value, 16));
         mutate_query(query, |q| q.bind_uuid(buf));
@@ -2183,25 +2184,26 @@ pub unsafe extern "C" fn line_reader_query_bind_uuid(
 /// Bind a 32-byte LONG256 value (raw little-endian bytes). `value` MUST be
 /// non-NULL and point to at least 32 readable bytes; passing a smaller
 /// buffer is a buffer over-read (undefined behaviour) — exactly 32 bytes
-/// are read unconditionally. A NULL `value` aborts the process — see
-/// `line_reader_query_bind_uuid` for the rationale. Use
-/// `line_reader_query_bind_null` with `line_reader_column_kind_long256` to
-/// bind SQL NULL.
+/// are read unconditionally. A NULL `value` stashes a deferred
+/// `InvalidBind` error on the query. Use `line_reader_query_bind_null`
+/// with `line_reader_column_kind_long256` to bind SQL NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_bind_long256(
     query: *mut line_reader_query,
     value: *const u8,
 ) {
-    if value.is_null() {
-        eprintln!(
-            "line_reader_query_bind_long256: `value` is NULL — \
-             pass a non-NULL 32-byte buffer or use \
-             line_reader_query_bind_null(query, line_reader_column_kind_long256). \
-             Aborting to avoid silently binding all-zero bytes."
-        );
-        std::process::abort();
-    }
     unsafe {
+        if value.is_null() {
+            defer_query_err(
+                query,
+                "line_reader_query_bind_long256",
+                Error::new(
+                    ErrorCode::InvalidBind,
+                    "value is NULL; use _bind_null(_, column_kind_long256) for SQL NULL",
+                ),
+            );
+            return;
+        }
         let mut buf = [0u8; 32];
         buf.copy_from_slice(slice::from_raw_parts(value, 32));
         mutate_query(query, |q| q.bind_long256(buf));
@@ -2246,8 +2248,8 @@ pub unsafe extern "C" fn line_reader_query_bind_decimal128(
 /// Bind a DECIMAL256 value as 32 little-endian raw bytes plus column scale.
 /// `value` MUST be non-NULL and point to at least 32 readable bytes;
 /// passing a smaller buffer is a buffer over-read (undefined behaviour) —
-/// exactly 32 bytes are read unconditionally. A NULL `value` aborts the
-/// process — see `line_reader_query_bind_uuid` for the rationale. Use
+/// exactly 32 bytes are read unconditionally. A NULL `value` stashes a
+/// deferred `InvalidBind` error on the query. Use
 /// `line_reader_query_bind_null_decimal256` to bind SQL NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_bind_decimal256(
@@ -2255,16 +2257,18 @@ pub unsafe extern "C" fn line_reader_query_bind_decimal256(
     value: *const u8,
     scale: i8,
 ) {
-    if value.is_null() {
-        eprintln!(
-            "line_reader_query_bind_decimal256: `value` is NULL — \
-             pass a non-NULL 32-byte buffer or use \
-             line_reader_query_bind_null_decimal256(query, scale). \
-             Aborting to avoid silently binding all-zero bytes."
-        );
-        std::process::abort();
-    }
     unsafe {
+        if value.is_null() {
+            defer_query_err(
+                query,
+                "line_reader_query_bind_decimal256",
+                Error::new(
+                    ErrorCode::InvalidBind,
+                    "value is NULL; use _bind_null_decimal256 for SQL NULL",
+                ),
+            );
+            return;
+        }
         let mut buf = [0u8; 32];
         buf.copy_from_slice(slice::from_raw_parts(value, 32));
         mutate_query(query, |q| q.bind_decimal256(buf, scale));
@@ -2283,9 +2287,25 @@ pub unsafe extern "C" fn line_reader_query_bind_null(
     kind: line_reader_column_kind,
 ) {
     unsafe {
-        // NULL-handle guard before any deferred_err deref below.
-        null_check_handle!(query, "line_reader_query_bind_null");
-        let k = column_kind_from_c(kind);
+        if query.is_null() {
+            eprintln!("line_reader_query_bind_null: NULL query handle; bind dropped");
+            return;
+        }
+        let k = match column_kind_from_c(kind) {
+            Some(k) => k,
+            None => {
+                if (*query).deferred_err.is_none() {
+                    (*query).deferred_err = Some(Error::new(
+                        ErrorCode::InvalidBind,
+                        "line_reader_query_bind_null: kind is the \
+                         line_reader_column_kind_unknown sentinel; pass a \
+                         concrete column kind"
+                            .to_string(),
+                    ));
+                }
+                return;
+            }
+        };
         match SimpleNullKind::try_from(k) {
             Ok(s) => mutate_query(query, |q| q.bind_null(s)),
             Err(invalid) => {
@@ -2309,9 +2329,9 @@ pub unsafe extern "C" fn line_reader_query_bind_null(
     }
 }
 
-fn column_kind_from_c(k: line_reader_column_kind) -> ColumnKind {
+fn column_kind_from_c(k: line_reader_column_kind) -> Option<ColumnKind> {
     use line_reader_column_kind::*;
-    match k {
+    Some(match k {
         line_reader_column_kind_boolean => ColumnKind::Boolean,
         line_reader_column_kind_byte => ColumnKind::Byte,
         line_reader_column_kind_short => ColumnKind::Short,
@@ -2335,7 +2355,8 @@ fn column_kind_from_c(k: line_reader_column_kind) -> ColumnKind {
         line_reader_column_kind_binary => ColumnKind::Binary,
         line_reader_column_kind_long256 => ColumnKind::Long256,
         line_reader_column_kind_ipv4 => ColumnKind::Ipv4,
-    }
+        line_reader_column_kind_unknown => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2451,7 +2472,14 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
     err_out: *mut *mut line_reader_error,
 ) -> *const line_reader_batch {
     unsafe {
-        null_check_handle!(cursor, "line_reader_cursor_next_batch");
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_next_batch: cursor is NULL",
+            );
+            return std::ptr::null();
+        }
         let c = &mut *cursor;
         // `cursor_for_mut` clears `current_batch` (releasing the prior
         // BatchView's borrow on the cursor) and yields exclusive access
@@ -2794,7 +2822,14 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        null_check_handle!(cursor, "line_reader_cursor_cancel");
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_cancel: cursor is NULL",
+            );
+            return false;
+        }
         // Routes through `cursor_for_mut` to maintain the BatchView /
         // &mut Cursor exclusion invariant — see line_reader_cursor docs.
         // `cancel()` runs the drain loop which can panic (decoder paths);
@@ -2824,7 +2859,14 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        null_check_handle!(cursor, "line_reader_cursor_add_credit");
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_add_credit: cursor is NULL",
+            );
+            return false;
+        }
         // Routes through `cursor_for_mut` — see line_reader_cursor docs.
         // Catch any unwind out of `add_credit` to keep panics from crossing
         // the FFI boundary.
@@ -3710,7 +3752,12 @@ mod tests {
                 "wire-byte mismatch for {:?}",
                 rust
             );
-            assert_eq!(column_kind_from_c(c), rust, "c→rust mapping for {:?}", rust);
+            assert_eq!(
+                column_kind_from_c(c),
+                Some(rust),
+                "c→rust mapping for {:?}",
+                rust
+            );
         }
     }
 

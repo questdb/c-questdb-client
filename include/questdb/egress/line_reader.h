@@ -251,6 +251,12 @@ typedef enum line_reader_column_kind
     line_reader_column_kind_char            = 0x16,
     line_reader_column_kind_binary          = 0x17,
     line_reader_column_kind_ipv4            = 0x18,
+    /** Sentinel for column kinds the running FFI build doesn't
+     *  recognise. Emitted when the upstream Rust crate adds a new
+     *  `ColumnKind` variant the C ABI hasn't been recompiled against
+     *  yet. Treat as opaque: skip / log / surface to ops rather than
+     *  route on it. */
+    line_reader_column_kind_unknown         = 0xFF,
 } line_reader_column_kind;
 
 /////////// Reader.
@@ -586,6 +592,12 @@ typedef enum line_reader_failover_phase
      *  error returned to the caller is available via
      *  `line_reader_failover_progress_event_final_error_*`. */
     line_reader_failover_phase_gave_up = 3,
+    /** Sentinel for phases the running FFI build doesn't recognise.
+     *  Emitted when the upstream Rust crate adds a new
+     *  `FailoverPhase` variant the C ABI hasn't been recompiled
+     *  against yet. Treat as opaque: skip / log / surface to ops
+     *  rather than route on it. */
+    line_reader_failover_phase_unknown = 0xFF,
 } line_reader_failover_phase;
 
 /**

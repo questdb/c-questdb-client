@@ -95,6 +95,11 @@ impl SymbolDict {
         let entry = self.entries.get(id as usize)?;
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
+        debug_assert!(
+            end <= self.arena.len(),
+            "entry {id} offset+len={end} exceeds arena len {}",
+            self.arena.len()
+        );
         // Safety: every byte slice that reaches the arena was UTF-8 validated
         // by `apply_delta` before being copied in.
         Some(unsafe { std::str::from_utf8_unchecked(&self.arena[start..end]) })
@@ -112,9 +117,13 @@ impl SymbolDict {
     }
 
     /// Clear all state. Triggered by a `CACHE_RESET` with the dict bit.
+    /// Shrinks the backing allocations so a previously-saturated dict
+    /// doesn't keep its full heap reserved after the reset.
     pub fn reset(&mut self) {
         self.entries.clear();
         self.arena.clear();
+        self.entries.shrink_to(1024);
+        self.arena.shrink_to(64 * 1024);
     }
 
     /// Apply a delta whose first new id is `delta_start` and whose entries

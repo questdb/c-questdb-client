@@ -45,6 +45,15 @@ extern "C" {
 #    define QUESTDB_CLIENT_API
 #endif
 
+/* `LINESENDER_API` is the historical name of this export attribute,
+   kept as an alias for one major-version cycle so downstream wrappers
+   that reference the old macro continue to build. New code should use
+   `QUESTDB_CLIENT_API`; this alias will be removed in the next major
+   release. */
+#ifndef LINESENDER_API
+#    define LINESENDER_API QUESTDB_CLIENT_API
+#endif
+
 /////////// Pointer argument conventions.
 /**
  * Unless a function's documentation states otherwise, every pointer
