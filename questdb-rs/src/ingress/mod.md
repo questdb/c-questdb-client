@@ -1,14 +1,9 @@
 # Fast Ingestion of Data into QuestDB
 
-The `ingress` module sends rows of time-series data to a QuestDB server. The
-recommended transport is the
-**QuestDB Wire Protocol over WebSocket (QWP/WebSocket)**: a columnar binary
-protocol with asynchronous server acknowledgements, multi-host failover, and
-optional on-disk durability.
-
-Legacy InfluxDB Line Protocol (ILP) transports — over HTTP and TCP — remain
-supported but are not recommended for new code; see
-[Legacy ILP Transports](#legacy-ilp-transports) below.
+The `ingress` module sends rows of time-series data to a QuestDB server over
+the **QuestDB Wire Protocol over WebSocket (QWP/WebSocket)**: a columnar
+binary protocol with asynchronous server acknowledgements, multi-host
+failover, and optional on-disk durability.
 
 To get started:
 
@@ -387,11 +382,6 @@ via
 structured server diagnostics. The
 [server log](https://questdb.com/docs/troubleshooting/log/) carries
 additional context.
-
-To inspect the bytes of an ILP buffer before sending, call
-[`buffer.as_bytes()`](Buffer::as_bytes). QWP buffers are encoded into
-frames during [`flush`](Sender::flush) and `as_bytes()` is not useful
-there.
 
 # Legacy ILP Transports
 

@@ -3,14 +3,11 @@
 Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
 database designed to process time-series data, faster.
 
-The client library is designed for fast ingestion of data into QuestDB. The
-recommended transport is the
-**QuestDB Wire Protocol over WebSocket (QWP/WebSocket)**: a columnar binary
-protocol with explicit asynchronous server acknowledgements, multi-host
-failover, optional on-disk durability, and a structured error model.
-
-Legacy InfluxDB Line Protocol (ILP) transports — over HTTP or TCP — remain
-supported for backwards compatibility but are not recommended for new code.
+The client library is designed for fast ingestion of data into QuestDB
+over the **QuestDB Wire Protocol over WebSocket (QWP/WebSocket)**: a
+columnar binary protocol with explicit asynchronous server
+acknowledgements, multi-host failover, optional on-disk durability, and a
+structured error model.
 
 * [Rust client documentation](https://questdb.com/docs/connect/clients/rust/) —
   the full guide on the QuestDB documentation site.
