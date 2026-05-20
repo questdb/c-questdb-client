@@ -215,18 +215,18 @@ struct IlpBookmarkState {
 ///
 /// | Buffer Method | Serialized as ILP type (Click on link to see possible casts) |
 /// |---------------|--------------------------------------------------------------|
-/// | [`symbol`](Buffer::symbol) | [`SYMBOL`](https://questdb.io/docs/concept/symbol/) |
-/// | [`column_bool`](Buffer::column_bool) | [`BOOLEAN`](https://questdb.io/docs/reference/api/ilp/columnset-types#boolean) |
-/// | [`column_i64`](Buffer::column_i64) | [`INTEGER`](https://questdb.io/docs/reference/api/ilp/columnset-types#integer) |
-/// | [`column_f64`](Buffer::column_f64) | [`FLOAT`](https://questdb.io/docs/reference/api/ilp/columnset-types#float) |
-/// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
-/// | [`column_arr`](Buffer::column_arr) | [`ARRAY`](https://questdb.io/docs/reference/api/ilp/columnset-types#array) |
-/// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
+/// | [`symbol`](Buffer::symbol) | [`SYMBOL`](https://questdb.com/docs/concept/symbol/) |
+/// | [`column_bool`](Buffer::column_bool) | [`BOOLEAN`](https://questdb.com/docs/reference/api/ilp/columnset-types#boolean) |
+/// | [`column_i64`](Buffer::column_i64) | [`INTEGER`](https://questdb.com/docs/reference/api/ilp/columnset-types#integer) |
+/// | [`column_f64`](Buffer::column_f64) | [`FLOAT`](https://questdb.com/docs/reference/api/ilp/columnset-types#float) |
+/// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.com/docs/reference/api/ilp/columnset-types#string) |
+/// | [`column_arr`](Buffer::column_arr) | [`ARRAY`](https://questdb.com/docs/reference/api/ilp/columnset-types#array) |
+/// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.com/docs/reference/api/ilp/columnset-types#timestamp) |
 ///
 /// QuestDB supports both `STRING` and `SYMBOL` column types.
 ///
 /// To understand the difference, refer to the
-/// [QuestDB documentation](https://questdb.io/docs/concept/symbol/). In a nutshell,
+/// [QuestDB documentation](https://questdb.com/docs/concept/symbol/). In a nutshell,
 /// symbols are interned strings, most suitable for identifiers that are repeated many
 /// times throughout the column. They offer an advantage in storage space and query
 /// performance.
