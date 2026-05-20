@@ -464,9 +464,12 @@ impl Sender {
 
     /// Send the given buffer of rows to the QuestDB server.
     ///
-    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
+    /// All the data stays in the buffer. Clear the buffer before
+    /// starting a new batch.
     ///
-    /// To send and clear in one step, call [Sender::flush] instead.
+    /// Same transport-specific semantics as [`Sender::flush`]; see its
+    /// docs for the QWP/WebSocket, ILP/HTTP, and ILP/TCP behaviour. To
+    /// send and clear in one step, call [`Sender::flush`] instead.
     pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
         self.flush_impl(buf, false)
     }
@@ -778,12 +781,10 @@ impl Sender {
         self.protocol_version
     }
 
-    /// Return the sender's maxinum name length of any column or table name.
-    /// This is either set explicitly when constructing the sender,
-    /// or the default value of 127.
-    /// When unset and using protocol version 2 over HTTP, the value is read
-    /// from the server from the `cairo.max.file.name.length` setting in
-    /// `server.conf` which defaults to 127.
+    /// Return the sender's maximum name length for any column or table
+    /// name. Set explicitly via [`SenderBuilder::max_name_len`], or the
+    /// default 127 bytes (or whatever the server advertises on ILP/HTTP
+    /// with auto-negotiated protocol version 2).
     pub fn max_name_len(&self) -> usize {
         self.max_name_len
     }
