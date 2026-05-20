@@ -1067,9 +1067,9 @@ TEST_CASE("mock: column::shape + elements<double> round-trip")
     size_t cnt0 = 0;
     const double* el0 = col.elements<double>(0, &cnt0);
     REQUIRE(cnt0 == 3);
-    CHECK(el0[0] == doctest::Approx(1.5));
-    CHECK(el0[1] == doctest::Approx(2.5));
-    CHECK(el0[2] == doctest::Approx(3.5));
+    CHECK(load_le(el0 + 0) == doctest::Approx(1.5));
+    CHECK(load_le(el0 + 1) == doctest::Approx(2.5));
+    CHECK(load_le(el0 + 2) == doctest::Approx(3.5));
 
     size_t rank1 = 0;
     const uint32_t* shape1 = col.shape(1, &rank1);
@@ -1079,7 +1079,7 @@ TEST_CASE("mock: column::shape + elements<double> round-trip")
     size_t cnt1 = 0;
     const double* el1 = col.elements<double>(1, &cnt1);
     REQUIRE(cnt1 == 4);
-    CHECK(el1[3] == doctest::Approx(40.0));
+    CHECK(load_le(el1 + 3) == doctest::Approx(40.0));
 }
 
 TEST_CASE("mock: LONG_ARRAY column rejected (not supported in this revision)")
@@ -1169,7 +1169,7 @@ TEST_CASE("mock: NULL array row surfaces via is_null")
     size_t cnt = 0;
     const double* el = col.elements<double>(0, &cnt);
     REQUIRE(cnt == 1);
-    CHECK(el[0] == doctest::Approx(7.0));
+    CHECK(load_le(el + 0) == doctest::Approx(7.0));
 }
 
 // ---------------------------------------------------------------------------
@@ -3948,9 +3948,9 @@ TEST_CASE("mock: batch::column — DOUBLE_ARRAY round-trip")
     size_t da_count = 0;
     const double* da_elems = da.elements<double>(0, &da_count);
     REQUIRE(da_count == 3);
-    CHECK(da_elems[0] == doctest::Approx(1.5));
-    CHECK(da_elems[1] == doctest::Approx(2.5));
-    CHECK(da_elems[2] == doctest::Approx(3.5));
+    CHECK(load_le(da_elems + 0) == doctest::Approx(1.5));
+    CHECK(load_le(da_elems + 1) == doctest::Approx(2.5));
+    CHECK(load_le(da_elems + 2) == doctest::Approx(3.5));
 
     // Empty non-null row: rank 1, shape[0] == 0, no elements.
     size_t da2_rank = 0;

@@ -49,6 +49,14 @@ struct overload : Fs...
 template <class... Fs>
 overload(Fs...) -> overload<Fs...>;
 
+template <typename T>
+T load_unaligned(const T* p)
+{
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    return v;
+}
+
 void print_hex(const uint8_t* p, size_t n)
 {
     static constexpr char hex[] = "0123456789abcdef";
@@ -70,7 +78,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL";
                     else
-                        std::cout << (v.values[r] ? "true" : "false");
+                        std::cout << (*v.value(r) ? "true" : "false");
                     std::cout << '\t';
                 }
             },
@@ -80,7 +88,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL";
                     else
-                        std::cout << static_cast<int>(v.values[r]);
+                        std::cout << static_cast<int>(*v.value(r));
                     std::cout << '\t';
                 }
             },
@@ -90,7 +98,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL";
                     else
-                        std::cout << v.values[r];
+                        std::cout << *v.value(r);
                     std::cout << '\t';
                 }
             },
@@ -100,7 +108,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL\t";
                     else
-                        std::printf("U+%04X\t", v.values[r]);
+                        std::printf("U+%04X\t", *v.value(r));
                 }
             },
             [](eg::fixed_view<int32_t> v) {
@@ -109,7 +117,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL";
                     else
-                        std::cout << v.values[r];
+                        std::cout << *v.value(r);
                     std::cout << '\t';
                 }
             },
@@ -121,7 +129,7 @@ void print_column(const eg::column& col)
                         std::cout << "NULL\t";
                         continue;
                     }
-                    const uint32_t x = v.values[r];
+                    const uint32_t x = *v.value(r);
                     std::printf(
                         "%u.%u.%u.%u\t",
                         (x >> 24) & 0xFF,
@@ -138,7 +146,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL";
                     else
-                        std::cout << v.values[r];
+                        std::cout << *v.value(r);
                     std::cout << '\t';
                 }
             },
@@ -148,7 +156,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL";
                     else
-                        std::cout << v.values[r];
+                        std::cout << *v.value(r);
                     std::cout << '\t';
                 }
             },
@@ -158,7 +166,7 @@ void print_column(const eg::column& col)
                     if (v.is_null(r))
                         std::cout << "NULL";
                     else
-                        std::cout << v.values[r];
+                        std::cout << *v.value(r);
                     std::cout << '\t';
                 }
             },
@@ -242,7 +250,7 @@ void print_column(const eg::column& col)
                     {
                         if (i != 0)
                             std::cout << ' ';
-                        std::cout << e->first[i];
+                        std::cout << load_unaligned(e->first + i);
                     }
                     std::cout << "]\t";
                 }
