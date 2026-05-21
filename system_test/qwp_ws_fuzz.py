@@ -421,9 +421,18 @@ def _missing_default(server_type: str) -> str:
     # BOOLEAN has no null sentinel and defaults to false; BYTE/SHORT
     # are non-nullable in QuestDB and default to 0; everything else
     # comes back as null too.
+    #
+    # `server_type` is sometimes the internal generator label
+    # (DOUBLE_ARRAY_1D / LONG_ARRAY) rather than the server's `DOUBLE[]`
+    # rendering — most callers pass either, depending on which side of
+    # the oracle they're on. Treat both as arrays so a null cell yields
+    # the same default whether we hit it via initial_col_type or via
+    # the live column metadata.
     if server_type in _NUMERIC_FLOAT_TYPES:
         return 'null'
     if _is_array_type(server_type):
+        return 'null'
+    if server_type.endswith('_ARRAY') or '_ARRAY_' in server_type:
         return 'null'
     if server_type in ('BYTE', 'SHORT'):
         return '0'

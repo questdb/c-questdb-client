@@ -2363,9 +2363,19 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         ]
 
     def _query_table_sorted(self, table_name: str):
-        resp = sql_query(
-            f'SELECT * FROM \'{table_name}\' ORDER BY timestamp')
-        return resp.get('columns') or [], resp.get('dataset') or []
+        # Verifies through the QWP egress reader, not /exec REST. /exec
+        # renders BINARY columns as the literal JSON `[]` (see
+        # JsonQueryProcessorState.putBinValue in QuestDB), which would make
+        # every BINARY round-trip fail regardless of what the sender wrote.
+        # Reading through the QWP egress reader exercises the column types we
+        # actually ingest end-to-end. Values come back in the same Python
+        # shape /exec used to return, with BINARY as real bytes that
+        # format_actual_cell can hex-encode.
+        import qwp_egress_reader
+        # The reader's connect-string scheme is `ws::` (egress side), distinct
+        # from the sender's `qwpws::` (ingress side) — both hit the HTTP port.
+        conf = f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
+        return qwp_egress_reader.query_table_sorted(conf, table_name)
 
     def _wait_for_row_count(self, table_name: str, expected: int):
         deadline = time.monotonic() + self.DRAIN_TIMEOUT_SEC
