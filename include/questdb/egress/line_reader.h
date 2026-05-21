@@ -31,6 +31,7 @@ extern "C" {
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
 
 /* Reuse `line_sender_utf8` for validated UTF-8 strings, and the
    `QUESTDB_CLIENT_API` / `QUESTDB_CLIENT_DYN_LIB` linkage macros. */
@@ -1393,6 +1394,321 @@ QUESTDB_CLIENT_API bool line_reader_cursor_add_credit(
     line_reader_cursor* cursor,
     uint64_t additional_bytes,
     line_reader_error** err_out);
+
+/* =========================================================================
+ * Inline single-cell read helpers for `line_reader_column_data`.
+ *
+ * The egress C ABI is bulk-only at the symbol level: every reader call
+ * fills a `line_reader_column_data` descriptor (one FFI crossing per
+ * column), and the caller indexes its dense buffer to read individual
+ * rows.
+ *
+ * This header is the opt-in convenience layer for the opposite pattern:
+ * a casual C caller that wants to read one cell with one line of code
+ * instead of three (row index + validity-bitmap probe + typed
+ * little-endian load).
+ *
+ *     // Without these helpers (verbose AND undefined behaviour):
+ *     const int64_t v = ((const int64_t*)d.values)[row];
+ *     const bool   is_null =
+ *         d.validity && ((d.validity[row >> 3] >> (row & 7)) & 1);
+ *
+ *     // With them:
+ *     bool is_null;
+ *     int64_t v = line_reader_column_data_get_i64(&d, row, &is_null);
+ *
+ * The "without" form is not only verbose — it is unsafe. `d.values` may
+ * not be aligned to `alignof(int64_t)`: densified column slices borrow
+ * from the wire payload at offsets that don't satisfy `T`'s alignment,
+ * and forming `((const T*)d.values)[row]` is undefined behaviour on
+ * strict-alignment targets. The helpers' `memcpy` is the safe
+ * equivalent (and the compiler lowers it to a single unaligned MOV
+ * at `-O1+`, so zero performance cost).
+ *
+ * All helpers are `static inline` — no new exported symbols, no added
+ * ABI surface.
+ *
+ * Scope:
+ *   - Covered: every fixed-width scalar (BOOLEAN..DOUBLE, TIMESTAMP /
+ *     TIMESTAMP_NS / DATE, IPv4, CHAR, UUID, LONG256, DECIMAL64 / 128,
+ *     GEOHASH), plus VARCHAR / BINARY and SYMBOL.
+ *   - Not covered: `DOUBLE_ARRAY`. Arrays use a separate descriptor
+ *     (`line_reader_array_data`) populated by
+ *     `line_reader_batch_array_column_data`.
+ *
+ * Convention:
+ *   Every `_get_<type>` helper writes `*out_is_null` separately from
+ *   the typed return. On a NULL row:
+ *     - scalar helpers (`_get_i8` .. `_get_f64`, `_get_bool`,
+ *       `_get_char`, `_get_ipv4`, `_get_geohash`,
+ *       `_get_decimal64_mantissa`) return zero.
+ *     - `_get_bytes` zero-fills the caller-supplied buffer.
+ *     - `_get_decimal128` writes `0` to both limbs.
+ *     - `_get_varlen` and `_get_symbol` set `*out_buf = NULL` and
+ *       `*out_len = 0`.
+ *   In every case `*out_is_null` is `true`. Always branch on
+ *   `out_is_null`; a literal `0` or empty slice is a valid value, not
+ *   a NULL marker.
+ *
+ * Preconditions (every helper unless its own doc says otherwise):
+ *   - `d` is a non-NULL, fully-filled descriptor from a successful
+ *     `line_reader_batch_column_data` against the CURRENT batch.
+ *   - `row < d->row_count`. The helpers DO NOT bounds-check; reading
+ *     past `row_count` reads past the validity bitmap and values buffer.
+ *   - `_get_symbol` additionally takes a `line_reader_symbol_dict*` —
+ *     it MUST be the snapshot from the SAME batch as `d`. A stale dict
+ *     from a previous batch silently resolves codes against the wrong
+ *     heap.
+ *
+ * Lifetime:
+ *   Every pointer or byte slice reachable through `d`, the dict, and
+ *   the `_get_varlen` / `_get_symbol` out-params borrows from the
+ *   current batch. They are invalidated by the next
+ *   `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`, or
+ *   `line_reader_cursor_free`. Copy out anything you need to keep.
+ *
+ * Idiom — scan one column:
+ *
+ *     line_reader_column_data d;
+ *     if (!line_reader_batch_column_data(batch, col, &d, &err))
+ *         goto on_error;
+ *     for (size_t row = 0; row < d.row_count; ++row) {
+ *         bool is_null;
+ *         int64_t v = line_reader_column_data_get_i64(&d, row, &is_null);
+ *         if (is_null) { ... }     // SQL NULL
+ *         else         { use(v); } // real value
+ *     }
+ *
+ * Idiom — SYMBOL column:
+ *
+ *     line_reader_symbol_dict dict;
+ *     if (!line_reader_batch_symbol_dict(batch, &dict, &err))
+ *         goto on_error;
+ *     for (size_t row = 0; row < d.row_count; ++row) {
+ *         const char* buf;
+ *         size_t      len;
+ *         bool        is_null;
+ *         line_reader_column_data_get_symbol(
+ *             &d, &dict, row, &buf, &len, &is_null);
+ *         if (is_null) { ... }
+ *         else         { use_utf8(buf, len); }
+ *     }
+ * ========================================================================= */
+
+static inline bool line_reader_column_data_is_null(
+    const line_reader_column_data* d, size_t row)
+{
+    return d->validity != NULL && ((d->validity[row >> 3] >> (row & 7)) & 1);
+}
+
+static inline bool line_reader_column_data_get_bool(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return false;
+    /* BOOLEAN is dense-1-byte-per-row on the C side (FFI decoder writes
+     * `value_stride == 1` for ColumnView::Boolean); honour the stride so
+     * the helper stays robust if the descriptor representation ever
+     * changes. */
+    return ((const uint8_t*)d->values)[row * d->value_stride] != 0;
+}
+
+static inline int8_t line_reader_column_data_get_i8(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    return *out_is_null ? 0 : ((const int8_t*)d->values)[row];
+}
+
+static inline int16_t line_reader_column_data_get_i16(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0;
+    int16_t v;
+    memcpy(&v, (const uint8_t*)d->values + row * 2, sizeof(v));
+    return v;
+}
+
+static inline uint16_t line_reader_column_data_get_char(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0;
+    uint16_t v;
+    memcpy(&v, (const uint8_t*)d->values + row * 2, sizeof(v));
+    return v;
+}
+
+static inline int32_t line_reader_column_data_get_i32(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0;
+    int32_t v;
+    memcpy(&v, (const uint8_t*)d->values + row * 4, sizeof(v));
+    return v;
+}
+
+static inline uint32_t line_reader_column_data_get_ipv4(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0;
+    uint32_t v;
+    memcpy(&v, (const uint8_t*)d->values + row * 4, sizeof(v));
+    return v;
+}
+
+static inline float line_reader_column_data_get_f32(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0.0f;
+    float v;
+    memcpy(&v, (const uint8_t*)d->values + row * 4, sizeof(v));
+    return v;
+}
+
+static inline int64_t line_reader_column_data_get_i64(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0;
+    int64_t v;
+    memcpy(&v, (const uint8_t*)d->values + row * 8, sizeof(v));
+    return v;
+}
+
+static inline double line_reader_column_data_get_f64(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0.0;
+    double v;
+    memcpy(&v, (const uint8_t*)d->values + row * 8, sizeof(v));
+    return v;
+}
+
+/* UUID / LONG256: copy `value_stride` bytes (16 or 32) into out. */
+static inline void line_reader_column_data_get_bytes(
+    const line_reader_column_data* d,
+    size_t row,
+    uint8_t* out,
+    bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+    {
+        memset(out, 0, d->value_stride);
+        return;
+    }
+    memcpy(
+        out,
+        (const uint8_t*)d->values + row * d->value_stride,
+        d->value_stride);
+}
+
+/* DECIMAL64: returns the mantissa; scale is on `d->decimal_scale`. */
+static inline int64_t line_reader_column_data_get_decimal64_mantissa(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    return line_reader_column_data_get_i64(d, row, out_is_null);
+}
+
+/* DECIMAL128: split as (low u64, high i64); scale on `d->decimal_scale`. */
+static inline void line_reader_column_data_get_decimal128(
+    const line_reader_column_data* d,
+    size_t row,
+    uint64_t* out_low,
+    int64_t* out_high,
+    bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+    {
+        *out_low = 0;
+        *out_high = 0;
+        return;
+    }
+    const uint8_t* p = (const uint8_t*)d->values + row * 16;
+    memcpy(out_low, p, 8);
+    memcpy(out_high, p + 8, 8);
+}
+
+/* GEOHASH: returns the value zero-extended into a u64. */
+static inline uint64_t line_reader_column_data_get_geohash(
+    const line_reader_column_data* d, size_t row, bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+        return 0;
+    uint64_t v = 0;
+    memcpy(
+        &v, (const uint8_t*)d->values + row * d->value_stride, d->value_stride);
+    return v;
+}
+
+/* VARCHAR / BINARY: per-row borrowed slice into `d->var_data`. NULL row
+ * yields `*out_buf == NULL && *out_len == 0`. */
+static inline void line_reader_column_data_get_varlen(
+    const line_reader_column_data* d,
+    size_t row,
+    const uint8_t** out_buf,
+    size_t* out_len,
+    bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+    {
+        *out_buf = NULL;
+        *out_len = 0;
+        return;
+    }
+    const uint32_t s = d->var_offsets[row];
+    const uint32_t e = d->var_offsets[row + 1];
+    *out_buf = d->var_data + s;
+    *out_len = (size_t)(e - s);
+}
+
+/* SYMBOL: resolve the row's dictionary code into a borrowed UTF-8 slice
+ * over the supplied dict snapshot. Returns false on a code out of range
+ * (corrupt batch) — caller's responsibility to surface as an error. */
+static inline bool line_reader_column_data_get_symbol(
+    const line_reader_column_data* d,
+    const line_reader_symbol_dict* dict,
+    size_t row,
+    const char** out_buf,
+    size_t* out_len,
+    bool* out_is_null)
+{
+    *out_is_null = line_reader_column_data_is_null(d, row);
+    if (*out_is_null)
+    {
+        *out_buf = NULL;
+        *out_len = 0;
+        return true;
+    }
+    const uint32_t code = d->symbol_codes[row];
+    if (code >= dict->entry_count)
+    {
+        *out_buf = NULL;
+        *out_len = 0;
+        return false;
+    }
+    const line_reader_symbol_entry e = dict->entries[code];
+    *out_buf = (const char*)dict->heap + e.offset;
+    *out_len = (size_t)e.length;
+    return true;
+}
 
 #ifdef __cplusplus
 }

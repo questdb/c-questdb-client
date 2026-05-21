@@ -31,7 +31,6 @@
  */
 
 #include <questdb/egress/line_reader.h>
-#include <questdb/egress/line_reader_helpers.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>

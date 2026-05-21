@@ -1,5 +1,4 @@
 #include <questdb/egress/line_reader.h>
-#include <questdb/egress/line_reader_helpers.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>

@@ -25,21 +25,18 @@
 /* Columnar bulk-read example for the QWP egress reader (C).
  *
  * Demonstrates `line_reader_cursor_next_batch` +
- * `line_reader_batch_column_data` / `_array_column_data` / `_symbol_dict`. One
- * FFI call per column rather than one per cell; this is the path Cython / numpy
- * / pandas bindings should use for zero-copy column construction. For one-off
- * scalar lookups see the inline helpers in `line_reader_helpers.h`. */
+ * `line_reader_batch_column_data` / `_array_column_data` / `_symbol_dict`.
+ * One FFI call per column rather than one per cell — the path Cython /
+ * numpy / pandas bindings should use for zero-copy column construction.
+ * Per-cell reads go through the `line_reader_column_data_get_*` inline
+ * helpers declared in the same header (alignment-safe `memcpy` under the
+ * hood; the compiler lowers each call to a single unaligned MOV). */
 
 #include <questdb/egress/line_reader.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-
-static bool row_is_null(const uint8_t* validity, size_t row)
-{
-    return validity != NULL && ((validity[row >> 3] >> (row & 7)) & 1) != 0;
-}
 
 static void print_hex(const uint8_t* p, size_t n)
 {
@@ -52,131 +49,116 @@ static int print_scalar_column(
     line_reader_column_data d = {0};
     if (!line_reader_batch_column_data(batch, col_idx, &d, err)) return -1;
 
+    /* For SYMBOL columns we resolve dict codes per row; fetch the dict
+     * snapshot once outside the row loop. */
+    line_reader_symbol_dict dict = {0};
+    if (d.kind == line_reader_column_kind_symbol
+        && !line_reader_batch_symbol_dict(batch, &dict, err))
+        return -1;
+
     for (size_t r = 0; r < d.row_count; ++r)
     {
-        if (row_is_null(d.validity, r))
+        if (line_reader_column_data_is_null(&d, r))
         {
             printf("NULL\t");
             continue;
         }
-        /* `d.values` may not be aligned to the element type — densified
-         * column slices borrow from the wire payload at offsets that
-         * don't satisfy `alignof(T)`. Forming `((const T*)d.values)[r]`
-         * is undefined behaviour; copy via `memcpy` into an aligned
-         * local instead. Compilers lower the small fixed-size memcpy
-         * to a single unaligned MOV. */
-        const uint8_t* base = (const uint8_t*)d.values + r * d.value_stride;
+        bool is_null;
         switch (d.kind)
         {
         case line_reader_column_kind_boolean:
-            printf("%s\t", base[0] ? "true" : "false");
+            printf("%s\t",
+                   line_reader_column_data_get_bool(&d, r, &is_null)
+                       ? "true" : "false");
             break;
         case line_reader_column_kind_byte:
-        {
-            int8_t v;
-            memcpy(&v, base, sizeof(v));
-            printf("%d\t", v);
+            printf("%d\t", line_reader_column_data_get_i8(&d, r, &is_null));
             break;
-        }
         case line_reader_column_kind_short:
-        {
-            int16_t v;
-            memcpy(&v, base, sizeof(v));
-            printf("%d\t", v);
+            printf("%d\t", line_reader_column_data_get_i16(&d, r, &is_null));
             break;
-        }
         case line_reader_column_kind_char:
-        {
-            uint16_t v;
-            memcpy(&v, base, sizeof(v));
-            printf("U+%04X\t", v);
+            printf("U+%04X\t",
+                   line_reader_column_data_get_char(&d, r, &is_null));
             break;
-        }
         case line_reader_column_kind_int:
-        {
-            int32_t v;
-            memcpy(&v, base, sizeof(v));
-            printf("%" PRId32 "\t", v);
+            printf("%" PRId32 "\t",
+                   line_reader_column_data_get_i32(&d, r, &is_null));
             break;
-        }
         case line_reader_column_kind_ipv4:
         {
-            uint32_t v;
-            memcpy(&v, base, sizeof(v));
+            const uint32_t v =
+                line_reader_column_data_get_ipv4(&d, r, &is_null);
             printf("%u.%u.%u.%u\t",
                    (v >> 24) & 0xFF, (v >> 16) & 0xFF,
                    (v >> 8) & 0xFF, v & 0xFF);
             break;
         }
         case line_reader_column_kind_float:
-        {
-            float v;
-            memcpy(&v, base, sizeof(v));
-            printf("%g\t", (double)v);
+            printf("%g\t", (double)line_reader_column_data_get_f32(
+                                &d, r, &is_null));
             break;
-        }
         case line_reader_column_kind_double:
-        {
-            double v;
-            memcpy(&v, base, sizeof(v));
-            printf("%g\t", v);
+            printf("%g\t", line_reader_column_data_get_f64(&d, r, &is_null));
             break;
-        }
         case line_reader_column_kind_long:
         case line_reader_column_kind_timestamp:
         case line_reader_column_kind_date:
         case line_reader_column_kind_timestamp_nanos:
-        {
-            int64_t v;
-            memcpy(&v, base, sizeof(v));
-            printf("%" PRId64 "\t", v);
+            printf("%" PRId64 "\t",
+                   line_reader_column_data_get_i64(&d, r, &is_null));
             break;
-        }
         case line_reader_column_kind_decimal64:
-        {
-            int64_t v;
-            memcpy(&v, base, sizeof(v));
-            printf("%" PRId64 "e%d\t", v, -(int)d.decimal_scale);
+            printf("%" PRId64 "e%d\t",
+                   line_reader_column_data_get_decimal64_mantissa(
+                       &d, r, &is_null),
+                   -(int)d.decimal_scale);
             break;
-        }
         case line_reader_column_kind_decimal128:
         case line_reader_column_kind_decimal256:
         case line_reader_column_kind_uuid:
         case line_reader_column_kind_long256:
-            print_hex((const uint8_t*)d.values + r * d.value_stride,
-                      d.value_stride);
+        {
+            uint8_t bytes[32];
+            line_reader_column_data_get_bytes(&d, r, bytes, &is_null);
+            print_hex(bytes, d.value_stride);
             if (d.kind == line_reader_column_kind_decimal128
                 || d.kind == line_reader_column_kind_decimal256)
                 printf("e%d", -(int)d.decimal_scale);
             printf("\t");
             break;
+        }
         case line_reader_column_kind_geohash:
-            print_hex((const uint8_t*)d.values + r * d.value_stride,
-                      d.value_stride);
-            printf("/%u\t", (unsigned)d.geohash_precision_bits);
+            printf("%" PRIx64 "/%u\t",
+                   line_reader_column_data_get_geohash(&d, r, &is_null),
+                   (unsigned)d.geohash_precision_bits);
             break;
         case line_reader_column_kind_varchar:
         case line_reader_column_kind_binary:
         {
-            const uint32_t s = d.var_offsets[r];
-            const uint32_t e = d.var_offsets[r + 1];
+            const uint8_t* buf = NULL;
+            size_t len = 0;
+            line_reader_column_data_get_varlen(
+                &d, r, &buf, &len, &is_null);
             if (d.kind == line_reader_column_kind_varchar)
-                printf("%.*s\t", (int)(e - s), (const char*)(d.var_data + s));
+                printf("%.*s\t", (int)len, (const char*)buf);
             else
             {
-                print_hex(d.var_data + s, e - s);
+                print_hex(buf, len);
                 printf("\t");
             }
             break;
         }
         case line_reader_column_kind_symbol:
         {
-            const uint32_t code = d.symbol_codes[r];
             const char* sym_buf = NULL;
             size_t sym_len = 0;
-            if (!line_reader_batch_symbol(
-                    batch, col_idx, code, &sym_buf, &sym_len, err))
+            if (!line_reader_column_data_get_symbol(
+                    &d, &dict, r, &sym_buf, &sym_len, &is_null))
+            {
+                fprintf(stderr, "symbol code out of dict range\n");
                 return -1;
+            }
             printf("%.*s\t", (int)sym_len, sym_buf);
             break;
         }
@@ -197,7 +179,8 @@ static int print_double_array_column(
 
     for (size_t r = 0; r < d.row_count; ++r)
     {
-        if (row_is_null(d.validity, r))
+        if (d.validity != NULL
+            && ((d.validity[r >> 3] >> (r & 7)) & 1))
         {
             printf("NULL\t");
             continue;
