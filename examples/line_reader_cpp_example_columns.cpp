@@ -256,7 +256,7 @@ int main()
 {
     try
     {
-        auto reader = eg::reader::open("ws::addr=localhost:9000;");
+        eg::reader reader{"ws::addr=localhost:9000;"_utf8};
         auto cur = reader.execute(
             "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)"_utf8);
 

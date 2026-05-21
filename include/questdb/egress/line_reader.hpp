@@ -654,18 +654,6 @@ public:
             line_reader_error::wrapped_call(::line_reader_from_env)};
     }
 
-    /**
-     * Shortcut factory equivalent to `reader{utf8_view{conf}}`. Lets
-     * callers pass a string literal / `std::string` / `string_view`
-     * directly instead of wrapping it manually:
-     *
-     *     auto r = eg::reader::open("ws::addr=localhost:9000;");
-     */
-    static reader open(std::string_view conf)
-    {
-        return reader{::questdb::ingress::utf8_view{conf}};
-    }
-
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
 

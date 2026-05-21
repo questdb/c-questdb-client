@@ -7,8 +7,7 @@ int main()
 {
     try
     {
-        auto reader =
-            questdb::egress::reader::open("ws::addr=localhost:9000;");
+        questdb::egress::reader reader{"ws::addr=localhost:9000;"_utf8};
 
         auto cur = reader
                        .prepare(
