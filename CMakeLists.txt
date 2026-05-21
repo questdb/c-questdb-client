@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15.0)
-project(c-questdb-client VERSION 6.1.0)
+project(c-questdb-client VERSION 7.0.0)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
@@ -31,12 +31,66 @@ option(
     "Build shared library dependencies instead of static."
     OFF)
 
+# Opt in to the synchronous WebSocket egress reader (`line_reader_*`
+# C/C++ surface). Pulls in the `tungstenite` + `zstd` Rust crates as
+# transitive dependencies, so downstreams that only need the line
+# sender can flip this OFF to keep the resulting library minimal.
+# Defaults ON for the in-tree build because the `line_reader_*`
+# examples and tests need it; external consumers who add this
+# project via `add_subdirectory` should set
+# `-DQUESTDB_ENABLE_READER=OFF` if they don't want the surface.
+option(
+    QUESTDB_ENABLE_READER
+    "Enable the synchronous WebSocket egress reader (line_reader_* API). Adds tungstenite+zstd."
+    ON)
+
+# When QUESTDB_TESTS_AND_EXAMPLES is enabled the reader-related
+# examples and tests need the reader API present. Refusing to build
+# in that combination is friendlier than producing a confusing link
+# error from missing `line_reader_*` symbols.
+if(QUESTDB_TESTS_AND_EXAMPLES AND NOT QUESTDB_ENABLE_READER)
+    message(FATAL_ERROR
+        "QUESTDB_TESTS_AND_EXAMPLES=ON requires QUESTDB_ENABLE_READER=ON: "
+        "the line_reader_* examples and tests would fail to link without it.")
+endif()
+
+# Compile in the `tls_verify=false` (sender) / `tls_verify=unsafe_off`
+# (egress reader) escape hatch. ON by default to preserve the legacy
+# behaviour of the shipped C ABI; security-conscious distributions can
+# flip it OFF (`-DQUESTDB_ENABLE_INSECURE_SKIP_VERIFY=OFF`) to harden
+# the resulting library — `line_sender_opts_tls_verify` then disappears
+# from the symbol table and `tls_verify=unsafe_off` in a connect string
+# is rejected at parse time.
+option(
+    QUESTDB_ENABLE_INSECURE_SKIP_VERIFY
+    "Compile in support for tls_verify off. Allows downstream code to disable TLS certificate verification at runtime."
+    ON)
+
+option(
+    QUESTDB_SANITIZE
+    "Build the C/C++ tests with -fsanitize=address,undefined."
+    OFF)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
-corrosion_import_crate(
-    MANIFEST_PATH questdb-rs-ffi/Cargo.toml
-    LOCKED)   # Use `Cargo.lock`
+set(QUESTDB_CARGO_FEATURES "")
+if(QUESTDB_ENABLE_READER)
+    list(APPEND QUESTDB_CARGO_FEATURES sync-reader-ws)
+endif()
+if(QUESTDB_ENABLE_INSECURE_SKIP_VERIFY)
+    list(APPEND QUESTDB_CARGO_FEATURES insecure-skip-verify)
+endif()
+if(QUESTDB_CARGO_FEATURES)
+    corrosion_import_crate(
+        MANIFEST_PATH questdb-rs-ffi/Cargo.toml
+        LOCKED
+        FEATURES ${QUESTDB_CARGO_FEATURES})
+else()
+    corrosion_import_crate(
+        MANIFEST_PATH questdb-rs-ffi/Cargo.toml
+        LOCKED)
+endif()
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -44,7 +98,7 @@ if(WIN32)
     set_target_properties(
         questdb_client-shared
         PROPERTIES
-        DEFINE_SYMBOL "LINESENDER_DYN_LIB")
+        DEFINE_SYMBOL "QUESTDB_CLIENT_DYN_LIB")
     target_link_libraries(
         questdb_client-shared
         INTERFACE wsock32 ws2_32 ntdll crypt32 Secur32 Ncrypt)
@@ -79,6 +133,27 @@ function(set_compile_flags TARGET_NAME)
         target_compile_options(
             ${TARGET_NAME} PRIVATE
             -Wall -Wextra -Wpedantic -Werror)
+    endif()
+endfunction()
+
+function(apply_sanitizers TARGET_NAME)
+    if(NOT QUESTDB_SANITIZE)
+        return()
+    endif()
+    if(MSVC)
+        message(WARNING
+            "QUESTDB_SANITIZE is not supported on MSVC (its ASan runtime is "
+            "not validated against the rustc-built library); skipping.")
+    else()
+        target_compile_options(
+            ${TARGET_NAME} PRIVATE
+            -fsanitize=address,undefined
+            -fno-sanitize-recover=all
+            -fno-omit-frame-pointer
+            -g)
+        target_link_options(
+            ${TARGET_NAME} PRIVATE
+            -fsanitize=address,undefined)
     endif()
 endfunction()
 
@@ -187,6 +262,24 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example_decimal_binary
         examples/line_sender_cpp_example_decimal_binary.cpp)
+    compile_example(
+        line_reader_c_example_from_conf
+        examples/line_reader_c_example_from_conf.c)
+    compile_example(
+        line_reader_cpp_example_from_conf
+        examples/line_reader_cpp_example_from_conf.cpp)
+    compile_example(
+        line_reader_c_example_with_binds
+        examples/line_reader_c_example_with_binds.c)
+    compile_example(
+        line_reader_cpp_example_with_binds
+        examples/line_reader_cpp_example_with_binds.cpp)
+    compile_example(
+        line_reader_cpp_example_columns
+        examples/line_reader_cpp_example_columns.cpp)
+    compile_example(
+        line_reader_c_example_columns
+        examples/line_reader_c_example_columns.c)
 
     # Include Rust tests as part of the tests run
     add_test(
@@ -207,15 +300,63 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
             ${TARGET_NAME}
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
         set_compile_flags(${TARGET_NAME})
+        apply_sanitizers(${TARGET_NAME})
         add_test(
             NAME ${TARGET_NAME}
             COMMAND ${TARGET_NAME})
+        if(QUESTDB_SANITIZE AND NOT MSVC)
+            # Leak detection is off: the Rust library is not instrumented and
+            # legitimately retains process-global allocations at exit, which
+            # LSan cannot tell apart from an FFI leak without a suppression
+            # file. ASan's use-after-free / out-of-bounds / double-free checks
+            # stay active.
+            set_tests_properties(
+                ${TARGET_NAME} PROPERTIES
+                ENVIRONMENT
+                "ASAN_OPTIONS=detect_leaks=0;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+        endif()
     endfunction()
 
     compile_test(
         test_line_sender
         cpp_test/mock_server.cpp
         cpp_test/test_line_sender.cpp)
+
+    # Live-broker integration tests for the egress reader. Skips per-test
+    # if no broker is reachable on QDB_LIVE_BROKER_HOST:QDB_LIVE_BROKER_HTTP_PORT
+    # (defaults: localhost:9000), so this test is safe to wire into ctest
+    # even on machines without a broker.
+    compile_test(
+        test_line_reader
+        cpp_test/test_line_reader.cpp)
+
+    # Broker-independent smoke test for the line_reader FFI. Targets a
+    # guaranteed-closed port (127.0.0.1:1) and asserts the FFI surfaces
+    # a non-NULL error that can be inspected and freed. Uses standard
+    # exit-code semantics so SIGSEGV / SIGABRT correctly fail the test
+    # (the previous WILL_FAIL-based smoke treated any non-zero exit as a
+    # pass, and inverted to a failure when QuestDB happened to be running
+    # on the developer's machine).
+    compile_test(
+        line_reader_c_smoke
+        cpp_test/smoke_line_reader.c)
+
+    # Broker-independent C++ tests for the line_reader FFI. Covers the
+    # error-handling surface, parser rejection paths, the connect-failure
+    # path against a closed port, NULL-idempotent free / close functions,
+    # `from_env`, and the C++ `line_reader_error` exception wrapper.
+    compile_test(
+        test_line_reader_offline
+        cpp_test/test_line_reader_offline.cpp)
+
+    # Mock-server-driven C++ tests for the line_reader FFI. Drives the
+    # reader against an in-process WebSocket + QWP1 mock so the
+    # column-getter / bind-encoding / server_info / error-code / stats
+    # surface that previously needed a live broker now runs in CI.
+    compile_test(
+        test_line_reader_mock
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/test_line_reader_mock.cpp)
 
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,

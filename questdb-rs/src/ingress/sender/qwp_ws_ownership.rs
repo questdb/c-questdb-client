@@ -140,6 +140,32 @@ fn default_qwp_ws_error_handler(error: &QwpWsSenderError) {
     }
 }
 
+/// Lifetime totals reported by a QWP/WebSocket [`crate::ingress::Sender`].
+///
+/// Mirrors the `getTotal*` counters on Java's `QwpWebSocketSender` so the
+/// QuestDB Enterprise e2e harness (questdb-ent/e2e) can compare the same
+/// signal across language bindings. All counts are cumulative from the
+/// moment the sender was constructed: they never reset, and they survive
+/// reconnects.
+#[non_exhaustive]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QwpWsTotals {
+    /// Frames handed to the transport for writing, regardless of whether the
+    /// server has acknowledged them.
+    pub frames_sent: u64,
+    /// Server responses interpreted as ACKs: ordinary OK, DurableOk, and
+    /// stand-alone DurableAck position notifications.
+    pub acks: u64,
+    /// Reconnect attempts initiated, including ones that returned
+    /// immediately because the retry budget was exhausted.
+    pub reconnect_attempts: u64,
+    /// Reconnect cycles that completed successfully and resumed publication.
+    pub reconnects_succeeded: u64,
+    /// Server-sent Reject responses (any policy: terminal, drop-and-continue,
+    /// durable, presend).
+    pub server_errors: u64,
+}
+
 /// Server-distinguishable QWP/WebSocket error category.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

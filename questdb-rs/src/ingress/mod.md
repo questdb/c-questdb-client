@@ -261,6 +261,14 @@ To select one, use the `tls_ca` config option. These are the supported variants:
   file. Main purpose is for testing with self-signed certificates. _Note:_ this
   automatically sets `tls_ca=pem_file`.
 
+* `tls_roots_password=<secret>;` unlocks a JKS / PKCS#12 keystore named by
+  `tls_roots`. QWP/WebSocket (`qwpwss::`) **only** — ILP/TCP and ILP/HTTP read
+  unencrypted PEM via rustls and reject this key. With the password set, the
+  `tls_roots` file is interpreted as a Java KeyStore (auto-detected: JKS magic
+  `0xFEEDFEED`, or PKCS#12 ASN.1 SEQUENCE) and its trusted-certificate entries
+  become the rustls root store. Mirrors the Java reference client's
+  `tls_roots_password` connect-string key.
+
 See our notes on [how to generate a self-signed
 certificate](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
 

@@ -28,7 +28,24 @@ mod error;
 #[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-qwp-udp"))]
 mod gai;
 
+// Shared RFC 6455 WebSocket plumbing. Compiled whenever either side
+// needs it (ingress QWP/WS sender or egress QWP/WS reader). Each side
+// keeps its own transport-specific state machine on top of these
+// primitives.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+mod ws;
+
+// JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
+// in only for the QWP transports — matches the Java reference's
+// `KeyStore.getInstance(...)` surface there. Other ILP transports
+// keep using rustls' native PEM input.
+#[cfg(feature = "_keystore-roots")]
+mod keystore_roots;
+
 pub mod ingress;
+
+#[cfg(feature = "_egress")]
+pub mod egress;
 
 pub use error::*;
 

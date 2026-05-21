@@ -1,0 +1,23 @@
+[package]
+name = "failover_clients"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Helpers invoked by `system_test/test_egress_failover.py`. Lives outside
+# `questdb-rs/examples/` so they don't appear in the docs as feature
+# examples — their only purpose is to drive the Python failover tests
+# from a child process.
+#
+# No default binary (no `src/main.rs`): every test selects its helper
+# explicitly by name. Each `[[bin]]` is auto-discovered from
+# `src/bin/`:
+#   - failover_client    — synchronised helper for mid-query failover
+#   - simple_client      — minimal connect-and-drain (no kill needed)
+#   - exhaustion_client  — synchronised helper for poison-after-exhaustion
+#   - qwp_sidecar        — line-protocol ingress sender driven by the
+#                          questdb-enterprise e2e harness (Rust port of
+#                          com.questdb.e2e.QwpSidecarMain)
+
+[dependencies]
+questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-ws", "sync-sender-qwp-ws"] }
