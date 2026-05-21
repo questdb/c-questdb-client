@@ -167,6 +167,8 @@ QuestDB documentation; the Rust API entry points are summarised here.
 * **Multi-host failover** — pass a comma-separated address list
   (`addr=a:9000,b:9000`) and tune `reconnect_max_duration_millis`,
   `reconnect_initial_backoff_millis`, `reconnect_max_backoff_millis`.
+  Setting any `reconnect_*` key implicitly enables synchronous initial
+  connect retry unless `initial_connect_retry=off` is set explicitly.
   Auth failures are terminal across all endpoints; transport errors are
   retried.
 * **Store-and-forward** — set `sf_dir` to a writable directory and

@@ -523,6 +523,30 @@ fn parse_qwp_ws_endpoints(
     Ok(endpoints)
 }
 
+#[cfg(feature = "_sender-qwp-ws")]
+fn qwp_ws_reconnect_policy_was_specified(qwp_ws: &conf::QwpWsConfig) -> bool {
+    matches!(&qwp_ws.reconnect_max_duration, ConfigSetting::Specified(_))
+        || matches!(
+            &qwp_ws.reconnect_initial_backoff,
+            ConfigSetting::Specified(_)
+        )
+        || matches!(&qwp_ws.reconnect_max_backoff, ConfigSetting::Specified(_))
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn qwp_ws_effective_config(qwp_ws: &conf::QwpWsConfig) -> conf::QwpWsConfig {
+    let mut effective = qwp_ws.clone();
+    if matches!(
+        &effective.initial_connect_retry,
+        ConfigSetting::Defaulted(_)
+    ) && qwp_ws_reconnect_policy_was_specified(qwp_ws)
+    {
+        effective.initial_connect_retry =
+            ConfigSetting::Defaulted(conf::QwpWsInitialConnectMode::Sync);
+    }
+    effective
+}
+
 /// Accumulates parameters for a new `Sender`.
 ///
 /// Most callers should use [`SenderBuilder::from_conf`] with a connect
@@ -1449,7 +1473,8 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Retry the initial connection using the reconnect policy. Default false.
+    /// Retry the initial connection using the reconnect policy. Defaults to
+    /// false unless a `reconnect_*` setting was specified.
     pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
@@ -2052,7 +2077,8 @@ impl SenderBuilder {
                         "QWP/WebSocket configuration is missing."
                     ));
                 };
-                reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
+                let qwp_ws = qwp_ws_effective_config(qwp_ws);
+                reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
                     if *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async {
@@ -2066,7 +2092,7 @@ impl SenderBuilder {
                         self.port.as_str(),
                         matches!(self.protocol, Protocol::QwpWss),
                         tls_settings,
-                        qwp_ws,
+                        &qwp_ws,
                         basic_auth,
                     )?))
                 } else {
@@ -2075,7 +2101,7 @@ impl SenderBuilder {
                         self.port.as_str(),
                         matches!(self.protocol, Protocol::QwpWss),
                         tls_settings,
-                        qwp_ws,
+                        &qwp_ws,
                         basic_auth,
                     )?
                 }

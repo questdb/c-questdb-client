@@ -3935,6 +3935,57 @@ fn qwp_ws_sync_initial_retry_budget_exhaustion_reports_context() {
 }
 
 #[test]
+fn qwp_ws_reconnect_knob_implicitly_promotes_initial_connect_to_sync() {
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};\
+         reconnect_max_duration_millis=1;"
+    );
+    let err = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(err.msg().contains("attempts="), "got: {}", err.msg());
+}
+
+#[test]
+fn qwp_ws_explicit_initial_connect_retry_off_suppresses_reconnect_promotion() {
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};\
+         reconnect_max_duration_millis=5000;\
+         initial_connect_retry=off;"
+    );
+    let err = SenderBuilder::from_conf(&conf)
+        .unwrap()
+        .build()
+        .unwrap_err();
+
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        !err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(!err.msg().contains("attempts="), "got: {}", err.msg());
+}
+
+#[test]
 fn qwp_ws_sync_initial_retry_resets_non_healthy_between_rounds() {
     let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     first_listener.set_nonblocking(true).unwrap();

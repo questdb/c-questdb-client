@@ -193,6 +193,61 @@ fn qwpws_store_and_forward_defaults_match_java() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
+fn qwpws_reconnect_policy_promotes_default_initial_connect_retry() {
+    for reconnect_setting in [
+        "reconnect_max_duration_millis=20000",
+        "reconnect_initial_backoff_millis=200",
+        "reconnect_max_backoff_millis=2000",
+    ] {
+        let builder =
+            SenderBuilder::from_conf(format!("qwpws::addr=localhost:9000;{reconnect_setting};"))
+                .unwrap();
+        let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+        assert_defaulted_eq(
+            &qwp_ws.initial_connect_retry,
+            conf::QwpWsInitialConnectMode::Off,
+        );
+
+        let effective = qwp_ws_effective_config(qwp_ws);
+        assert_defaulted_eq(
+            &effective.initial_connect_retry,
+            conf::QwpWsInitialConnectMode::Sync,
+        );
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_initial_connect_retry_suppresses_reconnect_policy_promotion() {
+    let off = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;\
+         reconnect_max_duration_millis=20000;\
+         initial_connect_retry=off;",
+    )
+    .unwrap();
+    let qwp_ws = off.qwp_ws.as_ref().unwrap();
+    let effective = qwp_ws_effective_config(qwp_ws);
+    assert_specified_eq(
+        &effective.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+
+    let async_mode = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;\
+         reconnect_max_duration_millis=20000;\
+         initial_connect_retry=async;",
+    )
+    .unwrap();
+    let qwp_ws = async_mode.qwp_ws.as_ref().unwrap();
+    let effective = qwp_ws_effective_config(qwp_ws);
+    assert_specified_eq(
+        &effective.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Async,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
 fn qwpws_progress_config_parses_manual_and_background() {
     let builder =
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=manual;").unwrap();
