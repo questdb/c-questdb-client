@@ -374,8 +374,11 @@ enum BufferInner {
 
 /// A reusable row buffer.
 ///
-/// For ILP senders this exposes the existing byte-oriented buffer implementation.
-/// For QWP/UDP senders it dispatches to the QWP-specific row buffer.
+/// The same `Buffer` type is shared across all transports; the underlying
+/// representation is chosen by the sender at construction time. For
+/// QWP senders (WebSocket or UDP) it dispatches to the QWP-specific
+/// columnar row buffer; for ILP senders (HTTP or TCP) it exposes the
+/// byte-oriented ILP buffer.
 #[derive(Clone, Debug)]
 pub struct Buffer {
     inner: BufferInner,
@@ -449,10 +452,10 @@ impl Buffer {
 
     /// Returns the protocol version associated with this buffer.
     ///
-    /// For ILP buffers this is the ILP protocol version. For QWP/UDP buffers
-    /// this is the QWP datagram version, currently represented as
-    /// [`ProtocolVersion::V1`]. Interpret the value together with the buffer
-    /// transport; do not use it by itself for ILP feature gating.
+    /// For ILP buffers this is the ILP protocol version. For QWP buffers
+    /// (UDP and WebSocket) this is the QWP wire-format version, currently
+    /// [`ProtocolVersion::V1`]. Interpret the value together with the
+    /// buffer transport; do not use it by itself for ILP feature gating.
     pub fn protocol_version(&self) -> ProtocolVersion {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.protocol_version(),
@@ -463,13 +466,12 @@ impl Buffer {
         }
     }
 
-    /// Reserves capacity associated with `additional` more bytes of buffered data.
+    /// Reserve capacity for `additional` more bytes of buffered data.
     ///
     /// For ILP buffers this reserves exact serialized-byte capacity. For
-    /// QWP/UDP buffers this is a heuristic prewarm of the internal arenas and
-    /// planner scratch used during datagram planning and encoding; it is not an
-    /// exact guarantee that [`Buffer::len`] can grow by `additional` bytes
-    /// without further allocation.
+    /// QWP buffers (UDP and WebSocket) this is a heuristic prewarm of the
+    /// internal arenas, not an exact guarantee that [`Buffer::len`] can
+    /// grow by `additional` bytes without further allocation.
     pub fn reserve(&mut self, additional: usize) {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.reserve(additional),
@@ -480,12 +482,12 @@ impl Buffer {
         }
     }
 
-    /// Returns the current buffered size.
+    /// Return the current buffered size.
     ///
-    /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
-    /// buffers this is the size hint used for flush planning. For QWP/WebSocket
-    /// buffers this is only a local size hint; the sender enforces
-    /// `max_buf_size` against the encoded replay message.
+    /// On ILP buffers this is the exact serialized byte count. On QWP
+    /// buffers (UDP and WebSocket) it is a local size hint; the actual
+    /// flushed payload may differ once the buffer is encoded into
+    /// datagrams or frames.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),
@@ -510,11 +512,12 @@ impl Buffer {
         }
     }
 
-    /// Returns whether the buffered batch is transactional.
+    /// Return whether the buffered batch is transactional.
     ///
-    /// For ILP buffers this is `true` only while the buffer contains rows for
-    /// at most one table. QWP/UDP does not support transactional flushes, so
-    /// QWP buffers always return `false`.
+    /// For ILP buffers this is `true` only while the buffer contains
+    /// rows for at most one table. QWP buffers (UDP and WebSocket) do
+    /// not expose flush-level atomicity through this getter and always
+    /// return `false`.
     pub fn transactional(&self) -> bool {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.transactional(),
@@ -536,11 +539,11 @@ impl Buffer {
         }
     }
 
-    /// Returns the current retained-capacity hint for the buffer.
+    /// Return the current retained-capacity hint for the buffer.
     ///
-    /// For ILP buffers, this is byte capacity. For QWP/UDP buffers, this is an
-    /// implementation-defined retained-capacity hint and should not be
-    /// interpreted as exact byte capacity.
+    /// For ILP buffers this is byte capacity. For QWP buffers (UDP and
+    /// WebSocket) this is an implementation-defined retained-capacity
+    /// hint and should not be interpreted as exact byte capacity.
     pub fn capacity(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.capacity(),
@@ -551,10 +554,11 @@ impl Buffer {
         }
     }
 
-    /// Returns the raw serialized ILP bytes currently stored in the buffer.
+    /// Return the raw serialized ILP bytes currently stored in the
+    /// buffer.
     ///
-    /// QWP/UDP buffers build datagrams during flush, so this returns an empty
-    /// slice for QWP/UDP.
+    /// QWP buffers (UDP and WebSocket) build their wire payloads during
+    /// flush, so this returns an empty slice on those transports.
     pub fn as_bytes(&self) -> &[u8] {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.as_bytes(),

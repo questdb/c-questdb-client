@@ -199,7 +199,8 @@ pub(crate) struct QwpWsConfig {
     /// Cap on the per-attempt reconnect delay.
     pub(crate) reconnect_max_backoff: ConfigSetting<std::time::Duration>,
     /// Initial-connect retry mode. Default is fail-fast after one endpoint
-    /// round, matching Java's startup behavior.
+    /// round unless a reconnect policy knob was specified, in which case
+    /// build-time resolution promotes the effective mode to sync retry.
     pub(crate) initial_connect_retry: ConfigSetting<QwpWsInitialConnectMode>,
     /// Bounded wait used by Sender::close_drain().
     pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,

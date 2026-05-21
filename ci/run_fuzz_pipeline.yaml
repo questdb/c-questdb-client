@@ -147,6 +147,14 @@ stages:
                   exit 1
                 fi
               done
+              # Disable xtrace before emitting `##vso[task.setvariable]`:
+              # under `set -x`, bash also prints the command to stderr with
+              # single-quoted arguments. The Azure agent parses `##vso` from
+              # either stream and "last line wins" -- the stderr copy can
+              # win the race, leaking a trailing `'` into JAVA_HOME and
+              # making Maven@3 fail with `Not found jdkUserInputPath`.
+              # See https://questdb.com/blog/azure-pipelines-stdout-stderr-race-condition/
+              set +x
               echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
               echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
             displayName: "Install missing deps + resolve JDKs"

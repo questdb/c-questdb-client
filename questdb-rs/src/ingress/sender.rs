@@ -159,27 +159,33 @@ impl Sender {
 
     /// Create a new `Sender` instance from the given configuration string.
     ///
-    /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
+    /// The format of the string is: `"ws::addr=host:port;key=value;...;"`.
     ///
-    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// and `"qwpudp"`.
+    /// Supported transport schemes:
     ///
-    /// We recommend HTTP for most cases because it provides more features, like
-    /// reporting errors to the client and supporting transaction control. TCP can
-    /// sometimes be faster in higher-latency networks, but misses a number of
-    /// features.
+    /// * `ws` / `wss` (long-form aliases: `qwpws` / `qwpwss`) — **recommended**.
+    ///   QuestDB Wire Protocol over WebSocket. Asynchronous server ACKs,
+    ///   multi-host failover, optional store-and-forward durability,
+    ///   structured error model.
+    /// * `http` / `https` — InfluxDB Line Protocol over HTTP (legacy).
+    ///   Request-response with retries.
+    /// * `tcp` / `tcps` — InfluxDB Line Protocol over TCP (legacy). No
+    ///   error reporting to the client; failures appear only in the
+    ///   server log.
     ///
-    /// Keys in the config string correspond to same-named methods on `SenderBuilder`.
-    ///
-    /// For the full list of keys and values, see the docs on [`SenderBuilder`].
+    /// Keys in the config string correspond to same-named methods on
+    /// [`SenderBuilder`]. For the full list of keys and values, see the
+    /// [`ingress`](crate::ingress) module docs and the [`SenderBuilder`]
+    /// reference.
     ///
     /// You can also load the configuration from an environment variable.
     /// See [`Sender::from_env`].
     ///
-    /// In the case of TCP, this synchronously establishes the TCP connection, and
-    /// returns once the connection is fully established. If the connection
-    /// requires authentication or TLS, these will also be completed before
-    /// returning.
+    /// For TCP this synchronously establishes the TCP connection and
+    /// returns once the connection (including any authentication and TLS
+    /// handshake) is fully established. For QWP/WebSocket the WebSocket
+    /// upgrade (likewise including any authentication and TLS handshake)
+    /// is performed synchronously here.
     #[cfg(feature = "_sync-sender")]
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         SenderBuilder::from_conf(conf)?.build()
@@ -189,10 +195,9 @@ impl Sender {
     /// environment variable. The format is the same as that accepted by
     /// [`Sender::from_conf`].
     ///
-    /// In the case of TCP, this synchronously establishes the TCP connection, and
-    /// returns once the connection is fully established. If the connection
-    /// requires authentication or TLS, these will also be completed before
-    /// returning.
+    /// As with [`Sender::from_conf`], TCP and QWP/WebSocket transports
+    /// establish the connection (including any authentication and TLS
+    /// handshake) synchronously before this function returns.
     #[cfg(feature = "_sync-sender")]
     pub fn from_env() -> Result<Self> {
         SenderBuilder::from_env()?.build()
@@ -459,9 +464,12 @@ impl Sender {
 
     /// Send the given buffer of rows to the QuestDB server.
     ///
-    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
+    /// All the data stays in the buffer. Clear the buffer before
+    /// starting a new batch.
     ///
-    /// To send and clear in one step, call [Sender::flush] instead.
+    /// Same transport-specific semantics as [`Sender::flush`]; see its
+    /// docs for the QWP/WebSocket, ILP/HTTP, and ILP/TCP behaviour. To
+    /// send and clear in one step, call [`Sender::flush`] instead.
     pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
         self.flush_impl(buf, false)
     }
@@ -498,11 +506,15 @@ impl Sender {
     /// transport failures observed later are reported by subsequent sender
     /// calls.
     ///
-    /// HTTP should be the first choice, but use TCP if you need to continuously send
-    /// data to the server at a high rate.
+    /// QWP/WebSocket is the recommended transport for new code: structured
+    /// error reporting, multi-host failover, and optional durable
+    /// store-and-forward. ILP-over-HTTP remains a reasonable second
+    /// choice; ILP-over-TCP trades observability for lower per-message
+    /// overhead.
     ///
-    /// To improve the HTTP performance, send larger buffers (with more rows), and
-    /// consider parallelizing writes using multiple senders from multiple threads.
+    /// To improve throughput, send larger buffers (with more rows), and
+    /// consider parallelizing writes using multiple senders from multiple
+    /// threads.
     pub fn flush(&mut self, buf: &mut Buffer) -> crate::Result<()> {
         self.flush_impl(buf, false)?;
         buf.clear();
@@ -728,16 +740,17 @@ impl Sender {
 
     /// Tell whether the sender is no longer usable and must be dropped.
     ///
-    /// Returns `true` after an unrecoverable failure. For ILP-over-TCP this
-    /// is any socket error. For QWP/WebSocket this also covers a server
-    /// rejection or protocol violation that latches the publication
-    /// lifecycle to its terminal state. ILP-over-HTTP and QWP/UDP never
-    /// transition into a permanently-unusable state and always return
-    /// `false`.
+    /// Returns `true` after an unrecoverable failure. For QWP/WebSocket
+    /// this covers a server rejection (parse error, internal error,
+    /// security error) or a terminal WebSocket protocol violation that
+    /// latches the publication lifecycle. For ILP-over-TCP it is any
+    /// socket error. ILP-over-HTTP and QWP/UDP never transition into a
+    /// permanently-unusable state and always return `false`.
     ///
-    /// In QWP/WebSocket manual progress mode the answer only refreshes when
-    /// the user drives the sender (`drive_once` / `flush`), since no
-    /// background thread is observing the transport.
+    /// In QWP/WebSocket manual progress mode the answer only refreshes
+    /// when the user drives the sender (`drive_once` / `flush` /
+    /// `await_acked_fsn`), since no background thread is observing the
+    /// transport.
     #[must_use]
     pub fn must_close(&self) -> bool {
         if !self.connected {
@@ -768,12 +781,10 @@ impl Sender {
         self.protocol_version
     }
 
-    /// Return the sender's maxinum name length of any column or table name.
-    /// This is either set explicitly when constructing the sender,
-    /// or the default value of 127.
-    /// When unset and using protocol version 2 over HTTP, the value is read
-    /// from the server from the `cairo.max.file.name.length` setting in
-    /// `server.conf` which defaults to 127.
+    /// Return the sender's maximum name length for any column or table
+    /// name. Set explicitly via [`SenderBuilder::max_name_len`], or the
+    /// default 127 bytes (or whatever the server advertises on ILP/HTTP
+    /// with auto-negotiated protocol version 2).
     pub fn max_name_len(&self) -> usize {
         self.max_name_len
     }

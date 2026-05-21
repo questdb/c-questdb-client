@@ -32,7 +32,8 @@ All code is under `questdb-rs/src/ingress/sender/`:
 
 Public configuration lives in `ingress/conf.rs`: `QwpWsConfig`, `SfDurability`
 (`Memory`; `Flush` and `Append` are parsed but currently rejected),
-`QwpWsInitialConnectMode` (`Off | Sync | Async`, default `Off`).
+`QwpWsInitialConnectMode` (`Off | Sync | Async`; effective default `Sync`
+when any `reconnect_*` knob is explicitly configured, otherwise `Off`).
 
 ---
 
@@ -450,9 +451,11 @@ counts after disruptions must use QuestDB table-level dedup
 (`DEDUP UPSERT KEYS(...)`); this matches the Java client's documented
 behavior.
 
-`initial_connect_retry` is `QwpWsInitialConnectMode` (`Off | Sync | Async`,
-default `Off`). `Async` lets the runner start before the first connection
-succeeds; `Sync` retries inline; `Off` fails fast on the first attempt.
+`initial_connect_retry` is `QwpWsInitialConnectMode` (`Off | Sync | Async`).
+When unset, the effective default is `Sync` if any `reconnect_*` knob is
+explicitly configured, otherwise `Off`. `Async` lets the runner start before
+the first connection succeeds; `Sync` retries inline; `Off` fails fast on the
+first attempt.
 
 ### 6.3 Error visibility
 

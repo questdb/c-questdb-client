@@ -190,7 +190,7 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
         ));
     }
 
-    for &param in ["auto_flush_rows", "auto_flush_bytes"].iter() {
+    for &param in ["auto_flush_rows", "auto_flush_bytes", "auto_flush_interval"].iter() {
         if params.contains_key(param) {
             return Err(error::fmt!(
                 ConfigError,
@@ -523,51 +523,50 @@ fn parse_qwp_ws_endpoints(
     Ok(endpoints)
 }
 
-/// Accumulates parameters for a new `Sender` instance.
+#[cfg(feature = "_sender-qwp-ws")]
+fn qwp_ws_reconnect_policy_was_specified(qwp_ws: &conf::QwpWsConfig) -> bool {
+    matches!(&qwp_ws.reconnect_max_duration, ConfigSetting::Specified(_))
+        || matches!(
+            &qwp_ws.reconnect_initial_backoff,
+            ConfigSetting::Specified(_)
+        )
+        || matches!(&qwp_ws.reconnect_max_backoff, ConfigSetting::Specified(_))
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn qwp_ws_effective_config(qwp_ws: &conf::QwpWsConfig) -> conf::QwpWsConfig {
+    let mut effective = qwp_ws.clone();
+    if matches!(
+        &effective.initial_connect_retry,
+        ConfigSetting::Defaulted(_)
+    ) && qwp_ws_reconnect_policy_was_specified(qwp_ws)
+    {
+        effective.initial_connect_retry =
+            ConfigSetting::Defaulted(conf::QwpWsInitialConnectMode::Sync);
+    }
+    effective
+}
+
+/// Accumulates parameters for a new `Sender`.
 ///
-/// You can also create the builder from a config string.
+/// Most callers should use [`SenderBuilder::from_conf`] with a connect
+/// string; the per-key methods on this builder are for callers that
+/// need to configure programmatically.
 ///
 /// ```no_run
 /// # use questdb::Result;
 /// use questdb::ingress::SenderBuilder;
-///
 /// # fn main() -> Result<()> {
-/// let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+/// # #[cfg(feature = "sync-sender-qwp-ws")] {
+/// let _sender = SenderBuilder::from_conf("ws::addr=localhost:9000;")?.build()?;
+/// # }
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// Or create it from the `QDB_CLIENT_CONF` environment variable.
-///
-/// ```no_run
-/// # use questdb::Result;
-/// use questdb::ingress::SenderBuilder;
-///
-/// # fn main() -> Result<()> {
-/// // export QDB_CLIENT_CONF="https::addr=localhost:9000;"
-/// let mut sender = SenderBuilder::from_env()?.build()?;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// The `SenderBuilder` can also be built programmatically.
-/// The minimum required parameters are the protocol, host, and port.
-///
-/// ```no_run
-/// # use questdb::Result;
-/// use questdb::ingress::SenderBuilder;
-/// use questdb::ingress::Protocol;
-///
-/// # fn main() -> Result<()> {
-/// # #[cfg(feature = "sync-sender-http")] {
-/// let mut sender = SenderBuilder::new(Protocol::Http, "localhost", 9000).build()?;
-/// # }
-/// # #[cfg(all(not(feature = "sync-sender-http"), feature = "sync-sender-tcp"))] {
-/// let mut sender = SenderBuilder::new(Protocol::Tcp, "localhost", 9009).build()?;
-/// # }
-/// # Ok(())
-/// # }
-/// ```
+/// See the
+/// [Rust client guide](https://questdb.com/docs/connect/clients/rust/)
+/// for the full configuration reference.
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
     protocol: Protocol,
@@ -609,44 +608,26 @@ pub struct SenderBuilder {
 }
 
 impl SenderBuilder {
-    /// Create a new `SenderBuilder` instance from the configuration string.
+    /// Build a `SenderBuilder` from a connect string.
     ///
-    /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
+    /// Connect strings have the form
+    /// `"<transport>::addr=host:port;key=value;...;"`. The recommended
+    /// transport is QWP/WebSocket (`ws::` / `wss::`); ILP/HTTP
+    /// (`http::` / `https::`), ILP/TCP (`tcp::` / `tcps::`), and QWP/UDP
+    /// (`qwpudp::`) are also accepted when their Cargo features are
+    /// enabled.
     ///
-    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// `"qwpudp"`, `"qwpws"`, `"qwpwss"`, and the QWP/WebSocket aliases
-    /// `"ws"` / `"wss"` when the corresponding sender features are enabled.
+    /// See the
+    /// [connect-string reference](https://questdb.com/docs/connect/clients/connect-string/)
+    /// for the full key list. Some QWP-specific keys (e.g. `sf_dir`,
+    /// `sender_id`, `in_flight_window`) are accepted only through the
+    /// connect string and not through a builder method.
     ///
-    /// We recommend HTTP for most cases because it provides more features, like
-    /// reporting errors to the client and supporting transaction control. TCP can
-    /// sometimes be faster in higher-latency networks, but misses a number of
-    /// features.
+    /// You can also load the configuration from an environment variable.
+    /// See [`SenderBuilder::from_env`].
     ///
-    /// Many accepted keys match one-for-one with the methods on `SenderBuilder`.
-    /// For example, this is a valid configuration string:
-    ///
-    /// "https::addr=host:port;username=alice;password=secret;"
-    ///
-    /// and there are matching methods [SenderBuilder::username] and
-    /// [SenderBuilder::password]. The value of `addr=` is supplied directly to the
-    /// `SenderBuilder` constructor, so there's no matching method for that.
-    ///
-    /// Some QWP/WebSocket configuration keys are accepted only through the
-    /// configuration string, primarily for compatibility with Java-style
-    /// configuration names and settings without a public Rust builder method.
-    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_bytes`,
-    /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
-    /// `auth_timeout_ms`, `close_flush_timeout_millis`, `request_durable_ack`,
-    /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
-    /// `max_background_drainers`, `error_inbox_capacity`, and
-    /// `max_schemas_per_connection`.
-    ///
-    /// You can also load the configuration from an environment variable. See
-    /// [`SenderBuilder::from_env`].
-    ///
-    /// Once you have a `SenderBuilder` instance, you can further customize it
-    /// before calling [`SenderBuilder::build`], but you can't change any settings
-    /// that are already set in the config string.
+    /// Settings already supplied via the connect string cannot be
+    /// overridden by subsequent builder calls.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf = conf.as_ref();
         #[cfg(feature = "_sender-qwp-ws")]
@@ -952,25 +933,11 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    /// Create a new `SenderBuilder` instance with the provided QuestDB
-    /// server and port, using ILP over the specified protocol.
+    /// Create a `SenderBuilder` with the given transport, host, and
+    /// port.
     ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// use questdb::ingress::{Protocol, SenderBuilder};
-    ///
-    /// # fn main() -> Result<()> {
-    /// # #[cfg(feature = "sync-sender-tcp")] {
-    /// let mut sender = SenderBuilder::new(
-    ///     Protocol::Tcp, "localhost", 9009).build()?;
-    /// # }
-    /// # #[cfg(all(not(feature = "sync-sender-tcp"), feature = "sync-sender-http"))] {
-    /// let mut sender = SenderBuilder::new(
-    ///     Protocol::Http, "localhost", 9000).build()?;
-    /// # }
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// Most callers should use [`SenderBuilder::from_conf`] or
+    /// [`Sender::from_conf`] instead.
     pub fn new<H: Into<String>, P: Into<Port>>(protocol: Protocol, host: H, port: P) -> Self {
         let host = host.into();
         let port: Port = port.into();
@@ -1079,12 +1046,11 @@ impl SenderBuilder {
 
     /// Set the username for authentication.
     ///
-    /// For TCP, this is the `kid` part of the ECDSA key set.
-    /// The other fields are [`token`](SenderBuilder::token), [`token_x`](SenderBuilder::token_x),
-    /// and [`token_y`](SenderBuilder::token_y).
-    ///
-    /// For HTTP, this is a part of basic authentication.
-    /// See also: [`password`](SenderBuilder::password).
+    /// For QWP/WebSocket and ILP/HTTP this is the basic-auth username;
+    /// pair with [`password`](SenderBuilder::password). For ILP/TCP this
+    /// is the `kid` part of the ECDSA key set; pair with
+    /// [`token`](SenderBuilder::token) / [`token_x`](SenderBuilder::token_x)
+    /// / [`token_y`](SenderBuilder::token_y).
     pub fn username(mut self, username: &str) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("username")?;
@@ -1093,8 +1059,8 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Set the password for basic HTTP authentication.
-    /// See also: [`username`](SenderBuilder::username).
+    /// Set the password for basic authentication (QWP/WebSocket or
+    /// ILP/HTTP). See also: [`username`](SenderBuilder::username).
     pub fn password(mut self, password: &str) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("password")?;
@@ -1103,8 +1069,11 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Set the Token (Bearer) Authentication parameter for HTTP,
-    /// or the ECDSA private key for TCP authentication.
+    /// Set the bearer-token authentication value for QWP/WebSocket or
+    /// ILP/HTTP. On ILP/TCP this is the ECDSA private key (the `d`
+    /// component), used with [`username`](SenderBuilder::username) /
+    /// [`token_x`](SenderBuilder::token_x) /
+    /// [`token_y`](SenderBuilder::token_y).
     pub fn token(mut self, token: &str) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("token")?;
@@ -1159,15 +1128,14 @@ impl SenderBuilder {
         }
     }
 
-    /// Sets the protocol version for ILP transports.
-    /// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**).
-    ///   You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
-    /// - TCP transport does not negotiate the protocol version and uses [`ProtocolVersion::V1`] by
-    ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
-    ///   arrays.
-    /// - QWP/UDP does not support explicit `protocol_version` configuration.
+    /// Set the ILP protocol version.
     ///
-    /// **Note**: QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support.
+    /// Applies only to the legacy ILP transports. ILP/HTTP auto-negotiates
+    /// by default (leave unset). ILP/TCP defaults to
+    /// [`ProtocolVersion::V1`]; set [`ProtocolVersion::V2`] for arrays
+    /// (server 9.0.0+) or [`ProtocolVersion::V3`] for decimals
+    /// (server 9.2.0+). QWP transports negotiate during handshake and do
+    /// not honour this setting.
     pub fn protocol_version(mut self, protocol_version: ProtocolVersion) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
         self.reject_if_qwp_udp("protocol_version")?;
@@ -1505,7 +1473,8 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Retry the initial connection using the reconnect policy. Default false.
+    /// Retry the initial connection using the reconnect policy. Defaults to
+    /// false unless a `reconnect_*` setting was specified.
     pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
@@ -1764,9 +1733,9 @@ impl SenderBuilder {
     /// The maximum buffered size that the client will flush to the server.
     /// The default is 100 MiB.
     ///
-    /// For ILP this applies to the exact pending byte length.
-    /// For QWP/UDP this applies to the buffer size hint exposed by [`Buffer::len`].
     /// For QWP/WebSocket this applies to the encoded replay message size.
+    /// For QWP/UDP this applies to the buffer size hint exposed by [`Buffer::len`].
+    /// For ILP this applies to the exact pending byte length.
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
         let min = 1024;
         if value < min {
@@ -1779,11 +1748,12 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// The maximum length of a table or column name in bytes.
-    /// Matches the `cairo.max.file.name.length` setting in the server.
-    /// The default is 127 bytes.
-    /// If running over HTTP and protocol version 2 is auto-negotiated, this
-    /// value is picked up from the server.
+    /// Maximum length of a table or column name in bytes.
+    ///
+    /// Matches the server's `cairo.max.file.name.length` setting; the
+    /// default is 127 bytes. ILP/HTTP with auto-negotiated protocol
+    /// version 2 picks this up from the server; other transports use the
+    /// configured (or default) value.
     pub fn max_name_len(mut self, value: usize) -> Result<Self> {
         if value < 16 {
             return Err(error::fmt!(
@@ -1979,10 +1949,9 @@ impl SenderBuilder {
     #[cfg(feature = "_sync-sender")]
     /// Build the sender.
     ///
-    /// In the case of TCP, this synchronously establishes the TCP connection, and
-    /// returns once the connection is fully established. If the connection
-    /// requires authentication or TLS, these will also be completed before
-    /// returning.
+    /// For ILP/TCP and QWP/WebSocket this synchronously establishes the
+    /// connection (including any authentication and TLS handshake) and
+    /// returns once it is fully established.
     pub fn build(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
@@ -2108,7 +2077,8 @@ impl SenderBuilder {
                         "QWP/WebSocket configuration is missing."
                     ));
                 };
-                reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
+                let qwp_ws = qwp_ws_effective_config(qwp_ws);
+                reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
                     if *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async {
@@ -2122,7 +2092,7 @@ impl SenderBuilder {
                         self.port.as_str(),
                         matches!(self.protocol, Protocol::QwpWss),
                         tls_settings,
-                        qwp_ws,
+                        &qwp_ws,
                         basic_auth,
                     )?))
                 } else {
@@ -2131,7 +2101,7 @@ impl SenderBuilder {
                         self.port.as_str(),
                         matches!(self.protocol, Protocol::QwpWss),
                         tls_settings,
-                        qwp_ws,
+                        &qwp_ws,
                         basic_auth,
                     )?
                 }

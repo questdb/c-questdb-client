@@ -34,6 +34,16 @@ search = "https://github.com/questdb/c-questdb-client/blob/{current_version}/que
 replace = "https://github.com/questdb/c-questdb-client/blob/{new_version}/questdb-rs/"
 
 [[tool.bumpversion.files]]
+filename = "questdb-rs/src/ingress/mod.md"
+search = "https://github.com/questdb/c-questdb-client/tree/{current_version}/"
+replace = "https://github.com/questdb/c-questdb-client/tree/{new_version}/"
+
+[[tool.bumpversion.files]]
+filename = "questdb-rs/src/ingress/mod.md"
+search = "https://github.com/questdb/c-questdb-client/blob/{current_version}/"
+replace = "https://github.com/questdb/c-questdb-client/blob/{new_version}/"
+
+[[tool.bumpversion.files]]
 filename = "questdb-rs-ffi/Cargo.toml"
 search = "version = \"{current_version}\""
 replace = "version = \"{new_version}\""

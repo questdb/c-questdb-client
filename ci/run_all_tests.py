@@ -40,11 +40,19 @@ def main():
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-native-certs,sync-sender',
             '--', '--nocapture', cwd='questdb-rs')
+    # Narrow single-transport matrix legs: verify the library compiles
+    # and tests pass when a downstream consumer enables only ILP/TCP or
+    # only ILP/HTTP. Skip doctests via `--lib --tests --examples` -- the
+    # crate-level docs describe QWP/WebSocket (the default transport) so
+    # they assume `sync-sender-qwp-ws` is enabled, which docs.rs builds
+    # with anyway (see Cargo.toml `package.metadata.docs.rs`).
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-tcp',
+            '--lib', '--tests', '--examples',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--no-default-features',
             '--features=ring-crypto,tls-webpki-certs,sync-sender-http',
+            '--lib', '--tests', '--examples',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
