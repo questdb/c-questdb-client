@@ -25,7 +25,17 @@ import struct
 from typing import Any, List, Optional, Tuple
 
 import numpy as np  # used to render FLOAT in the short f32 form /exec uses
-from questdb_line_sender import _DLL  # type: ignore[attr-defined]
+# Reuse the sender module's struct types (and its already-installed argtypes
+# for `line_sender_utf8_init` / `line_sender_error_msg` / `line_sender_error_free`).
+# ctypes treats two structurally-identical `Structure` subclasses as distinct
+# types, so a parallel set of definitions here would silently override the
+# sender's argtypes the moment this module is imported, then break every
+# subsequent sender-side call with `TypeError: expected LP__LineSenderUtf8 ...`.
+from questdb_line_sender import (  # type: ignore[attr-defined]
+    _DLL,
+    c_line_sender_error as _LineSenderError,
+    c_line_sender_utf8 as _LineSenderUtf8,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +117,8 @@ class _LineReaderError(ctypes.Structure):
     pass
 
 
-# `line_sender_utf8` from `line_sender.h` (the reader API reuses it).
-class _LineSenderUtf8(ctypes.Structure):
-    _fields_ = [("len", _c_size_t), ("buf", _c_char_p)]
-
-
-class _LineSenderError(ctypes.Structure):
-    pass
+# `line_sender_utf8` / `line_sender_error` come from the sender module so the
+# reader and sender share a single ctypes type per C struct (see import above).
 
 
 # `line_reader_column_data` from `line_reader.h:1156`.
@@ -174,18 +179,12 @@ def _setsig(name: str, restype, *argtypes) -> None:
     fn.argtypes = argtypes
 
 
-# UTF-8 helper (re-used from ingress).
-_setsig(
-    "line_sender_utf8_init",
-    _c_bool,
-    ctypes.POINTER(_LineSenderUtf8),
-    _c_size_t,
-    _c_char_p,
-    ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
-)
-_setsig("line_sender_error_msg", _c_char_p, ctypes.POINTER(_LineSenderError),
-        ctypes.POINTER(_c_size_t))
-_setsig("line_sender_error_free", None, ctypes.POINTER(_LineSenderError))
+# `line_sender_utf8_init`, `line_sender_error_msg`, `line_sender_error_free`
+# already have their argtypes installed by `questdb_line_sender._setup_cdll`.
+# Don't re-register them: ctypes uses one function object per DLL symbol, so
+# a second `argtypes = ...` here would clobber the sender's and break every
+# sender-side call (the reader and sender now share the underlying struct
+# types, but the sender's signatures stay the source of truth).
 
 # Reader lifecycle.
 _setsig(
