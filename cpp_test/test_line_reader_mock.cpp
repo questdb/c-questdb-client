@@ -4054,15 +4054,6 @@ TEST_CASE("mock: array accessors on a scalar column raise")
     CHECK_THROWS_AS(col.elements<double>(0, &dummy), eg::line_reader_error);
 }
 
-namespace
-{
-template <class... Fs> struct overload : Fs...
-{
-    using Fs::operator()...;
-};
-template <class... Fs> overload(Fs...) -> overload<Fs...>;
-} // namespace
-
 TEST_CASE(
     "mock: column::visit dispatches to the matching typed view per kind")
 {
@@ -4122,7 +4113,7 @@ TEST_CASE(
     REQUIRE(batch.column_count() == 9);
 
     auto tag_of = [](const eg::column& col) -> std::string {
-        return col.visit(overload{
+        return col.visit(eg::overload{
             [](eg::fixed_view<uint8_t>)  { return std::string{"bool"}; },
             [](eg::fixed_view<int8_t>)   { return std::string{"byte"}; },
             [](eg::fixed_view<int16_t>)  { return std::string{"short"}; },
@@ -4152,7 +4143,7 @@ TEST_CASE(
     CHECK(tag_of(batch.column(8)) == "symbol");
 
     // Sanity: the dispatched view actually yields the right value.
-    batch.column(1).visit(overload{
+    batch.column(1).visit(eg::overload{
         [](eg::fixed_view<int32_t> v) {
             REQUIRE(v.row_count == 1);
             REQUIRE_FALSE(v.is_null(0));
@@ -4162,7 +4153,7 @@ TEST_CASE(
             FAIL("INT column did not dispatch to fixed_view<int32_t>");
         },
     });
-    batch.column(4).visit(overload{
+    batch.column(4).visit(eg::overload{
         [](eg::decimal_view v) {
             CHECK(v.kind == eg::column_kind::decimal64);
             CHECK(v.value_stride == 8);
@@ -4172,7 +4163,7 @@ TEST_CASE(
             FAIL("DECIMAL64 column did not dispatch to decimal_view");
         },
     });
-    batch.column(8).visit(overload{
+    batch.column(8).visit(eg::overload{
         [](eg::symbol_view v) {
             const auto x = v.resolve(0);
             REQUIRE(x);
@@ -4202,7 +4193,7 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
 
-    batch_opt->column(0).visit(overload{
+    batch_opt->column(0).visit(eg::overload{
         [](eg::array_view<double> v) {
             REQUIRE(v.row_count == 1);
             const auto e = v.elements(0);

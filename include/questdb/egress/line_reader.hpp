@@ -257,6 +257,29 @@ private:
 template <typename T>
 using nullable = std::optional<T>;
 
+/**
+ * Variant-style visitor helper for `column::visit`. Combines several
+ * lambdas into a single callable whose `operator()` resolves by
+ * argument type:
+ *
+ *     col.visit(eg::overload{
+ *         [](eg::fixed_view<int32_t> v) { ... },
+ *         [](eg::varlen_view v)         { ... },
+ *         [](auto&&)                    { ... }, // catch-all
+ *     });
+ *
+ * C++17 deduction-guided. Equivalent to the textbook
+ * `template<class... Fs> struct overload : Fs... { using Fs::operator()...; };`
+ * pattern but spelled once here so callers don't have to re-declare it.
+ */
+template <typename... Fs>
+struct overload : Fs...
+{
+    using Fs::operator()...;
+};
+template <typename... Fs>
+overload(Fs...) -> overload<Fs...>;
+
 class cursor;           // fwd
 class query;            // fwd
 class batch;            // fwd
@@ -629,6 +652,18 @@ public:
     {
         return reader{
             line_reader_error::wrapped_call(::line_reader_from_env)};
+    }
+
+    /**
+     * Shortcut factory equivalent to `reader{utf8_view{conf}}`. Lets
+     * callers pass a string literal / `std::string` / `string_view`
+     * directly instead of wrapping it manually:
+     *
+     *     auto r = eg::reader::open("ws::addr=localhost:9000;");
+     */
+    static reader open(std::string_view conf)
+    {
+        return reader{::questdb::ingress::utf8_view{conf}};
     }
 
     reader(const reader&) = delete;
@@ -2244,6 +2279,42 @@ public:
         if (d.kind == ::line_reader_column_kind_symbol)
             dict = symbol_dict();
         return egress::column::make_scalar(d, dict);
+    }
+
+    /**
+     * Look up a column by name. O(N) over `column_count()`, intended
+     * for the common case where N is small (typically < 50). For tight
+     * loops cache the index from a one-time lookup.
+     * @throws line_reader_error with `invalid_api_call` if no column
+     *         matches `name`.
+     */
+    egress::column column_by_name(std::string_view name) const
+    {
+        const size_t n = column_count();
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (column_name(i) == name)
+                return column(i);
+        }
+        throw line_reader_error{
+            error_code::invalid_api_call,
+            "batch::column_by_name: no column named '" + std::string{name} +
+                "'"};
+    }
+
+    /**
+     * Look up a column by name without throwing. Returns `std::nullopt`
+     * when no column matches.
+     */
+    nullable<egress::column> try_column_by_name(std::string_view name) const
+    {
+        const size_t n = column_count();
+        for (size_t i = 0; i < n; ++i)
+        {
+            if (column_name(i) == name)
+                return column(i);
+        }
+        return std::nullopt;
     }
 
     /** Snapshot the connection-scoped symbol dictionary. */

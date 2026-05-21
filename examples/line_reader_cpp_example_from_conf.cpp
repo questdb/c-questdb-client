@@ -7,7 +7,8 @@ int main()
 {
     try
     {
-        questdb::egress::reader reader{"ws::addr=localhost:9000;"_utf8};
+        auto reader =
+            questdb::egress::reader::open("ws::addr=localhost:9000;");
         auto cur = reader.execute(
             "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)"_utf8);
 

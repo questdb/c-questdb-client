@@ -41,14 +41,6 @@ using namespace questdb::ingress::literals;
 namespace
 {
 
-template <class... Fs>
-struct overload : Fs...
-{
-    using Fs::operator()...;
-};
-template <class... Fs>
-overload(Fs...) -> overload<Fs...>;
-
 template <typename T>
 T load_unaligned(const T* p)
 {
@@ -70,7 +62,7 @@ void print_hex(const uint8_t* p, size_t n)
 void print_column(const eg::column& col)
 {
     col.visit(
-        overload{
+        eg::overload{
             // Fixed-width primitives — one lambda per `T`.
             [](eg::fixed_view<uint8_t> v) {
                 for (size_t r = 0; r < v.row_count; ++r)
@@ -264,7 +256,7 @@ int main()
 {
     try
     {
-        eg::reader reader{"ws::addr=localhost:9000;"_utf8};
+        auto reader = eg::reader::open("ws::addr=localhost:9000;");
         auto cur = reader.execute(
             "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)"_utf8);
 
