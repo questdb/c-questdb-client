@@ -52,6 +52,8 @@ pub mod config;
 pub(crate) mod decoder;
 pub mod error;
 pub(crate) mod gorilla;
+#[cfg(feature = "sync-reader-ws")]
+pub mod pipelined_reader;
 pub(crate) mod query_request;
 #[cfg(feature = "sync-reader-ws")]
 pub mod reader;
@@ -89,6 +91,12 @@ pub use config::{
 };
 pub use error::{Error, ErrorCode, Result};
 #[cfg(feature = "sync-reader-ws")]
+pub use pipelined_reader::{
+    DEFAULT_EVENT_CHANNEL_CAPACITY, Event as PipelinedEvent, OwnedBatch, PipelinedCursor,
+    PipelinedFailoverResetCallback, PipelinedQuery, PipelinedReader, PipelinedTerminal, SchemaRef,
+    SymbolDictRef,
+};
+#[cfg(feature = "sync-reader-ws")]
 pub use reader::{
     BatchView, Cursor, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ReaderQuery,
     ReaderStats, Terminal,
@@ -97,16 +105,20 @@ pub use server_event::{ServerInfo, ServerRole};
 pub use symbol_dict::{SymbolDict, SymbolEntry};
 
 /// Decoder internals re-exported for the in-crate criterion benchmark
-/// at `benches/decoder.rs`. **Not** a public API surface: the names
-/// are prefixed `_` and the module is `#[doc(hidden)]` precisely so
-/// downstream consumers don't reach into it. May be renamed or
-/// removed without notice; everything in here moves on the same
-/// stability footing as `pub(crate)`.
+/// at `benches/decoder.rs` and for the `questdb-rs-ffi` test suite
+/// (which needs synthetic `OwnedBatch`es to exercise the per-row FFI
+/// getters without spinning up a real connection). **Not** a public
+/// API surface: the names are prefixed `_` and the module is
+/// `#[doc(hidden)]` precisely so downstream consumers don't reach
+/// into it. May be renamed or removed without notice; everything in
+/// here moves on the same stability footing as `pub(crate)`.
 #[doc(hidden)]
 #[cfg(feature = "sync-reader-ws")]
 pub mod _bench_internals {
-    pub use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
-    pub use crate::egress::schema::SchemaRegistry;
+    pub use crate::egress::decoder::{
+        ColumnBuffer, DecodedBatch, DecodedColumn, ZstdScratch, decode_result_batch,
+    };
+    pub use crate::egress::schema::{Schema, SchemaColumn, SchemaRegistry};
     pub use crate::egress::symbol_dict::SymbolDict;
     pub use bytes::Bytes;
 }
