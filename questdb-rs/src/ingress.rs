@@ -190,7 +190,7 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
         ));
     }
 
-    for &param in ["auto_flush_rows", "auto_flush_bytes"].iter() {
+    for &param in ["auto_flush_rows", "auto_flush_bytes", "auto_flush_interval"].iter() {
         if params.contains_key(param) {
             return Err(error::fmt!(
                 ConfigError,
@@ -203,7 +203,12 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
 }
 
 /// Protocol used to communicate with the QuestDB server.
+///
+/// `#[non_exhaustive]` so new wire protocols can be added without breaking
+/// exhaustive matches in downstream code (the surface already covers ILP/TCP,
+/// ILP/HTTP, QWP/UDP, and QWP/WS, and is expected to grow).
 #[derive(PartialEq, Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Protocol {
     #[cfg(feature = "_sender-tcp")]
     /// ILP over TCP (streaming).
@@ -378,14 +383,22 @@ impl Protocol {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
-struct QwpWsAddrScan {
-    addr_values: Vec<String>,
-    sanitized_conf: String,
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+pub(crate) struct QwpWsAddrScan {
+    pub(crate) addr_values: Vec<String>,
+    pub(crate) sanitized_conf: String,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
-fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan>> {
+/// Pre-scan a raw connect string for repeated `addr=...` params. Returns the
+/// full list of addr values and a sanitized conf with duplicate `addr=` params
+/// removed (the first one is kept so the downstream `questdb_confstr` parser
+/// still sees a value).
+///
+/// Triggered when the schema is one of `qwpws`, `qwpwss`, `ws`, or `wss`; for
+/// any other schema (or a malformed conf), returns `None` and the caller
+/// should fall back to the standard `params.get("addr")` flow.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+pub(crate) fn scan_qwp_ws_addr_params(conf: &str) -> Result<Option<QwpWsAddrScan>> {
     let Some((service, params)) = conf.split_once("::") else {
         return Ok(None);
     };
@@ -574,6 +587,7 @@ pub struct SenderBuilder {
     host: ConfigSetting<String>,
     port: ConfigSetting<String>,
     net_interface: ConfigSetting<Option<String>>,
+    init_buf_size: ConfigSetting<usize>,
     max_buf_size: ConfigSetting<usize>,
     max_name_len: ConfigSetting<usize>,
     auth_timeout: ConfigSetting<Duration>,
@@ -594,6 +608,12 @@ pub struct SenderBuilder {
 
     tls_ca: ConfigSetting<CertificateAuthority>,
     tls_roots: ConfigSetting<Option<PathBuf>>,
+
+    /// Password unlocking a JKS / PKCS#12 keystore named by
+    /// `tls_roots`. QWP/WebSocket only — other transports keep PEM
+    /// as the sole `tls_roots` format.
+    #[cfg(feature = "_sender-qwp-ws")]
+    tls_roots_password: ConfigSetting<Option<String>>,
 
     #[cfg(feature = "_sender-http")]
     http: Option<conf::HttpConfig>,
@@ -787,10 +807,7 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "max_background_drainers" => builder.max_background_drainers(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "error_inbox_capacity" => builder.reject_unsupported_qwp_ws_setting(
-                    "error_inbox_capacity",
-                    "Java-style async error inbox configuration is not implemented",
-                )?,
+                "error_inbox_capacity" => builder.error_inbox_capacity(val)?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -805,12 +822,7 @@ impl SenderBuilder {
                 },
                 "max_name_len" => builder.max_name_len(parse_conf_value(key, val)?)?,
 
-                "init_buf_size" => {
-                    return Err(error::fmt!(
-                        ConfigError,
-                        "\"init_buf_size\" is not supported in config string"
-                    ));
-                }
+                "init_buf_size" => builder.init_buf_size(parse_conf_value(key, val)?)?,
 
                 "max_buf_size" => builder.max_buf_size(parse_conf_value(key, val)?)?,
 
@@ -909,10 +921,19 @@ impl SenderBuilder {
                 }
 
                 "tls_roots_password" => {
-                    return Err(error::fmt!(
-                        ConfigError,
-                        "\"tls_roots_password\" is not supported."
-                    ));
+                    #[cfg(feature = "_sender-qwp-ws")]
+                    {
+                        builder.tls_roots_password(val.to_string())?
+                    }
+                    #[cfg(not(feature = "_sender-qwp-ws"))]
+                    {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "\"tls_roots_password\" is only supported for QWP/WebSocket \
+                             (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                             unencrypted PEM via rustls."
+                        ));
+                    }
                 }
 
                 #[cfg(feature = "sync-sender-http")]
@@ -929,6 +950,10 @@ impl SenderBuilder {
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
+                #[cfg(feature = "sync-sender-http")]
+                "retry_max_backoff_millis" => {
+                    builder.retry_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?
+                }
 
                 // Ignore other parameters.
                 // We don't want to fail on unknown keys as this would require releasing different
@@ -936,6 +961,11 @@ impl SenderBuilder {
                 // even if it's not used.
                 _ => builder,
             };
+        }
+
+        #[cfg(feature = "_sender-qwp-ws")]
+        if let Some(qwp_ws) = builder.qwp_ws.as_mut() {
+            qwp_ws.apply_reconnect_implies_initial_retry();
         }
 
         Ok(builder)
@@ -990,6 +1020,7 @@ impl SenderBuilder {
             host: ConfigSetting::new_specified(host),
             port: ConfigSetting::new_specified(port),
             net_interface: ConfigSetting::new_default(None),
+            init_buf_size: ConfigSetting::new_default(64 * 1024),
             max_buf_size: ConfigSetting::new_default(100 * 1024 * 1024),
             max_name_len: ConfigSetting::new_default(MAX_NAME_LEN_DEFAULT),
             auth_timeout: ConfigSetting::new_default(Duration::from_secs(15)),
@@ -1010,6 +1041,9 @@ impl SenderBuilder {
 
             tls_ca: ConfigSetting::new_default(tls_ca),
             tls_roots: ConfigSetting::new_default(None),
+
+            #[cfg(feature = "_sender-qwp-ws")]
+            tls_roots_password: ConfigSetting::new_default(None),
 
             #[cfg(feature = "sync-sender-http")]
             http: if protocol.is_httpx() {
@@ -1658,6 +1692,28 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    fn error_inbox_capacity(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"error_inbox_capacity\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let value: usize = parse_conf_value("error_inbox_capacity", value)?;
+        if value < conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY {
+            return Err(error::fmt!(
+                ConfigError,
+                "error_inbox_capacity must be >= {}: {value}",
+                conf::QWP_WS_MIN_ERROR_INBOX_CAPACITY
+            ));
+        }
+        qwp_ws
+            .error_inbox_capacity
+            .set_specified("error_inbox_capacity", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     fn reject_unsupported_qwp_ws_setting(
         self,
         setting_name: &'static str,
@@ -1743,6 +1799,11 @@ impl SenderBuilder {
     /// Set the path to a custom root certificate `.pem` file.
     /// This is used to validate the server's certificate during the TLS handshake.
     ///
+    /// On QWP/WebSocket (`qwpws::` / `qwpwss::`) the same path key
+    /// also accepts a JKS or PKCS#12 keystore — see
+    /// [`tls_roots_password`](SenderBuilder::tls_roots_password) for
+    /// the unlock password.
+    ///
     /// See notes on how to test with [self-signed
     /// certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
     pub fn tls_roots<P: Into<PathBuf>>(self, path: P) -> Result<Self> {
@@ -1759,6 +1820,54 @@ impl SenderBuilder {
         })?;
         builder.tls_roots.set_specified("tls_roots", Some(path))?;
         Ok(builder)
+    }
+
+    /// Set the password unlocking the JKS / PKCS#12 keystore named by
+    /// [`tls_roots`](SenderBuilder::tls_roots). QWP/WebSocket only —
+    /// other transports keep PEM as the sole `tls_roots` format.
+    ///
+    /// With this set, the `tls_roots` file is read as a Java
+    /// KeyStore (auto-detected: JKS magic `0xFEEDFEED`, or PKCS#12
+    /// ASN.1 SEQUENCE) and trusted-certificate entries become the
+    /// rustls root store. Mirrors the Java reference client's
+    /// `tls_roots_password` connect-string key.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn tls_roots_password<S: Into<String>>(mut self, password: S) -> Result<Self> {
+        if !self.protocol.is_qwp_ws() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"tls_roots_password\" is only supported for QWP/WebSocket \
+                 (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read \
+                 unencrypted PEM via rustls."
+            ));
+        }
+        self.ensure_tls_enabled("tls_roots_password")?;
+        self.tls_roots_password
+            .set_specified("tls_roots_password", Some(password.into()))?;
+        Ok(self)
+    }
+
+    /// The initial buffered size that the client will pre-allocate for new
+    /// [`Buffer`] instances returned by [`Sender::new_buffer`].
+    /// The default is 64 KiB.
+    ///
+    /// For ILP / HTTP this pre-allocates the underlying byte vector to this
+    /// size; the buffer then grows up to [`Self::max_buf_size`].
+    /// For QWP/WebSocket the value is accepted and cross-validated against
+    /// `max_buf_size`, but no flat byte buffer exists to pre-allocate
+    /// — the columnar buffer allocates per-table on first row.
+    /// For QWP/UDP the value is accepted but has no effect: datagrams are
+    /// bounded by `max_datagram_size`.
+    pub fn init_buf_size(mut self, value: usize) -> Result<Self> {
+        let min = 1024;
+        if value < min {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"init_buf_size\" must be at least {min} bytes."
+            ));
+        }
+        self.init_buf_size.set_specified("init_buf_size", value)?;
+        Ok(self)
     }
 
     /// The maximum buffered size that the client will flush to the server.
@@ -1805,6 +1914,36 @@ impl SenderBuilder {
             return Err(error::fmt!(
                 ConfigError,
                 "retry_timeout is supported only in ILP over HTTP."
+            ));
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "sync-sender-http")]
+    /// Cap on per-attempt backoff in the HTTP retry loop.
+    ///
+    /// The retry loop starts at 10 ms, doubles each attempt with ±5 ms
+    /// jitter, and is bounded by this value (default: 1 second; minimum
+    /// 10 ms — a cap below the initial interval is incoherent). Total
+    /// retry budget is independently capped by
+    /// [`SenderBuilder::retry_timeout`]; this knob shapes how aggressively
+    /// the loop hits the server while waiting out a transient failure.
+    ///
+    /// Mirrors Java's `LineSenderBuilder.maxBackoffMillis(int)`.
+    pub fn retry_max_backoff(mut self, value: Duration) -> Result<Self> {
+        if value < Duration::from_millis(10) {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"retry_max_backoff_millis\" must be at least 10."
+            ));
+        }
+        if let Some(http) = &mut self.http {
+            http.retry_max_backoff
+                .set_specified("retry_max_backoff_millis", value)?;
+        } else {
+            return Err(error::fmt!(
+                ConfigError,
+                "retry_max_backoff_millis is supported only in ILP over HTTP."
             ));
         }
         Ok(self)
@@ -1984,6 +2123,19 @@ impl SenderBuilder {
     /// requires authentication or TLS, these will also be completed before
     /// returning.
     pub fn build(&self) -> Result<Sender> {
+        // Fail fast on misconfigured buffer sizes before opening any sockets.
+        // Only enforce the init-vs-max relationship when the user explicitly
+        // set init_buf_size; a defaulted init_buf_size silently clamps to
+        // max_buf_size below.
+        if self.init_buf_size.is_specified() && *self.init_buf_size > *self.max_buf_size {
+            return Err(error::fmt!(
+                ConfigError,
+                "init_buf_size ({}) cannot exceed max_buf_size ({})",
+                *self.init_buf_size,
+                *self.max_buf_size
+            ));
+        }
+
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
         if self.protocol.tls_enabled() {
@@ -1995,6 +2147,23 @@ impl SenderBuilder {
         #[cfg(feature = "insecure-skip-verify")]
         let tls_verify = *self.tls_verify;
 
+        #[cfg(feature = "_sender-qwp-ws")]
+        let tls_roots_password = self.tls_roots_password.deref().as_deref();
+        #[cfg(not(feature = "_sender-qwp-ws"))]
+        let tls_roots_password: Option<&str> = None;
+
+        // Pair validation: the password unlocks the keystore at
+        // `tls_roots`. Without `tls_roots`, the password names no
+        // file, so the trust source falls back to the default — not
+        // what the caller asked for. Java enforces the same pairing.
+        if tls_roots_password.is_some() && self.tls_roots.deref().is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"tls_roots_password\" requires \"tls_roots\" \
+                 (the password unlocks the keystore at that path)"
+            ));
+        }
+
         #[allow(unused_variables)]
         let tls_settings = tls::TlsSettings::build(
             self.protocol.tls_enabled(),
@@ -2002,6 +2171,7 @@ impl SenderBuilder {
             tls_verify,
             *self.tls_ca,
             self.tls_roots.deref().as_deref(),
+            tls_roots_password,
         )?;
 
         let auth = self.build_auth()?;
@@ -2108,6 +2278,13 @@ impl SenderBuilder {
                         "QWP/WebSocket configuration is missing."
                     ));
                 };
+                // Builder API callers reach build() without going through
+                // from_conf, so apply the reconnect-implies-initial-retry
+                // auto-on here too. Cheap clone; a no-op when the caller
+                // already specified initial_connect_retry.
+                let mut qwp_ws = qwp_ws.clone();
+                qwp_ws.apply_reconnect_implies_initial_retry();
+                let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
@@ -2187,9 +2364,15 @@ impl SenderBuilder {
             descr.push_str("auth=off]");
         }
 
+        // Defaulted init_buf_size clamps to max_buf_size when the cap is
+        // smaller. The explicit-init-too-big check fires at the top of
+        // build(); reaching here means init_buf_size is in range.
+        let effective_init_buf_size = (*self.init_buf_size).min(*self.max_buf_size);
+
         let sender = Sender::new(
             descr,
             handler,
+            effective_init_buf_size,
             *self.max_buf_size,
             self.protocol,
             protocol_version,

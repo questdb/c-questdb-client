@@ -1164,3 +1164,75 @@ pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> 
     }
     buf
 }
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn init_buf_size_conf_string_explicit_above_max_errors() {
+    let err = crate::ingress::Sender::from_conf(
+        "tcp::addr=localhost:9009;init_buf_size=131072;max_buf_size=65536;",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert_eq!(
+        err.msg(),
+        "init_buf_size (131072) cannot exceed max_buf_size (65536)"
+    );
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn init_buf_size_builder_below_min_errors() {
+    let err =
+        crate::ingress::SenderBuilder::new(crate::ingress::Protocol::Tcp, "localhost", 9009u16)
+            .init_buf_size(512)
+            .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("init_buf_size"),
+        "unexpected msg: {}",
+        err.msg()
+    );
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn init_buf_size_builder_explicit_above_max_errors_at_build() {
+    let err =
+        crate::ingress::SenderBuilder::new(crate::ingress::Protocol::Tcp, "localhost", 9009u16)
+            .init_buf_size(200 * 1024)
+            .unwrap()
+            .max_buf_size(64 * 1024)
+            .unwrap()
+            .build()
+            .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert_eq!(
+        err.msg(),
+        "init_buf_size (204800) cannot exceed max_buf_size (65536)"
+    );
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn init_buf_size_default_clamps_when_max_is_smaller() -> TestResult {
+    // A tiny max_buf_size used to error because the defaulted init_buf_size
+    // (64 KiB) exceeded the cap; instead it must silently clamp so the cap
+    // remains the only effective ceiling.
+    let server = crate::tests::mock::MockServer::new()?;
+    let sender = server.lsb_tcp().max_buf_size(1024)?.build()?;
+    assert!(!sender.must_close());
+    Ok(())
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn init_buf_size_conf_string_accepts_paired_values() -> TestResult {
+    let server = crate::tests::mock::MockServer::new()?;
+    let conf = format!(
+        "tcp::addr=localhost:{};init_buf_size=8192;max_buf_size=65536;",
+        server.port
+    );
+    let sender = crate::ingress::Sender::from_conf(&conf)?;
+    assert!(!sender.must_close());
+    Ok(())
+}

@@ -1,6 +1,6 @@
 [package]
 name = "questdb-rs"
-version = "6.1.0"
+version = "7.0.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "QuestDB Client Library for Rust"
@@ -24,6 +24,11 @@ dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
 ryu = { version = "1.0" }
 itoa = "1.0"
+# Used in the QWP egress decoder for zero-copy slicing of frame
+# payloads. Pulled in transitively via the `_egress` feature so a
+# sender-only build (`--no-default-features --features sync-sender`)
+# does not download or compile this crate.
+bytes = { version = "1.7", optional = true }
 log = "0.4"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
@@ -44,6 +49,20 @@ rust_decimal = { version = "1.38.0", optional = true }
 bigdecimal = { version = "0.4.8", optional = true }
 crc32c = "0.6"
 memmap2 = "0.9"
+
+# Java KeyStore readers. Pulled in only for the QWP transports
+# (ingress qwp-ws and egress reader) when `tls_roots_password` is
+# used to unlock a JKS/PKCS#12 trust store. Other ILP transports
+# stick to PEM (rustls' native input).
+#
+# `jks` ships with its own PKCS#12 support via the (pre-release)
+# `p12-keystore` 0.3 line, which is currently broken in the lock
+# (`from_pkcs12` ABI mismatch). Turn that off and bind PKCS#12
+# directly through the stable `p12-keystore` 0.2.x.
+jks = { version = "0.3", default-features = false, optional = true }
+p12-keystore = { version = "0.2", optional = true }
+
+zstd = { version = "0.13", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
@@ -67,6 +86,12 @@ tempfile = "3"
 webpki-roots = "1.0.1"
 rstest = "0.26.1"
 proptest = "1.6.0"
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+ureq = { version = "3.1.2, <3.2.0", default-features = false }
+# Bench harness for `benches/decoder.rs`. `default-features=false` skips
+# `rayon` (criterion's parallel sample analyser) — the bench runs
+# sequentially anyway and skipping rayon cuts the dev-dep tree.
+criterion = { version = "0.5", default-features = false }
 
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
@@ -95,7 +120,7 @@ sync-sender-http = [
 sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
 
 ## Sync QWP/WebSocket
-sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand"]
+sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand", "_keystore-roots"]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
@@ -118,6 +143,14 @@ ring-crypto = [
 ## Allow skipping verification of insecure certificates.
 insecure-skip-verify = []
 
+## Enable rustls' `KeyLogFile`. When enabled, the client honors the
+## `SSLKEYLOGFILE` environment variable and writes per-session TLS
+## secrets to that path — letting Wireshark / tshark decrypt captures.
+## Off by default: an attacker with write access to the user's
+## environment (CI matrix, debug shell, container env, systemd unit)
+## could otherwise siphon secrets without any in-process opt-in.
+tls-key-log = []
+
 ## Enable code-generation in `build.rs` for additional tests.
 json_tests = ["bigdecimal"]
 
@@ -130,12 +163,33 @@ rust_decimal = ["dep:rust_decimal"]
 ## Enable serialization of bigdecimal::BigDecimal in ILP
 bigdecimal = ["dep:bigdecimal"]
 
+## Sync QWP egress reader over WebSocket (plain `ws://`). Does NOT
+## pull in `compression-zstd`: zstd is opt-in. Without it, the decoder
+## still compiles but rejects `FLAG_ZSTD` batches at runtime with an
+## `UnsupportedServer` error.
+sync-reader-ws = ["_egress", "_keystore-roots"]
+
+## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
+compression-zstd = ["_egress", "dep:zstd"]
+
+## Run integration tests against a real QuestDB server launched from the
+## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
+## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
+live-server-tests = [
+    "sync-reader-ws",
+    "compression-zstd",
+    "sync-sender-http",
+    "sync-sender-qwp-ws",
+]
+
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
 _sender-http = []
 _sender-qwp-udp = []
 _sender-qwp-ws = []
 _sync-sender = []
+_egress = ["dep:bytes"]
+_keystore-roots = ["dep:jks", "dep:p12-keystore"]
 
 ## Enable all cross-compatible features.
 ## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
@@ -144,6 +198,8 @@ _sync-sender = []
 ## This is useful for quickly running `cargo test` or `cargo clippy`.
 almost-all-features = [
     "sync-sender",
+    "sync-reader-ws",
+    "compression-zstd",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",
@@ -176,5 +232,40 @@ name = "protocol_version"
 required-features = ["sync-sender-http", "ndarray", "bigdecimal"]
 
 [[example]]
+name = "qwp_egress_latency"
+required-features = ["sync-reader-ws"]
+
+[[example]]
+name = "qwp_egress_failover"
+required-features = ["sync-reader-ws"]
+
+[[example]]
+name = "qwp_egress_read"
+required-features = ["sync-reader-ws", "sync-sender-http"]
+
+[[example]]
+name = "qwp_egress_read_wide"
+required-features = ["sync-reader-ws", "sync-sender-http"]
+
+[[example]]
+name = "qwp_egress_hits"
+required-features = ["sync-reader-ws"]
+
+[[example]]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws"]
+
+# Decoder microbenchmark anchoring the perf claims from commits
+# `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR
+# decode hot paths). Run with:
+#
+#   cargo bench --features sync-reader-ws --bench decoder
+#
+# The default row count (configurable via `QUESTDB_BENCH_ROWS`) is
+# below the per-batch wire cap so the bench iterates fast on CI; set
+# `QUESTDB_BENCH_ROWS=1000000` to reproduce the PR's 1M-row-per-batch
+# workload directly.
+[[bench]]
+name = "decoder"
+harness = false
+required-features = ["sync-reader-ws"]

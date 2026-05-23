@@ -19,14 +19,30 @@ def run_cmd(*args, cwd=None):
         sys.stderr.write(f'Command `{args_str}` failed with return code {cpe.returncode}.\n')
         sys.exit(cpe.returncode)
 
+def find_binary(build_dir, name, exe_suffix):
+    return next(iter(build_dir.glob(f'**/{name}{exe_suffix}')))
+
+
 def main():
     build_dir = pathlib.Path('build')
-    exe_suffix = '.exe' if platform.system() == 'Windows' else ''
-    test_line_sender_path = next(iter(
-        build_dir.glob(f'**/test_line_sender{exe_suffix}')))
     build_cxx20_dir = pathlib.Path('build_CXX20')
-    test_line_sender_path_CXX20 = next(iter(
-        build_cxx20_dir.glob(f'**/test_line_sender{exe_suffix}')))
+    exe_suffix = '.exe' if platform.system() == 'Windows' else ''
+
+    # Test binaries to invoke from each build tree. All are
+    # broker-independent or skip-on-no-broker, so they are safe to run
+    # unconditionally in CI.
+    cpp_tests = [
+        'test_line_sender',
+        'test_line_reader_offline',
+        'test_line_reader_mock',
+        'line_reader_c_smoke',
+        'test_line_reader',  # live-broker; skips per-test when no broker reachable
+    ]
+    test_paths = [
+        (d, find_binary(d, name, exe_suffix))
+        for d in (build_dir, build_cxx20_dir)
+        for name in cpp_tests
+    ]
 
     system_test_path = pathlib.Path('system_test') / 'test.py'
     qdb_v = '9.2.0'  # The version of QuestDB we'll test against.
@@ -49,8 +65,8 @@ def main():
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
-    run_cmd(str(test_line_sender_path))
-    run_cmd(str(test_line_sender_path_CXX20))
+    for _, path in test_paths:
+        run_cmd(str(path))
     run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
     # run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
 

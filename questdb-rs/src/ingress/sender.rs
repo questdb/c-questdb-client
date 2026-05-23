@@ -22,6 +22,20 @@
  *
  ******************************************************************************/
 
+// `SyncProtocolHandler` is cfg-pruned: with only `sync-sender-qwp-ws`
+// enabled, the enum has just the two `*QwpWs` variants and a number
+// of `_ =>` fallbacks here become unreachable. Suppress only in that
+// exact configuration so a regression in the multi-handler builds
+// still surfaces.
+#![cfg_attr(
+    not(any(
+        feature = "sync-sender-tcp",
+        feature = "sync-sender-http",
+        feature = "sync-sender-qwp-udp"
+    )),
+    allow(unreachable_patterns)
+)]
+
 use crate::error::{self, Result};
 #[cfg(feature = "_sync-sender")]
 use crate::ingress::SenderBuilder;
@@ -120,6 +134,7 @@ pub struct Sender {
     descr: String,
     handler: SyncProtocolHandler,
     connected: bool,
+    init_buf_size: usize,
     max_buf_size: usize,
     protocol: Protocol,
     protocol_version: ProtocolVersion,
@@ -135,9 +150,11 @@ impl Debug for Sender {
 }
 
 impl Sender {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         descr: String,
         handler: SyncProtocolHandler,
+        init_buf_size: usize,
         max_buf_size: usize,
         protocol: Protocol,
         protocol_version: ProtocolVersion,
@@ -148,6 +165,7 @@ impl Sender {
             descr,
             handler,
             connected: true,
+            init_buf_size,
             max_buf_size,
             protocol,
             protocol_version,
@@ -213,7 +231,11 @@ impl Sender {
             return Buffer::qwp_ws_with_max_name_len(self.max_name_len);
         }
 
-        Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
+        Buffer::with_init_capacity_and_max_name_len(
+            self.protocol_version,
+            self.init_buf_size,
+            self.max_name_len,
+        )
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -405,6 +427,7 @@ impl Sender {
                     bytes,
                     *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
                     *state.config.retry_timeout,
+                    *state.config.retry_max_backoff,
                 ) {
                     Ok(res) => {
                         if res.status().is_client_error() || res.status().is_server_error() {
@@ -656,6 +679,27 @@ impl Sender {
                 "qwp_ws_errors_dropped is only supported for QWP/WebSocket senders."
             )),
         }
+    }
+
+    /// Snapshot the QWP/WebSocket sender's lifetime totals.
+    ///
+    /// Mirrors the `getTotal*` counters on Java's `QwpWebSocketSender` so the
+    /// QuestDB Enterprise e2e harness (questdb-ent/e2e) can read identical
+    /// signals across language bindings. See [`QwpWsTotals`] for the field
+    /// list. Returns `InvalidApiCall` for non-QWP/WebSocket senders.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn qwp_ws_totals(&self) -> Result<QwpWsTotals> {
+        let counters = match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_counters_background(state)?,
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_counters_manual(state)?,
+            _ => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "qwp_ws_totals is only supported for QWP/WebSocket senders."
+                ));
+            }
+        };
+        Ok(counters.into())
     }
 
     /// Drive one QWP/WebSocket progress step when the sender was built with

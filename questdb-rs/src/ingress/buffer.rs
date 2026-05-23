@@ -396,6 +396,24 @@ impl Buffer {
         }
     }
 
+    /// Creates a new ILP buffer that pre-allocates its byte storage to
+    /// `init_capacity` and accepts table / column names up to `max_name_len`.
+    /// The buffer is allowed to grow past `init_capacity`; it is purely a
+    /// starting-size hint to avoid early reallocations.
+    pub fn with_init_capacity_and_max_name_len(
+        protocol_version: ProtocolVersion,
+        init_capacity: usize,
+        max_name_len: usize,
+    ) -> Self {
+        Self {
+            inner: BufferInner::Ilp(IlpBuffer::with_init_capacity_and_max_name_len(
+                protocol_version,
+                init_capacity,
+                max_name_len,
+            )),
+        }
+    }
+
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
     /// Creates a new QWP/UDP buffer with default parameters.
     pub fn new_qwp() -> Self {
@@ -427,7 +445,7 @@ impl Buffer {
         }
     }
 
-    #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+    #[cfg(any(feature = "_sender-qwp-udp", all(test, feature = "_sender-qwp-ws")))]
     pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
         match &self.inner {
             BufferInner::Ilp(_) => None,
@@ -1204,6 +1222,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         let _ = &name;
+        let _ = (lo, hi);
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
@@ -1289,9 +1308,7 @@ impl Buffer {
     /// The wire encoding writes the 4 octets as `u32::from(addr).to_le_bytes()`,
     /// matching Rust's natural Ipv4Addr packing (octet 0 in the high byte).
     ///
-    /// IPv4 (`0x18`) is part of the QWP v1 spec. Server-side ingest does not
-    /// currently implement this wire type; batches using it will be rejected
-    /// with a descriptive error. This may change in future server releases.
+    /// IPv4 (`0x18`) is part of the QWP v1 spec.
     pub fn column_ipv4<'a, N>(
         &mut self,
         name: N,
@@ -1303,6 +1320,7 @@ impl Buffer {
     {
         let _ = (&name, value);
         let packed = u32::from(value);
+        let _ = packed;
         match &mut self.inner {
             BufferInner::Ilp(_) => Err(error::fmt!(
                 InvalidApiCall,
@@ -1424,10 +1442,7 @@ impl Buffer {
 
     /// Adds a BINARY column (opaque byte sequence). QWP-only.
     ///
-    /// BINARY (`0x17`) is part of the QWP v1 spec. Server-side ingest does
-    /// not currently implement this wire type; batches using it will be
-    /// rejected with a descriptive error. This may change in future server
-    /// releases.
+    /// BINARY (`0x17`) is part of the QWP v1 spec.
     pub fn column_binary<'a, N>(&mut self, name: N, value: &[u8]) -> crate::Result<&mut Self>
     where
         N: AsRef<str> + TryInto<ColumnName<'a>>,

@@ -25,7 +25,7 @@
 use super::*;
 use crate::ErrorCode;
 
-#[cfg(feature = "sync-sender-tcp")]
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-qwp-ws"))]
 use tempfile::TempDir;
 
 #[cfg(feature = "sync-sender-http")]
@@ -227,6 +227,119 @@ fn qwpws_config_accepts_java_in_flight_window_alias() {
     assert_specified_eq(&qwp_ws.max_in_flight, 1usize);
 }
 
+/// Connect-string keys that the Rust egress reader
+/// (`crate::egress::config::ReaderConfig::from_conf`) recognizes but
+/// the ingress sender has no use for. Today the sender's catch-all
+/// silently accepts unknown keys, so each of these falls through that
+/// branch — this list pins the behavior with a regression test so a
+/// future tightening of the catch-all can't break cross-role
+/// portability of a shared connect string.
+const EGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
+    // Egress-only protocol / decoder knobs
+    "path",
+    "max_version",
+    "compression",
+    "compression_level",
+    "max_batch_rows",
+    "client_id",
+    "target",
+    "auth",
+    // Egress-only failover policy
+    "failover",
+    "failover_max_attempts",
+    "failover_backoff_initial_ms",
+    "failover_backoff_max_ms",
+    "failover_max_duration_ms",
+    // Java-egress-only decoded-batch pool size (Rust egress is sync/pull,
+    // see comment in `egress/config.rs`); still ignored on ingress
+    // because that's an egress-side concern either way.
+    "buffer_pool_size",
+    // Reserved per-category server-error policy keys
+    // (java-questdb-client design/qwp-cursor-error-api.md). Both roles
+    // silently accept them so the resolver can be wired without
+    // breaking older clients.
+    "on_server_error",
+    "on_schema_error",
+    "on_parse_error",
+    "on_internal_error",
+    "on_security_error",
+    "on_write_error",
+];
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn ingress_silently_accepts_every_egress_only_key() {
+    // Cross-role portability: a connect string tuned for the egress
+    // reader (or written for both roles) must parse on the ingress
+    // sender. Values are not inspected — the ingress role doesn't
+    // care what the reader would have done with them.
+    for key in EGRESS_ONLY_CONFIG_KEYS {
+        for val in ["1", "primary", "halt", ""] {
+            let conf = format!("http::addr=127.0.0.1;{key}={val};");
+            SenderBuilder::from_conf(&conf).unwrap_or_else(|e| {
+                panic!(
+                    "expected ingress to silently accept egress-only \
+                     key {key}={val:?}, got {}",
+                    e.msg()
+                )
+            });
+        }
+    }
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn ingress_accepts_full_egress_connect_string_unchanged() {
+    // End-to-end portability smoke test: an egress-flavoured connect
+    // string with multiple egress-only keys interleaved with shared
+    // ones parses cleanly on the ingress sender without losing the
+    // shared knobs along the way.
+    // Note: `tls_verify` is intentionally omitted — it's a shared key,
+    // but `http::` is plain (no TLS), and under feature combos that
+    // include `insecure-skip-verify` the `tls_verify` arm routes through
+    // `ensure_tls_enabled` and rejects it. The portability claim is
+    // about *egress-only* keys riding alongside genuinely-shared ones
+    // (`addr`, `username`, `password`), not about smuggling TLS knobs
+    // into a non-TLS connect string.
+    let conf = "http::addr=127.0.0.1:9000\
+        ;username=u;password=p\
+        ;path=/exec;max_version=2;compression=zstd;compression_level=3\
+        ;max_batch_rows=10000;client_id=svc-a;target=primary\
+        ;failover=on;failover_max_attempts=3\
+        ;on_schema_error=drop;on_parse_error=halt\
+        ;buffer_pool_size=8";
+    let builder = SenderBuilder::from_conf(conf).unwrap();
+    assert_eq!(builder.protocol, Protocol::Http);
+    assert_specified_eq(&builder.host, "127.0.0.1");
+    assert_specified_eq(&builder.port, "9000");
+    assert_specified_eq(&builder.username, Some("u".to_string()));
+    assert_specified_eq(&builder.password, Some("p".to_string()));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_config_silently_accepts_reserved_on_error_policy_keys() {
+    // Java parity (design/qwp-cursor-error-api.md): the per-category
+    // server-error policy keys are reserved so the same connect string
+    // can be shared across language clients regardless of which side
+    // has wired the resolver. Today the sender catches them via the
+    // generic unknown-key fallthrough — this guard locks that in.
+    for key in [
+        "on_server_error",
+        "on_schema_error",
+        "on_parse_error",
+        "on_internal_error",
+        "on_security_error",
+        "on_write_error",
+    ] {
+        for val in ["halt", "drop", "auto", "anything", ""] {
+            let conf = format!("qwpws::addr=localhost:9000;{key}={val};");
+            SenderBuilder::from_conf(&conf)
+                .unwrap_or_else(|e| panic!("expected {key}={val:?} to parse, got {}", e.msg()));
+        }
+    }
+}
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
@@ -337,18 +450,17 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
     )
     .unwrap();
-    for (conf, expected) in [
-        (
-            "qwpws::addr=localhost:9000;max_schemas_per_connection=1024;",
-            "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
-        ),
-        (
-            "qwpws::addr=localhost:9000;error_inbox_capacity=64;",
-            "\"error_inbox_capacity\" is not supported by the Rust QWP/WebSocket sync sender yet; Java-style async error inbox configuration is not implemented.",
-        ),
-    ] {
-        assert_conf_err(SenderBuilder::from_conf(conf), expected);
-    }
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_schemas_per_connection=1024;"),
+        "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
+    );
+
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=16;").unwrap();
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=15;"),
+        "error_inbox_capacity must be >= 16: 15",
+    );
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]
@@ -1010,6 +1122,10 @@ fn tcps_tls_roots_file_missing() {
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn tcps_tls_roots_file_with_password() {
+    // `tls_roots_password` is QWP/WebSocket-only — ILP/TCP and
+    // ILP/HTTP still read PEM only (rustls' native input), so a
+    // password set on TCP must surface a precise diagnostic
+    // pointing the user at the right transport.
     use std::io::Write;
 
     let tmp_dir = TempDir::new().unwrap();
@@ -1020,7 +1136,48 @@ fn tcps_tls_roots_file_with_password() {
         "tcps::addr=localhost;tls_roots={};tls_roots_password=extremely_secure;",
         path.to_str().unwrap()
     ));
-    assert_conf_err(builder_or_err, "\"tls_roots_password\" is not supported.");
+    assert_conf_err(
+        builder_or_err,
+        "\"tls_roots_password\" is only supported for QWP/WebSocket \
+         (qwpws / qwpwss). ILP/TCP and ILP/HTTP transports read unencrypted \
+         PEM via rustls.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpwss_tls_roots_password_accepted() {
+    // Smoke-test that the QWP/WebSocket path accepts the pair
+    // without erroring at parse time. Actually loading the keystore
+    // is deferred to `build()`, so we don't need a real JKS file
+    // here.
+    use std::io::Write;
+
+    let tmp_dir = TempDir::new().unwrap();
+    let path = tmp_dir.path().join("trust.jks");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"placeholder").unwrap();
+    let builder = SenderBuilder::from_conf(format!(
+        "qwpwss::addr=localhost;tls_roots={};tls_roots_password=secret;",
+        path.to_str().unwrap()
+    ))
+    .unwrap();
+    assert_specified_eq(&builder.tls_roots_password, Some("secret".to_string()));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpwss_tls_roots_password_without_path_rejected() {
+    // Java enforces the same pairing: setting the password without
+    // pointing at the file makes the password name nothing.
+    let builder_or_err =
+        SenderBuilder::from_conf("qwpwss::addr=localhost;tls_roots_password=secret;").unwrap();
+    let err = builder_or_err.build().unwrap_err();
+    assert!(
+        err.msg().contains("tls_roots_password") && err.msg().contains("tls_roots"),
+        "msg: {}",
+        err.msg()
+    );
 }
 
 #[cfg(feature = "sync-sender-http")]
@@ -1058,6 +1215,42 @@ fn http_retry_timeout() {
     assert_defaulted_eq(&http_config.request_min_throughput, 102400u64);
     assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(10000));
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
+    assert_defaulted_eq(&http_config.retry_max_backoff, Duration::from_millis(1000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn http_retry_max_backoff() {
+    let builder =
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=250;").unwrap();
+    let Some(http_config) = builder.http else {
+        panic!("Expected Some(HttpConfig)");
+    };
+    assert_specified_eq(&http_config.retry_max_backoff, Duration::from_millis(250));
+    assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn http_retry_max_backoff_below_min_rejected() {
+    let msg = "\"retry_max_backoff_millis\" must be at least 10.";
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=0;"),
+        msg,
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost;retry_max_backoff_millis=3;"),
+        msg,
+    );
+}
+
+#[cfg(all(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+#[test]
+fn retry_max_backoff_rejected_on_non_http() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;retry_max_backoff_millis=250;"),
+        "retry_max_backoff_millis is supported only in ILP over HTTP.",
+    );
 }
 
 #[cfg(feature = "sync-sender-http")]
@@ -1121,6 +1314,217 @@ fn auto_flush_bytes_unsupported() {
         SenderBuilder::from_conf("tcps::addr=localhost;auto_flush_bytes=100;"),
         "Invalid configuration parameter \"auto_flush_bytes\". This client does not support auto-flush",
     );
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn auto_flush_interval_unsupported() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;auto_flush_interval=500;"),
+        "Invalid configuration parameter \"auto_flush_interval\". This client does not support auto-flush",
+    );
+}
+
+// `reconnect_*` knobs are documented as the reconnect budget but were
+// silently ignored on the *initial* connect because `initial_connect_retry`
+// defaulted to `off`. A user setting `reconnect_max_duration_millis=120000`
+// expecting it to cover startup races against an unhealthy server got one
+// shot at the WS upgrade and no retry. `apply_reconnect_implies_initial_retry`
+// (called from `from_conf` and `build`) closes this footgun by promoting
+// `initial_connect_retry` to `Sync` whenever any `reconnect_*` key is
+// explicitly set and the user has not picked a mode themselves.
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_defaults_leave_initial_connect_retry_off() {
+    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_defaulted_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_reconnect_max_duration_implies_initial_connect_retry_sync() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+    assert_specified_eq(&qwp_ws.reconnect_max_duration, Duration::from_secs(120));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_reconnect_initial_backoff_implies_initial_connect_retry_sync() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_initial_backoff_millis=250;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_reconnect_max_backoff_implies_initial_connect_retry_sync() {
+    let builder =
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;reconnect_max_backoff_millis=10000;")
+            .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_initial_connect_retry_off_is_preserved() {
+    // Belt-and-suspenders: even when the user sets a reconnect budget,
+    // an explicit initial_connect_retry=off override must win.
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=off;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_initial_connect_retry_async_is_preserved() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;initial_connect_retry=async;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Async,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_explicit_off_before_reconnect_key_is_preserved() {
+    // Reversed key order from `qwpws_explicit_initial_connect_retry_off_is_preserved`:
+    // the override is set first, then the reconnect budget. The promotion
+    // runs after the parse loop, so the explicit `off` must still win
+    // regardless of where it appeared in the conf string.
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;initial_connect_retry=off;reconnect_max_duration_millis=120000;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_multiple_reconnect_keys_promote_once() {
+    // Setting all three reconnect_* keys at once still resolves to a
+    // single `Sync` promotion -- no interaction between the keys.
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;\
+         reconnect_max_duration_millis=120000;\
+         reconnect_initial_backoff_millis=250;\
+         reconnect_max_backoff_millis=10000;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+    assert_specified_eq(&qwp_ws.reconnect_max_duration, Duration::from_secs(120));
+    assert_specified_eq(
+        &qwp_ws.reconnect_initial_backoff,
+        Duration::from_millis(250),
+    );
+    assert_specified_eq(&qwp_ws.reconnect_max_backoff, Duration::from_secs(10));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_reconnect_implies_initial_retry_via_builder_api() {
+    // The builder API reaches `build()` without going through `from_conf`,
+    // so the promotion must also fire from there. We can't observe
+    // `build()`'s local QwpWsConfig clone directly, but the helper that
+    // implements the invariant is `pub(crate)`, so exercise it on the
+    // same `QwpWsConfig` the builder would feed in.
+    let builder = SenderBuilder::new(Protocol::QwpWs, "localhost", 9000)
+        .reconnect_max_duration(Duration::from_secs(120))
+        .unwrap();
+    let mut qwp_ws = builder.qwp_ws.as_ref().unwrap().clone();
+    // Before the promotion runs (mirrors the builder-state-at-build-time):
+    assert_defaulted_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+    qwp_ws.apply_reconnect_implies_initial_retry();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_apply_reconnect_implies_initial_retry_is_idempotent() {
+    // `from_conf` already runs the promotion at parse time; `build()`
+    // then runs it again on a clone. The second run must be a no-op
+    // when the first has already settled the value.
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;reconnect_max_duration_millis=120000;",
+    )
+    .unwrap();
+    let mut qwp_ws = builder.qwp_ws.as_ref().unwrap().clone();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+    qwp_ws.apply_reconnect_implies_initial_retry();
+    assert_specified_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Sync,
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_apply_reconnect_implies_initial_retry_no_op_without_reconnect_keys() {
+    // Defaults only: no reconnect_* key was specified, so the promotion
+    // is a no-op and `initial_connect_retry` stays `Defaulted(Off)`.
+    let mut qwp_ws = conf::QwpWsConfig::default();
+    qwp_ws.apply_reconnect_implies_initial_retry();
+    assert_defaulted_eq(
+        &qwp_ws.initial_connect_retry,
+        conf::QwpWsInitialConnectMode::Off,
+    );
+}
+
+#[test]
+fn config_setting_is_specified_reports_variant() {
+    let mut setting: ConfigSetting<u32> = ConfigSetting::new_default(7);
+    assert!(!setting.is_specified());
+    setting.set_specified("test", 42).unwrap();
+    assert!(setting.is_specified());
 }
 
 fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(

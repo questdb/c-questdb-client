@@ -1197,7 +1197,7 @@ private:
     static inline ::line_sender_utf8 name()
     {
         // Maintained by .bumpversion.cfg
-        static const char user_agent[] = "questdb/c++/6.1.0";
+        static const char user_agent[] = "questdb/c++/7.0.0";
         ::line_sender_utf8 utf8 =
             ::line_sender_utf8_assert(sizeof(user_agent) - 1, user_agent);
         return utf8;
@@ -1499,6 +1499,10 @@ public:
      * This is used to validate the server's certificate during the TLS
      * handshake.
      *
+     * On QWP/WebSocket (`qwpwss::`) the same path may instead point at
+     * a JKS or PKCS#12 keystore; pair it with `tls_roots_password()` to
+     * unlock it.
+     *
      * See notes on how to test with self-signed certificates:
      * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
      */
@@ -1506,6 +1510,22 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_tls_roots, _impl, path._impl);
+        return *this;
+    }
+
+    /**
+     * Password unlocking the JKS / PKCS#12 keystore named by
+     * `tls_roots()`. QWP/WebSocket only — calling on an ILP/TCP or
+     * ILP/HTTP sender throws.
+     *
+     * The file's format is auto-detected (JKS magic `0xFEEDFEED` or
+     * PKCS#12 ASN.1 SEQUENCE). Mirrors the Java reference client's
+     * `tls_roots_password` connect-string key.
+     */
+    opts& tls_roots_password(utf8_view password)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_tls_roots_password, _impl, password._impl);
         return *this;
     }
 
@@ -1543,6 +1563,19 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_retry_timeout, _impl, millis);
+        return *this;
+    }
+
+    /**
+     * Cap on per-attempt backoff in the HTTP retry loop, in milliseconds.
+     * Default is 1000 ms. The retry loop starts at 10 ms and doubles each
+     * attempt up to this cap; the total retry budget is independently
+     * bounded by `retry_timeout()`. ILP-over-HTTP only.
+     */
+    opts& retry_max_backoff(uint64_t millis)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_retry_max_backoff, _impl, millis);
         return *this;
     }
 

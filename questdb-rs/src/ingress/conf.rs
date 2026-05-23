@@ -48,6 +48,13 @@ impl<T: PartialEq> ConfigSetting<T> {
         ConfigSetting::Specified(value)
     }
 
+    /// `true` once the value has been explicitly set by the user (either
+    /// via the conf string or a builder method); `false` while it still
+    /// holds the default.
+    pub(crate) fn is_specified(&self) -> bool {
+        matches!(self, ConfigSetting::Specified(_))
+    }
+
     /// Set the user-defined value.
     /// Note that it can't be changed once set.
     /// If the value is already specified, returns an error.
@@ -83,6 +90,7 @@ pub(crate) struct HttpConfig {
     pub(crate) request_min_throughput: ConfigSetting<u64>,
     pub(crate) user_agent: String,
     pub(crate) retry_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) retry_max_backoff: ConfigSetting<std::time::Duration>,
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
 }
 
@@ -93,6 +101,7 @@ impl Default for HttpConfig {
             request_min_throughput: ConfigSetting::new_default(102400), // 100 KiB/s
             user_agent: concat!("questdb/rust/", env!("CARGO_PKG_VERSION")).to_string(),
             retry_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
+            retry_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(1)),
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
         }
     }
@@ -128,6 +137,10 @@ pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY: usize = 256;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_MIN_ERROR_INBOX_CAPACITY: usize = 16;
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +224,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
     pub(crate) drain_orphans: ConfigSetting<bool>,
     pub(crate) max_background_drainers: ConfigSetting<usize>,
+    pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
 }
 
@@ -245,6 +259,7 @@ impl Default for QwpWsConfig {
             max_background_drainers: ConfigSetting::new_default(
                 QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS,
             ),
+            error_inbox_capacity: ConfigSetting::new_default(QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
         }
     }
@@ -263,6 +278,29 @@ impl QwpWsConfig {
             QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES
         };
         default_max_total_bytes.max(self.sf_max_bytes.saturating_mul(2))
+    }
+
+    /// Closes a documented footgun: `reconnect_max_duration_millis` and the
+    /// other `reconnect_*` knobs only govern the *post-first-success*
+    /// reconnect loop. The initial connect is one-shot unless
+    /// `initial_connect_retry` is explicitly turned on, so a user who sets
+    /// a longer reconnect budget expecting it to also bound the first
+    /// connect silently gets no retry at all.
+    ///
+    /// Promote `initial_connect_retry` to `Sync` whenever the user
+    /// explicitly set any `reconnect_*` key and did not explicitly choose
+    /// an `initial_connect_retry` mode themselves. Explicit
+    /// `initial_connect_retry=off` is preserved.
+    pub(crate) fn apply_reconnect_implies_initial_retry(&mut self) {
+        if self.initial_connect_retry.is_specified() {
+            return;
+        }
+        let any_reconnect_specified = self.reconnect_max_duration.is_specified()
+            || self.reconnect_initial_backoff.is_specified()
+            || self.reconnect_max_backoff.is_specified();
+        if any_reconnect_specified {
+            self.initial_connect_retry = ConfigSetting::Specified(QwpWsInitialConnectMode::Sync);
+        }
     }
 }
 

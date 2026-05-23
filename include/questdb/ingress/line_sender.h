@@ -32,10 +32,26 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
-#if defined(LINESENDER_DYN_LIB) && defined(_MSC_VER)
-#    define LINESENDER_API __declspec(dllimport)
+/* `LINESENDER_DYN_LIB` is the historical name of this toggle, from when the
+   library shipped only the line sender. Accepted as an alias so consumers
+   predating the `QUESTDB_CLIENT_*` naming keep linking unchanged. */
+#if defined(LINESENDER_DYN_LIB) && !defined(QUESTDB_CLIENT_DYN_LIB)
+#    define QUESTDB_CLIENT_DYN_LIB
+#endif
+
+#if defined(QUESTDB_CLIENT_DYN_LIB) && defined(_MSC_VER)
+#    define QUESTDB_CLIENT_API __declspec(dllimport)
 #else
-#    define LINESENDER_API
+#    define QUESTDB_CLIENT_API
+#endif
+
+/* `LINESENDER_API` is the historical name of this export attribute,
+   kept as an alias for one major-version cycle so downstream wrappers
+   that reference the old macro continue to build. New code should use
+   `QUESTDB_CLIENT_API`; this alias will be removed in the next major
+   release. */
+#ifndef LINESENDER_API
+#    define LINESENDER_API QUESTDB_CLIENT_API
 #endif
 
 /////////// Pointer argument conventions.
@@ -135,6 +151,15 @@ typedef enum line_sender_protocol
 
     /** QuestWire Protocol over WebSocket Secure (TLS). */
     line_sender_protocol_qwpwss,
+
+    /**
+     * Sentinel for a protocol the Rust `Protocol` enum knows about but
+     * this FFI build does not. Returned by `line_sender_get_protocol`
+     * for future `Protocol` variants added after this FFI was compiled.
+     * Passing this value to `line_sender_opts_new` /
+     * `line_sender_opts_new_service` causes them to return NULL.
+     */
+    line_sender_protocol_unknown,
 } line_sender_protocol;
 
 /** The line protocol version used to write data to buffer. */
@@ -186,7 +211,7 @@ typedef enum line_sender_ca
 } line_sender_ca;
 
 /** Error code categorizing the error. */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 
 /**
@@ -194,11 +219,11 @@ line_sender_error_code line_sender_error_get_code(const line_sender_error*);
  * The `len_out` argument is set to the number of bytes in the string.
  * The string is NOT null-terminated.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
 
 /** Clean up the error. */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_error_free(line_sender_error*);
 
 /////////// Preparing strings and names
@@ -224,7 +249,7 @@ typedef struct line_sender_utf8
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_utf8_init(
     line_sender_utf8* str,
     size_t len,
@@ -238,7 +263,7 @@ bool line_sender_utf8_init(
  * @param[in] len Length in bytes of the buffer.
  * @param[in] buf UTF-8 encoded buffer.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
 
 #define QDB_UTF8_LITERAL(literal)                                              \
@@ -277,7 +302,7 @@ typedef struct line_sender_table_name
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_table_name_init(
     line_sender_table_name* name,
     size_t len,
@@ -292,7 +317,7 @@ bool line_sender_table_name_init(
  * @param[in] len Length in bytes of the buffer.
  * @param[in] buf UTF-8 encoded buffer.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_table_name line_sender_table_name_assert(
     size_t len, const char* buf);
 
@@ -321,7 +346,7 @@ typedef struct line_sender_column_name
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_column_name_init(
     line_sender_column_name* name,
     size_t len,
@@ -336,7 +361,7 @@ bool line_sender_column_name_init(
  * @param[in] len Length in bytes of the buffer.
  * @param[in] buf UTF-8 encoded buffer.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_column_name line_sender_column_name_assert(
     size_t len, const char* buf);
 
@@ -373,7 +398,7 @@ typedef struct line_sender_bookmark
  * For protocol-neutral construction, especially when using QWP/UDP, prefer
  * `line_sender_buffer_new_for_sender(...)`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new(
     line_sender_protocol_version version);
 
@@ -385,7 +410,7 @@ line_sender_buffer* line_sender_buffer_new(
  * For protocol-neutral construction, especially when using QWP/UDP, prefer
  * `line_sender_buffer_new_for_sender(...)`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(
     line_sender_protocol_version version, size_t max_name_len);
 
@@ -393,18 +418,18 @@ line_sender_buffer* line_sender_buffer_with_max_name_len(
  * Construct a QWP/UDP `line_sender_buffer` with fixed 127-byte name length
  * limit.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp(void);
 
 /**
  * Construct a QWP/UDP `line_sender_buffer` with a max name length limit.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
     size_t max_name_len);
 
 /** Release the `line_sender_buffer` object. */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
 
 /**
@@ -413,7 +438,7 @@ void line_sender_buffer_free(line_sender_buffer* buffer);
  * Returns NULL and populates `err_out` if `buffer` is NULL or if the
  * underlying clone panics (e.g. allocation failure).
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_clone(
     const line_sender_buffer* buffer, line_sender_error** err_out);
 
@@ -429,7 +454,7 @@ line_sender_buffer* line_sender_buffer_clone(
  * is NULL or if the underlying allocator panics (e.g. capacity overflow).
  * See: `capacity`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_reserve(
     line_sender_buffer* buffer,
     size_t additional,
@@ -442,7 +467,7 @@ bool line_sender_buffer_reserve(
  * implementation-defined capacity hint and should not be interpreted as byte
  * capacity.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
 
 /**
@@ -455,7 +480,7 @@ size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
  * returns false and sets `err_out` if provided.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_bookmark(
     line_sender_buffer* buffer,
     line_sender_bookmark* out,
@@ -466,7 +491,7 @@ bool line_sender_buffer_bookmark(
  *
  * On success, the stored bookmark is consumed.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_rewind_to_bookmark(
     line_sender_buffer* buffer,
     line_sender_bookmark bookmark,
@@ -475,7 +500,7 @@ bool line_sender_buffer_rewind_to_bookmark(
 /**
  * Discard a previously captured bookmark if it is still current.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_buffer_clear_bookmark(
     line_sender_buffer* buffer,
     line_sender_bookmark bookmark);
@@ -488,7 +513,7 @@ void line_sender_buffer_clear_bookmark(
  * established by `line_sender_buffer_bookmark()`.
  * Once the marker is no longer needed, call `clear_marker()`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_set_marker(
     line_sender_buffer* buffer, line_sender_error** err_out);
 
@@ -500,7 +525,7 @@ bool line_sender_buffer_set_marker(
  *
  * As a side-effect, this also clears the stored rewind point.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_rewind_to_marker(
     line_sender_buffer* buffer, line_sender_error** err_out);
 
@@ -508,14 +533,14 @@ bool line_sender_buffer_rewind_to_marker(
  * Discard the currently stored rewind point, including one established by
  * `line_sender_buffer_bookmark()`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 
 /**
  * Remove all accumulated data and prepare the buffer for new lines.
  * This does not affect the buffer's capacity.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_buffer_clear(line_sender_buffer* buffer);
 
 /**
@@ -524,11 +549,11 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
  * For ILP buffers this is the exact pending byte length. For QWP buffers this
  * is a buffered size hint, not the exact size of any eventual UDP datagram.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
 
 /** The number of rows accumulated in the buffer. */
-LINESENDER_API
+QUESTDB_CLIENT_API
 size_t line_sender_buffer_row_count(const line_sender_buffer* buffer);
 
 /**
@@ -538,7 +563,7 @@ size_t line_sender_buffer_row_count(const line_sender_buffer* buffer);
  * table. QWP/UDP does not support transactional flushes, so QWP buffers
  * always return `false`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
 
 /**
@@ -553,7 +578,7 @@ bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
  *         sender buffer's contents for ILP, or an empty view with `len == 0`
  *         and `buf == NULL` for QWP.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_buffer_view line_sender_buffer_peek(
     const line_sender_buffer* buffer);
 
@@ -563,7 +588,7 @@ line_sender_buffer_view line_sender_buffer_peek(
  * @param[in] buffer Line buffer object.
  * @param[in] name Table name.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_table(
     line_sender_buffer* buffer,
     line_sender_table_name name,
@@ -579,7 +604,7 @@ bool line_sender_buffer_table(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_symbol(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -595,7 +620,7 @@ bool line_sender_buffer_symbol(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_bool(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -611,7 +636,7 @@ bool line_sender_buffer_column_bool(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_i64(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -627,7 +652,7 @@ bool line_sender_buffer_column_i64(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_f64(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -639,7 +664,7 @@ bool line_sender_buffer_column_f64(
  *
  * On ILP buffers this returns line_sender_error_invalid_api_call.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_i8(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -651,7 +676,7 @@ bool line_sender_buffer_column_i8(
  *
  * On ILP buffers this returns line_sender_error_invalid_api_call.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_i16(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -663,7 +688,7 @@ bool line_sender_buffer_column_i16(
  *
  * On ILP buffers this returns line_sender_error_invalid_api_call.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_i32(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -673,7 +698,7 @@ bool line_sender_buffer_column_i32(
 /**
  * Record a 32-bit floating-point value for the given column. QWP-only.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_f32(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -689,7 +714,7 @@ bool line_sender_buffer_column_f32(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -710,7 +735,7 @@ bool line_sender_buffer_column_str(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_dec_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -729,7 +754,7 @@ bool line_sender_buffer_column_dec_str(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_dec(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -745,7 +770,7 @@ bool line_sender_buffer_column_dec(
  * magnitude must fit a signed 64-bit integer at the column's pinned scale;
  * values that do not fit return line_sender_error_invalid_api_call.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_dec64_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -760,7 +785,7 @@ bool line_sender_buffer_column_dec64_str(
  * line_sender_buffer_column_dec. Values that do not fit a signed 64-bit
  * integer at the chosen scale return line_sender_error_invalid_api_call.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_dec64(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -776,7 +801,7 @@ bool line_sender_buffer_column_dec64(
  * not fit a signed 128-bit integer at the column's pinned scale return
  * line_sender_error_invalid_api_call.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_dec128_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -787,7 +812,7 @@ bool line_sender_buffer_column_dec128_str(
 /**
  * Record an unscaled-int decimal value as DECIMAL128. QWP-only.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_dec128(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -801,7 +826,7 @@ bool line_sender_buffer_column_dec128(
  *
  * The wire encoding writes `lo` (8 bytes LE) followed by `hi` (8 bytes LE).
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_uuid(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -815,7 +840,7 @@ bool line_sender_buffer_column_uuid(
  * `value` must point to exactly 32 bytes: four 64-bit limbs encoded
  * little-endian, least-significant limb first.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_long256(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -834,7 +859,7 @@ bool line_sender_buffer_column_long256(
  * currently implement this wire type; batches using it will be rejected
  * with a descriptive error. This may change in future server releases.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_ipv4(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -844,7 +869,7 @@ bool line_sender_buffer_column_ipv4(
 /**
  * Record a DATE column value (milliseconds since the Unix epoch). QWP-only.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_date(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -854,7 +879,7 @@ bool line_sender_buffer_column_date(
 /**
  * Record a CHAR column value (single UTF-16 code unit). QWP-only.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_char(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -868,7 +893,7 @@ bool line_sender_buffer_column_char(
  * currently implement this wire type; batches using it will be rejected
  * with a descriptive error. This may change in future server releases.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_binary(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -881,7 +906,7 @@ bool line_sender_buffer_column_binary(
  *
  * `precision_bits` must be in `1..=60` and is pinned per column.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_geohash(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -906,7 +931,7 @@ bool line_sender_buffer_column_geohash(
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_i64_arr_c_major(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -926,7 +951,7 @@ bool line_sender_buffer_column_i64_arr_c_major(
  * @param[in] strides Array strides, in the unit of bytes. Strides can be
  *                    negative.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_i64_arr_byte_strides(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -947,7 +972,7 @@ bool line_sender_buffer_column_i64_arr_byte_strides(
  * @param[in] strides Array strides, in the unit of elements. Strides can be
  *                    negative.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_i64_arr_elem_strides(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -973,7 +998,7 @@ bool line_sender_buffer_column_i64_arr_elem_strides(
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_f64_arr_c_major(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -1004,7 +1029,7 @@ bool line_sender_buffer_column_f64_arr_c_major(
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_f64_arr_byte_strides(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -1036,7 +1061,7 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_f64_arr_elem_strides(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -1056,7 +1081,7 @@ bool line_sender_buffer_column_f64_arr_elem_strides(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_ts_nanos(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -1072,7 +1097,7 @@ bool line_sender_buffer_column_ts_nanos(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_column_ts_micros(
     line_sender_buffer* buffer,
     line_sender_column_name name,
@@ -1094,7 +1119,7 @@ bool line_sender_buffer_column_ts_micros(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_at_nanos(
     line_sender_buffer* buffer,
     int64_t epoch_nanos,
@@ -1115,7 +1140,7 @@ bool line_sender_buffer_at_nanos(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_at_micros(
     line_sender_buffer* buffer,
     int64_t epoch_micros,
@@ -1147,7 +1172,7 @@ bool line_sender_buffer_at_micros(
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_at_now(
     line_sender_buffer* buffer, line_sender_error** err_out);
 
@@ -1156,7 +1181,7 @@ bool line_sender_buffer_at_now(
  * If this returns false, the buffer is incomplete and cannot be sent,
  * and an error message is set to indicate the problem.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_buffer_check_can_flush(
     const line_sender_buffer* buffer, line_sender_error** err_out);
 
@@ -1249,7 +1274,7 @@ typedef struct line_sender_opts line_sender_opts;
  * For the full list of keys, search this header for `bool
  * line_sender_opts_`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_from_conf(
     line_sender_utf8 config, line_sender_error** err_out);
 
@@ -1257,7 +1282,7 @@ line_sender_opts* line_sender_opts_from_conf(
  * Create a new `line_sender_opts` instance from the configuration stored in
  * the `QDB_CLIENT_CONF` environment variable.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_from_env(line_sender_error** err_out);
 
 /**
@@ -1268,7 +1293,7 @@ line_sender_opts* line_sender_opts_from_env(line_sender_error** err_out);
  * @param[in] host The QuestDB database host.
  * @param[in] port The QuestDB port for the selected protocol.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_new(
     line_sender_protocol protocol, line_sender_utf8 host, uint16_t port);
 
@@ -1276,7 +1301,7 @@ line_sender_opts* line_sender_opts_new(
  * Create a new `line_sender_opts` instance with the given protocol,
  * hostname and service name.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_new_service(
     line_sender_protocol protocol,
     line_sender_utf8 host,
@@ -1289,7 +1314,7 @@ line_sender_opts* line_sender_opts_new_service(
  *
  * The default is `0.0.0.0`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_bind_interface(
     line_sender_opts* opts,
     line_sender_utf8 bind_interface,
@@ -1312,7 +1337,7 @@ bool line_sender_opts_bind_interface(
  * Returns `false` and sets `err_out` on constraint violation or
  * protocol mismatch.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_max_datagram_size(
     line_sender_opts* opts,
     size_t max_datagram_size,
@@ -1332,7 +1357,7 @@ bool line_sender_opts_max_datagram_size(
  * Returns `false` and sets `err_out` on constraint violation or
  * protocol mismatch.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_multicast_ttl(
     line_sender_opts* opts,
     uint32_t multicast_ttl,
@@ -1344,7 +1369,7 @@ bool line_sender_opts_multicast_ttl(
  * only supported for `line_sender_protocol_qwpws` and
  * `line_sender_protocol_qwpwss`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_qwpws_progress(
     line_sender_opts* opts,
     line_sender_qwpws_progress progress,
@@ -1355,7 +1380,7 @@ bool line_sender_opts_qwpws_progress(
  * default C callback, which writes one structured line to stderr per
  * diagnostic.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_qwpws_error_handler(
     line_sender_opts* opts,
     line_sender_qwpws_error_cb cb,
@@ -1371,7 +1396,7 @@ bool line_sender_opts_qwpws_error_handler(
  * For HTTP, this is part of basic authentication.
  * See also: `line_sender_opts_password()`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_username(
     line_sender_opts* opts,
     line_sender_utf8 username,
@@ -1381,7 +1406,7 @@ bool line_sender_opts_username(
  * Set the password for basic HTTP authentication.
  * See also: `line_sender_opts_username()`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_password(
     line_sender_opts* opts,
     line_sender_utf8 password,
@@ -1391,7 +1416,7 @@ bool line_sender_opts_password(
  * Set the Token (Bearer) Authentication parameter for HTTP,
  * or the ECDSA private key for TCP authentication.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_token(
     line_sender_opts* opts,
     line_sender_utf8 token,
@@ -1400,7 +1425,7 @@ bool line_sender_opts_token(
 /**
  * Set the ECDSA public key X for TCP authentication.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_token_x(
     line_sender_opts* opts,
     line_sender_utf8 token_x,
@@ -1409,7 +1434,7 @@ bool line_sender_opts_token_x(
 /**
  * Set the ECDSA public key Y for TCP authentication.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_token_y(
     line_sender_opts* opts,
     line_sender_utf8 token_y,
@@ -1435,7 +1460,7 @@ bool line_sender_opts_token_y(
  * QuestDB server version 9.2.0 or later is required for
  * `line_sender_protocol_version_3` support.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_protocol_version(
     line_sender_opts* opts,
     line_sender_protocol_version version,
@@ -1446,7 +1471,7 @@ bool line_sender_opts_protocol_version(
  * the TLS handshake and authentication process.
  * The value is in milliseconds, and the default is 15 seconds.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_auth_timeout(
     line_sender_opts* opts, uint64_t millis, line_sender_error** err_out);
 
@@ -1457,7 +1482,7 @@ bool line_sender_opts_auth_timeout(
  * For testing, consider specifying a path to a `.pem` file instead via
  * the `tls_roots` setting.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_tls_verify(
     line_sender_opts* opts, bool verify, line_sender_error** err_out);
 
@@ -1465,7 +1490,7 @@ bool line_sender_opts_tls_verify(
  * Specify where to find the root certificates used to validate the
  * server's TLS certificate.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_tls_ca(
     line_sender_opts* opts, line_sender_ca ca, line_sender_error** err_out);
 
@@ -1474,12 +1499,37 @@ bool line_sender_opts_tls_ca(
  * This is used to validate the server's certificate during the TLS
  * handshake.
  *
+ * On QWP/WebSocket (`qwpwss::`) the same path may instead point at a
+ * JKS or PKCS#12 keystore; pair it with
+ * `line_sender_opts_tls_roots_password` to unlock it.
+ *
  * See notes on how to test with self-signed certificates:
  * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_tls_roots(
     line_sender_opts* opts, line_sender_utf8 path, line_sender_error** err_out);
+
+/**
+ * Set the password unlocking the JKS / PKCS#12 keystore named by
+ * `line_sender_opts_tls_roots`.
+ *
+ * QWP/WebSocket only (`qwpwss::`). Calling this on an ILP/TCP or
+ * ILP/HTTP sender returns an `invalid_api_call` error: those
+ * transports read unencrypted PEM via rustls and have no keystore
+ * concept.
+ *
+ * The file's format is auto-detected: JKS magic `0xFEEDFEED`, or
+ * PKCS#12 (ASN.1 SEQUENCE). Trusted-certificate entries become
+ * rustls roots; private-key entries are ignored — this is the trust
+ * store half of the Java reference's
+ * `KeyStore.getInstance(...).load(stream, pwd)` flow.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_opts_tls_roots_password(
+    line_sender_opts* opts,
+    line_sender_utf8 password,
+    line_sender_error** err_out);
 
 /**
  * Set the maximum buffered size that the client will flush to the server.
@@ -1489,7 +1539,7 @@ bool line_sender_opts_tls_roots(
  * For QWP/UDP this applies to the buffer size hint returned by
  * `line_sender_buffer_size()`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_max_buf_size(
     line_sender_opts* opts, size_t max_buf_size, line_sender_error** err_out);
 
@@ -1497,7 +1547,7 @@ bool line_sender_opts_max_buf_size(
  * Set the maximum length of a table or column name in bytes.
  * The default is 127 bytes.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_max_name_len(
     line_sender_opts* opts, size_t max_name_len, line_sender_error** err_out);
 
@@ -1505,8 +1555,18 @@ bool line_sender_opts_max_name_len(
  * Set the cumulative duration spent in retries.
  * The value is in milliseconds, and the default is 10 seconds.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_retry_timeout(
+    line_sender_opts* opts, uint64_t millis, line_sender_error** err_out);
+
+/**
+ * Cap on per-attempt backoff in the HTTP retry loop, in milliseconds.
+ * Default is 1000 ms. The retry loop starts at 10 ms and doubles each
+ * attempt up to this cap; the total retry budget is independently
+ * bounded by `line_sender_opts_retry_timeout()`. ILP-over-HTTP only.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_opts_retry_max_backoff(
     line_sender_opts* opts, uint64_t millis, line_sender_error** err_out);
 
 /**
@@ -1519,7 +1579,7 @@ bool line_sender_opts_retry_timeout(
  *
  * See also: `line_sender_opts_request_timeout()`
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_request_min_throughput(
     line_sender_opts* opts,
     uint64_t bytes_per_sec,
@@ -1533,7 +1593,7 @@ bool line_sender_opts_request_min_throughput(
  *
  * See also: `line_sender_opts_request_min_throughput()`
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_opts_request_timeout(
     line_sender_opts* opts, uint64_t millis, line_sender_error** err_out);
 
@@ -1548,14 +1608,14 @@ bool line_sender_opts_user_agent(
  * Both old and new objects will have to be freed.
  * Returns NULL if `opts` is NULL.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_opts* line_sender_opts_clone(line_sender_opts* opts);
 
 /**
  * Release the `line_sender_opts` object.
  * Passing NULL is a no-op.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_opts_free(line_sender_opts* opts);
 
 /**
@@ -1571,7 +1631,7 @@ void line_sender_opts_free(line_sender_opts* opts);
  * @note The caller retains ownership of `opts` and must release it with
  * `line_sender_opts_free()` when it is no longer needed.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender* line_sender_build(
     const line_sender_opts* opts, line_sender_error** err_out);
 
@@ -1600,7 +1660,7 @@ line_sender* line_sender_build(
  *
  * The sender should be accessed by only a single thread a time.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender* line_sender_from_conf(
     line_sender_utf8 config, line_sender_error** err_out);
 
@@ -1615,13 +1675,13 @@ line_sender* line_sender_from_conf(
  *
  * The sender should be accessed by only a single thread a time.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
 
 /**
  * Return the sender's configured transport protocol.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_protocol line_sender_get_protocol(const line_sender* sender);
 
 /**
@@ -1640,14 +1700,14 @@ line_sender_protocol line_sender_get_protocol(const line_sender* sender);
  * HTTP). If connecting via TCP and not overridden, the value is
  * `line_sender_protocol_version_1`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_protocol_version line_sender_get_protocol_version(
     const line_sender* sender);
 
 /**
  * Returns the configured max_name_len, or the default value of 127.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 size_t line_sender_get_max_name_len(const line_sender* sender);
 
 /**
@@ -1657,7 +1717,7 @@ size_t line_sender_get_max_name_len(const line_sender* sender);
  * different buffer implementation than `line_sender_buffer_new(...)`, for
  * example when the sender uses QWP-over-UDP or QWP-over-WebSocket.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_for_sender(
     const line_sender* sender);
 
@@ -1671,14 +1731,14 @@ line_sender_buffer* line_sender_buffer_new_for_sender(
  * @param[in] sender Line sender object.
  * @return true if an error occurred with a sender and it must be closed.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_must_close(const line_sender* sender);
 
 /**
  * Close the connection. Does not flush. Non-idempotent.
  * @param[in] sender Line sender object.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_close(line_sender* sender);
 
 /**
@@ -1686,7 +1746,7 @@ void line_sender_close(line_sender* sender);
  * assigned frame sequence number. Empty buffers succeed with
  * `fsn_out->has_value == false`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_flush_and_get_fsn(
     line_sender* sender,
     line_sender_buffer* buffer,
@@ -1698,7 +1758,7 @@ bool line_sender_qwpws_flush_and_get_fsn(
  * assigned frame sequence number. Empty buffers succeed with
  * `fsn_out->has_value == false`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_flush_and_keep_and_get_fsn(
     line_sender* sender,
     const line_sender_buffer* buffer,
@@ -1709,7 +1769,7 @@ bool line_sender_qwpws_flush_and_keep_and_get_fsn(
  * Drive one QWP/WebSocket progress step for a sender built with
  * `qwp_ws_progress=manual`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_drive_once(
     line_sender* sender,
     bool* progressed_out,
@@ -1719,7 +1779,7 @@ bool line_sender_qwpws_drive_once(
  * Return the highest QWP/WebSocket frame sequence number published locally, or
  * no value if no frame has been published.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_published_fsn(
     const line_sender* sender,
     line_sender_qwpws_fsn* fsn_out,
@@ -1729,7 +1789,7 @@ bool line_sender_qwpws_published_fsn(
  * Return the highest QWP/WebSocket frame sequence number completed by ACK or
  * drop-and-continue rejection, or no value if no frame has completed.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_acked_fsn(
     const line_sender* sender,
     line_sender_qwpws_fsn* fsn_out,
@@ -1739,7 +1799,7 @@ bool line_sender_qwpws_acked_fsn(
  * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
  * Timeout is a normal successful result with `*reached_out == false`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_await_acked_fsn(
     line_sender* sender,
     uint64_t fsn,
@@ -1751,7 +1811,7 @@ bool line_sender_qwpws_await_acked_fsn(
  * Poll the next structured QWP/WebSocket diagnostic. No diagnostic is a
  * successful result with `*error_out == NULL`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_poll_error(
     line_sender* sender,
     line_sender_qwpws_error** error_out,
@@ -1762,7 +1822,7 @@ bool line_sender_qwpws_poll_error(
  *
  * The view's `message` pointer is valid until `error` is freed.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 line_sender_qwpws_error_view line_sender_qwpws_error_get_view(
     const line_sender_qwpws_error* error);
 
@@ -1773,7 +1833,7 @@ line_sender_qwpws_error_view line_sender_qwpws_error_get_view(
  * The view's `message` pointer is valid until `error` is freed. Returns false
  * when `error` has no QWP/WebSocket diagnostic, or when either pointer is NULL.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_error_qwpws_get_view(
     const line_sender_error* error,
     line_sender_qwpws_error_view* view_out);
@@ -1781,7 +1841,7 @@ bool line_sender_error_qwpws_get_view(
 /**
  * Free an owned QWP/WebSocket diagnostic. Passing NULL is a no-op.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 void line_sender_qwpws_error_free(line_sender_qwpws_error* error);
 
 /**
@@ -1793,7 +1853,7 @@ void line_sender_qwpws_error_free(line_sender_qwpws_error* error);
  * entries live long enough for later diagnostics to overwrite them and
  * increment this count.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_errors_dropped(
     const line_sender* sender,
     uint64_t* dropped_out,
@@ -1806,7 +1866,7 @@ bool line_sender_qwpws_errors_dropped(
  * less than or equal to 0 configure a zero-timeout fast close. Timeout and
  * terminal failure are reported through `err_out`.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_qwpws_close_drain(
     line_sender* sender,
     line_sender_error** err_out);
@@ -1850,7 +1910,7 @@ bool line_sender_qwpws_close_drain(
  * @param[in] buffer Line buffer object.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_flush(
     line_sender* sender,
     line_sender_buffer* buffer,
@@ -1869,7 +1929,7 @@ bool line_sender_flush(
  * @param[in] buffer Line buffer object.
  * @return true on success, false on error.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_flush_and_keep(
     line_sender* sender,
     const line_sender_buffer* buffer,
@@ -1898,7 +1958,7 @@ bool line_sender_flush_and_keep(
  * All the data stays in the buffer. Clear the buffer before starting a new
  * batch.
  */
-LINESENDER_API
+QUESTDB_CLIENT_API
 bool line_sender_flush_and_keep_with_flags(
     line_sender* sender,
     line_sender_buffer* buffer,
@@ -1908,12 +1968,12 @@ bool line_sender_flush_and_keep_with_flags(
 /////////// Getting the current timestamp.
 
 /** Get the current time in nanoseconds since the Unix epoch (UTC). */
-LINESENDER_API
-int64_t line_sender_now_nanos();
+QUESTDB_CLIENT_API
+int64_t line_sender_now_nanos(void);
 
 /** Get the current time in microseconds since the Unix epoch (UTC). */
-LINESENDER_API
-int64_t line_sender_now_micros();
+QUESTDB_CLIENT_API
+int64_t line_sender_now_micros(void);
 
 #ifdef __cplusplus
 }

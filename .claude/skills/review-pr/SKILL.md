@@ -130,6 +130,20 @@ Group the callsites from 2.5b by execution context. Typical contexts in this cod
 
 Every entry on this list must be reviewed in Step 3.
 
+### 2.5e Build profile facts
+
+**This sub-step runs at every level, including levels 0 and 1 where the rest of Step 2.5 is skipped.** A single `Cargo.toml` setting can flip the panic-safety story for the entire crate; agents must reason from the actual profile, not from defaults.
+
+Read `questdb-rs/Cargo.toml` and `questdb-rs-ffi/Cargo.toml` and record, with file:line citations:
+
+- **panic strategy** per profile (`[profile.release]`, `[profile.dev]`). If `panic = "abort"` in either, **every `catch_unwind` in that crate is a no-op for that profile** and every reachable panic is a process abort. Agents 2, 3, and 4 (and the level-0 inline review) must not credit `catch_unwind` as a panic guard under `panic = "abort"`. The only acceptable defense under abort-panic is proving no panic path exists.
+- **overflow-checks** per profile. If `overflow-checks = false` in release (the default), integer overflow wraps silently in release builds instead of panicking — bugs that look like panics in test builds disappear into wrong values in production. State which mode applies.
+- **`[profile.*.package.*]` overrides** if present — a per-dependency profile can reintroduce unwinding for one crate even when the workspace defaults to abort.
+- **`#[global_allocator]`** if defined anywhere in the workspace. A custom allocator changes the OOM behavior (some abort, some unwind, some return null).
+- **lto / codegen-units / strip** — informational; flag if they look unusual.
+
+A review without this section is incomplete. State the panic mode in one line at the top of every Step 3 agent prompt so the agent reasons from the right premise.
+
 ## Step 3: Parallel review
 
 Every agent receives:
@@ -141,6 +155,7 @@ Every agent receives:
 - **Bugs at callsites outside the diff outrank bugs inside the diff.** A confirmed bug in a file the PR did not touch but that calls a changed symbol is a P0 finding.
 - **"Looks correct in isolation" is not a valid conclusion.** Before clearing a changed symbol, the agent must walk the callsite inventory from 2.5b and explicitly state, per callsite, whether the new behavior is still correct there.
 - **The diff is the entry point, not the scope.** If the change surface map shows the symbol is reachable from N other files, the review covers N+1 files.
+- **Crate-wide settings affect untouched code.** A change to `Cargo.toml` (panic strategy, allocator, feature defaults, MSRV, profile overrides), a new `#[global_allocator]`, or a new `panic_handler` retroactively changes the safety story for every existing function in the crate — not just the diff. When `Cargo.toml`, build scripts, or workspace-level config files appear in the diff, the review covers the panic/allocation/overflow contract of the **entire affected crate**, not just the touched lines. The same applies when 2.5e records a profile fact (e.g. `panic = "abort"`) that invalidates existing safety patterns in untouched code.
 - A single finding of the form "in `test_line_sender.cpp` the new behavior of `line_sender_buffer_column_f64` causes Y" is worth more than five findings inside the diff.
 
 ### Agents
@@ -160,7 +175,12 @@ Launch the following agents in parallel.
 - **C++ exceptions escaping into C:** the C++ wrapper (`include/questdb/ingress/*.hpp`) is reachable from pure-C callers via inline forwarders. Any path where the wrapper can throw (`std::bad_alloc`, `std::system_error`, user-defined `throw`) and reach a C caller is undefined behavior. Verify wrapper functions called from C are `noexcept` or only invoked from C++ contexts.
 - **SIGPIPE on broken sockets:** writing to a closed peer raises SIGPIPE by default on Linux/macOS, killing the process. Verify TCP/HTTP write paths set `MSG_NOSIGNAL` or mask SIGPIPE.
 
-Every fallible operation must use `Result`/`Option` with proper error propagation. Every `extern "C"` function must wrap its body in `catch_unwind` or prove no panic path exists.
+**Panic strategy is the foundation.** Before reasoning about any panic guard, look up the `panic` setting from Step 2.5e:
+
+- **Under `panic = "abort"`**, `catch_unwind` is a no-op — it cannot catch anything because nothing unwinds. Every reachable panic is a process abort regardless of where the `catch_unwind` is placed. The only acceptable defense is *proving no panic path exists*: front-load every length check, replace `unwrap`/`expect`/indexing on wire-derived or caller-supplied values with `Result`-returning equivalents, validate before allocating, use `checked_*` arithmetic. A `catch_unwind` wrapper in this mode is misleading documentation, not a safety net — flag it if it gives the reader false confidence.
+- **Under `panic = "unwind"`**, every `extern "C"` function must wrap its body in `catch_unwind` AND every `Drop` impl on the unwind path must be panic-free (double-panic aborts the process). Fallible operations must use `Result`/`Option` with proper error propagation.
+
+State which panic mode applies in the agent's first sentence. Every panic-related finding must be evaluated under the actual mode, not the textbook one.
 
 **Agent 3 — FFI boundary safety:** Check every `#[no_mangle]` / `extern "C"` function. Verify: NULL pointer checks on all pointer arguments, proper error propagation across the FFI boundary (no panics escaping into C), correct ownership transfer semantics (who allocates, who frees), buffer length validation, string encoding correctness (UTF-8 ↔ C strings, NUL handling), and that the C header (`include/questdb/ingress/line_sender.h`) and C++ wrapper (`include/questdb/ingress/line_sender.hpp` + the split `line_sender_core.hpp` / `line_sender_array.hpp` / `line_sender_decimal.hpp`) accurately reflect the Rust implementation. If `cbindgen.toml` is involved, verify generated output matches handwritten headers.
 
@@ -250,10 +270,12 @@ Review the diff for:
 - All `unsafe` blocks have documented safety invariants
 - No undefined behavior: dangling pointers, use-after-free, double-free, data races
 - Proper `Send`/`Sync` bounds on public types
-- No panics that can escape FFI boundaries (every `extern "C"` function uses `catch_unwind` or proves panics are impossible)
+- No panics that can escape FFI boundaries — and the meaning of "escape" depends on the panic strategy (see Step 2.5e). Under `panic = "abort"`, `catch_unwind` is a no-op and *every* reachable panic is a fatal escape; the FFI function must prove no panic path exists. Under `panic = "unwind"`, every `extern "C"` function must wrap its body in `catch_unwind`.
 
 ### Crash surface
-Anything that aborts the Rust side aborts the host process. Beyond panics, check for:
+Anything that aborts the Rust side aborts the host process. The first check is the panic strategy itself — everything else is downstream of it.
+
+- **Panic strategy** (from Step 2.5e): under `panic = "abort"`, the entire `catch_unwind` defense collapses — every panic across the entire crate is fatal. Verify the profile before crediting any panic guard. A finding that says "the panic at X is caught by `catch_unwind` at Y" is incorrect under abort-panic.
 - Direct aborts: `std::process::abort()`, `libc::abort()`, `std::intrinsics::abort()`
 - Allocation-failure aborts: any allocation sized by an untrusted length parameter must validate the bound before allocating (Rust's default allocator aborts on OOM)
 - Stack overflow: unbounded recursion, recursive `Drop` impls, deeply nested untrusted input

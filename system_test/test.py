@@ -2363,9 +2363,19 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         ]
 
     def _query_table_sorted(self, table_name: str):
-        resp = sql_query(
-            f'SELECT * FROM \'{table_name}\' ORDER BY timestamp')
-        return resp.get('columns') or [], resp.get('dataset') or []
+        # Verifies through the QWP egress reader, not /exec REST. /exec
+        # renders BINARY columns as the literal JSON `[]` (see
+        # JsonQueryProcessorState.putBinValue in QuestDB), which would make
+        # every BINARY round-trip fail regardless of what the sender wrote.
+        # Reading through the QWP egress reader exercises the column types we
+        # actually ingest end-to-end. Values come back in the same Python
+        # shape /exec used to return, with BINARY as real bytes that
+        # format_actual_cell can hex-encode.
+        import qwp_egress_reader
+        # The reader's connect-string scheme is `ws::` (egress side), distinct
+        # from the sender's `qwpws::` (ingress side) — both hit the HTTP port.
+        conf = f'ws::addr={QDB_FIXTURE.host}:{QDB_FIXTURE.http_server_port};'
+        return qwp_egress_reader.query_table_sorted(conf, table_name)
 
     def _wait_for_row_count(self, table_name: str, expected: int):
         deadline = time.monotonic() + self.DRAIN_TIMEOUT_SEC
@@ -2391,6 +2401,24 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
         except Exception as e:  # noqa: BLE001 — table may already be absent
             self._log(f'DROP TABLE IF EXISTS {table_name!r} ignored: {e}')
 
+    @staticmethod
+    def _create_dedup_fuzz_table(table_name: str):
+        # Failover tests bounce the server mid-stream, which forces the
+        # QWP/WS sender to replay any sent-but-not-yet-acked FSN range
+        # after reconnect. The protocol is at-least-once on the wire,
+        # so the server can see byte-identical re-transmits of rows it
+        # already persisted. Pre-create with DEDUP UPSERT KEYS on the
+        # designated TIMESTAMP column — every fuzz row gets a globally
+        # unique µs timestamp from the harness's locked counter, so
+        # dedup-by-timestamp collapses retransmits while leaving
+        # legitimate rows untouched. Additional columns are added by
+        # ILP on first sight.
+        sql_query(
+            f'CREATE TABLE \'{table_name}\' '
+            '(timestamp TIMESTAMP) '
+            'TIMESTAMP(timestamp) PARTITION BY DAY WAL '
+            'DEDUP UPSERT KEYS(timestamp)')
+
     def _run_fuzz(self, load: 'qwp_ws_fuzz.LoadParams',
                   fuzz: 'qwp_ws_fuzz.FuzzParams'):
         # Pre-create per-table buffers. Java keys by lowercase name (case-
@@ -2401,24 +2429,8 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             name = qwp_ws_fuzz.canonical_table_name(i)
             tables[name] = qwp_ws_fuzz.TableData(name)
             self._drop_table_if_exists(name)
-            # Pre-create the table with the designated TIMESTAMP column and
-            # DEDUP enabled on it. QWP/WebSocket is at-least-once on
-            # reconnect: after a fixture bounce the client correctly
-            # replays unacked frames from its local low-water mark, and
-            # the server applies every accepted frame without frame-level
-            # dedup, so replays can re-apply rows whose original ACK was
-            # lost. The test's strict expected-vs-actual row-count
-            # comparison only holds if those duplicate rows are filtered
-            # at the WAL level. Per-row timestamps are globally unique
-            # (monotonic `next_ts()` below), so DEDUP UPSERT KEYS on the
-            # designated timestamp filters exactly the duplicates without
-            # touching distinct rows. Other columns are auto-added by
-            # QuestDB on the first row that contains them.
-            sql_query(
-                f'CREATE TABLE IF NOT EXISTS "{name}" '
-                '(timestamp TIMESTAMP) '
-                'TIMESTAMP(timestamp) PARTITION BY DAY WAL '
-                'DEDUP UPSERT KEYS(timestamp)')
+            if fuzz.max_bounces > 0:
+                self._create_dedup_fuzz_table(name)
             self._created_tables.append(name)
 
         run_id = uuid.uuid4().hex[:8]
@@ -2550,6 +2562,11 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
+        # `reconnect_max_duration_millis` is the explicit knob; the
+        # library auto-promotes `initial_connect_retry` to `sync` when
+        # any `reconnect_*` key is set, so a producer that races a
+        # bounce reuses the same 120s budget on its very first connect
+        # instead of getting one shot.
         conf = self._sender_conf(
             sender_id,
             sf_root,

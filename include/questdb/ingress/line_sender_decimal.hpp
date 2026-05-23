@@ -101,7 +101,7 @@ private:
  * buffer.column("price"_cn, "123.456"_decimal);
  * @endcode
  */
-inline decimal_str_view operator"" _decimal(const char* buf, size_t len)
+inline decimal_str_view operator""_decimal(const char* buf, size_t len)
 {
     return decimal_str_view{buf, len};
 }
