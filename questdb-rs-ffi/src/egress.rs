@@ -2322,11 +2322,13 @@ pub unsafe extern "C" fn line_reader_query_bind_decimal256(
 /// metadata. Passing a kind not in the simple-null set (e.g. SYMBOL,
 /// VARCHAR, DECIMAL64, DOUBLE_ARRAY) stashes an `InvalidBind` deferred
 /// error on the query that surfaces from `_query_execute`.
+///
+/// `kind` carries a `line_reader_column_kind_*` discriminant as a raw
+/// integer (not the typed enum) so a buggy caller passing an out-of-range
+/// value surfaces as a deferred `InvalidBind` error rather than triggering
+/// undefined behaviour at the FFI boundary.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_query_bind_null(
-    query: *mut line_reader_query,
-    kind: line_reader_column_kind,
-) {
+pub unsafe extern "C" fn line_reader_query_bind_null(query: *mut line_reader_query, kind: u32) {
     unsafe {
         if query.is_null() {
             eprintln!("line_reader_query_bind_null: NULL query handle; bind dropped");
@@ -2336,13 +2338,20 @@ pub unsafe extern "C" fn line_reader_query_bind_null(
             Some(k) => k,
             None => {
                 if (*query).deferred_err.is_none() {
-                    (*query).deferred_err = Some(Error::new(
-                        ErrorCode::InvalidBind,
+                    let msg = if kind
+                        == line_reader_column_kind::line_reader_column_kind_unknown as u32
+                    {
                         "line_reader_query_bind_null: kind is the \
                          line_reader_column_kind_unknown sentinel; pass a \
                          concrete column kind"
-                            .to_string(),
-                    ));
+                            .to_string()
+                    } else {
+                        format!(
+                            "line_reader_query_bind_null: kind 0x{kind:02X} is not a \
+                             recognised line_reader_column_kind discriminant"
+                        )
+                    };
+                    (*query).deferred_err = Some(Error::new(ErrorCode::InvalidBind, msg));
                 }
                 return;
             }
@@ -2370,34 +2379,17 @@ pub unsafe extern "C" fn line_reader_query_bind_null(
     }
 }
 
-fn column_kind_from_c(k: line_reader_column_kind) -> Option<ColumnKind> {
-    use line_reader_column_kind::*;
-    Some(match k {
-        line_reader_column_kind_boolean => ColumnKind::Boolean,
-        line_reader_column_kind_byte => ColumnKind::Byte,
-        line_reader_column_kind_short => ColumnKind::Short,
-        line_reader_column_kind_int => ColumnKind::Int,
-        line_reader_column_kind_long => ColumnKind::Long,
-        line_reader_column_kind_float => ColumnKind::Float,
-        line_reader_column_kind_double => ColumnKind::Double,
-        line_reader_column_kind_symbol => ColumnKind::Symbol,
-        line_reader_column_kind_timestamp => ColumnKind::Timestamp,
-        line_reader_column_kind_date => ColumnKind::Date,
-        line_reader_column_kind_uuid => ColumnKind::Uuid,
-        line_reader_column_kind_geohash => ColumnKind::Geohash,
-        line_reader_column_kind_varchar => ColumnKind::Varchar,
-        line_reader_column_kind_timestamp_nanos => ColumnKind::TimestampNanos,
-        line_reader_column_kind_double_array => ColumnKind::DoubleArray,
-        line_reader_column_kind_long_array => ColumnKind::LongArray,
-        line_reader_column_kind_decimal64 => ColumnKind::Decimal64,
-        line_reader_column_kind_decimal128 => ColumnKind::Decimal128,
-        line_reader_column_kind_decimal256 => ColumnKind::Decimal256,
-        line_reader_column_kind_char => ColumnKind::Char,
-        line_reader_column_kind_binary => ColumnKind::Binary,
-        line_reader_column_kind_long256 => ColumnKind::Long256,
-        line_reader_column_kind_ipv4 => ColumnKind::Ipv4,
-        line_reader_column_kind_unknown => return None,
-    })
+/// Convert a raw C-side `line_reader_column_kind` discriminant into a
+/// `ColumnKind`. Accepting `u32` rather than the enum keeps the FFI
+/// boundary sound when a C caller hands us a bit pattern outside the
+/// declared discriminants (passing such a value as `line_reader_column_kind`
+/// is undefined behaviour per the Rust reference). The wire bytes match
+/// `ColumnKind::as_u8`, so we delegate to `ColumnKind::from_u8`; both the
+/// documented `_unknown` (0xFF) sentinel and arbitrary garbage map to
+/// `None`.
+fn column_kind_from_c(k: u32) -> Option<ColumnKind> {
+    let byte = u8::try_from(k).ok()?;
+    ColumnKind::from_u8(byte).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -3802,12 +3794,33 @@ mod tests {
                 rust
             );
             assert_eq!(
-                column_kind_from_c(c),
+                column_kind_from_c(c as u32),
                 Some(rust),
                 "c→rust mapping for {:?}",
                 rust
             );
         }
+        // Out-of-range / reserved / sentinel discriminants must round-trip
+        // to None rather than UB. The FFI parameter is `u32` precisely so
+        // these values can be represented and rejected (storing them in a
+        // `line_reader_column_kind` value would be UB per the Rust
+        // reference).
+        assert_eq!(
+            column_kind_from_c(line_reader_column_kind::line_reader_column_kind_unknown as u32),
+            None,
+            "unknown sentinel rejects"
+        );
+        assert_eq!(
+            column_kind_from_c(0x08),
+            None,
+            "reserved STRING code rejects"
+        );
+        assert_eq!(column_kind_from_c(0x99), None, "garbage byte rejects");
+        assert_eq!(
+            column_kind_from_c(0x1_0000),
+            None,
+            "out-of-byte-range rejects"
+        );
     }
 
     #[test]

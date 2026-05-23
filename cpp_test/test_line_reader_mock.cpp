@@ -3475,6 +3475,70 @@ TEST_CASE("mock: progress callback noexcept trampoline swallows user exceptions"
     CHECK(cur.failover_resets() == 1);
 }
 
+// Regression: `query` move-constructor and move-assignment must transfer
+// `_progress_callback` ownership, not just `_impl` and `_callback`. If
+// the heap-allocated `failover_progress_callback` stays with the
+// moved-from source, source destruction frees the storage the C layer
+// still references via `user_data`, and the next progress event UAFs
+// inside `progress_trampoline`. The cursor's mirror move handles both
+// callbacks correctly; this test pins the same behaviour on `query`.
+//
+// Pure-lifetime witness: install a callback that captures a shared_ptr
+// by value, then track its weak_ptr across moves. Whoever owns the heap
+// `failover_progress_callback` transitively owns the shared_ptr; if
+// ownership leaks to the moved-from source, the witness expires the
+// moment the source destructs while the destination is still live.
+// Deterministic, no ASan required.
+TEST_CASE(
+    "mock: query move transfers _progress_callback ownership (UAF regression)")
+{
+    qm::Script s = {qm::ActionSendServerInfo{}};
+
+    SUBCASE("move-constructor carries the progress callback to the destination")
+    {
+        qm::MockServer srv({s});
+        auto reader = connect_to(srv);
+
+        auto sentinel = std::make_shared<int>(0);
+        std::weak_ptr<int> witness = sentinel;
+        std::optional<eg::query> dest;
+        {
+            auto src = reader.prepare("X"_utf8);
+            src.on_failover_progress(
+                [held = std::move(sentinel)](
+                    const eg::failover_progress_event_view&) { (void)held; });
+            dest.emplace(std::move(src));
+        } // `src` destructs here.
+        // With the fix `dest` owns the heap callback (and thus the
+        // shared_ptr captured by the lambda) — the witness must still
+        // be live. With the bug the heap callback was freed during
+        // `src`'s destruction and the witness has already expired.
+        CHECK_FALSE(witness.expired());
+        dest.reset();
+        CHECK(witness.expired());
+    }
+
+    SUBCASE("move-assignment carries the progress callback to the destination")
+    {
+        qm::MockServer srv_src({s});
+        qm::MockServer srv_dest({s});
+        auto reader_src = connect_to(srv_src);
+        auto reader_dest = connect_to(srv_dest);
+
+        auto sentinel = std::make_shared<int>(0);
+        std::weak_ptr<int> witness = sentinel;
+        auto dest = reader_dest.prepare("X"_utf8);
+        {
+            auto src = reader_src.prepare("X"_utf8);
+            src.on_failover_progress(
+                [held = std::move(sentinel)](
+                    const eg::failover_progress_event_view&) { (void)held; });
+            dest = std::move(src);
+        } // `src` destructs here.
+        CHECK_FALSE(witness.expired());
+    }
+}
+
 // Batch / column bulk descriptor — cross-check the new columnar API
 // (`cursor::next_batch()` + `batch::column()` / `column::values<T>()`) against
 // the per-cell `cursor::get_*` path on the same emitted batch.

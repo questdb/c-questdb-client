@@ -52,6 +52,7 @@ use tungstenite::{Message, WebSocket, accept_hdr};
 const MAGIC: [u8; 4] = *b"QWP1";
 const MSG_QUERY_REQUEST: u8 = 0x10;
 const MSG_RESULT_END: u8 = 0x12;
+const MSG_QUERY_ERROR: u8 = 0x13;
 const MSG_CANCEL: u8 = 0x14;
 const MSG_CACHE_RESET: u8 = 0x17;
 const MSG_SERVER_INFO: u8 = 0x18;
@@ -105,6 +106,19 @@ fn result_end_frame(request_id: i64) -> Vec<u8> {
     framed(2, 0, 0, &payload)
 }
 
+/// `QUERY_ERROR` frame: `[0x13, request_id i64 LE, status u8, msg_len u16 LE, msg_bytes...]`.
+/// `status` is a raw `StatusCode` discriminant (e.g. `0x06` InternalError).
+fn query_error_frame(request_id: i64, status: u8, message: &str) -> Vec<u8> {
+    let msg_bytes = message.as_bytes();
+    let mut payload = Vec::with_capacity(1 + 8 + 1 + 2 + msg_bytes.len());
+    payload.push(MSG_QUERY_ERROR);
+    payload.extend_from_slice(&request_id.to_le_bytes());
+    payload.push(status);
+    payload.extend_from_slice(&(msg_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(msg_bytes);
+    framed(2, 0, 0, &payload)
+}
+
 /// `CACHE_RESET` frame. `mask = 0x01` clears the per-connection symbol
 /// dict, `0x02` clears the schema registry, `0x03` clears both. The
 /// payload is just `[msg_kind, mask]`.
@@ -136,6 +150,10 @@ enum Action {
     /// Reply with RESULT_END (using the request_id from the most-recent
     /// AwaitQueryRequest).
     SendResultEnd,
+    /// Reply with QUERY_ERROR (using the request_id from the most-recent
+    /// AwaitQueryRequest). `status` is a raw `StatusCode` discriminant,
+    /// e.g. `0x06` (InternalError) for a generic server-side failure.
+    SendQueryError { status: u8, message: String },
     /// Drop the underlying TCP connection without a clean WS close.
     HardDrop,
     /// Sleep for the given duration before processing the next action.
@@ -432,6 +450,13 @@ fn run_script(
             Action::SendResultEnd => {
                 let rid = last_request_id.expect("AwaitQueryRequest before SendResultEnd");
                 let frame = result_end_frame(rid);
+                if ws.send(Message::Binary(frame.into())).is_err() {
+                    return;
+                }
+            }
+            Action::SendQueryError { status, message } => {
+                let rid = last_request_id.expect("AwaitQueryRequest before SendQueryError");
+                let frame = query_error_frame(rid, status, &message);
                 if ws.send(Message::Binary(frame.into())).is_err() {
                     return;
                 }
@@ -1274,6 +1299,108 @@ fn reader_poisoned_after_failover_exhaustion_returns_err_not_panic() {
         Ok(_) => panic!("execute on a poisoned Reader must error"),
     };
     assert_eq!(err.code(), ErrorCode::SocketError);
+}
+
+#[test]
+fn next_batch_after_failover_exhaustion_does_not_collapse_to_clean_eof() {
+    // Regression: once `failover_reconnect_and_replay` exhausts its
+    // budget it sets `done=true` and surfaces the trigger error. The
+    // contract is that subsequent `next_batch` calls keep surfacing
+    // that error — NOT `Ok(None)`, which a retry-on-transient-error
+    // caller would treat as a clean RESULT_END and silently drop the
+    // remainder of the result set.
+    let srv_a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        drop_at_connect_script(),
+    ]);
+    let srv_b = MockServer::start(vec![drop_at_connect_script()]);
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=1;failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let first = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("budget exhausts and surfaces an error"),
+    };
+    assert!(
+        matches!(
+            first.code(),
+            ErrorCode::SocketError | ErrorCode::ProtocolError
+        ),
+        "unexpected exhaustion code: {:?}",
+        first.code()
+    );
+
+    match cursor.next_batch() {
+        Ok(None) => panic!(
+            "post-exhaustion next_batch collapsed to clean EOF — silent data loss \
+             against a caller that retries on transient errors"
+        ),
+        Ok(Some(_)) => panic!("post-exhaustion next_batch yielded a batch"),
+        Err(_) => { /* fine: error must keep surfacing */ }
+    }
+
+    // Errored cursors must not expose a success terminal either —
+    // `terminal()` is reserved for RESULT_END / EXEC_DONE.
+    assert!(cursor.terminal().is_none());
+}
+
+#[test]
+fn next_batch_after_query_error_does_not_collapse_to_clean_eof() {
+    // Same shape as `next_batch_after_failover_exhaustion_*`, but the
+    // terminal here is a server-emitted `QUERY_ERROR` rather than a
+    // failover give-up. Pins the second `next_batch` contract for the
+    // server-error path at reader.rs around the `ServerEvent::Error`
+    // arm: a follow-up call must re-raise, not silently return
+    // `Ok(None)` and look like a clean RESULT_END.
+    //
+    // `failover=off` is explicit: QUERY_ERROR is not failover-eligible
+    // even with failover on (server-level errors are terminal by
+    // contract), so the flag doesn't change behaviour — it just keeps
+    // the test's intent unambiguous on inspection.
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        // status=0x06 → StatusCode::InternalError → ErrorCode::ServerInternalError.
+        Action::SendQueryError {
+            status: 0x06,
+            message: "synthetic server failure".into(),
+        },
+    ]]);
+    let conf = format!("ws::addr={};failover=off", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let first = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("server emitted QUERY_ERROR; first next_batch must surface it"),
+    };
+    assert_eq!(
+        first.code(),
+        ErrorCode::ServerInternalError,
+        "unexpected error code from QUERY_ERROR terminal: {:?}",
+        first.code()
+    );
+
+    match cursor.next_batch() {
+        Ok(None) => panic!(
+            "post-QUERY_ERROR next_batch collapsed to clean EOF — silent data loss \
+             against a caller that retries on transient errors"
+        ),
+        Ok(Some(_)) => panic!("post-QUERY_ERROR next_batch yielded a batch"),
+        Err(_) => { /* fine: error must keep surfacing */ }
+    }
+
+    assert!(
+        cursor.terminal().is_none(),
+        "errored cursor must not expose a success terminal"
+    );
 }
 
 #[test]
@@ -2230,14 +2357,19 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         "callback must have fired exactly once"
     );
 
-    // Cursor terminal: a follow-up next_batch returns Ok(None),
-    // not Err and not a stale frame.
-    assert!(
-        cursor
-            .next_batch()
-            .expect("terminal returns Ok(None)")
-            .is_none(),
-        "cursor must be terminal after exhaustion"
+    // Cursor terminal: follow-up next_batch keeps surfacing the
+    // exhaustion error (same code as the first call) rather than
+    // collapsing to Ok(None) — see
+    // `next_batch_after_failover_exhaustion_does_not_collapse_to_clean_eof`
+    // for the silent-data-loss rationale.
+    let replay = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("post-exhaustion next_batch must re-raise, not return Ok"),
+    };
+    assert_eq!(
+        replay.code(),
+        err.code(),
+        "replayed terminal error code must match the originating error"
     );
 }
 
@@ -2636,14 +2768,17 @@ fn all_role_mismatch_endpoints_during_failover_surfaces_role_mismatch() {
         "on_failover_reset must NOT fire when failover exhausts without success"
     );
 
-    // The cursor must be terminal — a follow-up next_batch returns
-    // Ok(None), not Err and not a stale frame.
-    assert!(
-        cursor
-            .next_batch()
-            .expect("terminal returns Ok(None)")
-            .is_none(),
-        "cursor must be terminal after RoleMismatch exhaustion"
+    // The cursor must be terminal — a follow-up next_batch re-raises
+    // the same RoleMismatch error rather than collapsing to Ok(None)
+    // — see `next_batch_after_failover_exhaustion_*` for rationale.
+    let replay = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("post-exhaustion next_batch must re-raise, not return Ok"),
+    };
+    assert_eq!(
+        replay.code(),
+        ErrorCode::RoleMismatch,
+        "replayed terminal must keep the RoleMismatch code"
     );
 }
 

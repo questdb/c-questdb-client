@@ -827,6 +827,7 @@ public:
     query(query&& other) noexcept
         : _impl{other._impl}
         , _callback{std::move(other._callback)}
+        , _progress_callback{std::move(other._progress_callback)}
     {
         other._impl = nullptr;
     }
@@ -838,6 +839,7 @@ public:
             ::line_reader_query_free(_impl);
             _impl = other._impl;
             _callback = std::move(other._callback);
+            _progress_callback = std::move(other._progress_callback);
             other._impl = nullptr;
         }
         return *this;
@@ -951,6 +953,15 @@ public:
         ::line_reader_query_bind_varchar(_impl, to_c_utf8(v));
         return *this;
     }
+    /**
+     * Bind a `BINARY` value. The bytes are copied.
+     *
+     * Not supported by Phase 1 servers — `execute()` will throw
+     * `error_code::invalid_bind`. The method is part of the public ABI
+     * for forward-compatibility; see
+     * `::line_reader_query_bind_binary` in the C header for the
+     * server-side rationale.
+     */
     query& bind_binary(const uint8_t* buf, size_t len)
     {
         ensure_impl();
@@ -973,17 +984,35 @@ public:
         ::line_reader_query_bind_long256(_impl, bytes.data());
         return *this;
     }
+    /**
+     * Bind an IPv4 address as a host-order `uint32_t`.
+     *
+     * Not supported by Phase 1 servers — `execute()` will throw
+     * `error_code::invalid_bind`. The method is part of the public ABI
+     * for forward-compatibility; see `::line_reader_query_bind_ipv4`
+     * in the C header for the server-side rationale.
+     */
     query& bind_ipv4(uint32_t host_order)
     {
         ensure_impl();
         ::line_reader_query_bind_ipv4(_impl, host_order);
         return *this;
     }
+    /**
+     * Bind a typed `NULL` for a simple column kind (numeric, temporal,
+     * UUID, etc.). For `VARCHAR` / `BINARY` / `DECIMAL*` / `GEOHASH`
+     * use the dedicated `bind_null_*` methods below.
+     *
+     * Phase 1 servers don't accept all in-range kinds: passing
+     * `column_kind::ipv4` is accepted here but `execute()` will throw
+     * `error_code::invalid_bind` — see `bind_ipv4` above. The
+     * discriminant stays in the public ABI for forward-compatibility.
+     */
     query& bind_null(column_kind kind)
     {
         ensure_impl();
         ::line_reader_query_bind_null(
-            _impl, static_cast<::line_reader_column_kind>(kind));
+            _impl, static_cast<uint32_t>(kind));
         return *this;
     }
     query& bind_null_varchar()
@@ -992,6 +1021,12 @@ public:
         ::line_reader_query_bind_null_varchar(_impl);
         return *this;
     }
+    /**
+     * Bind a SQL `NULL` of column kind `BINARY`.
+     *
+     * Not supported by Phase 1 servers — `execute()` will throw
+     * `error_code::invalid_bind`. See `bind_binary` above.
+     */
     query& bind_null_binary()
     {
         ensure_impl();

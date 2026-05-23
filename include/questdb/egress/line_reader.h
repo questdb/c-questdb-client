@@ -892,29 +892,47 @@ QUESTDB_CLIENT_API void line_reader_query_bind_varchar(
 /** Bind a BINARY value. The bytes are copied. `buf` may be NULL when
  *  `len == 0` (binds an empty byte slice). For any non-zero `len`, `buf`
  *  must be non-NULL and point to at least `len` readable bytes — a NULL
- *  `buf` with non-zero `len` aborts the process, matching the policy of
- *  `line_reader_query_bind_uuid`. */
+ *  `buf` with non-zero `len` stores a deferred
+ *  `line_reader_error_invalid_bind` on the query that surfaces from
+ *  `line_reader_query_execute`, matching the policy of
+ *  `line_reader_query_bind_uuid`.
+ *
+ *  Not supported by Phase 1 servers: the call records the value, but
+ *  `line_reader_query_execute` will fail with
+ *  `line_reader_error_invalid_bind` because the server has no decoder
+ *  for the BINARY wire type. Listed in the public ABI for
+ *  forward-compatibility — when the server adds support, no client
+ *  change is needed. */
 QUESTDB_CLIENT_API void line_reader_query_bind_binary(
     line_reader_query*, const uint8_t* buf, size_t len);
 
 /** Bind a 16-byte UUID value (raw bytes). `value` MUST be non-NULL and point
- *  to at least 16 readable bytes. A NULL `value` aborts the process — silently
- *  binding all-zero bytes would produce a valid-looking
- *  `00000000-0000-0000-0000-000000000000` UUID and corrupt the query. To bind
- *  SQL NULL, call `line_reader_query_bind_null` with
- *  `line_reader_column_kind_uuid` instead. */
+ *  to at least 16 readable bytes. A NULL `value` stores a deferred
+ *  `line_reader_error_invalid_bind` on the query that surfaces from
+ *  `line_reader_query_execute` — silently binding all-zero bytes would
+ *  produce a valid-looking `00000000-0000-0000-0000-000000000000` UUID and
+ *  corrupt the query. To bind SQL NULL, call `line_reader_query_bind_null`
+ *  with `line_reader_column_kind_uuid` instead. */
 QUESTDB_CLIENT_API void line_reader_query_bind_uuid(
     line_reader_query*, const uint8_t value[16]);
 
 /** Bind a 32-byte LONG256 value (raw little-endian bytes). `value` MUST be
- *  non-NULL and point to at least 32 readable bytes. A NULL `value` aborts the
- *  process for the same reason as `line_reader_query_bind_uuid`. To bind SQL
- *  NULL, call `line_reader_query_bind_null` with
- *  `line_reader_column_kind_long256`. */
+ *  non-NULL and point to at least 32 readable bytes. A NULL `value` stores
+ *  a deferred `line_reader_error_invalid_bind` on the query that surfaces
+ *  from `line_reader_query_execute`, for the same reason as
+ *  `line_reader_query_bind_uuid`. To bind SQL NULL, call
+ *  `line_reader_query_bind_null` with `line_reader_column_kind_long256`. */
 QUESTDB_CLIENT_API void line_reader_query_bind_long256(
     line_reader_query*, const uint8_t value[32]);
 
-/** Bind an IPv4 address as a host-order `uint32_t`. */
+/** Bind an IPv4 address as a host-order `uint32_t`.
+ *
+ *  Not supported by Phase 1 servers: the call records the value, but
+ *  `line_reader_query_execute` will fail with
+ *  `line_reader_error_invalid_bind` because the server has no decoder
+ *  for the IPv4 wire type. Listed in the public ABI for
+ *  forward-compatibility — when the server adds support, no client
+ *  change is needed. */
 QUESTDB_CLIENT_API void line_reader_query_bind_ipv4(
     line_reader_query*, uint32_t host_order);
 
@@ -939,7 +957,8 @@ QUESTDB_CLIENT_API void line_reader_query_bind_decimal128(
 
 /** Bind a DECIMAL256 mantissa as 32 little-endian raw bytes plus column scale.
  *  `value` MUST be non-NULL and point to at least 32 readable bytes. A NULL
- *  `value` aborts the process for the same reason as
+ *  `value` stores a deferred `line_reader_error_invalid_bind` on the query
+ *  that surfaces from `line_reader_query_execute`, for the same reason as
  *  `line_reader_query_bind_uuid`. To bind SQL NULL, call
  *  `line_reader_query_bind_null_decimal256(query, scale)`. */
 QUESTDB_CLIENT_API void line_reader_query_bind_decimal256(
@@ -949,14 +968,33 @@ QUESTDB_CLIENT_API void line_reader_query_bind_decimal256(
  * Bind a typed NULL for one of the simple column kinds (numeric, temporal,
  * UUID, etc.). For VARCHAR / BINARY / DECIMAL* / GEOHASH use the
  * dedicated `_null_*` variants below since those carry extra column metadata.
+ *
+ * `kind` is a `line_reader_column_kind` discriminant passed as a raw
+ * `uint32_t` (typed-enum constants implicitly convert). The integer ABI
+ * keeps the FFI boundary sound when a caller hands across a value outside
+ * the declared discriminants — out-of-range values surface as a deferred
+ * `line_reader_error_invalid_bind` on `line_reader_query_execute` rather
+ * than triggering undefined behaviour.
+ *
+ * Phase 1 servers don't accept all in-range kinds. Passing
+ * `line_reader_column_kind_ipv4` is accepted by this call but
+ * `line_reader_query_execute` will fail with
+ * `line_reader_error_invalid_bind` — see `line_reader_query_bind_ipv4`.
+ * The IPv4 discriminant stays in the public ABI for
+ * forward-compatibility.
  */
 QUESTDB_CLIENT_API void line_reader_query_bind_null(
-    line_reader_query*, line_reader_column_kind kind);
+    line_reader_query*, uint32_t kind);
 
 /** Bind a SQL NULL of column kind VARCHAR. */
 QUESTDB_CLIENT_API void line_reader_query_bind_null_varchar(line_reader_query*);
 
-/** Bind a SQL NULL of column kind BINARY. */
+/** Bind a SQL NULL of column kind BINARY.
+ *
+ *  Not supported by Phase 1 servers — see
+ *  `line_reader_query_bind_binary` for the rationale. The call records
+ *  the null, but `line_reader_query_execute` will fail with
+ *  `line_reader_error_invalid_bind`. */
 QUESTDB_CLIENT_API void line_reader_query_bind_null_binary(line_reader_query*);
 
 /** Bind a SQL NULL of column kind DECIMAL64 with the given column `scale`. */

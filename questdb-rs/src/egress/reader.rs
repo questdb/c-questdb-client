@@ -1162,6 +1162,7 @@ impl<'r> ReaderQuery<'r> {
             credit_enabled,
             cancelling: false,
             done: false,
+            terminal_error: None,
             encoded_request,
             on_failover_reset: self.on_failover_reset,
             on_failover_progress: self.on_failover_progress,
@@ -1293,16 +1294,41 @@ pub struct Cursor<'r> {
     cancelling: bool,
     /// Set once any terminal frame has been observed for this cursor:
     /// `RESULT_END`, `EXEC_DONE`, or `QUERY_ERROR` (including the
-    /// `STATUS_CANCELLED` reply to `cancel()`). Drives the early
-    /// return in `next_batch()` so a follow-up call doesn't try to
-    /// read another frame off a server that has already finished with
-    /// this `request_id`. `terminal` (the public lifecycle accessor)
-    /// only stores the success terminals — error terminals are
-    /// surfaced via the `Err` return and don't need a structured
-    /// representation here.
+    /// `STATUS_CANCELLED` reply to `cancel()`). Also set on the
+    /// failover-give-up path and on every other error-terminal in
+    /// `next_batch`. Drives the early return in `next_batch()` so a
+    /// follow-up call doesn't try to read another frame off a server
+    /// that has already finished with this `request_id`. `terminal`
+    /// (the public lifecycle accessor) only stores the success
+    /// terminals; error terminals are stashed in `terminal_error`
+    /// instead and re-raised from any subsequent `next_batch` /
+    /// `add_credit` call so a transient-retry caller can't mistake
+    /// an errored cursor for a clean RESULT_END.
     done: bool,
+    /// `Some(err)` iff the cursor terminated with an error (failover
+    /// give-up, server `QUERY_ERROR`, decode failure, stale-rid, etc).
+    /// Clone-replayed by every public method that would otherwise
+    /// short-circuit on `self.done` — without this, the first call
+    /// surfaces the error and every subsequent call returns
+    /// `Ok(None)`, looking indistinguishable from a clean RESULT_END
+    /// to a caller with a retry-on-transient-error loop.
+    ///
+    /// Captured at most once (the first error wins) so a follow-up
+    /// failure during teardown can't overwrite the originating cause.
+    terminal_error: Option<Error>,
     /// Pin `!Send` regardless of whether the callback is installed.
     _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// Borrow-free outcome of `next_batch_inner`. The wrapper in
+/// `next_batch` matches on this and constructs the public `BatchView`
+/// (which holds borrows into `self`) only in the `HaveBatch` arm —
+/// keeping the inner result borrow-free is what lets the `Err` arm
+/// mutate `self.terminal_error` to stash the cursor-killing error
+/// for replay on subsequent calls.
+enum NextOutcome {
+    HaveBatch,
+    Done,
 }
 
 impl<'r> Cursor<'r> {
@@ -1372,9 +1398,54 @@ impl<'r> Cursor<'r> {
     /// or set `failover=off` and handle reconnect at the
     /// application layer.
     pub fn next_batch(&mut self) -> Result<Option<BatchView<'_>>> {
+        // Replay-on-terminal guard. If the cursor previously terminated
+        // with an error, surface that error on every subsequent call
+        // rather than collapsing to `Ok(None)` (which is the clean-EOF
+        // signal — a retry-on-transient-error caller would silently
+        // treat an incomplete result set as complete).
         if self.done {
-            return Ok(None);
+            return match self.terminal_error.as_ref() {
+                Some(e) => Err(e.clone()),
+                None => Ok(None),
+            };
         }
+        // Inner returns a borrow-free discriminant so the borrow
+        // checker can split the lifetime — the Err arm needs to
+        // mutate `self.terminal_error`, which it can't if the
+        // inner result still holds a reference into `self`.
+        // Capture is conditioned on `self.done` (set by every
+        // error-terminal path, either directly or via
+        // `terminate_with_close`) and on `terminal_error.is_none()`
+        // so the FIRST cause wins — a follow-up teardown failure
+        // can't overwrite the originating error.
+        match self.next_batch_inner() {
+            Ok(NextOutcome::HaveBatch) => {
+                let last = self
+                    .last_batch
+                    .as_ref()
+                    .expect("HaveBatch implies last_batch populated");
+                let schema = self
+                    .reader
+                    .registry
+                    .get(last.schema_id)
+                    .expect("schema validated by inner");
+                Ok(Some(BatchView {
+                    decoded: last,
+                    dict: &self.reader.dict,
+                    schema,
+                }))
+            }
+            Ok(NextOutcome::Done) => Ok(None),
+            Err(e) => {
+                if self.done && self.terminal_error.is_none() {
+                    self.terminal_error = Some(e.clone());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn next_batch_inner(&mut self) -> Result<NextOutcome> {
         loop {
             // Transport read: a failure here (socket closed, TLS
             // reset, truncated WS frame) is what failover is for.
@@ -1514,14 +1585,15 @@ impl<'r> Cursor<'r> {
                     // that point the caller has consumed at least one
                     // row from this query.
                     self.data_delivered = true;
-                    // Re-lookup is infallible: existence was checked
-                    // above and the registry isn't mutated in between.
-                    let schema = self.reader.registry.get(schema_id).expect("schema present");
-                    return Ok(Some(BatchView {
-                        decoded: last,
-                        dict: &self.reader.dict,
-                        schema,
-                    }));
+                    // BatchView construction is hoisted to `next_batch`
+                    // (the wrapper) so the inner returns a borrow-free
+                    // discriminant; the wrapper re-acquires the borrows
+                    // on `last_batch`, `dict`, and `registry` itself.
+                    // `last`/`schema_id` are still in scope here only
+                    // for the side effects (insert + data_delivered).
+                    let _ = last;
+                    let _ = schema_id;
+                    return Ok(NextOutcome::HaveBatch);
                 }
                 ServerEvent::End {
                     request_id,
@@ -1538,7 +1610,7 @@ impl<'r> Cursor<'r> {
                     });
                     self.reader.cursor_active = false;
                     self.done = true;
-                    return Ok(None);
+                    return Ok(NextOutcome::Done);
                 }
                 ServerEvent::ExecDone {
                     request_id,
@@ -1555,7 +1627,7 @@ impl<'r> Cursor<'r> {
                     });
                     self.reader.cursor_active = false;
                     self.done = true;
-                    return Ok(None);
+                    return Ok(NextOutcome::Done);
                 }
                 ServerEvent::Error {
                     request_id,
@@ -2006,10 +2078,10 @@ impl<'r> Cursor<'r> {
     /// over.
     pub fn add_credit(&mut self, additional_bytes: u64) -> Result<()> {
         if self.done {
-            return Err(fmt!(
-                InvalidApiCall,
-                "cursor is terminal; add_credit not allowed"
-            ));
+            return Err(match self.terminal_error.as_ref() {
+                Some(e) => e.clone(),
+                None => fmt!(InvalidApiCall, "cursor is terminal; add_credit not allowed"),
+            });
         }
         let first_err = match self.send_credit_frame(additional_bytes) {
             Ok(()) => return Ok(()),
