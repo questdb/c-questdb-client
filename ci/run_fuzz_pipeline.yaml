@@ -2,10 +2,10 @@ trigger: none
 
 pr: none
 
-# Hourly cron against the default branch (and active egress feature
-# branches), always run even if there were no changes since the previous
-# run. The Linux leg of the QWP/WS fuzz runs on the self-hosted
-# hetzner-incus pool (matching questdb/questdb's ci/test-fuzz.yml) — the
+# Hourly cron against the default branch, always run even if there were
+# no changes since the previous run. The Linux leg of the QWP/WS fuzz
+# runs on the self-hosted hetzner-incus pool (matching
+# questdb/questdb's ci/test-fuzz.yml) — the
 # Microsoft-hosted ubuntu-latest agents were hitting "Free disk space on /
 # is lower than 5%" and OOM-killing the test with SIGBUS mid-run. The
 # mac/windows legs stay on Microsoft-hosted images. The pure-Rust QWP
@@ -19,7 +19,6 @@ schedules:
     branches:
       include:
         - main
-        - vi_egress
     always: true
 
 stages:
