@@ -83,7 +83,7 @@ pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
 pub use qwp_ws_ownership::*;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-mod qwp_ws;
+pub(crate) mod qwp_ws;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws::*;
@@ -834,52 +834,6 @@ impl Sender {
             ));
         }
         Ok(())
-    }
-
-    /// Publish a pre-encoded QWP/WebSocket payload through this sender's
-    /// replay queue, returning the assigned frame sequence number (FSN).
-    ///
-    /// Caller-side escape hatch used by the column-major sender; the row-API
-    /// path stays on [`Sender::flush_and_get_fsn`]. The payload must already
-    /// be a valid QWP frame including its 12-byte header. Manual progress
-    /// mode and non-QWP/WS handlers are rejected with `InvalidApiCall`.
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    pub(crate) fn qwp_ws_publish_raw(&mut self, payload: &[u8]) -> Result<u64> {
-        let SyncProtocolHandler::SyncQwpWs(_) = &self.handler else {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "qwp_ws_publish_raw is only supported for QWP/WebSocket senders \
-                 in background progress mode."
-            ));
-        };
-        if let SyncProtocolHandler::SyncQwpWs(state) = &self.handler
-            && let Err(err) = qwp_ws_check_error_background(state)
-        {
-            let _ = self.drain_qwp_ws_error_notifications();
-            return Err(err);
-        }
-        self.drain_qwp_ws_error_notifications()?;
-
-        if payload.len() > self.max_buf_size {
-            return Err(qwp_ws_publisher::qwp_ws_encoded_message_size_error(
-                payload.len(),
-                self.max_buf_size,
-            ));
-        }
-
-        let result = match &mut self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => {
-                qwp_ws_publish_replay_background(state, payload)
-            }
-            _ => unreachable!("guarded above"),
-        };
-        if result
-            .as_ref()
-            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
-        {
-            self.connected = false;
-        }
-        result
     }
 }
 

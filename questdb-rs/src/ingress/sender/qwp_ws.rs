@@ -2778,17 +2778,6 @@ pub(crate) fn flush_qwp_ws(
     })
 }
 
-/// Background-mode escape hatch used by the column-major sender: hand a
-/// pre-encoded QWP/WebSocket frame to the replay queue and return its FSN.
-/// Bypasses the row-API encoder; the caller is responsible for producing a
-/// spec-conformant payload.
-pub(crate) fn qwp_ws_publish_replay_background(
-    state: &mut SyncQwpWsHandlerState,
-    payload: &[u8],
-) -> crate::Result<u64> {
-    state.runner.publish_replay_payload(payload)
-}
-
 pub(crate) fn flush_qwp_ws_manual(
     state: &mut ManualQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,

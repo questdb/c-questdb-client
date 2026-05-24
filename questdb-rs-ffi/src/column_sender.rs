@@ -52,7 +52,14 @@ pub struct column_sender(OwnedSender);
 
 /// One DataFrame's worth of column buffers destined for one QuestDB table.
 /// Owned by the caller; not bound to a sender.
-pub struct column_sender_chunk(Chunk);
+///
+/// Holds raw pointers into caller buffers (no copy). Per the FFI ABI
+/// doc §2.3, the caller MUST keep every column buffer passed in via
+/// `column_sender_chunk_column_*` / `column_sender_chunk_symbol_dict_*`
+/// alive until the next `column_sender_flush` call returns. We hide the
+/// chunk's lifetime by promoting its inner type to `'static`; the lifetime
+/// is enforced by the caller, not the borrow checker.
+pub struct column_sender_chunk(Chunk<'static>);
 
 // ===========================================================================
 // Validity bitmap (Arrow shape: bit = 1 means valid, LSB-first).
@@ -746,17 +753,23 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
 // Flush
 // ===========================================================================
 
-/// Encode `chunk` into a QWP/WebSocket frame, publish it, and block
-/// until the server acknowledges at the requested `ack_level`.
+/// Encode `chunk` into a QWP/WebSocket frame, write it to the socket,
+/// and return immediately — without waiting for the server's ack.
+///
+/// Ready acks are drained non-blocking before the write. If the
+/// in-flight count has hit the protocol cap (128), the call blocks
+/// until one ack frees a slot.
 ///
 /// On success, `chunk` is cleared and the call returns `true`. On
 /// failure, `chunk` is left untouched and `false` is returned (with
 /// `*err_out` set if provided).
+///
+/// Call [`column_sender_sync`] after the last flush to drain all
+/// remaining in-flight acks.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush(
     sender: *mut column_sender,
     chunk: *mut column_sender_chunk,
-    ack_level: column_sender_ack_level,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let sender = match unsafe { sender.as_mut() } {
@@ -778,7 +791,40 @@ pub unsafe extern "C" fn column_sender_flush(
         Some(c) => &mut c.0,
         None => return reject_null_chunk(err_out),
     };
-    bubble!(err_out, sender.flush(chunk, ack_level.into()));
+    bubble!(err_out, sender.flush(chunk));
+    true
+}
+
+/// Block until all in-flight frames are acknowledged at the requested
+/// `ack_level`.
+///
+/// `column_sender_ack_level_ok` waits for every in-flight frame's
+/// WAL-commit ack. `column_sender_ack_level_durable` additionally waits
+/// for the server's object-store durability watermarks.
+///
+/// Returns `true` on success, `false` on error (with `*err_out` set).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_sync(
+    sender: *mut column_sender,
+    ack_level: column_sender_ack_level,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let sender = match unsafe { sender.as_mut() } {
+        Some(s) => s.0.get_mut(),
+        None => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        "column_sender_sync: sender pointer is NULL".to_string(),
+                    ),
+                );
+            }
+            return false;
+        }
+    };
+    bubble!(err_out, sender.sync(ack_level.into()));
     true
 }
 

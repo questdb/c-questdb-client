@@ -49,29 +49,62 @@ op-state validation: for 50M rows × 6 columns that's 300M name lookups
 column-major API replaces all of that with **6 bulk appends per chunk
 + 1 encode pass**.
 
-### 2.1 Decoupled from the existing row encoder
+### 2.1 Decoupled from the existing row encoder *and the row publisher*
 
 Performance is the goal; **code reuse is a non-goal**. The column
-sender does **not** reuse `QwpWsColumnarBuffer` or the row API's
-encoder. It writes a fresh QWP/WS frame directly from pandas/polars-
-shaped buffers, via a new `BulkChunk` type and a sibling encoder in a
-new module.
+sender does **not** reuse `QwpWsColumnarBuffer`, the row API's
+encoder, **or the row API's publisher / driver / queue stack**. It
+owns its own QWP/WebSocket socket end-to-end via a dedicated
+`ColumnConn` type (`questdb-rs/src/ingress/column_sender/conn.rs`):
+
+- one write buffer reused across flushes (no per-frame allocation);
+- the encoder writes the QWP frame body directly into that buffer at
+  offset `WS_HEADER_RESERVE = 14`, leaving room to prepend the WS
+  header in place once the payload length is known;
+- the buffer is masked in place per RFC 6455 §5.3 and `write_all`'d to
+  the socket — at most one frame in flight by construction;
+- the ack reader synchronously parses the QWP response inline (no
+  replay queue, no background thread).
 
 What is shared with the row API is only what *must* stay coherent at
 connection scope:
 
 - `SymbolGlobalDict` (`questdb-rs/src/ingress/buffer/qwp.rs:5041`) —
-  the connection-scoped symbol intern table the wire requires.
-- `SchemaRegistry` (`qwp.rs:5148`) — connection-scoped schema IDs.
-- The QWP/WS publisher / driver / WS framing in
-  `questdb-rs/src/ingress/sender/qwp_ws*.rs` — connection lifecycle,
-  ack pump, reconnect, FSN tracking.
+  the connection-scoped symbol intern table the wire requires. A
+  fresh instance per `ColumnConn`.
+- The shared RFC 6455 WS plumbing in `crate::ws::{frame, mask,
+  handshake, crypto}` (handshake, frame header parse,
+  client-frame encode, mask key source).
+- TCP connect + TLS setup + WS handshake, reached via
+  `SenderBuilder::build_qwp_ws_raw_stream` which returns a
+  `RawQwpWsStream` and never assembles the row-API publisher /
+  driver / queue.
 
-What is *not* shared, and may be duplicated verbatim if that's
-simplest, is the wire-formatting helper surface: varint writers, type-
-byte tables, schema-signature construction. These are stable per the
-QWP v1 spec; duplicating costs ~100 lines and removes one layer of
-indirection from the hot path.
+Note that `SchemaRegistry` is now **column-sender-local** (defined in
+`column_sender/encoder.rs`), not shared. Each `ColumnConn` carries its
+own registry through the pool; the row API has its own, separate
+registry inside `QwpWsReplayEncoder`.
+
+What is *not* shared, and is duplicated verbatim where simplest, is
+the QWP response parser (one binary OK / DurableAck / error frame at
+a time) and the wire-formatting helper surface (varint writers,
+type-byte tables, schema-signature construction). These are stable per
+the QWP v1 spec; duplicating costs ~150 lines and removes one layer
+of indirection from the hot path.
+
+### 2.1.1 Borrow-not-copy
+
+`Chunk<'a>` holds **raw pointers** into the caller's column buffers,
+not copied wire-shape bytes. Each `column_*` call validates input
+(name, lengths, varchar offset monotonicity, symbol-code range) and
+stores a descriptor; the encoder dereferences the pointers at flush
+time. The caller's buffers must outlive flush.
+
+On the Rust API, the lifetime parameter `'a` ties the chunk to every
+borrowed buffer, so the borrow checker catches use-after-free at
+compile time. The FFI layer carries the same shape via
+`Chunk<'static>` and an explicit ABI contract — see
+`doc/COLUMN_SENDER_FFI_ABI.md` §2.3.
 
 ### 2.2 Two code paths per type
 

@@ -32,57 +32,58 @@ QUESTDB_COLUMN_BENCH_ROWS=10000000 \
 #   QUESTDB_COLUMN_BENCH_SYM_CARD     default 1_000
 ```
 
-## First-baseline numbers
+## Numbers after the borrow-not-copy rewrite
 
 Captured on an Apple Silicon laptop, default workload
 (`rows = 100_000`, `varchar_len = 16`, `sym_card = 1_000`),
-`cargo bench ... -- --quick --noplot`. Replace with refreshed numbers as
-the encoder evolves.
+`cargo bench ... -- --quick --noplot`. The big change vs the first
+baseline: `Chunk` now holds raw pointers into the caller's buffers;
+all wire-formatting is deferred to flush time and writes directly into
+the connection's reusable write buffer.
 
-| Bench                               | Median time | Median throughput   | Notes |
-|-------------------------------------|------------:|--------------------:|-------|
-| `column_i64/memcpy_baseline`        |     ~143 µs |     ~5.2 GiB/s      | High variance — bare `Vec` alloc + push + extend on a 800 KB allocation dominates. |
-| `column_i64/column_sender_no_null`  |    ~13.7 µs |     ~54 GiB/s       | Memcpy-bound; matches the plan's "no-null = `extend_from_slice`" goal. |
-| `column_i64/column_sender_nullable` |    ~79.1 µs |     ~9.4 GiB/s      | Sentinel-encode per row (`i64::MIN` for nulls). |
-| `column_f64/memcpy_baseline`        |    ~13.6 µs |     ~54.7 GiB/s     | |
-| `column_f64/column_sender_no_null`  |    ~13.5 µs |     ~55 GiB/s       | Indistinguishable from memcpy. |
-| `column_varchar/memcpy_baseline`    |    ~63.6 µs |     ~29.3 GiB/s     | Offset table + bytes copy. |
-| `column_varchar/column_sender_no_null` | ~67.0 µs |     ~27.8 GiB/s     | Within ~5 % of memcpy; rebase-to-zero path is the same as memcpy when `offsets[0] == 0`. |
-| `symbol_dict/column_sender`         |     ~135 µs |  ~740 M rows/s      | 100k rows × 1 000-card dict; three-pass bulk-intern. |
-| `symbol_dict/naive_per_row_hashmap` |    ~2.16 ms |   ~46 M rows/s      | Per-row HashMap probe; mirrors what the row API pays. **~16× slower than the column path** — confirms the WS-4 plan claim (drops 100k probes to 1 000 interns). |
-| `encode_chunk/populate_only`        |     ~294 µs |  ~341 M rows/s      | 5 columns (i64, f64, varchar, symbol, designated_ts); all bulk-append calls. |
-| `encode_chunk/encode_only`          |     ~437 µs |  ~229 M rows/s      | Header + dict-delta + table block + per-column splices. |
-| `encode_chunk/populate_plus_encode` |     ~718 µs |  ~139 M rows/s      | End-to-end, no network. |
+| Bench                               | Median time | Notes |
+|-------------------------------------|------------:|-------|
+| `column_i64/column_sender_no_null`  |    ~57 ns   | Descriptor store only — no data copy at append time. |
+| `column_i64/column_sender_nullable` |   ~289 ns   | Descriptor store + `non_null_count` precompute over the bitmap. |
+| `column_f64/column_sender_no_null`  |    ~57 ns   | Same as i64 — `Chunk` never touches the caller's bytes. |
+| `encode_chunk/populate_only`        |    ~76 µs   | Chunk-fill for the 5-column workload (was ~294 µs in the pre-rewrite baseline). **~4× faster.** |
+| `encode_chunk/encode_only`          |   ~500 µs   | Full encode: header + dict-delta + table block + per-column wire encode straight into a reusable buffer (was ~437 µs in the pre-rewrite baseline; now does the per-row work that previously happened during populate). |
+| `encode_chunk/populate_plus_encode` |   ~575 µs   | **End-to-end flush time (no network) was ~718 µs pre-rewrite → ~575 µs after. ~20 % faster.** |
 
 A second-pass `encode_chunk/encode_only` on the same workload should
 land in **REFERENCE mode** for the schema (because the registry caches
 the signature from the first encode), shaving off the FULL-mode
 signature bytes — see `doc/COLUMN_SENDER_PLAN.md` §2.1.
 
-## Interpreting the baseline
+The per-column microbenches no longer measure data movement: with raw
+pointers stored, `column_iN`/`column_fN` are essentially constant-time
+in `row_count`. The honest end-to-end metric is
+`encode_chunk/populate_plus_encode`, which is what a single flush
+costs (chunk-fill + frame encode into the WS write buffer, before
+masking/socket-write).
 
-- The **`column_f64/column_sender_no_null` ≈ memcpy** result is the
-  load-bearing perf claim of the column sender: a contiguous typed
-  buffer pays the cost of a `memcpy` and nothing more. The chunk's
-  per-column `Vec<u8>` storage absorbs the null-flag byte + payload in
-  one extend; encode time then turns each column into a single
-  `extend_from_slice`.
-- The **`column_i64/memcpy_baseline` variance** is bench noise from the
-  large per-iteration allocation in the baseline (a fresh
-  ~800 KB `Vec` per sample). The column-sender path reuses its
-  `Vec::with_capacity(16)` seed and grows in place, which the
-  allocator handles more uniformly. Both medians are well above
-  network bandwidth, so this is not the bottleneck.
-- The **nullable I64 path** at ~9.4 GiB/s is the sentinel-encode loop
-  (`if v.is_valid(i) { value } else { I64_NULL }`), bounded by branch
-  prediction. It still moves the same 800 KB; a SIMD lowering would
-  close the gap with the no-null path but isn't necessary to hit the
-  "memcpy-bound when the user has no nulls" bar.
-- The **symbol bulk-intern speedup (~16×)** comes from the WS-4
-  three-pass design — referenced bitset, compact dict copy, code
-  translation. At 100k rows × 1 000-card dict the column path runs
-  1 000 interns plus 100 000 `Vec<u32>` writes; the naïve path runs
-  100 000 HashMap probes.
+## Interpreting the numbers
+
+- The **`encode_chunk/populate_plus_encode` ~20 % win** is the
+  load-bearing claim: end-to-end CPU time per flush is lower than the
+  pre-rewrite design that copied each column into per-column `Vec<u8>`
+  staging and then aggregated those into a fresh per-frame `Vec<u8>`.
+  We now do exactly one memcpy per fixed-width column — straight from
+  the caller's buffer into the connection's reusable write buffer.
+- The **`encode_only` is *slightly* slower in isolation** (~500 µs vs
+  ~437 µs) because the per-row work that used to be amortised into
+  `populate_only` is now done at encode time. `populate_only` dropped
+  from ~294 µs to ~76 µs, and the sum is what matters.
+- The encoder pre-sizes the write buffer in one shot via
+  `estimate_frame_size(...)` to avoid the geometric-growth memcpy
+  pattern when payloads exceed the default 64 KiB capacity. Without
+  this, end-to-end flush time would be ~880 µs (worse than the
+  baseline).
+- The **symbol bulk-intern** still runs the WS-4 three-pass design
+  (referenced bitset, intern only referenced slots, then per-row
+  emit). At 100 k rows × 1 000-card dict the encoder runs ≤ 1 000
+  interns + 100 k varint writes — the per-row HashMap probe of the
+  row-API path remains ~16× slower.
 
 ## Out of scope here
 

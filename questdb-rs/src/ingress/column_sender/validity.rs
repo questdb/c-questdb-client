@@ -86,22 +86,6 @@ impl<'a> Validity<'a> {
         }
         count
     }
-
-    /// Write the QWP-shape null bitmap (bit = 1 means NULL) for this
-    /// validity into `out`. Always writes `ceil(bit_len / 8)` bytes; the
-    /// last byte's high bits past `bit_len` are masked to zero.
-    pub(crate) fn write_qwp_bitmap(&self, out: &mut Vec<u8>) {
-        let full_bytes = self.bit_len / 8;
-        let trailing_bits = self.bit_len % 8;
-        for &byte in &self.bits[..full_bytes] {
-            out.push(!byte);
-        }
-        if trailing_bits != 0 {
-            let mask = (1u8 << trailing_bits) - 1;
-            let inverted = !self.bits[full_bytes] & mask;
-            out.push(inverted);
-        }
-    }
 }
 
 /// Validate that a caller-supplied `data` length matches a chunk's locked
@@ -147,20 +131,6 @@ mod tests {
         let bits = [0b1010_1010, 0xFFu8]; // second byte has every bit set
         let v = Validity::from_bitmap(&bits, 9).unwrap();
         assert_eq!(v.non_null_count(), 4 + 1);
-    }
-
-    #[test]
-    fn write_qwp_bitmap_inverts_arrow_semantics() {
-        // Arrow: bit=1 valid. QWP wire: bit=1 NULL. Trailing high bits of
-        // the last byte are masked to 0.
-        let bits = [0b1100_1100, 0b0000_0011];
-        let v = Validity::from_bitmap(&bits, 12).unwrap();
-        let mut out = Vec::new();
-        v.write_qwp_bitmap(&mut out);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0], !0b1100_1100);
-        // Last byte: invert and mask to 4 valid bits (rows 8..12).
-        assert_eq!(out[1], (!0b0000_0011) & 0b0000_1111);
     }
 
     #[test]

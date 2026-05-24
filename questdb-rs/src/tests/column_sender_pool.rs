@@ -375,9 +375,8 @@ fn refuses_durable_ack_without_opt_in() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
     let mut sender = db.borrow_sender().expect("borrow");
-    let mut chunk = Chunk::new("trades");
     let err = sender
-        .flush(&mut chunk, AckLevel::Durable)
+        .sync(AckLevel::Durable)
         .expect_err("durable without opt-in must fail");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(
@@ -394,8 +393,9 @@ fn empty_chunk_flush_round_trips() {
     let mut sender = db.borrow_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     assert_eq!(chunk.row_count(), 0);
+    sender.flush(&mut chunk).unwrap();
     sender
-        .flush(&mut chunk, AckLevel::Ok)
+        .sync(AckLevel::Ok)
         .expect("empty-chunk flush must round-trip");
     // Flush clears the chunk.
     assert_eq!(chunk.row_count(), 0);
@@ -408,9 +408,8 @@ fn flush_clears_chunk_for_reuse_and_can_repeat() {
     let mut sender = db.borrow_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     for _ in 0..3 {
-        sender
-            .flush(&mut chunk, AckLevel::Ok)
-            .expect("repeated empty flush");
+        sender.flush(&mut chunk).unwrap();
+        sender.sync(AckLevel::Ok).expect("repeated empty flush");
     }
 }
 
@@ -424,7 +423,7 @@ fn flush_rejects_chunk_with_no_designated_timestamp() {
         .column_i64("price", &[1, 2, 3], None)
         .expect("column_i64");
     let err = sender
-        .flush(&mut chunk, AckLevel::Ok)
+        .flush(&mut chunk)
         .expect_err("non-empty chunk without designated_ts must error");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("designated"), "msg: {}", err.msg());
@@ -458,9 +457,8 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
         .unwrap();
     assert_eq!(chunk.row_count(), 3);
 
-    sender
-        .flush(&mut chunk, AckLevel::Ok)
-        .expect("numeric chunk flush");
+    sender.flush(&mut chunk).unwrap();
+    sender.sync(AckLevel::Ok).expect("numeric chunk flush");
     assert!(chunk.is_empty(), "flush must clear the chunk");
 
     // Second flush with the SAME schema exercises the SchemaRegistry's
@@ -473,8 +471,9 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
     chunk
         .designated_timestamp_nanos(&[1_700_000_000_000_003_000, 1_700_000_000_000_004_000])
         .unwrap();
+    sender.flush(&mut chunk).unwrap();
     sender
-        .flush(&mut chunk, AckLevel::Ok)
+        .sync(AckLevel::Ok)
         .expect("second flush (schema reuse)");
 }
 
@@ -510,9 +509,8 @@ fn varchar_chunk_round_trips() {
         ])
         .unwrap();
     assert_eq!(chunk.row_count(), 4);
-    sender
-        .flush(&mut chunk, AckLevel::Ok)
-        .expect("varchar flush");
+    sender.flush(&mut chunk).unwrap();
+    sender.sync(AckLevel::Ok).expect("varchar flush");
     assert!(chunk.is_empty());
 }
 
@@ -532,9 +530,8 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
         .symbol_dict_i32("sym", &[0, 2, 0, 2], &dict_offsets, dict_bytes, None)
         .expect("symbol_dict_i32 first flush");
     chunk.designated_timestamp_nanos(&[1, 2, 3, 4]).unwrap();
-    sender
-        .flush(&mut chunk, AckLevel::Ok)
-        .expect("symbol flush 1");
+    sender.flush(&mut chunk).unwrap();
+    sender.sync(AckLevel::Ok).expect("symbol flush 1");
 
     // Second flush re-uses entry 0 ("alpha", already in the global dict)
     // and adds entry 1 ("beta"). With the connection-scoped dict the
@@ -543,9 +540,8 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
         .symbol_dict_i32("sym", &[1, 0, 1, 0], &dict_offsets, dict_bytes, None)
         .expect("symbol_dict_i32 second flush");
     chunk.designated_timestamp_nanos(&[5, 6, 7, 8]).unwrap();
-    sender
-        .flush(&mut chunk, AckLevel::Ok)
-        .expect("symbol flush 2");
+    sender.flush(&mut chunk).unwrap();
+    sender.sync(AckLevel::Ok).expect("symbol flush 2");
 }
 
 #[test]

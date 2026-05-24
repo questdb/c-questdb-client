@@ -63,7 +63,9 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use questdb::ingress::column_sender::_bench_internals::{BenchEncoderState, bench_encode_chunk};
+use questdb::ingress::column_sender::_bench_internals::{
+    BenchEncoderState, bench_encode_chunk_into,
+};
 use questdb::ingress::column_sender::{Chunk, Validity};
 
 // ---------------------------------------------------------------------------
@@ -157,7 +159,7 @@ fn make_symbol_workload(rows: usize, cardinality: usize) -> (Vec<i32>, Vec<i32>,
 // Bench helpers
 // ---------------------------------------------------------------------------
 
-fn fresh_chunk(table: &str) -> Chunk {
+fn fresh_chunk<'a>(table: &str) -> Chunk<'a> {
     Chunk::new(table)
 }
 
@@ -397,10 +399,16 @@ fn encode_chunk_group(c: &mut Criterion) {
     let prebuilt = build_chunk();
     group.bench_function("encode_only", |b| {
         b.iter_batched(
-            BenchEncoderState::new,
-            |mut state| {
-                let frame = bench_encode_chunk(&prebuilt, &mut state).unwrap();
-                black_box(frame);
+            || {
+                (
+                    BenchEncoderState::new(),
+                    Vec::<u8>::with_capacity(64 * 1024),
+                )
+            },
+            |(mut state, mut out)| {
+                out.clear();
+                bench_encode_chunk_into(&mut out, &prebuilt, &mut state).unwrap();
+                black_box(&out);
             },
             BatchSize::SmallInput,
         );
@@ -408,11 +416,17 @@ fn encode_chunk_group(c: &mut Criterion) {
 
     group.bench_function("populate_plus_encode", |b| {
         b.iter_batched(
-            BenchEncoderState::new,
-            |mut state| {
+            || {
+                (
+                    BenchEncoderState::new(),
+                    Vec::<u8>::with_capacity(64 * 1024),
+                )
+            },
+            |(mut state, mut out)| {
                 let chunk = build_chunk();
-                let frame = bench_encode_chunk(&chunk, &mut state).unwrap();
-                black_box(frame);
+                out.clear();
+                bench_encode_chunk_into(&mut out, &chunk, &mut state).unwrap();
+                black_box(&out);
             },
             BatchSize::SmallInput,
         );

@@ -71,9 +71,6 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedConf {
     pub(crate) pool: PoolConfig,
-    /// `true` iff the connect string opted in to durable acks via
-    /// `request_durable_ack=on`. Required for `AckLevel::Durable` flushes.
-    pub(crate) durable_ack_opt_in: bool,
 }
 
 /// Validate and extract pool-specific knobs from a column-sender connect
@@ -104,7 +101,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
 
     let mut pool = PoolConfig::default();
     let mut pool_size_specified = false;
-    let mut durable_ack_opt_in = false;
 
     walk_params(params, |key, value| {
         if is_refused_key(key) {
@@ -112,7 +108,9 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         }
         match key {
             "request_durable_ack" => {
-                durable_ack_opt_in = parse_on_off("request_durable_ack", value)?;
+                // Syntactic check; the SenderBuilder also parses this
+                // for ColumnConn.
+                let _ = parse_on_off("request_durable_ack", value)?;
             }
             "qwp_ws_progress" if value != "background" => {
                 return Err(error::fmt!(
@@ -181,10 +179,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         ));
     }
 
-    Ok(ParsedConf {
-        pool,
-        durable_ack_opt_in,
-    })
+    Ok(ParsedConf { pool })
 }
 
 fn parse_on_off(key: &str, value: &str) -> Result<bool> {
@@ -376,12 +371,12 @@ mod tests {
 
     #[test]
     fn parses_request_durable_ack() {
-        let off = parse_ok("qwpws::addr=localhost:9000;");
-        assert!(!off.durable_ack_opt_in);
-        let on = parse_ok("qwpws::addr=localhost:9000;request_durable_ack=on;");
-        assert!(on.durable_ack_opt_in);
-        let explicit_off = parse_ok("qwpws::addr=localhost:9000;request_durable_ack=off;");
-        assert!(!explicit_off.durable_ack_opt_in);
+        // Syntactically valid values pass the column-sender's pre-check.
+        // The actual `durable_ack_opt_in` flag is sourced from the
+        // SenderBuilder inside `ColumnConn::connect`.
+        let _ = parse_ok("qwpws::addr=localhost:9000;");
+        let _ = parse_ok("qwpws::addr=localhost:9000;request_durable_ack=on;");
+        let _ = parse_ok("qwpws::addr=localhost:9000;request_durable_ack=off;");
     }
 
     #[test]

@@ -89,9 +89,19 @@ For every column-append function:
   contiguous in the common case.)
 - All column buffers passed in one chunk must have the same `row_count`
   — the chunk's row count, set by the first column-append call.
-- Buffer ownership stays with the caller; the FFI copies into internal
-  storage during the call. The buffer can be freed or reused
-  immediately on return.
+- **Buffer lifetime contract.** Buffers passed to a `column_sender_chunk_*`
+  function (numeric columns, varchar offsets/bytes, symbol codes/dict
+  offsets/dict bytes, designated timestamps, validity bitmaps) **must
+  remain alive and unchanged until the next `column_sender_flush` call
+  on the chunk returns** (or until `column_sender_chunk_free` /
+  `column_sender_chunk_clear` is called without a flush). The FFI stores
+  raw pointers into the caller's buffers; it does **not** copy at
+  append time. This is required to hit memcpy-bandwidth throughput on
+  the no-null hot path — see `doc/COLUMN_SENDER_PLAN.md` §2.
+- For Python wrappers, the typical pattern is to fill the chunk from a
+  live DataFrame's numpy / Arrow buffers and flush before letting the
+  DataFrame go out of scope — the contract is naturally satisfied
+  because flush is synchronous.
 
 ### 2.4 Validity bitmaps
 

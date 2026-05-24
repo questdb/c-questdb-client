@@ -41,6 +41,7 @@
 
 mod chunk;
 mod conf;
+mod conn;
 mod db;
 mod encoder;
 mod sender;
@@ -64,7 +65,7 @@ pub mod _bench_internals {
     use crate::ingress::buffer::SymbolGlobalDict;
 
     use super::chunk::Chunk;
-    use super::encoder::{SchemaRegistry, encode_chunk};
+    use super::encoder::{SchemaRegistry, encode_chunk_into};
 
     /// Opaque holder for the connection-scoped state the encoder needs.
     /// Lets benches reuse the encoder across iterations without
@@ -90,10 +91,19 @@ pub mod _bench_internals {
         }
     }
 
-    /// Encode `chunk` against `state`. Mirrors [`encode_chunk`] but
-    /// hides the internal-state types so the bench module never has to
-    /// touch them.
-    pub fn bench_encode_chunk(chunk: &Chunk, state: &mut BenchEncoderState) -> Result<Vec<u8>> {
-        encode_chunk(chunk, &mut state.schema_registry, &mut state.symbol_dict)
+    /// Encode `chunk` into `out`. Mirrors [`encode_chunk_into`] but hides
+    /// the internal-state types so the bench module never has to touch
+    /// them.
+    pub fn bench_encode_chunk_into(
+        out: &mut Vec<u8>,
+        chunk: &Chunk<'_>,
+        state: &mut BenchEncoderState,
+    ) -> Result<()> {
+        encode_chunk_into(
+            out,
+            chunk,
+            &mut state.schema_registry,
+            &mut state.symbol_dict,
+        )
     }
 }

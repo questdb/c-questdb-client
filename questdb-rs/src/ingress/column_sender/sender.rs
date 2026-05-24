@@ -24,25 +24,22 @@
 
 //! Borrowed-handle types for the column-major sender.
 //!
-//! A [`ColumnSender`] is one borrowed pool slot. It owns the underlying
-//! [`crate::ingress::Sender`], the connection-scoped [`SchemaRegistry`],
-//! and the connection-scoped [`SymbolGlobalDict`]: all three travel back
-//! into the pool together when the [`super::BorrowedSender`] is dropped.
+//! A [`ColumnSender`] owns one pipelined QWP/WebSocket connection
+//! ([`super::conn::ColumnConn`]), a connection-scoped
+//! [`SchemaRegistry`](super::encoder::SchemaRegistry), and a
+//! connection-scoped [`SymbolGlobalDict`]: all three travel back into the
+//! pool together when the [`super::BorrowedSender`] is dropped.
 
 use std::fmt::{self, Debug, Formatter};
-use std::time::Duration;
 
-use crate::ingress::Sender;
+use crate::Result;
 use crate::ingress::buffer::SymbolGlobalDict;
-use crate::{Result, error};
 
 use super::chunk::Chunk;
+use super::conn::ColumnConn;
 use super::encoder::{self, SchemaRegistry};
 
-/// Acknowledgement level a [`ColumnSender::flush`] call waits for.
-///
-/// See `doc/COLUMN_SENDER_PLAN.md` §4 for the rationale and the QWP/WS spec
-/// for the status-byte values.
+/// Acknowledgement level for [`ColumnSender::sync`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AckLevel {
     /// Wait for the server's WAL-commit ACK (spec status `0x00`). Always
@@ -50,45 +47,37 @@ pub enum AckLevel {
     #[default]
     Ok,
     /// Wait for the server's object-store durability ACK (spec status
-    /// `0x02`). Enterprise feature; requires `request_durable_ack=on` in the
-    /// connect string. Flush returns `InvalidApiCall` otherwise.
+    /// `0x02`). Enterprise feature; requires `request_durable_ack=on` in
+    /// the connect string.
     Durable,
 }
 
-/// One [`crate::ingress::Sender`] in the pool, wrapped in the column-sender
-/// type system.
-///
-/// The user reaches this via [`super::BorrowedSender`].
+/// One [`ColumnConn`] in the pool, wrapped in the column-sender API.
 pub struct ColumnSender {
-    pub(crate) sender: Sender,
+    pub(crate) conn: ColumnConn,
     pub(crate) schema_registry: SchemaRegistry,
     pub(crate) symbol_dict: SymbolGlobalDict,
-    /// Latched from the connect string at [`super::QuestDb::connect`]; a
-    /// [`AckLevel::Durable`] flush is only honoured when this is `true`.
-    durable_ack_opt_in: bool,
 }
 
 impl Debug for ColumnSender {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ColumnSender")
-            .field("sender", &self.sender)
-            .field("durable_ack_opt_in", &self.durable_ack_opt_in)
+            .field("must_close", &self.conn.must_close())
+            .field("in_flight", &self.conn.in_flight())
             .finish()
     }
 }
 
 impl ColumnSender {
     pub(crate) fn new(
-        sender: Sender,
+        conn: ColumnConn,
         schema_registry: SchemaRegistry,
         symbol_dict: SymbolGlobalDict,
-        durable_ack_opt_in: bool,
     ) -> Self {
         Self {
-            sender,
+            conn,
             schema_registry,
             symbol_dict,
-            durable_ack_opt_in,
         }
     }
 
@@ -97,57 +86,52 @@ impl ColumnSender {
     /// are dropped rather than recycled.
     #[must_use]
     pub fn must_close(&self) -> bool {
-        self.sender.must_close()
+        self.conn.must_close()
     }
 
-    /// Encode `chunk` into a QWP/WebSocket frame, publish it, and block
-    /// until the server acknowledges at the requested [`AckLevel`].
+    /// Encode `chunk` into a QWP/WebSocket frame, write it to the
+    /// socket, and return — **without** waiting for the server's ack.
     ///
-    /// On success, `chunk` is cleared (its retained capacity is preserved).
-    /// On failure, `chunk` is left untouched so the caller can inspect or
-    /// recover its contents before dropping it.
+    /// Ready acks are drained non-blocking before the write. If the
+    /// in-flight count has reached the protocol cap (128), this call
+    /// blocks until at least one ack frees a slot.
     ///
-    /// At most one frame is in flight per sender at a time — that is what
-    /// makes this call synchronous. For parallel ingest, borrow multiple
-    /// senders from the [`super::QuestDb`] pool, one per worker thread.
+    /// On success, `chunk` is cleared (its retained descriptor capacity
+    /// is preserved) and the caller's buffers are released. The ack
+    /// will arrive later; call [`sync`](Self::sync) when you need all
+    /// in-flight frames acknowledged.
     ///
-    /// `AckLevel::Durable` requires the pool to have been opened with
-    /// `request_durable_ack=on`; otherwise this returns `InvalidApiCall`.
-    pub fn flush(&mut self, chunk: &mut Chunk, ack_level: AckLevel) -> Result<()> {
-        if ack_level == AckLevel::Durable && !self.durable_ack_opt_in {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires the pool to be opened with \
-                 `request_durable_ack=on` in the connect string."
-            ));
+    /// On failure, the connection is latched as terminal and the error
+    /// is returned. `chunk` is left untouched.
+    pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
+        // Drain any ready acks to keep the pipeline moving and to
+        // surface server errors as early as possible.
+        self.conn.try_drain_acks()?;
+
+        // If we've hit the cap, block until one slot frees up.
+        if self.conn.at_in_flight_cap() {
+            self.conn.drain_one_ack_blocking()?;
         }
 
-        let payload =
-            encoder::encode_chunk(chunk, &mut self.schema_registry, &mut self.symbol_dict)?;
-        let fsn = self.sender.qwp_ws_publish_raw(&payload)?;
-        self.await_ack(fsn)?;
+        let schema = &mut self.schema_registry;
+        let dict = &mut self.symbol_dict;
+        let published = self
+            .conn
+            .publish_qwp(|out| encoder::encode_chunk_into(out, chunk, schema, dict))?;
+
+        self.conn.push_pending(published.fsn);
         chunk.clear();
         Ok(())
     }
 
-    /// Wait until the underlying connection's cumulative ack watermark
-    /// reaches `fsn`, or until the connection latches into `must_close`.
-    fn await_ack(&mut self, fsn: u64) -> Result<()> {
-        // Poll in 50 ms slices so a connection that latches into
-        // `must_close` mid-wait is surfaced promptly rather than blocking
-        // forever on the underlying ack watermark.
-        const POLL: Duration = Duration::from_millis(50);
-        loop {
-            if self.sender.await_acked_fsn(fsn, POLL)? {
-                return Ok(());
-            }
-            if self.sender.must_close() {
-                return Err(error::fmt!(
-                    SocketError,
-                    "QWP/WebSocket connection entered a terminal state before \
-                     the published frame was acknowledged."
-                ));
-            }
-        }
+    /// Block until all in-flight frames are acknowledged at the
+    /// requested [`AckLevel`].
+    ///
+    /// `AckLevel::Ok` waits for every in-flight frame's WAL-commit ack.
+    /// `AckLevel::Durable` additionally waits for the server's
+    /// object-store durability watermarks to reach every frame's
+    /// seq_txn (requires `request_durable_ack=on` at connect).
+    pub fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
+        self.conn.sync_all_acks(ack_level)
     }
 }

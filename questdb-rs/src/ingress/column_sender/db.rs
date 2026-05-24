@@ -45,10 +45,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::ingress::{Sender, SenderBuilder};
 use crate::{Result, error};
 
 use super::conf::{self, PoolReap};
+use super::conn::ColumnConn;
 use super::sender::ColumnSender;
 
 /// Lower bound on the reaper's wake interval.
@@ -75,9 +75,6 @@ struct DbInner {
     pool_size: usize,
     pool_max: usize,
     pool_idle_timeout: Duration,
-    /// Latched from the connect string. Required for `AckLevel::Durable`
-    /// flushes; without it, a `Durable` flush returns `InvalidApiCall`.
-    durable_ack_opt_in: bool,
     state: Mutex<PoolState>,
     /// Wakes the reaper thread on `shutdown` and lets a future blocking
     /// borrow wait for a free slot once we grow `borrow_sender` past
@@ -101,7 +98,7 @@ impl PoolState {
 }
 
 struct PoolEntry {
-    sender: Sender,
+    conn: ColumnConn,
     /// Connection-scoped schema interner. Travels with the slot so its
     /// `(signature → id)` map stays coherent across borrow/return cycles;
     /// both client and server build the same map by first-emit order, so
@@ -138,7 +135,7 @@ impl QuestDb {
         let mut free = Vec::with_capacity(pool_cfg.pool_size);
         let now = Instant::now();
         for slot in 0..pool_cfg.pool_size {
-            let sender = build_sender(conf).map_err(|err| {
+            let conn = ColumnConn::connect(conf).map_err(|err| {
                 crate::Error::new(
                     err.code(),
                     format!(
@@ -150,7 +147,7 @@ impl QuestDb {
                 )
             })?;
             free.push(PoolEntry {
-                sender,
+                conn,
                 schema_registry: super::encoder::SchemaRegistry::new(),
                 symbol_dict: crate::ingress::buffer::SymbolGlobalDict::new(),
                 last_idle_at: now,
@@ -162,7 +159,6 @@ impl QuestDb {
             pool_size: pool_cfg.pool_size,
             pool_max: pool_cfg.pool_max,
             pool_idle_timeout: pool_cfg.pool_idle_timeout,
-            durable_ack_opt_in: parsed.durable_ack_opt_in,
             state: Mutex::new(PoolState { free, in_use: 0 }),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
@@ -210,10 +206,9 @@ impl QuestDb {
             state.in_use += 1;
             drop(state);
             return Ok(ColumnSender::new(
-                entry.sender,
+                entry.conn,
                 entry.schema_registry,
                 entry.symbol_dict,
-                self.inner.durable_ack_opt_in,
             ));
         }
 
@@ -232,8 +227,8 @@ impl QuestDb {
         state.in_use += 1;
         drop(state);
 
-        let sender = match build_sender(&self.inner.conf) {
-            Ok(sender) => sender,
+        let conn = match ColumnConn::connect(&self.inner.conf) {
+            Ok(c) => c,
             Err(err) => {
                 let mut state = self.inner.state.lock().expect("pool mutex poisoned");
                 state.in_use -= 1;
@@ -242,10 +237,9 @@ impl QuestDb {
         };
 
         Ok(ColumnSender::new(
-            sender,
+            conn,
             super::encoder::SchemaRegistry::new(),
             crate::ingress::buffer::SymbolGlobalDict::new(),
-            self.inner.durable_ack_opt_in,
         ))
     }
 
@@ -429,20 +423,16 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     state.in_use -= 1;
     if !must_close {
         state.free.push(PoolEntry {
-            sender: sender.sender,
+            conn: sender.conn,
             schema_registry: sender.schema_registry,
             symbol_dict: sender.symbol_dict,
             last_idle_at: Instant::now(),
         });
     }
-    // Dropped `sender` (when `must_close`) falls out of scope here, after
+    // When `must_close`, the contained connection is dropped here, after
     // the count was decremented but with the mutex still held — safe
-    // since `Sender::drop` does not re-enter the pool.
+    // since `ColumnConn::drop` does not re-enter the pool.
     drop(state);
-}
-
-fn build_sender(conf: &str) -> Result<Sender> {
-    SenderBuilder::from_conf(conf)?.build()
 }
 
 fn spawn_reaper(inner: Arc<DbInner>) -> JoinHandle<()> {
@@ -481,10 +471,10 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
 }
 
 fn reap_idle_inner(inner: &DbInner) -> usize {
-    // Drop the to-be-closed senders OUTSIDE the lock so closing a connection
+    // Drop the to-be-closed connections OUTSIDE the lock so closing a connection
     // (which may take an unbounded amount of time) does not stall concurrent
     // borrows.
-    let to_drop: Vec<Sender> = {
+    let to_drop: Vec<ColumnConn> = {
         let mut state = inner.state.lock().expect("pool mutex poisoned");
         let mut to_drop = Vec::new();
         let now = Instant::now();
@@ -500,7 +490,7 @@ fn reap_idle_inner(inner: &DbInner) -> usize {
             let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
             if idle_for > inner.pool_idle_timeout {
                 let entry = state.free.remove(i);
-                to_drop.push(entry.sender);
+                to_drop.push(entry.conn);
             } else {
                 i += 1;
             }
