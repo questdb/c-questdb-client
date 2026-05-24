@@ -30,7 +30,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "sync-sender-qwp-ws")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -413,6 +413,7 @@ impl OrphanDrainer {
             config.tls_settings.clone(),
             config.qwp_ws.clone(),
             config.auth_header.clone(),
+            Arc::new(AtomicUsize::new(0)),
         ) {
             Ok(transport) => transport,
             Err(err) => {

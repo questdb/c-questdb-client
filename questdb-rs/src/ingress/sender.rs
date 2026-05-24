@@ -42,6 +42,8 @@ use crate::ingress::SenderBuilder;
 use crate::ingress::{Buffer, Protocol, ProtocolVersion};
 use std::fmt::{Debug, Formatter};
 #[cfg(feature = "sync-sender-qwp-ws")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "sync-sender-qwp-ws")]
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-udp")]
@@ -105,6 +107,16 @@ mod http;
 
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn effective_qwp_ws_max_buf_size(configured: usize, server_max: &AtomicUsize) -> usize {
+    let server = server_max.load(Ordering::Relaxed);
+    if server > 0 {
+        configured.min(server)
+    } else {
+        configured
+    }
+}
 
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum SyncProtocolHandler {
@@ -303,9 +315,15 @@ impl Sender {
         }
 
         let result = match &mut self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => flush_qwp_ws(state, qwp, self.max_buf_size),
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                let max =
+                    effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size);
+                flush_qwp_ws(state, qwp, max)
+            }
             SyncProtocolHandler::ManualQwpWs(state) => {
-                flush_qwp_ws_manual(state, qwp, self.max_buf_size)
+                let max =
+                    effective_qwp_ws_max_buf_size(self.max_buf_size, &state.server_max_batch_size);
+                flush_qwp_ws_manual(state, qwp, max)
             }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
