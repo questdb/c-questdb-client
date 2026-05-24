@@ -68,6 +68,9 @@ pub use sender::*;
 mod decimal;
 pub use decimal::DecimalView;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub mod column_sender;
+
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
 /// The maximum allowed dimensions for arrays.

@@ -76,6 +76,9 @@ use ndarr::StrideArrayView;
 #[cfg(feature = "sync-reader-ws")]
 mod egress;
 
+pub mod column_sender;
+pub use column_sender::*;
+
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
         bubble_err_to_c!($err_out, $expression, false)

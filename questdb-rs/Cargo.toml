@@ -269,3 +269,14 @@ required-features = ["sync-sender-qwp-ws"]
 name = "decoder"
 harness = false
 required-features = ["sync-reader-ws"]
+
+# Column-major sender hot-path bench. Anchors the perf claims from
+# `doc/COLUMN_SENDER_PLAN.md` §2 (memcpy-bound no-null path,
+# referenced-only symbol intern). Run with:
+#
+#   cargo bench --features sync-sender-qwp-ws --bench column_sender
+#   QUESTDB_COLUMN_BENCH_ROWS=10000000 cargo bench --features sync-sender-qwp-ws --bench column_sender
+[[bench]]
+name = "column_sender"
+harness = false
+required-features = ["sync-sender-qwp-ws"]
