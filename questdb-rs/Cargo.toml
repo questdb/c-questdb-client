@@ -255,6 +255,12 @@ required-features = ["sync-reader-ws"]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws"]
 
+# Synthetic equities L1 quote feed → QuestDB via the column-major
+# sender. End-to-end throughput sanity check against a real server.
+[[example]]
+name = "qwp_ws_l1_quotes"
+required-features = ["sync-sender-qwp-ws"]
+
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR
 # decode hot paths). Run with:
