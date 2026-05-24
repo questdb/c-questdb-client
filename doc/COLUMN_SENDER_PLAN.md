@@ -112,8 +112,8 @@ Python repo (separate)                  c-questdb-client (this repo)
                               │         │     ▼                       │
                               │         │  ColumnSender (borrowed)    │
                               │         │   ├─ new_chunk              │
-                              │         │   ├─ submit (FSN-returning) │
-                              │         │   └─ await_acked_fsn        │
+                              │         │   └─ flush (sync, blocks    │
+                              │         │       until server ACK)     │
                               │         └─────────┬───────────────────┘
                                                   │
                                                   ▼  (BulkChunk encoder,
@@ -180,15 +180,38 @@ pub struct ColumnSender { /* &mut Connection (lifetime-bound) */ }
 
 impl ColumnSender {
     /// Create a chunk for a given table. Doesn't touch the connection
-    /// — chunks are pure data until submitted.
+    /// — chunks are pure data until flushed.
     pub fn new_chunk(&self, table: TableName) -> Chunk;
 
-    /// Submit a chunk: encode → publish → return FSN (= wire `sequence`).
-    /// Clears the chunk for reuse on success.
-    pub fn submit(&mut self, chunk: &mut Chunk) -> Result<Fsn>;
+    /// Synchronously flush a chunk: encode → publish → block until the
+    /// server ACK at the requested level arrives. On success the chunk
+    /// is cleared (allocations retained) ready for the next DataFrame.
+    /// On failure the chunk is left untouched.
+    ///
+    /// `ack_level`:
+    /// - `AckLevel::Ok` — wait for WAL-commit ACK (spec status `0x00`).
+    ///   Always available.
+    /// - `AckLevel::Durable` — wait for object-store durability ACK
+    ///   (spec status `0x02`). Enterprise feature; requires the pool
+    ///   to be opened with `request_durable_ack=on` in the connect
+    ///   string. If the connection did not opt in, returns
+    ///   `InvalidApiCall`.
+    ///
+    /// At most one frame in flight per sender; for parallel ingest,
+    /// borrow multiple senders from the `QuestDb` pool.
+    pub fn flush(&mut self, chunk: &mut Chunk, ack_level: AckLevel) -> Result<()>;
 
-    pub fn await_acked_fsn(&mut self, fsn: Fsn, timeout: Duration) -> Result<()>;
     pub fn must_close(&self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum AckLevel {
+    /// Server's WAL commit (spec status `0x00`). Always available.
+    #[default]
+    Ok,
+    /// Server's object-store durability (spec status `0x02`).
+    /// Enterprise + requires durable-ack opt-in at connect.
+    Durable,
 }
 
 pub struct Chunk { /* table name + Vec<ChunkColumn> + row_count */ }
@@ -327,19 +350,26 @@ land.
     timeout while keeping `pool_size` warm,
   - `close()` joins the reaper cleanly.
 
-### WS-1 — `ColumnSender` thin handle & wire-side submit plumbing
+### WS-1 — `ColumnSender` thin handle & synchronous flush plumbing
 
 - Define `ColumnSender` as a `&mut Connection` lifetime-bound borrow
-  handle. Implement `submit(chunk)` that calls the new encoder
-  (WS-2/3/4) and hands the encoded frame to the existing publisher
-  (`questdb-rs/src/ingress/sender/qwp_ws_publisher.rs`).
-- Hook up FSN return, `await_acked_fsn`, `must_close`.
-- Stub `submit()` for an empty chunk that produces a header-only QWP
-  frame end-to-end (no columns; pure framing) and the server accepts.
+  handle. Implement `flush(chunk)` that calls the new encoder
+  (WS-2/3/4), hands the encoded frame to the existing publisher
+  (`questdb-rs/src/ingress/sender/qwp_ws_publisher.rs`), and blocks
+  until the server ACK arrives.
+- Internally the publisher still tracks the wire `sequence` (FSN);
+  `flush` waits on that FSN. FSN is not exposed at the public API.
+- Hook up `must_close`.
+- Refuse `sf_dir` (and other `sf_*` keys) at `QuestDb::connect`-time
+  with `ConfigError`. Update WS-0's connect-string parser
+  accordingly.
+- Stub `flush()` on an empty chunk: produces a header-only QWP frame
+  end-to-end (no columns; pure framing), server accepts and ACKs.
 - Owner: 1 engineer.
 - Depends on: WS-0.
-- Done when: empty-chunk submit round-trips against a real server and
-  the FSN is acked.
+- Done when: empty-chunk `flush` round-trips against a real server and
+  returns on ACK; `sf_dir` in the connect string is rejected with a
+  clear error.
 
 ### WS-2 — `Chunk`, `BulkChunk` encoder, numeric/fixed-width columns
 
@@ -535,6 +565,21 @@ flag a deviation rather than re-litigate silently.
   Naming: `QuestDb`, `ColumnSender`, `Chunk`, `Validity`.
 - **Mental model:** `DataFrame → Table`. One chunk = one table = one
   DataFrame = one QWP frame = one FSN.
+- **Send is synchronous.** `sender.flush(&mut chunk, ack_level)`
+  blocks until the server ACK at the requested level arrives. Two
+  levels: `Ok` (WAL commit, always available) and `Durable`
+  (object-store durability — Enterprise; requires durable-ack opt-in
+  at connect). At most one frame in flight per sender. Parallelism is
+  expressed by borrowing multiple senders from the pool, one per
+  thread. The wire's 128-in-flight cap is never reached. The QWP
+  `sequence` / FSN is tracked internally and not exposed at the API
+  or FFI surface.
+- **Store-and-forward (`sf_dir`) is refused in v1.** Passing `sf_dir`
+  or any other `sf_*` key to `QuestDb::connect` returns `ConfigError`.
+  SF is single-writer per slot and interacts awkwardly with pool
+  auto-grow. Users who need on-disk durability across crashes can use
+  the existing row-major `Sender` API. Revisit if a real user needs
+  both throughput and SF.
 - **Connection layer:** pool (`QuestDb::connect`), borrow/return
   (`db.borrow_sender()` → drop returns to pool). Defaults:
   `pool_size=1`, `pool_max=64`, `pool_idle_timeout_ms=60000`. Eager
@@ -571,8 +616,6 @@ flag a deviation rather than re-litigate silently.
 - `LONG_ARRAY` / `DOUBLE_ARRAY` per-row, `GEOHASH`, `CHAR`, `BINARY`.
 - C++ header wrapper (`column_sender.hpp`). Python wrapper does not
   need it.
-- Durable-ack callback API. Connect-string opt-in
-  (`X-QWP-Request-Durable-Ack: true` via `qwp_durable_ack=on`) is
-  surfaced; the OK fast path is what the throughput target cares
-  about.
+- (Removed in this revision: durable-ack as deferred. See settled
+  decisions for ack-level handling.)
 

@@ -199,9 +199,18 @@ return per work unit (or per thread).
 | `pool_reap`            | `auto`  | `auto` — pool spawns a background thread that periodically reaps idle connections per `pool_idle_timeout_ms`. `manual` — no background thread; caller invokes `questdb_db_reap_idle` on its own cadence. |
 
 All other connect-string keys are inherited from the existing
-`qwpws::` configuration (auth, TLS, `auth_timeout_ms`, retry, store-
-and-forward, durable-ack opt-in, etc.). See `doc/CONSIDERATIONS.md`
-and the row-API connect-string reference.
+`qwpws::` configuration (auth, TLS, `auth_timeout_ms`, retry,
+durable-ack opt-in, etc.). See `doc/CONSIDERATIONS.md` and the
+row-API connect-string reference.
+
+**Not accepted in v1:** `sf_dir` and the other `sf_*` store-and-
+forward keys (`sender_id`, `sf_max_bytes`, `sf_max_total_bytes`,
+`sf_durability`, `sf_append_deadline_millis`). Passing any of them to
+`questdb_db_connect` returns `line_sender_error_config_error` with a
+message pointing to the row-major `line_sender` API for users who
+need SF semantics. SF is fundamentally single-writer per slot and
+interacts awkwardly with the pool's auto-grow; revisit only if a
+real user needs both throughput and on-disk durability.
 
 Validity: `pool_size <= pool_max` must hold; otherwise
 `questdb_db_connect` returns `line_sender_error_config_error`.
@@ -663,61 +672,63 @@ per row.)
 
 ---
 
-## 11. Submit
+## 11. Flush (synchronous)
 
 ```c
 /**
- * Encode the chunk into a QWP/WebSocket frame and publish it. On
- * success the chunk is cleared (row count → 0, allocations retained)
- * and can be reused.
+ * Acknowledgement level the flush waits for.
+ */
+typedef enum column_sender_ack_level
+{
+    /** Wait for the server's WAL-commit ACK (spec status 0x00).
+        Always available. */
+    column_sender_ack_level_ok = 0,
+
+    /** Wait for the server's object-store durability ACK
+        (spec status 0x02). Enterprise only. Requires the pool to be
+        opened with `request_durable_ack=on` in the connect string
+        (and the server's 101 response confirming
+        `X-QWP-Durable-Ack: enabled`). If the connection did not opt
+        in, flush returns line_sender_error_invalid_api_call. */
+    column_sender_ack_level_durable = 1,
+} column_sender_ack_level;
+
+/**
+ * Encode the chunk into a QWP/WebSocket frame, publish it, and block
+ * until the server acknowledges at the requested `ack_level`. Returns
+ * true once the ACK is received; the chunk is then cleared (row count
+ * → 0, allocations retained) and can be reused for the next DataFrame.
  *
- * If fsn_out != NULL, the frame's assigned sequence number is written
- * to *fsn_out on success. This value is the QWP wire `sequence` field
- * (spec §Sequence numbering): a per-connection counter starting at 0,
- * server-assigned by counting inbound frames. The existing Rust API
- * calls it "FSN" (frame sequence number) — the two terms are
- * interchangeable.
+ * Synchronous semantics: at most one frame in flight per sender. For
+ * parallel ingest, borrow multiple senders from the pool — one per
+ * thread — and flush concurrently. The 128-in-flight wire cap is
+ * never reached.
  *
- * Use column_sender_await_acked_fsn to block until the server acks it.
+ * Ack level semantics:
+ *  - `ok` — returns when the server has written the batch to its WAL.
+ *  - `durable` — returns when the WAL segment is durably uploaded to
+ *    the configured object store. Strictly later than the OK
+ *    watermark; can be significantly later under upload pressure.
  *
- * On failure, the chunk is left untouched so the caller can recover
- * its contents (e.g. write to local fallback storage) before freeing.
+ * On any failure (server rejection, transport error, latched-error
+ * sender, or `durable` requested without opt-in), returns false and
+ * sets *err_out. The chunk is left untouched so the caller can
+ * inspect or recover its contents before freeing.
  *
- * Back-pressure: the wire allows at most 128 in-flight (unacked)
- * batches. When the in-flight queue is full, submit blocks until an
- * ack frees a slot, or returns an error if the deadline configured on
- * the sender elapses first.
+ * Flush blocks until ack or until the underlying connection enters a
+ * terminal failure state (must_close() becomes true). Transient
+ * disconnects are absorbed by the existing reconnect machinery. No
+ * separate per-call timeout in v1; if you need one, file a request.
+ *
+ * The QWP wire `sequence` (FSN) is tracked internally and is not
+ * exposed at the FFI — synchronous flush makes it unnecessary.
  */
 QUESTDB_CLIENT_API
-bool column_sender_submit(
+bool column_sender_flush(
     column_sender* sender,
     column_sender_chunk* chunk,
-    uint64_t* fsn_out,
+    column_sender_ack_level ack_level,
     line_sender_error** err_out);
-
-/**
- * Block until the server has durably acknowledged the given FSN, or
- * until the timeout elapses.
- *
- * timeout_millis = 0 means non-blocking poll.
- *
- * Returns true if acked within the deadline, false otherwise. On
- * unrecoverable error sets *err_out.
- */
-QUESTDB_CLIENT_API
-bool column_sender_await_acked_fsn(
-    column_sender* sender,
-    uint64_t fsn,
-    uint64_t timeout_millis,
-    line_sender_error** err_out);
-
-/**
- * Non-blocking poll of progress counters.
- */
-QUESTDB_CLIENT_API
-uint64_t column_sender_published_fsn(const column_sender* sender);
-QUESTDB_CLIENT_API
-uint64_t column_sender_acked_fsn(const column_sender* sender);
 ```
 
 ---
@@ -767,9 +778,9 @@ int send_one_chunk(questdb_db* db) {
     if (!column_sender_chunk_designated_timestamp_nanos(
             chunk, timestamps_ns, 3, &err)) goto fail;
 
-    uint64_t fsn = 0;
-    if (!column_sender_submit(sender, chunk, &fsn, &err)) goto fail;
-    if (!column_sender_await_acked_fsn(sender, fsn, 5000, &err)) goto fail;
+    if (!column_sender_flush(
+            sender, chunk, column_sender_ack_level_ok, &err)) goto fail;
+    /* flush returned: server has WAL-committed; chunk cleared & reusable */
 
     column_sender_chunk_free(chunk);
     questdb_db_return_sender(db, sender);
