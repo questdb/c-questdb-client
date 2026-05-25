@@ -57,6 +57,11 @@ pub struct ColumnSender {
     pub(crate) conn: ColumnConn,
     pub(crate) schema_registry: SchemaRegistry,
     pub(crate) symbol_dict: SymbolGlobalDict,
+    /// The first frame is sent without `FLAG_DEFER_COMMIT` so the server
+    /// commits it immediately. This lets the WAL segment roll and update
+    /// `initialSymbolCount`, warming the server's `ClientSymbolCache` for
+    /// all subsequent deferred frames.
+    first_frame_sent: bool,
 }
 
 impl Debug for ColumnSender {
@@ -78,6 +83,7 @@ impl ColumnSender {
             conn,
             schema_registry,
             symbol_dict,
+            first_frame_sent: false,
         }
     }
 
@@ -106,7 +112,10 @@ impl ColumnSender {
     /// On failure, the connection is latched as terminal and the error
     /// is returned. `chunk` is left untouched.
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
-        self.flush_inner(chunk, /* defer_commit = */ true)
+        let defer = self.first_frame_sent;
+        self.flush_inner(chunk, defer)?;
+        self.first_frame_sent = true;
+        Ok(())
     }
 
     /// Block until all in-flight frames are acknowledged at the
