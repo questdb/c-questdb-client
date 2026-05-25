@@ -30,6 +30,8 @@ The valid protocols are:
 * ``http``: ILP/HTTP
 * ``https``: ILP/HTTP with TLS
 * ``qwpudp``: QWP/UDP (QuestWire Protocol over UDP)
+* ``qwpws``: QWP/WebSocket
+* ``qwpwss``: QWP/WebSocket with TLS
 
 If you're unsure which protocol to use, see :ref:`sender_which_protocol`.
 
@@ -59,7 +61,7 @@ Connection
 
   This key-value pair is mandatory, but the port can be defaulted.
   If omitted, the port will be defaulted to 9009 for TCP(s),
-  9000 for HTTP(s), and 9007 for QWP/UDP.
+  9000 for HTTP(s) and QWP/WebSocket, and 9007 for QWP/UDP.
 
 * ``bind_interface`` - TCP/QWP-UDP only, ``str``: Network interface to bind
   from. Useful if you have an accelerated network interface (e.g. Solarflare)
@@ -75,7 +77,7 @@ Connection
 * ``multicast_ttl`` - QWP/UDP-only, ``int (0-255)``: Multicast TTL
   (time-to-live) for UDP datagrams.
 
-  Default: 0.
+  Default: 1.
 
 .. _sender_conf_auth:
 
@@ -115,7 +117,7 @@ See the :ref:`auth_and_tls_example` example for more details.
 TLS
 ===
 
-TLS in enabled by selecting the ``tcps`` or ``https`` protocol.
+TLS is enabled by selecting the ``tcps``, ``https``, or ``qwpwss`` protocol.
 
 See the `QuestDB enterprise TLS documentation <https://questdb.com/docs/operations/tls/>`_
 on how to enable this feature in the server.
@@ -143,6 +145,12 @@ still use TLS by setting up a proxy in front of QuestDB, such as
 
 * ``tls_roots`` - ``str``: Path to a PEM-encoded certificate authority file.
   When used it defaults the ``tls_ca`` to ``'pem_file'``.
+
+  For ``qwpwss``, this can also point at a JKS or PKCS#12 keystore when
+  paired with ``tls_roots_password``.
+
+* ``tls_roots_password`` - ``str``: Password for the JKS or PKCS#12 keystore
+  configured by ``tls_roots``. This is supported only for ``qwpwss``.
 
 * ``tls_verify`` - ``'on'`` | ``'unsafe_off'``: Whether to verify the server's
   certificate. This should only be used for testing as a last resort and never
@@ -293,10 +301,15 @@ The following parameters control the HTTP request behavior.
 
 * ``retry_timeout`` - ``int > 0``: The time in milliseconds to continue retrying
   after a failed HTTP request. The interval between retries is an exponential
-  backoff starting at 10ms and doubling after each failed attempt up to a
-  maximum of 1 second.
+  backoff starting at 10ms and doubling after each failed attempt up to
+  ``retry_max_backoff_millis``.
     
   Default: 10000 (10 seconds).
+
+* ``retry_max_backoff_millis`` - ``int >= 10``: Maximum per-attempt backoff in
+  milliseconds for the HTTP retry loop.
+
+  Default: 1000 (1 second).
 
 * ``request_timeout`` - ``int > 0``: The time in milliseconds to wait for a
   response from the server. This is in addition to the calculation derived from

@@ -151,7 +151,7 @@ class IngressErrorCode(Enum):
     ArrayError = line_sender_error_array_error
     ProtocolVersionError = line_sender_error_protocol_version_error
     DecimalError = line_sender_error_invalid_decimal
-    BadDataFrame = <int>line_sender_error_invalid_decimal + 1
+    BadDataFrame = <int>line_sender_error_server_rejection + 1
 
     def __str__(self) -> str:
         """Return the name of the enum."""
@@ -276,6 +276,14 @@ cdef inline object c_err_to_py_fmt(line_sender_error* err, str fmt):
     if tup[0] == IngressErrorCode.ServerRejection:
         return IngressServerRejectionError(tup[0], fmt.format(tup[1]), tup[2])
     return IngressError(tup[0], fmt.format(tup[1]), tup[2])
+
+
+cdef inline void_int reserve_buffer(
+        line_sender_buffer* buffer,
+        size_t additional) except -1:
+    cdef line_sender_error* err = NULL
+    if not line_sender_buffer_reserve(buffer, additional, &err):
+        raise c_err_to_py(err)
 
 
 cdef object _utf8_decode_error(
@@ -920,7 +928,7 @@ cdef class Buffer:
     cdef inline _init_ilp_impl(self, line_sender_protocol_version version, size_t init_buf_size, size_t max_name_len):
         self._impl = line_sender_buffer_with_max_name_len(version, max_name_len)
         self._b = qdb_pystr_buf_new()
-        line_sender_buffer_reserve(self._impl, init_buf_size)
+        reserve_buffer(self._impl, init_buf_size)
         self._init_buf_size = init_buf_size
         self._max_name_len = max_name_len
         self._row_complete_sender = None
@@ -928,7 +936,7 @@ cdef class Buffer:
     cdef inline _init_qwp_impl(self, size_t init_buf_size, size_t max_name_len):
         self._impl = line_sender_buffer_new_qwp_with_max_name_len(max_name_len)
         self._b = qdb_pystr_buf_new()
-        line_sender_buffer_reserve(self._impl, init_buf_size)
+        reserve_buffer(self._impl, init_buf_size)
         self._init_buf_size = init_buf_size
         self._max_name_len = max_name_len
         self._row_complete_sender = None
@@ -968,7 +976,7 @@ cdef class Buffer:
         if additional < 0:
             raise ValueError('additional must be non-negative.')
         self._check_impl()
-        line_sender_buffer_reserve(self._impl, additional)
+        reserve_buffer(self._impl, additional)
 
     def capacity(self) -> int:
         """The current buffer capacity."""
@@ -2058,8 +2066,10 @@ cdef object parse_conf_str(
         'tls_verify': str,
         'tls_ca': str,
         'tls_roots': str,
+        'tls_roots_password': str,
         'max_buf_size': int,
         'retry_timeout': int,
+        'retry_max_backoff_millis': int,
         'request_min_throughput': int,
         'request_timeout': int,
         'auto_flush': str,
@@ -2117,8 +2127,10 @@ cdef class Sender:
             object tls_verify,
             object tls_ca,
             object tls_roots,
+            object tls_roots_password,
             object max_buf_size,
             object retry_timeout,
+            object retry_max_backoff,
             object request_min_throughput,
             object request_timeout,
             object auto_flush,
@@ -2148,8 +2160,10 @@ cdef class Sender:
         cdef bint c_tls_verify
         cdef line_sender_ca c_tls_ca
         cdef line_sender_utf8 c_tls_roots
+        cdef line_sender_utf8 c_tls_roots_password
         cdef uint64_t c_max_buf_size
         cdef uint64_t c_retry_timeout
+        cdef uint64_t c_retry_max_backoff
         cdef uint64_t c_request_min_throughput
         cdef uint64_t c_request_timeout
         cdef size_t c_max_datagram_size = 0
@@ -2299,6 +2313,12 @@ cdef class Sender:
             if not line_sender_opts_tls_roots(self._opts, c_tls_roots, &err):
                 raise c_err_to_py(err)
 
+        if tls_roots_password is not None:
+            str_to_utf8(b, <PyObject*>tls_roots_password, &c_tls_roots_password)
+            if not line_sender_opts_tls_roots_password(
+                    self._opts, c_tls_roots_password, &err):
+                raise c_err_to_py(err)
+
         if tls_ca is not None:
             c_tls_ca = TlsCa.parse(tls_ca).c_value
             if not line_sender_opts_tls_ca(self._opts, c_tls_ca, &err):
@@ -2328,6 +2348,22 @@ cdef class Sender:
                 raise TypeError(
                     '"retry_timeout" must be an int or a timedelta, '
                     f'not {_fqn(type(retry_timeout))}')
+
+        if retry_max_backoff is not None:
+            if isinstance(retry_max_backoff, int):
+                c_retry_max_backoff = retry_max_backoff
+                if not line_sender_opts_retry_max_backoff(
+                        self._opts, c_retry_max_backoff, &err):
+                    raise c_err_to_py(err)
+            elif isinstance(retry_max_backoff, cp_timedelta):
+                c_retry_max_backoff = _timedelta_to_millis(retry_max_backoff)
+                if not line_sender_opts_retry_max_backoff(
+                        self._opts, c_retry_max_backoff, &err):
+                    raise c_err_to_py(err)
+            else:
+                raise TypeError(
+                    '"retry_max_backoff" must be an int or a timedelta, '
+                    f'not {_fqn(type(retry_max_backoff))}')
 
         if request_min_throughput is not None:
             c_request_min_throughput = request_min_throughput
@@ -2393,8 +2429,10 @@ cdef class Sender:
             object tls_verify=None,  # default: True
             object tls_ca=None,  # default: TlsCa.WebpkiRoots
             object tls_roots=None,
+            str tls_roots_password=None,
             object max_buf_size=None,  # 100 * 1024 * 1024 - 100MiB
             object retry_timeout=None,  # default: 10000 milliseconds
+            object retry_max_backoff=None,  # default: 1000 milliseconds
             object request_min_throughput=None, # default: 100 * 1024 - 100KiB/s
             object request_timeout=None,
             object auto_flush=None,  # Default True
@@ -2402,7 +2440,7 @@ cdef class Sender:
             object auto_flush_bytes=None,  # Default off
             object auto_flush_interval=None,  # Default 1000 milliseconds
             object max_datagram_size=None,  # Default 1400 for QWP/UDP
-            object multicast_ttl=None,  # Default 0 for QWP/UDP
+            object multicast_ttl=None,  # Default 1 for QWP/UDP
             object qwp_ws_progress=None,  # Default background for QWP/WebSocket
             object qwp_ws_error_handler=None,
             object protocol_version=None,  # Default auto
@@ -2441,8 +2479,10 @@ cdef class Sender:
                 tls_verify,
                 tls_ca,
                 tls_roots,
+                tls_roots_password,
                 max_buf_size,
                 retry_timeout,
+                retry_max_backoff,
                 request_min_throughput,
                 request_timeout,
                 auto_flush,
@@ -2473,8 +2513,10 @@ cdef class Sender:
             object tls_verify=None,  # default: True
             object tls_ca=None,  # default: TlsCa.WebpkiRoots
             object tls_roots=None,
+            str tls_roots_password=None,
             object max_buf_size=None,  # 100 * 1024 * 1024 - 100MiB
             object retry_timeout=None,  # default: 10000 milliseconds
+            object retry_max_backoff=None,  # default: 1000 milliseconds
             object request_min_throughput=None, # default: 100 * 1024 - 100KiB/s
             object request_timeout=None,
             object auto_flush=None,  # Default True
@@ -2482,7 +2524,7 @@ cdef class Sender:
             object auto_flush_bytes=None,  # Default off
             object auto_flush_interval=None,  # Default 1000 milliseconds
             object max_datagram_size=None,  # Default 1400 for QWP/UDP
-            object multicast_ttl=None,  # Default 0 for QWP/UDP
+            object multicast_ttl=None,  # Default 1 for QWP/UDP
             object qwp_ws_progress=None,  # Default background for QWP/WebSocket
             object qwp_ws_error_handler=None,
             object protocol_version=None,  # Default auto
@@ -2514,11 +2556,6 @@ cdef class Sender:
                     IngressErrorCode.ConfigError,
                     'Missing "addr" parameter in config string')
             
-            if 'tls_roots_password' in params:
-                raise IngressError(
-                    IngressErrorCode.ConfigError,
-                    '"tls_roots_password" is not supported in the conf_str.')
-
             # add fields to the dictionary, so long as they aren't already
             # present in the params dictionary
             for override_key, override_value in {
@@ -2532,8 +2569,10 @@ cdef class Sender:
                 'tls_verify': tls_verify,
                 'tls_ca': tls_ca,
                 'tls_roots': tls_roots,
+                'tls_roots_password': tls_roots_password,
                 'max_buf_size': max_buf_size,
                 'retry_timeout': retry_timeout,
+                'retry_max_backoff_millis': retry_max_backoff,
                 'request_min_throughput': request_min_throughput,
                 'request_timeout': request_timeout,
                 'auto_flush': auto_flush,
@@ -2569,8 +2608,10 @@ cdef class Sender:
                 'tls_verify',
                 'tls_ca',
                 'tls_roots',
+                'tls_roots_password',
                 'max_buf_size',
                 'retry_timeout',
+                'retry_max_backoff_millis',
                 'request_min_throughput',
                 'request_timeout',
                 'auto_flush',
@@ -2611,8 +2652,10 @@ cdef class Sender:
                 params.get('tls_verify'),
                 params.get('tls_ca'),
                 params.get('tls_roots'),
+                params.get('tls_roots_password'),
                 params.get('max_buf_size'),
                 params.get('retry_timeout'),
+                params.get('retry_max_backoff_millis'),
                 params.get('request_min_throughput'),
                 params.get('request_timeout'),
                 params.get('auto_flush'),
@@ -2644,8 +2687,10 @@ cdef class Sender:
             object tls_verify=None,  # default: True
             object tls_ca=None,  # default: TlsCa.WebpkiRoots
             object tls_roots=None,
+            str tls_roots_password=None,
             object max_buf_size=None,  # 100 * 1024 * 1024 - 100MiB
             object retry_timeout=None,  # default: 10000 milliseconds
+            object retry_max_backoff=None,  # default: 1000 milliseconds
             object request_min_throughput=None, # default: 100 * 1024 - 100KiB/s
             object request_timeout=None,
             object auto_flush=None,  # Default True
@@ -2653,7 +2698,7 @@ cdef class Sender:
             object auto_flush_bytes=None,  # Default off
             object auto_flush_interval=None,  # Default 1000 milliseconds
             object max_datagram_size=None,  # Default 1400 for QWP/UDP
-            object multicast_ttl=None,  # Default 0 for QWP/UDP
+            object multicast_ttl=None,  # Default 1 for QWP/UDP
             object qwp_ws_progress=None,  # Default background for QWP/WebSocket
             object qwp_ws_error_handler=None,
             object protocol_version=None,  # Default auto
@@ -2688,8 +2733,10 @@ cdef class Sender:
             tls_verify=tls_verify,
             tls_ca=tls_ca,
             tls_roots=tls_roots,
+            tls_roots_password=tls_roots_password,
             max_buf_size=max_buf_size,
             retry_timeout=retry_timeout,
+            retry_max_backoff=retry_max_backoff,
             request_min_throughput=request_min_throughput,
             request_timeout=request_timeout,
             auto_flush=auto_flush,
@@ -2709,7 +2756,7 @@ cdef class Sender:
         cdef Buffer buf = Buffer.__new__(Buffer)
         buf._impl = line_sender_buffer_new_for_sender(self._impl)
         buf._b = qdb_pystr_buf_new()
-        line_sender_buffer_reserve(buf._impl, self._init_buf_size)
+        reserve_buffer(buf._impl, self._init_buf_size)
         buf._init_buf_size = self._init_buf_size
         buf._max_name_len = line_sender_get_max_name_len(self._impl)
         return buf

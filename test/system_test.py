@@ -1117,10 +1117,10 @@ class TestWithDatabase(unittest.TestCase):
             f'TIMESTAMP(timestamp) PARTITION BY DAY;')
         with self._mk_qwpudp_sender() as sender:
             sender.row(table_name,
-                       columns={'val': decimal.Decimal('0')},
+                       columns={'val': decimal.Decimal('0.000')},
                        at=qi.TimestampNanos.now())
             sender.row(table_name,
-                       columns={'val': decimal.Decimal('-0')},
+                       columns={'val': decimal.Decimal('-0.000')},
                        at=qi.TimestampNanos.now())
             sender.row(table_name,
                        columns={'val': decimal.Decimal('-123456789.012')},

@@ -146,7 +146,7 @@ def cargo_build():
         else:
             del env['CXX']
     subprocess.check_call(
-        cargo_args + ['--features', 'confstr-ffi'],
+        cargo_args + ['--features', 'confstr-ffi,insecure-skip-verify'],
         cwd=str(PROJ_ROOT / 'c-questdb-client' / 'questdb-rs-ffi'),
         env=env)
 

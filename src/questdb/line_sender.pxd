@@ -42,11 +42,11 @@ cdef extern from "questdb/ingress/line_sender.h":
         line_sender_error_tls_error,
         line_sender_error_http_not_supported,
         line_sender_error_server_flush_error,
-        line_sender_error_server_rejection,
         line_sender_error_config_error,
         line_sender_error_array_error,
         line_sender_error_protocol_version_error,
-        line_sender_error_invalid_decimal
+        line_sender_error_invalid_decimal,
+        line_sender_error_server_rejection
 
     cdef enum line_sender_protocol:
         line_sender_protocol_tcp,
@@ -56,6 +56,7 @@ cdef extern from "questdb/ingress/line_sender.h":
         line_sender_protocol_qwpudp,
         line_sender_protocol_qwpws,
         line_sender_protocol_qwpwss,
+        line_sender_protocol_unknown,
 
     cdef enum line_sender_protocol_version:
         line_sender_protocol_version_1 = 1,
@@ -201,9 +202,10 @@ cdef extern from "questdb/ingress/line_sender.h":
         const line_sender_buffer* buffer
         ) noexcept nogil
 
-    void line_sender_buffer_reserve(
+    bint line_sender_buffer_reserve(
         line_sender_buffer* buffer,
-        size_t additional
+        size_t additional,
+        line_sender_error** err_out
         ) noexcept nogil
 
     size_t line_sender_buffer_capacity(
@@ -477,6 +479,12 @@ cdef extern from "questdb/ingress/line_sender.h":
         line_sender_error** err_out
         ) noexcept nogil
 
+    bint line_sender_opts_tls_roots_password(
+        line_sender_opts* opts,
+        line_sender_utf8 password,
+        line_sender_error** err_out
+        ) noexcept nogil
+
     bint line_sender_opts_max_buf_size(
         line_sender_opts* opts,
         size_t max_buf_size,
@@ -490,6 +498,12 @@ cdef extern from "questdb/ingress/line_sender.h":
         ) noexcept nogil
 
     bint line_sender_opts_retry_timeout(
+        line_sender_opts* opts,
+        uint64_t millis,
+        line_sender_error** err_out
+        ) noexcept nogil
+
+    bint line_sender_opts_retry_max_backoff(
         line_sender_opts* opts,
         uint64_t millis,
         line_sender_error** err_out

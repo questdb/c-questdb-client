@@ -10,6 +10,7 @@ import time
 from enum import Enum
 import random
 import pathlib
+import tempfile
 import numpy as np
 
 import patch_path
@@ -124,6 +125,11 @@ class TestQwpWebSocketApi(unittest.TestCase):
         self.assertEqual(err.code, qi.IngressErrorCode.ServerRejection)
         self.assertEqual(err.qwp_ws_error.category, qi.QwpWsErrorCategory.ParseError)
 
+    def test_python_only_error_codes_do_not_overlap_ffi_codes(self):
+        self.assertNotEqual(
+            qi.IngressErrorCode.BadDataFrame,
+            qi.IngressErrorCode.ServerRejection)
+
     def test_from_conf_preserves_qwpws_progress(self):
         sender = qi.Sender.from_conf(
             'qwpws::addr=localhost:9000;qwp_ws_progress=manual;')
@@ -140,6 +146,44 @@ class TestQwpWebSocketApi(unittest.TestCase):
                 qi.IngressError,
                 'invalid sf_max_bytes'):
             qi.Sender.from_conf('qwpws::addr=localhost:9000;sf_max_bytes=64mi;')
+
+    def test_from_conf_accepts_qwpwss_tls_roots_password(self):
+        with tempfile.NamedTemporaryFile() as roots:
+            sender = qi.Sender.from_conf(
+                'qwpwss::addr=localhost:9000;'
+                f'tls_roots={roots.name};'
+                'tls_roots_password=secret;')
+            try:
+                self.assertIsInstance(sender, qi.Sender)
+            finally:
+                sender.close(False)
+
+    def test_tls_roots_password_rejects_non_qwp_websocket(self):
+        with tempfile.NamedTemporaryFile() as roots:
+            with self.assertRaisesRegex(
+                    qi.IngressError,
+                    'only supported for QWP/WebSocket'):
+                qi.Sender.from_conf(
+                    'tcps::addr=localhost:9009;'
+                    f'tls_roots={roots.name};'
+                    'tls_roots_password=secret;')
+
+    def test_from_conf_preserves_http_retry_max_backoff(self):
+        with self.assertRaisesRegex(
+                qi.IngressError,
+                'retry_max_backoff_millis.*at least 10'):
+            qi.Sender.from_conf(
+                'http::addr=localhost:9000;retry_max_backoff_millis=3;')
+
+    def test_retry_max_backoff_rejects_non_http_protocol(self):
+        with self.assertRaisesRegex(
+                qi.IngressError,
+                'retry_max_backoff_millis is supported only in ILP over HTTP'):
+            qi.Sender(
+                qi.Protocol.Tcp,
+                '127.0.0.1',
+                9009,
+                retry_max_backoff=250)
 
     def test_from_conf_preserves_escaped_semicolon_in_c_only_qwpws_key(self):
         sender = qi.Sender.from_conf(
@@ -1533,8 +1577,10 @@ def build_conf(protocol, host, port, **kwargs):
         'tls_verify': lambda v: 'on' if v else 'unsafe_off',
         'tls_ca': str,
         'tls_roots': str,
+        'tls_roots_password': str,
         'max_buf_size': str,
         'retry_timeout': encode_duration,
+        'retry_max_backoff': encode_duration,
         'request_min_throughput': str,
         'request_timeout': encode_duration,
         'auto_flush': lambda v: 'on' if v else 'off',
@@ -1550,8 +1596,13 @@ def build_conf(protocol, host, port, **kwargs):
         encoder = encoders.get(k, str)
         return encoder(v)
 
+    def conf_key(k):
+        if k == 'retry_max_backoff':
+            return 'retry_max_backoff_millis'
+        return k
+
     return f'{protocol.tag}::addr={host}:{port};' + ''.join(
-        f'{k}={encode(k, v)};'
+        f'{conf_key(k)}={encode(k, v)};'
         for k, v in kwargs.items()
         if v is not None)
 

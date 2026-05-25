@@ -844,8 +844,8 @@ See the :ref:`sender_conf_protocol_version` section for more details.
 Which protocol?
 ===============
 
-The sender supports ``tcp``, ``tcps``, ``http``, ``https``, and ``qwpudp``
-protocols.
+The sender supports ``tcp``, ``tcps``, ``http``, ``https``, ``qwpudp``,
+``qwpws``, and ``qwpwss`` protocols.
 
 **You should prefer to use ILP/HTTP in most cases as it provides better
 feedback on errors and transaction control.**
