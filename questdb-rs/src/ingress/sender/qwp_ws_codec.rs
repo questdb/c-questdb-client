@@ -112,16 +112,28 @@ pub(super) fn qwp_extra_headers(
 
 // ---------- HTTP response validation (post-shared-handshake) ----------
 
+/// Validated QWP handshake result extracted from the server's 101 response.
+#[derive(Debug)]
+pub(crate) struct QwpWsHandshakeResult {
+    /// Negotiated protocol version.
+    pub(super) version: u8,
+    /// Server's effective per-message payload cap in bytes, from
+    /// `X-QWP-Max-Batch-Size`. `0` when the server did not advertise the
+    /// header (older builds); callers fall back to their locally configured
+    /// byte budget.
+    pub(super) server_max_batch_size: usize,
+}
+
 /// QWP-specific post-validation on a successful 101 response. Returns the
 /// negotiated protocol version (defaults to 1 when the server omits
-/// X-QWP-Version, matching the spec). Errors when the server returns an
-/// out-of-range version or fails to echo `X-QWP-Durable-Ack: enabled`
-/// after the client requested it.
+/// X-QWP-Version, matching the spec) and the server-advertised max batch
+/// size. Errors when the server returns an out-of-range version or fails
+/// to echo `X-QWP-Durable-Ack: enabled` after the client requested it.
 pub(super) fn validate_qwp_handshake_headers(
     headers: &crate::ws::handshake::Headers,
     max_version: u32,
     request_durable_ack: bool,
-) -> crate::Result<u8> {
+) -> crate::Result<QwpWsHandshakeResult> {
     let version: u8 = match headers.find_ci("x-qwp-version") {
         Some(v) => v.parse().map_err(|_| {
             error::fmt!(
@@ -157,7 +169,24 @@ pub(super) fn validate_qwp_handshake_headers(
             ));
         }
     }
-    Ok(version)
+
+    let server_max_batch_size = extract_server_max_batch_size(headers);
+
+    Ok(QwpWsHandshakeResult {
+        version,
+        server_max_batch_size,
+    })
+}
+
+/// Parse `X-QWP-Max-Batch-Size` from the 101 upgrade response. Returns 0
+/// when the header is absent, malformed, or negative (older servers, or a
+/// server bug). Mirrors the Java reference implementation's
+/// `extractMaxBatchSize`.
+fn extract_server_max_batch_size(headers: &crate::ws::handshake::Headers) -> usize {
+    headers
+        .find_ci("x-qwp-max-batch-size")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 /// Map a non-101 HTTP response (from
@@ -537,7 +566,9 @@ mod tests {
     fn validate_qwp_handshake_headers_negotiates_version() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false).unwrap(),
+            validate_qwp_handshake_headers(&headers, 1, false)
+                .unwrap()
+                .version,
             1
         );
     }
@@ -582,7 +613,9 @@ mod tests {
     fn validate_qwp_handshake_headers_defaults_to_v1_when_missing() {
         let headers = Headers::default();
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false).unwrap(),
+            validate_qwp_handshake_headers(&headers, 1, false)
+                .unwrap()
+                .version,
             1
         );
     }
@@ -601,7 +634,9 @@ mod tests {
         let headers =
             Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Durable-Ack", "enabled")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, true).unwrap(),
+            validate_qwp_handshake_headers(&headers, 1, true)
+                .unwrap()
+                .version,
             1
         );
     }
@@ -610,9 +645,54 @@ mod tests {
     fn validate_qwp_handshake_headers_allows_missing_durable_ack_by_default() {
         let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
         assert_eq!(
-            validate_qwp_handshake_headers(&headers, 1, false).unwrap(),
+            validate_qwp_handshake_headers(&headers, 1, false)
+                .unwrap()
+                .version,
             1
         );
+    }
+
+    #[test]
+    fn extract_server_max_batch_size_absent_returns_zero() {
+        let headers = Headers::from_pairs([("X-QWP-Version", "1")]);
+        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        assert_eq!(result.server_max_batch_size, 0);
+    }
+
+    #[test]
+    fn extract_server_max_batch_size_parses_valid_value() {
+        let headers =
+            Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Max-Batch-Size", "16777202")]);
+        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        assert_eq!(result.server_max_batch_size, 16_777_202);
+    }
+
+    #[test]
+    fn extract_server_max_batch_size_malformed_returns_zero() {
+        let headers = Headers::from_pairs([
+            ("X-QWP-Version", "1"),
+            ("X-QWP-Max-Batch-Size", "not-a-number"),
+        ]);
+        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        assert_eq!(result.server_max_batch_size, 0);
+    }
+
+    #[test]
+    fn extract_server_max_batch_size_negative_returns_zero() {
+        let headers =
+            Headers::from_pairs([("X-QWP-Version", "1"), ("X-QWP-Max-Batch-Size", "-100")]);
+        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        assert_eq!(result.server_max_batch_size, 0);
+    }
+
+    #[test]
+    fn extract_server_max_batch_size_trims_whitespace() {
+        let headers = Headers::from_pairs([
+            ("X-QWP-Version", "1"),
+            ("X-QWP-Max-Batch-Size", " 2097138 "),
+        ]);
+        let result = validate_qwp_handshake_headers(&headers, 1, false).unwrap();
+        assert_eq!(result.server_max_batch_size, 2_097_138);
     }
 
     #[test]

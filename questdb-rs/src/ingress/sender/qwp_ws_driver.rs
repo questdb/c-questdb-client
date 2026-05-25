@@ -34,7 +34,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -2123,6 +2123,7 @@ pub(crate) struct BlockingQwpWsTransport {
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
     negotiated_version: u8,
+    server_max_batch_size: Arc<AtomicUsize>,
     stream: WsStream,
     reader: WsFrameReader,
     send_buf: Vec<u8>,
@@ -2139,6 +2140,7 @@ impl BlockingQwpWsTransport {
         tls_settings: Option<TlsSettings>,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
+        server_max_batch_size: Arc<AtomicUsize>,
     ) -> crate::Result<Self> {
         let host = host.into();
         let port = port.into();
@@ -2161,10 +2163,12 @@ impl BlockingQwpWsTransport {
             tls_settings,
             qwp_ws,
             auth_header,
+            server_max_batch_size,
             connected,
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_connected(
         endpoints: Arc<[QwpWsEndpoint]>,
         tracker: QwpWsHostHealthTracker,
@@ -2172,8 +2176,10 @@ impl BlockingQwpWsTransport {
         tls_settings: Option<TlsSettings>,
         qwp_ws: QwpWsConfig,
         auth_header: Option<String>,
+        server_max_batch_size: Arc<AtomicUsize>,
         connected: QwpWsConnectRoundSuccess,
     ) -> Self {
+        server_max_batch_size.store(connected.server_max_batch_size, Ordering::Relaxed);
         Self {
             endpoints,
             previous_idx: Some(connected.endpoint_idx),
@@ -2183,6 +2189,7 @@ impl BlockingQwpWsTransport {
             qwp_ws,
             auth_header,
             negotiated_version: connected.negotiated_version,
+            server_max_batch_size,
             stream: connected.stream,
             reader: WsFrameReader::with_initial_input(connected.leftover),
             send_buf: Vec::with_capacity(16 * 1024),
@@ -2209,6 +2216,8 @@ impl BlockingQwpWsTransport {
         self.previous_idx = Some(connected.endpoint_idx);
         self.stream = connected.stream;
         self.negotiated_version = connected.negotiated_version;
+        self.server_max_batch_size
+            .store(connected.server_max_batch_size, Ordering::Relaxed);
         self.reader = WsFrameReader::with_initial_input(connected.leftover);
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
