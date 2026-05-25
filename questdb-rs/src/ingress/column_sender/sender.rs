@@ -92,46 +92,56 @@ impl ColumnSender {
     /// Encode `chunk` into a QWP/WebSocket frame, write it to the
     /// socket, and return — **without** waiting for the server's ack.
     ///
+    /// The frame is sent with `FLAG_DEFER_COMMIT`: the server appends
+    /// rows to WAL but skips the commit. Call [`sync`](Self::sync) to
+    /// trigger the commit for all accumulated rows.
+    ///
     /// Ready acks are drained non-blocking before the write. If the
     /// in-flight count has reached the protocol cap (128), this call
     /// blocks until at least one ack frees a slot.
     ///
     /// On success, `chunk` is cleared (its retained descriptor capacity
-    /// is preserved) and the caller's buffers are released. The ack
-    /// will arrive later; call [`sync`](Self::sync) when you need all
-    /// in-flight frames acknowledged.
+    /// is preserved) and the caller's buffers are released.
     ///
     /// On failure, the connection is latched as terminal and the error
     /// is returned. `chunk` is left untouched.
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
-        // Drain any ready acks to keep the pipeline moving and to
-        // surface server errors as early as possible.
-        self.conn.try_drain_acks()?;
-
-        // If we've hit the cap, block until one slot frees up.
-        if self.conn.at_in_flight_cap() {
-            self.conn.drain_one_ack_blocking()?;
-        }
-
-        let schema = &mut self.schema_registry;
-        let dict = &mut self.symbol_dict;
-        let published = self
-            .conn
-            .publish_qwp(|out| encoder::encode_chunk_into(out, chunk, schema, dict))?;
-
-        self.conn.push_pending(published.fsn);
-        chunk.clear();
-        Ok(())
+        self.flush_inner(chunk, /* defer_commit = */ true)
     }
 
     /// Block until all in-flight frames are acknowledged at the
     /// requested [`AckLevel`].
+    ///
+    /// Sends a commit-triggering frame (without `FLAG_DEFER_COMMIT`)
+    /// so the server commits all rows accumulated from preceding
+    /// deferred flushes, then drains all acks.
     ///
     /// `AckLevel::Ok` waits for every in-flight frame's WAL-commit ack.
     /// `AckLevel::Durable` additionally waits for the server's
     /// object-store durability watermarks to reach every frame's
     /// seq_txn (requires `request_durable_ack=on` at connect).
     pub fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
+        // Send a commit-triggering empty frame (no FLAG_DEFER_COMMIT).
+        let mut commit_chunk = Chunk::new("");
+        self.flush_inner(&mut commit_chunk, /* defer_commit = */ false)?;
         self.conn.sync_all_acks(ack_level)
+    }
+
+    fn flush_inner(&mut self, chunk: &mut Chunk<'_>, defer_commit: bool) -> Result<()> {
+        self.conn.try_drain_acks()?;
+
+        if self.conn.at_in_flight_cap() {
+            self.conn.drain_one_ack_blocking()?;
+        }
+
+        let schema = &mut self.schema_registry;
+        let dict = &mut self.symbol_dict;
+        let published = self.conn.publish_qwp(|out| {
+            encoder::encode_chunk_into(out, chunk, schema, dict, defer_commit)
+        })?;
+
+        self.conn.push_pending(published.fsn);
+        chunk.clear();
+        Ok(())
     }
 }

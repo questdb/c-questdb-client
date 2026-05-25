@@ -35,6 +35,7 @@ pub(crate) const QWP_MAGIC: [u8; 4] = *b"QWP1";
 pub(crate) const QWP_VERSION_1: u8 = 1;
 /// Wire-spec flag set on every column-sender frame (matches the row-API
 /// `QwpBuffer::encode_ws_message`).
+pub(crate) const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 pub(crate) const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 pub(crate) const QWP_HEADER_LEN: usize = 12;
 

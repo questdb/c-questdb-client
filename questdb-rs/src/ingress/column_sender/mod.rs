@@ -104,6 +104,7 @@ pub mod _bench_internals {
             chunk,
             &mut state.schema_registry,
             &mut state.symbol_dict,
+            false,
         )
     }
 }

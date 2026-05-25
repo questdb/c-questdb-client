@@ -41,7 +41,7 @@ use super::chunk::{
     Chunk, ColumnDescriptor, ColumnKind, DesignatedTsDescriptor, SymbolCodesPtr, ValidityDescriptor,
 };
 use super::wire::{
-    F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, MAX_NAME_LEN,
+    F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, MAX_NAME_LEN, QWP_FLAG_DEFER_COMMIT,
     QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_SCHEMA_MODE_FULL,
     QWP_SCHEMA_MODE_REFERENCE, QWP_VERSION_1, validate_name, write_qwp_bytes, write_qwp_varint,
 };
@@ -88,9 +88,10 @@ pub(crate) fn encode_chunk_into(
     chunk: &Chunk<'_>,
     schema_registry: &mut SchemaRegistry,
     symbol_dict: &mut SymbolGlobalDict,
+    defer_commit: bool,
 ) -> Result<()> {
     if chunk.is_empty() {
-        emit_header_only_frame(out);
+        emit_header_only_frame(out, defer_commit);
         return Ok(());
     }
     if chunk.designated_ts.is_none() {
@@ -156,7 +157,7 @@ pub(crate) fn encode_chunk_into(
 
     // --- Reserve frame header placeholder ---
     let frame_start = out.len();
-    write_header_placeholder(out, /* table_count = */ 1);
+    write_header_placeholder(out, /* table_count = */ 1, defer_commit);
     let payload_start = out.len();
 
     // --- Delta-symbol-dict prefix ---
@@ -252,9 +253,9 @@ fn estimate_frame_size(
     total
 }
 
-fn emit_header_only_frame(out: &mut Vec<u8>) {
+fn emit_header_only_frame(out: &mut Vec<u8>, defer_commit: bool) {
     let frame_start = out.len();
-    write_header_placeholder(out, 0);
+    write_header_placeholder(out, 0, defer_commit);
     let payload_start = out.len();
     write_qwp_varint(out, 0); // delta_start
     write_qwp_varint(out, 0); // new_symbols_count
@@ -262,11 +263,15 @@ fn emit_header_only_frame(out: &mut Vec<u8>) {
     out[frame_start + 8..frame_start + 12].copy_from_slice(&payload_len.to_le_bytes());
 }
 
-fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16) {
+fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: bool) {
     let start = out.len();
     out.extend_from_slice(&QWP_MAGIC);
     out.push(QWP_VERSION_1);
-    out.push(QWP_FLAG_DELTA_SYMBOL_DICT);
+    let mut flags = QWP_FLAG_DELTA_SYMBOL_DICT;
+    if defer_commit {
+        flags |= QWP_FLAG_DEFER_COMMIT;
+    }
+    out.push(flags);
     out.extend_from_slice(&table_count.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // payload_len placeholder
     debug_assert_eq!(out.len() - start, QWP_HEADER_LEN);
@@ -734,7 +739,7 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
         out
     }
 
@@ -744,7 +749,7 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
         assert_eq!(out.len(), 14);
         assert_eq!(&out[0..4], b"QWP1");
         assert_eq!(out[5], QWP_FLAG_DELTA_SYMBOL_DICT);
@@ -759,7 +764,7 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict).unwrap_err();
+        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("designated"));
     }
@@ -774,14 +779,14 @@ mod tests {
         c1.column_i64("price", &p1, None).unwrap();
         c1.designated_timestamp_nanos(&p1).unwrap();
         let mut out1 = Vec::new();
-        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, false).unwrap();
 
         let p2 = [3i64, 4];
         let mut c2 = Chunk::new("trades");
         c2.column_i64("price", &p2, None).unwrap();
         c2.designated_timestamp_nanos(&p2).unwrap();
         let mut out2 = Vec::new();
-        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, false).unwrap();
 
         assert!(out2.len() < out1.len());
         assert_eq!(reg.len(), 1, "schema signature interned once");
@@ -800,7 +805,7 @@ mod tests {
         a.column_i64("x", &x, None).unwrap();
         a.designated_timestamp_nanos(&x).unwrap();
         let mut oa = Vec::new();
-        encode_chunk_into(&mut oa, &a, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut oa, &a, &mut reg, &mut dict, false).unwrap();
 
         let y = [1.0f64];
         let ts = [1i64];
@@ -808,7 +813,7 @@ mod tests {
         b.column_f64("y", &y, None).unwrap();
         b.designated_timestamp_nanos(&ts).unwrap();
         let mut ob = Vec::new();
-        encode_chunk_into(&mut ob, &b, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut ob, &b, &mut reg, &mut dict, false).unwrap();
 
         assert_eq!(reg.len(), 2);
     }
@@ -824,7 +829,7 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
         assert!(out.len() > 32);
     }
 
@@ -842,7 +847,7 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
         assert_eq!(dict.next_id(), 2, "alpha + gamma only, beta unsent");
     }
 
@@ -860,7 +865,7 @@ mod tests {
             .unwrap();
         c1.designated_timestamp_nanos(&ts1).unwrap();
         let mut out1 = Vec::new();
-        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, false).unwrap();
         assert_eq!(dict.next_id(), 2);
 
         let codes2 = [0i32, 2];
@@ -870,7 +875,7 @@ mod tests {
             .unwrap();
         c2.designated_timestamp_nanos(&ts2).unwrap();
         let mut out2 = Vec::new();
-        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict).unwrap();
+        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, false).unwrap();
         assert_eq!(dict.next_id(), 3, "gamma added on second frame");
     }
 
