@@ -39,12 +39,12 @@ by this ABI. They are not API design choices.
 
 | Limit                          | Value                                  | Enforcement                                              |
 |--------------------------------|----------------------------------------|----------------------------------------------------------|
-| Max batch (frame) size         | 16 MiB protocol ceiling; effectively `min(server recv buf − 14, 16 MiB)` advertised on upgrade via `X-QWP-Max-Batch-Size` | `column_sender_submit` returns an error if the encoded frame exceeds the negotiated cap. |
+| Max batch (frame) size         | 16 MiB protocol ceiling; effectively `min(server recv buf − 14, 16 MiB)` advertised on upgrade via `X-QWP-Max-Batch-Size` | `column_sender_flush` returns an error if the encoded frame exceeds the negotiated cap. |
 | Max tables per connection      | 10,000                                 | Server-enforced; client surfaces server rejections.       |
 | Max rows per table block       | 1,000,000                              | `column_sender_chunk_*` calls fail if `row_count` exceeds. |
 | Max columns per table          | 2,048                                  | `column_sender_chunk_column_*` fails after the 2048th column. |
 | Max table / column name length | 127 bytes UTF-8                        | Rejected at name validation.                              |
-| Max in-flight batches          | 128                                    | `column_sender_submit` blocks (or returns back-pressure) until an ack frees a slot. |
+| Max in-flight batches          | 128                                    | Deferred flushes reserve one slot for `column_sender_sync`; flush returns back-pressure when the reserve would be exhausted. |
 | Max symbol dictionary entries  | 1,000,000 per connection               | Server returns `PARSE_ERROR`; surfaced as `line_sender_error_server_rejection`. |
 
 The wire pins protocol version 1; clients advertise
@@ -101,7 +101,8 @@ For every column-append function:
 - For Python wrappers, the typical pattern is to fill the chunk from a
   live DataFrame's numpy / Arrow buffers and flush before letting the
   DataFrame go out of scope — the contract is naturally satisfied
-  because flush is synchronous.
+  because flush encodes and writes the frame synchronously before
+  returning.
 
 ### 2.4 Validity bitmaps
 
@@ -145,7 +146,7 @@ inputs.
   the borrowing thread until returned. Do not pass it across threads.
 - A `column_sender_chunk` is owned by one thread at a time. It is
   *not* tied to a particular sender; chunks can be built without a
-  borrow and submitted on any sender borrowed from the same `db`.
+  borrow and flushed on any sender borrowed from the same `db`.
 - `line_sender_error` is thread-safe to read but not to share writes.
 
 ### 2.6 String / UTF-8
@@ -190,7 +191,7 @@ multiple connections. The pool absorbs both cases:
                           ┌──────────────────────────┐
                           │  column_sender (borrowed)│
                           │   ├─ new_chunk            │
-                          │   ├─ submit / await       │
+                          │   ├─ flush / sync         │
                           │   └─ ...                  │
                           └──────────────────────────┘
 ```
@@ -245,7 +246,7 @@ questdb_db* questdb_db_connect(
  * Close the pool and all its connections. Accepts NULL and no-ops.
  * Senders still checked out are invalidated; calls on them return
  * line_sender_error_invalid_api_call. Callers must not call close()
- * while any thread is mid-submit on a borrowed sender.
+ * while any thread is mid-flush or mid-sync on a borrowed sender.
  */
 QUESTDB_CLIENT_API
 void questdb_db_close(questdb_db* db);
@@ -291,7 +292,7 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * Return a sender to the pool. The sender pointer is invalidated and
  * must not be used again after this call. Any chunks created from the
  * sender remain valid (chunks are caller-owned, not sender-owned) but
- * cannot be submitted until borrowed again from a new sender.
+ * cannot be flushed until borrowed again from a new sender.
  *
  * If the sender is in a latched-error state (must_close() == true),
  * its underlying connection is closed and dropped from the pool
@@ -323,7 +324,7 @@ bool column_sender_must_close(const column_sender* sender);
 A chunk represents one DataFrame's worth of column buffers destined
 for one table. It is the "one chunk = one table = one frame = one
 FSN" unit. Chunks are caller-owned and **not bound to a particular
-sender** — build a chunk on any thread, submit it on any sender
+sender** — build a chunk on any thread, flush it on any sender
 borrowed from the same `db`.
 
 ```c
@@ -331,10 +332,10 @@ borrowed from the same `db`.
  * Create an empty chunk for the given table. The table name must be
  * valid (same rules as line_sender_table_name; max 127 bytes UTF-8).
  *
- * Does not require a sender — the chunk is pure data until submitted.
+ * Does not require a sender — the chunk is pure data until flushed.
  *
- * The chunk is owned by the caller and must be either submitted with
- * column_sender_submit (which clears it for reuse) or freed with
+ * The chunk is owned by the caller and must be either flushed with
+ * column_sender_flush (which clears it for reuse) or freed with
  * column_sender_chunk_free.
  */
 QUESTDB_CLIENT_API
@@ -641,7 +642,7 @@ bool column_sender_chunk_symbol_dict_i32(
 
 ## 10. Designated timestamp
 
-Required exactly once per chunk before `submit`. Two variants picking
+Required exactly once per chunk before `flush`. Two variants picking
 the on-wire type:
 
 - `..._micros` encodes the column on the wire as TIMESTAMP (`0x0A`,
@@ -682,11 +683,11 @@ per row.)
 
 ---
 
-## 11. Flush (synchronous)
+## 11. Flush and sync
 
 ```c
 /**
- * Acknowledgement level the flush waits for.
+ * Acknowledgement level `column_sender_sync` waits for.
  */
 typedef enum column_sender_ack_level
 {
@@ -699,20 +700,43 @@ typedef enum column_sender_ack_level
         opened with `request_durable_ack=on` in the connect string
         (and the server's 101 response confirming
         `X-QWP-Durable-Ack: enabled`). If the connection did not opt
-        in, flush returns line_sender_error_invalid_api_call. */
+        in, sync returns line_sender_error_invalid_api_call. */
     column_sender_ack_level_durable = 1,
 } column_sender_ack_level;
 
 /**
- * Encode the chunk into a QWP/WebSocket frame, publish it, and block
- * until the server acknowledges at the requested `ack_level`. Returns
- * true once the ACK is received; the chunk is then cleared (row count
- * → 0, allocations retained) and can be reused for the next DataFrame.
+ * Encode the chunk into a QWP/WebSocket frame, publish it, and return
+ * without waiting for a server ACK. On success the chunk is cleared
+ * (row count → 0, allocations retained) and can be reused for the next
+ * DataFrame.
  *
- * Synchronous semantics: at most one frame in flight per sender. For
- * parallel ingest, borrow multiple senders from the pool — one per
- * thread — and flush concurrently. The 128-in-flight wire cap is
- * never reached.
+ * The first flush is sent as an immediate commit. Later flushes are
+ * sent with QWP's deferred-commit flag so callers can pipeline many
+ * chunks. Call `column_sender_sync` after the final flush to send the
+ * commit frame and wait for all in-flight ACKs.
+ *
+ * The sender keeps one protocol in-flight slot reserved for the sync
+ * commit frame. If that reserve would be exhausted, flush returns
+ * line_sender_error_invalid_api_call; call `column_sender_sync` before
+ * flushing more chunks.
+ *
+ * For parallel ingest, borrow multiple senders from the pool — one per
+ * thread — and flush concurrently.
+ *
+ * On any failure (server rejection, transport error, latched-error
+ * sender, invalid chunk, or exhausted deferred-flight reserve), returns
+ * false and sets *err_out. The chunk is left untouched so the caller can
+ * inspect or recover its contents before freeing.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush(
+    column_sender* sender,
+    column_sender_chunk* chunk,
+    line_sender_error** err_out);
+
+/**
+ * Send a commit-triggering frame and block until all in-flight frames are
+ * acknowledged at the requested `ack_level`.
  *
  * Ack level semantics:
  *  - `ok` — returns when the server has written the batch to its WAL.
@@ -722,21 +746,20 @@ typedef enum column_sender_ack_level
  *
  * On any failure (server rejection, transport error, latched-error
  * sender, or `durable` requested without opt-in), returns false and
- * sets *err_out. The chunk is left untouched so the caller can
- * inspect or recover its contents before freeing.
+ * sets *err_out.
  *
- * Flush blocks until ack or until the underlying connection enters a
- * terminal failure state (must_close() becomes true). Transient
- * disconnects are absorbed by the existing reconnect machinery. No
- * separate per-call timeout in v1; if you need one, file a request.
+ * Sync blocks until ack or until the underlying connection enters a
+ * terminal failure state (must_close() becomes true). Transport errors
+ * latch the sender as terminal; return it to the pool and borrow a fresh
+ * sender to continue. No separate per-call timeout in v1; if you need
+ * one, file a request.
  *
  * The QWP wire `sequence` (FSN) is tracked internally and is not
- * exposed at the FFI — synchronous flush makes it unnecessary.
+ * exposed at the FFI.
  */
 QUESTDB_CLIENT_API
-bool column_sender_flush(
+bool column_sender_sync(
     column_sender* sender,
-    column_sender_chunk* chunk,
     column_sender_ack_level ack_level,
     line_sender_error** err_out);
 ```
@@ -788,9 +811,11 @@ int send_one_chunk(questdb_db* db) {
     if (!column_sender_chunk_designated_timestamp_nanos(
             chunk, timestamps_ns, 3, &err)) goto fail;
 
-    if (!column_sender_flush(
-            sender, chunk, column_sender_ack_level_ok, &err)) goto fail;
-    /* flush returned: server has WAL-committed; chunk cleared & reusable */
+    if (!column_sender_flush(sender, chunk, &err)) goto fail;
+    /* flush returned: chunk cleared & reusable; ACK wait is deferred */
+    if (!column_sender_sync(
+            sender, column_sender_ack_level_ok, &err)) goto fail;
+    /* sync returned: server has WAL-committed all flushed chunks */
 
     column_sender_chunk_free(chunk);
     questdb_db_return_sender(db, sender);

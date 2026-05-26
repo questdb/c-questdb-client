@@ -40,6 +40,7 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -387,6 +388,54 @@ fn refuses_durable_ack_without_opt_in() {
 }
 
 #[test]
+fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+    let port = listener.local_addr().expect("local_addr").port();
+    let (tx, rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        perform_server_upgrade(&mut stream).expect("upgrade");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let frame = match read_frame(&mut stream) {
+            Ok((_fin, opcode, _payload)) => Some(opcode),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                None
+            }
+            Err(e) => panic!("unexpected server read error: {e}"),
+        };
+        tx.send(frame).expect("send frame observation");
+    });
+
+    let db = QuestDb::connect(&conf_for(port, "")).unwrap();
+    let mut sender = db.borrow_sender().expect("borrow");
+    let err = sender
+        .sync(AckLevel::Durable)
+        .expect_err("durable without opt-in must fail before publish");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("request_durable_ack"),
+        "msg: {}",
+        err.msg()
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("server observation"),
+        None,
+        "sync must reject durable ACK before sending a commit frame"
+    );
+
+    drop(sender);
+    drop(db);
+    handle.join().expect("server thread");
+}
+
+#[test]
 fn empty_chunk_flush_round_trips() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
@@ -399,6 +448,33 @@ fn empty_chunk_flush_round_trips() {
         .expect("empty-chunk flush must round-trip");
     // Flush clears the chunk.
     assert_eq!(chunk.row_count(), 0);
+}
+
+#[test]
+fn deferred_flush_reserves_slot_for_sync_commit() {
+    let server = MockServer::spawn(2);
+    let db = QuestDb::connect(&conf_for(server.port(), "close_flush_timeout_millis=50;")).unwrap();
+    let mut sender = db.borrow_sender().expect("borrow");
+    let mut chunk = Chunk::new("trades");
+
+    for _ in 0..127 {
+        sender.flush(&mut chunk).expect("flush below reserve");
+    }
+
+    chunk.column_i64("qty", &[42], None).expect("column_i64");
+    chunk
+        .designated_timestamp_nanos(&[1_700_000_000_000_000_000])
+        .expect("designated timestamp");
+    let err = sender
+        .flush(&mut chunk)
+        .expect_err("deferred flush must preserve the sync commit slot");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("sync()"), "msg: {}", err.msg());
+    assert_eq!(
+        chunk.row_count(),
+        1,
+        "capacity failure must leave the caller's chunk untouched"
+    );
 }
 
 #[test]

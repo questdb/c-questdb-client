@@ -757,6 +757,20 @@ mod tests {
     }
 
     #[test]
+    fn defer_commit_flag_is_set_when_requested() {
+        let chunk = Chunk::new("trades");
+        let mut out = Vec::new();
+        let mut reg = SchemaRegistry::new();
+        let mut dict = SymbolGlobalDict::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, true).unwrap();
+        assert_eq!(out[5] & QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DEFER_COMMIT);
+        assert_eq!(
+            out[5] & QWP_FLAG_DELTA_SYMBOL_DICT,
+            QWP_FLAG_DELTA_SYMBOL_DICT
+        );
+    }
+
+    #[test]
     fn non_empty_chunk_without_designated_ts_errors() {
         let mut chunk = Chunk::new("trades");
         let data = [1i64, 2, 3];

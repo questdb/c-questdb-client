@@ -756,9 +756,11 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
 /// Encode `chunk` into a QWP/WebSocket frame, write it to the socket,
 /// and return immediately — without waiting for the server's ack.
 ///
-/// Ready acks are drained non-blocking before the write. If the
-/// in-flight count has hit the protocol cap (128), the call blocks
-/// until one ack frees a slot.
+/// Ready acks are drained non-blocking before the write. Deferred
+/// flushes keep one in-flight slot reserved for the later
+/// `column_sender_sync` commit frame; if that reserve would be
+/// consumed, the call fails and the caller must sync before flushing
+/// more chunks.
 ///
 /// On success, `chunk` is cleared and the call returns `true`. On
 /// failure, `chunk` is left untouched and `false` is returned (with

@@ -30,9 +30,10 @@
 //! per RFC 6455, and `write_all`s to the socket — then returns immediately
 //! without waiting for the server's ack. Between publishes, ready acks
 //! are drained non-blocking via `try_drain_acks`. When the in-flight
-//! count hits the protocol cap (128), the next publish blocks until one
-//! ack frees a slot. An explicit `sync_all_acks` blocks until every
-//! in-flight frame is acknowledged.
+//! count hits the protocol cap (128), the next non-deferred publish
+//! blocks until one ack frees a slot. Deferred publishes reserve one
+//! in-flight slot for the later commit-triggering frame. An explicit
+//! `sync_all_acks` blocks until every in-flight frame is acknowledged.
 //!
 //! No replay queue, no background thread — single-thread, single-socket,
 //! pipelined.
@@ -238,6 +239,23 @@ impl ColumnConn {
         self.in_flight
     }
 
+    /// `true` when a deferred publish can still leave one in-flight slot
+    /// for the later non-deferred sync commit frame.
+    pub(crate) fn has_sync_commit_slot(&self) -> bool {
+        self.in_flight < MAX_IN_FLIGHT - 1
+    }
+
+    pub(crate) fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
+        if ack_level == AckLevel::Durable && !self.durable_ack_opt_in {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "AckLevel::Durable requires the pool to be opened with \
+                 `request_durable_ack=on` in the connect string."
+            ));
+        }
+        Ok(())
+    }
+
     /// Drain any ack responses available without blocking. Returns the
     /// number of OK acks consumed.
     pub(crate) fn try_drain_acks(&mut self) -> Result<u32> {
@@ -280,13 +298,7 @@ impl ColumnConn {
                 "QWP/WebSocket connection latched as terminal."
             ));
         }
-        if ack_level == AckLevel::Durable && !self.durable_ack_opt_in {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires the pool to be opened with \
-                 `request_durable_ack=on` in the connect string."
-            ));
-        }
+        self.validate_ack_level(ack_level)?;
 
         // Phase 1: drain all OK acks.
         let mut durable_targets: HashMap<String, i64> = HashMap::new();

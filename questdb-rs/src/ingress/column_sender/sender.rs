@@ -32,8 +32,8 @@
 
 use std::fmt::{self, Debug, Formatter};
 
-use crate::Result;
 use crate::ingress::buffer::SymbolGlobalDict;
+use crate::{Result, error};
 
 use super::chunk::Chunk;
 use super::conn::ColumnConn;
@@ -98,19 +98,25 @@ impl ColumnSender {
     /// Encode `chunk` into a QWP/WebSocket frame, write it to the
     /// socket, and return — **without** waiting for the server's ack.
     ///
-    /// The frame is sent with `FLAG_DEFER_COMMIT`: the server appends
-    /// rows to WAL but skips the commit. Call [`sync`](Self::sync) to
-    /// trigger the commit for all accumulated rows.
+    /// The first frame is sent as an immediate commit so the server can
+    /// warm its symbol cache. Later frames are sent with
+    /// `FLAG_DEFER_COMMIT`: the server appends rows to WAL but skips the
+    /// commit. Call [`sync`](Self::sync) to trigger the commit for all
+    /// accumulated rows.
     ///
-    /// Ready acks are drained non-blocking before the write. If the
-    /// in-flight count has reached the protocol cap (128), this call
-    /// blocks until at least one ack frees a slot.
+    /// Ready acks are drained non-blocking before the write. Deferred
+    /// flushes reserve one in-flight slot for the later
+    /// commit-triggering sync frame; when that reserve would be consumed,
+    /// this call returns [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall)
+    /// and the caller must call [`sync`](Self::sync) before flushing more
+    /// chunks.
     ///
     /// On success, `chunk` is cleared (its retained descriptor capacity
     /// is preserved) and the caller's buffers are released.
     ///
-    /// On failure, the connection is latched as terminal and the error
-    /// is returned. `chunk` is left untouched.
+    /// On failure, the error is returned and `chunk` is left untouched.
+    /// Transport and server failures latch the connection as terminal;
+    /// validation and capacity failures leave it usable.
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
         let defer = self.first_frame_sent;
         self.flush_inner(chunk, defer)?;
@@ -130,6 +136,8 @@ impl ColumnSender {
     /// object-store durability watermarks to reach every frame's
     /// seq_txn (requires `request_durable_ack=on` at connect).
     pub fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
+        self.conn.validate_ack_level(ack_level)?;
+
         // Send a commit-triggering empty frame (no FLAG_DEFER_COMMIT).
         let mut commit_chunk = Chunk::new("");
         self.flush_inner(&mut commit_chunk, /* defer_commit = */ false)?;
@@ -138,6 +146,14 @@ impl ColumnSender {
 
     fn flush_inner(&mut self, chunk: &mut Chunk<'_>, defer_commit: bool) -> Result<()> {
         self.conn.try_drain_acks()?;
+
+        if defer_commit && !self.conn.has_sync_commit_slot() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "column sender deferred flush capacity exhausted; call sync() \
+                 before flushing more chunks."
+            ));
+        }
 
         if self.conn.at_in_flight_cap() {
             self.conn.drain_one_ack_blocking()?;

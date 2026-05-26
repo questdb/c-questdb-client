@@ -34,8 +34,8 @@
  *
  * Round-trips a single 3-row chunk with mixed i64, f64, varchar, and a
  * designated timestamp. Prints any client-side error to stderr and
- * exits non-zero; on success exits 0 after flushing and returning the
- * sender to the pool.
+ * exits non-zero; on success exits 0 after flushing, syncing, and
+ * returning the sender to the pool.
  */
 
 #include <stdint.h>
@@ -149,13 +149,20 @@ int main(int argc, char** argv)
         return die(err, "designated_timestamp_nanos failed");
     }
 
-    if (!column_sender_flush(
-            sender, chunk, column_sender_ack_level_ok, &err))
+    if (!column_sender_flush(sender, chunk, &err))
     {
         column_sender_chunk_free(chunk);
         questdb_db_return_sender(db, sender);
         questdb_db_close(db);
         return die(err, "column_sender_flush failed");
+    }
+
+    if (!column_sender_sync(sender, column_sender_ack_level_ok, &err))
+    {
+        column_sender_chunk_free(chunk);
+        questdb_db_return_sender(db, sender);
+        questdb_db_close(db);
+        return die(err, "column_sender_sync failed");
     }
 
     column_sender_chunk_free(chunk);

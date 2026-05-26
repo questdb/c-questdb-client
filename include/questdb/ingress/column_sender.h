@@ -83,7 +83,7 @@ typedef struct column_sender_validity
 } column_sender_validity;
 
 /* -------------------------------------------------------------------------
- * Acknowledgement level for `column_sender_flush`.
+ * Acknowledgement level for `column_sender_sync`.
  * ------------------------------------------------------------------------- */
 
 typedef enum column_sender_ack_level
@@ -94,7 +94,7 @@ typedef enum column_sender_ack_level
 
     /** Wait for the server's object-store durability ACK (spec status
      *  0x02). Enterprise only; requires the pool to be opened with
-     *  `request_durable_ack=on` in the connect string. Flush returns
+     *  `request_durable_ack=on` in the connect string. Sync returns
      *  `line_sender_error_invalid_api_call` otherwise. */
     column_sender_ack_level_durable = 1
 } column_sender_ack_level;
@@ -443,21 +443,33 @@ bool column_sender_chunk_designated_timestamp_nanos(
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
- * Flush (synchronous)
+ * Flush / sync
  *
- * Encode `chunk` into a QWP/WebSocket frame, publish it, and block
- * until the server acknowledges at the requested `ack_level`. On
- * success, `chunk` is cleared (allocations retained) and `true` is
- * returned. On failure, `chunk` is left untouched.
+ * `column_sender_flush` encodes `chunk` into a QWP/WebSocket frame,
+ * publishes it, and returns without waiting for a server ACK. On success,
+ * `chunk` is cleared (allocations retained) and `true` is returned. On
+ * failure, `chunk` is left untouched.
  *
- * At most one frame in flight per sender. For parallel ingest, borrow
- * multiple senders from the same `questdb_db` — one per worker thread.
+ * The first flush is sent as an immediate commit. Later flushes are sent
+ * with QWP's deferred-commit flag so callers can pipeline many chunks.
+ * Call `column_sender_sync` after the final flush to send the commit frame
+ * and wait until all in-flight frames are acknowledged at `ack_level`.
+ *
+ * The sender keeps one protocol in-flight slot reserved for the sync commit
+ * frame. If that reserve would be exhausted, flush returns
+ * `line_sender_error_invalid_api_call`; call `column_sender_sync` before
+ * flushing more chunks.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
 bool column_sender_flush(
     column_sender* sender,
     column_sender_chunk* chunk,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool column_sender_sync(
+    column_sender* sender,
     column_sender_ack_level ack_level,
     line_sender_error** err_out);
 

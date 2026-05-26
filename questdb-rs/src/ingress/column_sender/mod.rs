@@ -35,8 +35,8 @@
 //! - Borrow a sender with [`QuestDb::borrow_sender`].
 //! - Build a [`Chunk`] of column buffers for one table, then pin a
 //!   designated timestamp on it.
-//! - Flush the chunk synchronously; the call blocks until the server
-//!   acknowledges at the requested [`AckLevel`].
+//! - Flush chunks to publish them without waiting for ACKs, then call
+//!   [`ColumnSender::sync`] to commit and wait at the requested [`AckLevel`].
 //! - Drop the [`BorrowedSender`] to return its connection to the pool.
 
 mod chunk;
