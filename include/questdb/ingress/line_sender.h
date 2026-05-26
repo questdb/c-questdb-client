@@ -126,6 +126,18 @@ typedef enum line_sender_error_code
 
     /** QWP/WebSocket server rejection or terminal protocol violation. */
     line_sender_error_server_rejection,
+
+    /** `line_sender_buffer_append_arrow` was passed a column whose Arrow
+     *  / QuestDB kind cannot be persisted to a QuestDB table (e.g.
+     *  `LONG128` ingest is not yet wired; `ARRAY(LONG, N-D)` is
+     *  egress-only). Only emitted with the `arrow` feature enabled. */
+    line_sender_error_arrow_unsupported_column_kind,
+
+    /** `line_sender_buffer_append_arrow` rejected a `RecordBatch` at
+     *  client-side structural validation (column count, name encoding,
+     *  Arrow C Data Interface struct contract). Only emitted with the
+     *  `arrow` feature enabled. */
+    line_sender_error_arrow_ingest,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -1974,6 +1986,39 @@ int64_t line_sender_now_nanos(void);
 /** Get the current time in microseconds since the Unix epoch (UTC). */
 QUESTDB_CLIENT_API
 int64_t line_sender_now_micros(void);
+
+/* Apache Arrow C Data Interface (feature: arrow). Struct layouts per
+ * https://arrow.apache.org/docs/format/CDataInterface.html. */
+
+struct ArrowArray;
+struct ArrowSchema;
+
+typedef enum line_sender_designated_timestamp_kind
+{
+    line_sender_designated_timestamp_column = 0,
+    line_sender_designated_timestamp_now = 1,
+    line_sender_designated_timestamp_server_now = 2,
+} line_sender_designated_timestamp_kind;
+
+/**
+ * Append every row of a `RecordBatch` (Arrow C Data Interface) to
+ * `buffer`. `array` is consumed (release invoked by the imported
+ * `ArrayData`'s drop); `schema` is borrowed.
+ *
+ * When `ts_kind == column`, `ts_column_name` / `ts_column_name_len`
+ * name the source column (UTF-8, not NUL-terminated). Server-side
+ * type-mismatch surfaces from the next `line_sender_flush`.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_buffer_append_arrow(
+    line_sender_buffer* buffer,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_designated_timestamp_kind ts_kind,
+    const char* ts_column_name,
+    size_t ts_column_name_len,
+    line_sender_error** err_out);
 
 #ifdef __cplusplus
 }

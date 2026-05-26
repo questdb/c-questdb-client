@@ -71,6 +71,11 @@ option(
     "Build the C/C++ tests with -fsanitize=address,undefined."
     OFF)
 
+option(
+    QUESTDB_ENABLE_ARROW
+    "Build with Apache Arrow C Data Interface exports. Opt-in: pulls arrow-rs."
+    OFF)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
@@ -80,6 +85,13 @@ if(QUESTDB_ENABLE_READER)
 endif()
 if(QUESTDB_ENABLE_INSECURE_SKIP_VERIFY)
     list(APPEND QUESTDB_CARGO_FEATURES insecure-skip-verify)
+endif()
+if(QUESTDB_TESTS_AND_EXAMPLES AND NOT QUESTDB_ENABLE_ARROW)
+    message(STATUS "QUESTDB_TESTS_AND_EXAMPLES=ON: enabling QUESTDB_ENABLE_ARROW")
+    set(QUESTDB_ENABLE_ARROW ON)
+endif()
+if(QUESTDB_ENABLE_ARROW)
+    list(APPEND QUESTDB_CARGO_FEATURES arrow)
 endif()
 if(QUESTDB_CARGO_FEATURES)
     corrosion_import_crate(
@@ -357,6 +369,20 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_line_reader_mock
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_line_reader_mock.cpp)
+
+    # Apache Arrow C Data Interface tests. The fatal_error gate above
+    # forces QUESTDB_ENABLE_ARROW=ON when tests are enabled, so these
+    # always build alongside the rest of the suite.
+    compile_test(
+        test_arrow_c
+        cpp_test/test_arrow_c.c)
+    compile_test(
+        test_arrow_egress
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/test_arrow_egress.cpp)
+    compile_test(
+        test_arrow_ingress
+        cpp_test/test_arrow_ingress.cpp)
 
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,

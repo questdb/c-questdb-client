@@ -264,6 +264,17 @@ pub enum line_sender_error_code {
 
     /// QWP/WebSocket server rejection or terminal protocol violation.
     line_sender_error_server_rejection,
+
+    /// `line_sender_buffer_append_arrow` was passed a column whose
+    /// Arrow / QuestDB kind cannot be persisted to a QuestDB table.
+    /// Only emitted with the `arrow` feature enabled.
+    line_sender_error_arrow_unsupported_column_kind,
+
+    /// `line_sender_buffer_append_arrow` rejected a `RecordBatch` at
+    /// client-side structural validation (column count, name encoding,
+    /// FFI struct contract). Only emitted with the `arrow` feature
+    /// enabled.
+    line_sender_error_arrow_ingest,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -296,6 +307,10 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_protocol_version_error
             }
             ErrorCode::InvalidDecimal => line_sender_error_code::line_sender_error_invalid_decimal,
+            ErrorCode::ArrowUnsupportedColumnKind => {
+                line_sender_error_code::line_sender_error_arrow_unsupported_column_kind
+            }
+            ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
         }
     }
 }
@@ -3601,6 +3616,137 @@ pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
     unsafe {
         use questdb_confstr_ffi::questdb_conf_str_parse_err_free;
         questdb_conf_str_parse_err_free(err);
+    }
+}
+
+/// Selects the per-row designated-timestamp source for
+/// `line_sender_buffer_append_arrow`. Mirrors the three-variant Rust
+/// `DesignatedTimestamp` enum (Decision 9 in the design doc).
+#[cfg(feature = "arrow")]
+#[inline]
+fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => std::process::abort(),
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[allow(dead_code)]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_sender_designated_timestamp_kind {
+    /// Pull per-row timestamp from a named column. The column's
+    /// Arrow DataType must be `Timestamp(_)`.
+    line_sender_designated_timestamp_column = 0,
+    /// Sample `TimestampNanos::now()` client-side per row.
+    line_sender_designated_timestamp_now = 1,
+    /// Omit the timestamp from the wire payload (server fills
+    /// arrival time when the destination table has a designated
+    /// timestamp; otherwise stores the row without one).
+    line_sender_designated_timestamp_server_now = 2,
+}
+
+/// Append every row of a `RecordBatch` (passed via the Apache Arrow
+/// C Data Interface) to `buffer`. `array` is consumed (release
+/// invoked by the imported `ArrayData`'s drop); `schema` is
+/// borrowed.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_append_arrow(
+    buffer: *mut line_sender_buffer,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_kind: line_sender_designated_timestamp_kind,
+    ts_column_name: *const c_char,
+    ts_column_name_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    use arrow_array::{RecordBatch, StructArray};
+    use questdb::ingress::{ColumnName, DesignatedTimestamp};
+    panic_guard(|| unsafe {
+        if buffer.is_null() || array.is_null() || schema.is_null() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_buffer_append_arrow: NULL buffer / array / schema".to_string(),
+            );
+            return false;
+        }
+        let inner = unwrap_buffer_mut(buffer);
+        let ts_name_owned: Option<String> = match ts_kind {
+            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_column => {
+                if ts_column_name.is_null() || ts_column_name_len == 0 {
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::InvalidApiCall,
+                        "line_sender_buffer_append_arrow: ts_kind=column requires non-NULL ts_column_name".to_string(),
+                    );
+                    return false;
+                }
+                let bytes = slice::from_raw_parts(ts_column_name as *const u8, ts_column_name_len);
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => Some(s.to_string()),
+                    Err(e) => {
+                        arrow_err_to_c_box(
+                            err_out,
+                            ErrorCode::InvalidUtf8,
+                            format!("ts_column_name is not valid UTF-8: {}", e),
+                        );
+                        return false;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let imported_array = std::ptr::read(array);
+        let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
+            Ok(d) => d,
+            Err(e) => {
+                arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::ArrowIngest,
+                    format!("from_ffi failed: {}", e),
+                );
+                return false;
+            }
+        };
+        let struct_array = StructArray::from(array_data);
+        let rb: RecordBatch = struct_array.into();
+        let ts = match ts_kind {
+            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_column => {
+                let name_str = ts_name_owned.as_deref().unwrap_or("");
+                match ColumnName::new(name_str) {
+                    Ok(n) => DesignatedTimestamp::Column(n),
+                    Err(e) => {
+                        arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+                        return false;
+                    }
+                }
+            }
+            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_now => {
+                DesignatedTimestamp::Now
+            }
+            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_server_now => {
+                DesignatedTimestamp::ServerNow
+            }
+        };
+        bubble_err_to_c!(err_out, inner.append_arrow(table.as_name(), &rb, ts));
+        true
+    })
+}
+
+#[cfg(feature = "arrow")]
+fn arrow_err_to_c_box(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
+    unsafe {
+        if err_out.is_null() {
+            return;
+        }
+        *err_out = Box::into_raw(Box::new(line_sender_error {
+            error: Error::new(code, msg),
+            qwp_ws_error: None,
+        }));
     }
 }
 

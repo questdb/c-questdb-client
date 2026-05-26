@@ -68,6 +68,13 @@ pub use sender::*;
 mod decimal;
 pub use decimal::DecimalView;
 
+#[cfg(feature = "arrow")]
+pub mod arrow;
+#[cfg(feature = "arrow")]
+pub use arrow::DesignatedTimestamp;
+#[cfg(feature = "polars")]
+pub mod polars;
+
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
 /// The maximum allowed dimensions for arrays.
