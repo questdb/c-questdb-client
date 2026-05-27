@@ -443,6 +443,11 @@ bool column_sender_chunk_symbol_dict_i32(
  *   - dictionary-typed schema with the index format above and a
  *     UTF-8 "u" value type → routes to symbol_dict_i*.
  *
+ * `row_offset` and `row_count` describe which slice of the array to
+ * append. Use `row_offset=0, row_count=array->length` for the whole
+ * array. When the array has nulls, `row_offset` must be a multiple of 8
+ * (the QWP encoder reads the validity bitmap byte-aligned).
+ *
  * Constraints:
  *  - `array->offset` must be 0. Consolidate sliced arrays caller-side
  *    before passing them in.
@@ -471,6 +476,8 @@ bool column_sender_chunk_append_arrow_column(
     size_t name_len,
     const struct ArrowArray* array,
     const struct ArrowSchema* schema,
+    size_t row_offset,
+    size_t row_count,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------

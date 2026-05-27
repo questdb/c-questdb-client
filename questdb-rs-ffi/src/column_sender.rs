@@ -807,12 +807,18 @@ unsafe fn arrow_check_offset(array: &ArrowArray, err_out: *mut *mut line_sender_
     true
 }
 
-/// Build a Validity from the array's validity buffer (buffers[0]).
-/// Returns `Some(None)` when the array has no nulls (so no validity is
-/// passed to the column writer), `Some(Some(_))` when validity is
-/// present, and `None` on error.
+/// Build a Validity from the slice `[row_offset .. row_offset + row_count)`
+/// of the array's validity buffer (buffers[0]). Returns `Some(None)` when
+/// the array has no nulls (so no validity is passed to the column writer),
+/// `Some(Some(_))` when validity is present, and `None` on error.
+///
+/// `row_offset` must be a multiple of 8 when validity is present, because
+/// the QWP encoder reads the bitmap byte-aligned. Callers planning
+/// non-aligned chunk boundaries must either align them or rebuild the
+/// bitmap.
 unsafe fn arrow_validity<'a>(
     array: &ArrowArray,
+    row_offset: usize,
     row_count: usize,
     err_out: *mut *mut line_sender_error,
 ) -> Option<Option<Validity<'a>>> {
@@ -845,8 +851,25 @@ unsafe fn arrow_validity<'a>(
         }
         return None;
     }
+    if !row_offset.is_multiple_of(8) {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "ArrowArray validity slice requires row_offset to be a \
+                         multiple of 8 (got {row_offset}); align chunk \
+                         boundaries or rebuild the bitmap."
+                    ),
+                ),
+            );
+        }
+        return None;
+    }
+    let shifted = unsafe { validity_buf.add(row_offset / 8) };
     let required = row_count.div_ceil(8);
-    let bytes = unsafe { slice::from_raw_parts(validity_buf, required) };
+    let bytes = unsafe { slice::from_raw_parts(shifted, required) };
     match Validity::from_bitmap(bytes, row_count) {
         Ok(v) => Some(Some(v)),
         Err(err) => {
@@ -941,15 +964,23 @@ unsafe fn arrow_dictionary_utf8<'a>(
     Some((offsets, bytes))
 }
 
-/// Append one column from an Arrow C Data interface array. Delegates to
-/// the appropriate `column_sender_chunk_column_*` / `_symbol_dict_*`
-/// path based on the schema's format string.
+/// Append a slice of one column from an Arrow C Data interface array.
+/// Delegates to the appropriate `column_sender_chunk_column_*` /
+/// `_symbol_dict_*` path based on the schema's format string.
+///
+/// `row_offset` and `row_count` describe the slice of the array to
+/// append; pass `row_offset=0, row_count=array->length` to send the
+/// whole array. When the array has nulls, `row_offset` must be a
+/// multiple of 8 (the QWP encoder reads the validity bitmap
+/// byte-aligned).
 ///
 /// Supported formats (see Apache Arrow C Data Interface spec):
 ///   - `c`, `s`, `i`, `l`          int8 / int16 / int32 / int64
 ///   - `f`, `g`                    float32 / float64
 ///   - `b`                         bool (LSB-first bitmap)
 ///   - `u`                         UTF-8 string (int32 offsets)
+///   - `U`                         LargeUtf8 string (int64 offsets;
+///     narrowed to u32 at encode time)
 ///   - `tsn:...`                   timestamp nanos (timezone ignored)
 ///   - `tsu:...`                   timestamp micros (timezone ignored)
 ///   - dictionary-typed schema with the index format above and a
@@ -957,7 +988,8 @@ unsafe fn arrow_dictionary_utf8<'a>(
 ///
 /// Other formats return `line_sender_error_invalid_api_call`.
 ///
-/// The array must have `offset == 0` (consolidate slices upstream).
+/// The array must have `offset == 0` (consolidate slices upstream of
+/// this call).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
     chunk: *mut column_sender_chunk,
@@ -965,6 +997,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
     name_len: size_t,
     array: *const ArrowArray,
     schema: *const ArrowSchema,
+    row_offset: size_t,
+    row_count: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let chunk = match unsafe { chunk.as_mut() } {
@@ -992,7 +1026,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
     if !unsafe { arrow_check_offset(array_ref, err_out) } {
         return false;
     }
-    let row_count = if array_ref.length < 0 {
+    if array_ref.length < 0 {
         unsafe {
             set_err_out_from_error(
                 err_out,
@@ -1003,60 +1037,74 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             );
         }
         return false;
-    } else {
-        array_ref.length as usize
-    };
+    }
+    let array_len = array_ref.length as usize;
+    if row_offset > array_len || row_count > array_len - row_offset {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "slice [{row_offset}, {row_offset}+{row_count}) \
+                         out of range for ArrowArray.length={array_len}"
+                    ),
+                ),
+            );
+        }
+        return false;
+    }
 
     let format = match unsafe { arrow_format_str(schema_ref, err_out) } {
         Some(s) => s,
         None => return false,
     };
-    let validity = match unsafe { arrow_validity(array_ref, row_count, err_out) } {
+    let validity = match unsafe { arrow_validity(array_ref, row_offset, row_count, err_out) } {
         Some(v) => v,
         None => return false,
     };
 
     // Dictionary types dispatch to symbol_dict_*; the outer format is
-    // the index width.
+    // the index width. The dictionary array is shared across chunks;
+    // only the per-row codes are sliced by row_offset.
     if !schema_ref.dictionary.is_null() {
         let (dict_offsets, dict_bytes) =
             match unsafe { arrow_dictionary_utf8(schema_ref, array_ref, err_out) } {
                 Some(t) => t,
                 None => return false,
             };
-        // Indices live in buffers[1] for dictionary arrays.
         match format {
             "c" => {
-                let codes = match unsafe { arrow_buffer::<i8>(array_ref, 1, err_out, "dict codes") }
-                {
-                    Some(p) => p,
-                    None => return false,
-                };
-                let codes = unsafe { slice::from_raw_parts(codes, row_count) };
+                let codes_ptr =
+                    match unsafe { arrow_buffer::<i8>(array_ref, 1, err_out, "dict codes") } {
+                        Some(p) => p,
+                        None => return false,
+                    };
+                let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
                 bubble!(
                     err_out,
                     chunk.symbol_dict_i8(name, codes, dict_offsets, dict_bytes, validity.as_ref())
                 );
             }
             "s" => {
-                let codes =
+                let codes_ptr =
                     match unsafe { arrow_buffer::<i16>(array_ref, 1, err_out, "dict codes") } {
                         Some(p) => p,
                         None => return false,
                     };
-                let codes = unsafe { slice::from_raw_parts(codes, row_count) };
+                let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
                 bubble!(
                     err_out,
                     chunk.symbol_dict_i16(name, codes, dict_offsets, dict_bytes, validity.as_ref())
                 );
             }
             "i" => {
-                let codes =
+                let codes_ptr =
                     match unsafe { arrow_buffer::<i32>(array_ref, 1, err_out, "dict codes") } {
                         Some(p) => p,
                         None => return false,
                     };
-                let codes = unsafe { slice::from_raw_parts(codes, row_count) };
+                let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
                 bubble!(
                     err_out,
                     chunk.symbol_dict_i32(name, codes, dict_offsets, dict_bytes, validity.as_ref())
@@ -1090,7 +1138,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                 Some(p) => p,
                 None => return false,
             };
-            let data = unsafe { slice::from_raw_parts(ptr, row_count) };
+            let data = unsafe { slice::from_raw_parts(ptr.add(row_offset), row_count) };
             bubble!(err_out, chunk.$method(name, data, validity.as_ref()));
         }};
     }
@@ -1102,12 +1150,31 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
         "f" => primitive!(f32, column_f32, "f32 column data"),
         "g" => primitive!(f64, column_f64, "f64 column data"),
         "b" => {
+            // Bool bitmap: callers using row_offset on a packed bitmap
+            // must align by 8 just like validity. Rust crate's
+            // column_bool reads bit-shifted only off the byte boundary.
+            if !row_offset.is_multiple_of(8) {
+                unsafe {
+                    set_err_out_from_error(
+                        err_out,
+                        Error::new(
+                            ErrorCode::InvalidApiCall,
+                            format!(
+                                "Arrow bool column slice requires row_offset \
+                                 to be a multiple of 8 (got {row_offset})."
+                            ),
+                        ),
+                    );
+                }
+                return false;
+            }
             let ptr = match unsafe { arrow_buffer::<u8>(array_ref, 1, err_out, "bool bitmap") } {
                 Some(p) => p,
                 None => return false,
             };
+            let shifted = unsafe { ptr.add(row_offset / 8) };
             let len = row_count.div_ceil(8);
-            let bits = unsafe { slice::from_raw_parts(ptr, len) };
+            let bits = unsafe { slice::from_raw_parts(shifted, len) };
             bubble!(
                 err_out,
                 chunk.column_bool(name, bits, row_count, validity.as_ref())
@@ -1117,7 +1184,9 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
         "tsu" => primitive!(i64, column_ts_micros, "ts_micros column data"),
         "u" => {
             // UTF-8 string column with int32 offsets. buffers[1] = offsets,
-            // buffers[2] = bytes.
+            // buffers[2] = bytes. The offsets array has length array.length
+            // + 1; slicing means starting at offsets[row_offset] and
+            // reading row_count + 1 entries.
             let offsets_ptr =
                 match unsafe { arrow_buffer::<i32>(array_ref, 1, err_out, "varchar offsets") } {
                     Some(p) => p,
@@ -1128,11 +1197,20 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                     Some(p) => p,
                     None => return false,
                 };
-            let offsets = unsafe { slice::from_raw_parts(offsets_ptr, row_count + 1) };
-            let bytes_len = if row_count == 0 {
+            let offsets =
+                unsafe { slice::from_raw_parts(offsets_ptr.add(row_offset), row_count + 1) };
+            // bytes_len passed to Chunk::column_varchar is the high-water
+            // mark of the slice — the Rust encoder reads bytes in the
+            // range [offsets[0], offsets[row_count]); pass the full
+            // original bytes buffer length so validate_varchar_offsets
+            // doesn't complain.
+            let bytes_len = if array_len == 0 {
                 0
             } else {
-                offsets[row_count] as usize
+                // Read original offsets[array_len] as the bytes-buffer
+                // upper bound. Avoids slicing the bytes; the encoder
+                // does its own rebase.
+                unsafe { *offsets_ptr.add(array_len) as usize }
             };
             let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
                 &[][..]
@@ -1145,10 +1223,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             );
         }
         "U" => {
-            // LargeUtf8 column with int64 offsets. buffers[1] = offsets,
-            // buffers[2] = bytes. Narrowing to u32 happens at encode
-            // time (per-row read + LE write into the wire frame), so
-            // no Python- or Rust-side scratch allocation is needed.
+            // LargeUtf8 column with int64 offsets. Same shape as `u`
+            // but offsets are i64.
             let offsets_ptr = match unsafe {
                 arrow_buffer::<i64>(array_ref, 1, err_out, "large_varchar offsets")
             } {
@@ -1160,11 +1236,12 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                     Some(p) => p,
                     None => return false,
                 };
-            let offsets = unsafe { slice::from_raw_parts(offsets_ptr, row_count + 1) };
-            let bytes_len = if row_count == 0 {
+            let offsets =
+                unsafe { slice::from_raw_parts(offsets_ptr.add(row_offset), row_count + 1) };
+            let bytes_len = if array_len == 0 {
                 0
             } else {
-                offsets[row_count] as usize
+                unsafe { *offsets_ptr.add(array_len) as usize }
             };
             let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
                 &[][..]
