@@ -294,6 +294,30 @@ pub unsafe extern "C" fn questdb_db_return_conn(_db: *mut questdb_db, conn: *mut
     }
 }
 
+/// Force-drop a borrowed conn instead of recycling it. The conn is
+/// marked terminal (`qwpws_conn_must_close` becomes `true`) before
+/// the usual pool-return path runs, so the underlying connection is
+/// closed and dropped from the pool. Invalidates `conn`. Accepts
+/// NULL `conn` and no-ops.
+///
+/// Use this in error-recovery paths where the conn may hold
+/// in-flight uncommitted frames that the next borrower would otherwise
+/// commit alongside their own. Equivalent to "mark must_close, then
+/// return" but in a single atomic step from the caller's perspective.
+///
+/// `db` is ignored, kept for symmetry with the other pool entry
+/// points.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_drop_conn(_db: *mut questdb_db, conn: *mut qwpws_conn) {
+    if !conn.is_null() {
+        // SAFETY: caller guarantees `conn` is a live qwpws_conn handle
+        // (NULL handled above).
+        let owned = unsafe { &mut *conn };
+        owned.0.get_mut().mark_must_close();
+        unsafe { drop(Box::from_raw(conn)) };
+    }
+}
+
 /// Manually reap idle connections. Returns the number of connections
 /// closed by this invocation. `db` must be non-NULL.
 #[unsafe(no_mangle)]

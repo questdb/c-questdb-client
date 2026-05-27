@@ -146,6 +146,15 @@ impl ColumnConn {
         self.must_close
     }
 
+    /// Force the connection into the terminal `must_close` state so
+    /// the pool drops it on return instead of recycling it. Used by
+    /// the higher-level error-recovery path when a mid-call failure
+    /// leaves the conn with in-flight uncommitted data that the next
+    /// borrower would otherwise commit alongside their own.
+    pub(crate) fn mark_must_close(&mut self) {
+        self.must_close = true;
+    }
+
     /// Hand `encode` a `&mut Vec<u8>` with `WS_HEADER_RESERVE` bytes
     /// pre-reserved at the front; `encode` appends the QWP frame body to
     /// it. Frame the result as a WS binary frame (mask in place), write

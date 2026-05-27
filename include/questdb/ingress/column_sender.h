@@ -162,6 +162,21 @@ void questdb_db_return_conn(
     qwpws_conn* conn);
 
 /**
+ * Force-drop a borrowed conn instead of recycling it. Marks the conn
+ * terminal (qwpws_conn_must_close becomes true) before the usual
+ * pool-return path runs, so the underlying connection is closed and
+ * dropped. Invalidates `conn`. Accepts NULL `conn` and no-ops.
+ *
+ * Use this in error-recovery paths where the conn may hold in-flight
+ * uncommitted frames that the next borrower would otherwise commit
+ * alongside their own (the round-3 dirty-sender concern).
+ */
+QUESTDB_CLIENT_API
+void questdb_db_drop_conn(
+    questdb_db* db,
+    qwpws_conn* conn);
+
+/**
  * Manually reap idle connections (closes free-list entries idle longer
  * than `pool_idle_timeout_ms`, never shrinking below `pool_size`).
  * Returns the number of connections closed.

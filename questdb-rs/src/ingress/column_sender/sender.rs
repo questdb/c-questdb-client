@@ -95,6 +95,16 @@ impl ColumnSender {
         self.conn.must_close()
     }
 
+    /// Force the connection into the terminal `must_close` state. The
+    /// pool will drop this conn on return instead of recycling it.
+    /// Intended for higher-level error recovery: when a mid-call flush
+    /// fails after earlier flushes succeeded, the conn holds in-flight
+    /// uncommitted frames; recycling it would let the next borrower's
+    /// flush commit those frames alongside their own.
+    pub fn mark_must_close(&mut self) {
+        self.conn.mark_must_close();
+    }
+
     /// Encode `chunk` into a QWP/WebSocket frame, write it to the
     /// socket, and return — **without** waiting for the server's ack.
     ///
