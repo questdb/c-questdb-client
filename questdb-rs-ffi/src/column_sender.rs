@@ -869,13 +869,21 @@ unsafe fn arrow_validity<'a>(
     }
     let validity_buf = unsafe { *array.buffers.add(0) } as *const u8;
     if validity_buf.is_null() {
-        // null_count == -1 (unknown) with no bitmap also lands here.
+        // Arrow spec: `null_count = -1` means "unknown". When the
+        // bitmap pointer is also NULL the producer is signalling "I
+        // don't know how many nulls there are, and I'm not exposing a
+        // bitmap" — most producers (pyarrow, polars) only emit this
+        // shape when the column has no nulls. Treat it as no-nulls
+        // here; downstream encoders read the data buffer densely.
+        if array.null_count < 0 {
+            return Some(None);
+        }
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "ArrowArray.null_count != 0 but validity buffer is NULL".to_string(),
+                    "ArrowArray.null_count > 0 but validity buffer is NULL".to_string(),
                 ),
             );
         }
@@ -991,6 +999,21 @@ unsafe fn arrow_dictionary_utf8<'a>(
                     format!(
                         "dictionary value type {dict_format:?} is not \
                          supported (only UTF-8 'u' for now)"
+                    ),
+                ),
+            );
+        }
+        return None;
+    }
+    if dict_array.length < 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "ArrowArray dictionary length is negative: {}",
+                        dict_array.length
                     ),
                 ),
             );
@@ -1200,7 +1223,11 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
 
     // Plain (non-dictionary) types. Data lives in buffers[1] for fixed-
     // width primitives; varchar additionally uses buffers[2] for bytes.
-    let format_head = format.split(':').next().unwrap_or(format);
+    //
+    // The Arrow C Data Interface puts a `:`-prefixed parameter (e.g.
+    // timezone) only on timestamp / date / time formats. For everything
+    // else we exact-match the format string so e.g. a malformed `"u:foo"`
+    // doesn't spuriously dispatch to the varchar arm.
     macro_rules! primitive {
         ($ty:ty, $method:ident, $what:literal) => {{
             let ptr = match unsafe { arrow_buffer::<$ty>(array_ref, 1, false, err_out, $what) } {
@@ -1211,7 +1238,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             bubble!(err_out, chunk.$method(name, data, validity.as_ref()));
         }};
     }
-    match format_head {
+    match format {
         "c" => primitive!(i8, column_i8, "i8 column data"),
         "s" => primitive!(i16, column_i16, "i16 column data"),
         "i" => primitive!(i32, column_i32, "i32 column data"),
@@ -1250,8 +1277,16 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                 chunk.column_bool(name, bits, row_count, validity.as_ref())
             );
         }
-        "tsn" => primitive!(i64, column_ts_nanos, "ts_nanos column data"),
-        "tsu" => primitive!(i64, column_ts_micros, "ts_micros column data"),
+        // Timestamp formats carry a `:<tz>` (or `:`) suffix per the
+        // Arrow C Data Interface. We ignore the timezone — the QWP
+        // wire stores absolute instants, and Pandas / Polars give us
+        // UTC-normalised values by convention.
+        f if f.starts_with("tsn:") => {
+            primitive!(i64, column_ts_nanos, "ts_nanos column data")
+        }
+        f if f.starts_with("tsu:") => {
+            primitive!(i64, column_ts_micros, "ts_micros column data")
+        }
         "u" => {
             // UTF-8 string column with int32 offsets. buffers[1] = offsets,
             // buffers[2] = bytes. The offsets array has length array.length
