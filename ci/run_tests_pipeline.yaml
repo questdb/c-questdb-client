@@ -220,18 +220,14 @@ stages:
               echo "##vso[task.prependpath]$CARGO_BIN"
             displayName: "Resolve Rust toolchain"
           - template: compile.yaml
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-              cd questdb
-              git submodule update --init --depth 1 java-questdb-client
-            displayName: git clone questdb
+          - template: clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"
@@ -298,18 +294,14 @@ stages:
               echo "Resolved JDK 25: $JDK_HOME"
               echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
             displayName: "Resolve JDK 25"
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-              cd questdb
-              git submodule update --init --depth 1 java-questdb-client
-            displayName: git clone questdb
+          - template: clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -399,18 +391,14 @@ stages:
               echo "##vso[task.prependpath]$CARGO_BIN"
             displayName: "Resolve Rust toolchain"
           - template: compile.yaml
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-              cd questdb
-              git submodule update --init --depth 1 java-questdb-client
-            displayName: git clone questdb
+          - template: clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -450,9 +438,7 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-            displayName: git clone questdb
+          - template: clone_questdb.yaml
           - script: |
               set -euo pipefail
               JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
@@ -466,7 +452,7 @@ stages:
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               set -euxo pipefail
               cd questdb-rs
