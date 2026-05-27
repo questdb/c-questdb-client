@@ -347,6 +347,13 @@ bool column_sender_chunk_column_date_millis(
 
 /* -------------------------------------------------------------------------
  * Variable-width text (VARCHAR)
+ *
+ * For callers that already hold an Arrow C Data Interface array, prefer
+ * `column_sender_chunk_append_arrow_column` below — it dispatches by
+ * schema format and handles both UTF-8 (`u`) and LargeUtf8 (`U`) in one
+ * call. The per-type entry point here is the lower-level building block,
+ * useful when the caller has raw int32 offsets + bytes and no Arrow
+ * schema.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -390,6 +397,11 @@ bool column_sender_chunk_column_varchar(
  *
  * `codes[i]` must be in `0 .. dict_len` for non-null rows; null-row
  * codes are not inspected.
+ *
+ * Callers passing an Arrow Dictionary array should prefer
+ * `column_sender_chunk_append_arrow_column`, which dispatches on the
+ * outer schema's index width (`c`/`s`/`i`) automatically. The per-type
+ * entries here remain the lower-level building block.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API

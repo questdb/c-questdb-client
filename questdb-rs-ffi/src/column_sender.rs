@@ -326,6 +326,10 @@ pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool 
 // pointer the caller passes in points at a compatible memory layout.
 // ===========================================================================
 
+// Field types mirror the Apache Arrow C Data Interface declarations
+// (`struct ArrowArray**` etc.). We never mutate the structs, but the
+// inner pointer type matches the spec so the layout description reads
+// the same on both sides.
 #[repr(C)]
 pub struct ArrowArray {
     pub length: i64,
@@ -334,8 +338,8 @@ pub struct ArrowArray {
     pub n_buffers: i64,
     pub n_children: i64,
     pub buffers: *const *const std::ffi::c_void,
-    pub children: *const *const ArrowArray,
-    pub dictionary: *const ArrowArray,
+    pub children: *const *mut ArrowArray,
+    pub dictionary: *mut ArrowArray,
     pub release: Option<unsafe extern "C" fn(*mut ArrowArray)>,
     pub private_data: *mut std::ffi::c_void,
 }
@@ -347,8 +351,8 @@ pub struct ArrowSchema {
     pub metadata: *const c_char,
     pub flags: i64,
     pub n_children: i64,
-    pub children: *const *const ArrowSchema,
-    pub dictionary: *const ArrowSchema,
+    pub children: *const *mut ArrowSchema,
+    pub dictionary: *mut ArrowSchema,
     pub release: Option<unsafe extern "C" fn(*mut ArrowSchema)>,
     pub private_data: *mut std::ffi::c_void,
 }
@@ -1038,8 +1042,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
         }
         return false;
     }
-    let array_len = array_ref.length as usize;
-    if row_offset > array_len || row_count > array_len - row_offset {
+    let array_total_len = array_ref.length as usize;
+    if row_offset > array_total_len || row_count > array_total_len - row_offset {
         unsafe {
             set_err_out_from_error(
                 err_out,
@@ -1047,7 +1051,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                     ErrorCode::InvalidApiCall,
                     format!(
                         "slice [{row_offset}, {row_offset}+{row_count}) \
-                         out of range for ArrowArray.length={array_len}"
+                         out of range for ArrowArray.length={array_total_len}"
                     ),
                 ),
             );
@@ -1204,13 +1208,13 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             // range [offsets[0], offsets[row_count]); pass the full
             // original bytes buffer length so validate_varchar_offsets
             // doesn't complain.
-            let bytes_len = if array_len == 0 {
+            let bytes_len = if array_total_len == 0 {
                 0
             } else {
-                // Read original offsets[array_len] as the bytes-buffer
+                // Read original offsets[array_total_len] as the bytes-buffer
                 // upper bound. Avoids slicing the bytes; the encoder
                 // does its own rebase.
-                unsafe { *offsets_ptr.add(array_len) as usize }
+                unsafe { *offsets_ptr.add(array_total_len) as usize }
             };
             let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
                 &[][..]
@@ -1238,10 +1242,10 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                 };
             let offsets =
                 unsafe { slice::from_raw_parts(offsets_ptr.add(row_offset), row_count + 1) };
-            let bytes_len = if array_len == 0 {
+            let bytes_len = if array_total_len == 0 {
                 0
             } else {
-                unsafe { *offsets_ptr.add(array_len) as usize }
+                unsafe { *offsets_ptr.add(array_total_len) as usize }
             };
             let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
                 &[][..]
