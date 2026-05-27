@@ -49,7 +49,7 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - template: compile.yaml
+          - template: templates/compile.yaml
           - script: |
               cd questdb-rs
               cargo build --examples --features almost-all-features
@@ -219,8 +219,8 @@ stages:
               set +x
               echo "##vso[task.prependpath]$CARGO_BIN"
             displayName: "Resolve Rust toolchain"
-          - template: compile.yaml
-          - template: clone_questdb.yaml
+          - template: templates/compile.yaml
+          - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
@@ -267,7 +267,7 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - template: compile.yaml
+          - template: templates/compile.yaml
           # Linux and Windows runners ship with JDK 25 at $JAVA_HOME_25_X64.
           # macOS-latest doesn't, so we brew-install openjdk@25 there and
           # discover its install location with `brew --prefix`. Both
@@ -294,7 +294,7 @@ stages:
               echo "Resolved JDK 25: $JDK_HOME"
               echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
             displayName: "Resolve JDK 25"
-          - template: clone_questdb.yaml
+          - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
@@ -390,8 +390,8 @@ stages:
               set +x
               echo "##vso[task.prependpath]$CARGO_BIN"
             displayName: "Resolve Rust toolchain"
-          - template: compile.yaml
-          - template: clone_questdb.yaml
+          - template: templates/compile.yaml
+          - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
@@ -437,8 +437,8 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - template: compile.yaml
-          - template: clone_questdb.yaml
+          - template: templates/compile.yaml
+          - template: templates/clone_questdb.yaml
           - script: |
               set -euo pipefail
               JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
