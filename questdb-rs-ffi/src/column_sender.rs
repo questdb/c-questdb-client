@@ -1144,6 +1144,38 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                 chunk.column_varchar(name, offsets, bytes, validity.as_ref())
             );
         }
+        "U" => {
+            // LargeUtf8 column with int64 offsets. buffers[1] = offsets,
+            // buffers[2] = bytes. Narrowing to u32 happens at encode
+            // time (per-row read + LE write into the wire frame), so
+            // no Python- or Rust-side scratch allocation is needed.
+            let offsets_ptr = match unsafe {
+                arrow_buffer::<i64>(array_ref, 1, err_out, "large_varchar offsets")
+            } {
+                Some(p) => p,
+                None => return false,
+            };
+            let bytes_ptr =
+                match unsafe { arrow_buffer::<u8>(array_ref, 2, err_out, "large_varchar bytes") } {
+                    Some(p) => p,
+                    None => return false,
+                };
+            let offsets = unsafe { slice::from_raw_parts(offsets_ptr, row_count + 1) };
+            let bytes_len = if row_count == 0 {
+                0
+            } else {
+                offsets[row_count] as usize
+            };
+            let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
+            };
+            bubble!(
+                err_out,
+                chunk.column_varchar_large(name, offsets, bytes, validity.as_ref())
+            );
+        }
         other => {
             unsafe {
                 set_err_out_from_error(

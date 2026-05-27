@@ -243,7 +243,8 @@ fn estimate_frame_size(
             ColumnKind::Bool { .. } => bitmap_bytes,
             ColumnKind::Uuid { .. } => 16 * row_count,
             ColumnKind::Long256 { .. } => 32 * row_count,
-            ColumnKind::Varchar { bytes_len, .. } => 4 * (row_count + 1) + bytes_len,
+            ColumnKind::Varchar { bytes_len, .. }
+            | ColumnKind::VarcharLarge { bytes_len, .. } => 4 * (row_count + 1) + bytes_len,
             ColumnKind::Symbol { .. } => 5 * row_count, // varint upper bound
         };
         total += null_overhead + payload_size;
@@ -430,6 +431,22 @@ unsafe fn encode_column(
                 validity,
             );
         },
+        ColumnKind::VarcharLarge {
+            offsets,
+            offsets_len,
+            bytes,
+            bytes_len,
+        } => unsafe {
+            encode_varchar_large(
+                out,
+                offsets,
+                offsets_len,
+                bytes,
+                bytes_len,
+                row_count,
+                validity,
+            );
+        },
         ColumnKind::Symbol { codes, .. } => {
             let resolved = resolution.per_column[col_idx]
                 .as_ref()
@@ -606,6 +623,66 @@ unsafe fn encode_varchar(
                 let end = offsets_slice[row_count] as usize;
                 out.extend_from_slice(&bytes_slice[start..end]);
             }
+        }
+        Some(v) => {
+            out.push(1);
+            unsafe { write_qwp_bitmap_from_validity(out, v) };
+            let non_null = v.non_null_count;
+            let offsets_start = out.len();
+            out.resize(offsets_start + 4 * (non_null + 1), 0);
+            out[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
+            let mut cumulative: u32 = 0;
+            let mut next_offset_idx = 1usize;
+            let bytes_anchor = out.len();
+            for i in 0..row_count {
+                if !unsafe { v.is_valid(i) } {
+                    continue;
+                }
+                let start = offsets_slice[i] as usize;
+                let end = offsets_slice[i + 1] as usize;
+                let len = end - start;
+                out.extend_from_slice(&bytes_slice[start..end]);
+                cumulative = cumulative.saturating_add(len as u32);
+                let off = offsets_start + 4 * next_offset_idx;
+                out[off..off + 4].copy_from_slice(&cumulative.to_le_bytes());
+                next_offset_idx += 1;
+            }
+            debug_assert_eq!(next_offset_idx - 1, non_null);
+            debug_assert_eq!(out.len() - bytes_anchor, cumulative as usize);
+        }
+    }
+}
+
+/// Same wire output as [`encode_varchar`], but reads `int64` offsets
+/// (Arrow LargeUtf8 layout) and narrows each to `u32` in-place while
+/// writing — no intermediate `Vec<i32>` allocation. Per-offset
+/// `u32::MAX` overflow has already been rejected at chunk-build time by
+/// [`validate_varchar_offsets_i64`](super::chunk::validate_varchar_offsets_i64),
+/// so the narrowing here is always lossless.
+unsafe fn encode_varchar_large(
+    out: &mut Vec<u8>,
+    offsets: *const i64,
+    offsets_len: usize,
+    bytes: *const u8,
+    bytes_len: usize,
+    row_count: usize,
+    validity: Option<&ValidityDescriptor>,
+) {
+    let offsets_slice = unsafe { slice::from_raw_parts(offsets, offsets_len) };
+    let bytes_slice = unsafe { slice::from_raw_parts(bytes, bytes_len) };
+
+    match validity {
+        None => {
+            out.push(0); // null_flag
+            out.reserve(4 * (row_count + 1) + bytes_len);
+            let base = offsets_slice[0];
+            for &off in offsets_slice {
+                let normalized = (off - base) as u32;
+                out.extend_from_slice(&normalized.to_le_bytes());
+            }
+            let start = base as usize;
+            let end = offsets_slice[row_count] as usize;
+            out.extend_from_slice(&bytes_slice[start..end]);
         }
         Some(v) => {
             out.push(1);

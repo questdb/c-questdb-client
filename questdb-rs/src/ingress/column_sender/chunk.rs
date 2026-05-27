@@ -146,6 +146,19 @@ pub(crate) enum ColumnKind {
         bytes_len: usize,
     },
 
+    // ---- Variable-width text from Arrow LargeUtf8 (i64 offsets) ----
+    //
+    // The wire format is identical to `Varchar`; we narrow each i64
+    // offset to u32 on the fly inside the encoder, with an
+    // overflow check (QWP's offset table is uint32 LE on the wire).
+    VarcharLarge {
+        offsets: *const i64,
+        /// row_count + 1
+        offsets_len: usize,
+        bytes: *const u8,
+        bytes_len: usize,
+    },
+
     // ---- Symbol (dictionary-encoded) ----
     Symbol {
         codes: SymbolCodesPtr,
@@ -538,6 +551,44 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Same wire output as [`column_varchar`], but accepts Arrow
+    /// LargeUtf8 input where offsets are `int64` instead of `int32`. The
+    /// encoder narrows each offset to `u32` at encode time with an
+    /// overflow check (QWP's offset table is uint32 LE on the wire), so
+    /// no caller-side copy / narrowing is needed.
+    ///
+    /// Errors if any offset is negative, decreasing, exceeds the bytes
+    /// buffer length, or — at encode time — exceeds `u32::MAX`.
+    pub fn column_varchar_large(
+        &mut self,
+        name: &str,
+        offsets: &'a [i64],
+        bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if offsets.is_empty() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "LargeVARCHAR offsets must have at least one entry (row_count + 1)"
+            ));
+        }
+        let row_count = offsets.len() - 1;
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+        validate_varchar_offsets_i64(offsets, bytes.len())?;
+        self.push_column(
+            name,
+            QWP_TYPE_VARCHAR,
+            ColumnKind::VarcharLarge {
+                offsets: offsets.as_ptr(),
+                offsets_len: offsets.len(),
+                bytes: bytes.as_ptr(),
+                bytes_len: bytes.len(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
     // -------------------------------------------------------------------
     // Symbol
     // -------------------------------------------------------------------
@@ -745,6 +796,51 @@ fn validate_varchar_offsets(offsets: &[i32], bytes_len: usize) -> Result<()> {
             "VARCHAR offsets exceed bytes buffer: last offset = {}, bytes_len = {}",
             prev,
             bytes_len
+        ));
+    }
+    Ok(())
+}
+
+fn validate_varchar_offsets_i64(offsets: &[i64], bytes_len: usize) -> Result<()> {
+    let mut prev = offsets[0];
+    if prev < 0 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "LargeVARCHAR offsets must be non-negative (offsets[0] = {})",
+            prev
+        ));
+    }
+    for (i, &off) in offsets.iter().enumerate().skip(1) {
+        if off < prev {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "LargeVARCHAR offsets must be non-decreasing (offsets[{}] = {} < offsets[{}] = {})",
+                i,
+                off,
+                i - 1,
+                prev
+            ));
+        }
+        prev = off;
+    }
+    let last = prev;
+    if last < 0 || (last as u64) > bytes_len as u64 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "LargeVARCHAR offsets exceed bytes buffer: last offset = {}, bytes_len = {}",
+            last,
+            bytes_len
+        ));
+    }
+    // QWP's wire offset table is uint32 LE; reject up front so the
+    // caller sees a meaningful error rather than a per-row overflow at
+    // encode time.
+    if last > u32::MAX as i64 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "LargeVARCHAR offsets exceed QWP uint32 limit: last offset = {} > {} (u32::MAX)",
+            last,
+            u32::MAX
         ));
     }
     Ok(())

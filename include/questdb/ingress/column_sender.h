@@ -435,6 +435,9 @@ bool column_sender_chunk_symbol_dict_i32(
  *   - "f", "g"                  float32 / float64
  *   - "b"                       bool (LSB-first bitmap)
  *   - "u"                       UTF-8 string (int32 offsets)
+ *   - "U"                       LargeUtf8 string (int64 offsets;
+ *                               narrowed to u32 at encode time, no
+ *                               caller-side cast needed)
  *   - "tsn:..."                 timestamp nanos (timezone ignored)
  *   - "tsu:..."                 timestamp micros (timezone ignored)
  *   - dictionary-typed schema with the index format above and a
@@ -446,11 +449,13 @@ bool column_sender_chunk_symbol_dict_i32(
  *  - The chunk's row-count lock applies as with any other appender:
  *    the first column to append sets the count; subsequent appends
  *    must agree.
+ *  - LargeUtf8 column total bytes must fit in `uint32_t` (the QWP wire
+ *    offset table). Larger columns fail with
+ *    `line_sender_error_invalid_api_call` at chunk-build time.
  *
- * Other formats — including LargeUtf8 (`U`), decimal, struct, list, and
- * non-UTF-8 dictionary values — currently return
- * `line_sender_error_invalid_api_call`. Coverage broadens in subsequent
- * patches.
+ * Other formats — decimal, struct, list, and non-UTF-8 dictionary
+ * values — currently return `line_sender_error_invalid_api_call`.
+ * Coverage broadens in subsequent patches.
  * ------------------------------------------------------------------------- */
 
 /** Forward declarations of Apache Arrow C Data Interface structs.
