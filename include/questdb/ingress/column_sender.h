@@ -423,6 +423,52 @@ bool column_sender_chunk_symbol_dict_i32(
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
+ * Generic Arrow column appender
+ *
+ * Single entry point that consumes an Apache Arrow C Data Interface
+ * `ArrowArray` + `ArrowSchema` pair and routes to the appropriate
+ * per-type writer. Avoids the per-column dispatch every Python /
+ * Polars caller would otherwise have to write.
+ *
+ * Supported schema formats (see Apache Arrow C Data Interface spec):
+ *   - "c", "s", "i", "l"       int8 / int16 / int32 / int64
+ *   - "f", "g"                  float32 / float64
+ *   - "b"                       bool (LSB-first bitmap)
+ *   - "u"                       UTF-8 string (int32 offsets)
+ *   - "tsn:..."                 timestamp nanos (timezone ignored)
+ *   - "tsu:..."                 timestamp micros (timezone ignored)
+ *   - dictionary-typed schema with the index format above and a
+ *     UTF-8 "u" value type → routes to symbol_dict_i*.
+ *
+ * Constraints:
+ *  - `array->offset` must be 0. Consolidate sliced arrays caller-side
+ *    before passing them in.
+ *  - The chunk's row-count lock applies as with any other appender:
+ *    the first column to append sets the count; subsequent appends
+ *    must agree.
+ *
+ * Other formats — including LargeUtf8 (`U`), decimal, struct, list, and
+ * non-UTF-8 dictionary values — currently return
+ * `line_sender_error_invalid_api_call`. Coverage broadens in subsequent
+ * patches.
+ * ------------------------------------------------------------------------- */
+
+/** Forward declarations of Apache Arrow C Data Interface structs.
+ *  We never construct or release them — the caller owns lifetime —
+ *  and consume them via opaque pointers in the appender call below. */
+struct ArrowArray;
+struct ArrowSchema;
+
+QUESTDB_CLIENT_API
+bool column_sender_chunk_append_arrow_column(
+    column_sender_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    const struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_error** err_out);
+
+/* -------------------------------------------------------------------------
  * Designated timestamp
  *
  * Required exactly once per chunk before flush. Always non-null per the

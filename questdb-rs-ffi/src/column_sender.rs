@@ -317,6 +317,43 @@ pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool 
 }
 
 // ===========================================================================
+// Arrow C Data Interface mirror types
+//
+// We read these but never construct or release them — that's the
+// producer's responsibility. The fields below mirror the layout from
+// the Apache Arrow C Data Interface spec
+// (https://arrow.apache.org/docs/format/CDataInterface.html) so the
+// pointer the caller passes in points at a compatible memory layout.
+// ===========================================================================
+
+#[repr(C)]
+pub struct ArrowArray {
+    pub length: i64,
+    pub null_count: i64,
+    pub offset: i64,
+    pub n_buffers: i64,
+    pub n_children: i64,
+    pub buffers: *const *const std::ffi::c_void,
+    pub children: *const *const ArrowArray,
+    pub dictionary: *const ArrowArray,
+    pub release: Option<unsafe extern "C" fn(*mut ArrowArray)>,
+    pub private_data: *mut std::ffi::c_void,
+}
+
+#[repr(C)]
+pub struct ArrowSchema {
+    pub format: *const c_char,
+    pub name: *const c_char,
+    pub metadata: *const c_char,
+    pub flags: i64,
+    pub n_children: i64,
+    pub children: *const *const ArrowSchema,
+    pub dictionary: *const ArrowSchema,
+    pub release: Option<unsafe extern "C" fn(*mut ArrowSchema)>,
+    pub private_data: *mut std::ffi::c_void,
+}
+
+// ===========================================================================
 // Chunk lifecycle
 // ===========================================================================
 
@@ -705,6 +742,427 @@ symbol_fn!(
     symbol_dict_i32,
     "symbol codes (i32)"
 );
+
+// ===========================================================================
+// Generic Arrow column appender
+// ===========================================================================
+
+/// Read the Arrow schema's format string. Returns `None` on a NULL ptr
+/// or invalid UTF-8.
+unsafe fn arrow_format_str(
+    schema: &ArrowSchema,
+    err_out: *mut *mut line_sender_error,
+) -> Option<&str> {
+    if schema.format.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "ArrowSchema.format is NULL".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(schema.format) }.to_bytes();
+    match str::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidUtf8,
+                        "ArrowSchema.format is not valid UTF-8".to_string(),
+                    ),
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Reject Arrow arrays with a non-zero logical offset — the current
+/// validity / offset slicing logic assumes the array starts at bit 0
+/// of buffers[0] and offset 0 of buffers[1]. Sliced arrays must be
+/// consolidated by the caller.
+unsafe fn arrow_check_offset(array: &ArrowArray, err_out: *mut *mut line_sender_error) -> bool {
+    if array.offset != 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "ArrowArray.offset is {} (only 0 is supported); \
+                         consolidate the array before passing it in.",
+                        array.offset
+                    ),
+                ),
+            );
+        }
+        return false;
+    }
+    true
+}
+
+/// Build a Validity from the array's validity buffer (buffers[0]).
+/// Returns `Some(None)` when the array has no nulls (so no validity is
+/// passed to the column writer), `Some(Some(_))` when validity is
+/// present, and `None` on error.
+unsafe fn arrow_validity<'a>(
+    array: &ArrowArray,
+    row_count: usize,
+    err_out: *mut *mut line_sender_error,
+) -> Option<Option<Validity<'a>>> {
+    if array.null_count == 0 {
+        return Some(None);
+    }
+    if array.n_buffers < 1 || array.buffers.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "ArrowArray has nulls but no buffers".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
+    let validity_buf = unsafe { *array.buffers.add(0) } as *const u8;
+    if validity_buf.is_null() {
+        // null_count == -1 (unknown) with no bitmap also lands here.
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "ArrowArray.null_count != 0 but validity buffer is NULL".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
+    let required = row_count.div_ceil(8);
+    let bytes = unsafe { slice::from_raw_parts(validity_buf, required) };
+    match Validity::from_bitmap(bytes, row_count) {
+        Ok(v) => Some(Some(v)),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            None
+        }
+    }
+}
+
+/// Read the i-th buffer pointer from `array.buffers`, cast to `*const T`.
+unsafe fn arrow_buffer<T>(
+    array: &ArrowArray,
+    idx: i64,
+    err_out: *mut *mut line_sender_error,
+    what: &'static str,
+) -> Option<*const T> {
+    if array.n_buffers <= idx || array.buffers.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "ArrowArray missing buffer #{idx} for {what} \
+                         (n_buffers={})",
+                        array.n_buffers
+                    ),
+                ),
+            );
+        }
+        return None;
+    }
+    Some(unsafe { *array.buffers.add(idx as usize) } as *const T)
+}
+
+/// Inspect the Arrow dictionary subtree for a Categorical-style column.
+/// Returns the (dict_offsets, dict_offsets_len, dict_bytes, dict_bytes_len)
+/// tuple ready to feed into `Chunk::symbol_dict_i*`. Rejects any dict
+/// type other than UTF-8 with int32 offsets (`u`) for now.
+unsafe fn arrow_dictionary_utf8<'a>(
+    schema: &ArrowSchema,
+    array: &ArrowArray,
+    err_out: *mut *mut line_sender_error,
+) -> Option<(&'a [i32], &'a [u8])> {
+    if schema.dictionary.is_null() || array.dictionary.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "dictionary type missing dictionary array or schema".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
+    let dict_schema = unsafe { &*schema.dictionary };
+    let dict_array = unsafe { &*array.dictionary };
+    if !unsafe { arrow_check_offset(dict_array, err_out) } {
+        return None;
+    }
+    let dict_format = unsafe { arrow_format_str(dict_schema, err_out) }?;
+    if dict_format != "u" {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "dictionary value type {dict_format:?} is not \
+                         supported (only UTF-8 'u' for now)"
+                    ),
+                ),
+            );
+        }
+        return None;
+    }
+    let dict_len = dict_array.length as usize;
+    let offsets_ptr = unsafe { arrow_buffer::<i32>(dict_array, 1, err_out, "dict offsets") }?;
+    let bytes_ptr = unsafe { arrow_buffer::<u8>(dict_array, 2, err_out, "dict bytes") }?;
+    let offsets = unsafe { slice::from_raw_parts(offsets_ptr, dict_len + 1) };
+    let bytes_len = if dict_len == 0 {
+        0
+    } else {
+        offsets[dict_len] as usize
+    };
+    let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
+    };
+    Some((offsets, bytes))
+}
+
+/// Append one column from an Arrow C Data interface array. Delegates to
+/// the appropriate `column_sender_chunk_column_*` / `_symbol_dict_*`
+/// path based on the schema's format string.
+///
+/// Supported formats (see Apache Arrow C Data Interface spec):
+///   - `c`, `s`, `i`, `l`          int8 / int16 / int32 / int64
+///   - `f`, `g`                    float32 / float64
+///   - `b`                         bool (LSB-first bitmap)
+///   - `u`                         UTF-8 string (int32 offsets)
+///   - `tsn:...`                   timestamp nanos (timezone ignored)
+///   - `tsu:...`                   timestamp micros (timezone ignored)
+///   - dictionary-typed schema with the index format above and a
+///     UTF-8 `u` value type → routes to `symbol_dict_i*`.
+///
+/// Other formats return `line_sender_error_invalid_api_call`.
+///
+/// The array must have `offset == 0` (consolidate slices upstream).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
+    chunk: *mut column_sender_chunk,
+    name: *const c_char,
+    name_len: size_t,
+    array: *const ArrowArray,
+    schema: *const ArrowSchema,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let chunk = match unsafe { chunk.as_mut() } {
+        Some(c) => &mut c.0,
+        None => return reject_null_chunk(err_out),
+    };
+    let name = match unsafe { name_str(name, name_len, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    if array.is_null() || schema.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "ArrowArray and ArrowSchema must be non-NULL".to_string(),
+                ),
+            );
+        }
+        return false;
+    }
+    let array_ref = unsafe { &*array };
+    let schema_ref = unsafe { &*schema };
+    if !unsafe { arrow_check_offset(array_ref, err_out) } {
+        return false;
+    }
+    let row_count = if array_ref.length < 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("ArrowArray.length is negative: {}", array_ref.length),
+                ),
+            );
+        }
+        return false;
+    } else {
+        array_ref.length as usize
+    };
+
+    let format = match unsafe { arrow_format_str(schema_ref, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let validity = match unsafe { arrow_validity(array_ref, row_count, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // Dictionary types dispatch to symbol_dict_*; the outer format is
+    // the index width.
+    if !schema_ref.dictionary.is_null() {
+        let (dict_offsets, dict_bytes) =
+            match unsafe { arrow_dictionary_utf8(schema_ref, array_ref, err_out) } {
+                Some(t) => t,
+                None => return false,
+            };
+        // Indices live in buffers[1] for dictionary arrays.
+        match format {
+            "c" => {
+                let codes = match unsafe { arrow_buffer::<i8>(array_ref, 1, err_out, "dict codes") }
+                {
+                    Some(p) => p,
+                    None => return false,
+                };
+                let codes = unsafe { slice::from_raw_parts(codes, row_count) };
+                bubble!(
+                    err_out,
+                    chunk.symbol_dict_i8(name, codes, dict_offsets, dict_bytes, validity.as_ref())
+                );
+            }
+            "s" => {
+                let codes =
+                    match unsafe { arrow_buffer::<i16>(array_ref, 1, err_out, "dict codes") } {
+                        Some(p) => p,
+                        None => return false,
+                    };
+                let codes = unsafe { slice::from_raw_parts(codes, row_count) };
+                bubble!(
+                    err_out,
+                    chunk.symbol_dict_i16(name, codes, dict_offsets, dict_bytes, validity.as_ref())
+                );
+            }
+            "i" => {
+                let codes =
+                    match unsafe { arrow_buffer::<i32>(array_ref, 1, err_out, "dict codes") } {
+                        Some(p) => p,
+                        None => return false,
+                    };
+                let codes = unsafe { slice::from_raw_parts(codes, row_count) };
+                bubble!(
+                    err_out,
+                    chunk.symbol_dict_i32(name, codes, dict_offsets, dict_bytes, validity.as_ref())
+                );
+            }
+            other => {
+                unsafe {
+                    set_err_out_from_error(
+                        err_out,
+                        Error::new(
+                            ErrorCode::InvalidApiCall,
+                            format!(
+                                "dictionary index type {other:?} is not \
+                                 supported (only c / s / i for now)"
+                            ),
+                        ),
+                    );
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Plain (non-dictionary) types. Data lives in buffers[1] for fixed-
+    // width primitives; varchar additionally uses buffers[2] for bytes.
+    let format_head = format.split(':').next().unwrap_or(format);
+    macro_rules! primitive {
+        ($ty:ty, $method:ident, $what:literal) => {{
+            let ptr = match unsafe { arrow_buffer::<$ty>(array_ref, 1, err_out, $what) } {
+                Some(p) => p,
+                None => return false,
+            };
+            let data = unsafe { slice::from_raw_parts(ptr, row_count) };
+            bubble!(err_out, chunk.$method(name, data, validity.as_ref()));
+        }};
+    }
+    match format_head {
+        "c" => primitive!(i8, column_i8, "i8 column data"),
+        "s" => primitive!(i16, column_i16, "i16 column data"),
+        "i" => primitive!(i32, column_i32, "i32 column data"),
+        "l" => primitive!(i64, column_i64, "i64 column data"),
+        "f" => primitive!(f32, column_f32, "f32 column data"),
+        "g" => primitive!(f64, column_f64, "f64 column data"),
+        "b" => {
+            let ptr = match unsafe { arrow_buffer::<u8>(array_ref, 1, err_out, "bool bitmap") } {
+                Some(p) => p,
+                None => return false,
+            };
+            let len = row_count.div_ceil(8);
+            let bits = unsafe { slice::from_raw_parts(ptr, len) };
+            bubble!(
+                err_out,
+                chunk.column_bool(name, bits, row_count, validity.as_ref())
+            );
+        }
+        "tsn" => primitive!(i64, column_ts_nanos, "ts_nanos column data"),
+        "tsu" => primitive!(i64, column_ts_micros, "ts_micros column data"),
+        "u" => {
+            // UTF-8 string column with int32 offsets. buffers[1] = offsets,
+            // buffers[2] = bytes.
+            let offsets_ptr =
+                match unsafe { arrow_buffer::<i32>(array_ref, 1, err_out, "varchar offsets") } {
+                    Some(p) => p,
+                    None => return false,
+                };
+            let bytes_ptr =
+                match unsafe { arrow_buffer::<u8>(array_ref, 2, err_out, "varchar bytes") } {
+                    Some(p) => p,
+                    None => return false,
+                };
+            let offsets = unsafe { slice::from_raw_parts(offsets_ptr, row_count + 1) };
+            let bytes_len = if row_count == 0 {
+                0
+            } else {
+                offsets[row_count] as usize
+            };
+            let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
+            };
+            bubble!(
+                err_out,
+                chunk.column_varchar(name, offsets, bytes, validity.as_ref())
+            );
+        }
+        other => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "Arrow column format {other:?} (full: {format:?}) \
+                             is not yet supported by \
+                             column_sender_chunk_append_arrow_column"
+                        ),
+                    ),
+                );
+            }
+            return false;
+        }
+    }
+    true
+}
 
 // ===========================================================================
 // Designated timestamp
