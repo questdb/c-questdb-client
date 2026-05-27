@@ -884,9 +884,16 @@ unsafe fn arrow_validity<'a>(
 }
 
 /// Read the i-th buffer pointer from `array.buffers`, cast to `*const T`.
+///
+/// `allow_null` lets caller opt in to a NULL buffer pointer (only the
+/// bytes buffer of an empty varchar/symbol-dict array does this). All
+/// other call sites must pass `allow_null = false` so a malformed Arrow
+/// array (length > 0 with a NULL data buffer) is rejected with an
+/// `InvalidApiCall` rather than dereferenced.
 unsafe fn arrow_buffer<T>(
     array: &ArrowArray,
     idx: i64,
+    allow_null: bool,
     err_out: *mut *mut line_sender_error,
     what: &'static str,
 ) -> Option<*const T> {
@@ -906,7 +913,20 @@ unsafe fn arrow_buffer<T>(
         }
         return None;
     }
-    Some(unsafe { *array.buffers.add(idx as usize) } as *const T)
+    let p = unsafe { *array.buffers.add(idx as usize) } as *const T;
+    if !allow_null && p.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("ArrowArray buffer #{idx} for {what} is NULL"),
+                ),
+            );
+        }
+        return None;
+    }
+    Some(p)
 }
 
 /// Inspect the Arrow dictionary subtree for a Categorical-style column.
@@ -952,8 +972,24 @@ unsafe fn arrow_dictionary_utf8<'a>(
         return None;
     }
     let dict_len = dict_array.length as usize;
-    let offsets_ptr = unsafe { arrow_buffer::<i32>(dict_array, 1, err_out, "dict offsets") }?;
-    let bytes_ptr = unsafe { arrow_buffer::<u8>(dict_array, 2, err_out, "dict bytes") }?;
+    let offsets_ptr = unsafe {
+        arrow_buffer::<i32>(
+            dict_array,
+            1,
+            /* allow_null = */ false,
+            err_out,
+            "dict offsets",
+        )
+    }?;
+    let bytes_ptr = unsafe {
+        arrow_buffer::<u8>(
+            dict_array,
+            2,
+            /* allow_null = */ true,
+            err_out,
+            "dict bytes",
+        )
+    }?;
     let offsets = unsafe { slice::from_raw_parts(offsets_ptr, dict_len + 1) };
     let bytes_len = if dict_len == 0 {
         0
@@ -1080,7 +1116,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
         match format {
             "c" => {
                 let codes_ptr =
-                    match unsafe { arrow_buffer::<i8>(array_ref, 1, err_out, "dict codes") } {
+                    match unsafe { arrow_buffer::<i8>(array_ref, 1, false, err_out, "dict codes") }
+                    {
                         Some(p) => p,
                         None => return false,
                     };
@@ -1091,11 +1128,12 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                 );
             }
             "s" => {
-                let codes_ptr =
-                    match unsafe { arrow_buffer::<i16>(array_ref, 1, err_out, "dict codes") } {
-                        Some(p) => p,
-                        None => return false,
-                    };
+                let codes_ptr = match unsafe {
+                    arrow_buffer::<i16>(array_ref, 1, false, err_out, "dict codes")
+                } {
+                    Some(p) => p,
+                    None => return false,
+                };
                 let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
                 bubble!(
                     err_out,
@@ -1103,11 +1141,12 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                 );
             }
             "i" => {
-                let codes_ptr =
-                    match unsafe { arrow_buffer::<i32>(array_ref, 1, err_out, "dict codes") } {
-                        Some(p) => p,
-                        None => return false,
-                    };
+                let codes_ptr = match unsafe {
+                    arrow_buffer::<i32>(array_ref, 1, false, err_out, "dict codes")
+                } {
+                    Some(p) => p,
+                    None => return false,
+                };
                 let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
                 bubble!(
                     err_out,
@@ -1138,7 +1177,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
     let format_head = format.split(':').next().unwrap_or(format);
     macro_rules! primitive {
         ($ty:ty, $method:ident, $what:literal) => {{
-            let ptr = match unsafe { arrow_buffer::<$ty>(array_ref, 1, err_out, $what) } {
+            let ptr = match unsafe { arrow_buffer::<$ty>(array_ref, 1, false, err_out, $what) } {
                 Some(p) => p,
                 None => return false,
             };
@@ -1172,10 +1211,11 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                 }
                 return false;
             }
-            let ptr = match unsafe { arrow_buffer::<u8>(array_ref, 1, err_out, "bool bitmap") } {
-                Some(p) => p,
-                None => return false,
-            };
+            let ptr =
+                match unsafe { arrow_buffer::<u8>(array_ref, 1, false, err_out, "bool bitmap") } {
+                    Some(p) => p,
+                    None => return false,
+                };
             let shifted = unsafe { ptr.add(row_offset / 8) };
             let len = row_count.div_ceil(8);
             let bits = unsafe { slice::from_raw_parts(shifted, len) };
@@ -1191,13 +1231,14 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             // buffers[2] = bytes. The offsets array has length array.length
             // + 1; slicing means starting at offsets[row_offset] and
             // reading row_count + 1 entries.
-            let offsets_ptr =
-                match unsafe { arrow_buffer::<i32>(array_ref, 1, err_out, "varchar offsets") } {
-                    Some(p) => p,
-                    None => return false,
-                };
+            let offsets_ptr = match unsafe {
+                arrow_buffer::<i32>(array_ref, 1, false, err_out, "varchar offsets")
+            } {
+                Some(p) => p,
+                None => return false,
+            };
             let bytes_ptr =
-                match unsafe { arrow_buffer::<u8>(array_ref, 2, err_out, "varchar bytes") } {
+                match unsafe { arrow_buffer::<u8>(array_ref, 2, true, err_out, "varchar bytes") } {
                     Some(p) => p,
                     None => return false,
                 };
@@ -1230,16 +1271,17 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             // LargeUtf8 column with int64 offsets. Same shape as `u`
             // but offsets are i64.
             let offsets_ptr = match unsafe {
-                arrow_buffer::<i64>(array_ref, 1, err_out, "large_varchar offsets")
+                arrow_buffer::<i64>(array_ref, 1, false, err_out, "large_varchar offsets")
             } {
                 Some(p) => p,
                 None => return false,
             };
-            let bytes_ptr =
-                match unsafe { arrow_buffer::<u8>(array_ref, 2, err_out, "large_varchar bytes") } {
-                    Some(p) => p,
-                    None => return false,
-                };
+            let bytes_ptr = match unsafe {
+                arrow_buffer::<u8>(array_ref, 2, true, err_out, "large_varchar bytes")
+            } {
+                Some(p) => p,
+                None => return false,
+            };
             let offsets =
                 unsafe { slice::from_raw_parts(offsets_ptr.add(row_offset), row_count + 1) };
             let bytes_len = if array_total_len == 0 {

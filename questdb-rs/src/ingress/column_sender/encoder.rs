@@ -243,8 +243,9 @@ fn estimate_frame_size(
             ColumnKind::Bool { .. } => bitmap_bytes,
             ColumnKind::Uuid { .. } => 16 * row_count,
             ColumnKind::Long256 { .. } => 32 * row_count,
-            ColumnKind::Varchar { bytes_len, .. }
-            | ColumnKind::VarcharLarge { bytes_len, .. } => 4 * (row_count + 1) + bytes_len,
+            ColumnKind::Varchar { bytes_len, .. } | ColumnKind::VarcharLarge { bytes_len, .. } => {
+                4 * (row_count + 1) + bytes_len
+            }
             ColumnKind::Symbol { .. } => 5 * row_count, // varint upper bound
         };
         total += null_overhead + payload_size;

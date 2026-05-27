@@ -802,14 +802,15 @@ fn validate_varchar_offsets(offsets: &[i32], bytes_len: usize) -> Result<()> {
 }
 
 fn validate_varchar_offsets_i64(offsets: &[i64], bytes_len: usize) -> Result<()> {
-    let mut prev = offsets[0];
-    if prev < 0 {
+    let first = offsets[0];
+    if first < 0 {
         return Err(error::fmt!(
             InvalidApiCall,
             "LargeVARCHAR offsets must be non-negative (offsets[0] = {})",
-            prev
+            first
         ));
     }
+    let mut prev = first;
     for (i, &off) in offsets.iter().enumerate().skip(1) {
         if off < prev {
             return Err(error::fmt!(
@@ -824,7 +825,7 @@ fn validate_varchar_offsets_i64(offsets: &[i64], bytes_len: usize) -> Result<()>
         prev = off;
     }
     let last = prev;
-    if last < 0 || (last as u64) > bytes_len as u64 {
+    if (last as u64) > bytes_len as u64 {
         return Err(error::fmt!(
             InvalidApiCall,
             "LargeVARCHAR offsets exceed bytes buffer: last offset = {}, bytes_len = {}",
@@ -832,14 +833,20 @@ fn validate_varchar_offsets_i64(offsets: &[i64], bytes_len: usize) -> Result<()>
             bytes_len
         ));
     }
-    // QWP's wire offset table is uint32 LE; reject up front so the
-    // caller sees a meaningful error rather than a per-row overflow at
-    // encode time.
-    if last > u32::MAX as i64 {
+    // QWP's wire offset table is uint32 LE. The encoder narrows
+    // `(off - first)` to u32 per row, so the *span* must fit u32::MAX,
+    // not the absolute last offset. A slice taken from the tail of a
+    // multi-GiB LargeUtf8 array remains valid as long as the span is
+    // bounded.
+    let span = last - first;
+    if span > u32::MAX as i64 {
         return Err(error::fmt!(
             InvalidApiCall,
-            "LargeVARCHAR offsets exceed QWP uint32 limit: last offset = {} > {} (u32::MAX)",
+            "LargeVARCHAR slice span exceeds QWP uint32 limit: \
+             last - first = {} - {} = {} > {} (u32::MAX)",
             last,
+            first,
+            span,
             u32::MAX
         ));
     }
