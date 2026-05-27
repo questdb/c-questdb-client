@@ -140,13 +140,13 @@ inputs.
 ### 2.5 Threading
 
 - A `questdb_db` (the pool) is **thread-safe**. Share it across
-  threads. `questdb_db_borrow_sender` and `questdb_db_return_sender`
+  threads. `questdb_db_borrow_conn` and `questdb_db_return_conn`
   are safe to call concurrently.
-- A `column_sender` (a borrow) is **not thread-safe**. It belongs to
+- A `qwpws_conn` (a borrow) is **not thread-safe**. It belongs to
   the borrowing thread until returned. Do not pass it across threads.
 - A `column_sender_chunk` is owned by one thread at a time. It is
-  *not* tied to a particular sender; chunks can be built without a
-  borrow and flushed on any sender borrowed from the same `db`.
+  *not* tied to a particular conn; chunks can be built without a
+  borrow and flushed on any conn borrowed from the same `db`.
 - `line_sender_error` is thread-safe to read but not to share writes.
 
 ### 2.6 String / UTF-8
@@ -162,7 +162,7 @@ for ensuring valid UTF-8 from Pandas/Polars.
 
 ```c
 typedef struct questdb_db        questdb_db;        /* connection pool */
-typedef struct column_sender     column_sender;     /* borrowed handle */
+typedef struct qwpws_conn        qwpws_conn;        /* borrowed connection */
 typedef struct column_sender_chunk column_sender_chunk;
 ```
 
@@ -170,7 +170,7 @@ Errors reuse `line_sender_error*` (from `line_sender.h`).
 
 ---
 
-## 4. Connection pool and sender borrow
+## 4. Connection pool and conn borrow
 
 ### 4.1 Conceptual shape
 
@@ -186,13 +186,13 @@ multiple connections. The pool absorbs both cases:
                           │   ├─ connection #2 (lazy) │
                           │   └─ ...                  │
                           └──────────┬────────────────┘
-                                     │ borrow_sender / return_sender
+                                     │ borrow_conn / return_conn
                                      ▼
                           ┌──────────────────────────┐
-                          │  column_sender (borrowed)│
-                          │   ├─ new_chunk            │
-                          │   ├─ flush / sync         │
-                          │   └─ ...                  │
+                          │  qwpws_conn (borrowed)   │
+                          │   ├─ column_sender_chunk │
+                          │   ├─ flush / sync        │
+                          │   └─ ...                 │
                           └──────────────────────────┘
 ```
 
@@ -205,7 +205,7 @@ return per work unit (or per thread).
 | Key                    | Default | Description                                                                                                                                  |
 |------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------|
 | `pool_size`            | 1       | Warm / minimum connections, opened eagerly at `questdb_db_connect`. All N go through the full WS upgrade before `connect` returns. The pool never shrinks below this. |
-| `pool_max`             | 64      | Hard cap on auto-grow. When all current senders are checked out and pool size < `pool_max`, a new connection is opened on demand. When at `pool_max`, `borrow_sender` fails fast (see §4.3).                       |
+| `pool_max`             | 64      | Hard cap on auto-grow. When all current conns are checked out and pool size < `pool_max`, a new connection is opened on demand. When at `pool_max`, `borrow_conn` fails fast (see §4.3).                       |
 | `pool_idle_timeout_ms` | 60000   | Connections *above* `pool_size` are closed after this much idle time in the pool's free list. Set to 0 to disable shrink (the pool only grows). |
 | `pool_reap`            | `auto`  | `auto` — pool spawns a background thread that periodically reaps idle connections per `pool_idle_timeout_ms`. `manual` — no background thread; caller invokes `questdb_db_reap_idle` on its own cadence. |
 
@@ -257,18 +257,18 @@ void questdb_db_close(questdb_db* db);
  * Selection rules:
  *  1. If a previously-returned sender is in the free list, hand it out.
  *  2. Otherwise, if pool size < `pool_max`, open a new connection on
- *     demand (auto-grow) and hand out a sender bound to it.
+ *     demand (auto-grow) and hand out a conn bound to it.
  *  3. Otherwise (at `pool_max` cap, all checked out), return
  *     line_sender_error_invalid_api_call. This is fail-fast: hitting
  *     the cap signals either a leaked borrow or a `pool_max` set too
  *     low — both want an error rather than silent blocking. Caller may
- *     retry after returning senders.
+ *     retry after returning conns.
  *
- * The returned sender is bound to the calling thread until returned.
+ * The returned conn is bound to the calling thread until returned.
  * Do not share across threads.
  */
 QUESTDB_CLIENT_API
-column_sender* questdb_db_borrow_sender(
+qwpws_conn* questdb_db_borrow_conn(
     questdb_db* db,
     line_sender_error** err_out);
 
@@ -289,32 +289,31 @@ QUESTDB_CLIENT_API
 size_t questdb_db_reap_idle(questdb_db* db);
 
 /**
- * Return a sender to the pool. The sender pointer is invalidated and
- * must not be used again after this call. Any chunks created from the
- * sender remain valid (chunks are caller-owned, not sender-owned) but
- * cannot be flushed until borrowed again from a new sender.
+ * Return a conn to the pool. The conn pointer is invalidated and
+ * must not be used again after this call. Any chunks created while the
+ * conn was borrowed remain valid (chunks are caller-owned, not
+ * conn-owned) but cannot be flushed until a conn is borrowed again.
  *
- * If the sender is in a latched-error state (must_close() == true),
- * its underlying connection is closed and dropped from the pool
- * instead of returned.
+ * If the conn is in a latched-error state (`qwpws_conn_must_close()`
+ * == true), its underlying connection is closed and dropped from the
+ * pool instead of returned.
  */
 QUESTDB_CLIENT_API
-void questdb_db_return_sender(
+void questdb_db_return_conn(
     questdb_db* db,
-    column_sender* sender);
+    qwpws_conn* conn);
 ```
 
-### 4.4 Sender state inspection
+### 4.4 Connection state inspection
 
 ```c
 /**
- * True if the sender's underlying connection is in a permanently-
- * unusable state (a QWP halt rejection, terminal WS protocol
- * violation, etc.). On return to the pool, such senders are dropped,
- * not recycled.
+ * True if the connection is in a permanently-unusable state (a QWP
+ * halt rejection, terminal WS protocol violation, etc.). On return to
+ * the pool, such conns are dropped, not recycled.
  */
 QUESTDB_CLIENT_API
-bool column_sender_must_close(const column_sender* sender);
+bool qwpws_conn_must_close(const qwpws_conn* conn);
 ```
 
 ---
@@ -720,17 +719,17 @@ typedef enum column_sender_ack_level
  * line_sender_error_invalid_api_call; call `column_sender_sync` before
  * flushing more chunks.
  *
- * For parallel ingest, borrow multiple senders from the pool — one per
+ * For parallel ingest, borrow multiple conns from the pool — one per
  * thread — and flush concurrently.
  *
  * On any failure (server rejection, transport error, latched-error
- * sender, invalid chunk, or exhausted deferred-flight reserve), returns
+ * conn, invalid chunk, or exhausted deferred-flight reserve), returns
  * false and sets *err_out. The chunk is left untouched so the caller can
  * inspect or recover its contents before freeing.
  */
 QUESTDB_CLIENT_API
 bool column_sender_flush(
-    column_sender* sender,
+    qwpws_conn* conn,
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
@@ -745,21 +744,21 @@ bool column_sender_flush(
  *    watermark; can be significantly later under upload pressure.
  *
  * On any failure (server rejection, transport error, latched-error
- * sender, or `durable` requested without opt-in), returns false and
+ * conn, or `durable` requested without opt-in), returns false and
  * sets *err_out.
  *
  * Sync blocks until ack or until the underlying connection enters a
- * terminal failure state (must_close() becomes true). Transport errors
- * latch the sender as terminal; return it to the pool and borrow a fresh
- * sender to continue. No separate per-call timeout in v1; if you need
- * one, file a request.
+ * terminal failure state (`qwpws_conn_must_close()` becomes true).
+ * Transport errors latch the conn as terminal; return it to the pool
+ * and borrow a fresh conn to continue. No separate per-call timeout in
+ * v1; if you need one, file a request.
  *
  * The QWP wire `sequence` (FSN) is tracked internally and is not
  * exposed at the FFI.
  */
 QUESTDB_CLIENT_API
 bool column_sender_sync(
-    column_sender* sender,
+    qwpws_conn* conn,
     column_sender_ack_level ack_level,
     line_sender_error** err_out);
 ```
@@ -780,7 +779,7 @@ This API is **draft / unstable** until first ship. Once shipped:
 
 ## 13. Minimal C example
 
-Pool/borrow shape: one `questdb_db` per process, borrow a sender per
+Pool/borrow shape: one `questdb_db` per process, borrow a conn per
 unit of work, return it when done.
 
 ```c
@@ -789,11 +788,11 @@ unit of work, return it when done.
 
 int send_one_chunk(questdb_db* db) {
     line_sender_error* err = NULL;
-    column_sender* sender = NULL;
+    qwpws_conn* conn = NULL;
     column_sender_chunk* chunk = NULL;
 
-    sender = questdb_db_borrow_sender(db, &err);
-    if (!sender) goto fail;
+    conn = questdb_db_borrow_conn(db, &err);
+    if (!conn) goto fail;
 
     chunk = column_sender_chunk_new("trades", 6, &err);
     if (!chunk) goto fail;
@@ -811,14 +810,14 @@ int send_one_chunk(questdb_db* db) {
     if (!column_sender_chunk_designated_timestamp_nanos(
             chunk, timestamps_ns, 3, &err)) goto fail;
 
-    if (!column_sender_flush(sender, chunk, &err)) goto fail;
+    if (!column_sender_flush(conn, chunk, &err)) goto fail;
     /* flush returned: chunk cleared & reusable; ACK wait is deferred */
     if (!column_sender_sync(
-            sender, column_sender_ack_level_ok, &err)) goto fail;
+            conn, column_sender_ack_level_ok, &err)) goto fail;
     /* sync returned: server has WAL-committed all flushed chunks */
 
     column_sender_chunk_free(chunk);
-    questdb_db_return_sender(db, sender);
+    questdb_db_return_conn(db, conn);
     return 0;
 
 fail:
@@ -827,7 +826,7 @@ fail:
         line_sender_error_free(err);
     }
     column_sender_chunk_free(chunk);
-    if (sender) questdb_db_return_sender(db, sender);
+    if (conn) questdb_db_return_conn(db, conn);
     return 1;
 }
 

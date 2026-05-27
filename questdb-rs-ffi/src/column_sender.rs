@@ -26,8 +26,8 @@
 //!
 //! Mirrors `doc/COLUMN_SENDER_FFI_ABI.md`. The ABI re-uses
 //! `line_sender_error*` for fallible-call error reporting; opaque types
-//! (`questdb_db`, `column_sender`, `column_sender_chunk`) are heap-allocated
-//! and freed through their dedicated `_close` / `_free` / `_return_sender`
+//! (`questdb_db`, `qwpws_conn`, `column_sender_chunk`) are heap-allocated
+//! and freed through their dedicated `_close` / `_free` / `_return_conn`
 //! entry points.
 
 use libc::{c_char, size_t};
@@ -46,12 +46,15 @@ use crate::{line_sender_error, set_err_out_from_error};
 /// Connection pool. Thread-safe; share across threads.
 pub struct questdb_db(QuestDb);
 
-/// Borrowed sender. Owns a pool slot until `questdb_db_return_sender` is
-/// called. Not thread-safe.
-pub struct column_sender(OwnedSender);
+/// Borrowed QWP/WS connection. Owns a pool slot until
+/// `questdb_db_return_conn` is called. Not thread-safe. Bundles the
+/// per-connection schema registry and symbol-dict state used by all
+/// writer modes (column-sender chunks, future Arrow / NumPy appenders,
+/// future egress readers).
+pub struct qwpws_conn(OwnedSender);
 
 /// One DataFrame's worth of column buffers destined for one QuestDB table.
-/// Owned by the caller; not bound to a sender.
+/// Owned by the caller; not bound to a connection.
 ///
 /// Holds raw pointers into caller buffers (no copy). Per the FFI ABI
 /// doc §2.3, the caller MUST keep every column buffer passed in via
@@ -238,9 +241,9 @@ pub unsafe extern "C" fn questdb_db_connect(
 
 /// Close the pool and all its connections. Accepts NULL and no-ops.
 ///
-/// Outstanding `column_sender` handles remain valid (they hold an
+/// Outstanding `qwpws_conn` handles remain valid (they hold an
 /// internal reference to the pool's state) and return themselves on
-/// `questdb_db_return_sender`.
+/// `questdb_db_return_conn`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
     if !db.is_null() {
@@ -248,21 +251,21 @@ pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
     }
 }
 
-/// Borrow a sender from the pool. See
+/// Borrow a QWP/WS connection from the pool. See
 /// `doc/COLUMN_SENDER_FFI_ABI.md` §4.3 for the selection rules. Returns
 /// NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_sender(
+pub unsafe extern "C" fn questdb_db_borrow_conn(
     db: *mut questdb_db,
     err_out: *mut *mut line_sender_error,
-) -> *mut column_sender {
+) -> *mut qwpws_conn {
     if db.is_null() {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "questdb_db_borrow_sender: db pointer is NULL".to_string(),
+                    "questdb_db_borrow_conn: db pointer is NULL".to_string(),
                 ),
             );
         }
@@ -270,7 +273,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sender(
     }
     let db_ref = unsafe { &*db };
     match db_ref.0.borrow_sender_owned() {
-        Ok(owned) => Box::into_raw(Box::new(column_sender(owned))),
+        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             std::ptr::null_mut()
@@ -278,17 +281,14 @@ pub unsafe extern "C" fn questdb_db_borrow_sender(
     }
 }
 
-/// Return a borrowed sender to the pool. Invalidates `sender`. Accepts
-/// NULL `sender` and no-ops. `db` is ignored — the sender carries its
-/// own reference to the pool — but kept in the ABI for symmetry with the
+/// Return a borrowed conn to the pool. Invalidates `conn`. Accepts
+/// NULL `conn` and no-ops. `db` is ignored — the conn carries its own
+/// reference to the pool — but kept in the ABI for symmetry with the
 /// borrow call and to allow future runtime checks.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_return_sender(
-    _db: *mut questdb_db,
-    sender: *mut column_sender,
-) {
-    if !sender.is_null() {
-        unsafe { drop(Box::from_raw(sender)) };
+pub unsafe extern "C" fn questdb_db_return_conn(_db: *mut questdb_db, conn: *mut qwpws_conn) {
+    if !conn.is_null() {
+        unsafe { drop(Box::from_raw(conn)) };
     }
 }
 
@@ -304,17 +304,16 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
 }
 
 // ===========================================================================
-// Sender state
+// Connection state
 // ===========================================================================
 
-/// `true` if the sender's underlying connection is in a permanently-
-/// unusable state.
+/// `true` if the connection is in a permanently-unusable state.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_must_close(sender: *const column_sender) -> bool {
-    if sender.is_null() {
+pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool {
+    if conn.is_null() {
         return true;
     }
-    unsafe { (*sender).0.get().must_close() }
+    unsafe { (*conn).0.get().must_close() }
 }
 
 // ===========================================================================
@@ -770,19 +769,19 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
 /// remaining in-flight acks.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush(
-    sender: *mut column_sender,
+    conn: *mut qwpws_conn,
     chunk: *mut column_sender_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = match unsafe { sender.as_mut() } {
-        Some(s) => s.0.get_mut(),
+    let sender = match unsafe { conn.as_mut() } {
+        Some(c) => c.0.get_mut(),
         None => {
             unsafe {
                 set_err_out_from_error(
                     err_out,
                     Error::new(
                         ErrorCode::InvalidApiCall,
-                        "column_sender_flush: sender pointer is NULL".to_string(),
+                        "column_sender_flush: conn pointer is NULL".to_string(),
                     ),
                 );
             }
@@ -807,19 +806,19 @@ pub unsafe extern "C" fn column_sender_flush(
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_sync(
-    sender: *mut column_sender,
+    conn: *mut qwpws_conn,
     ack_level: column_sender_ack_level,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = match unsafe { sender.as_mut() } {
-        Some(s) => s.0.get_mut(),
+    let sender = match unsafe { conn.as_mut() } {
+        Some(c) => c.0.get_mut(),
         None => {
             unsafe {
                 set_err_out_from_error(
                     err_out,
                     Error::new(
                         ErrorCode::InvalidApiCall,
-                        "column_sender_sync: sender pointer is NULL".to_string(),
+                        "column_sender_sync: conn pointer is NULL".to_string(),
                     ),
                 );
             }

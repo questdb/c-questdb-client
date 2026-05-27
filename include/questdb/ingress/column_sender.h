@@ -58,9 +58,12 @@ extern "C" {
 /** Connection pool. Thread-safe; share across threads. */
 typedef struct questdb_db questdb_db;
 
-/** Borrowed sender. Not thread-safe; belongs to the borrowing thread
- *  until returned via `questdb_db_return_sender`. */
-typedef struct column_sender column_sender;
+/** Borrowed QWP/WS connection. Not thread-safe; belongs to the borrowing
+ *  thread until returned via `questdb_db_return_conn`. Carries the
+ *  per-connection schema registry and symbol-dictionary state used by all
+ *  writer modes (per-type, Arrow, NumPy) and — in the future — by egress
+ *  readers. */
+typedef struct qwpws_conn qwpws_conn;
 
 /** One DataFrame's worth of column buffers destined for one QuestDB table.
  *  Owned by the caller. */
@@ -126,37 +129,37 @@ questdb_db* questdb_db_connect(
 
 /**
  * Close the pool and all its connections. Accepts NULL and no-ops.
- * Outstanding `column_sender` handles remain valid and return their
- * connections on `questdb_db_return_sender` — the pool's state is
+ * Outstanding `qwpws_conn` handles remain valid and return their
+ * connections on `questdb_db_return_conn` — the pool's state is
  * reference-counted internally.
  */
 QUESTDB_CLIENT_API
 void questdb_db_close(questdb_db* db);
 
 /**
- * Borrow a sender. Selection rules:
- *  1. If a previously-returned sender is in the free list, hand it out.
+ * Borrow a QWP/WS connection. Selection rules:
+ *  1. If a previously-returned conn is in the free list, hand it out.
  *  2. Otherwise, if pool size < `pool_max`, open a new connection.
  *  3. Otherwise (at cap), return NULL + `line_sender_error_invalid_api_call`.
  *
- * The returned sender is bound to the calling thread until returned.
+ * The returned conn is bound to the calling thread until returned.
  */
 QUESTDB_CLIENT_API
-column_sender* questdb_db_borrow_sender(
+qwpws_conn* questdb_db_borrow_conn(
     questdb_db* db,
     line_sender_error** err_out);
 
 /**
- * Return a sender to the pool. Accepts NULL `sender` and no-ops.
- * Invalidates the `sender` pointer; do not use it after this call.
+ * Return a conn to the pool. Accepts NULL `conn` and no-ops.
+ * Invalidates the `conn` pointer; do not use it after this call.
  *
- * `db` is currently ignored — the sender carries its own reference to
+ * `db` is currently ignored — the conn carries its own reference to
  * the pool — but accepted for symmetry with the borrow call.
  */
 QUESTDB_CLIENT_API
-void questdb_db_return_sender(
+void questdb_db_return_conn(
     questdb_db* db,
-    column_sender* sender);
+    qwpws_conn* conn);
 
 /**
  * Manually reap idle connections (closes free-list entries idle longer
@@ -167,16 +170,16 @@ QUESTDB_CLIENT_API
 size_t questdb_db_reap_idle(questdb_db* db);
 
 /* -------------------------------------------------------------------------
- * Sender state inspection
+ * Connection state inspection
  * ------------------------------------------------------------------------- */
 
 /**
- * `true` if the sender's underlying connection is in a permanently-
- * unusable state. On return to the pool such senders are dropped, not
- * recycled.
+ * `true` if the connection is in a permanently-unusable state (latched
+ * by any writer that hits a transport or protocol error). On return to
+ * the pool such conns are dropped, not recycled.
  */
 QUESTDB_CLIENT_API
-bool column_sender_must_close(const column_sender* sender);
+bool qwpws_conn_must_close(const qwpws_conn* conn);
 
 /* -------------------------------------------------------------------------
  * Chunk lifecycle
@@ -446,30 +449,30 @@ bool column_sender_chunk_designated_timestamp_nanos(
  * Flush / sync
  *
  * `column_sender_flush` encodes `chunk` into a QWP/WebSocket frame,
- * publishes it, and returns without waiting for a server ACK. On success,
- * `chunk` is cleared (allocations retained) and `true` is returned. On
- * failure, `chunk` is left untouched.
+ * publishes it through `conn`, and returns without waiting for a server
+ * ACK. On success, `chunk` is cleared (allocations retained) and `true`
+ * is returned. On failure, `chunk` is left untouched.
  *
  * The first flush is sent as an immediate commit. Later flushes are sent
  * with QWP's deferred-commit flag so callers can pipeline many chunks.
  * Call `column_sender_sync` after the final flush to send the commit frame
  * and wait until all in-flight frames are acknowledged at `ack_level`.
  *
- * The sender keeps one protocol in-flight slot reserved for the sync commit
- * frame. If that reserve would be exhausted, flush returns
+ * The connection keeps one protocol in-flight slot reserved for the sync
+ * commit frame. If that reserve would be exhausted, flush returns
  * `line_sender_error_invalid_api_call`; call `column_sender_sync` before
  * flushing more chunks.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
 bool column_sender_flush(
-    column_sender* sender,
+    qwpws_conn* conn,
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
 bool column_sender_sync(
-    column_sender* sender,
+    qwpws_conn* conn,
     column_sender_ack_level ack_level,
     line_sender_error** err_out);
 
