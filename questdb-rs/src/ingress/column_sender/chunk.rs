@@ -222,11 +222,37 @@ pub(crate) struct DesignatedTsDescriptor {
 /// data is copied. The caller's buffers must outlive the chunk —
 /// concretely, they must remain alive from each column append through
 /// the next [`ColumnSender::flush`](super::ColumnSender::flush) call.
+/// Chunk-owned widened scratch buffer for [`Chunk::column_numpy`]
+/// appends. The variant matches the destination wire type so the
+/// allocation has the right alignment for the `ColumnDescriptor`'s
+/// `*const T` to be safely dereferenced by the encoder.
+///
+/// The inner boxes are storage-only — the active alias is the raw
+/// pointer kept on `ColumnDescriptor::kind`. We never read the box
+/// directly, so the compiler flags the fields as "never read"; that's
+/// the intended semantics for an arena.
+#[allow(dead_code)]
+pub(crate) enum NumpyScratch {
+    /// 8-byte-aligned buffer of widened `i64` values (covers `i8/i16/
+    /// i32/i64/u8/u16/u32/u64`).
+    I64(Box<[i64]>),
+    /// 8-byte-aligned buffer of widened `f64` values (covers `f32/f64`).
+    F64(Box<[f64]>),
+    /// Packed Arrow LSB-first `bool` bitmap.
+    Bool(Box<[u8]>),
+}
+
 pub struct Chunk<'a> {
     pub(crate) table: String,
     pub(crate) row_count: Option<usize>,
     pub(crate) columns: Vec<ColumnDescriptor>,
     pub(crate) designated_ts: Option<DesignatedTsDescriptor>,
+    /// One entry per column that needed widening. The corresponding
+    /// `ColumnDescriptor::kind` stores a `*const T` into this scratch;
+    /// keeping these alive for the chunk's lifetime preserves pointer
+    /// validity through to flush. Cleared on [`Self::clear`] alongside
+    /// the descriptor vec.
+    pub(crate) scratch: Vec<NumpyScratch>,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -239,6 +265,7 @@ impl<'a> Chunk<'a> {
             row_count: None,
             columns: Vec::new(),
             designated_ts: None,
+            scratch: Vec::new(),
             _marker: PhantomData,
         }
     }
@@ -262,6 +289,7 @@ impl<'a> Chunk<'a> {
         self.row_count = None;
         self.columns.clear();
         self.designated_ts = None;
+        self.scratch.clear();
     }
 
     // -------------------------------------------------------------------
@@ -696,6 +724,59 @@ impl<'a> Chunk<'a> {
     }
 
     // -------------------------------------------------------------------
+    // NumPy widening / packing (column_numpy)
+    //
+    // Single entry point that takes a raw NumPy buffer of a narrower
+    // dtype and a `NumpyDtype` tag. Widens / packs into a chunk-owned
+    // scratch buffer and emits via the existing fixed-width / bool
+    // encoder so the wire-encode hot path is unchanged.
+    //
+    // Strided arrays and non-native-endian are not supported in v1 —
+    // the caller (Python client) consolidates upstream.
+    // -------------------------------------------------------------------
+
+    /// Append a column whose source layout is described by [`NumpyDtype`].
+    /// The data buffer must be contiguous and native-endian. Widening
+    /// (narrower int / float / bool → wire type) happens in this method;
+    /// the result is owned by the chunk's scratch arena and freed on
+    /// [`Self::clear`] or chunk drop.
+    ///
+    /// Caller's `data` buffer is read once at append time and need not
+    /// outlive this call — the widened bytes are copied into the chunk
+    /// scratch.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be either NULL with `row_count == 0`, or point to
+    /// at least `row_count * sizeof(dtype)` valid, contiguous,
+    /// native-endian bytes — `row_count` bytes for `NumpyDtype::Bool`
+    /// (one byte per row, NumPy native layout). The caller's buffer
+    /// is read once at append time and not retained.
+    pub unsafe fn column_numpy(
+        &mut self,
+        name: &str,
+        dtype: NumpyDtype,
+        data: *const u8,
+        row_count: usize,
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if data.is_null() && row_count != 0 {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "column_numpy: data pointer is NULL with row_count = {}",
+                row_count
+            ));
+        }
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+
+        // Materialise the widened buffer into chunk-owned scratch, then
+        // build a ColumnKind that borrows into it.
+        let (wire_type, kind) = unsafe { widen_into_scratch(self, dtype, data, row_count) };
+
+        self.push_column(name, wire_type, kind, validity, row_count)
+    }
+
+    // -------------------------------------------------------------------
     // Designated timestamp
     // -------------------------------------------------------------------
 
@@ -766,6 +847,215 @@ impl<'a> Chunk<'a> {
         }
         Ok(())
     }
+}
+
+/// NumPy source dtype tag for [`Chunk::column_numpy`]. Mirrored at the
+/// C ABI as `column_sender_numpy_dtype`.
+///
+/// Widening / packing rules (per QuestDB row-path parity, no separate
+/// design):
+///  - signed `i8/i16/i32` widen sign-extend to `i64` (wire = LONG).
+///  - unsigned `u8/u16/u32` widen zero-extend to `i64` (wire = LONG).
+///  - `i64` and `u64` pass through; `u64` values > `i64::MAX` are
+///    silently bit-reinterpreted as negative `i64` (matches the row
+///    path's C-cast behaviour — the user is responsible for staying
+///    in range if they care about the sign).
+///  - `f32` widens to `f64` (wire = DOUBLE); `f64` passes through.
+///  - `bool` is a NumPy byte-per-row buffer and gets packed into the
+///    Arrow LSB-first bitmap that `column_bool` expects (wire =
+///    BOOLEAN).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumpyDtype {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+    Bool,
+}
+
+/// Widen `data` (a contiguous, native-endian NumPy buffer described
+/// by `dtype`) into a freshly-allocated, properly-aligned scratch
+/// buffer owned by `chunk`. Returns the `(wire_type, ColumnKind)` to
+/// feed into `Chunk::push_column`.
+///
+/// SAFETY: `data` must be either NULL with `row_count == 0`, or point
+/// to at least `row_count * sizeof(<dtype>)` valid bytes (or
+/// `row_count` bytes for `Bool` — NumPy `bool` is one byte per row).
+unsafe fn widen_into_scratch<'a>(
+    chunk: &mut Chunk<'a>,
+    dtype: NumpyDtype,
+    data: *const u8,
+    row_count: usize,
+) -> (u8, ColumnKind) {
+    match dtype {
+        NumpyDtype::I8 => unsafe { push_i64_scratch::<i8>(chunk, data, row_count) },
+        NumpyDtype::I16 => unsafe { push_i64_scratch::<i16>(chunk, data, row_count) },
+        NumpyDtype::I32 => unsafe { push_i64_scratch::<i32>(chunk, data, row_count) },
+        NumpyDtype::I64 => unsafe { push_i64_scratch::<i64>(chunk, data, row_count) },
+        NumpyDtype::U8 => unsafe { push_unsigned_i64_scratch::<u8>(chunk, data, row_count) },
+        NumpyDtype::U16 => unsafe { push_unsigned_i64_scratch::<u16>(chunk, data, row_count) },
+        NumpyDtype::U32 => unsafe { push_unsigned_i64_scratch::<u32>(chunk, data, row_count) },
+        // u64 -> i64: bit-reinterpret. Values > i64::MAX wrap to
+        // negative on the wire, matching the row-path's C cast.
+        NumpyDtype::U64 => unsafe { push_i64_scratch::<u64>(chunk, data, row_count) },
+        NumpyDtype::F32 => unsafe { push_f64_scratch::<f32>(chunk, data, row_count) },
+        NumpyDtype::F64 => unsafe { push_f64_scratch::<f64>(chunk, data, row_count) },
+        NumpyDtype::Bool => unsafe { push_bool_scratch(chunk, data, row_count) },
+    }
+}
+
+trait WidenToI64: Copy {
+    fn widen(self) -> i64;
+}
+impl WidenToI64 for i8 {
+    fn widen(self) -> i64 {
+        self as i64
+    }
+}
+impl WidenToI64 for i16 {
+    fn widen(self) -> i64 {
+        self as i64
+    }
+}
+impl WidenToI64 for i32 {
+    fn widen(self) -> i64 {
+        self as i64
+    }
+}
+impl WidenToI64 for i64 {
+    fn widen(self) -> i64 {
+        self
+    }
+}
+impl WidenToI64 for u64 {
+    /// Bit-reinterpret. Matches the row-path's C cast — values >
+    /// i64::MAX show up as negative on the wire.
+    fn widen(self) -> i64 {
+        self as i64
+    }
+}
+
+/// Build an `i64` scratch from a sign-extending or pass-through
+/// source, push it onto `chunk.scratch`, and return a `ColumnKind`
+/// referencing it.
+unsafe fn push_i64_scratch<T: WidenToI64>(
+    chunk: &mut Chunk<'_>,
+    data: *const u8,
+    row_count: usize,
+) -> (u8, ColumnKind) {
+    let mut out: Vec<i64> = Vec::with_capacity(row_count.max(1));
+    if row_count > 0 {
+        let src = unsafe { std::slice::from_raw_parts(data as *const T, row_count) };
+        for &v in src {
+            out.push(v.widen());
+        }
+    }
+    let boxed = out.into_boxed_slice();
+    let ptr = boxed.as_ptr();
+    chunk.scratch.push(NumpyScratch::I64(boxed));
+    (QWP_TYPE_LONG, ColumnKind::Long { data: ptr })
+}
+
+trait UnsignedToU64: Copy {
+    fn widen_u64(self) -> u64;
+}
+impl UnsignedToU64 for u8 {
+    fn widen_u64(self) -> u64 {
+        self as u64
+    }
+}
+impl UnsignedToU64 for u16 {
+    fn widen_u64(self) -> u64 {
+        self as u64
+    }
+}
+impl UnsignedToU64 for u32 {
+    fn widen_u64(self) -> u64 {
+        self as u64
+    }
+}
+
+/// Build an `i64` scratch from a zero-extending unsigned source
+/// (`u8`/`u16`/`u32`). All such values fit in `i64::MAX` so the
+/// bit-cast is lossless.
+unsafe fn push_unsigned_i64_scratch<T: UnsignedToU64>(
+    chunk: &mut Chunk<'_>,
+    data: *const u8,
+    row_count: usize,
+) -> (u8, ColumnKind) {
+    let mut out: Vec<i64> = Vec::with_capacity(row_count.max(1));
+    if row_count > 0 {
+        let src = unsafe { std::slice::from_raw_parts(data as *const T, row_count) };
+        for &v in src {
+            out.push(v.widen_u64() as i64);
+        }
+    }
+    let boxed = out.into_boxed_slice();
+    let ptr = boxed.as_ptr();
+    chunk.scratch.push(NumpyScratch::I64(boxed));
+    (QWP_TYPE_LONG, ColumnKind::Long { data: ptr })
+}
+
+trait WidenToF64: Copy {
+    fn widen_f64(self) -> f64;
+}
+impl WidenToF64 for f32 {
+    fn widen_f64(self) -> f64 {
+        self as f64
+    }
+}
+impl WidenToF64 for f64 {
+    fn widen_f64(self) -> f64 {
+        self
+    }
+}
+
+unsafe fn push_f64_scratch<T: WidenToF64>(
+    chunk: &mut Chunk<'_>,
+    data: *const u8,
+    row_count: usize,
+) -> (u8, ColumnKind) {
+    let mut out: Vec<f64> = Vec::with_capacity(row_count.max(1));
+    if row_count > 0 {
+        let src = unsafe { std::slice::from_raw_parts(data as *const T, row_count) };
+        for &v in src {
+            out.push(v.widen_f64());
+        }
+    }
+    let boxed = out.into_boxed_slice();
+    let ptr = boxed.as_ptr();
+    chunk.scratch.push(NumpyScratch::F64(boxed));
+    (QWP_TYPE_DOUBLE, ColumnKind::Double { data: ptr })
+}
+
+/// Pack a NumPy byte-per-row bool array into an Arrow LSB-first
+/// bitmap; push onto `chunk.scratch` and return a `ColumnKind`
+/// referencing the bitmap bytes.
+unsafe fn push_bool_scratch(
+    chunk: &mut Chunk<'_>,
+    data: *const u8,
+    row_count: usize,
+) -> (u8, ColumnKind) {
+    let bytes = row_count.div_ceil(8).max(1);
+    let mut out: Vec<u8> = vec![0u8; bytes];
+    if row_count > 0 {
+        let src = unsafe { std::slice::from_raw_parts(data, row_count) };
+        for (i, &b) in src.iter().enumerate() {
+            if b != 0 {
+                out[i >> 3] |= 1 << (i & 7);
+            }
+        }
+    }
+    let boxed = out.into_boxed_slice();
+    let ptr = boxed.as_ptr();
+    chunk.scratch.push(NumpyScratch::Bool(boxed));
+    (QWP_TYPE_BOOLEAN, ColumnKind::Bool { bits: ptr })
 }
 
 fn validate_varchar_offsets(offsets: &[i32], bytes_len: usize) -> Result<()> {

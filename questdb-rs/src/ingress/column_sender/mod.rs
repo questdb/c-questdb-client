@@ -48,7 +48,7 @@ mod sender;
 mod validity;
 mod wire;
 
-pub use chunk::Chunk;
+pub use chunk::{Chunk, NumpyDtype};
 pub use db::{BorrowedSender, QuestDb};
 pub use sender::{AckLevel, ColumnSender};
 pub use validity::Validity;

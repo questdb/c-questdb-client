@@ -34,7 +34,9 @@ use libc::{c_char, size_t};
 use std::slice;
 use std::str;
 
-use questdb::ingress::column_sender::{AckLevel, Chunk, OwnedSender, QuestDb, Validity};
+use questdb::ingress::column_sender::{
+    AckLevel, Chunk, NumpyDtype, OwnedSender, QuestDb, Validity,
+};
 use questdb::{Error, ErrorCode};
 
 use crate::{line_sender_error, set_err_out_from_error};
@@ -1316,6 +1318,95 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             return false;
         }
     }
+    true
+}
+
+// ===========================================================================
+// NumPy column appender
+//
+// Companion to `column_sender_chunk_append_arrow_column` that takes a
+// raw contiguous NumPy buffer + a dtype tag. Widening / packing happens
+// in Rust at append time into a chunk-owned scratch arena, so callers
+// don't allocate a widened buffer themselves.
+//
+// Stride and non-native-endian are not supported; the caller (Python
+// client) consolidates upstream.
+// ===========================================================================
+
+/// NumPy source dtype, mirrored to the C ABI as `int32` values. Keep
+/// in sync with the Cython `cdef enum column_sender_numpy_dtype` and
+/// the Rust [`NumpyDtype`] enum (see `Chunk::column_numpy` for the
+/// widening / packing rules).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum column_sender_numpy_dtype {
+    column_sender_numpy_i8 = 0,
+    column_sender_numpy_i16 = 1,
+    column_sender_numpy_i32 = 2,
+    column_sender_numpy_i64 = 3,
+    column_sender_numpy_u8 = 4,
+    column_sender_numpy_u16 = 5,
+    column_sender_numpy_u32 = 6,
+    column_sender_numpy_u64 = 7,
+    column_sender_numpy_f32 = 8,
+    column_sender_numpy_f64 = 9,
+    column_sender_numpy_bool = 10,
+}
+
+impl From<column_sender_numpy_dtype> for NumpyDtype {
+    fn from(value: column_sender_numpy_dtype) -> Self {
+        match value {
+            column_sender_numpy_dtype::column_sender_numpy_i8 => NumpyDtype::I8,
+            column_sender_numpy_dtype::column_sender_numpy_i16 => NumpyDtype::I16,
+            column_sender_numpy_dtype::column_sender_numpy_i32 => NumpyDtype::I32,
+            column_sender_numpy_dtype::column_sender_numpy_i64 => NumpyDtype::I64,
+            column_sender_numpy_dtype::column_sender_numpy_u8 => NumpyDtype::U8,
+            column_sender_numpy_dtype::column_sender_numpy_u16 => NumpyDtype::U16,
+            column_sender_numpy_dtype::column_sender_numpy_u32 => NumpyDtype::U32,
+            column_sender_numpy_dtype::column_sender_numpy_u64 => NumpyDtype::U64,
+            column_sender_numpy_dtype::column_sender_numpy_f32 => NumpyDtype::F32,
+            column_sender_numpy_dtype::column_sender_numpy_f64 => NumpyDtype::F64,
+            column_sender_numpy_dtype::column_sender_numpy_bool => NumpyDtype::Bool,
+        }
+    }
+}
+
+/// Append one column from a contiguous, native-endian NumPy buffer.
+/// Widening (narrower int / float → wire type) and NumPy bool packing
+/// (byte-per-row → LSB-bitmap) happen inside Rust at append time; the
+/// caller's `data` buffer is read once and not retained.
+///
+/// `data` must point to at least `row_count * sizeof(dtype)` bytes
+/// (for `column_sender_numpy_bool`: `row_count` bytes, one byte per
+/// row, NumPy native layout). Strided / non-native-endian arrays are
+/// rejected by convention — the caller consolidates upstream.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
+    chunk: *mut column_sender_chunk,
+    name: *const c_char,
+    name_len: size_t,
+    dtype: column_sender_numpy_dtype,
+    data: *const u8,
+    row_count: size_t,
+    validity: *const column_sender_validity,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let chunk = match unsafe { chunk.as_mut() } {
+        Some(c) => &mut c.0,
+        None => return reject_null_chunk(err_out),
+    };
+    let name = match unsafe { name_str(name, name_len, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let validity = match unsafe { as_validity(validity, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let dtype: NumpyDtype = dtype.into();
+    bubble!(err_out, unsafe {
+        chunk.column_numpy(name, dtype, data, row_count, validity.as_ref())
+    });
     true
 }
 

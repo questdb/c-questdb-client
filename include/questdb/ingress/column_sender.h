@@ -493,6 +493,62 @@ bool column_sender_chunk_append_arrow_column(
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
+ * Generic NumPy column appender
+ *
+ * Companion to `column_sender_chunk_append_arrow_column` for callers
+ * holding a raw NumPy buffer. Widening (narrower int / float → wire
+ * type) and bool packing (NumPy byte-per-row → Arrow LSB-bitmap) happen
+ * inside Rust at append time, into a chunk-owned scratch arena. The
+ * caller's `data` buffer is read once and need not outlive this call.
+ *
+ * Supported dtypes and their widening rules:
+ *   - `i8/i16/i32`   sign-extend to `i64`  (wire = LONG)
+ *   - `u8/u16/u32`   zero-extend to `i64`  (wire = LONG)
+ *   - `i64`           pass-through         (wire = LONG)
+ *   - `u64`           bit-reinterpret as `i64` (values > i64::MAX wrap
+ *                     to negative on the wire — matches the row-path's
+ *                     C-cast behaviour)
+ *   - `f32`           widen to `f64`       (wire = DOUBLE)
+ *   - `f64`           pass-through         (wire = DOUBLE)
+ *   - `bool`          NumPy byte-per-row → Arrow LSB-bitmap (wire =
+ *                     BOOLEAN)
+ *
+ * Constraints:
+ *   - `data` must be contiguous and native-endian. Strided arrays and
+ *     non-native-endian arrays are not supported; the caller should
+ *     consolidate upstream.
+ *   - `validity` follows the same Arrow LSB-first convention used by
+ *     the per-type appenders.
+ *   - The chunk's row-count lock applies as elsewhere.
+ * ------------------------------------------------------------------------- */
+
+typedef enum column_sender_numpy_dtype
+{
+    column_sender_numpy_i8   = 0,
+    column_sender_numpy_i16  = 1,
+    column_sender_numpy_i32  = 2,
+    column_sender_numpy_i64  = 3,
+    column_sender_numpy_u8   = 4,
+    column_sender_numpy_u16  = 5,
+    column_sender_numpy_u32  = 6,
+    column_sender_numpy_u64  = 7,
+    column_sender_numpy_f32  = 8,
+    column_sender_numpy_f64  = 9,
+    column_sender_numpy_bool = 10
+} column_sender_numpy_dtype;
+
+QUESTDB_CLIENT_API
+bool column_sender_chunk_append_numpy_column(
+    column_sender_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    column_sender_numpy_dtype dtype,
+    const uint8_t* data,
+    size_t row_count,
+    const column_sender_validity* validity,
+    line_sender_error** err_out);
+
+/* -------------------------------------------------------------------------
  * Designated timestamp
  *
  * Required exactly once per chunk before flush. Always non-null per the
