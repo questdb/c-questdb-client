@@ -37,42 +37,6 @@
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
- * Apache Arrow C Data Interface struct layouts. Spec at
- * https://arrow.apache.org/docs/format/CDataInterface.html.
- * Kept inline here so this file has zero C/C++ dependencies beyond libc
- * and the questdb-client headers.
- * ------------------------------------------------------------------------- */
-
-struct ArrowArray
-{
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-struct ArrowSchema
-{
-    const char* format;
-    const char* name;
-    const char* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-
-#define ARROW_FLAG_NULLABLE 2
-
-/* ---------------------------------------------------------------------------
  * Test harness.
  * ------------------------------------------------------------------------- */
 
@@ -186,7 +150,7 @@ static line_sender_table_name make_table(const char* name)
 
 static line_sender_buffer* fresh_qwp_buffer(void)
 {
-    return line_sender_buffer_new_qwp();
+    return line_sender_buffer_new_qwp_ws();
 }
 
 /* ---------------------------------------------------------------------------

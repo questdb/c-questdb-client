@@ -96,6 +96,21 @@ enum class error_code : int
     server_limit_exceeded     = ::line_reader_error_server_limit_exceeded,
     cancelled                 = ::line_reader_error_cancelled,
     failover_would_duplicate  = ::line_reader_error_failover_would_duplicate,
+
+    /** Streaming Arrow adapter observed a mid-stream schema change. The
+     *  cursor is still usable; re-call `next_arrow_batch` after dropping
+     *  any partial state to snapshot the new schema. Only raised with
+     *  the `arrow` feature enabled. */
+    schema_drift     = ::line_reader_error_schema_drift,
+    /** `next_arrow_batch` was called on a stream that terminated before
+     *  any batch was produced — no schema to snapshot. Only raised with
+     *  the `arrow` feature enabled. */
+    no_schema        = ::line_reader_error_no_schema,
+    /** Arrow C Data Interface export failed (arrow-rs rejected the
+     *  produced `ArrayData`'s invariants). Indicates a client bug —
+     *  not user-recoverable. Only raised with the `arrow` feature
+     *  enabled. */
+    arrow_export     = ::line_reader_error_arrow_export,
 };
 
 /**
@@ -2446,6 +2461,62 @@ public:
         }
         return egress::batch{p};
     }
+
+#ifdef QUESTDB_CLIENT_HAS_ARROW
+    /**
+     * Result of `next_arrow_batch`. Aggregate of the two Apache Arrow
+     * C Data Interface structs the C entry point fills in.
+     *
+     * Ownership: the caller of `next_arrow_batch` owns the `array` and
+     * `schema` returned here. After processing, the caller MUST either:
+     *   - Invoke `array.release(&array)` and `schema.release(&schema)`
+     *     directly, or
+     *   - Transfer ownership to an Arrow consumer such as
+     *     `arrow::ImportRecordBatch(&array, &schema)`, which zeros the
+     *     release callbacks on success so subsequent manual release
+     *     calls become no-ops.
+     */
+    struct arrow_batch
+    {
+        ::ArrowArray array;
+        ::ArrowSchema schema;
+    };
+
+    /**
+     * Advance to the next batch and export it via the Apache Arrow
+     * C Data Interface.
+     *
+     * @return `std::nullopt` when the stream terminates normally
+     *         (no further batches).
+     * @return An owned `arrow_batch` on success. See the struct's
+     *         documentation for release responsibilities.
+     * @throws line_reader_error on transport / protocol failure or any
+     *         Arrow-specific error (`schema_drift`, `no_schema`,
+     *         `arrow_export`).
+     *
+     * Unlike `next_batch`, the returned `arrow_batch` is NOT invalidated
+     * by subsequent cursor operations — it owns its release callbacks
+     * and is independent of the cursor lifetime.
+     */
+    std::optional<arrow_batch> next_arrow_batch()
+    {
+        ensure_impl();
+        ::line_reader_error* c_err{nullptr};
+        arrow_batch out{};
+        const auto rc = ::line_reader_cursor_next_arrow_batch(
+            _impl, &out.array, &out.schema, &c_err);
+        switch (rc)
+        {
+            case ::line_reader_arrow_batch_ok:
+                return out;
+            case ::line_reader_arrow_batch_end:
+                return std::nullopt;
+            case ::line_reader_arrow_batch_error:
+            default:
+                throw line_reader_error::from_c(c_err);
+        }
+    }
+#endif /* QUESTDB_CLIENT_HAS_ARROW */
 
     // ---- Introspection -----------------------------------------------------
 

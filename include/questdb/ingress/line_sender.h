@@ -440,6 +440,14 @@ QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
     size_t max_name_len);
 
+/**
+ * Construct a QWP/WebSocket columnar `line_sender_buffer` with a 127-byte
+ * name length limit. This is the buffer kind required by
+ * `line_sender_buffer_append_arrow`.
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws(void);
+
 /** Release the `line_sender_buffer` object. */
 QUESTDB_CLIENT_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
@@ -1987,11 +1995,45 @@ int64_t line_sender_now_nanos(void);
 QUESTDB_CLIENT_API
 int64_t line_sender_now_micros(void);
 
-/* Apache Arrow C Data Interface (feature: arrow). Struct layouts per
- * https://arrow.apache.org/docs/format/CDataInterface.html. */
+#ifdef QUESTDB_CLIENT_HAS_ARROW
+/* Apache Arrow C Data Interface (feature: arrow).
+ * https://arrow.apache.org/docs/format/CDataInterface.html */
 
-struct ArrowArray;
-struct ArrowSchema;
+#ifndef ARROW_C_DATA_INTERFACE
+#    define ARROW_C_DATA_INTERFACE
+
+#    define ARROW_FLAG_DICTIONARY_ORDERED 1
+#    define ARROW_FLAG_NULLABLE 2
+#    define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema
+{
+    const char* format;
+    const char* name;
+    const char* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
+    void (*release)(struct ArrowSchema*);
+    void* private_data;
+};
+
+struct ArrowArray
+{
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
 
 typedef enum line_sender_designated_timestamp_kind
 {
@@ -2001,13 +2043,24 @@ typedef enum line_sender_designated_timestamp_kind
 } line_sender_designated_timestamp_kind;
 
 /**
- * Append every row of a `RecordBatch` (Arrow C Data Interface) to
- * `buffer`. `array` is consumed (release invoked by the imported
- * `ArrayData`'s drop); `schema` is borrowed.
+ * Append every row of a `RecordBatch` (Arrow C Data Interface) to `buffer`.
  *
- * When `ts_kind == column`, `ts_column_name` / `ts_column_name_len`
- * name the source column (UTF-8, not NUL-terminated). Server-side
- * type-mismatch surfaces from the next `line_sender_flush`.
+ * `array` may be either:
+ *   - A Struct array (one child per column, the standard RecordBatch shape), or
+ *   - A non-Struct (single-column) array whose `schema->name` becomes the
+ *     column name.
+ *
+ * On both success and failure this function takes ownership of `array`'s
+ * release callback. `array->release` is set to NULL before returning; the
+ * caller may invoke `array->release(array)` defensively (it becomes a no-op).
+ * `schema` is borrowed (not consumed).
+ *
+ * When `ts_kind == column`, `ts_column_name` / `ts_column_name_len` name the
+ * source column (UTF-8, not NUL-terminated). Both NULL and length 0 are
+ * rejected as `line_sender_error_invalid_api_call`. When `ts_kind` is `now`
+ * or `server_now`, both must be NULL / 0.
+ *
+ * Server-side type-mismatch surfaces from the next `line_sender_flush`.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_append_arrow(
@@ -2019,6 +2072,7 @@ bool line_sender_buffer_append_arrow(
     const char* ts_column_name,
     size_t ts_column_name_len,
     line_sender_error** err_out);
+#endif /* QUESTDB_CLIENT_HAS_ARROW */
 
 #ifdef __cplusplus
 }

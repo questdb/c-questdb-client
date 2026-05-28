@@ -8,7 +8,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include <questdb/ingress/line_sender.h>
+#include <questdb/ingress/line_sender.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -16,40 +16,8 @@
 #include <string>
 #include <vector>
 
-extern "C"
-{
-struct ArrowArray
-{
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-struct ArrowSchema
-{
-    const char* format;
-    const char* name;
-    const char* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-}
-
 namespace
 {
-
-constexpr int64_t ARROW_FLAG_NULLABLE = 2;
 
 // Owner for heap allocations referenced by a hand-built ArrowArray. We
 // register `release_owner` as the array's release callback; arrow-rs's
@@ -127,76 +95,49 @@ std::shared_ptr<std::vector<uint8_t>> pack_le(const std::vector<T>& vs)
     return out;
 }
 
-line_sender_table_name make_table(const char* name)
-{
-    line_sender_error* err = nullptr;
-    line_sender_table_name tbl;
-    line_sender_table_name_init(&tbl, std::strlen(name), name, &err);
-    if (err)
-        line_sender_error_free(err);
-    return tbl;
-}
+namespace qdb = questdb::ingress;
 
-// Call `line_sender_buffer_append_arrow`, expecting success. Releases
-// the schema; the array's release is consumed by from_ffi.
+using ts_kind = qdb::line_sender_buffer::designated_timestamp_kind;
+
+// Releases the schema afterwards; the array's release is consumed by FFI.
 void append_ok(
-    line_sender_buffer* buf,
-    line_sender_table_name tbl,
+    qdb::line_sender_buffer& buf,
+    qdb::table_name_view tbl,
     ArrowArray& arr,
     ArrowSchema& sch,
-    line_sender_designated_timestamp_kind ts_kind,
-    const char* ts_name)
+    ts_kind kind = ts_kind::now)
 {
-    line_sender_error* err = nullptr;
-    bool ok = line_sender_buffer_append_arrow(
-        buf, tbl,
-        reinterpret_cast<::ArrowArray*>(&arr),
-        reinterpret_cast<::ArrowSchema*>(&sch),
-        ts_kind,
-        ts_name,
-        ts_name ? std::strlen(ts_name) : 0,
-        &err);
-    if (!ok)
+    try
     {
-        std::string msg;
-        if (err)
-        {
-            size_t n = 0;
-            auto p = line_sender_error_msg(err, &n);
-            msg.assign(p, n);
-            line_sender_error_free(err);
-        }
-        FAIL("append_arrow returned false: " << msg);
+        buf.append_arrow(tbl, arr, sch, kind);
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        FAIL("append_arrow threw: " << e.what());
     }
     if (sch.release)
         sch.release(&sch);
 }
 
-// Call `line_sender_buffer_append_arrow`, expecting failure with the
-// given error code.
 void append_expect_error(
-    line_sender_buffer* buf,
-    line_sender_table_name tbl,
+    qdb::line_sender_buffer& buf,
+    qdb::table_name_view tbl,
     ArrowArray& arr,
     ArrowSchema& sch,
-    line_sender_designated_timestamp_kind ts_kind,
-    const char* ts_name,
-    line_sender_error_code expected_code)
+    ts_kind kind,
+    qdb::line_sender_error_code expected_code)
 {
-    line_sender_error* err = nullptr;
-    bool ok = line_sender_buffer_append_arrow(
-        buf, tbl,
-        reinterpret_cast<::ArrowArray*>(&arr),
-        reinterpret_cast<::ArrowSchema*>(&sch),
-        ts_kind,
-        ts_name,
-        ts_name ? std::strlen(ts_name) : 0,
-        &err);
-    REQUIRE_FALSE(ok);
-    REQUIRE(err != nullptr);
-    CHECK(line_sender_error_get_code(err) == expected_code);
-    line_sender_error_free(err);
-    // On failure ownership of `arr` stays with us — release manually.
+    bool thrown = false;
+    try
+    {
+        buf.append_arrow(tbl, arr, sch, kind);
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        thrown = true;
+        CHECK(e.code() == expected_code);
+    }
+    REQUIRE(thrown);
     if (arr.release)
         arr.release(&arr);
     if (sch.release)
@@ -205,76 +146,9 @@ void append_expect_error(
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// NULL / contract tests.
-// ---------------------------------------------------------------------------
-
-TEST_CASE("arrow ingress: NULL buffer / array / schema → false + err_out")
-{
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
-    REQUIRE(buf != nullptr);
-
-    ArrowArray dummy_arr;
-    ArrowSchema dummy_sch;
-    std::memset(&dummy_arr, 0, sizeof(dummy_arr));
-    std::memset(&dummy_sch, 0, sizeof(dummy_sch));
-
-    line_sender_error* err = nullptr;
-    SUBCASE("NULL buffer")
-    {
-        bool ok = line_sender_buffer_append_arrow(
-            nullptr, make_table("t"),
-            reinterpret_cast<::ArrowArray*>(&dummy_arr),
-            reinterpret_cast<::ArrowSchema*>(&dummy_sch),
-            line_sender_designated_timestamp_now,
-            nullptr, 0, &err);
-        CHECK_FALSE(ok);
-        REQUIRE(err != nullptr);
-        line_sender_error_free(err);
-    }
-    SUBCASE("NULL array")
-    {
-        bool ok = line_sender_buffer_append_arrow(
-            buf, make_table("t"),
-            nullptr,
-            reinterpret_cast<::ArrowSchema*>(&dummy_sch),
-            line_sender_designated_timestamp_now,
-            nullptr, 0, &err);
-        CHECK_FALSE(ok);
-        REQUIRE(err != nullptr);
-        line_sender_error_free(err);
-    }
-    SUBCASE("NULL schema")
-    {
-        bool ok = line_sender_buffer_append_arrow(
-            buf, make_table("t"),
-            reinterpret_cast<::ArrowArray*>(&dummy_arr),
-            nullptr,
-            line_sender_designated_timestamp_now,
-            nullptr, 0, &err);
-        CHECK_FALSE(ok);
-        REQUIRE(err != nullptr);
-        line_sender_error_free(err);
-    }
-
-    line_sender_buffer_free(buf);
-}
-
-TEST_CASE("arrow ingress: ts_kind=column requires non-NULL ts_column_name")
-{
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
-    auto col = pack_le<int64_t>({10, 20});
-    auto arr = make_array(2, 0, {nullptr, col});
-    auto sch = make_schema("l", "v");
-
-    append_expect_error(
-        buf, make_table("t"), arr, sch,
-        line_sender_designated_timestamp_column,
-        nullptr,
-        line_sender_error_invalid_api_call);
-
-    line_sender_buffer_free(buf);
-}
+// NULL-pointer / contract tests for the C ABI live in `test_arrow_c.c`.
+// The C++ wrapper takes references and validated views, so equivalents
+// here would be untestable at compile time.
 
 // ---------------------------------------------------------------------------
 // Primitive type dispatch — each Arrow format code routes to the right
@@ -283,81 +157,67 @@ TEST_CASE("arrow ingress: ts_kind=column requires non-NULL ts_column_name")
 
 TEST_CASE("arrow ingress: Boolean column")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     // Boolean values are bit-packed in Arrow C ABI: 1 byte per 8 rows.
     auto values = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>{0b00000101});
     auto arr = make_array(3, 0, {nullptr, values});
     auto sch = make_schema("b", "flag");
-    append_ok(buf, make_table("t_bool"), arr, sch,
-              line_sender_designated_timestamp_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_bool", arr, sch, ts_kind::now);
 }
 
 TEST_CASE("arrow ingress: Int8 / Int16 / Int32 / Int64 columns")
 {
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int8_t>({-1, 0, 127});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("c", "by");
-        append_ok(buf, make_table("t_i8"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_i8", arr, sch, ts_kind::now);
     }
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int16_t>({-1234, 0, 31000});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("s", "sh");
-        append_ok(buf, make_table("t_i16"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_i16", arr, sch, ts_kind::now);
     }
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int32_t>({-1, 0, 0x7FFFFFFF});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("i", "in");
-        append_ok(buf, make_table("t_i32"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_i32", arr, sch, ts_kind::now);
     }
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int64_t>({-1, 0, 0x7FFFFFFF'FFFFFFFFLL});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("l", "lo");
-        append_ok(buf, make_table("t_i64"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_i64", arr, sch, ts_kind::now);
     }
 }
 
 TEST_CASE("arrow ingress: Float32 / Float64 columns")
 {
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<float>({1.5f, -2.5f, 3.14f});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("f", "f3");
-        append_ok(buf, make_table("t_f32"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_f32", arr, sch, ts_kind::now);
     }
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<double>({1.5, -2.5, 3.14159});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("g", "f6");
-        append_ok(buf, make_table("t_f64"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_f64", arr, sch, ts_kind::now);
     }
 }
 
 TEST_CASE("arrow ingress: UInt16 + questdb.column_type=char routes to column_char")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto col = pack_le<uint16_t>({0x41, 0x42, 0x43});
     auto arr = make_array(3, 0, {nullptr, col});
     auto sch = make_schema("S", "c"); // Arrow "S" = UInt16
@@ -366,18 +226,18 @@ TEST_CASE("arrow ingress: UInt16 + questdb.column_type=char routes to column_cha
     // Arrow spec layout: i32 n_keys, then per pair: i32 key_len, key bytes, i32 val_len, val bytes.
     // We use a static buffer that outlives the call.
     static const char md[] =
-        "\x01\x00\x00\x00"               // n=1
-        "\x13\x00\x00\x00questdb.column_type"
-        "\x04\x00\x00\x00char";
+        "\x01\x00\x00\x00" // n=1
+        "\x13\x00\x00\x00"
+        "questdb.column_type"
+        "\x04\x00\x00\x00"
+        "char";
     sch.metadata = md;
-    append_ok(buf, make_table("t_char"), arr, sch,
-              line_sender_designated_timestamp_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_char", arr, sch, ts_kind::now);
 }
 
 TEST_CASE("arrow ingress: UInt32 + questdb.column_type=ipv4 routes to column_ipv4")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto col = pack_le<uint32_t>({0x0A000001u, 0xC0A80001u});
     auto arr = make_array(2, 0, {nullptr, col});
     auto sch = make_schema("I", "ip");
@@ -386,9 +246,7 @@ TEST_CASE("arrow ingress: UInt32 + questdb.column_type=ipv4 routes to column_ipv
         "\x13\x00\x00\x00questdb.column_type"
         "\x04\x00\x00\x00ipv4";
     sch.metadata = md;
-    append_ok(buf, make_table("t_ipv4"), arr, sch,
-              line_sender_designated_timestamp_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_ipv4", arr, sch, ts_kind::now);
 }
 
 TEST_CASE("arrow ingress: Utf8 / Binary / LargeUtf8 / LargeBinary")
@@ -406,28 +264,24 @@ TEST_CASE("arrow ingress: Utf8 / Binary / LargeUtf8 / LargeBinary")
     };
 
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto pair = build_utf8();
         auto arr = make_array(3, 0, {nullptr, pair.first, pair.second});
         auto sch = make_schema("u", "name");
-        append_ok(buf, make_table("t_utf8"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_utf8", arr, sch, ts_kind::now);
     }
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto pair = build_utf8();
         auto arr = make_array(3, 0, {nullptr, pair.first, pair.second});
         auto sch = make_schema("z", "blob");
-        append_ok(buf, make_table("t_binary"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_binary", arr, sch, ts_kind::now);
     }
 }
 
 TEST_CASE("arrow ingress: FixedSizeBinary(16) + arrow.uuid extension → column_uuid")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto data = std::make_shared<std::vector<uint8_t>>();
     for (int i = 0; i < 32; ++i)
         data->push_back(static_cast<uint8_t>(i));
@@ -435,48 +289,46 @@ TEST_CASE("arrow ingress: FixedSizeBinary(16) + arrow.uuid extension → column_
     auto sch = make_schema("w:16", "id");
     static const char md[] =
         "\x01\x00\x00\x00"
-        "\x15\x00\x00\x00" "ARROW:extension:name"
-        "\x0A\x00\x00\x00" "arrow.uuid";
+        "\x14\x00\x00\x00"
+        "ARROW:extension:name"
+        "\x0A\x00\x00\x00"
+        "arrow.uuid";
     sch.metadata = md;
-    append_ok(buf, make_table("t_uuid"), arr, sch,
-              line_sender_designated_timestamp_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_uuid", arr, sch, ts_kind::now);
 }
 
 TEST_CASE("arrow ingress: FixedSizeBinary(16) without UUID metadata → ArrowUnsupportedColumnKind")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto data = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>(16, 0));
     auto arr = make_array(1, 0, {nullptr, data});
     auto sch = make_schema("w:16", "id");
     append_expect_error(
-        buf, make_table("t_unsup"), arr, sch,
-        line_sender_designated_timestamp_now, nullptr,
-        line_sender_error_arrow_unsupported_column_kind);
-    line_sender_buffer_free(buf);
+        buf,
+        "t_unsup",
+        arr,
+        sch,
+        ts_kind::now,
+        qdb::line_sender_error_code::arrow_unsupported_column_kind);
 }
 
 TEST_CASE("arrow ingress: FixedSizeBinary(32) → column_long256")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto data = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>(64, 0xAB));
     auto arr = make_array(2, 0, {nullptr, data});
     auto sch = make_schema("w:32", "l256");
-    append_ok(buf, make_table("t_l256"), arr, sch,
-              line_sender_designated_timestamp_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_l256", arr, sch, ts_kind::now);
 }
 
 TEST_CASE("arrow ingress: Timestamp(µs) / Timestamp(ns) / Timestamp(ms)")
 {
     auto build_ts_col = [](const char* fmt, int64_t v0, int64_t v1) {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int64_t>({v0, v1});
         auto arr = make_array(2, 0, {nullptr, col});
         auto sch = make_schema(fmt, "ts");
-        append_ok(buf, make_table("t_ts"), arr, sch,
-                  line_sender_designated_timestamp_server_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_ts", arr, sch, ts_kind::server_now);
     };
     build_ts_col("tsu:UTC", 1700000000000000LL, 1700000000000001LL);
     build_ts_col("tsn:UTC", 1700000000000000000LL, 1700000000000000001LL);
@@ -489,7 +341,7 @@ TEST_CASE("arrow ingress: Timestamp(µs) / Timestamp(ns) / Timestamp(ms)")
 
 TEST_CASE("arrow ingress: DTS=Column picks per-row ts from the named ts column")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
 
     // Two columns: ts (Timestamp µs UTC) + v (Int64).
     auto ts_col = pack_le<int64_t>({1700000000000000LL, 1700000000000001LL});
@@ -529,49 +381,35 @@ TEST_CASE("arrow ingress: DTS=Column picks per-row ts from the named ts column")
     outer_sch.children = child_schema_ptrs;
     outer_sch.release = schema_release_noop;
 
-    // Now we have to wire append_arrow against this struct. Since
-    // append_arrow expects the entire RecordBatch in the array — and
-    // arrow-rs imports the struct's children as RecordBatch columns —
-    // this exercises the per-row TS column extraction.
-    line_sender_error* err = nullptr;
-    bool ok = line_sender_buffer_append_arrow(
-        buf, make_table("t_dts_col"),
-        reinterpret_cast<::ArrowArray*>(&outer_arr),
-        reinterpret_cast<::ArrowSchema*>(&outer_sch),
-        line_sender_designated_timestamp_column,
-        "ts", 2, &err);
-    if (!ok && err)
+    try
     {
-        size_t n = 0;
-        const char* m = line_sender_error_msg(err, &n);
-        FAIL("DTS=Column failed: " << std::string(m, n));
-        line_sender_error_free(err);
+        buf.append_arrow(
+            "t_dts_col", outer_arr, outer_sch, qdb::column_name_view{"ts"});
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        FAIL("DTS=Column failed: " << e.what());
     }
     ts_sch->release = nullptr;
     v_sch->release = nullptr;
-    line_sender_buffer_free(buf);
 }
 
 TEST_CASE("arrow ingress: DTS=Now exercises client-side TimestampNanos::now()")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto col = pack_le<int64_t>({10, 20});
     auto arr = make_array(2, 0, {nullptr, col});
     auto sch = make_schema("l", "v");
-    append_ok(buf, make_table("t_dts_now"), arr, sch,
-              line_sender_designated_timestamp_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_dts_now", arr, sch, ts_kind::now);
 }
 
 TEST_CASE("arrow ingress: DTS=ServerNow omits per-row timestamp")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto col = pack_le<int64_t>({10, 20});
     auto arr = make_array(2, 0, {nullptr, col});
     auto sch = make_schema("l", "v");
-    append_ok(buf, make_table("t_dts_snow"), arr, sch,
-              line_sender_designated_timestamp_server_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_dts_snow", arr, sch, ts_kind::server_now);
 }
 
 // ---------------------------------------------------------------------------
@@ -582,39 +420,33 @@ TEST_CASE("arrow ingress: Decimal64 / Decimal128 / Decimal256")
 {
     // Decimal64 (i64 mantissa, scale=2).
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int64_t>({12345, 67890});
         auto arr = make_array(2, 0, {nullptr, col});
         auto sch = make_schema("d:18,2", "d64");
-        append_ok(buf, make_table("t_d64"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_d64", arr, sch, ts_kind::now);
     }
     // Decimal128 (i128 mantissa, scale=3).
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto data = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>(32, 0));
         auto arr = make_array(2, 0, {nullptr, data});
         auto sch = make_schema("d:38,3", "d128");
-        append_ok(buf, make_table("t_d128"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_d128", arr, sch, ts_kind::now);
     }
     // Decimal256 (i256 mantissa, scale=5).
     {
-        line_sender_buffer* buf = line_sender_buffer_new_qwp();
+        auto buf = qdb::line_sender_buffer::qwp_ws();
         auto data = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>(64, 0));
         auto arr = make_array(2, 0, {nullptr, data});
         auto sch = make_schema("d:76,5,256", "d256");
-        append_ok(buf, make_table("t_d256"), arr, sch,
-                  line_sender_designated_timestamp_now, nullptr);
-        line_sender_buffer_free(buf);
+        append_ok(buf, "t_d256", arr, sch, ts_kind::now);
     }
 }
 
 TEST_CASE("arrow ingress: Int32 + questdb.geohash_bits routes to column_geohash")
 {
-    line_sender_buffer* buf = line_sender_buffer_new_qwp();
+    auto buf = qdb::line_sender_buffer::qwp_ws();
     auto col = pack_le<int32_t>({0x1FFFF, 0x10000});
     auto arr = make_array(2, 0, {nullptr, col});
     auto sch = make_schema("i", "g");
@@ -623,7 +455,5 @@ TEST_CASE("arrow ingress: Int32 + questdb.geohash_bits routes to column_geohash"
         "\x14\x00\x00\x00" "questdb.geohash_bits"
         "\x02\x00\x00\x00" "20";
     sch.metadata = md;
-    append_ok(buf, make_table("t_geo"), arr, sch,
-              line_sender_designated_timestamp_now, nullptr);
-    line_sender_buffer_free(buf);
+    append_ok(buf, "t_geo", arr, sch, ts_kind::now);
 }

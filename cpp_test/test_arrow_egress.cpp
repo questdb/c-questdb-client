@@ -9,54 +9,19 @@
 
 #include "qwp_mock_server.hpp"
 
-#include <questdb/egress/line_reader.h>
+#include <questdb/egress/line_reader.hpp>
 
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qm = qwp_mock;
-
-// ---------------------------------------------------------------------------
-// Apache Arrow C Data Interface struct layouts (Spec:
-// https://arrow.apache.org/docs/format/CDataInterface.html).
-//
-// Defined inline so this file does NOT depend on arrow-cpp. The arrow-cpp
-// interop is covered by a separate test file gated on
-// QUESTDB_ENABLE_ARROW_CPP_INTEROP.
-// ---------------------------------------------------------------------------
-
-extern "C"
-{
-struct ArrowArray
-{
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-struct ArrowSchema
-{
-    const char* format;
-    const char* name;
-    const char* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-}
+namespace egress = questdb::egress;
+namespace ingress = questdb::ingress;
 
 namespace
 {
@@ -74,67 +39,24 @@ std::vector<uint8_t> pack_le(const std::vector<T>& vs)
     return out;
 }
 
-// Open a reader against the mock and pump it through `execute` to get a
-// `line_reader_cursor*`. Returns the raw pointers so the tests can call
-// the Arrow C ABI directly. Caller is responsible for `_cursor_free` and
-// `_close`.
+// `reader + cursor` pair against an in-process mock. Move-only; both
+// members RAII-release through their C++ wrappers.
 struct ReaderHandles
 {
-    line_reader* reader;
-    line_reader_cursor* cursor;
+    egress::reader reader;
+    egress::cursor cursor;
 };
 
 ReaderHandles open_cursor(const qm::MockServer& srv, const char* sql)
 {
     const std::string conf = "ws::addr=" + srv.addr() + ";";
-    line_sender_utf8 conf_utf8;
-    REQUIRE(line_sender_utf8_init(
-        &conf_utf8, conf.size(), conf.data(), nullptr));
-
-    line_reader_error* err = nullptr;
-    line_reader* reader = line_reader_from_conf(conf_utf8, &err);
-    REQUIRE(reader != nullptr);
-
-    line_sender_utf8 sql_utf8;
-    REQUIRE(line_sender_utf8_init(
-        &sql_utf8, std::strlen(sql), sql, nullptr));
-
-    err = nullptr;
-    line_reader_cursor* cursor =
-        line_reader_execute(reader, sql_utf8, &err);
-    REQUIRE(cursor != nullptr);
-
-    return {reader, cursor};
+    egress::reader r{ingress::utf8_view{conf.data(), conf.size()}};
+    auto c = r.execute(ingress::utf8_view{sql, std::strlen(sql)});
+    return {std::move(r), std::move(c)};
 }
 
-void close_handles(ReaderHandles& h)
-{
-    if (h.cursor)
-        line_reader_cursor_free(h.cursor);
-    if (h.reader)
-        line_reader_close(h.reader);
-    h.cursor = nullptr;
-    h.reader = nullptr;
-}
-
-// Drain one batch via the Arrow C ABI. Returns the tristate outcome and
-// fills `out_arr` / `out_sch` on success. Caller MUST eventually invoke
-// each struct's release callback when done.
-line_reader_arrow_batch_result drain_one(
-    line_reader_cursor* cursor,
-    ArrowArray* out_arr,
-    ArrowSchema* out_sch,
-    line_reader_error** out_err)
-{
-    return line_reader_cursor_next_arrow_batch(
-        cursor,
-        reinterpret_cast<::ArrowArray*>(out_arr),
-        reinterpret_cast<::ArrowSchema*>(out_sch),
-        out_err);
-}
-
-// Helper: count down the children list (depth-first) and assert every
-// child has a release callback set.
+// Depth-first sanity check that every child in the array/schema tree has
+// a release callback set.
 void assert_release_chain_present(ArrowArray* a, ArrowSchema* s)
 {
     REQUIRE(static_cast<bool>(a->release));
@@ -175,29 +97,21 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select 1 from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    std::memset(&arr, 0xCC, sizeof(arr));
-    std::memset(&sch, 0xCC, sizeof(sch));
-    line_reader_error* err = nullptr;
-
     // `next_arrow_batch` snapshots schema eagerly. With ZERO batches the
     // adapter must EITHER:
-    //   - surface `line_reader_error_no_schema` (when QWP protocol path
+    //   - throw `line_reader_error_no_schema` (when QWP protocol path
     //     reaches `as_record_batch_reader` with no first batch), OR
-    //   - return `_end` directly (when the inner pump terminates first).
-    // The doc deliberately leaves this Phase-0-dependent; the contract
-    // we check here is "no _ok, no half-filled structs".
-    auto rc = drain_one(h.cursor, &arr, &sch, &err);
-    CHECK((rc == line_reader_arrow_batch_end ||
-           rc == line_reader_arrow_batch_error));
-    if (rc == line_reader_arrow_batch_error)
+    //   - return `nullopt` directly (when the inner pump terminates
+    //     first).
+    try
     {
-        REQUIRE(err != nullptr);
-        line_reader_error_free(err);
+        auto b = h.cursor.next_arrow_batch();
+        CHECK(!b.has_value());
     }
-
-    close_handles(h);
+    catch (const egress::line_reader_error&)
+    {
+        // _error path acceptable per the doc.
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,12 +136,10 @@ TEST_CASE("arrow egress: single Long batch — struct layout + release order")
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select v from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    auto rc = drain_one(h.cursor, &arr, &sch, &err);
-    REQUIRE(rc == line_reader_arrow_batch_ok);
-    REQUIRE(err == nullptr);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     // The egress export wraps the RecordBatch as a StructArray, so the
     // outer ArrowArray represents the struct with N children.
@@ -248,13 +160,9 @@ TEST_CASE("arrow egress: single Long batch — struct layout + release order")
     assert_release_chain_present(&arr, &sch);
 
     // Subsequent call returns _end.
-    ArrowArray arr2;
-    ArrowSchema sch2;
-    auto rc2 = drain_one(h.cursor, &arr2, &sch2, &err);
-    CHECK(rc2 == line_reader_arrow_batch_end);
+    CHECK(!h.cursor.next_arrow_batch().has_value());
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,11 +204,10 @@ TEST_CASE("arrow egress: mixed kinds — Bool / Byte / Short / Int / Long / Floa
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select * from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    auto rc = drain_one(h.cursor, &arr, &sch, &err);
-    REQUIRE(rc == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     CHECK(arr.length == 2);
     CHECK(arr.n_children == 7);
@@ -315,7 +222,6 @@ TEST_CASE("arrow egress: mixed kinds — Bool / Byte / Short / Int / Long / Floa
     }
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 TEST_CASE("arrow egress: TIMESTAMP / TIMESTAMP_NS / DATE — timezone-carrying format codes")
@@ -341,10 +247,10 @@ TEST_CASE("arrow egress: TIMESTAMP / TIMESTAMP_NS / DATE — timezone-carrying f
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select * from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr, &sch, &err) == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     CHECK(sch.n_children == 3);
     REQUIRE(sch.children[0]->format != nullptr);
@@ -356,7 +262,6 @@ TEST_CASE("arrow egress: TIMESTAMP / TIMESTAMP_NS / DATE — timezone-carrying f
     CHECK(std::string(sch.children[2]->format).find("tsm") == 0);
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 TEST_CASE("arrow egress: VARCHAR + BINARY — variable-length format codes")
@@ -379,10 +284,10 @@ TEST_CASE("arrow egress: VARCHAR + BINARY — variable-length format codes")
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select * from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr, &sch, &err) == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     CHECK(sch.n_children == 2);
     CHECK(std::string(sch.children[0]->format) == "u"); // Utf8
@@ -393,7 +298,6 @@ TEST_CASE("arrow egress: VARCHAR + BINARY — variable-length format codes")
     CHECK(arr.children[1]->n_buffers == 3);
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 TEST_CASE("arrow egress: UUID — FixedSizeBinary(16) with arrow.uuid extension metadata")
@@ -414,10 +318,10 @@ TEST_CASE("arrow egress: UUID — FixedSizeBinary(16) with arrow.uuid extension 
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select id from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr, &sch, &err) == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     REQUIRE(sch.children[0]->format != nullptr);
     CHECK(std::string(sch.children[0]->format) == "w:16"); // FixedSizeBinary(16)
@@ -429,7 +333,6 @@ TEST_CASE("arrow egress: UUID — FixedSizeBinary(16) with arrow.uuid extension 
     CHECK(sch.children[0]->metadata != nullptr);
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 TEST_CASE("arrow egress: LONG256 — FixedSizeBinary(32)")
@@ -448,14 +351,13 @@ TEST_CASE("arrow egress: LONG256 — FixedSizeBinary(32)")
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select l from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr, &sch, &err) == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
     CHECK(std::string(sch.children[0]->format) == "w:32");
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 TEST_CASE("arrow egress: SYMBOL — Dictionary(UInt32, Utf8) with questdb.symbol metadata")
@@ -478,10 +380,10 @@ TEST_CASE("arrow egress: SYMBOL — Dictionary(UInt32, Utf8) with questdb.symbol
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select sym from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr, &sch, &err) == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     REQUIRE(sch.children[0]->format != nullptr);
     // Dictionary-encoded — Arrow encodes the keys' format ("I" for UInt32)
@@ -491,7 +393,6 @@ TEST_CASE("arrow egress: SYMBOL — Dictionary(UInt32, Utf8) with questdb.symbol
     CHECK(std::string(sch.children[0]->dictionary->format) == "u"); // Utf8
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 TEST_CASE("arrow egress: DECIMAL64 / DECIMAL128 / DECIMAL256 — decimal format codes")
@@ -518,10 +419,10 @@ TEST_CASE("arrow egress: DECIMAL64 / DECIMAL128 / DECIMAL256 — decimal format 
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select * from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr, &sch, &err) == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     // Arrow decimal format: "d:precision,scale" or "d:precision,scale,bitwidth".
     REQUIRE(sch.children[0]->format != nullptr);
@@ -532,7 +433,6 @@ TEST_CASE("arrow egress: DECIMAL64 / DECIMAL128 / DECIMAL256 — decimal format 
     CHECK(std::string(sch.children[2]->format).rfind("d:", 0) == 0);
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 TEST_CASE("arrow egress: DOUBLE_ARRAY — nested List(Float64)")
@@ -555,10 +455,10 @@ TEST_CASE("arrow egress: DOUBLE_ARRAY — nested List(Float64)")
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select a from t");
 
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr, &sch, &err) == line_reader_arrow_batch_ok);
+    auto _b = h.cursor.next_arrow_batch();
+    REQUIRE(_b.has_value());
+    auto& arr = _b->array;
+    auto& sch = _b->schema;
 
     // List(Float64) — format "+l" with a single child of format "g".
     REQUIRE(sch.children[0]->format != nullptr);
@@ -568,7 +468,6 @@ TEST_CASE("arrow egress: DOUBLE_ARRAY — nested List(Float64)")
     CHECK(std::string(sch.children[0]->children[0]->format) == "g");
 
     release_pair(&arr, &sch);
-    close_handles(h);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +475,7 @@ TEST_CASE("arrow egress: DOUBLE_ARRAY — nested List(Float64)")
 // stay untouched.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("arrow egress: tristate _end leaves out structs untouched")
+TEST_CASE("arrow egress: stream exhaustion — second call returns nullopt")
 {
     qm::ColumnSpec c{"v", qm::COL_LONG,
                      qm::fixed_column_bytes(1, pack_le<int64_t>({42}))};
@@ -591,61 +490,13 @@ TEST_CASE("arrow egress: tristate _end leaves out structs untouched")
     qm::MockServer srv({s});
     auto h = open_cursor(srv, "select v from t");
 
-    ArrowArray arr1;
-    ArrowSchema sch1;
-    line_reader_error* err = nullptr;
-    REQUIRE(drain_one(h.cursor, &arr1, &sch1, &err) == line_reader_arrow_batch_ok);
-    release_pair(&arr1, &sch1);
+    auto first = h.cursor.next_arrow_batch();
+    REQUIRE(first.has_value());
+    release_pair(&first->array, &first->schema);
 
-    // Pre-fill the slot with a recognisable poison and re-call.
-    ArrowArray arr2;
-    ArrowSchema sch2;
-    std::memset(&arr2, 0x5A, sizeof(arr2));
-    std::memset(&sch2, 0x5A, sizeof(sch2));
-    auto rc = drain_one(h.cursor, &arr2, &sch2, &err);
-    CHECK(rc == line_reader_arrow_batch_end);
-    // Spec: out_array / out_schema NOT populated on _end. The bytes we
-    // poisoned should be observable still.
-    uint8_t* a_bytes = reinterpret_cast<uint8_t*>(&arr2);
-    uint8_t* s_bytes = reinterpret_cast<uint8_t*>(&sch2);
-    CHECK(a_bytes[0] == 0x5A);
-    CHECK(s_bytes[0] == 0x5A);
-
-    close_handles(h);
+    CHECK(!h.cursor.next_arrow_batch().has_value());
 }
 
-TEST_CASE("arrow egress: NULL cursor returns _error and populates err_out")
-{
-    ArrowArray arr;
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    auto rc = drain_one(nullptr, &arr, &sch, &err);
-    CHECK(rc == line_reader_arrow_batch_error);
-    REQUIRE(err != nullptr);
-    CHECK(line_reader_error_get_code(err) ==
-          line_reader_error_invalid_api_call);
-    line_reader_error_free(err);
-}
-
-TEST_CASE("arrow egress: NULL out_array returns _error")
-{
-    qm::Script s = {qm::ActionSendServerInfo{},
-                    qm::ActionAwaitQueryRequest{},
-                    qm::ActionSendResultEnd{}};
-    qm::MockServer srv({s});
-    auto h = open_cursor(srv, "select 1 from t");
-
-    ArrowSchema sch;
-    line_reader_error* err = nullptr;
-    auto rc = line_reader_cursor_next_arrow_batch(
-        h.cursor,
-        nullptr,
-        reinterpret_cast<::ArrowSchema*>(&sch),
-        &err);
-    CHECK(rc == line_reader_arrow_batch_error);
-    REQUIRE(err != nullptr);
-    CHECK(line_reader_error_get_code(err) ==
-          line_reader_error_invalid_api_call);
-    line_reader_error_free(err);
-    close_handles(h);
-}
+// Tristate / NULL-pointer contract tests for the C ABI live in
+// `test_arrow_c.c`. The C++ wrapper returns `std::optional<arrow_batch>`
+// directly, so those cases are unrepresentable at the call site.

@@ -98,8 +98,60 @@ public:
             protocol_version::v1,
             init_buf_size,
             max_name_len,
-            true};
+            _backend_kind::qwp_udp};
     }
+
+    /**
+     * Construct a standalone QWP/WebSocket columnar buffer.
+     *
+     * This is the buffer kind required by `append_arrow`. Unlike the ILP
+     * and QWP/UDP buffers, QWP/WS stores rows in column-major form, so the
+     * row-by-row API (`table`/`symbol`/`column`/`at`) is unavailable on
+     * this buffer kind — use `append_arrow` instead.
+     *
+     * For protocol-neutral construction tied to a sender instance, prefer
+     * `line_sender::new_buffer()` (it returns the buffer kind matching the
+     * sender's protocol automatically).
+     *
+     * @param init_buf_size Hint passed to `line_sender_buffer_reserve` for
+     *                      the initial capacity of the underlying column
+     *                      storage.
+     */
+    static line_sender_buffer qwp_ws(size_t init_buf_size = 64 * 1024)
+    {
+        auto* raw_buffer = ::line_sender_buffer_new_qwp_ws();
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
+        return line_sender_buffer{
+            raw_buffer,
+            protocol_version::v1,
+            init_buf_size,
+            127,
+            _backend_kind::qwp_ws};
+    }
+
+    /**
+     * Designated-timestamp source for `append_arrow` when the timestamp is
+     * not pulled from a source column. To use a per-row timestamp from a
+     * named column, pass that column name to the `column_name_view`
+     * overload of `append_arrow` directly — this enum has no `column`
+     * variant by design.
+     */
+    enum class designated_timestamp_kind
+    {
+        /// `TimestampNanos::now()` evaluated client-side, per row.
+        now = 1,
+        /// Server stamps each row on arrival; no per-row timestamp shipped.
+        server_now = 2,
+    };
 
     line_sender_buffer(const line_sender_buffer& other)
         : _impl{
@@ -110,7 +162,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
     }
@@ -120,7 +172,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
         other._impl = nullptr;
@@ -142,7 +194,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
         }
         return *this;
     }
@@ -156,7 +208,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
             other._impl = nullptr;
         }
         return *this;
@@ -1117,6 +1169,98 @@ public:
         line_sender_error::wrapped_call(::line_sender_buffer_at_now, _impl);
     }
 
+#ifdef QUESTDB_CLIENT_HAS_ARROW
+    /**
+     * Append every row of an Apache Arrow `RecordBatch` to the buffer.
+     *
+     * Requires a QWP/WebSocket buffer — see `qwp_ws()` or
+     * `line_sender::new_buffer()` against a `qwpws://` sender. ILP and
+     * QWP/UDP buffers throw `line_sender_error` with code `invalid_api_call`.
+     *
+     * Accepts both `Struct` top-level arrays (standard RecordBatch shape,
+     * one child per column) and non-Struct single arrays (treated as a
+     * one-column batch using `schema.name`).
+     *
+     * Ownership:
+     *   - `array` is consumed. `array.release` is cleared to `nullptr`
+     *     before returning, on both success and failure. Defensive
+     *     `array.release(&array)` calls after this become no-ops.
+     *   - `schema` is borrowed; the caller still owns it and is responsible
+     *     for invoking `schema.release` once done.
+     *
+     * Server-side type mismatches surface from the next `flush()`, not from
+     * `append_arrow` itself.
+     *
+     * @param table     Destination table.
+     * @param array     Arrow C Data Interface array (consumed).
+     * @param schema    Arrow C Data Interface schema (borrowed).
+     * @param ts_kind   `now` (client-side per-row `TimestampNanos::now()`,
+     *                  default) or `server_now` (server stamps on arrival).
+     *                  For a column-sourced timestamp, use the
+     *                  `column_name_view` overload below.
+     *
+     * @throws line_sender_error on validation or classification failure.
+     */
+    void append_arrow(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        designated_timestamp_kind ts_kind = designated_timestamp_kind::now)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_append_arrow,
+            _impl,
+            table._impl,
+            &array,
+            &schema,
+            static_cast<::line_sender_designated_timestamp_kind>(ts_kind),
+            static_cast<const char*>(nullptr),
+            size_t{0});
+    }
+
+    /**
+     * Append an Arrow `RecordBatch`, taking the designated timestamp from
+     * a named source column.
+     *
+     * Contract notes from the no-name overload apply unchanged (QWP/WS
+     * buffer required, Struct / single-array top-level, `array` consumed,
+     * `schema` borrowed, mismatches surface on flush).
+     *
+     * The named column must be a `Timestamp(Microsecond | Nanosecond |
+     * Millisecond, _)` Arrow column. `Millisecond` is widened to
+     * microseconds before going on the wire (the designated-timestamp
+     * wire format supports µs / ns only). Any null cell in the timestamp
+     * column raises `line_sender_error` with code `arrow_ingest`.
+     *
+     * @param table             Destination table.
+     * @param array             Arrow C Data Interface array (consumed).
+     * @param schema            Arrow C Data Interface schema (borrowed).
+     * @param ts_column_name    Name of the timestamp column inside the batch.
+     *
+     * @throws line_sender_error on validation, classification failure,
+     *         missing / wrong-typed timestamp column, or null timestamp
+     *         rows.
+     */
+    void append_arrow(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column_name)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_append_arrow,
+            _impl,
+            table._impl,
+            &array,
+            &schema,
+            ::line_sender_designated_timestamp_column,
+            ts_column_name._impl.buf,
+            ts_column_name._impl.len);
+    }
+#endif /* QUESTDB_CLIENT_HAS_ARROW */
+
     void check_can_flush() const
     {
         if (!_impl)
@@ -1137,17 +1281,24 @@ public:
     }
 
 private:
+    enum class _backend_kind
+    {
+        ilp,
+        qwp_udp,
+        qwp_ws
+    };
+
     line_sender_buffer(
         ::line_sender_buffer* impl,
         protocol_version version,
         size_t init_buf_size,
         size_t max_name_len,
-        bool is_qwp = false) noexcept
+        _backend_kind backend = _backend_kind::ilp) noexcept
         : _impl{impl}
         , _protocol_version{version}
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
-        , _is_qwp{is_qwp}
+        , _backend{backend}
     {
     }
 
@@ -1156,17 +1307,21 @@ private:
         if (!_impl)
         {
             ::line_sender_buffer* tmp = nullptr;
-            if (_is_qwp)
+            switch (_backend)
             {
+            case _backend_kind::qwp_ws:
+                tmp = ::line_sender_buffer_new_qwp_ws();
+                break;
+            case _backend_kind::qwp_udp:
                 tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
                     _max_name_len);
-            }
-            else
-            {
+                break;
+            case _backend_kind::ilp:
                 tmp = ::line_sender_buffer_with_max_name_len(
                     static_cast<::line_sender_protocol_version>(
                         static_cast<int>(_protocol_version)),
                     _max_name_len);
+                break;
             }
             try
             {
@@ -1186,7 +1341,7 @@ private:
     protocol_version _protocol_version;
     size_t _init_buf_size;
     size_t _max_name_len;
-    bool _is_qwp{false};
+    _backend_kind _backend{_backend_kind::ilp};
 
     friend class line_sender;
 };
@@ -1801,9 +1956,13 @@ public:
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto sender_protocol = this->protocol();
-        bool is_qwp = sender_protocol == protocol::qwpudp ||
+        auto backend = line_sender_buffer::_backend_kind::ilp;
+        if (sender_protocol == protocol::qwpudp)
+            backend = line_sender_buffer::_backend_kind::qwp_udp;
+        else if (
             sender_protocol == protocol::qwpws ||
-            sender_protocol == protocol::qwpwss;
+            sender_protocol == protocol::qwpwss)
+            backend = line_sender_buffer::_backend_kind::qwp_ws;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         try
         {
@@ -1816,11 +1975,7 @@ public:
             throw;
         }
         return line_sender_buffer{
-            raw_buffer,
-            version,
-            init_buf_size,
-            max_name_len,
-            is_qwp};
+            raw_buffer, version, init_buf_size, max_name_len, backend};
     }
 
     /**

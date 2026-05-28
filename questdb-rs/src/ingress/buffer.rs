@@ -433,7 +433,12 @@ impl Buffer {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    pub(crate) fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
+    pub fn new_qwp_ws() -> Self {
+        Self::qwp_ws_with_max_name_len(127)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
         Self {
             inner: BufferInner::QwpWs(Box::new(QwpWsColumnarBuffer::new(max_name_len))),
         }

@@ -106,6 +106,9 @@ endif()
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(QUESTDB_ENABLE_ARROW)
+    target_compile_definitions(questdb_client INTERFACE QUESTDB_CLIENT_HAS_ARROW)
+endif()
 if(WIN32)
     set_target_properties(
         questdb_client-shared
@@ -292,6 +295,26 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_reader_c_example_columns
         examples/line_reader_c_example_columns.c)
+    compile_example(
+        line_reader_c_example_arrow
+        examples/line_reader_c_example_arrow.c)
+
+    find_package(Arrow QUIET)
+    if(Arrow_FOUND)
+        compile_example(
+            line_sender_cpp_example_arrow
+            examples/line_sender_cpp_example_arrow.cpp)
+        target_link_libraries(
+            line_sender_cpp_example_arrow Arrow::arrow_shared)
+        compile_example(
+            line_reader_cpp_example_arrow
+            examples/line_reader_cpp_example_arrow.cpp)
+        target_link_libraries(
+            line_reader_cpp_example_arrow Arrow::arrow_shared)
+    else()
+        message(STATUS
+            "arrow-cpp not found; skipping line_{sender,reader}_cpp_example_arrow.")
+    endif()
 
     # Include Rust tests as part of the tests run
     add_test(

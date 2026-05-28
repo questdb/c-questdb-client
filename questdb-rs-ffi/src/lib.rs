@@ -935,6 +935,15 @@ pub unsafe extern "C" fn line_sender_buffer_new_qwp() -> *mut line_sender_buffer
     }))
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws() -> *mut line_sender_buffer {
+    let buffer = Buffer::new_qwp_ws();
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: true,
+    }))
+}
+
 /// Construct a QWP/UDP `line_sender_buffer` with a custom maximum length for
 /// table and column names.
 ///
@@ -3663,7 +3672,9 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
     ts_column_name_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    use arrow_array::{RecordBatch, StructArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
+    use std::sync::Arc;
     use questdb::ingress::{ColumnName, DesignatedTimestamp};
     panic_guard(|| unsafe {
         if buffer.is_null() || array.is_null() || schema.is_null() {
@@ -3701,6 +3712,7 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
             _ => None,
         };
         let imported_array = std::ptr::read(array);
+        (*array).release = None;
         let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
             Ok(d) => d,
             Err(e) => {
@@ -3712,8 +3724,35 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
                 return false;
             }
         };
-        let struct_array = StructArray::from(array_data);
-        let rb: RecordBatch = struct_array.into();
+        let rb = if matches!(array_data.data_type(), DataType::Struct(_)) {
+            let struct_array = StructArray::from(array_data);
+            RecordBatch::from(struct_array)
+        } else {
+            let field = match Field::try_from(&*schema) {
+                Ok(f) => f,
+                Err(e) => {
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::ArrowIngest,
+                        format!("schema conversion failed: {}", e),
+                    );
+                    return false;
+                }
+            };
+            let arr_ref: ArrayRef = make_array(array_data);
+            let rb_schema = Arc::new(Schema::new(vec![field]));
+            match RecordBatch::try_new(rb_schema, vec![arr_ref]) {
+                Ok(rb) => rb,
+                Err(e) => {
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::ArrowIngest,
+                        format!("RecordBatch::try_new failed: {}", e),
+                    );
+                    return false;
+                }
+            }
+        };
         let ts = match ts_kind {
             line_sender_designated_timestamp_kind::line_sender_designated_timestamp_column => {
                 let name_str = ts_name_owned.as_deref().unwrap_or("");
