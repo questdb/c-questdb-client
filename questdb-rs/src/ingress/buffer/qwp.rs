@@ -44,6 +44,8 @@ use std::hash::{BuildHasher, Hash, Hasher};
 
 use super::op_state::{Op, OpState};
 use super::{Bookmark, BufferBookmarkMeta, ColumnName, StoredBookmark, TableName};
+#[cfg(feature = "arrow")]
+use arrow_buffer::NullBuffer;
 
 /// Wire layout of a QWP datagram header.
 ///
@@ -565,7 +567,7 @@ impl DecimalValue {
 // --- Column kind ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColumnKind {
+pub(crate) enum ColumnKind {
     Bool,
     Symbol,
     I8,
@@ -2523,6 +2525,55 @@ enum QwpWsColumnValues {
         cells: Vec<QwpWsSliceCell>,
         data: Vec<u8>,
     },
+    #[cfg(feature = "arrow")]
+    ArrowFixed {
+        bitmap: Option<Vec<u8>>,
+        values: Vec<u8>,
+        row_count: u32,
+    },
+    #[cfg(feature = "arrow")]
+    ArrowVarLen {
+        bitmap: Option<Vec<u8>>,
+        offsets: Vec<u32>,
+        data: Vec<u8>,
+        row_count: u32,
+    },
+    #[cfg(feature = "arrow")]
+    ArrowBool {
+        bitmap: Option<Vec<u8>>,
+        packed_bits: Vec<u8>,
+        row_count: u32,
+    },
+    #[cfg(feature = "arrow")]
+    ArrowSymbol {
+        bitmap: Option<Vec<u8>>,
+        dict: Vec<QwpWsSymbolEntry>,
+        dict_lookup: QwpWsLocalSymbolLookup,
+        dict_data: Vec<u8>,
+        keys: Vec<u32>,
+        row_count: u32,
+    },
+    #[cfg(feature = "arrow")]
+    ArrowDecimal {
+        bitmap: Option<Vec<u8>>,
+        values: Vec<u8>,
+        decimal_scale: u8,
+        element_width: u8,
+        row_count: u32,
+    },
+    #[cfg(feature = "arrow")]
+    ArrowGeohash {
+        bitmap: Option<Vec<u8>>,
+        values: Vec<u8>,
+        precision_bits: u8,
+        row_count: u32,
+    },
+    #[cfg(feature = "arrow")]
+    ArrowArray {
+        bitmap: Option<Vec<u8>>,
+        data: Vec<u8>,
+        row_count: u32,
+    },
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2689,13 +2740,27 @@ impl QwpWsColumnarBuffer {
             for column in &table.columns {
                 total += qwp_string_byte_len(column.name.len()) + 1;
                 total += column.estimated_payload_len(table.row_count as usize);
-                if let QwpWsColumnValues::Symbol { dict, data, .. } = &column.values {
-                    symbol_dict_count += dict.len();
-                    for entry in dict {
-                        let bytes =
-                            &data[entry.offset as usize..(entry.offset + entry.len) as usize];
-                        symbol_dict_bytes += qwp_string_byte_len(bytes.len());
+                match &column.values {
+                    QwpWsColumnValues::Symbol { dict, data, .. } => {
+                        symbol_dict_count += dict.len();
+                        for entry in dict {
+                            let bytes =
+                                &data[entry.offset as usize..(entry.offset + entry.len) as usize];
+                            symbol_dict_bytes += qwp_string_byte_len(bytes.len());
+                        }
                     }
+                    #[cfg(feature = "arrow")]
+                    QwpWsColumnValues::ArrowSymbol {
+                        dict, dict_data, ..
+                    } => {
+                        symbol_dict_count += dict.len();
+                        for entry in dict {
+                            let bytes = &dict_data
+                                [entry.offset as usize..(entry.offset + entry.len) as usize];
+                            symbol_dict_bytes += qwp_string_byte_len(bytes.len());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3470,6 +3535,270 @@ impl QwpWsColumnarBuffer {
         Ok(())
     }
 
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_begin(
+        &mut self,
+        table_name: TableName<'_>,
+    ) -> crate::Result<ArrowBulkCtx> {
+        self.check_op(Op::Table)?;
+        let table_bytes = table_name.as_ref().as_bytes();
+        self.validate_max_name_len(table_name.as_ref())?;
+        let idx = self.lookup_or_create_table(table_bytes)?;
+        if self.tables[idx].in_progress {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS bulk arrow append cannot start while a row is in progress on table '{}'",
+                table_name.as_ref()
+            ));
+        }
+        self.current_table_idx = Some(idx);
+        let starting_rows = self.tables[idx].row_count;
+        Ok(ArrowBulkCtx {
+            table_idx: idx,
+            starting_rows,
+        })
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_fixed<F>(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name: ColumnName<'_>,
+        kind: ColumnKind,
+        info: ArrowBatchInfo<'_>,
+        write_values: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        let col_bytes = column_name.as_ref().as_bytes();
+        self.validate_max_name_len(column_name.as_ref())?;
+        let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, kind)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_fixed_batch(
+            kind,
+            info,
+            write_values,
+        )
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_varlen<F>(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name: ColumnName<'_>,
+        kind: ColumnKind,
+        info: ArrowBatchInfo<'_>,
+        write: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u32>, &mut Vec<u8>) -> crate::Result<()>,
+    {
+        let col_bytes = column_name.as_ref().as_bytes();
+        self.validate_max_name_len(column_name.as_ref())?;
+        let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, kind)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_varlen_batch(kind, info, write)
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_bool(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name: ColumnName<'_>,
+        batch_packed_bits: &[u8],
+        info: ArrowBatchInfo<'_>,
+    ) -> crate::Result<()> {
+        let col_bytes = column_name.as_ref().as_bytes();
+        self.validate_max_name_len(column_name.as_ref())?;
+        let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, ColumnKind::Bool)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_bool_batch(batch_packed_bits, info)
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_symbol(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name: ColumnName<'_>,
+        batch_keys: &[u32],
+        batch_dict_entries: &[(u32, u32)],
+        batch_dict_data: &[u8],
+        info: ArrowBatchInfo<'_>,
+    ) -> crate::Result<()> {
+        let col_bytes = column_name.as_ref().as_bytes();
+        self.validate_max_name_len(column_name.as_ref())?;
+        let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, ColumnKind::Symbol)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_symbol_batch(
+            batch_keys,
+            batch_dict_entries,
+            batch_dict_data,
+            info,
+        )
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_decimal<F>(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name: ColumnName<'_>,
+        kind: ColumnKind,
+        spec: ArrowDecimalSpec,
+        info: ArrowBatchInfo<'_>,
+        write_values: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        let col_bytes = column_name.as_ref().as_bytes();
+        self.validate_max_name_len(column_name.as_ref())?;
+        let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, kind)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_decimal_batch(
+            kind,
+            spec,
+            info,
+            write_values,
+        )
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_geohash<F>(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name: ColumnName<'_>,
+        precision_bits: u8,
+        info: ArrowBatchInfo<'_>,
+        write_values: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        let col_bytes = column_name.as_ref().as_bytes();
+        self.validate_max_name_len(column_name.as_ref())?;
+        let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, ColumnKind::Geohash)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_geohash_batch(
+            precision_bits,
+            info,
+            write_values,
+        )
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_array<F>(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name: ColumnName<'_>,
+        kind: ColumnKind,
+        info: ArrowBatchInfo<'_>,
+        write_data: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        let col_bytes = column_name.as_ref().as_bytes();
+        self.validate_max_name_len(column_name.as_ref())?;
+        let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, kind)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_array_batch(kind, info, write_data)
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_set_designated_ts<F>(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        kind: ColumnKind,
+        info: ArrowBatchInfo<'_>,
+        write_values: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        if !matches!(
+            kind,
+            ColumnKind::TimestampMicros | ColumnKind::TimestampNanos
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS designated timestamp must be TimestampMicros or TimestampNanos, got {:?}",
+                kind
+            ));
+        }
+        let col_idx = self.lookup_or_create_arrow_column(ctx, b"", kind)?;
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_fixed_batch(
+            kind,
+            info,
+            write_values,
+        )
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_commit(
+        &mut self,
+        ctx: ArrowBulkCtx,
+        batch_rows: u32,
+    ) -> crate::Result<()> {
+        let table = &mut self.tables[ctx.table_idx];
+        let expected_rows = ctx.starting_rows.checked_add(batch_rows).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "QWP/WS table row count overflow on '{}'",
+                String::from_utf8_lossy(&table.table_name)
+            )
+        })?;
+        for column in &table.columns {
+            let arrow_rows = column.arrow_row_count();
+            match arrow_rows {
+                Some(rows) if rows == expected_rows => {}
+                Some(rows) => {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "QWP/WS arrow column '{}' has {} rows after bulk batch but table expects {}",
+                        String::from_utf8_lossy(&column.name),
+                        rows,
+                        expected_rows
+                    ));
+                }
+                None => {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "QWP/WS column '{}' is not in arrow-fed mode; mixed bulk + row-by-row batches are not supported",
+                        String::from_utf8_lossy(&column.name)
+                    ));
+                }
+            }
+        }
+        table.row_count = expected_rows;
+        table.in_progress = false;
+        table.in_progress_column_count = 0;
+        table.column_access_cursor = 0;
+        table.row_mark = None;
+        let added = batch_rows as usize;
+        self.state.row_count = self
+            .state
+            .row_count
+            .checked_add(added)
+            .ok_or_else(|| error::fmt!(InvalidApiCall, "QWP/WS buffer row count overflow"))?;
+        self.state.op_state.finish_row();
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn lookup_or_create_arrow_column(
+        &mut self,
+        ctx: &ArrowBulkCtx,
+        column_name_bytes: &[u8],
+        kind: ColumnKind,
+    ) -> crate::Result<usize> {
+        let table = &mut self.tables[ctx.table_idx];
+        let idx = match table.lookup_column(column_name_bytes)? {
+            Some(idx) => {
+                if table.columns[idx].kind != kind {
+                    return Err(batched_type_change_error_ws(column_name_bytes));
+                }
+                idx
+            }
+            None => table.create_column(column_name_bytes, kind)?,
+        };
+        table.column_access_cursor = idx + 1;
+        Ok(idx)
+    }
+
     fn rollback_current_row(&mut self) {
         let Some(table_idx) = self.current_table_idx else {
             return;
@@ -3579,17 +3908,37 @@ impl QwpWsColumnarBuffer {
             for (col_idx, column) in table.columns.iter().enumerate() {
                 let globals = &mut per_col[col_idx];
                 globals.clear();
-                if let QwpWsColumnValues::Symbol { dict, data, .. } = &column.values {
-                    globals.reserve(dict.len());
-                    for entry in dict {
-                        let bytes =
-                            &data[entry.offset as usize..(entry.offset + entry.len) as usize];
-                        let (gid, _) = global_dict.intern(bytes);
-                        highest_referenced_symbol_id = Some(
-                            highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
-                        );
-                        globals.push(gid);
+                match &column.values {
+                    QwpWsColumnValues::Symbol { dict, data, .. } => {
+                        globals.reserve(dict.len());
+                        for entry in dict {
+                            let bytes =
+                                &data[entry.offset as usize..(entry.offset + entry.len) as usize];
+                            let (gid, _) = global_dict.intern(bytes);
+                            highest_referenced_symbol_id = Some(
+                                highest_referenced_symbol_id
+                                    .map_or(gid, |highest| highest.max(gid)),
+                            );
+                            globals.push(gid);
+                        }
                     }
+                    #[cfg(feature = "arrow")]
+                    QwpWsColumnValues::ArrowSymbol {
+                        dict, dict_data, ..
+                    } => {
+                        globals.reserve(dict.len());
+                        for entry in dict {
+                            let bytes = &dict_data
+                                [entry.offset as usize..(entry.offset + entry.len) as usize];
+                            let (gid, _) = global_dict.intern(bytes);
+                            highest_referenced_symbol_id = Some(
+                                highest_referenced_symbol_id
+                                    .map_or(gid, |highest| highest.max(gid)),
+                            );
+                            globals.push(gid);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3815,6 +4164,36 @@ impl QwpWsColumnBuffer {
             QwpWsColumnValues::LongArray { cells, data } => {
                 cells.reserve(rows);
                 data.reserve(rows * 16);
+            }
+            #[cfg(feature = "arrow")]
+            QwpWsColumnValues::ArrowFixed { values, .. }
+            | QwpWsColumnValues::ArrowGeohash { values, .. }
+            | QwpWsColumnValues::ArrowDecimal { values, .. } => values.reserve(rows),
+            #[cfg(feature = "arrow")]
+            QwpWsColumnValues::ArrowVarLen { offsets, data, .. } => {
+                offsets.reserve(rows.saturating_add(1));
+                data.reserve(rows.saturating_mul(8));
+            }
+            #[cfg(feature = "arrow")]
+            QwpWsColumnValues::ArrowBool { packed_bits, .. } => {
+                packed_bits.reserve(rows.div_ceil(8));
+            }
+            #[cfg(feature = "arrow")]
+            QwpWsColumnValues::ArrowSymbol {
+                dict,
+                dict_lookup,
+                dict_data,
+                keys,
+                ..
+            } => {
+                dict.reserve(rows);
+                dict_lookup.reserve(rows);
+                dict_data.reserve(rows.saturating_mul(8));
+                keys.reserve(rows);
+            }
+            #[cfg(feature = "arrow")]
+            QwpWsColumnValues::ArrowArray { data, .. } => {
+                data.reserve(rows.saturating_mul(16));
             }
         }
     }
@@ -4235,6 +4614,567 @@ impl QwpWsColumnBuffer {
         Ok(())
     }
 
+    #[cfg(feature = "arrow")]
+    fn precheck_arrow_batch_overflows(
+        &self,
+        prior_row_count: u32,
+        info: &ArrowBatchInfo<'_>,
+    ) -> crate::Result<(u32, u32)> {
+        let new_row_count = prior_row_count.checked_add(info.rows).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow row count overflow on column '{}'",
+                String::from_utf8_lossy(&self.name)
+            )
+        })?;
+        let new_non_null = self
+            .non_null_count
+            .checked_add(info.non_null)
+            .ok_or_else(|| {
+                error::fmt!(
+                    InvalidApiCall,
+                    "QWP/WebSocket non-null value count exceeds maximum of {}",
+                    u32::MAX
+                )
+            })?;
+        Ok((new_row_count, new_non_null))
+    }
+
+    #[cfg(feature = "arrow")]
+    fn is_fresh(&self) -> bool {
+        self.last_written_row.is_none() && self.non_null_count == 0
+    }
+
+    #[cfg(feature = "arrow")]
+    fn arrow_row_count(&self) -> Option<u32> {
+        match &self.values {
+            QwpWsColumnValues::ArrowFixed { row_count, .. }
+            | QwpWsColumnValues::ArrowVarLen { row_count, .. }
+            | QwpWsColumnValues::ArrowBool { row_count, .. }
+            | QwpWsColumnValues::ArrowSymbol { row_count, .. }
+            | QwpWsColumnValues::ArrowDecimal { row_count, .. }
+            | QwpWsColumnValues::ArrowGeohash { row_count, .. }
+            | QwpWsColumnValues::ArrowArray { row_count, .. } => Some(*row_count),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_arrow_fixed_batch<F>(
+        &mut self,
+        kind: ColumnKind,
+        info: ArrowBatchInfo<'_>,
+        write_values: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        if self.kind != kind {
+            return Err(type_mismatch_error_ws(&self.name));
+        }
+        let element_width = fixed_element_width(kind).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-fixed not valid for {:?} on column '{}'",
+                kind,
+                String::from_utf8_lossy(&self.name)
+            )
+        })?;
+        let expected_rows = if kind_supports_sparse_nulls(kind) {
+            info.non_null as usize
+        } else {
+            info.rows as usize
+        };
+        let expected_bytes = expected_rows.saturating_mul(element_width);
+        if !matches!(self.values, QwpWsColumnValues::ArrowFixed { .. }) {
+            if !self.is_fresh() {
+                return Err(arrow_bulk_mixing_error(&self.name));
+            }
+            self.values = QwpWsColumnValues::ArrowFixed {
+                bitmap: None,
+                values: Vec::new(),
+                row_count: 0,
+            };
+        }
+        let prior_rows = match &self.values {
+            QwpWsColumnValues::ArrowFixed { row_count, .. } => *row_count,
+            _ => unreachable!(),
+        };
+        let (new_row_count, new_non_null) =
+            self.precheck_arrow_batch_overflows(prior_rows, &info)?;
+        let QwpWsColumnValues::ArrowFixed {
+            bitmap,
+            values,
+            row_count,
+        } = &mut self.values
+        else {
+            unreachable!()
+        };
+        let prior_len = values.len();
+        if let Err(e) = write_values(values) {
+            values.truncate(prior_len);
+            return Err(e);
+        }
+        let written = values.len() - prior_len;
+        if written != expected_bytes {
+            values.truncate(prior_len);
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-fixed expects {} bytes ({} rows × {}), got {}",
+                expected_bytes,
+                expected_rows,
+                element_width,
+                written
+            ));
+        }
+        extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
+        *row_count = new_row_count;
+        self.non_null_count = new_non_null;
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_arrow_varlen_batch<F>(
+        &mut self,
+        kind: ColumnKind,
+        info: ArrowBatchInfo<'_>,
+        write: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u32>, &mut Vec<u8>) -> crate::Result<()>,
+    {
+        if self.kind != kind {
+            return Err(type_mismatch_error_ws(&self.name));
+        }
+        if !matches!(self.values, QwpWsColumnValues::ArrowVarLen { .. }) {
+            if !self.is_fresh() {
+                return Err(arrow_bulk_mixing_error(&self.name));
+            }
+            self.values = QwpWsColumnValues::ArrowVarLen {
+                bitmap: None,
+                offsets: vec![0u32],
+                data: Vec::new(),
+                row_count: 0,
+            };
+        }
+        let prior_rows = match &self.values {
+            QwpWsColumnValues::ArrowVarLen { row_count, .. } => *row_count,
+            _ => unreachable!(),
+        };
+        let (new_row_count, new_non_null) =
+            self.precheck_arrow_batch_overflows(prior_rows, &info)?;
+        let QwpWsColumnValues::ArrowVarLen {
+            bitmap,
+            offsets,
+            data,
+            row_count,
+        } = &mut self.values
+        else {
+            unreachable!()
+        };
+        let prior_offsets_len = offsets.len();
+        let prior_data_len = data.len();
+        if let Err(e) = write(offsets, data) {
+            offsets.truncate(prior_offsets_len);
+            data.truncate(prior_data_len);
+            return Err(e);
+        }
+        let pushed = offsets.len() - prior_offsets_len;
+        if pushed != info.non_null as usize {
+            offsets.truncate(prior_offsets_len);
+            data.truncate(prior_data_len);
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-varlen expects {} offsets pushed for {} non-null rows, got {}",
+                info.non_null,
+                info.non_null,
+                pushed
+            ));
+        }
+        extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
+        *row_count = new_row_count;
+        self.non_null_count = new_non_null;
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_arrow_bool_batch(
+        &mut self,
+        batch_packed_bits: &[u8],
+        info: ArrowBatchInfo<'_>,
+    ) -> crate::Result<()> {
+        if self.kind != ColumnKind::Bool {
+            return Err(type_mismatch_error_ws(&self.name));
+        }
+        if batch_packed_bits.len() != (info.rows as usize).div_ceil(8) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-bool expects {} packed bytes for {} rows, got {}",
+                (info.rows as usize).div_ceil(8),
+                info.rows,
+                batch_packed_bits.len()
+            ));
+        }
+        if !matches!(self.values, QwpWsColumnValues::ArrowBool { .. }) {
+            if !self.is_fresh() {
+                return Err(arrow_bulk_mixing_error(&self.name));
+            }
+            self.values = QwpWsColumnValues::ArrowBool {
+                bitmap: None,
+                packed_bits: Vec::new(),
+                row_count: 0,
+            };
+        }
+        let prior_rows = match &self.values {
+            QwpWsColumnValues::ArrowBool { row_count, .. } => *row_count,
+            _ => unreachable!(),
+        };
+        let (new_row_count, new_non_null) =
+            self.precheck_arrow_batch_overflows(prior_rows, &info)?;
+        let QwpWsColumnValues::ArrowBool {
+            bitmap,
+            packed_bits,
+            row_count,
+        } = &mut self.values
+        else {
+            unreachable!()
+        };
+        append_packed_bits(
+            packed_bits,
+            prior_rows as usize,
+            batch_packed_bits,
+            info.rows as usize,
+        );
+        extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
+        *row_count = new_row_count;
+        self.non_null_count = new_non_null;
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_arrow_symbol_batch(
+        &mut self,
+        batch_keys: &[u32],
+        batch_dict_entries: &[(u32, u32)],
+        batch_dict_data: &[u8],
+        info: ArrowBatchInfo<'_>,
+    ) -> crate::Result<()> {
+        if self.kind != ColumnKind::Symbol {
+            return Err(type_mismatch_error_ws(&self.name));
+        }
+        if batch_keys.len() != info.rows as usize {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-symbol expects {} keys, got {}",
+                info.rows,
+                batch_keys.len()
+            ));
+        }
+        if !matches!(self.values, QwpWsColumnValues::ArrowSymbol { .. }) {
+            if !self.is_fresh() {
+                return Err(arrow_bulk_mixing_error(&self.name));
+            }
+            self.values = QwpWsColumnValues::ArrowSymbol {
+                bitmap: None,
+                dict: Vec::new(),
+                dict_lookup: QwpWsLocalSymbolLookup::default(),
+                dict_data: Vec::new(),
+                keys: Vec::new(),
+                row_count: 0,
+            };
+        }
+        let prior_rows = match &self.values {
+            QwpWsColumnValues::ArrowSymbol { row_count, .. } => *row_count,
+            _ => unreachable!(),
+        };
+        let (new_row_count, new_non_null) =
+            self.precheck_arrow_batch_overflows(prior_rows, &info)?;
+        let QwpWsColumnValues::ArrowSymbol {
+            bitmap,
+            dict,
+            dict_lookup,
+            dict_data,
+            keys,
+            row_count,
+        } = &mut self.values
+        else {
+            unreachable!()
+        };
+        let mut batch_to_local: Vec<u32> = Vec::with_capacity(batch_dict_entries.len());
+        for &(off, len) in batch_dict_entries {
+            let bytes = &batch_dict_data[off as usize..(off + len) as usize];
+            let hash = qwp_ws_symbol_hash(bytes);
+            let local_id = if let Some(existing) = dict_lookup.get(hash, bytes, dict, dict_data) {
+                existing
+            } else {
+                let id = checked_qwp_push_index(dict.len(), "QWP/WS symbol dictionary length")?;
+                let data_offset =
+                    QwpBuffer::checked_arena_offset(dict_data.len(), bytes.len(), "QWP/WS symbol")?;
+                let qwp_len = checked_qwp_u32(bytes.len(), "QWP/WS symbol length")?;
+                dict_data.extend_from_slice(bytes);
+                dict.push(QwpWsSymbolEntry {
+                    offset: data_offset,
+                    len: qwp_len,
+                });
+                dict_lookup.insert(hash, id);
+                id
+            };
+            batch_to_local.push(local_id);
+        }
+        keys.reserve(info.rows as usize);
+        for (row_idx, &batch_key) in batch_keys.iter().enumerate() {
+            let is_null = info.bitmap.is_some_and(|nb| nb.is_null(row_idx));
+            if is_null {
+                keys.push(0);
+                continue;
+            }
+            let mapped = batch_to_local
+                .get(batch_key as usize)
+                .copied()
+                .ok_or_else(|| {
+                    error::fmt!(
+                        InvalidApiCall,
+                        "QWP/WS arrow-symbol key {} out of range (dict size {})",
+                        batch_key,
+                        batch_to_local.len()
+                    )
+                })?;
+            keys.push(mapped);
+        }
+        extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
+        *row_count = new_row_count;
+        self.non_null_count = new_non_null;
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_arrow_decimal_batch<F>(
+        &mut self,
+        kind: ColumnKind,
+        spec: ArrowDecimalSpec,
+        info: ArrowBatchInfo<'_>,
+        write_values: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        if self.kind != kind {
+            return Err(type_mismatch_error_ws(&self.name));
+        }
+        if !matches!(
+            kind,
+            ColumnKind::Decimal | ColumnKind::Decimal64 | ColumnKind::Decimal128
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-decimal only valid for Decimal / Decimal64 / Decimal128, got {:?}",
+                kind
+            ));
+        }
+        let expected_bytes = (info.non_null as usize).saturating_mul(spec.element_width as usize);
+        if !matches!(self.values, QwpWsColumnValues::ArrowDecimal { .. }) {
+            if !self.is_fresh() {
+                return Err(arrow_bulk_mixing_error(&self.name));
+            }
+            self.values = QwpWsColumnValues::ArrowDecimal {
+                bitmap: None,
+                values: Vec::new(),
+                decimal_scale: spec.scale,
+                element_width: spec.element_width,
+                row_count: 0,
+            };
+        }
+        let prior_rows = match &self.values {
+            QwpWsColumnValues::ArrowDecimal { row_count, .. } => *row_count,
+            _ => unreachable!(),
+        };
+        let (new_row_count, new_non_null) =
+            self.precheck_arrow_batch_overflows(prior_rows, &info)?;
+        let QwpWsColumnValues::ArrowDecimal {
+            bitmap,
+            values,
+            decimal_scale,
+            element_width: stored_width,
+            row_count,
+        } = &mut self.values
+        else {
+            unreachable!()
+        };
+        if *stored_width != spec.element_width {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-decimal element width mismatch on '{}': existing={}, batch={}",
+                String::from_utf8_lossy(&self.name),
+                stored_width,
+                spec.element_width
+            ));
+        }
+        if info.non_null > 0
+            && *decimal_scale != QWP_DECIMAL_SCALE_UNSET
+            && *decimal_scale != spec.scale
+        {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-decimal scale changed on '{}': existing={}, batch={}",
+                String::from_utf8_lossy(&self.name),
+                decimal_scale,
+                spec.scale
+            ));
+        }
+        let prior_len = values.len();
+        if let Err(e) = write_values(values) {
+            values.truncate(prior_len);
+            return Err(e);
+        }
+        let written = values.len() - prior_len;
+        if written != expected_bytes {
+            values.truncate(prior_len);
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-decimal expects {} value bytes for {} non-null rows of width {}, got {}",
+                expected_bytes,
+                info.non_null,
+                spec.element_width,
+                written
+            ));
+        }
+        if info.non_null > 0 {
+            *decimal_scale = spec.scale;
+        }
+        extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
+        *row_count = new_row_count;
+        self.non_null_count = new_non_null;
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_arrow_geohash_batch<F>(
+        &mut self,
+        precision_bits: u8,
+        info: ArrowBatchInfo<'_>,
+        write_values: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        if self.kind != ColumnKind::Geohash {
+            return Err(type_mismatch_error_ws(&self.name));
+        }
+        let element_width = geohash_bytes_per_value(precision_bits);
+        let expected_bytes = (info.non_null as usize).saturating_mul(element_width);
+        if !matches!(self.values, QwpWsColumnValues::ArrowGeohash { .. }) {
+            if !self.is_fresh() {
+                return Err(arrow_bulk_mixing_error(&self.name));
+            }
+            self.values = QwpWsColumnValues::ArrowGeohash {
+                bitmap: None,
+                values: Vec::new(),
+                precision_bits,
+                row_count: 0,
+            };
+        }
+        let prior_rows = match &self.values {
+            QwpWsColumnValues::ArrowGeohash { row_count, .. } => *row_count,
+            _ => unreachable!(),
+        };
+        let (new_row_count, new_non_null) =
+            self.precheck_arrow_batch_overflows(prior_rows, &info)?;
+        let QwpWsColumnValues::ArrowGeohash {
+            bitmap,
+            values,
+            precision_bits: stored_precision,
+            row_count,
+        } = &mut self.values
+        else {
+            unreachable!()
+        };
+        if *stored_precision != precision_bits {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-geohash precision mismatch on '{}': existing={}, batch={}",
+                String::from_utf8_lossy(&self.name),
+                stored_precision,
+                precision_bits
+            ));
+        }
+        let prior_len = values.len();
+        if let Err(e) = write_values(values) {
+            values.truncate(prior_len);
+            return Err(e);
+        }
+        let written = values.len() - prior_len;
+        if written != expected_bytes {
+            values.truncate(prior_len);
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-geohash expects {} value bytes for {} non-null rows of width {}, got {}",
+                expected_bytes,
+                info.non_null,
+                element_width,
+                written
+            ));
+        }
+        extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
+        *row_count = new_row_count;
+        self.non_null_count = new_non_null;
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn append_arrow_array_batch<F>(
+        &mut self,
+        kind: ColumnKind,
+        info: ArrowBatchInfo<'_>,
+        write_data: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> crate::Result<()>,
+    {
+        if self.kind != kind {
+            return Err(type_mismatch_error_ws(&self.name));
+        }
+        if !matches!(kind, ColumnKind::DoubleArray | ColumnKind::LongArray) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow-array only valid for DoubleArray / LongArray, got {:?}",
+                kind
+            ));
+        }
+        if !matches!(self.values, QwpWsColumnValues::ArrowArray { .. }) {
+            if !self.is_fresh() {
+                return Err(arrow_bulk_mixing_error(&self.name));
+            }
+            self.values = QwpWsColumnValues::ArrowArray {
+                bitmap: None,
+                data: Vec::new(),
+                row_count: 0,
+            };
+        }
+        let prior_rows = match &self.values {
+            QwpWsColumnValues::ArrowArray { row_count, .. } => *row_count,
+            _ => unreachable!(),
+        };
+        let (new_row_count, new_non_null) =
+            self.precheck_arrow_batch_overflows(prior_rows, &info)?;
+        let QwpWsColumnValues::ArrowArray {
+            bitmap,
+            data,
+            row_count,
+        } = &mut self.values
+        else {
+            unreachable!()
+        };
+        let prior_len = data.len();
+        if let Err(e) = write_data(data) {
+            data.truncate(prior_len);
+            return Err(e);
+        }
+        extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
+        *row_count = new_row_count;
+        self.non_null_count = new_non_null;
+        Ok(())
+    }
+
     fn encode(&self, row_count: usize, globals: &[u64], out: &mut Vec<u8>) -> crate::Result<()> {
         out.push(u8::from(self.uses_null_bitmap(row_count)));
         if self.uses_null_bitmap(row_count) {
@@ -4346,6 +5286,76 @@ impl QwpWsColumnValues {
             | Self::Decimal128 { cells, .. } => {
                 cells.clear();
             }
+            #[cfg(feature = "arrow")]
+            Self::ArrowFixed {
+                bitmap,
+                values,
+                row_count,
+            }
+            | Self::ArrowGeohash {
+                bitmap,
+                values,
+                row_count,
+                ..
+            }
+            | Self::ArrowDecimal {
+                bitmap,
+                values,
+                row_count,
+                ..
+            } => {
+                bitmap.take();
+                values.clear();
+                *row_count = 0;
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowVarLen {
+                bitmap,
+                offsets,
+                data,
+                row_count,
+            } => {
+                bitmap.take();
+                offsets.clear();
+                data.clear();
+                *row_count = 0;
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowBool {
+                bitmap,
+                packed_bits,
+                row_count,
+            } => {
+                bitmap.take();
+                packed_bits.clear();
+                *row_count = 0;
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowSymbol {
+                bitmap,
+                dict,
+                dict_lookup,
+                dict_data,
+                keys,
+                row_count,
+            } => {
+                bitmap.take();
+                dict.clear();
+                dict_lookup.clear();
+                dict_data.clear();
+                keys.clear();
+                *row_count = 0;
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowArray {
+                bitmap,
+                data,
+                row_count,
+            } => {
+                bitmap.take();
+                data.clear();
+                *row_count = 0;
+            }
         }
     }
 
@@ -4389,6 +5399,46 @@ impl QwpWsColumnValues {
             | Self::Decimal64 { cells, .. }
             | Self::Decimal128 { cells, .. } => {
                 cells.capacity() * std::mem::size_of::<QwpWsDecimalCell>()
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowFixed { bitmap, values, .. }
+            | Self::ArrowGeohash { bitmap, values, .. }
+            | Self::ArrowDecimal { bitmap, values, .. } => {
+                bitmap.as_ref().map(|b| b.capacity()).unwrap_or(0) + values.capacity()
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowVarLen {
+                bitmap,
+                offsets,
+                data,
+                ..
+            } => {
+                bitmap.as_ref().map(|b| b.capacity()).unwrap_or(0)
+                    + offsets.capacity() * std::mem::size_of::<u32>()
+                    + data.capacity()
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowBool {
+                bitmap,
+                packed_bits,
+                ..
+            } => bitmap.as_ref().map(|b| b.capacity()).unwrap_or(0) + packed_bits.capacity(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowSymbol {
+                bitmap,
+                dict,
+                dict_data,
+                keys,
+                ..
+            } => {
+                bitmap.as_ref().map(|b| b.capacity()).unwrap_or(0)
+                    + dict.capacity() * std::mem::size_of::<QwpWsSymbolEntry>()
+                    + dict_data.capacity()
+                    + keys.capacity() * std::mem::size_of::<u32>()
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowArray { bitmap, data, .. } => {
+                bitmap.as_ref().map(|b| b.capacity()).unwrap_or(0) + data.capacity()
             }
         }
     }
@@ -4483,6 +5533,14 @@ impl QwpWsColumnValues {
                     false
                 }
             }
+            #[cfg(feature = "arrow")]
+            Self::ArrowFixed { .. }
+            | Self::ArrowVarLen { .. }
+            | Self::ArrowBool { .. }
+            | Self::ArrowSymbol { .. }
+            | Self::ArrowDecimal { .. }
+            | Self::ArrowGeohash { .. }
+            | Self::ArrowArray { .. } => false,
         }
     }
 
@@ -4539,10 +5597,27 @@ impl QwpWsColumnValues {
                     .saturating_mul(geohash_bytes_per_value(*precision_bits))
             }
             Self::LongArray { data, .. } => data.len(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowFixed { values, .. }
+            | Self::ArrowGeohash { values, .. }
+            | Self::ArrowDecimal { values, .. } => values.len(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowVarLen { offsets, data, .. } => offsets.len().saturating_mul(4) + data.len(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowBool { packed_bits, .. } => packed_bits.len(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowSymbol { keys, .. } => keys.iter().map(|&k| qwp_varint_size(k as u64)).sum(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowArray { data, .. } => data.len(),
         }
     }
 
     fn encode_null_bitmap(&self, row_count: usize, out: &mut Vec<u8>) -> crate::Result<()> {
+        #[cfg(feature = "arrow")]
+        if let Some(prebuilt) = self.prebuilt_qwp_bitmap(row_count)? {
+            out.extend_from_slice(prebuilt);
+            return Ok(());
+        }
         let mut packed = 0u8;
         let mut bit_idx = 0u8;
         let mut cursor = self.first_row_cursor();
@@ -4572,6 +5647,43 @@ impl QwpWsColumnValues {
             out.push(packed);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "arrow")]
+    fn prebuilt_qwp_bitmap(&self, row_count: usize) -> crate::Result<Option<&[u8]>> {
+        let (bitmap, arrow_rows) = match self {
+            Self::ArrowFixed {
+                bitmap, row_count, ..
+            }
+            | Self::ArrowVarLen {
+                bitmap, row_count, ..
+            }
+            | Self::ArrowBool {
+                bitmap, row_count, ..
+            }
+            | Self::ArrowSymbol {
+                bitmap, row_count, ..
+            }
+            | Self::ArrowDecimal {
+                bitmap, row_count, ..
+            }
+            | Self::ArrowGeohash {
+                bitmap, row_count, ..
+            }
+            | Self::ArrowArray {
+                bitmap, row_count, ..
+            } => (bitmap.as_deref(), *row_count as usize),
+            _ => return Ok(None),
+        };
+        if arrow_rows != row_count {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WS arrow column row mismatch: arrow holds {} rows, table has {}",
+                arrow_rows,
+                row_count
+            ));
+        }
+        Ok(bitmap)
     }
 
     fn encode(&self, row_count: usize, globals: &[u64], out: &mut Vec<u8>) -> crate::Result<()> {
@@ -4885,6 +5997,102 @@ impl QwpWsColumnValues {
                 }
                 Ok(())
             }
+            #[cfg(feature = "arrow")]
+            Self::ArrowFixed {
+                values,
+                row_count: arrow_rows,
+                ..
+            } => {
+                ensure_arrow_row_count(*arrow_rows, row_count)?;
+                out.extend_from_slice(values);
+                Ok(())
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowVarLen {
+                offsets,
+                data,
+                row_count: arrow_rows,
+                ..
+            } => {
+                ensure_arrow_row_count(*arrow_rows, row_count)?;
+                for offset in offsets {
+                    out.extend_from_slice(&offset.to_le_bytes());
+                }
+                out.extend_from_slice(data);
+                Ok(())
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowBool {
+                packed_bits,
+                row_count: arrow_rows,
+                ..
+            } => {
+                ensure_arrow_row_count(*arrow_rows, row_count)?;
+                out.extend_from_slice(packed_bits);
+                Ok(())
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowSymbol {
+                bitmap,
+                keys,
+                row_count: arrow_rows,
+                ..
+            } => {
+                ensure_arrow_row_count(*arrow_rows, row_count)?;
+                for (row_idx, &local_id) in keys.iter().enumerate() {
+                    if let Some(bm) = bitmap.as_deref()
+                        && (bm[row_idx / 8] >> (row_idx % 8)) & 1 == 1
+                    {
+                        continue;
+                    }
+                    let gid = globals
+                        .get(local_id as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            error::fmt!(
+                                InvalidApiCall,
+                                "internal QWP/WS encoder error: missing global symbol id for column-local index {}",
+                                local_id
+                            )
+                        })?;
+                    write_qwp_varint(out, gid);
+                }
+                Ok(())
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowDecimal {
+                values,
+                decimal_scale,
+                row_count: arrow_rows,
+                ..
+            } => {
+                ensure_arrow_row_count(*arrow_rows, row_count)?;
+                out.push(*decimal_scale);
+                out.extend_from_slice(values);
+                Ok(())
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowGeohash {
+                values,
+                precision_bits,
+                row_count: arrow_rows,
+                ..
+            } => {
+                ensure_arrow_row_count(*arrow_rows, row_count)?;
+                write_qwp_varint(out, *precision_bits as u64);
+                out.extend_from_slice(values);
+                Ok(())
+            }
+            #[cfg(feature = "arrow")]
+            Self::ArrowArray {
+                data,
+                row_count: arrow_rows,
+                ..
+            } => {
+                ensure_arrow_row_count(*arrow_rows, row_count)?;
+                out.extend_from_slice(data);
+                Ok(())
+            }
         }
     }
 
@@ -4918,6 +6126,14 @@ impl QwpWsColumnValues {
             Self::Binary { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::Geohash { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
             Self::LongArray { cells, .. } => cells.get(cursor).map(|cell| cell.row_idx),
+            #[cfg(feature = "arrow")]
+            Self::ArrowFixed { .. }
+            | Self::ArrowVarLen { .. }
+            | Self::ArrowBool { .. }
+            | Self::ArrowSymbol { .. }
+            | Self::ArrowDecimal { .. }
+            | Self::ArrowGeohash { .. }
+            | Self::ArrowArray { .. } => None,
         }
     }
 
@@ -5020,6 +6236,116 @@ fn batched_type_change_error_ws(entry_name: &[u8]) -> crate::Error {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "arrow")]
+#[derive(Debug)]
+pub(crate) struct ArrowBulkCtx {
+    table_idx: usize,
+    starting_rows: u32,
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArrowBatchInfo<'a> {
+    pub bitmap: Option<&'a NullBuffer>,
+    pub rows: u32,
+    pub non_null: u32,
+}
+
+#[cfg(feature = "arrow")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArrowDecimalSpec {
+    pub scale: u8,
+    pub element_width: u8,
+}
+
+#[cfg(feature = "arrow")]
+fn fixed_element_width(kind: ColumnKind) -> Option<usize> {
+    Some(match kind {
+        ColumnKind::I8 => 1,
+        ColumnKind::I16 | ColumnKind::Char => 2,
+        ColumnKind::I32 | ColumnKind::F32 | ColumnKind::Ipv4 => 4,
+        ColumnKind::I64
+        | ColumnKind::F64
+        | ColumnKind::TimestampMicros
+        | ColumnKind::TimestampNanos
+        | ColumnKind::Date => 8,
+        ColumnKind::Uuid => 16,
+        ColumnKind::Long256 => 32,
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "arrow")]
+fn ensure_arrow_row_count(arrow_rows: u32, expected: usize) -> crate::Result<()> {
+    if arrow_rows as usize != expected {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "QWP/WS arrow column row mismatch: arrow={} table={}",
+            arrow_rows,
+            expected
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arrow")]
+fn arrow_bulk_mixing_error(column_name: &[u8]) -> crate::Error {
+    error::fmt!(
+        InvalidApiCall,
+        "column '{}' has row-by-row writes; cannot switch to bulk arrow write within the same batch",
+        String::from_utf8_lossy(column_name)
+    )
+}
+
+#[cfg(feature = "arrow")]
+fn append_packed_bits(
+    existing: &mut Vec<u8>,
+    existing_rows: usize,
+    incoming: &[u8],
+    incoming_rows: usize,
+) {
+    let total_rows = existing_rows + incoming_rows;
+    let total_bytes = total_rows.div_ceil(8);
+    if existing.len() < total_bytes {
+        existing.resize(total_bytes, 0);
+    }
+    for i in 0..incoming_rows {
+        if (incoming[i / 8] >> (i % 8)) & 1 == 1 {
+            let target = existing_rows + i;
+            existing[target / 8] |= 1 << (target % 8);
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+fn extend_qwp_bitmap(
+    existing: &mut Option<Vec<u8>>,
+    existing_rows: usize,
+    incoming: Option<&NullBuffer>,
+    incoming_rows: usize,
+) {
+    let total_rows = existing_rows + incoming_rows;
+    if existing.is_none() && incoming.is_none() {
+        return;
+    }
+    let total_bytes = total_rows.div_ceil(8);
+    let mut bm = existing
+        .take()
+        .unwrap_or_else(|| vec![0u8; existing_rows.div_ceil(8)]);
+    if bm.len() < total_bytes {
+        bm.resize(total_bytes, 0);
+    }
+    if let Some(nulls) = incoming {
+        for i in 0..incoming_rows {
+            if nulls.is_null(i) {
+                let target = existing_rows + i;
+                bm[target / 8] |= 1 << (target % 8);
+            }
+        }
+    }
+    *existing = Some(bm);
+}
+
 fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
     batched_type_change_error_ws(entry_name)
 }

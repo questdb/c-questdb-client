@@ -29,7 +29,7 @@
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -169,6 +169,7 @@ struct QwpWsConnectedParts {
 pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
+    pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     orphan_pool: Option<OrphanDrainerPool>,
     close_drain_timeout: Duration,
 }
@@ -177,6 +178,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
+    pub(crate) server_max_batch_size: Arc<AtomicUsize>,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -208,7 +210,6 @@ struct SyncQwpWsPendingRunnerCore {
     lifecycle: PublicationLifecycle,
 }
 
-#[derive(Clone)]
 struct QwpWsPendingConnect {
     host: String,
     port: String,
@@ -219,6 +220,7 @@ struct QwpWsPendingConnect {
     reconnect_policy: ReconnectPolicy,
     max_in_flight: usize,
     durable_ack: bool,
+    server_max_batch_size: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -595,6 +597,7 @@ impl QwpWsPendingConnect {
         auth_header: Option<String>,
         max_in_flight: usize,
         durable_ack: bool,
+        server_max_batch_size: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             host: host.to_string(),
@@ -610,6 +613,7 @@ impl QwpWsPendingConnect {
             ),
             max_in_flight,
             durable_ack,
+            server_max_batch_size,
         }
     }
 
@@ -647,6 +651,7 @@ impl QwpWsPendingConnect {
                         self.tls_settings.clone(),
                         self.qwp_ws.clone(),
                         self.auth_header.clone(),
+                        Arc::clone(&self.server_max_batch_size),
                         connected,
                     )));
                 }
@@ -2030,12 +2035,12 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     let extras = codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
     let handshake = crate::ws::handshake::upgrade(stream, host_header, codec::WS_PATH, &extras)
         .map_err(codec::handshake_error_to_ingress)?;
-    let version = codec::validate_qwp_handshake_headers(
+    let result = codec::validate_qwp_handshake_headers(
         &handshake.headers,
         max_version,
         request_durable_ack,
     )?;
-    Ok((version, handshake.leftover))
+    Ok((result.version, handshake.leftover))
 }
 
 // ---------- connect ----------
@@ -2260,6 +2265,7 @@ pub(super) struct QwpWsConnectRoundSuccess {
     pub(super) endpoint_idx: usize,
     pub(super) stream: WsStream,
     pub(super) negotiated_version: u8,
+    pub(super) server_max_batch_size: usize,
     pub(super) leftover: Vec<u8>,
 }
 
@@ -2321,7 +2327,7 @@ pub(crate) fn establish_connection(
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
-) -> crate::Result<(WsStream, u8, Vec<u8>)> {
+) -> crate::Result<(WsStream, codec::QwpWsHandshakeResult, Vec<u8>)> {
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
 
@@ -2337,7 +2343,7 @@ pub(crate) fn establish_connection(
     let client_id = qwp_ws.client_id.as_deref();
     let request_durable_ack = *qwp_ws.request_durable_ack;
 
-    let (stream, negotiated_version, leftover) = if use_tls {
+    let (stream, handshake_result, leftover) = if use_tls {
         let tls = tls_settings.ok_or_else(|| {
             error::fmt!(ConfigError, "TLS settings missing for QWP/WebSocket Secure")
         })?;
@@ -2375,7 +2381,7 @@ pub(crate) fn establish_connection(
         let handshake =
             crate::ws::handshake::upgrade(&mut tls_stream, &host_header, codec::WS_PATH, &extras)
                 .map_err(codec::handshake_error_to_ingress)?;
-        let negotiated_version = codec::validate_qwp_handshake_headers(
+        let handshake_result = codec::validate_qwp_handshake_headers(
             &handshake.headers,
             max_version,
             request_durable_ack,
@@ -2383,7 +2389,7 @@ pub(crate) fn establish_connection(
         let leftover = handshake.leftover;
         (
             WsStream::Tls(Box::new(tls_stream)),
-            negotiated_version,
+            handshake_result,
             leftover,
         )
     } else {
@@ -2394,20 +2400,20 @@ pub(crate) fn establish_connection(
         let handshake =
             crate::ws::handshake::upgrade(&mut plain_stream, &host_header, codec::WS_PATH, &extras)
                 .map_err(codec::handshake_error_to_ingress)?;
-        let negotiated_version = codec::validate_qwp_handshake_headers(
+        let handshake_result = codec::validate_qwp_handshake_headers(
             &handshake.headers,
             max_version,
             request_durable_ack,
         )?;
         let leftover = handshake.leftover;
-        (WsStream::Plain(plain_stream), negotiated_version, leftover)
+        (WsStream::Plain(plain_stream), handshake_result, leftover)
     };
 
     stream
         .set_timeouts(Some(request_timeout), Some(request_timeout))
         .ok();
 
-    Ok((stream, negotiated_version, leftover))
+    Ok((stream, handshake_result, leftover))
 }
 
 pub(super) fn connect_qwp_ws_endpoint_round(
@@ -2442,13 +2448,14 @@ pub(super) fn connect_qwp_ws_endpoint_round(
             qwp_ws,
             auth_header,
         ) {
-            Ok((stream, negotiated_version, leftover)) => {
+            Ok((stream, handshake_result, leftover)) => {
                 tracker.record_success(idx);
                 *previous_idx = Some(idx);
                 return Ok(QwpWsConnectRoundSuccess {
                     endpoint_idx: idx,
                     stream,
-                    negotiated_version,
+                    negotiated_version: handshake_result.version,
+                    server_max_batch_size: handshake_result.server_max_batch_size,
                     leftover,
                 });
             }
@@ -2530,6 +2537,7 @@ pub(crate) fn connect_qwp_ws(
         qwp_ws,
         auth_header.clone(),
     );
+    let server_max_batch_size = Arc::new(AtomicUsize::new(0));
     let (runner, encoder) = if *qwp_ws.initial_connect_retry == QwpWsInitialConnectMode::Async {
         let queue = open_configured_qwp_ws_queue(qwp_ws)?;
         let pending_connect = QwpWsPendingConnect::new(
@@ -2541,6 +2549,7 @@ pub(crate) fn connect_qwp_ws(
             auth_header,
             queue.max_in_flight(),
             *qwp_ws.request_durable_ack,
+            Arc::clone(&server_max_batch_size),
         );
         (
             SyncQwpWsRunner::start_pending_connect(
@@ -2552,7 +2561,15 @@ pub(crate) fn connect_qwp_ws(
             QwpWsReplayEncoder::new(1),
         )
     } else {
-        let parts = open_qwp_ws_parts(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+        let parts = open_qwp_ws_parts(
+            host,
+            port,
+            use_tls,
+            tls_settings,
+            qwp_ws,
+            auth_header,
+            Arc::clone(&server_max_batch_size),
+        )?;
         (
             SyncQwpWsRunner::start_with_append_deadline(
                 parts.store,
@@ -2573,6 +2590,7 @@ pub(crate) fn connect_qwp_ws(
         SyncQwpWsHandlerState {
             encoder,
             runner,
+            server_max_batch_size,
             orphan_pool,
             close_drain_timeout: *qwp_ws.close_flush_timeout,
         },
@@ -2606,7 +2624,16 @@ pub(crate) fn open_manual_qwp_ws(
         qwp_ws,
         auth_header.clone(),
     );
-    let parts = open_qwp_ws_parts(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    let server_max_batch_size = Arc::new(AtomicUsize::new(0));
+    let parts = open_qwp_ws_parts(
+        host,
+        port,
+        use_tls,
+        tls_settings,
+        qwp_ws,
+        auth_header,
+        Arc::clone(&server_max_batch_size),
+    )?;
     let orphan_drainers = ManualOrphanDrainers::new(
         orphan_candidates(qwp_ws),
         *qwp_ws.max_background_drainers,
@@ -2616,6 +2643,7 @@ pub(crate) fn open_manual_qwp_ws(
         encoder: parts.encoder,
         store: parts.store,
         send_core: parts.send_core,
+        server_max_batch_size,
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
@@ -2630,10 +2658,18 @@ fn open_qwp_ws_parts(
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
+    server_max_batch_size: Arc<AtomicUsize>,
 ) -> crate::Result<QwpWsConnectedParts> {
     let queue = open_configured_qwp_ws_queue(qwp_ws)?;
-    let transport =
-        connect_blocking_transport(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    let transport = connect_blocking_transport(
+        host,
+        port,
+        use_tls,
+        tls_settings,
+        qwp_ws,
+        auth_header,
+        Arc::clone(&server_max_batch_size),
+    )?;
     let negotiated_version = transport.negotiated_version();
     let max_in_flight = queue.max_in_flight();
     let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
@@ -2662,6 +2698,7 @@ fn connect_blocking_transport(
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
+    server_max_batch_size: Arc<AtomicUsize>,
 ) -> crate::Result<BlockingQwpWsTransport> {
     match *qwp_ws.initial_connect_retry {
         QwpWsInitialConnectMode::Off => BlockingQwpWsTransport::connect(
@@ -2671,6 +2708,7 @@ fn connect_blocking_transport(
             tls_settings,
             qwp_ws.clone(),
             auth_header,
+            server_max_batch_size,
         ),
         QwpWsInitialConnectMode::Sync | QwpWsInitialConnectMode::Async => {
             connect_blocking_transport_with_retry(
@@ -2680,6 +2718,7 @@ fn connect_blocking_transport(
                 tls_settings,
                 qwp_ws,
                 auth_header,
+                server_max_batch_size,
             )
         }
     }
@@ -2692,6 +2731,7 @@ fn connect_blocking_transport_with_retry(
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
+    server_max_batch_size: Arc<AtomicUsize>,
 ) -> crate::Result<BlockingQwpWsTransport> {
     let started = Instant::now();
     let deadline = started.checked_add(*qwp_ws.reconnect_max_duration);
@@ -2721,6 +2761,7 @@ fn connect_blocking_transport_with_retry(
                     tls_settings,
                     qwp_ws.clone(),
                     auth_header,
+                    server_max_batch_size,
                     connected,
                 ));
             }
@@ -3508,10 +3549,10 @@ mod tests {
         let handshake =
             crate::ws::handshake::upgrade(&mut stream, "localhost:9000", codec::WS_PATH, &extras)
                 .unwrap();
-        let version = codec::validate_qwp_handshake_headers(&handshake.headers, 1, false).unwrap();
+        let result = codec::validate_qwp_handshake_headers(&handshake.headers, 1, false).unwrap();
         let leftover = handshake.leftover;
 
-        assert_eq!(version, 1);
+        assert_eq!(result.version, 1);
         let mut reader = WsFrameReader::with_initial_input(leftover);
         let mut written = Vec::new();
         let mut scratch = Vec::new();

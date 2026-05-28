@@ -43,6 +43,11 @@ import threading
 import questdb_line_sender as qls
 import qwp_ws_fuzz
 import uuid
+
+from arrow_egress_fuzz import TestArrowEgressFuzz  # noqa: F401
+from arrow_ingress_fuzz import TestArrowIngressFuzz  # noqa: F401
+from arrow_round_trip_fuzz import TestArrowRoundTripFuzz  # noqa: F401
+from arrow_alignment_fuzz import TestArrowAlignmentFuzz  # noqa: F401
 from fixture import (
     Project,
     QuestDbFixtureBase,

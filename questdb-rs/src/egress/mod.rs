@@ -44,6 +44,8 @@
 // are surfaced via the top-level `pub use` block below; everything
 // else stays internal and is free to evolve without a breaking
 // change.
+#[cfg(feature = "arrow")]
+pub mod arrow;
 pub(crate) mod auth;
 pub(crate) mod binds;
 pub mod column;

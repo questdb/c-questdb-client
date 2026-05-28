@@ -193,6 +193,21 @@ typedef enum line_reader_error_code
      *  connect failover (before any batch is yielded) is unaffected
      *  and remains transparent. */
     line_reader_error_failover_would_duplicate = 21,
+    /** Streaming Arrow adapter saw a mid-stream schema change. The
+     *  cursor is still usable; re-wrap with
+     *  `line_reader_cursor_next_arrow_batch` after dropping any
+     *  partial state to snapshot the new schema. Only emitted when
+     *  the `arrow` feature is enabled. */
+    line_reader_error_schema_drift = 22,
+    /** `line_reader_cursor_next_arrow_batch` was called on a stream
+     *  that terminated before any batch was produced — no schema to
+     *  snapshot. Only emitted when the `arrow` feature is enabled. */
+    line_reader_error_no_schema = 23,
+    /** Arrow C Data Interface export failed (arrow-rs rejected the
+     *  produced `ArrayData`'s invariants). Indicates a client bug —
+     *  not user-recoverable. Only emitted when the `arrow` feature
+     *  is enabled. */
+    line_reader_error_arrow_export = 24,
 } line_reader_error_code;
 
 /**
@@ -1747,6 +1762,68 @@ static inline bool line_reader_column_data_get_symbol(
     *out_len = (size_t)e.length;
     return true;
 }
+
+#ifdef QUESTDB_CLIENT_HAS_ARROW
+/* Apache Arrow C Data Interface (feature: arrow).
+ * https://arrow.apache.org/docs/format/CDataInterface.html */
+
+#    ifndef ARROW_C_DATA_INTERFACE
+#        define ARROW_C_DATA_INTERFACE
+
+#        define ARROW_FLAG_DICTIONARY_ORDERED 1
+#        define ARROW_FLAG_NULLABLE 2
+#        define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema
+{
+    const char* format;
+    const char* name;
+    const char* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
+    void (*release)(struct ArrowSchema*);
+    void* private_data;
+};
+
+struct ArrowArray
+{
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+};
+
+#    endif /* ARROW_C_DATA_INTERFACE */
+
+typedef enum line_reader_arrow_batch_result
+{
+    line_reader_arrow_batch_ok = 0,
+    line_reader_arrow_batch_end = 1,
+    line_reader_arrow_batch_error = 2,
+} line_reader_arrow_batch_result;
+
+/**
+ * Advance the cursor by one RESULT_BATCH and export it as an Arrow
+ * C Data Interface array + schema. `out_array` / `out_schema` must be
+ * caller-allocated; on `_ok` they are filled in place and the caller
+ * owns the release callback contract. On `_end` / `_error` they are
+ * left untouched.
+ */
+QUESTDB_CLIENT_API
+line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(
+    line_reader_cursor* cursor,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema,
+    line_reader_error** err_out);
+#endif /* QUESTDB_CLIENT_HAS_ARROW */
 
 #ifdef __cplusplus
 }

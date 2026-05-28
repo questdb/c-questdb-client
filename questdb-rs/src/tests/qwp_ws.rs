@@ -4185,3 +4185,337 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
         err.msg()
     );
 }
+
+// ---------- X-QWP-Max-Batch-Size handling ----------
+
+fn upgrade_mock_stream_with_max_batch_size(
+    stream: &mut TcpStream,
+    max_batch_size: Option<usize>,
+) -> Vec<String> {
+    let req_bytes = read_request_until_blank(stream).unwrap();
+    let req = String::from_utf8_lossy(&req_bytes).to_string();
+    let request_lines: Vec<String> = req
+        .split("\r\n")
+        .take_while(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
+    let accept = compute_accept(&key);
+    let batch_size_header = match max_batch_size {
+        Some(n) => format!("X-QWP-Max-Batch-Size: {n}\r\n"),
+        None => String::new(),
+    };
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         X-QWP-Version: 1\r\n\
+         {batch_size_header}\
+         \r\n"
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+    request_lines
+}
+
+fn spawn_max_batch_size_server(max_batch_size: Option<usize>) -> (u16, mpsc::Receiver<MockResult>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request_lines = upgrade_mock_stream_with_max_batch_size(&mut stream, max_batch_size);
+        let mut received_frames = Vec::new();
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        received_frames.push(payload);
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        let _ = tx.send(MockResult {
+            request_lines,
+            received_frames,
+        });
+        thread::sleep(Duration::from_millis(50));
+    });
+    (port, rx)
+}
+
+fn spawn_max_batch_size_upgrade_only_server(max_batch_size: Option<usize>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        upgrade_mock_stream_with_max_batch_size(&mut stream, max_batch_size);
+        thread::sleep(Duration::from_millis(200));
+    });
+    port
+}
+
+fn build_buffer_with_payload_bytes(target_encoded_len: usize) -> Buffer {
+    let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+    buf.table("t").unwrap();
+    let col_name = "v";
+    let value_len = target_encoded_len;
+    let big_value: String = "x".repeat(value_len);
+    buf.column_str(col_name, big_value.as_str())
+        .unwrap()
+        .at_now()
+        .unwrap();
+    buf
+}
+
+#[test]
+fn server_max_batch_size_clamps_flush_below_configured_max_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let server_cap: usize = 512;
+        let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(100 * 1024 * 1024)
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+
+        let mut buf = build_buffer_with_payload_bytes(server_cap + 200);
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+        assert!(
+            encoded_len > server_cap,
+            "mode={}: encoded_len={encoded_len} must exceed server_cap={server_cap}",
+            progress.name()
+        );
+
+        let err = sender.flush(&mut buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::InvalidApiCall,
+            "mode={}",
+            progress.name()
+        );
+        assert!(
+            err.msg()
+                .contains("exceeds maximum configured allowed size"),
+            "mode={}: got: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert!(
+            err.msg().contains(&server_cap.to_string()),
+            "mode={}: error should reference server cap {server_cap}, got: {}",
+            progress.name(),
+            err.msg()
+        );
+    }
+}
+
+#[test]
+fn server_max_batch_size_allows_flush_when_encoded_fits_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let server_cap: usize = 100 * 1024;
+        let (port, rx) = spawn_max_batch_size_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(100 * 1024 * 1024)
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+
+        let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+        buf.table("t")
+            .unwrap()
+            .column_i64("v", 42)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+        assert!(
+            encoded_len < server_cap,
+            "mode={}: encoded_len={encoded_len} must be under server_cap={server_cap}",
+            progress.name()
+        );
+
+        sender.flush(&mut buf).unwrap();
+        if progress == ProgressCase::Manual {
+            assert!(sender.drive_once().unwrap());
+        }
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+    }
+}
+
+#[test]
+fn absent_server_max_batch_size_falls_back_to_configured_max_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let configured_max: usize = 1024;
+        let port = spawn_max_batch_size_upgrade_only_server(None);
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(configured_max)
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+
+        let mut buf = build_buffer_with_payload_bytes(configured_max + 200);
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+        assert!(
+            encoded_len > configured_max,
+            "mode={}: encoded_len={encoded_len} must exceed configured_max={configured_max}",
+            progress.name()
+        );
+
+        let err = sender.flush(&mut buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::InvalidApiCall,
+            "mode={}",
+            progress.name()
+        );
+        assert!(
+            err.msg().contains(&configured_max.to_string()),
+            "mode={}: error should reference configured max {configured_max}, got: {}",
+            progress.name(),
+            err.msg()
+        );
+    }
+}
+
+#[test]
+fn configured_max_wins_when_smaller_than_server_cap_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let configured_max: usize = 1024;
+        let server_cap: usize = 16 * 1024 * 1024;
+        let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(configured_max)
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+
+        let mut buf = build_buffer_with_payload_bytes(configured_max + 200);
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+        assert!(
+            encoded_len > configured_max,
+            "mode={}: encoded_len={encoded_len} must exceed configured_max={configured_max}",
+            progress.name()
+        );
+        assert!(
+            encoded_len < server_cap,
+            "mode={}: encoded_len={encoded_len} must be under server_cap={server_cap}",
+            progress.name()
+        );
+
+        let err = sender.flush(&mut buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::InvalidApiCall,
+            "mode={}",
+            progress.name()
+        );
+        assert!(
+            err.msg().contains(&configured_max.to_string()),
+            "mode={}: error should reference configured max {configured_max}, got: {}",
+            progress.name(),
+            err.msg()
+        );
+    }
+}
+
+#[test]
+fn server_cap_prevents_message_too_big_by_rejecting_locally_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let server_cap: usize = 2048;
+        let (port, _rx) = spawn_max_batch_size_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(100 * 1024 * 1024)
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+
+        let mut small_buf = Buffer::qwp_ws_with_max_name_len(127);
+        small_buf
+            .table("t")
+            .unwrap()
+            .column_i64("v", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        sender.flush(&mut small_buf).unwrap();
+        if progress == ProgressCase::Manual {
+            assert!(sender.drive_once().unwrap());
+        }
+
+        let mut big_buf = build_buffer_with_payload_bytes(server_cap + 500);
+        let encoded_len = qwp_ws_replay_encoded_len(&big_buf);
+        assert!(
+            encoded_len > server_cap,
+            "mode={}: encoded_len={encoded_len} must exceed server_cap={server_cap}",
+            progress.name()
+        );
+
+        let err = sender.flush(&mut big_buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::InvalidApiCall,
+            "mode={}: must get local InvalidApiCall, not a server error",
+            progress.name()
+        );
+    }
+}
+
+#[test]
+fn server_cap_at_exact_boundary_allows_flush_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+        buf.table("t")
+            .unwrap()
+            .column_i64("v", 42)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+
+        let server_cap = encoded_len;
+        let (port, rx) = spawn_max_batch_size_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(100 * 1024 * 1024)
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+
+        sender.flush(&mut buf).unwrap();
+        if progress == ProgressCase::Manual {
+            assert!(sender.drive_once().unwrap());
+        }
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+        assert_eq!(
+            result.received_frames[0].len(),
+            encoded_len,
+            "mode={}",
+            progress.name()
+        );
+    }
+}
+
+#[test]
+fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+        buf.table("t")
+            .unwrap()
+            .column_i64("v", 42)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+
+        let server_cap = encoded_len - 1;
+        let port = spawn_max_batch_size_upgrade_only_server(Some(server_cap));
+        let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+            .max_buf_size(100 * 1024 * 1024)
+            .unwrap();
+        let mut sender = build_qwp_ws_sender_from_builder(progress, builder);
+
+        let err = sender.flush(&mut buf).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::InvalidApiCall,
+            "mode={}",
+            progress.name()
+        );
+        assert!(
+            err.msg().contains(&server_cap.to_string()),
+            "mode={}: error should reference server cap {server_cap}, got: {}",
+            progress.name(),
+            err.msg()
+        );
+    }
+}

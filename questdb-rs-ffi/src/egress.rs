@@ -118,6 +118,19 @@ pub enum line_reader_error_code {
     /// `line_reader_query_on_failover_reset` to opt in to replays, or
     /// re-execute the query from scratch.
     line_reader_error_failover_would_duplicate = 21,
+    /// Streaming Arrow adapter saw a mid-stream schema change. The cursor
+    /// is still usable; re-wrap with `line_reader_cursor_next_arrow_batch`
+    /// after dropping any partial state to snapshot the new schema. Only
+    /// emitted with the `arrow` feature enabled.
+    line_reader_error_schema_drift = 22,
+    /// `line_reader_cursor_next_arrow_batch` was called on a stream that
+    /// terminated before any batch was produced — no schema to snapshot.
+    /// Only emitted with the `arrow` feature enabled.
+    line_reader_error_no_schema = 23,
+    /// Arrow C Data Interface export failed (arrow-rs rejected the
+    /// produced `ArrayData`'s invariants). Indicates a client bug — not
+    /// user-recoverable. Only emitted with the `arrow` feature enabled.
+    line_reader_error_arrow_export = 24,
 }
 
 impl From<ErrorCode> for line_reader_error_code {
@@ -144,6 +157,9 @@ impl From<ErrorCode> for line_reader_error_code {
             ErrorCode::ServerLimitExceeded => line_reader_error_server_limit_exceeded,
             ErrorCode::Cancelled => line_reader_error_cancelled,
             ErrorCode::FailoverWouldDuplicate => line_reader_error_failover_would_duplicate,
+            ErrorCode::SchemaDriftMidStream => line_reader_error_schema_drift,
+            ErrorCode::NoSchema => line_reader_error_no_schema,
+            ErrorCode::ArrowExport => line_reader_error_arrow_export,
             // ErrorCode is `#[non_exhaustive]`. Any future variant added
             // upstream that the C ABI hasn't been taught about falls
             // back to ProtocolError so callers see *something* rather
@@ -3894,5 +3910,68 @@ mod tests {
         dispatch_via_trampoline(cb, user_data, ev);
         // No assertion on side-effects: the goal is to confirm dispatch
         // is a no-op when the C callback slot is empty.
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_reader_arrow_batch_result {
+    line_reader_arrow_batch_ok = 0,
+    line_reader_arrow_batch_end = 1,
+    line_reader_arrow_batch_error = 2,
+}
+
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
+    cursor: *mut line_reader_cursor,
+    out_array: *mut arrow::ffi::FFI_ArrowArray,
+    out_schema: *mut arrow::ffi::FFI_ArrowSchema,
+    err_out: *mut *mut line_reader_error,
+) -> line_reader_arrow_batch_result {
+    use arrow_array::{Array, StructArray};
+    unsafe {
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_next_arrow_batch: cursor is NULL",
+            );
+            return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
+        }
+        if out_array.is_null() || out_schema.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_next_arrow_batch: out_array or out_schema is NULL",
+            );
+            return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
+        }
+        let c = &mut *cursor;
+        let inner: &mut Cursor<'static> = c.cursor_for_mut();
+        let outcome = panic_guard(|| inner.next_arrow_batch_inner(None));
+        match outcome {
+            Ok(Some(rb)) => {
+                let struct_array: StructArray = rb.into();
+                let array_data = struct_array.into_data();
+                match arrow::ffi::to_ffi(&array_data) {
+                    Ok((ffi_array, ffi_schema)) => {
+                        std::ptr::write(out_array, ffi_array);
+                        std::ptr::write(out_schema, ffi_schema);
+                        line_reader_arrow_batch_result::line_reader_arrow_batch_ok
+                    }
+                    Err(e) => {
+                        write_err_box(err_out, Error::new(ErrorCode::ArrowExport, e.to_string()));
+                        line_reader_arrow_batch_result::line_reader_arrow_batch_error
+                    }
+                }
+            }
+            Ok(None) => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
+            Err(e) => {
+                write_err_box(err_out, e);
+                line_reader_arrow_batch_result::line_reader_arrow_batch_error
+            }
+        }
     }
 }

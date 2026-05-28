@@ -1445,6 +1445,66 @@ impl<'r> Cursor<'r> {
         }
     }
 
+    /// Wrap this cursor as an Arrow [`RecordBatchReader`]. Blocks until
+    /// the first `RESULT_BATCH` is decoded, then snapshots its schema.
+    /// Mid-stream schema drift poisons the adapter; re-wrap to resume.
+    /// Returns [`ErrorCode::NoSchema`] if the stream terminates before
+    /// any batch is produced.
+    ///
+    /// [`RecordBatchReader`]: arrow_array::RecordBatchReader
+    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
+    #[cfg(feature = "arrow")]
+    pub fn as_record_batch_reader<'c>(
+        &'c mut self,
+    ) -> Result<crate::egress::arrow::CursorRecordBatchReader<'r, 'c>> {
+        crate::egress::arrow::CursorRecordBatchReader::new(self)
+    }
+
+    #[cfg(feature = "arrow")]
+    #[doc(hidden)]
+    pub fn next_arrow_batch_inner(
+        &mut self,
+        expected_schema: Option<&arrow_schema::SchemaRef>,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch, schemas_equal};
+        use std::sync::Arc;
+
+        match self.next_batch_inner()? {
+            NextOutcome::Done => Ok(None),
+            NextOutcome::HaveBatch => {
+                let decoded = self
+                    .last_batch
+                    .take()
+                    .expect("HaveBatch implies last_batch");
+                let egress_schema = self
+                    .reader
+                    .registry
+                    .get(decoded.schema_id)
+                    .ok_or_else(|| {
+                        fmt!(
+                            ProtocolError,
+                            "schema id {} missing from registry",
+                            decoded.schema_id
+                        )
+                    })?
+                    .clone();
+                let arrow_schema = Arc::new(batch_arrow_schema(&egress_schema, &decoded)?);
+                if let Some(expected) = expected_schema
+                    && !schemas_equal(expected.as_ref(), arrow_schema.as_ref())
+                {
+                    return Err(fmt!(
+                        SchemaDriftMidStream,
+                        "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
+                        decoded.batch_seq
+                    ));
+                }
+                let dict_clone = self.reader.dict.clone();
+                let rb = batch_to_record_batch(arrow_schema, &egress_schema, decoded, &dict_clone)?;
+                Ok(Some(rb))
+            }
+        }
+    }
+
     fn next_batch_inner(&mut self) -> Result<NextOutcome> {
         loop {
             // Transport read: a failure here (socket closed, TLS
