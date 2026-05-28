@@ -45,6 +45,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "_egress")]
+use crate::egress::Reader;
 use crate::{Result, error};
 
 use super::conf::{self, PoolReap};
@@ -69,13 +71,23 @@ pub struct QuestDb {
 }
 
 struct DbInner {
-    /// Original connect string. Kept verbatim so auto-grow can spin up a new
-    /// connection with the same settings.
+    /// Original connect string. Kept verbatim so auto-grow can spin up a
+    /// new connection with the same settings — for either the sender
+    /// pool (`ColumnConn::connect`) or the reader pool
+    /// (`Reader::from_conf`). The reader's parser accepts the writer's
+    /// scheme prefixes and ignores pool_* keys, so no translation is
+    /// needed.
     conf: String,
     pool_size: usize,
     pool_max: usize,
     pool_idle_timeout: Duration,
     state: Mutex<PoolState>,
+    /// Reader pool. Lazy-init: starts empty, populated on first
+    /// `borrow_reader_owned` call. Same `pool_size` / `pool_max` /
+    /// `pool_idle_timeout` budget as the sender pool but a separate
+    /// free list so heavy ingest doesn't starve queries.
+    #[cfg(feature = "_egress")]
+    reader_state: Mutex<ReaderPoolState>,
     /// Wakes the reaper thread on `shutdown` and lets a future blocking
     /// borrow wait for a free slot once we grow `borrow_sender` past
     /// fail-fast (not in v1).
@@ -109,6 +121,32 @@ struct PoolEntry {
     /// argument: the server tracks ids by first-emit order over the life
     /// of the WS connection, so the dict must travel with the slot.
     symbol_dict: crate::ingress::buffer::SymbolGlobalDict,
+    last_idle_at: Instant,
+}
+
+#[cfg(feature = "_egress")]
+#[derive(Default)]
+struct ReaderPoolState {
+    /// Idle readers, oldest at front, newest at back (push on return /
+    /// pop on borrow). Same FIFO/LIFO discipline as the sender free list.
+    free: Vec<ReaderPoolEntry>,
+    /// Currently-borrowed readers + in-flight grow operations.
+    in_use: usize,
+}
+
+#[cfg(feature = "_egress")]
+impl ReaderPoolState {
+    fn total(&self) -> usize {
+        self.free.len() + self.in_use
+    }
+}
+
+#[cfg(feature = "_egress")]
+struct ReaderPoolEntry {
+    /// The reader carries its own per-connection state (symbol dict,
+    /// schema registry, request-id sequence) inside itself, so unlike
+    /// the sender pool we don't need to track them as separate fields.
+    reader: Reader,
     last_idle_at: Instant,
 }
 
@@ -160,6 +198,8 @@ impl QuestDb {
             pool_max: pool_cfg.pool_max,
             pool_idle_timeout: pool_cfg.pool_idle_timeout,
             state: Mutex::new(PoolState { free, in_use: 0 }),
+            #[cfg(feature = "_egress")]
+            reader_state: Mutex::new(ReaderPoolState::default()),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
         });
@@ -283,6 +323,103 @@ impl QuestDb {
     #[doc(hidden)]
     pub fn in_use_count(&self) -> usize {
         self.inner.state.lock().expect("pool mutex poisoned").in_use
+    }
+
+    /// FFI escape hatch: borrow a reader from the egress pool.
+    ///
+    /// Same shape as [`Self::borrow_sender_owned`] but pulls a
+    /// [`Reader`] from the reader free list (lazily opens one if the
+    /// free list is empty and total < `pool_max`). Returned via
+    /// [`OwnedReader`]'s Drop: see the sender variant for the same
+    /// pattern.
+    #[cfg(feature = "_egress")]
+    #[doc(hidden)]
+    pub fn borrow_reader_owned(&self) -> crate::egress::error::Result<OwnedReader> {
+        let reader = self.pick_reader()?;
+        Ok(OwnedReader {
+            inner: Arc::clone(&self.inner),
+            reader: Some(reader),
+            must_close: false,
+        })
+    }
+
+    /// Construct an opaque pool reference that downstream code (the
+    /// FFI's `line_reader` wrapper, in particular) can hold to return
+    /// readers without having to expose [`DbInner`].
+    #[cfg(feature = "_egress")]
+    #[doc(hidden)]
+    pub fn reader_pool_handle(&self) -> ReaderPoolHandle {
+        ReaderPoolHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    #[cfg(feature = "_egress")]
+    fn pick_reader(&self) -> crate::egress::error::Result<Reader> {
+        use crate::egress::error::{Error as EgressError, ErrorCode as EgressErrorCode};
+        let mut state = self
+            .inner
+            .reader_state
+            .lock()
+            .expect("reader pool mutex poisoned");
+        if let Some(entry) = state.free.pop() {
+            state.in_use += 1;
+            drop(state);
+            return Ok(entry.reader);
+        }
+
+        if state.total() >= self.inner.pool_max {
+            return Err(EgressError::new(
+                EgressErrorCode::InvalidApiCall,
+                format!(
+                    "Reader pool exhausted: {} readers are currently borrowed and \
+                     the pool is at its `pool_max` cap of {}. \
+                     Release a reader or raise `pool_max`.",
+                    state.in_use, self.inner.pool_max
+                ),
+            ));
+        }
+
+        // Reserve the slot before releasing the lock so concurrent
+        // borrows cannot over-grow past `pool_max`.
+        state.in_use += 1;
+        drop(state);
+
+        match Reader::from_conf(&self.inner.conf) {
+            Ok(r) => Ok(r),
+            Err(err) => {
+                let mut state = self
+                    .inner
+                    .reader_state
+                    .lock()
+                    .expect("reader pool mutex poisoned");
+                state.in_use -= 1;
+                Err(err)
+            }
+        }
+    }
+
+    /// Snapshot the number of idle (free) readers currently in the pool.
+    #[cfg(feature = "_egress")]
+    #[doc(hidden)]
+    pub fn reader_free_count(&self) -> usize {
+        self.inner
+            .reader_state
+            .lock()
+            .expect("reader pool mutex poisoned")
+            .free
+            .len()
+    }
+
+    /// Snapshot the number of currently-borrowed readers.
+    #[cfg(feature = "_egress")]
+    #[doc(hidden)]
+    pub fn reader_in_use_count(&self) -> usize {
+        self.inner
+            .reader_state
+            .lock()
+            .expect("reader pool mutex poisoned")
+            .in_use
     }
 }
 
@@ -417,6 +554,101 @@ impl Drop for OwnedSender {
     }
 }
 
+/// Owned (lifetime-free) variant of a borrowed reader used by the C FFI.
+///
+/// Holds an `Arc<DbInner>` for the same reason [`OwnedSender`] does: the
+/// C ABI can free its `questdb_db*` pointer before dropping outstanding
+/// reader handles without invalidating the free list / mutex.
+///
+/// `must_close` short-circuits the return path: when set, the reader is
+/// dropped instead of being returned to the pool. The egress-side
+/// cursor lifecycle uses this to force-close readers whose underlying
+/// transport has been torn down by a mid-stream cursor drop.
+#[cfg(feature = "_egress")]
+#[doc(hidden)]
+pub struct OwnedReader {
+    inner: Arc<DbInner>,
+    reader: Option<Reader>,
+    must_close: bool,
+}
+
+#[cfg(feature = "_egress")]
+impl OwnedReader {
+    /// Inspect the wrapped reader without taking ownership.
+    pub fn get(&self) -> &Reader {
+        self.reader
+            .as_ref()
+            .expect("OwnedReader already returned to the pool")
+    }
+
+    /// Borrow the underlying reader mutably.
+    pub fn get_mut(&mut self) -> &mut Reader {
+        self.reader
+            .as_mut()
+            .expect("OwnedReader already returned to the pool")
+    }
+
+    /// Mark this reader for must-close: it will be dropped on Drop
+    /// instead of returned to the pool.
+    pub fn mark_must_close(&mut self) {
+        self.must_close = true;
+    }
+
+    /// Take the inner reader, leaving the wrapper inert. Used by the
+    /// FFI to expose the raw `Reader` to other call sites that don't
+    /// know about the pool (e.g. monitoring stat getters).
+    pub fn take(mut self) -> Option<Reader> {
+        self.reader.take()
+    }
+}
+
+#[cfg(feature = "_egress")]
+impl Drop for OwnedReader {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            return_reader_to_pool(&self.inner, reader, self.must_close);
+        }
+    }
+}
+
+/// Opaque handle to a [`QuestDb`] pool, used by the FFI's
+/// `line_reader` wrapper to return readers without exposing
+/// `DbInner`. Cheap to clone (just bumps the inner `Arc`).
+#[cfg(feature = "_egress")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ReaderPoolHandle {
+    inner: Arc<DbInner>,
+}
+
+#[cfg(feature = "_egress")]
+impl ReaderPoolHandle {
+    /// Return a [`Reader`] to the pool it came from. If `must_close`
+    /// is set the reader is dropped instead of recycled — matching
+    /// the [`OwnedReader::mark_must_close`] semantics.
+    pub fn return_reader(&self, reader: Reader, must_close: bool) {
+        return_reader_to_pool(&self.inner, reader, must_close);
+    }
+}
+
+#[cfg(feature = "_egress")]
+fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool) {
+    let mut state = inner
+        .reader_state
+        .lock()
+        .expect("reader pool mutex poisoned");
+    state.in_use -= 1;
+    if !must_close {
+        state.free.push(ReaderPoolEntry {
+            reader,
+            last_idle_at: Instant::now(),
+        });
+    }
+    // When must_close, `reader` is dropped here under the lock — safe
+    // since Reader::drop does not re-enter the pool.
+    drop(state);
+}
+
 fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     let must_close = sender.must_close();
     let mut state = inner.state.lock().expect("pool mutex poisoned");
@@ -471,6 +703,16 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
 }
 
 fn reap_idle_inner(inner: &DbInner) -> usize {
+    #[cfg_attr(not(feature = "_egress"), allow(unused_mut))]
+    let mut dropped = reap_idle_senders(inner);
+    #[cfg(feature = "_egress")]
+    {
+        dropped += reap_idle_readers(inner);
+    }
+    dropped
+}
+
+fn reap_idle_senders(inner: &DbInner) -> usize {
     // Drop the to-be-closed connections OUTSIDE the lock so closing a connection
     // (which may take an unbounded amount of time) does not stall concurrent
     // borrows.
@@ -491,6 +733,40 @@ fn reap_idle_inner(inner: &DbInner) -> usize {
             if idle_for > inner.pool_idle_timeout {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.conn);
+            } else {
+                i += 1;
+            }
+        }
+        to_drop
+    };
+    let dropped = to_drop.len();
+    drop(to_drop);
+    dropped
+}
+
+#[cfg(feature = "_egress")]
+fn reap_idle_readers(inner: &DbInner) -> usize {
+    let to_drop: Vec<Reader> = {
+        let mut state = inner
+            .reader_state
+            .lock()
+            .expect("reader pool mutex poisoned");
+        let mut to_drop = Vec::new();
+        let now = Instant::now();
+        // Reader pool is lazy-init so there is no warm-min floor to
+        // preserve. We reap any idle reader that's been parked longer
+        // than the timeout.
+        let mut i = 0;
+        while i < state.free.len() {
+            // Apply the same floor as the sender pool — keep at most
+            // `pool_size` warm readers around.
+            if state.total() <= inner.pool_size {
+                break;
+            }
+            let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
+            if idle_for > inner.pool_idle_timeout {
+                let entry = state.free.remove(i);
+                to_drop.push(entry.reader);
             } else {
                 i += 1;
             }

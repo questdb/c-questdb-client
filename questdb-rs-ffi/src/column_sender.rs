@@ -46,7 +46,7 @@ use crate::{line_sender_error, set_err_out_from_error};
 // ===========================================================================
 
 /// Connection pool. Thread-safe; share across threads.
-pub struct questdb_db(QuestDb);
+pub struct questdb_db(pub(crate) QuestDb);
 
 /// Borrowed QWP/WS connection. Owns a pool slot until
 /// `questdb_db_return_conn` is called. Not thread-safe. Bundles the

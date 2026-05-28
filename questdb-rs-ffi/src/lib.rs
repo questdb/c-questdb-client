@@ -3677,8 +3677,8 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
 ) -> bool {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
-    use std::sync::Arc;
     use questdb::ingress::{ColumnName, DesignatedTimestamp};
+    use std::sync::Arc;
     panic_guard(|| unsafe {
         if buffer.is_null() || array.is_null() || schema.is_null() {
             arrow_err_to_c_box(

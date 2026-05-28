@@ -56,6 +56,10 @@ pub use validity::Validity;
 #[doc(hidden)]
 pub use db::OwnedSender;
 
+#[cfg(feature = "_egress")]
+#[doc(hidden)]
+pub use db::{OwnedReader, ReaderPoolHandle};
+
 /// Internals exposed for criterion benchmarks under
 /// `questdb-rs/benches/`. Not part of the public API; bumped freely
 /// without semver concerns.

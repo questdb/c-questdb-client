@@ -347,6 +347,58 @@ QUESTDB_CLIENT_API
 void line_reader_close(line_reader* reader);
 
 /**
+ * Mark a pool-borrowed reader for must-close: the next
+ * `line_reader_close` will drop the reader instead of returning it
+ * to the pool. No-op on standalone readers (they're dropped on
+ * close regardless) and on NULL handles.
+ *
+ * Use this when the cursor lifecycle detected a state that makes
+ * the reader unsafe to recycle — e.g. a cursor abandoned mid-stream,
+ * which causes the Rust `Cursor::Drop` to tear down the transport.
+ */
+QUESTDB_CLIENT_API
+void line_reader_mark_must_close(line_reader* reader);
+
+/* Reader pool (provided by `questdb/ingress/column_sender.h`'s
+ * `questdb_db` opaque). Same FFI surface as the writer-side
+ * `questdb_db_borrow_conn` / `_return_conn`, but for `line_reader`
+ * handles. Lives here because it wraps the `line_reader` type. */
+struct questdb_db;
+
+/**
+ * Borrow a reader from the egress pool. Returns NULL and sets
+ * `*err_out` on failure (pool exhausted, transport failure, etc.).
+ *
+ * The returned `line_reader*` is equivalent to one constructed via
+ * `line_reader_from_conf`. On `line_reader_close` the reader is
+ * returned to the pool (or dropped if `line_reader_mark_must_close`
+ * was called first).
+ */
+QUESTDB_CLIENT_API
+line_reader* questdb_db_borrow_reader(
+    struct questdb_db* db,
+    line_reader_error** err_out);
+
+/**
+ * Return a borrowed reader to the pool. Invalidates `reader`.
+ * Accepts NULL `reader` and no-ops. `db` is ignored — the reader
+ * carries its own pool back-reference — but kept in the ABI for
+ * symmetry with the borrow call.
+ */
+QUESTDB_CLIENT_API
+void questdb_db_return_reader(
+    struct questdb_db* db,
+    line_reader* reader);
+
+/** Snapshot of idle reader count. Internal / test-only. */
+QUESTDB_CLIENT_API
+size_t questdb_db_reader_free_count(struct questdb_db* db);
+
+/** Snapshot of in-use reader count. Internal / test-only. */
+QUESTDB_CLIENT_API
+size_t questdb_db_reader_in_use_count(struct questdb_db* db);
+
+/**
  * Peek at the reader's active-query flag.
  *
  * Returns `1` when a `line_reader_query` or `line_reader_cursor` produced

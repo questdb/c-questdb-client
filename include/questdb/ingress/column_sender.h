@@ -176,6 +176,11 @@ void questdb_db_drop_conn(
     questdb_db* db,
     qwpws_conn* conn);
 
+/* Reader-pool entry points (`questdb_db_borrow_reader`,
+ * `questdb_db_return_reader`, `questdb_db_reader_*_count`) live in
+ * `questdb/egress/line_reader.h` alongside the `line_reader` type
+ * they wrap. */
+
 /**
  * Manually reap idle connections (closes free-list entries idle longer
  * than `pool_idle_timeout_ms`, never shrinking below `pool_size`).
