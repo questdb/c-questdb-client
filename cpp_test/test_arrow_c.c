@@ -48,7 +48,8 @@ static int tests = 0;
 #define CHECK(cond, msg)                                                       \
     do                                                                         \
     {                                                                          \
-        if (!(cond))                                                           \
+        bool check_pass_ = (cond);                                             \
+        if (!check_pass_)                                                      \
         {                                                                      \
             fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, msg);    \
             errors++;                                                          \

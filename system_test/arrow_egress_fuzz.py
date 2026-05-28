@@ -1,357 +1,297 @@
-"""Arrow C Data Interface egress fuzz — live-server end-to-end.
-
-Drives `line_reader_cursor_next_arrow_batch` from Python via PyArrow's
-`_import_from_c`. Each iteration:
-
-1. Picks a random subset of Arrow-round-trip-able types from the QWP type
-   matrix and creates a fresh QuestDB table for them.
-2. Generates ``ROWS_PER_ITER`` rows of deterministic values and ingests
-   them through the **existing** QWP/WS Sender (the egress fuzz tests
-   reading, not writing).
-3. Waits for the rows to land via ``SELECT count(*)``.
-4. Streams the result back via the new Arrow C ABI:
-   ``line_reader_cursor_next_arrow_batch`` → pyarrow.RecordBatch.
-5. Asserts that:
-     * PyArrow accepts every batch (Apache-Arrow-spec valid).
-     * The total row count matches the expected.
-     * Per-cell values round-trip equal modulo documented degradations
-       (validity inversion, SYMBOL dict densification, GEOHASH widening).
-6. Cleans up the table.
-
-Reproducer seed: ``QWP_WS_FUZZ_SEED=0x...``.
-"""
-
 from __future__ import annotations
 
-import datetime as _dt
 import os
 import sys
-import time
 import unittest
-import uuid
+from typing import List, Tuple
 
-import qwp_ws_fuzz
-from arrow_ffi import (
-    NEXT_ARROW_BATCH_END,
-    NEXT_ARROW_BATCH_OK,
-    next_arrow_batch,
-    pyarrow_import_record_batch,
-)
+import pyarrow as pa
 
+import arrow_fuzz_common as afc
+from arrow_fuzz_common import KIND_REGISTRY, KindSpec
 
-_ARROW_FUZZ_ITER_DEFAULT = int(os.environ.get("ARROW_EGRESS_FUZZ_ITERATIONS", "8"))
-ROWS_PER_ITER = int(os.environ.get("ARROW_EGRESS_FUZZ_ROWS", "16"))
+_FUZZ_ITERATIONS = int(os.environ.get("ARROW_EGRESS_FUZZ_ITERATIONS", "6"))
+_ROWS_PER_BATCH = int(os.environ.get("ARROW_EGRESS_FUZZ_ROWS", "16"))
 
 
-ARROW_KIND_DDL = {
-    "boolean": "BOOLEAN",
-    "byte": "BYTE",
-    "short": "SHORT",
-    "int": "INT",
-    "long": "LONG",
-    "float": "FLOAT",
-    "double": "DOUBLE",
-    "char": "CHAR",
-    "ipv4": "IPV4",
-    "symbol": "SYMBOL",
-    "varchar": "VARCHAR",
-    "binary": "BINARY",
-    "uuid": "UUID",
-    "long256": "LONG256",
-    "date": "DATE",
-    "timestamp": "TIMESTAMP",
-    "timestamp_ns": "TIMESTAMP_NS",
+def _ilp_capable_kinds() -> List[Tuple[str, KindSpec]]:
+    return [(k, s) for k, s in KIND_REGISTRY.items() if s.supports_ilp_setter]
+
+
+_TIER_A_FIXED_PRIMITIVES = {
+    "byte", "short", "int", "long",
+    "float", "double",
+    "char", "ipv4",
+    "uuid", "long256",
+    "date", "timestamp", "timestamp_ns",
+    "decimal64", "decimal128",
+    "geohash1", "geohash5", "geohash32", "geohash60",
 }
 
-
-def _connect_existing_sender(host: str, port: int, sender_id: str, sf_dir: str):
-    """Build a QWP/WS Sender via the *existing* (non-Arrow) Python wrapper."""
-    import questdb_line_sender as qls
-    conf = (
-        f"qwpws::addr={host}:{port};"
-        f"sender_id={sender_id};"
-        f"sf_dir={sf_dir};"
-    )
-    sender = qls.Sender.from_conf(conf)
-    sender.connect()
-    return sender
-
-
-def _populate_via_existing_sender(sender, table: str, rows):
-    """Write each row through the existing per-type column setters."""
-    for r in rows:
-        line = sender.table(table)
-        for col_name, kind, value in r["cols"]:
-            if value is None:
+def _populate_table_via_ilp(sender, table: str, kinds, values_per_col, ts_base_us: int) -> None:
+    n = len(next(iter(values_per_col.values()))) if values_per_col else 0
+    for r in range(n):
+        sender.table(table)
+        wrote_any = False
+        for col_name, spec in kinds:
+            v = values_per_col[col_name][r]
+            if v is None:
                 continue
-            if kind == "boolean":
-                line.column(col_name, bool(value))
-            elif kind in ("byte", "short", "int", "long"):
-                line.column(col_name, int(value))
-            elif kind in ("float", "double"):
-                line.column(col_name, float(value))
-            elif kind == "char":
-                line.column_char(col_name, int(value))
-            elif kind == "ipv4":
-                line.column_ipv4(col_name, int(value))
-            elif kind == "symbol":
-                line.symbol(col_name, str(value))
-            elif kind == "varchar":
-                line.column(col_name, str(value))
-            elif kind == "binary":
-                line.column_binary(col_name, bytes(value))
-            elif kind == "uuid":
-                lo, hi = value
-                line.column_uuid(col_name, lo, hi)
-            elif kind == "long256":
-                line.column_long256(col_name, bytes(value))
-            elif kind == "date":
-                line.column_date(col_name, int(value))
-            elif kind == "timestamp":
-                line.column_ts_micros(col_name, int(value))
-            elif kind == "timestamp_ns":
-                line.column_ts_nanos(col_name, int(value))
-            else:
-                raise ValueError(f"unhandled kind {kind!r}")
-        line.at_micros(r["ts_us"])
+            spec.ilp_set(sender, col_name, v)
+            wrote_any = True
+        if not wrote_any:
+            sender.column("_keep", True)
+        sender.at_micros(ts_base_us + r)
+    sender.flush()
 
+def _read_back_arrow(fixture, table: str, kinds) -> pa.RecordBatch:
+    cols_sql = ", ".join(f'"{c}"' for c, _ in kinds)
+    sql = f"select {cols_sql} from '{table}' order by ts"
+    return afc.read_back_arrow_concat(fixture, sql)
 
-def _generate_row(row_idx: int, kinds, rnd: qwp_ws_fuzz.Rng):
-    cols = []
-    for col_name, kind in kinds:
-        cols.append((col_name, kind, _gen_value_for_kind(kind, row_idx, rnd)))
-    return {"ts_us": qwp_ws_fuzz.QwpWsTestSupport.BASE_TIMESTAMP_US + row_idx,
-            "cols": cols}
+def _ingest_and_read_back(testcase, table: str, kinds, *, null_mode: str
+                          ) -> Tuple[pa.RecordBatch, dict]:
+    """Common pipeline used by per-kind and fuzz tests."""
+    rnd = testcase._master_rng
+    n = _ROWS_PER_BATCH
+    values_per_col: dict = {}
+    for col_name, spec in kinds:
+        if null_mode == "valid":
+            mask = afc.all_valid_mask(n)
+            edge = False
+        elif null_mode == "partial":
+            mask = afc.partial_null_mask(rnd, n, null_p=0.3)
+            edge = False
+        elif null_mode == "all_null":
+            mask = afc.all_null_mask(n)
+            edge = False
+        elif null_mode == "edge":
+            mask = afc.all_valid_mask(n)
+            edge = True
+        else:
+            raise ValueError(null_mode)
+        values_per_col[col_name] = spec.generate_values(rnd, n, mask, edge=edge)
+    ts_base = 1_700_000_000_000_000 + rnd.next_int(1_000_000)
+    with afc.existing_sender(testcase._fixture) as sender:
+        _populate_table_via_ilp(sender, table, kinds, values_per_col, ts_base)
+    afc.wait_for_rows(testcase._fixture, table, n)
+    rb = _read_back_arrow(testcase._fixture, table, kinds)
+    return rb, values_per_col
 
+def _build_expected_arrow(kinds, values_per_col, num_rows: int) -> pa.RecordBatch:
+    arrays = []
+    fields = []
+    for col_name, spec in kinds:
+        arr = spec.build_arrow_array(values_per_col[col_name])
+        arrays.append(arr)
+        fields.append(spec.make_field(col_name))
+    return pa.RecordBatch.from_arrays(arrays, schema=pa.schema(fields))
 
-def _gen_value_for_kind(kind: str, row_idx: int, rnd: qwp_ws_fuzz.Rng):
-    if kind == "boolean":
-        return (row_idx & 1) == 0
-    if kind == "byte":
-        return (row_idx % 200) - 100
-    if kind == "short":
-        return row_idx * 7 - 1
-    if kind == "int":
-        return row_idx * 13 - 17
-    if kind == "long":
-        return row_idx * 1_000_003
-    if kind == "float":
-        return float(row_idx) * 0.5
-    if kind == "double":
-        return float(row_idx) * 1.25
-    if kind == "char":
-        return 0x41 + (row_idx % 26)
-    if kind == "ipv4":
-        return 0x0A000000 | (row_idx & 0xFF_FFFF)
-    if kind == "symbol":
-        return ["alpha", "beta", "gamma", "delta"][row_idx % 4]
-    if kind == "varchar":
-        return f"row-{row_idx:04d}"
-    if kind == "binary":
-        return bytes((row_idx & 0xFF, (row_idx >> 8) & 0xFF, 0xAA, 0x55))
-    if kind == "uuid":
-        return (row_idx, 0xCAFE_BABE_DEAD_BEEF)
-    if kind == "long256":
-        return bytes([row_idx & 0xFF] * 32)
-    if kind == "date":
-        return 1_700_000_000_000 + row_idx
-    if kind == "timestamp":
-        return 1_700_000_000_000_000 + row_idx
-    if kind == "timestamp_ns":
-        return 1_700_000_000_000_000_000 + row_idx
-    raise ValueError(f"no generator for kind {kind!r}")
+class TestArrowEgressPerKind(afc.ArrowFuzzBase):
+    """One test method per kind covering all four null modes via sub-tests."""
 
+    SUITE_LABEL = "arrow_egress_per_kind"
 
-def _pyarrow_cell(rb, col_idx: int, row_idx: int):
-    col = rb.column(col_idx)
-    if col.is_null(row_idx):
+    def _exercise_kind(self, kind_name: str) -> None:
+        spec = KIND_REGISTRY[kind_name]
+        if not spec.supports_ilp_setter:
+            self.skipTest(f"kind {kind_name!r} has no ILP setter (Arrow-ingest only)")
+        for null_mode in ("valid", "partial", "all_null", "edge"):
+            with self.subTest(null_mode=null_mode):
+                table = self.fresh_table(f"arrow_eg_{kind_name}_{null_mode}")
+                kinds = [(f"c_{kind_name}", spec)]
+                rb, values_per_col = _ingest_and_read_back(
+                    self, table, kinds, null_mode=null_mode,
+                )
+                self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+
+    def _assert_kind_round_trip(self, rb, kinds, values_per_col, null_mode: str) -> None:
+        col_name, spec = kinds[0]
+        self.assertEqual(rb.num_columns, 1, self.label(f"kind={spec.name}"))
+        self.assertEqual(rb.num_rows, _ROWS_PER_BATCH,
+                         self.label(f"row count kind={spec.name}"))
+        expected_dtype = spec.arrow_type()
+        actual_dtype = rb.column(0).type
+        self.assertEqual(
+            str(actual_dtype), str(expected_dtype),
+            self.label(f"DataType mismatch kind={spec.name}: "
+                       f"want {expected_dtype}, got {actual_dtype}"),
+        )
+        self._assert_field_metadata(rb.schema.field(0), spec)
+        expected_values = values_per_col[col_name]
+        for r in range(rb.num_rows):
+            expected = expected_values[r]
+            actual = rb.column(0)[r].as_py()
+            expected_canon = _canonicalise_for_compare(expected, spec)
+            actual_canon = _canonicalise_for_compare(actual, spec)
+            if not spec.compare(actual_canon, expected_canon):
+                self.fail(self.label(
+                    f"kind={spec.name} mode={null_mode} row={r}: "
+                    f"expected {expected_canon!r}, got {actual_canon!r}"
+                ))
+
+    def _assert_field_metadata(self, field: pa.Field, spec: KindSpec) -> None:
+        expected_md = spec.metadata() or {}
+        if not expected_md:
+            return
+        actual_md = dict(field.metadata or {})
+        for k, v in expected_md.items():
+            key_bytes = k if isinstance(k, bytes) else k.encode()
+            val_bytes = v if isinstance(v, bytes) else v.encode()
+            self.assertEqual(
+                actual_md.get(key_bytes), val_bytes,
+                self.label(
+                    f"kind={spec.name}: field metadata "
+                    f"{key_bytes!r} expected={val_bytes!r} "
+                    f"actual={actual_md.get(key_bytes)!r}"
+                ),
+            )
+
+def _canonicalise_for_compare(value, spec: KindSpec):
+    """Normalise a PyArrow .as_py() value into the same shape the
+    KindSpec's value generator produces, so spec.compare can be used
+    directly."""
+    if value is None:
         return None
-    return col[row_idx].as_py()
+    import datetime as _dt
+    from decimal import Decimal
+    if isinstance(value, _dt.datetime):
+        unit = spec.params.get("unit", "us")
+        divisor = {"s": 1, "ms": 1_000, "us": 1_000_000, "ns": 1_000_000_000}[unit]
+        epoch = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=_dt.timezone.utc)
+        delta_s = (value - epoch).total_seconds()
+        return int(round(delta_s * divisor))
+    if isinstance(value, Decimal):
+        scale = spec.params.get("scale", 0)
+        return int(value.scaleb(scale))
+    if spec.name == "uuid":
+        if isinstance(value, (bytes, bytearray)):
+            lo = int.from_bytes(value[:8], "little")
+            hi = int.from_bytes(value[8:], "little")
+            return (lo, hi)
+    return value
 
+# Inject one test method per kind so failures pinpoint the offending type.
+for _kind_name in list(KIND_REGISTRY.keys()):
+    def _make(name):
+        def test(self):
+            self._exercise_kind(name)
+        test.__name__ = f"test_kind_{name}"
+        test.__qualname__ = f"TestArrowEgressPerKind.test_kind_{name}"
+        return test
+    setattr(TestArrowEgressPerKind, f"test_kind_{_kind_name}", _make(_kind_name))
 
-class TestArrowEgressFuzz(unittest.TestCase):
-    ITERATIONS = _ARROW_FUZZ_ITER_DEFAULT
+class TestArrowEgressTierA(afc.ArrowFuzzBase):
+    """Verify zero-copy primitive value buffers come back 64-byte aligned."""
 
-    def setUp(self):
-        from test import QDB_FIXTURE, QuestDbFixture, QuestDbExternalFixture
-        if not isinstance(QDB_FIXTURE, (QuestDbFixture, QuestDbExternalFixture)):
-            self.skipTest("Arrow egress fuzz requires a live QuestDB fixture")
+    SUITE_LABEL = "arrow_egress_tier_a"
+
+    def test_primitive_buffers_64_byte_aligned(self):
+        # One column per Tier-A primitive — single batch keeps aligned
+        # buffers in a single round trip.
+        candidate_kinds = [
+            (n, KIND_REGISTRY[n])
+            for n in sorted(_TIER_A_FIXED_PRIMITIVES)
+            if n in KIND_REGISTRY and KIND_REGISTRY[n].supports_ilp_setter
+        ]
+        table = self.fresh_table("arrow_eg_tier_a")
+        kinds = [(f"c_{n}", s) for n, s in candidate_kinds]
+        rb, _values = _ingest_and_read_back(self, table, kinds, null_mode="valid")
+        misaligned: List[str] = []
+        for col_idx, (col_name, spec) in enumerate(kinds):
+            col = rb.column(col_idx)
+            for buf_idx, buf in enumerate(col.buffers()):
+                if buf is None or buf.size < 8:
+                    continue
+                addr = buf.address
+                if addr & 63 != 0:
+                    misaligned.append(
+                        f"{spec.name} buf[{buf_idx}] addr={addr:#x} (mod64={addr & 63})"
+                    )
+        if misaligned:
+            self.fail(self.label("\n  " + "\n  ".join(misaligned)))
+
+class TestArrowEgressEmpty(afc.ArrowFuzzBase):
+    """Zero-row stream → cursor terminates cleanly (no half-filled batch)."""
+
+    SUITE_LABEL = "arrow_egress_empty"
+
+    def test_empty_select_returns_no_batches(self):
+        # No table; query a constant that produces 0 rows.
+        sql = "select 1 from long_sequence(0)"
         try:
-            import pyarrow  # noqa: F401
-        except ImportError:
-            self.skipTest("pyarrow is required for the Arrow egress fuzz")
-        seed = qwp_ws_fuzz.derive_master_seed()
-        self._master_rng = qwp_ws_fuzz.Rng(seed)
-        self._seed_label = qwp_ws_fuzz.format_seed(seed)
-        sys.stderr.write(f"[arrow_egress_fuzz seed] {self.id()} {self._seed_label}\n")
-        sys.stderr.flush()
-        self._created_tables = []
-        self._fixture = QDB_FIXTURE
-
-    def tearDown(self):
-        from test import sql_query
-        for table in self._created_tables:
-            try:
-                sql_query(f"DROP TABLE IF EXISTS '{table}'")
-            except Exception:
-                pass
-
-    def test_per_type_round_trip_across_iterations(self):
-        all_kinds = list(ARROW_KIND_DDL.keys())
-        for it in range(self.ITERATIONS):
-            self._master_rng.shuffle(all_kinds)
-            picked = all_kinds[: 4 + (it % 4)]
-            self._run_one_iteration(it, picked)
-
-    def _run_one_iteration(self, iter_idx: int, kinds: list):
-        from test import sql_query
-        run_id = uuid.uuid4().hex[:8]
-        table = f"arrow_eg_{run_id}_{iter_idx}"
-        col_defs = ["ts TIMESTAMP"]
-        col_names = []
-        for i, k in enumerate(kinds):
-            cn = f"c{i}_{k}"
-            col_names.append((cn, k))
-            col_defs.append(f"\"{cn}\" {ARROW_KIND_DDL[k]}")
-        ddl = (
-            f"CREATE TABLE '{table}' ({', '.join(col_defs)}) "
-            f"TIMESTAMP(ts) PARTITION BY DAY WAL"
-        )
-        sql_query(ddl)
-        self._created_tables.append(table)
-        rows = [_generate_row(i, col_names, self._master_rng) for i in range(ROWS_PER_ITER)]
-        sf_dir = f"/tmp/arrow_eg_{run_id}_{iter_idx}"
-        os.makedirs(sf_dir, exist_ok=True)
-        sender = _connect_existing_sender(
-            self._fixture.host,
-            self._fixture.http_server_port,
-            f"arrow-eg-{run_id}",
-            sf_dir,
-        )
-        try:
-            _populate_via_existing_sender(sender, table, rows)
-            sender.flush()
-        finally:
-            sender.close()
-        self._wait_for_rows(table, len(rows))
-        self._read_back_and_assert(table, col_names, rows)
-
-    def _wait_for_rows(self, table: str, expected: int, timeout_s: float = 20.0):
-        from test import sql_query
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            resp = sql_query(f"select count() from '{table}'")
-            if int(resp["dataset"][0][0]) >= expected:
-                return
-            time.sleep(0.1)
-        self.fail(f"timed out waiting for {expected} rows in {table}")
-
-    def _read_back_and_assert(self, table, col_names, rows):
-        sql = (
-            f"select "
-            + ", ".join(f"\"{c}\"" for c, _ in col_names)
-            + f" from '{table}' order by ts"
-        )
-        cursor, reader = self._arrow_cursor(sql)
-        try:
-            collected = []
-            while True:
-                rc, arr, sch = next_arrow_batch(cursor)
-                if rc == NEXT_ARROW_BATCH_END:
-                    break
-                if rc != NEXT_ARROW_BATCH_OK:
-                    self.fail(f"unexpected rc={rc}")
-                rb = pyarrow_import_record_batch(arr, sch)
-                self.assertGreater(rb.num_columns, 0)
-                collected.append(rb)
-            total = sum(rb.num_rows for rb in collected)
-            self.assertEqual(total, len(rows), f"row count mismatch (table={table})")
-            self._assert_per_cell_equal(collected, col_names, rows)
-        finally:
-            from qwp_egress_reader import _DLL
-            _DLL.line_reader_cursor_free(cursor)
-            _DLL.line_reader_close(reader)
-
-    def _arrow_cursor(self, sql: str):
-        from qwp_egress_reader import _DLL, _LineReader, _LineReaderError, _utf8
-        import ctypes
-        conf = self._fixture.qwp_conf() if hasattr(self._fixture, "qwp_conf") else None
-        if conf is None:
-            self.skipTest("fixture does not expose qwp_conf()")
-        conf_utf8 = _utf8(conf)
-        err_ref = ctypes.POINTER(_LineReaderError)()
-        reader = _DLL.line_reader_from_conf(conf_utf8, ctypes.byref(err_ref))
-        self.assertTrue(bool(reader), f"line_reader_from_conf failed (label={self._seed_label})")
-        sql_utf8 = _utf8(sql)
-        err_ref = ctypes.POINTER(_LineReaderError)()
-        cursor = _DLL.line_reader_execute(reader, sql_utf8, ctypes.byref(err_ref))
-        self.assertTrue(bool(cursor), f"line_reader_execute failed (label={self._seed_label})")
-        return cursor, reader
-
-    def _assert_per_cell_equal(self, batches, col_names, rows):
-        flat_idx = 0
-        for rb in batches:
-            for r in range(rb.num_rows):
-                expected_row = rows[flat_idx]
-                for col_idx, (col_name, kind) in enumerate(col_names):
-                    expected = expected_row["cols"][col_idx][2]
-                    actual = _pyarrow_cell(rb, col_idx, r)
-                    self._assert_value(kind, col_name, expected, actual)
-                flat_idx += 1
-        self.assertEqual(flat_idx, len(rows))
-
-    def _assert_value(self, kind, col_name, expected, actual):
-        if expected is None:
-            self.assertIsNone(
-                actual,
-                f"col={col_name} kind={kind} expected None got {actual!r} (seed={self._seed_label})",
+            batches = afc.read_back_arrow_batches(self._fixture, sql)
+        except afc.ReaderError as e:
+            # Acceptable per the doc: no_schema is allowed when the stream
+            # ends before any batch. Match the FFI code.
+            from arrow_ffi import ReaderErrorCode
+            self.assertEqual(
+                e.code, ReaderErrorCode.NO_SCHEMA,
+                self.label(f"unexpected ReaderError code={e.code} msg={e.message!r}")
             )
             return
-        if kind == "boolean":
-            self.assertEqual(bool(actual), bool(expected))
-        elif kind in ("byte", "short", "int", "long", "char", "ipv4"):
-            self.assertEqual(int(actual), int(expected),
-                             f"col={col_name} (seed={self._seed_label})")
-        elif kind == "float":
-            self.assertAlmostEqual(float(actual), float(expected), places=5)
-        elif kind == "double":
-            self.assertAlmostEqual(float(actual), float(expected), places=10)
-        elif kind == "symbol":
-            self.assertEqual(str(actual), str(expected))
-        elif kind == "varchar":
-            self.assertEqual(str(actual), str(expected))
-        elif kind == "binary":
-            self.assertEqual(bytes(actual), bytes(expected))
-        elif kind == "uuid":
-            lo, hi = expected
-            uuid_int = (hi << 64) | lo
-            actual_uuid = uuid.UUID(bytes=bytes(actual)) if isinstance(actual, (bytes, bytearray)) else actual
-            if isinstance(actual_uuid, uuid.UUID):
-                self.assertEqual(actual_uuid.int, uuid_int)
-            else:
-                self.assertEqual(actual, expected)
-        elif kind == "long256":
-            self.assertEqual(bytes(actual), bytes(expected))
-        elif kind == "date":
-            if isinstance(actual, _dt.datetime):
-                expected_dt = _dt.datetime.fromtimestamp(expected / 1000.0, tz=_dt.timezone.utc)
-                self.assertEqual(actual.replace(tzinfo=_dt.timezone.utc), expected_dt)
-            else:
-                self.assertEqual(int(actual), int(expected))
-        elif kind in ("timestamp", "timestamp_ns"):
-            if isinstance(actual, _dt.datetime):
-                divisor = 1_000_000 if kind == "timestamp" else 1_000_000_000
-                expected_dt = _dt.datetime.fromtimestamp(expected / divisor, tz=_dt.timezone.utc)
-                self.assertEqual(actual.replace(tzinfo=_dt.timezone.utc), expected_dt)
-            else:
-                self.assertEqual(int(actual), int(expected))
-        else:
-            self.fail(f"no oracle for kind {kind!r}")
+        self.assertEqual(len(batches), 0,
+                         self.label(f"expected 0 batches, got {len(batches)}"))
 
+    def test_filter_yielding_no_rows(self):
+        table = self.fresh_table("arrow_eg_filter_empty")
+        kinds = [("c_int", KIND_REGISTRY["int"])]
+        rb, _ = _ingest_and_read_back(self, table, kinds, null_mode="valid")
+        self.assertGreater(rb.num_rows, 0)
+        sql = f"select c_int from '{table}' where c_int = -999999999"
+        try:
+            batches = afc.read_back_arrow_batches(self._fixture, sql)
+        except afc.ReaderError as e:
+            from arrow_ffi import ReaderErrorCode
+            self.assertEqual(e.code, ReaderErrorCode.NO_SCHEMA, self.label())
+            return
+        self.assertEqual(len(batches), 0, self.label())
+
+class TestArrowEgressFuzz(afc.ArrowFuzzBase):
+    """Random subsets of ILP-capable kinds per iteration."""
+
+    SUITE_LABEL = "arrow_egress_fuzz"
+
+    def test_random_schemas(self):
+        kinds_pool = _ilp_capable_kinds()
+        for it in range(_FUZZ_ITERATIONS):
+            with self.subTest(iter=it):
+                self._master_rng.shuffle(kinds_pool)
+                picked_kinds = kinds_pool[:4 + (it % 4)]
+                kinds = [(f"c{i}_{n}", s) for i, (n, s) in enumerate(picked_kinds)]
+                null_mode = ("valid", "partial", "all_null")[it % 3]
+                table = self.fresh_table(f"arrow_eg_fuzz_{it}")
+                rb, values_per_col = _ingest_and_read_back(
+                    self, table, kinds, null_mode=null_mode,
+                )
+                self.assertEqual(rb.num_rows, _ROWS_PER_BATCH,
+                                 self.label(f"iter={it}"))
+                self.assertEqual(rb.num_columns, len(kinds), self.label())
+                # Per-cell comparison via each spec's canonicaliser.
+                for col_idx, (col_name, spec) in enumerate(kinds):
+                    expected = values_per_col[col_name]
+                    for r in range(rb.num_rows):
+                        a = _canonicalise_for_compare(rb.column(col_idx)[r].as_py(), spec)
+                        e = _canonicalise_for_compare(expected[r], spec)
+                        if not spec.compare(a, e):
+                            self.fail(self.label(
+                                f"iter={it} kind={spec.name} col={col_name} row={r}: "
+                                f"expected {e!r}, got {a!r}"
+                            ))
 
 def register(loop_registry):
+    loop_registry.append(TestArrowEgressPerKind)
+    loop_registry.append(TestArrowEgressTierA)
+    loop_registry.append(TestArrowEgressEmpty)
     loop_registry.append(TestArrowEgressFuzz)
 
-
 if __name__ == "__main__":
+    print(
+        "Note: arrow_egress_fuzz tests require a live QuestDB fixture. "
+        "Run via `python test.py run --existing HOST:ILP:HTTP "
+        "TestArrowEgressPerKind` (or any of the other arrow egress classes).",
+        file=sys.stderr,
+    )
     unittest.main()

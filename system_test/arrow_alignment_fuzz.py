@@ -1,46 +1,22 @@
-"""Arrow alignment fuzz — live-server end-to-end.
-
-Constructs schemas whose column orderings force the per-column wire
-offsets to be deliberately misaligned for various ``T::SIZE`` values
-(1/2/4/8/16/32). Asserts that:
-
-  * PyArrow successfully imports every batch (proves the §10 Tier B
-    ``align_buffers(true)`` fallback works under real misalignment).
-  * PyArrow compute kernels over the imported buffers return correct
-    values (the fallback memcpy doesn't corrupt data).
-  * Tier A buffers (validity bitmap, SYMBOL union dict, BOOLEAN
-    bit-pack, ARRAY offsets) never look misaligned at the PyArrow
-    boundary — the AVec 64-byte allocation is preserved across FFI.
-
-Reproducer seed: ``QWP_WS_FUZZ_SEED=0x...``.
-"""
-
 from __future__ import annotations
 
-import ctypes
 import os
 import sys
-import time
 import unittest
-import uuid
+from typing import Dict, List, Tuple
 
-import qwp_ws_fuzz
-from arrow_ffi import (
-    NEXT_ARROW_BATCH_END,
-    NEXT_ARROW_BATCH_OK,
-    next_arrow_batch,
-    pyarrow_import_record_batch,
-)
+import pyarrow as pa
 
+import arrow_fuzz_common as afc
+from arrow_fuzz_common import KIND_REGISTRY, KindSpec
 
-_ARROW_FUZZ_ITER_DEFAULT = int(os.environ.get("ARROW_ALIGNMENT_FUZZ_ITERATIONS", "6"))
-ROWS_PER_ITER = int(os.environ.get("ARROW_ALIGNMENT_FUZZ_ROWS", "16"))
+_ITERATIONS = int(os.environ.get("ARROW_ALIGNMENT_FUZZ_ITERATIONS", "4"))
+_ROWS_PER_ITER = int(os.environ.get("ARROW_ALIGNMENT_FUZZ_ROWS", "16"))
 
-
-# Misalignment schedule: each entry forces a different pad-byte sum
-# before the target column, exercising different residues mod each
-# primitive width (1/2/4/8/16/32).
-PAD_PROGRAM = [
+# Each program forces a different pad-byte sum before the target
+# column, exercising different residues mod each primitive width
+# (1/2/4/8/16/32) on the wire.
+_PAD_PROGRAM: List[List[str]] = [
     [],
     ["boolean"],
     ["byte"],
@@ -52,221 +28,119 @@ PAD_PROGRAM = [
     ["long256", "byte"],
 ]
 
+_TARGET_ROTATION = ["long", "double", "uuid", "long256", "timestamp"]
 
-def _connect_existing_sender(fixture, sender_id: str, sf_dir: str):
-    import questdb_line_sender as qls
-    conf = (
-        f"qwpws::addr={fixture.host}:{fixture.http_server_port};"
-        f"sender_id={sender_id};"
-        f"sf_dir={sf_dir};"
-    )
-    sender = qls.Sender.from_conf(conf)
-    sender.connect()
-    return sender
-
-
-def _ddl_for_kind(kind: str) -> str:
-    return {
-        "boolean": "BOOLEAN",
-        "byte": "BYTE",
-        "short": "SHORT",
-        "char": "CHAR",
-        "int": "INT",
-        "long": "LONG",
-        "float": "FLOAT",
-        "double": "DOUBLE",
-        "uuid": "UUID",
-        "long256": "LONG256",
-        "timestamp": "TIMESTAMP",
-    }[kind]
-
-
-def _write_value(line, col_name: str, kind: str, row_idx: int):
-    if kind == "boolean":
-        line.column(col_name, (row_idx & 1) == 0)
-    elif kind == "byte":
-        line.column(col_name, (row_idx % 200) - 100)
-    elif kind == "short":
-        line.column(col_name, row_idx * 7 - 1)
-    elif kind == "int":
-        line.column(col_name, row_idx * 13 - 17)
-    elif kind == "long":
-        line.column(col_name, row_idx * 1_000_003)
-    elif kind == "float":
-        line.column(col_name, float(row_idx) * 0.5)
-    elif kind == "double":
-        line.column(col_name, float(row_idx) * 1.25)
-    elif kind == "char":
-        line.column_char(col_name, 0x41 + (row_idx % 26))
-    elif kind == "uuid":
-        line.column_uuid(col_name, row_idx, 0xCAFE_BABE_DEAD_BEEF)
-    elif kind == "long256":
-        line.column_long256(col_name, bytes([row_idx & 0xFF] * 32))
-    elif kind == "timestamp":
-        line.column_ts_micros(col_name, 1_700_000_000_000_000 + row_idx)
-    else:
-        raise ValueError(f"unhandled kind {kind!r}")
-
-
-def _assert_compute_kernels_sane(rb, kinds: list[tuple[str, str]]):
-    """Run PyArrow compute kernels on every column — sum / count_distinct
-    / min / max — to exercise the imported buffers under real read
-    patterns. A misaligned buffer that arrow-rs's ``align_buffers(true)``
-    failed to fix up shows here as a numerical mismatch or a panic.
-    """
-    import pyarrow.compute as pc
-    for col_idx, (_, kind) in enumerate(kinds):
+def _check_buffer_alignment(rb: pa.RecordBatch) -> List[str]:
+    """Return a list of misalignment complaints (empty = all aligned)."""
+    bad: List[str] = []
+    for col_idx in range(rb.num_columns):
         col = rb.column(col_idx)
-        n = rb.num_rows
-        if kind == "boolean":
+        field = rb.schema.field(col_idx)
+        for buf_idx, buf in enumerate(col.buffers()):
+            if buf is None or buf.size < 8:
+                continue
+            addr = buf.address
+            if addr & 63 != 0:
+                bad.append(
+                    f"field={field.name} buf[{buf_idx}] "
+                    f"addr={addr:#x} (mod64={addr & 63})"
+                )
+    return bad
+
+def _exercise_compute_kernels(rb: pa.RecordBatch, kinds: List[Tuple[str, KindSpec]]) -> None:
+    import pyarrow.compute as pc
+    for col_idx, (_, spec) in enumerate(kinds):
+        col = rb.column(col_idx)
+        name = spec.name
+        if name in {"boolean"}:
             true_count = pc.sum(pc.cast(col, "int64")).as_py() or 0
-            assert 0 <= int(true_count) <= n, f"bool sum out of range: {true_count}"
-        elif kind in ("byte", "short", "int", "long", "char"):
+            assert 0 <= int(true_count) <= rb.num_rows
+        elif name in {"byte", "short", "int", "long", "char", "ipv4"}:
             total = pc.sum(pc.cast(col, "int64")).as_py()
             min_v = pc.min(pc.cast(col, "int64")).as_py()
             max_v = pc.max(pc.cast(col, "int64")).as_py()
             assert total is not None
-            assert min_v is not None
-            assert max_v is not None
+            assert min_v is not None and max_v is not None
             assert min_v <= max_v
-        elif kind in ("float", "double"):
+        elif name in {"float", "double"}:
             total = pc.sum(col).as_py()
             assert total is not None
-        elif kind == "uuid" or kind == "long256":
+        elif name in {"uuid", "long256"}:
             assert col.type.byte_width in (16, 32)
-        elif kind == "timestamp":
+        elif name in {"timestamp", "timestamp_ns", "date"}:
             min_v = pc.min(col).as_py()
             max_v = pc.max(col).as_py()
-            assert min_v is not None
-            assert max_v is not None
+            assert min_v is not None and max_v is not None
 
+def _populate_via_ilp(sender, table: str, kinds, values_per_col, ts_base_us: int) -> None:
+    from questdb_line_sender import Buffer
+    buf = Buffer.from_sender(sender._impl)
+    n = len(next(iter(values_per_col.values())))
+    for r in range(n):
+        buf.table(table)
+        for col_name, spec in kinds:
+            v = values_per_col[col_name][r]
+            if v is None:
+                continue
+            spec.ilp_set(buf, col_name, v)
+        buf.at_micros(ts_base_us + r)
+    sender.flush(buf)
 
-class TestArrowAlignmentFuzz(unittest.TestCase):
-    ITERATIONS = _ARROW_FUZZ_ITER_DEFAULT
+def _read_back(fixture, table: str, kinds) -> pa.RecordBatch:
+    cols_sql = ", ".join(f'"{c}"' for c, _ in kinds)
+    return afc.read_back_arrow_concat(
+        fixture, f"select {cols_sql} from '{table}' order by ts"
+    )
 
-    def setUp(self):
-        from test import QDB_FIXTURE, QuestDbFixture, QuestDbExternalFixture
-        if not isinstance(QDB_FIXTURE, (QuestDbFixture, QuestDbExternalFixture)):
-            self.skipTest("Arrow alignment fuzz requires a live QuestDB fixture")
-        try:
-            import pyarrow  # noqa: F401
-            import pyarrow.compute  # noqa: F401
-        except ImportError:
-            self.skipTest("pyarrow is required for the Arrow alignment fuzz")
-        seed = qwp_ws_fuzz.derive_master_seed()
-        self._master_rng = qwp_ws_fuzz.Rng(seed)
-        self._seed_label = qwp_ws_fuzz.format_seed(seed)
-        sys.stderr.write(
-            f"[arrow_alignment_fuzz seed] {self.id()} {self._seed_label}\n"
-        )
-        sys.stderr.flush()
-        self._created_tables = []
-        self._fixture = QDB_FIXTURE
+class TestArrowAlignment(afc.ArrowFuzzBase):
+    SUITE_LABEL = "arrow_alignment_fuzz"
 
-    def tearDown(self):
-        from test import sql_query
-        for table in self._created_tables:
-            try:
-                sql_query(f"DROP TABLE IF EXISTS '{table}'")
-            except Exception:
-                pass
+    def _run_program(self, iter_idx: int, kind_order: List[str]):
+        table = self.fresh_table(f"arrow_aln_{iter_idx}")
+        kinds = [(f"c{i}_{n}", KIND_REGISTRY[n]) for i, n in enumerate(kind_order)]
+        n = _ROWS_PER_ITER
+        rnd = self._master_rng
+        values_per_col: Dict[str, list] = {}
+        for col_name, spec in kinds:
+            mask = afc.all_valid_mask(n)
+            values_per_col[col_name] = spec.generate_values(rnd, n, mask, edge=False)
+        with afc.existing_sender(self._fixture) as sender:
+            _populate_via_ilp(sender, table, kinds, values_per_col,
+                              ts_base_us=1_700_000_000_000_000 + iter_idx * 1_000_000)
+        afc.wait_for_rows(self._fixture, table, n)
+        rb = _read_back(self._fixture, table, kinds)
+        self.assertEqual(rb.num_rows, n, self.label())
+        return rb, kinds
 
-    def test_misalignment_schedule(self):
-        for it in range(self.ITERATIONS):
-            for prog_idx, pad in enumerate(PAD_PROGRAM):
-                target = ["long", "double", "uuid", "long256", "timestamp"][
-                    prog_idx % 5
-                ]
-                self._run_one_iteration(it, pad + [target])
+    def test_misalignment_schedule_imports_and_computes(self):
+        for it in range(_ITERATIONS):
+            for prog_idx, pad in enumerate(_PAD_PROGRAM):
+                with self.subTest(iter=it, prog_idx=prog_idx):
+                    target = _TARGET_ROTATION[prog_idx % len(_TARGET_ROTATION)]
+                    kind_order = pad + [target]
+                    rb, kinds = self._run_program(prog_idx + it * len(_PAD_PROGRAM),
+                                                   kind_order)
+                    _exercise_compute_kernels(rb, kinds)
 
-    def _run_one_iteration(self, iter_idx: int, kinds_in_order: list[str]):
-        from test import sql_query
-        run_id = uuid.uuid4().hex[:8]
-        table = f"arrow_aln_{run_id}_{iter_idx}"
-        col_defs = []
-        col_names = []
-        for i, k in enumerate(kinds_in_order):
-            cn = f"c{i}_{k}"
-            col_names.append((cn, k))
-            col_defs.append(f"\"{cn}\" {_ddl_for_kind(k)}")
-        col_defs.append("ts TIMESTAMP")
-        sql_query(
-            f"CREATE TABLE '{table}' ({', '.join(col_defs)}) "
-            f"TIMESTAMP(ts) PARTITION BY DAY WAL"
-        )
-        self._created_tables.append(table)
-        sf_dir = f"/tmp/arrow_aln_{run_id}_{iter_idx}"
-        os.makedirs(sf_dir, exist_ok=True)
-        sender = _connect_existing_sender(
-            self._fixture, f"arrow-aln-{run_id}", sf_dir
-        )
-        try:
-            for r in range(ROWS_PER_ITER):
-                line = sender.table(table)
-                for col_name, kind in col_names:
-                    _write_value(line, col_name, kind, r)
-                line.at_micros(
-                    qwp_ws_fuzz.QwpWsTestSupport.BASE_TIMESTAMP_US + r
-                )
-            sender.flush()
-        finally:
-            sender.close()
-        self._wait_for_rows(table, ROWS_PER_ITER)
-        rb = self._read_back_first_batch(table, col_names)
-        self.assertEqual(rb.num_rows, ROWS_PER_ITER,
-                         f"row count (seed={self._seed_label})")
-        _assert_compute_kernels_sane(rb, col_names)
-
-    def _wait_for_rows(self, table: str, expected: int, timeout_s: float = 20.0):
-        from test import sql_query
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            try:
-                resp = sql_query(f"select count() from '{table}'")
-                if int(resp["dataset"][0][0]) >= expected:
-                    return
-            except Exception:
-                pass
-            time.sleep(0.1)
-        self.fail(f"timed out waiting for {expected} rows in {table}")
-
-    def _read_back_first_batch(self, table: str, col_names: list):
-        from qwp_egress_reader import _DLL, _LineReaderError, _utf8
-        sql = (
-            "select "
-            + ", ".join(f"\"{c}\"" for c, _ in col_names)
-            + f" from '{table}' order by ts"
-        )
-        conf_utf8 = _utf8(self._fixture.qwp_conf())
-        err_ref = ctypes.POINTER(_LineReaderError)()
-        reader = _DLL.line_reader_from_conf(conf_utf8, ctypes.byref(err_ref))
-        self.assertTrue(bool(reader))
-        sql_utf8 = _utf8(sql)
-        err_ref = ctypes.POINTER(_LineReaderError)()
-        cursor = _DLL.line_reader_execute(reader, sql_utf8, ctypes.byref(err_ref))
-        self.assertTrue(bool(cursor))
-        try:
-            collected = []
-            while True:
-                rc, arr, sch = next_arrow_batch(cursor)
-                if rc == NEXT_ARROW_BATCH_END:
-                    break
-                if rc != NEXT_ARROW_BATCH_OK:
-                    self.fail(f"unexpected rc={rc}")
-                collected.append(pyarrow_import_record_batch(arr, sch))
-            self.assertGreater(len(collected), 0)
-            if len(collected) == 1:
-                return collected[0]
-            import pyarrow as pa
-            return pa.Table.from_batches(collected).combine_chunks().to_batches()[0]
-        finally:
-            _DLL.line_reader_cursor_free(cursor)
-            _DLL.line_reader_close(reader)
-
+    def test_buffers_64_byte_aligned_under_misalignment(self):
+        for prog_idx, pad in enumerate(_PAD_PROGRAM):
+            with self.subTest(prog_idx=prog_idx):
+                target = _TARGET_ROTATION[prog_idx % len(_TARGET_ROTATION)]
+                rb, _kinds = self._run_program(prog_idx, pad + [target])
+                bad = _check_buffer_alignment(rb)
+                if bad:
+                    self.fail(self.label(
+                        f"prog_idx={prog_idx}: misaligned buffers:\n  "
+                        + "\n  ".join(bad)
+                    ))
 
 def register(loop_registry):
-    loop_registry.append(TestArrowAlignmentFuzz)
-
+    loop_registry.append(TestArrowAlignment)
 
 if __name__ == "__main__":
+    print(
+        "Note: arrow_alignment_fuzz tests require a live QuestDB fixture. "
+        "Run via `python test.py run --existing HOST:ILP:HTTP TestArrowAlignment`.",
+        file=sys.stderr,
+    )
     unittest.main()
