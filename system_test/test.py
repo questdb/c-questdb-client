@@ -27,6 +27,9 @@
 import sys
 
 sys.dont_write_bytecode = True
+
+sys.modules.setdefault('test', sys.modules[__name__])
+
 import os
 import pathlib
 import math
@@ -44,10 +47,31 @@ import questdb_line_sender as qls
 import qwp_ws_fuzz
 import uuid
 
-from arrow_egress_fuzz import TestArrowEgressFuzz  # noqa: F401
-from arrow_ingress_fuzz import TestArrowIngressFuzz  # noqa: F401
-from arrow_round_trip_fuzz import TestArrowRoundTripFuzz  # noqa: F401
-from arrow_alignment_fuzz import TestArrowAlignmentFuzz  # noqa: F401
+from arrow_egress_fuzz import (  # noqa: F401
+    TestArrowEgressPerKind,
+    TestArrowEgressTierA,
+    TestArrowEgressEmpty,
+    TestArrowEgressFuzz,
+)
+from arrow_ingress_fuzz import (  # noqa: F401
+    TestArrowIngressPerKind,
+    TestArrowIngressDesignatedTs,
+    TestArrowIngressErrors,
+    TestArrowIngressMultiBatch,
+    TestArrowIngressFuzz,
+)
+from arrow_round_trip_fuzz import (  # noqa: F401
+    TestArrowRoundTripPerKind,
+    TestArrowRoundTripFuzz,
+)
+from arrow_alignment_fuzz import TestArrowAlignment  # noqa: F401
+from test_arrow_fuzz_common_unit import (  # noqa: F401
+    TestKindRegistryCompleteness,
+    TestCompareSemantics,
+    TestRngDeterminism,
+    TestBuildRecordBatch,
+    TestEdgeCorpora,
+)
 from fixture import (
     Project,
     QuestDbFixtureBase,

@@ -1,4 +1,12 @@
 steps:
+  - bash: |
+      df -h /
+      sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                  /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+      sudo docker image prune --all --force >/dev/null 2>&1 || true
+      df -h /
+    condition: eq(variables['imageName'], 'ubuntu-latest')
+    displayName: "Free disk space (Microsoft-hosted ubuntu)"
   - script: |
       rustup update $(toolchain)
       rustup default $(toolchain)

@@ -9,11 +9,13 @@ Layout of `ArrowArray` / `ArrowSchema` mirrors the Apache Arrow spec:
 from __future__ import annotations
 
 import ctypes
-from typing import Tuple
+from typing import Optional, Tuple
 
 from questdb_line_sender import (  # type: ignore[attr-defined]
     _DLL,
+    SenderError as _SenderError,
     c_line_sender_error as _LineSenderError,
+    c_line_sender_error_p as _LineSenderErrorPtr,
     c_line_sender_table_name as _LineSenderTableName,
     c_line_sender_buffer as _LineSenderBuffer,
 )
@@ -21,6 +23,41 @@ from qwp_egress_reader import (  # type: ignore[attr-defined]
     _LineReaderCursor,
     _LineReaderError,
 )
+
+
+# The wider Python wrapper registered `line_sender_error_get_code` with the
+# wrong restype/argtypes (it never called the function, so the bug went
+# unnoticed). Re-register it here with the correct C ABI — ctypes uses a
+# single Function object per DLL symbol, so the override is global.
+_DLL.line_sender_error_get_code.restype = ctypes.c_int
+_DLL.line_sender_error_get_code.argtypes = [_LineSenderErrorPtr]
+
+
+class ArrowSenderError(_SenderError):
+    """`SenderError` carrying the `line_sender_error_code` discriminant."""
+
+    def __init__(self, message: str, code: int, qwp_ws_error=None) -> None:
+        super().__init__(message, qwp_ws_error)
+        self.code = code
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        return f"[code={self.code}] {base}"
+
+
+def _take_sender_error(err_ptr) -> ArrowSenderError:
+    code = int(_DLL.line_sender_error_get_code(err_ptr))
+    c_len = ctypes.c_size_t(0)
+    raw = _DLL.line_sender_error_msg(err_ptr, ctypes.byref(c_len))
+    msg = (
+        ctypes.string_at(raw, c_len.value).decode("utf-8", "replace")
+        if raw and c_len.value
+        else ""
+    )
+    from questdb_line_sender import _qwpws_error_from_sender_error  # late bind
+    qwp_view = _qwpws_error_from_sender_error(err_ptr)
+    _DLL.line_sender_error_free(err_ptr)
+    return ArrowSenderError(msg, code, qwp_view)
 
 
 class ArrowArray(ctypes.Structure):
@@ -66,6 +103,56 @@ NEXT_ARROW_BATCH_ERROR = 2
 DTS_COLUMN = 0
 DTS_NOW = 1
 DTS_SERVER_NOW = 2
+
+
+class SenderErrorCode:
+    """`line_sender_error_code` discriminants. Pinned in
+    `questdb-rs-ffi/src/lib.rs::line_sender_error_code_discriminants_are_abi_stable`."""
+    COULD_NOT_RESOLVE_ADDR = 0
+    INVALID_API_CALL = 1
+    SOCKET_ERROR = 2
+    INVALID_UTF8 = 3
+    INVALID_NAME = 4
+    INVALID_TIMESTAMP = 5
+    AUTH_ERROR = 6
+    TLS_ERROR = 7
+    HTTP_NOT_SUPPORTED = 8
+    SERVER_FLUSH_ERROR = 9
+    CONFIG_ERROR = 10
+    ARRAY_ERROR = 11
+    PROTOCOL_VERSION_ERROR = 12
+    INVALID_DECIMAL = 13
+    SERVER_REJECTION = 14
+    ARROW_UNSUPPORTED_COLUMN_KIND = 15
+    ARROW_INGEST = 16
+
+
+class ReaderErrorCode:
+    """`line_reader_error_code` discriminants. Pinned in
+    `questdb-rs-ffi/src/egress.rs::line_reader_error_code`."""
+    COULD_NOT_RESOLVE_ADDR = 0
+    CONFIG_ERROR = 1
+    INVALID_API_CALL = 2
+    SOCKET_ERROR = 3
+    TLS_ERROR = 4
+    HANDSHAKE_ERROR = 5
+    AUTH_ERROR = 6
+    UNSUPPORTED_SERVER = 7
+    ROLE_MISMATCH = 8
+    PROTOCOL_ERROR = 9
+    INVALID_UTF8 = 10
+    INVALID_BIND = 11
+    SERVER_SCHEMA_MISMATCH = 14
+    SERVER_PARSE_ERROR = 15
+    SERVER_INTERNAL_ERROR = 16
+    SERVER_SECURITY_ERROR = 17
+    LIMIT_EXCEEDED = 18
+    SERVER_LIMIT_EXCEEDED = 19
+    CANCELLED = 20
+    FAILOVER_WOULD_DUPLICATE = 21
+    SCHEMA_DRIFT = 22
+    NO_SCHEMA = 23
+    ARROW_EXPORT = 24
 
 
 def _setsig(name, restype, *argtypes):
@@ -126,7 +213,8 @@ def buffer_append_arrow(
     ts_column_name: bytes,
 ) -> None:
     """Drive `line_sender_buffer_append_arrow`. Consumes `array_ptr`'s
-    ownership; `schema_ptr` remains the caller's."""
+    ownership; `schema_ptr` remains the caller's. Raises
+    `ArrowSenderError` with `.code` populated on failure."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     name_bytes = ts_column_name if ts_column_name is not None else b""
     ok = _append_arrow(
@@ -140,8 +228,7 @@ def buffer_append_arrow(
         ctypes.byref(err_ref),
     )
     if not ok:
-        from questdb_line_sender import _c_err_to_py  # type: ignore[attr-defined]
-        raise _c_err_to_py(err_ref)
+        raise _take_sender_error(err_ref)
 
 
 def pyarrow_export_record_batch(record_batch) -> Tuple[ArrowArray, ArrowSchema]:
