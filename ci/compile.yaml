@@ -14,12 +14,12 @@ steps:
     displayName: "Update and set Rust toolchain"
   - script: |
       brew install numpy
-      python3 -m pip install --break-system-packages pyarrow
+      python3 -m pip install --break-system-packages pyarrow polars
     condition: eq(variables['imageName'], 'macos-latest')
-    displayName: "Install numpy + pyarrow on macOS"
+    displayName: "Install numpy + pyarrow + polars on macOS"
   - script: |
       python -m pip install --upgrade pip
-      pip install numpy pyarrow
+      pip install numpy pyarrow polars
     condition: |
       and(
         ne(variables['imageName'], 'macos-latest'),

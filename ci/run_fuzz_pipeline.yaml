@@ -138,7 +138,7 @@ stages:
               set -eux
               sudo apt-get update
               sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
-              sudo python3 -m pip install --break-system-packages pyarrow
+              sudo python3 -m pip install --break-system-packages pyarrow polars
               # Image-provided JDK paths (see provision.sh's
               # `apt-get install -y openjdk-17-jdk openjdk-25-jdk maven`).
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
@@ -204,7 +204,9 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb \
                 TestArrowEgressFuzz TestArrowIngressFuzz \
-                TestArrowRoundTripFuzz TestArrowAlignment -v
+                TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes \
+                TestArrowRoundTripFuzz TestArrowAlignment \
+                TestArrowPolarsFuzz TestArrowPolarsPerDtype -v
             displayName: "TestArrowFuzz"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"

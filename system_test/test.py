@@ -56,12 +56,21 @@ from arrow_ingress_fuzz import (  # noqa: F401
     TestArrowIngressPerKind,
     TestArrowIngressDesignatedTs,
     TestArrowIngressErrors,
+    TestArrowIngressExtraTypes,
+    TestArrowIngressUnsupportedTypes,
     TestArrowIngressMultiBatch,
     TestArrowIngressFuzz,
 )
 from arrow_round_trip_fuzz import (  # noqa: F401
     TestArrowRoundTripPerKind,
     TestArrowRoundTripFuzz,
+)
+from arrow_polars_fuzz import (  # noqa: F401
+    TestArrowPolarsRoundTripPerKind,
+    TestArrowPolarsFuzz,
+)
+from arrow_polars_per_dtype import (  # noqa: F401
+    TestArrowPolarsPerDtype,
 )
 from arrow_alignment_fuzz import TestArrowAlignment  # noqa: F401
 from test_arrow_fuzz_common_unit import (  # noqa: F401

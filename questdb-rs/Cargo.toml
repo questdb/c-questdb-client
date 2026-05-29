@@ -95,6 +95,9 @@ slugify = "0.1.0"
 indoc = "2"
 
 [dev-dependencies]
+# Pulled in transitively by `arrow-array`; named explicitly here so unit
+# tests under `ingress::arrow::tests` can build `Float16Array` payloads.
+half = "2"
 socket2 = "0.6.1"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
@@ -204,7 +207,7 @@ arrow = [
 ]
 
 ## Polars sub-feature. ~30 lines of wrappers on top of `arrow`.
-polars = ["arrow", "dep:polars", "dep:polars-arrow"]
+polars = ["arrow", "sync-reader-ws", "dep:polars", "dep:polars-arrow"]
 
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at

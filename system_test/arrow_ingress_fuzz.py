@@ -667,6 +667,138 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
         rb = pa.RecordBatch.from_arrays([c_geo, ts_arr], schema=schema)
         self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
 
+class TestArrowIngressExtraTypes(afc.ArrowFuzzBase):
+    """Arrow primitive variants that don't surface via polars but are
+    accepted by the Rust ingest path through a widening / unit conversion:
+    Float16, Date64, Timestamp(s), Decimal32."""
+
+    SUITE_LABEL = "arrow_ingress_extra_types"
+
+    def _ts_arr(self, n: int) -> pa.Array:
+        return pa.array(
+            [1_700_000_000_000_000 + i for i in range(n)],
+            type=pa.timestamp("us", tz="UTC"),
+        )
+
+    def _ingest_one_col(self, table: str, ddl_col: str, col_name: str,
+                        col_arr: pa.Array) -> None:
+        afc.exec_ddl(
+            self._fixture,
+            f'CREATE TABLE "{table}" ("{col_name}" {ddl_col}, ts TIMESTAMP) '
+            f'TIMESTAMP(ts) PARTITION BY DAY WAL',
+        )
+        ts_arr = self._ts_arr(len(col_arr))
+        schema = pa.schema([
+            pa.field(col_name, col_arr.type, nullable=True),
+            pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+        ])
+        rb = pa.RecordBatch.from_arrays([col_arr, ts_arr], schema=schema)
+        afc.ingest_via_arrow(self._fixture, table, rb,
+                              ts_kind=DTS_COLUMN, ts_col=b"ts")
+        afc.wait_for_rows(self._fixture, table, len(col_arr))
+
+    def test_extra_float16_widens_to_double(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy required to build Float16 arrays via pyarrow")
+        arr = pa.array(np.array([1.5, -2.5, 0.0, 1.0], dtype=np.float16))
+        self.assertEqual(arr.type, pa.float16())
+        table = self.fresh_table("arrow_extra_f16")
+        self._ingest_one_col(table, "FLOAT", "c", arr)
+
+    def test_extra_date64_appends_as_date(self):
+        # Date64 stores ms-since-epoch as i64.
+        day_ms = 86_400_000
+        arr = pa.array([0, day_ms * 19_675, day_ms * 20_000, None],
+                       type=pa.date64())
+        table = self.fresh_table("arrow_extra_d64")
+        self._ingest_one_col(table, "DATE", "c", arr)
+
+    def test_extra_timestamp_second_widens_to_micros(self):
+        arr = pa.array([1_700_000_000, 0, 1, None],
+                       type=pa.timestamp("s", tz="UTC"))
+        table = self.fresh_table("arrow_extra_ts_s")
+        self._ingest_one_col(table, "TIMESTAMP", "c", arr)
+
+    def test_extra_decimal32_widens_to_decimal64(self):
+        arr = pa.array([Decimal("1.23"), Decimal("-0.99"),
+                        Decimal("99.99"), None],
+                       type=pa.decimal32(9, 2))
+        table = self.fresh_table("arrow_extra_d32")
+        self._ingest_one_col(table, "DECIMAL(18, 2)", "c", arr)
+
+
+class TestArrowIngressUnsupportedTypes(afc.ArrowFuzzBase):
+    """Arrow primitive variants that QuestDB ingress explicitly rejects
+    with ARROW_UNSUPPORTED_COLUMN_KIND."""
+
+    SUITE_LABEL = "arrow_ingress_unsupported"
+
+    def _expect_unsupported(self, col_arr: pa.Array) -> None:
+        n = len(col_arr)
+        ts_arr = pa.array(
+            [1_700_000_000_000_000 + i for i in range(n)],
+            type=pa.timestamp("us", tz="UTC"),
+        )
+        schema = pa.schema([
+            pa.field("c", col_arr.type, nullable=True),
+            pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+        ])
+        rb = pa.RecordBatch.from_arrays([col_arr, ts_arr], schema=schema)
+        table = self.fresh_table("arrow_in_reject")
+        try:
+            afc.ingest_via_arrow(self._fixture, table, rb,
+                                  ts_kind=DTS_COLUMN, ts_col=b"ts")
+        except ArrowSenderError as e:
+            self.assertEqual(
+                e.code, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND,
+                self.label(f"code={e.code} msg={e}")
+            )
+            return
+        self.fail(self.label(
+            f"expected ARROW_UNSUPPORTED_COLUMN_KIND for arrow type {col_arr.type}"
+        ))
+
+    def test_reject_interval_month_day_nano(self):
+        arr = pa.array([(1, 2, 3)], type=pa.month_day_nano_interval())
+        self._expect_unsupported(arr)
+
+    def test_reject_map_string_int32(self):
+        arr = pa.array([[("k", 1)], [("q", 2)]],
+                       type=pa.map_(pa.string(), pa.int32()))
+        self._expect_unsupported(arr)
+
+    def test_reject_struct(self):
+        arr = pa.StructArray.from_arrays(
+            [pa.array([1, 2], type=pa.int32()),
+             pa.array(["a", "b"], type=pa.string())],
+            names=["x", "y"],
+        )
+        self._expect_unsupported(arr)
+
+    def test_reject_dense_union(self):
+        arr = pa.UnionArray.from_dense(
+            pa.array([0, 1, 0], type=pa.int8()),
+            pa.array([0, 0, 1], type=pa.int32()),
+            [pa.array([1, 2]), pa.array(["x"])],
+            ["i", "s"],
+        )
+        self._expect_unsupported(arr)
+
+    def test_reject_run_end_encoded(self):
+        arr = pa.RunEndEncodedArray.from_arrays([3], pa.array([42]))
+        self._expect_unsupported(arr)
+
+    def test_reject_fixed_size_binary_non_uuid_width(self):
+        arr = pa.array([b"12345678"], type=pa.binary(8))
+        self._expect_unsupported(arr)
+
+    def test_reject_null(self):
+        arr = pa.array([None, None, None], type=pa.null())
+        self._expect_unsupported(arr)
+
+
 class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
     """Multiple `buffer_append_arrow` calls on one Buffer before flush."""
 
@@ -780,6 +912,8 @@ def register(loop_registry):
     loop_registry.append(TestArrowIngressPerKind)
     loop_registry.append(TestArrowIngressDesignatedTs)
     loop_registry.append(TestArrowIngressErrors)
+    loop_registry.append(TestArrowIngressExtraTypes)
+    loop_registry.append(TestArrowIngressUnsupportedTypes)
     loop_registry.append(TestArrowIngressMultiBatch)
     loop_registry.append(TestArrowIngressFuzz)
 

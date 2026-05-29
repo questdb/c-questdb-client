@@ -181,7 +181,7 @@ stages:
               # debian-installed packages because the wheel RECORD file is
               # missing). --break-system-packages overrides PEP 668.
               sudo apt-get install -y --no-install-recommends cmake python3-pip
-              sudo python3 -m pip install --break-system-packages 'numpy>=2' pyarrow
+              sudo python3 -m pip install --break-system-packages 'numpy>=2' pyarrow polars
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
               JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
               for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
@@ -361,7 +361,7 @@ stages:
               set -eux
               sudo apt-get update
               sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
-              sudo python3 -m pip install --break-system-packages pyarrow
+              sudo python3 -m pip install --break-system-packages pyarrow polars
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
               JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
               for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
@@ -418,7 +418,9 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb \
                 TestArrowEgressFuzz TestArrowIngressFuzz \
-                TestArrowRoundTripFuzz TestArrowAlignment -v
+                TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes \
+                TestArrowRoundTripFuzz TestArrowAlignment \
+                TestArrowPolarsFuzz TestArrowPolarsPerDtype -v
             displayName: "TestArrowWsFuzz"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"
