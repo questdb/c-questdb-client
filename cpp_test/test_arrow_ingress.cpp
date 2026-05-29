@@ -419,11 +419,13 @@ TEST_CASE("arrow ingress: DTS=ServerNow omits per-row timestamp")
 TEST_CASE("arrow ingress: Decimal64 / Decimal128 / Decimal256")
 {
     // Decimal64 (i64 mantissa, scale=2).
+    // Format must carry explicit ",64" — Arrow C Data Interface defaults
+    // `"d:p,s"` (no bitwidth) to Decimal128, not Decimal64.
     {
         auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int64_t>({12345, 67890});
         auto arr = make_array(2, 0, {nullptr, col});
-        auto sch = make_schema("d:18,2", "d64");
+        auto sch = make_schema("d:18,2,64", "d64");
         append_ok(buf, "t_d64", arr, sch, ts_kind::now);
     }
     // Decimal128 (i128 mantissa, scale=3).

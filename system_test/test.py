@@ -154,7 +154,7 @@ def _suite_kind(test):
         return SUITE_QWP_WS_PROTOCOL
     if class_name == 'TestQwpWsRestart':
         return SUITE_QWP_WS_RESTART
-    if class_name == 'TestQwpWsFuzz':
+    if class_name == 'TestQwpWsFuzz' or class_name.startswith('TestArrow'):
         return SUITE_QWP_WS_FUZZ
     return SUITE_MATRIX
 
