@@ -49,7 +49,6 @@ import uuid
 
 from arrow_egress_fuzz import (  # noqa: F401
     TestArrowEgressPerKind,
-    TestArrowEgressTierA,
     TestArrowEgressEmpty,
     TestArrowEgressFuzz,
 )

@@ -84,20 +84,107 @@ def _iso_to_ns(s: str) -> int:
 def _iso_to_ms(s: str) -> int:
     return _iso_to_us(s) // 1_000
 
+_INT_NULL_SENTINEL = -(1 << 31)
+_LONG_NULL_SENTINEL = -(1 << 63)
+_IPV4_NULL_SENTINEL = 0
+
+
 def _cmp_int(expected, actual) -> bool:
     if expected is None or actual is None or actual == "":
         return expected is None and (actual is None or actual == "")
     return int(expected) == int(actual)
 
-def _cmp_float(expected, actual) -> bool:
+
+def _cmp_int32(expected, actual) -> bool:
+    if expected == _INT_NULL_SENTINEL:
+        expected = None
+    return _cmp_int(expected, actual)
+
+
+def _cmp_int64(expected, actual) -> bool:
+    if expected == _LONG_NULL_SENTINEL:
+        expected = None
+    return _cmp_int(expected, actual)
+
+
+def _cmp_ipv4_with_sentinel(expected, actual) -> bool:
+    if expected == _IPV4_NULL_SENTINEL:
+        expected = None
+    if expected is None:
+        return actual is None or actual == ""
+    if isinstance(actual, str):
+        parts = list(int(expected).to_bytes(4, "big"))
+        return actual == ".".join(str(p) for p in parts)
+    return int(actual) == int(expected)
+
+
+_GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def _geohash_decode_server_str(s: str, bits: int) -> int:
+    if bits % 5 == 0:
+        result = 0
+        for c in s:
+            try:
+                result = (result << 5) | _GEOHASH_BASE32.index(c)
+            except ValueError:
+                return -1
+        return result
+    result = 0
+    for c in s:
+        if c not in ("0", "1"):
+            return -1
+        result = (result << 1) | (1 if c == "1" else 0)
+    return result
+
+
+def _cmp_geohash_with_sentinel(bits: int):
+    storage_w = 8 if bits <= 7 else 16 if bits <= 15 else 32 if bits <= 32 else 64
+    storage_sentinel = (1 << storage_w) - 1
+    def fn(expected, actual) -> bool:
+        if expected == storage_sentinel:
+            expected = None
+        if expected is None:
+            return actual is None or actual == ""
+        if actual is None or actual == "":
+            return False
+        if isinstance(actual, str):
+            decoded = _geohash_decode_server_str(actual, bits)
+            return decoded == int(expected)
+        return int(actual) == int(expected)
+    return fn
+
+def _is_null_or_special(v):
     import math
-    if expected is None or actual is None or actual == "":
-        return expected is None and (actual is None or actual == "")
-    e = float(expected)
-    a = float(actual) if not isinstance(actual, float) else actual
-    if math.isnan(e) and math.isnan(a):
+    if v is None or v == "":
         return True
-    return e == a
+    try:
+        f = float(v)
+        return math.isnan(f) or math.isinf(f)
+    except (TypeError, ValueError):
+        return False
+
+
+def _cmp_float(expected, actual) -> bool:
+    if _is_null_or_special(expected) and _is_null_or_special(actual):
+        return True
+    if _is_null_or_special(expected) or _is_null_or_special(actual):
+        return False
+    return float(expected) == float(actual)
+
+
+def _cmp_float32(expected, actual) -> bool:
+    import struct, math
+    if _is_null_or_special(expected) and _is_null_or_special(actual):
+        return True
+    if _is_null_or_special(expected) or _is_null_or_special(actual):
+        return False
+    def _f32(v):
+        try:
+            return struct.unpack("<f", struct.pack("<f", float(v)))[0]
+        except (OverflowError, ValueError):
+            return math.copysign(math.inf, float(v))
+    return _f32(expected) == _f32(actual)
 
 def _cmp_str(expected, actual) -> bool:
     if expected is None:
@@ -115,9 +202,15 @@ def _cmp_bool(expected, actual) -> bool:
 
 def _cmp_binary(expected, actual) -> bool:
     if expected is None:
-        return actual is None or actual == ""
+        return actual is None or actual == "" or actual == []
+    if isinstance(actual, list):
+        if not actual:
+            return True
+        try:
+            return bytes(expected) == bytes(actual)
+        except (TypeError, ValueError):
+            return False
     if isinstance(actual, str):
-        # /exec may render BINARY as base64 or hex with `0x` prefix.
         if actual.startswith("0x"):
             try:
                 return bytes(expected) == bytes.fromhex(actual[2:])
@@ -218,10 +311,11 @@ def _cmp_array(expected, actual) -> bool:
 # kind name → (expected_value, actual_json_cell) -> bool
 _INGRESS_ORACLES: Dict[str, Callable[[Any, Any], bool]] = {
     "boolean": _cmp_bool,
-    "byte": _cmp_int, "short": _cmp_int, "int": _cmp_int, "long": _cmp_int,
-    "float": _cmp_float, "double": _cmp_float,
+    "byte": _cmp_int, "short": _cmp_int,
+    "int": _cmp_int32, "long": _cmp_int64,
+    "float": _cmp_float32, "double": _cmp_float,
     "char": _cmp_char_codepoint,
-    "ipv4": _cmp_ipv4,
+    "ipv4": _cmp_ipv4_with_sentinel,
     "varchar": _cmp_str,
     "binary": _cmp_binary,
     "symbol": _cmp_str,
@@ -230,10 +324,10 @@ _INGRESS_ORACLES: Dict[str, Callable[[Any, Any], bool]] = {
     "date": _cmp_date_ms,
     "timestamp": _cmp_timestamp_us,
     "timestamp_ns": _cmp_timestamp_ns,
-    "geohash1": _cmp_passthrough,
-    "geohash5": _cmp_passthrough,
-    "geohash32": _cmp_passthrough,
-    "geohash60": _cmp_passthrough,
+    "geohash1": _cmp_geohash_with_sentinel(1),
+    "geohash5": _cmp_geohash_with_sentinel(5),
+    "geohash32": _cmp_geohash_with_sentinel(32),
+    "geohash60": _cmp_geohash_with_sentinel(60),
     "decimal64": lambda e, a: _cmp_decimal(e, a, scale=4),
     "decimal128": lambda e, a: _cmp_decimal(e, a, scale=10),
     "decimal256": lambda e, a: _cmp_decimal(e, a, scale=20),
@@ -281,6 +375,16 @@ def _read_back_json(fixture, table: str, kinds: List[Tuple[str, KindSpec]]) -> T
     )
     return resp["columns"], resp["dataset"]
 
+
+def _read_back_arrow_cells(fixture, table: str, kinds: List[Tuple[str, KindSpec]]) -> list:
+    """Read column 0 cells back via Arrow C ABI (used for kinds that /exec
+    JSON cannot represent correctly, e.g. BINARY on this server)."""
+    cols_sql = ", ".join(f'"{c}"' for c, _ in kinds)
+    rb = afc.read_back_arrow_concat(
+        fixture, f"select {cols_sql} from '{table}' order by ts"
+    )
+    return [rb.column(0)[r].as_py() for r in range(rb.num_rows)]
+
 class TestArrowIngressPerKind(afc.ArrowFuzzBase):
     """One method per kind. Ingest via Arrow, read back via /exec, compare."""
 
@@ -290,19 +394,53 @@ class TestArrowIngressPerKind(afc.ArrowFuzzBase):
         spec = KIND_REGISTRY[kind_name]
         if not spec.supports_arrow_ingest:
             self.skipTest(f"kind {kind_name!r} not supported by Arrow ingest")
-        for null_mode in ("valid", "partial", "all_null", "edge"):
+        modes = ["valid", "edge"]
+        if spec.supports_server_null:
+            modes[1:1] = ["partial", "all_null"]
+        for null_mode in modes:
             with self.subTest(null_mode=null_mode):
                 table = self.fresh_table(f"arrow_in_{kind_name}_{null_mode}")
                 kinds = [(f"c_{kind_name}", spec)]
+                afc.create_table_from_kinds(self._fixture, table, kinds)
                 rb, vpc = _build_record_batch_with_ts(
                     self._master_rng, _ROWS_PER_BATCH, kinds, null_mode=null_mode,
                 )
                 afc.ingest_via_arrow(self._fixture, table, rb, ts_kind=DTS_COLUMN)
                 afc.wait_for_rows(self._fixture, table, rb.num_rows)
-                _columns, dataset = _read_back_json(self._fixture, table, kinds)
-                self._assert_dataset_matches(
-                    kind_name, spec, vpc[f"c_{kind_name}"], dataset, null_mode,
-                )
+                expected_col = vpc[f"c_{kind_name}"]
+                if kind_name == "binary":
+                    dataset = _read_back_arrow_cells(
+                        self._fixture, table, kinds,
+                    )
+                    self._assert_arrow_binary_matches(
+                        kind_name, expected_col, dataset, null_mode,
+                    )
+                else:
+                    _columns, dataset = _read_back_json(self._fixture, table, kinds)
+                    self._assert_dataset_matches(
+                        kind_name, spec, expected_col, dataset, null_mode,
+                    )
+
+    def _assert_arrow_binary_matches(
+        self, kind_name: str, expected_values, actual_cells, null_mode: str,
+    ) -> None:
+        self.assertEqual(
+            len(actual_cells), len(expected_values),
+            self.label(f"row count for kind={kind_name} mode={null_mode}"),
+        )
+        for r, (e, a) in enumerate(zip(expected_values, actual_cells)):
+            if e is None:
+                if a not in (None, b""):
+                    self.fail(self.label(
+                        f"kind={kind_name} mode={null_mode} row={r}: "
+                        f"expected=None actual={a!r}"
+                    ))
+                continue
+            if bytes(e) != bytes(a if a is not None else b""):
+                self.fail(self.label(
+                    f"kind={kind_name} mode={null_mode} row={r}: "
+                    f"expected={bytes(e)!r} actual={a!r}"
+                ))
 
     def _assert_dataset_matches(
         self, kind_name: str, spec: KindSpec,
@@ -437,7 +575,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             [("c_int", KIND_REGISTRY["int"])],
             null_mode="valid",
         )
-        self._expect_code(rb, SenderErrorCode.INVALID_API_CALL,
+        self._expect_code(rb, SenderErrorCode.ARROW_INGEST,
                           ts_col=b"definitely_not_a_column")
 
     def test_err_designated_ts_wrong_type(self):
@@ -451,7 +589,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
             pa.field("ts", pa.int64(), nullable=True),
         ])
         rb = pa.RecordBatch.from_arrays([arr_int, ts_arr], schema=schema)
-        self._expect_code(rb, SenderErrorCode.INVALID_API_CALL)
+        self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
 
     def test_err_designated_ts_has_nulls(self):
         n = 4
@@ -569,7 +707,10 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
         self._ingest_two_batches(table, rb1, rb2)
         afc.wait_for_rows(self._fixture, table, 12)
 
-    def test_schema_grows_new_column_in_batch2(self):
+    def test_schema_grows_new_column_in_batch2_rejected(self):
+        # QWP/WS Arrow ingest requires consistent column set per buffer:
+        # adding a column in batch 2 leaves batch-1 columns short of rows
+        # and is rejected client-side.
         table = self.fresh_table("arrow_in_mb_grow")
         kinds1 = [("c_int", KIND_REGISTRY["int"])]
         rb1, _ = _build_record_batch_with_ts(
@@ -583,15 +724,12 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
             self._master_rng, 4, kinds2, null_mode="valid",
             ts_base_us=1_700_000_010_000_000,
         )
-        self._ingest_two_batches(table, rb1, rb2)
-        afc.wait_for_rows(self._fixture, table, 8)
-        # Earlier rows for c_sym should be null on the server side.
-        resp = self._fixture.http_sql_query(
-            f"select count() from '{table}' where c_sym is not null"
-        )
-        self.assertEqual(int(resp["dataset"][0][0]), 4, self.label())
+        with self.assertRaises(ArrowSenderError) as cm:
+            self._ingest_two_batches(table, rb1, rb2)
+        self.assertEqual(cm.exception.code, SenderErrorCode.INVALID_API_CALL,
+                         self.label(f"msg={cm.exception}"))
 
-    def test_schema_drops_column_in_batch2(self):
+    def test_schema_drops_column_in_batch2_rejected(self):
         table = self.fresh_table("arrow_in_mb_drop")
         kinds_a = [
             ("c_int", KIND_REGISTRY["int"]),
@@ -605,12 +743,10 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
             self._master_rng, 4, kinds_b, null_mode="valid",
             ts_base_us=1_700_000_010_000_000,
         )
-        self._ingest_two_batches(table, rb1, rb2)
-        afc.wait_for_rows(self._fixture, table, 8)
-        resp = self._fixture.http_sql_query(
-            f"select count() from '{table}' where c_sym is null"
-        )
-        self.assertEqual(int(resp["dataset"][0][0]), 4, self.label())
+        with self.assertRaises(ArrowSenderError) as cm:
+            self._ingest_two_batches(table, rb1, rb2)
+        self.assertEqual(cm.exception.code, SenderErrorCode.INVALID_API_CALL,
+                         self.label(f"msg={cm.exception}"))
 
 class TestArrowIngressFuzz(afc.ArrowFuzzBase):
     """Random subsets of kinds × random null modes × random DTS variants."""
@@ -618,21 +754,24 @@ class TestArrowIngressFuzz(afc.ArrowFuzzBase):
     SUITE_LABEL = "arrow_ingress_fuzz"
 
     def test_random_arrow_ingest(self):
-        pool = [
+        full_pool = [
             (n, s) for n, s in KIND_REGISTRY.items()
             if s.supports_arrow_ingest
         ]
+        nullable_pool = [(n, s) for n, s in full_pool if s.supports_server_null]
         for it in range(_FUZZ_ITERATIONS):
             with self.subTest(iter=it):
+                null_mode = ("valid", "partial", "all_null")[it % 3]
+                pool = full_pool if null_mode == "valid" else nullable_pool
                 self._master_rng.shuffle(pool)
                 picked = pool[: 4 + (it % 4)]
                 kinds = [(f"c{i}_{n}", s) for i, (n, s) in enumerate(picked)]
-                null_mode = ("valid", "partial", "all_null")[it % 3]
                 rb, _vpc = _build_record_batch_with_ts(
                     self._master_rng, _ROWS_PER_BATCH, kinds,
                     null_mode=null_mode,
                 )
                 table = self.fresh_table(f"arrow_in_fuzz_{it}")
+                afc.create_table_from_kinds(self._fixture, table, kinds)
                 afc.ingest_via_arrow(self._fixture, table, rb,
                                       ts_kind=DTS_COLUMN)
                 afc.wait_for_rows(self._fixture, table, rb.num_rows)

@@ -492,7 +492,89 @@ QUESTDB_CLIENT_API void line_reader_server_info_node_id(
  */
 typedef struct line_reader_failover_event line_reader_failover_event;
 
-/**
+/*======================================================================
+  FAIL: test_kind_double_array_2d (arrow_egress_fuzz.TestArrowEgressPerKind) (null_mode='partial')
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 112, in _exercise_kind
+      self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 134, in _assert_kind_round_trip
+      self.fail(self.label(
+  AssertionError: seed=0xe9cd2585b37cd247 kind=double_array_2d mode=partial row=2: expected [[-2.22]], got [[]]
+
+  ======================================================================
+  FAIL: test_kind_double_array_3d (arrow_egress_fuzz.TestArrowEgressPerKind) (null_mode='partial')
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 112, in _exercise_kind
+      self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 134, in _assert_kind_round_trip
+      self.fail(self.label(
+  AssertionError: seed=0xc6c2b5873e014045 kind=double_array_3d mode=partial row=3: expected [[[-4.15, -4.57], [4.52, -4.61]], [[4.15, -4.91], [2.45, 1.89]]], got [[], []]
+
+  ======================================================================
+  FAIL: test_kind_geohash32 (arrow_egress_fuzz.TestArrowEgressPerKind) (null_mode='edge')
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 112, in _exercise_kind
+      self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 134, in _assert_kind_round_trip
+      self.fail(self.label(
+  AssertionError: seed=0xad866b2ffe5d3332 kind=geohash32 mode=edge row=1: expected 4294967295, got None
+
+  ======================================================================
+  FAIL: test_kind_uuid (arrow_egress_fuzz.TestArrowEgressPerKind) (null_mode='valid')
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 112, in _exercise_kind
+      self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 126, in _assert_kind_round_trip
+      self._assert_field_metadata(rb.schema.field(0), spec)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 147, in _assert_field_metadata
+      self.assertEqual(
+  AssertionError: None != b'arrow.uuid' : seed=0x709064cd3600da64 kind=uuid: field metadata b'ARROW:extension:name' expected=b'arrow.uuid' actual=None
+
+  ======================================================================
+  FAIL: test_kind_uuid (arrow_egress_fuzz.TestArrowEgressPerKind) (null_mode='partial')
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 112, in _exercise_kind
+      self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 126, in _assert_kind_round_trip
+      self._assert_field_metadata(rb.schema.field(0), spec)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 147, in _assert_field_metadata
+      self.assertEqual(
+  AssertionError: None != b'arrow.uuid' : seed=0x709064cd3600da64 kind=uuid: field metadata b'ARROW:extension:name' expected=b'arrow.uuid' actual=None
+
+  ======================================================================
+  FAIL: test_kind_uuid (arrow_egress_fuzz.TestArrowEgressPerKind) (null_mode='all_null')
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 112, in _exercise_kind
+      self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 126, in _assert_kind_round_trip
+      self._assert_field_metadata(rb.schema.field(0), spec)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 147, in _assert_field_metadata
+      self.assertEqual(
+  AssertionError: None != b'arrow.uuid' : seed=0x709064cd3600da64 kind=uuid: field metadata b'ARROW:extension:name' expected=b'arrow.uuid' actual=None
+
+  ======================================================================
+  FAIL: test_kind_uuid (arrow_egress_fuzz.TestArrowEgressPerKind) (null_mode='edge')
+  ----------------------------------------------------------------------
+  Traceback (most recent call last):
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 112, in _exercise_kind
+      self._assert_kind_round_trip(rb, kinds, values_per_col, null_mode)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 126, in _assert_kind_round_trip
+      self._assert_field_metadata(rb.schema.field(0), spec)
+    File "/Users/victor/code/c-questdb-client/system_test/arrow_egress_fuzz.py", line 147, in _assert_field_metadata
+      self.assertEqual(
+  AssertionError: None != b'arrow.uuid' : seed=0x709064cd3600da64 kind=uuid: field metadata b'ARROW:extension:name' expected=b'arrow.uuid' actual=None
+
+  ----------------------------------------------------------------------
+  Ran 28 tests in 1.893s
+
+  FAILED (failures=7, skipped=2)
+*
  * User callback fired after each successful mid-query failover. The
  * `event` pointer is valid only for the duration of the call.
  *

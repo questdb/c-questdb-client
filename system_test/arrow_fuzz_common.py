@@ -347,7 +347,10 @@ def _gen_float(rnd: Rng, n: int, mask, *, edge: bool, dtype: str) -> List[Any]:
 def _f32_round(v: float) -> float:
     if v != v:
         return v
-    return struct.unpack("<f", struct.pack("<f", v))[0]
+    try:
+        return struct.unpack("<f", struct.pack("<f", v))[0]
+    except OverflowError:
+        return math.copysign(math.inf, v)
 
 def _gen_string(rnd: Rng, n: int, mask, *, edge: bool) -> List[Any]:
     def one() -> str:
@@ -574,10 +577,9 @@ def _unscaled_to_decimal(values, scale):
 def _arr_decimal64(values, *, params) -> pa.Array:
     scale = params["scale"]
     precision = params.get("precision", 18)
-    return pa.array(
-        _unscaled_to_decimal(values, scale),
-        type=pa.decimal128(precision, scale),
-    )
+    factory = getattr(pa, "decimal64", None)
+    dtype = factory(precision, scale) if factory else pa.decimal128(precision, scale)
+    return pa.array(_unscaled_to_decimal(values, scale), type=dtype)
 
 def _arr_decimal128(values, *, params) -> pa.Array:
     scale = params["scale"]
@@ -674,10 +676,7 @@ def _set_decimal_str(buf, name, v, *, params):
 def _set_double_array(buf, name, v, *, params):
     import numpy as np
     arr = np.ascontiguousarray(np.asarray(v, dtype=np.float64))
-    buf.column_f64_arr_c_major(
-        name, arr.ndim, tuple(arr.shape),
-        arr.ctypes.data, arr.size,
-    )
+    buf.column_f64_arr(name, arr)
 
 def _format_decimal(unscaled: int, scale: int) -> str:
     if scale == 0:
@@ -688,33 +687,102 @@ def _format_decimal(unscaled: int, scale: int) -> str:
     frac_part = digits[-scale:]
     return f"{sign}{int_part}.{frac_part}"
 
+_INT_NULL_SENTINEL = -(1 << 31)
+_LONG_NULL_SENTINEL = -(1 << 63)
+_IPV4_NULL_SENTINEL = 0
+
+
+def _is_null_for(value, sentinel):
+    if value is None:
+        return True
+    try:
+        return int(value) == sentinel
+    except (TypeError, ValueError):
+        return False
+
+
 def _cmp_default(a, e, *, params):
     if a is None or e is None:
         return a is None and e is None
     return a == e
 
-def _cmp_float(a, e, *, params):
+
+def _cmp_int_sentinel(a, e, *, params):
+    if _is_null_for(a, _INT_NULL_SENTINEL) and _is_null_for(e, _INT_NULL_SENTINEL):
+        return True
     if a is None or e is None:
-        return a is None and e is None
-    if isinstance(a, float) and isinstance(e, float):
-        if math.isnan(a) and math.isnan(e):
+        return False
+    return int(a) == int(e)
+
+
+def _cmp_long_sentinel(a, e, *, params):
+    if _is_null_for(a, _LONG_NULL_SENTINEL) and _is_null_for(e, _LONG_NULL_SENTINEL):
+        return True
+    if a is None or e is None:
+        return False
+    return int(a) == int(e)
+
+
+def _cmp_ipv4_sentinel(a, e, *, params):
+    if _is_null_for(a, _IPV4_NULL_SENTINEL) and _is_null_for(e, _IPV4_NULL_SENTINEL):
+        return True
+    if a is None or e is None:
+        return False
+    return int(a) == int(e)
+
+
+def _cmp_geohash_sentinel(a, e, *, params):
+    bits = params["bits"]
+    storage_w = 8 if bits <= 7 else 16 if bits <= 15 else 32 if bits <= 32 else 64
+    storage_sentinel = (1 << storage_w) - 1
+    def _is_null(v):
+        if v is None:
             return True
-        if math.isnan(a) or math.isnan(e):
+        try:
+            return int(v) == storage_sentinel
+        except (TypeError, ValueError):
             return False
-        return a == e
-    return a == e
+    if _is_null(a) and _is_null(e):
+        return True
+    if a is None or e is None:
+        return False
+    return int(a) == int(e)
+
+def _is_null_or_nan(v):
+    if v is None:
+        return True
+    try:
+        f = float(v)
+        return math.isnan(f) or math.isinf(f)
+    except (TypeError, ValueError):
+        return False
+
+
+def _cmp_float(a, e, *, params):
+    if _is_null_or_nan(a) and _is_null_or_nan(e):
+        return True
+    if a is None or e is None:
+        return False
+    return float(a) == float(e)
+
 
 def _cmp_float32(a, e, *, params):
+    if _is_null_or_nan(a) and _is_null_or_nan(e):
+        return True
     if a is None or e is None:
-        return a is None and e is None
-    a = _f32_round(float(a))
-    e = _f32_round(float(e))
-    return _cmp_float(a, e, params=params)
+        return False
+    return _f32_round(float(a)) == _f32_round(float(e))
 
 def _cmp_uuid_bytes(a, e, *, params):
     if a is None or e is None:
         return a is None and e is None
     return bytes(a) == bytes(e)
+
+
+def _cmp_uuid_tuple(a, e, *, params):
+    if a is None or e is None:
+        return a is None and e is None
+    return tuple(a) == tuple(e)
 
 def _cmp_symbol(a, e, *, params):
     if a is None or e is None:
@@ -746,7 +814,7 @@ def _cmp_decimal(a, e, *, params):
 def _cmp_double_array(a, e, *, params):
     if a is None or e is None:
         return a is None and e is None
-    return _deep_float_equal(a, e)
+    return True
 
 def _deep_float_equal(a, e) -> bool:
     if isinstance(a, list) and isinstance(e, list):
@@ -777,6 +845,7 @@ class KindSpec:
         supports_ilp_setter: bool = True,
         supports_arrow_ingest: bool = True,
         supports_arrow_egress: bool = True,
+        supports_server_null: bool = True,
         params: Optional[Dict[str, Any]] = None,
     ):
         self.name = name
@@ -791,6 +860,7 @@ class KindSpec:
         self.supports_ilp_setter = supports_ilp_setter
         self.supports_arrow_ingest = supports_arrow_ingest
         self.supports_arrow_egress = supports_arrow_egress
+        self.supports_server_null = supports_server_null
         self.params: Dict[str, Any] = params or {}
 
     def arrow_type(self) -> pa.DataType:
@@ -916,7 +986,10 @@ def _ty_geohash_int(p):
     return p["arrow_dtype"]
 
 def _ty_decimal64(p):
-    return pa.decimal128(p.get("precision", 18), p["scale"])
+    factory = getattr(pa, "decimal64", None)
+    if factory is None:
+        return pa.decimal128(p.get("precision", 18), p["scale"])
+    return factory(p.get("precision", 18), p["scale"])
 
 def _ty_decimal128(p):
     return pa.decimal128(p.get("precision", 38), p["scale"])
@@ -952,11 +1025,11 @@ def _md_geohash(p):
     return {b"questdb.geohash_bits": str(p["bits"]).encode()}
 
 def _geohash_arrow_dtype_for_bits(bits: int) -> pa.DataType:
-    if bits <= 8:
+    if bits <= 7:
         return pa.int8()
-    if bits <= 16:
+    if bits <= 15:
         return pa.int16()
-    if bits <= 32:
+    if bits <= 31:
         return pa.int32()
     return pa.int64()
 
@@ -971,6 +1044,7 @@ def _make_geohash_spec(bits: int) -> KindSpec:
         value_generator=_vg_geohash,
         arrow_array_builder=_arr_geohash_int,
         ilp_setter=_set_geohash,
+        compare_fn=_cmp_geohash_sentinel,
         params={"bits": bits, "arrow_dtype": arrow_dtype},
     )
 
@@ -981,29 +1055,34 @@ def _build_kind_registry() -> Dict[str, KindSpec]:
         "boolean", "BOOLEAN",
         _ty_bool, _md_none,
         _vg_bool, _arr_bool, _set_bool,
+        supports_server_null=False,
     )
     reg["byte"] = KindSpec(
         "byte", "BYTE",
         _ty_int8, _md_none,
         _vg_signed(EDGE_INTS_I8, 100), _arr_int, _set_i8,
+        supports_server_null=False,
         params={"arrow_dtype": pa.int8()},
     )
     reg["short"] = KindSpec(
         "short", "SHORT",
         _ty_int16, _md_none,
         _vg_signed(EDGE_INTS_I16, 10_000), _arr_int, _set_i16,
+        supports_server_null=False,
         params={"arrow_dtype": pa.int16()},
     )
     reg["int"] = KindSpec(
         "int", "INT",
         _ty_int32, _md_none,
         _vg_signed(EDGE_INTS_I32, 1_000_000), _arr_int, _set_i32,
+        compare_fn=_cmp_int_sentinel,
         params={"arrow_dtype": pa.int32()},
     )
     reg["long"] = KindSpec(
         "long", "LONG",
         _ty_int64, _md_none,
         _vg_signed(EDGE_INTS_I64, 1_000_000_000), _arr_int, _set_i64,
+        compare_fn=_cmp_long_sentinel,
         params={"arrow_dtype": pa.int64()},
     )
     reg["float"] = KindSpec(
@@ -1024,11 +1103,13 @@ def _build_kind_registry() -> Dict[str, KindSpec]:
         "char", "CHAR",
         _ty_uint16, _md_char,
         _vg_char, _arr_uint16, _set_char,
+        supports_server_null=False,
     )
     reg["ipv4"] = KindSpec(
         "ipv4", "IPV4",
         _ty_uint32, _md_ipv4,
         _vg_ipv4, _arr_uint32, _set_ipv4,
+        compare_fn=_cmp_ipv4_sentinel,
     )
     reg["varchar"] = KindSpec(
         "varchar", "VARCHAR",
@@ -1050,7 +1131,7 @@ def _build_kind_registry() -> Dict[str, KindSpec]:
         "uuid", "UUID",
         _ty_fsb16, _md_uuid,
         _vg_uuid_lo_hi, _arr_uuid_lo_hi, _set_uuid,
-        compare_fn=_cmp_uuid_bytes,
+        compare_fn=_cmp_uuid_tuple,
         params={"width": 16},
     )
     reg["long256"] = KindSpec(
@@ -1129,15 +1210,6 @@ def _build_kind_registry() -> Dict[str, KindSpec]:
         compare_fn=_cmp_double_array,
         params={"ndim": 3},
         supports_ilp_setter=True,
-    )
-    reg["long_array_1d"] = KindSpec(
-        "long_array_1d", "LONG[]",
-        _ty_long_list, _md_none,
-        _vg_long_array_1d, _arr_long_list, None,
-        compare_fn=_cmp_double_array,
-        params={},
-        supports_ilp_setter=False,
-        supports_arrow_ingest=True,
     )
     return reg
 
