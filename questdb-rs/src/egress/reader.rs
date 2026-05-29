@@ -2892,13 +2892,13 @@ mod tests {
     }
 
     /// Every draw lies in `[0, base)` — the full-jitter contract from
-    /// failover.md §3.1. This is the discriminator against the
-    /// equal-jitter variant `[base, 2*base)` used by SF ingress: a
-    /// regression that swapped the implementation would produce draws
-    /// of `base` or higher on the first iteration. 10k samples per base across
-    /// several bases (powers of two, near-`u32::MAX`, and primes that
-    /// exercise the `% base` reduction) catches both off-by-one and
-    /// signed/unsigned mix-ups.
+    /// failover.md §3.1. SF ingress uses a different scheme (centered
+    /// jitter, `[base/2, 3*base/2)`, in `qwp_ws_driver.rs`); this test
+    /// pins the egress full-jitter contract, which — unlike that — may
+    /// wait near zero. 10k samples per base across several bases
+    /// (powers of two, near-`u32::MAX`, and primes that exercise the
+    /// `% base` reduction) catches both off-by-one and signed/unsigned
+    /// mix-ups.
     #[test]
     fn full_jitter_ms_draws_are_in_range() {
         let mut rng = FailoverRng::new();

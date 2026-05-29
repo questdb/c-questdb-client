@@ -1860,17 +1860,22 @@ fn double_duration(duration: Duration) -> Duration {
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-fn equal_jitter_duration(base: Duration) -> Duration {
+fn centered_jitter_duration(base: Duration) -> Duration {
     let base_nanos = base.as_nanos().min(u128::from(u64::MAX)) as u64;
     if base_nanos == 0 {
         return base;
     }
+    // Centered jitter: a half-backoff floor plus a uniform draw over a full
+    // backoff -> sleep in [base/2, 3*base/2), centered on `base`. Scatters
+    // retries around the target delay (sometimes sooner, sometimes later) and
+    // decorrelates concurrent reconnects. Egress failover uses full jitter
+    // (failover.md §3.1); the two schemes are intentionally separate.
     let extra = rand::rng().random_range(0..base_nanos);
-    base.saturating_add(Duration::from_nanos(extra))
+    Duration::from_nanos((base_nanos / 2).saturating_add(extra))
 }
 
 #[cfg(not(feature = "sync-sender-qwp-ws"))]
-fn equal_jitter_duration(base: Duration) -> Duration {
+fn centered_jitter_duration(base: Duration) -> Duration {
     base
 }
 
@@ -1882,7 +1887,7 @@ pub(super) fn reconnect_sleep_duration(
     if role_reject {
         initial_backoff
     } else {
-        equal_jitter_duration(backoff)
+        centered_jitter_duration(backoff)
     }
 }
 
@@ -4186,6 +4191,23 @@ mod tests {
             reconnect_sleep_duration(false, initial, Duration::ZERO),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn centered_jitter_reconnect_sleep_scatters_around_backoff() {
+        // Non-role-reject reconnects use centered jitter: sleep in
+        // [base/2, 3*base/2), centered on the backoff.
+        let unused_initial = Duration::from_millis(100);
+        for base_ms in [2u64, 80, 100, 1_000, 5_000] {
+            let base = Duration::from_millis(base_ms);
+            for _ in 0..10_000 {
+                let d = reconnect_sleep_duration(false, unused_initial, base);
+                assert!(
+                    d >= base / 2 && d < base + base / 2,
+                    "centered-jitter sleep {d:?} outside [base/2, 3*base/2) for base={base:?}"
+                );
+            }
+        }
     }
 
     #[test]
