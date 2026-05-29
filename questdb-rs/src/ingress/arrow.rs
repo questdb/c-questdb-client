@@ -33,10 +33,10 @@ use arrow_array::{
     DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
     DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray,
-    LargeStringArray, ListArray, RecordBatch, StringArray, StringViewArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    LargeStringArray, ListArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -371,9 +371,16 @@ fn emit_arrow_column(
         ColumnKind::F16ToF32 => {
             let a = arr.as_any().downcast_ref::<Float16Array>().unwrap();
             qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::F32, info_full, |out| {
-                full_with_sentinel_into(out, arr, f32::NAN.to_le_bytes(), |row| {
-                    a.value(row).to_f32().to_le_bytes()
-                });
+                if null_count == 0 {
+                    out.reserve(a.values().len() * 4);
+                    for &h in a.values() {
+                        out.extend_from_slice(&h.to_f32().to_le_bytes());
+                    }
+                } else {
+                    full_with_sentinel_into(out, arr, f32::NAN.to_le_bytes(), |row| {
+                        a.value(row).to_f32().to_le_bytes()
+                    });
+                }
                 Ok(())
             })
         }
@@ -464,19 +471,24 @@ fn emit_arrow_column(
             })
         }
         ColumnKind::TimestampSecondToMicros => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap();
+            let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
             qwp_ws.arrow_bulk_set_fixed(
                 ctx,
                 col_name,
                 QwpColumnKind::TimestampMicros,
                 info_sparse,
                 |out| {
-                    non_null_le_into(out, arr, |row| {
-                        a.value(row).saturating_mul(1_000_000).to_le_bytes()
-                    });
+                    if null_count == 0 {
+                        let src = a.values();
+                        out.reserve(src.len() * 8);
+                        for &v in src {
+                            out.extend_from_slice(&v.saturating_mul(1_000_000).to_le_bytes());
+                        }
+                    } else {
+                        non_null_le_into(out, arr, |row| {
+                            a.value(row).saturating_mul(1_000_000).to_le_bytes()
+                        });
+                    }
                     Ok(())
                 },
             )
@@ -538,10 +550,18 @@ fn emit_arrow_column(
         ColumnKind::Date32Days => {
             let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
             qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::Date, info_sparse, |out| {
-                non_null_le_into(out, arr, |row| {
-                    let days = a.value(row) as i64;
-                    days.saturating_mul(86_400_000).to_le_bytes()
-                });
+                if null_count == 0 {
+                    let src = a.values();
+                    out.reserve(src.len() * 8);
+                    for &d in src {
+                        out.extend_from_slice(&(d as i64).saturating_mul(86_400_000).to_le_bytes());
+                    }
+                } else {
+                    non_null_le_into(out, arr, |row| {
+                        let days = a.value(row) as i64;
+                        days.saturating_mul(86_400_000).to_le_bytes()
+                    });
+                }
                 Ok(())
             })
         }
@@ -658,8 +678,15 @@ fn emit_arrow_column(
             })
         }
         ColumnKind::SymbolDict { key, value } => {
-            let (keys, entries, dict_data) = build_symbol_payload_dyn(arr, key, value)?;
-            qwp_ws.arrow_bulk_set_symbol(ctx, col_name, &keys, &entries, &dict_data, info_sparse)
+            let payload = build_symbol_payload_dyn(arr, key, value)?;
+            qwp_ws.arrow_bulk_set_symbol(
+                ctx,
+                col_name,
+                &payload.keys,
+                &payload.entries,
+                &payload.dict_data,
+                info_sparse,
+            )
         }
         ColumnKind::SymbolDictAsStr { key, value } => qwp_ws.arrow_bulk_set_varlen(
             ctx,
@@ -745,7 +772,13 @@ fn emit_arrow_column(
                 },
                 info_sparse,
                 |out| {
-                    build_decimal_bytes_i256_into(out, a);
+                    if le_no_nulls {
+                        // SAFETY: i256 is `#[repr(C)] { low: u128, high: i128 }`;
+                        // on LE that's byte-identical to `to_le_bytes()` output.
+                        out.extend_from_slice(unsafe { typed_slice_as_le_bytes(a.values()) });
+                    } else {
+                        build_decimal_bytes_i256_into(out, a);
+                    }
                     Ok(())
                 },
             )
@@ -763,18 +796,25 @@ fn emit_arrow_column(
 fn pack_bool_bits(arr: &BooleanArray) -> Vec<u8> {
     let row_count = arr.len();
     let n_bytes = row_count.div_ceil(8);
-    if arr.null_count() == 0 {
-        let bb = arr.values();
-        if bb.offset().is_multiple_of(8) {
-            let start = bb.offset() / 8;
-            let mut packed = bb.values()[start..start + n_bytes].to_vec();
-            let trailing = row_count % 8;
-            if trailing != 0 {
-                let mask = (1u8 << trailing) - 1;
-                *packed.last_mut().unwrap() &= mask;
+    let value_buf = arr.values();
+    let null_buf = arr.nulls();
+    let nulls_aligned = null_buf.is_none_or(|nb| nb.offset().is_multiple_of(8));
+    if value_buf.offset().is_multiple_of(8) && nulls_aligned {
+        let v_start = value_buf.offset() / 8;
+        let mut packed = value_buf.values()[v_start..v_start + n_bytes].to_vec();
+        if let Some(nb) = null_buf {
+            let n_start = nb.offset() / 8;
+            let n_slice = &nb.buffer().as_slice()[n_start..n_start + n_bytes];
+            for (p, &v) in packed.iter_mut().zip(n_slice) {
+                *p &= v;
             }
-            return packed;
         }
+        let trailing = row_count % 8;
+        if trailing != 0 {
+            let mask = (1u8 << trailing) - 1;
+            *packed.last_mut().unwrap() &= mask;
+        }
+        return packed;
     }
     let mut packed = vec![0u8; n_bytes];
     for row in 0..row_count {
@@ -1030,7 +1070,6 @@ fn build_geohash_bytes_into(out: &mut Vec<u8>, arr: &dyn Array, precision_bits: 
     Ok(())
 }
 
-
 fn decimal_scale_u8(scale_i8: i8, label: &str) -> Result<u8> {
     if scale_i8 < 0 {
         return Err(fmt!(
@@ -1044,6 +1083,14 @@ fn decimal_scale_u8(scale_i8: i8, label: &str) -> Result<u8> {
 }
 
 fn build_decimal_bytes_i32_widen_into(out: &mut Vec<u8>, arr: &Decimal32Array) {
+    if arr.null_count() == 0 {
+        let src = arr.values();
+        out.reserve(src.len() * 8);
+        for &v in src {
+            out.extend_from_slice(&(v as i64).to_le_bytes());
+        }
+        return;
+    }
     let row_count = arr.len();
     out.reserve((row_count - arr.null_count()) * 8);
     for row in 0..row_count {
@@ -1089,11 +1136,15 @@ fn build_decimal_bytes_i256_into(out: &mut Vec<u8>, arr: &Decimal256Array) {
 
 fn build_array_blob_data_into(data: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -> Result<()> {
     let row_count = arr.len();
+    let ndim_u8 =
+        u8::try_from(ndim).map_err(|_| fmt!(ArrowIngest, "ARRAY ndim {} exceeds u8::MAX", ndim))?;
+    let mut shape: Vec<usize> = Vec::with_capacity(ndim);
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
         }
-        let extract = extract_array_row(arr, ndim, row)?;
+        shape.clear();
+        let extract = extract_array_row(arr, ndim, row, &mut shape)?;
         let leaf = extract
             .leaf
             .as_any()
@@ -1108,15 +1159,8 @@ fn build_array_blob_data_into(data: &mut Vec<u8>, arr: &dyn Array, ndim: usize) 
                 )
             })?;
         let leaf_values = &leaf.values()[extract.leaf_start..extract.leaf_end];
-        let ndim_u8 = u8::try_from(extract.shape.len()).map_err(|_| {
-            fmt!(
-                ArrowIngest,
-                "ARRAY ndim {} exceeds u8::MAX",
-                extract.shape.len()
-            )
-        })?;
         data.push(ndim_u8);
-        for &dim in &extract.shape {
+        for &dim in shape.iter() {
             let dim_u32 = u32::try_from(dim)
                 .map_err(|_| fmt!(ArrowIngest, "ARRAY dimension {} exceeds u32::MAX", dim))?;
             data.extend_from_slice(&dim_u32.to_le_bytes());
@@ -1168,121 +1212,93 @@ fn dict_value_for(dt: &DataType) -> Option<DictValue> {
     }
 }
 
-fn build_time_as_long_into(out: &mut Vec<u8>, arr: &dyn Array, unit: TimeUnit) -> Result<()> {
+fn emit_i32_widen_to_i64_full(out: &mut Vec<u8>, arr: &dyn Array, values: &[i32]) {
     let sentinel = i64::MIN.to_le_bytes();
+    if arr.null_count() == 0 {
+        out.reserve(values.len() * 8);
+        for &v in values {
+            out.extend_from_slice(&(v as i64).to_le_bytes());
+        }
+    } else {
+        full_with_sentinel_into(out, arr, sentinel, |row| (values[row] as i64).to_le_bytes());
+    }
+}
+
+fn emit_i64_full(out: &mut Vec<u8>, arr: &dyn Array, values: &[i64]) {
+    let sentinel = i64::MIN.to_le_bytes();
+    if arr.null_count() == 0 && cfg!(target_endian = "little") {
+        // SAFETY: i64 has no padding; LE target → wire-format bytes.
+        out.extend_from_slice(unsafe { typed_slice_as_le_bytes(values) });
+    } else if arr.null_count() == 0 {
+        out.reserve(values.len() * 8);
+        for &v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    } else {
+        full_with_sentinel_into(out, arr, sentinel, |row| values[row].to_le_bytes());
+    }
+}
+
+fn build_time_as_long_into(out: &mut Vec<u8>, arr: &dyn Array, unit: TimeUnit) -> Result<()> {
     match unit {
         TimeUnit::Second => {
             let a = arr.as_any().downcast_ref::<Time32SecondArray>().unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| (a.value(row) as i64).to_le_bytes());
+            emit_i32_widen_to_i64_full(out, arr, a.values());
         }
         TimeUnit::Millisecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Time32MillisecondArray>()
                 .unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| (a.value(row) as i64).to_le_bytes());
+            emit_i32_widen_to_i64_full(out, arr, a.values());
         }
         TimeUnit::Microsecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Time64MicrosecondArray>()
                 .unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| a.value(row).to_le_bytes());
+            emit_i64_full(out, arr, a.values());
         }
         TimeUnit::Nanosecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Time64NanosecondArray>()
                 .unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| a.value(row).to_le_bytes());
+            emit_i64_full(out, arr, a.values());
         }
     }
     Ok(())
 }
 
 fn build_duration_as_long_into(out: &mut Vec<u8>, arr: &dyn Array, unit: TimeUnit) -> Result<()> {
-    let sentinel = i64::MIN.to_le_bytes();
     match unit {
         TimeUnit::Second => {
             let a = arr.as_any().downcast_ref::<DurationSecondArray>().unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| a.value(row).to_le_bytes());
+            emit_i64_full(out, arr, a.values());
         }
         TimeUnit::Millisecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<DurationMillisecondArray>()
                 .unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| a.value(row).to_le_bytes());
+            emit_i64_full(out, arr, a.values());
         }
         TimeUnit::Microsecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<DurationMicrosecondArray>()
                 .unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| a.value(row).to_le_bytes());
+            emit_i64_full(out, arr, a.values());
         }
         TimeUnit::Nanosecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<DurationNanosecondArray>()
                 .unwrap();
-            full_with_sentinel_into(out, arr, sentinel, |row| a.value(row).to_le_bytes());
+            emit_i64_full(out, arr, a.values());
         }
     }
     Ok(())
-}
-
-fn dict_value_str_dyn(arr: &dyn Array, row: usize, key: DictKey, value: DictValue) -> Result<&str> {
-    match (key, value) {
-        (DictKey::U32, DictValue::Utf8) => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-                .unwrap();
-            let key_idx = dict.keys().value(row) as usize;
-            dict_lookup_str(dict.values(), key_idx, /*large=*/ false)
-        }
-        (DictKey::U16, DictValue::Utf8) => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt16Type>>()
-                .unwrap();
-            let key_idx = dict.keys().value(row) as usize;
-            dict_lookup_str(dict.values(), key_idx, /*large=*/ false)
-        }
-        (DictKey::U8, DictValue::Utf8) => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt8Type>>()
-                .unwrap();
-            let key_idx = dict.keys().value(row) as usize;
-            dict_lookup_str(dict.values(), key_idx, /*large=*/ false)
-        }
-        (DictKey::U32, DictValue::LargeUtf8) => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-                .unwrap();
-            let key_idx = dict.keys().value(row) as usize;
-            dict_lookup_str(dict.values(), key_idx, /*large=*/ true)
-        }
-        (DictKey::U16, DictValue::LargeUtf8) => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt16Type>>()
-                .unwrap();
-            let key_idx = dict.keys().value(row) as usize;
-            dict_lookup_str(dict.values(), key_idx, /*large=*/ true)
-        }
-        (DictKey::U8, DictValue::LargeUtf8) => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt8Type>>()
-                .unwrap();
-            let key_idx = dict.keys().value(row) as usize;
-            dict_lookup_str(dict.values(), key_idx, /*large=*/ true)
-        }
-    }
 }
 
 fn dict_lookup_str(values: &ArrayRef, key_idx: usize, large: bool) -> Result<&str> {
@@ -1339,7 +1355,7 @@ fn dict_lookup_str(values: &ArrayRef, key_idx: usize, large: bool) -> Result<&st
     }
 }
 
-fn dict_values_dyn<'a>(arr: &'a dyn Array, key: DictKey) -> &'a ArrayRef {
+fn dict_values_dyn(arr: &dyn Array, key: DictKey) -> &ArrayRef {
     match key {
         DictKey::U32 => arr
             .as_any()
@@ -1359,34 +1375,17 @@ fn dict_values_dyn<'a>(arr: &'a dyn Array, key: DictKey) -> &'a ArrayRef {
     }
 }
 
-fn dict_key_at(arr: &dyn Array, row: usize, key: DictKey) -> u32 {
-    match key {
-        DictKey::U32 => arr
-            .as_any()
-            .downcast_ref::<DictionaryArray<UInt32Type>>()
-            .unwrap()
-            .keys()
-            .value(row),
-        DictKey::U16 => arr
-            .as_any()
-            .downcast_ref::<DictionaryArray<UInt16Type>>()
-            .unwrap()
-            .keys()
-            .value(row) as u32,
-        DictKey::U8 => arr
-            .as_any()
-            .downcast_ref::<DictionaryArray<UInt8Type>>()
-            .unwrap()
-            .keys()
-            .value(row) as u32,
-    }
+struct SymbolPayload {
+    keys: Vec<u32>,
+    entries: Vec<(u32, u32)>,
+    dict_data: Vec<u8>,
 }
 
 fn build_symbol_payload_dyn(
     arr: &dyn Array,
     key: DictKey,
     value: DictValue,
-) -> Result<(Vec<u32>, Vec<(u32, u32)>, Vec<u8>)> {
+) -> Result<SymbolPayload> {
     let values = dict_values_dyn(arr, key);
     let value_count = values.len();
     let mut entries: Vec<(u32, u32)> = Vec::with_capacity(value_count);
@@ -1405,14 +1404,106 @@ fn build_symbol_payload_dyn(
     }
     let row_count = arr.len();
     let mut keys: Vec<u32> = Vec::with_capacity(row_count);
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            keys.push(0);
-            continue;
+    fill_dict_keys_into(&mut keys, arr, key);
+    debug_assert_eq!(keys.len(), row_count);
+    Ok(SymbolPayload {
+        keys,
+        entries,
+        dict_data,
+    })
+}
+
+fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
+    let row_count = arr.len();
+    let has_nulls = arr.null_count() != 0;
+    match key {
+        DictKey::U32 => {
+            let dict = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap();
+            let raw = dict.keys().values();
+            if !has_nulls {
+                out.extend_from_slice(raw);
+                return;
+            }
+            out.reserve(row_count);
+            for (row, &k) in raw.iter().enumerate() {
+                out.push(if arr.is_null(row) { 0 } else { k });
+            }
         }
-        keys.push(dict_key_at(arr, row, key));
+        DictKey::U16 => {
+            let dict = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+                .unwrap();
+            let raw = dict.keys().values();
+            out.reserve(row_count);
+            if !has_nulls {
+                for &k in raw {
+                    out.push(k as u32);
+                }
+            } else {
+                for (row, &k) in raw.iter().enumerate() {
+                    out.push(if arr.is_null(row) { 0 } else { k as u32 });
+                }
+            }
+        }
+        DictKey::U8 => {
+            let dict = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt8Type>>()
+                .unwrap();
+            let raw = dict.keys().values();
+            out.reserve(row_count);
+            if !has_nulls {
+                for &k in raw {
+                    out.push(k as u32);
+                }
+            } else {
+                for (row, &k) in raw.iter().enumerate() {
+                    out.push(if arr.is_null(row) { 0 } else { k as u32 });
+                }
+            }
+        }
     }
-    Ok((keys, entries, dict_data))
+}
+
+fn validate_dict_values_for_str(values: &ArrayRef, large: bool) -> Result<()> {
+    if large {
+        let utf8 = values
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "dictionary values must be LargeUtf8 for this column"
+                )
+            })?;
+        if utf8.null_count() != 0 {
+            return Err(fmt!(
+                ArrowIngest,
+                "dictionary values for SYMBOL / VARCHAR must not contain nulls"
+            ));
+        }
+    } else {
+        let utf8 = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "dictionary values must be Utf8 for this column"
+                )
+            })?;
+        if utf8.null_count() != 0 {
+            return Err(fmt!(
+                ArrowIngest,
+                "dictionary values for SYMBOL / VARCHAR must not contain nulls"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_varlen_from_dict_as_str_dyn(
@@ -1424,35 +1515,122 @@ fn build_varlen_from_dict_as_str_dyn(
 ) -> Result<()> {
     let row_count = arr.len();
     let data_base = varlen_data_base(data, "VARCHAR")?;
-    let mut cumulative: u32 = 0;
+    let values = dict_values_dyn(arr, key);
+    validate_dict_values_for_str(values, value == DictValue::LargeUtf8)?;
     offsets.reserve(row_count - arr.null_count());
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            continue;
+
+    // Each match arm grabs the typed key and value arrays once, then runs a
+    // tight per-row loop that does direct index lookups (no per-row downcast,
+    // no per-row dict-null check — both validated upfront).
+    macro_rules! run {
+        ($keys:expr, $values:expr) => {{
+            let keys = $keys;
+            let values = $values;
+            let mut cumulative: u32 = 0;
+            for row in 0..row_count {
+                if arr.is_null(row) {
+                    continue;
+                }
+                let key_idx = keys.value(row) as usize;
+                if key_idx >= values.len() {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "dict key {} out of range (dict size {})",
+                        key_idx,
+                        values.len()
+                    ));
+                }
+                let s = values.value(key_idx).as_bytes();
+                cumulative = cumulative.checked_add(s.len() as u32).ok_or_else(|| {
+                    fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX")
+                })?;
+                let absolute = data_base.checked_add(cumulative).ok_or_else(|| {
+                    fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX")
+                })?;
+                data.extend_from_slice(s);
+                offsets.push(absolute);
+            }
+        }};
+    }
+
+    match (key, value) {
+        (DictKey::U32, DictValue::Utf8) => {
+            let d = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap();
+            let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+            run!(d.keys(), v);
         }
-        let s = dict_value_str_dyn(arr, row, key, value)?.as_bytes();
-        cumulative = cumulative
-            .checked_add(s.len() as u32)
-            .ok_or_else(|| fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX"))?;
-        let absolute = data_base
-            .checked_add(cumulative)
-            .ok_or_else(|| fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX"))?;
-        data.extend_from_slice(s);
-        offsets.push(absolute);
+        (DictKey::U16, DictValue::Utf8) => {
+            let d = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+                .unwrap();
+            let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+            run!(d.keys(), v);
+        }
+        (DictKey::U8, DictValue::Utf8) => {
+            let d = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt8Type>>()
+                .unwrap();
+            let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+            run!(d.keys(), v);
+        }
+        (DictKey::U32, DictValue::LargeUtf8) => {
+            let d = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap();
+            let v = d
+                .values()
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap();
+            run!(d.keys(), v);
+        }
+        (DictKey::U16, DictValue::LargeUtf8) => {
+            let d = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+                .unwrap();
+            let v = d
+                .values()
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap();
+            run!(d.keys(), v);
+        }
+        (DictKey::U8, DictValue::LargeUtf8) => {
+            let d = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt8Type>>()
+                .unwrap();
+            let v = d
+                .values()
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .unwrap();
+            run!(d.keys(), v);
+        }
     }
     Ok(())
 }
 
 struct ArrayRowExtract {
-    shape: Vec<usize>,
     leaf: ArrayRef,
     leaf_start: usize,
     leaf_end: usize,
 }
 
-fn extract_array_row(outer: &dyn Array, ndim: usize, row: usize) -> Result<ArrayRowExtract> {
+fn extract_array_row(
+    outer: &dyn Array,
+    ndim: usize,
+    row: usize,
+    shape: &mut Vec<usize>,
+) -> Result<ArrayRowExtract> {
     let (mut start, mut end) = list_row_range(outer, row)?;
-    let mut shape: Vec<usize> = Vec::with_capacity(ndim);
     shape.push(end - start);
     let mut current_values: ArrayRef = list_values(outer)?;
     for _ in 1..ndim {
@@ -1464,7 +1642,6 @@ fn extract_array_row(outer: &dyn Array, ndim: usize, row: usize) -> Result<Array
         current_values = next_values;
     }
     Ok(ArrayRowExtract {
-        shape,
         leaf: current_values,
         leaf_start: start,
         leaf_end: end,
@@ -1758,11 +1935,7 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         (DataType::Decimal64(_, _), _, _) => ColumnKind::Decimal64,
         (DataType::Decimal128(_, _), _, _) => ColumnKind::Decimal128,
         (DataType::Decimal256(_, _), _, _) => ColumnKind::Decimal256,
-        (
-            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _),
-            _,
-            _,
-        ) => {
+        (DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _), _, _) => {
             let (leaf, ndim) = walk_list_leaf(field.data_type());
             match leaf {
                 DataType::Float64 => ColumnKind::ArrayDouble(ndim),
@@ -2492,11 +2665,7 @@ mod tests {
         t.append_value(0);
         t.append_value(86_399);
         let rb = RecordBatch::try_new(
-            arrow_schema_with(Field::new(
-                "t",
-                DataType::Time32(TimeUnit::Second),
-                true,
-            )),
+            arrow_schema_with(Field::new("t", DataType::Time32(TimeUnit::Second), true)),
             vec![Arc::new(t.finish()) as ArrayRef],
         )
         .unwrap();
@@ -2557,22 +2726,16 @@ mod tests {
             ["AAPL", "MSFT", "AAPL"].into_iter().map(Some),
         );
         let large_values = LargeStringArray::from(vec!["AAPL", "MSFT"]);
-        let dict = DictionaryArray::<UInt32Type>::try_new(
-            dict.keys().clone(),
-            Arc::new(large_values),
-        )
-        .unwrap();
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(dict.keys().clone(), Arc::new(large_values))
+                .unwrap();
         let field = Field::new(
             "s",
-            DataType::Dictionary(
-                Box::new(DataType::UInt32),
-                Box::new(DataType::LargeUtf8),
-            ),
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::LargeUtf8)),
             true,
         );
-        let rb =
-            RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
-                .unwrap();
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
             .unwrap();
@@ -2591,9 +2754,8 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
             true,
         );
-        let rb =
-            RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
-                .unwrap();
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
             .unwrap();
@@ -2614,11 +2776,7 @@ mod tests {
         b.append(true);
         let arr = b.finish();
         let rb = RecordBatch::try_new(
-            arrow_schema_with(Field::new(
-                "a",
-                arr.data_type().clone(),
-                true,
-            )),
+            arrow_schema_with(Field::new("a", arr.data_type().clone(), true)),
             vec![Arc::new(arr) as ArrayRef],
         )
         .unwrap();
@@ -2679,11 +2837,7 @@ mod tests {
         d.append_value(-3600);
         d.append_value(86_400);
         let rb = RecordBatch::try_new(
-            arrow_schema_with(Field::new(
-                "d",
-                DataType::Duration(TimeUnit::Second),
-                true,
-            )),
+            arrow_schema_with(Field::new("d", DataType::Duration(TimeUnit::Second), true)),
             vec![Arc::new(d.finish()) as ArrayRef],
         )
         .unwrap();
@@ -2739,17 +2893,15 @@ mod tests {
     fn dict_u16_utf8_appends_as_varchar() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt16Type;
-        let dict = DictionaryArray::<UInt16Type>::from_iter(
-            ["x", "y", "x", "z"].into_iter().map(Some),
-        );
+        let dict =
+            DictionaryArray::<UInt16Type>::from_iter(["x", "y", "x", "z"].into_iter().map(Some));
         let field = Field::new(
             "s",
             DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
             true,
         );
-        let rb =
-            RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
-                .unwrap();
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
             .unwrap();
@@ -2762,19 +2914,14 @@ mod tests {
         use arrow_array::types::UInt8Type;
         let keys = arrow_array::UInt8Array::from(vec![0u8, 1, 0, 1]);
         let values = LargeStringArray::from(vec!["alpha", "beta"]);
-        let dict =
-            DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values)).unwrap();
+        let dict = DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values)).unwrap();
         let field = Field::new(
             "s",
-            DataType::Dictionary(
-                Box::new(DataType::UInt8),
-                Box::new(DataType::LargeUtf8),
-            ),
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::LargeUtf8)),
             true,
         );
-        let rb =
-            RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
-                .unwrap();
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
             .unwrap();
@@ -2785,9 +2932,7 @@ mod tests {
     fn symbol_dict_metadata_routes_to_symbol_not_varchar() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt32Type;
-        let dict = DictionaryArray::<UInt32Type>::from_iter(
-            ["A", "B", "A"].into_iter().map(Some),
-        );
+        let dict = DictionaryArray::<UInt32Type>::from_iter(["A", "B", "A"].into_iter().map(Some));
         let field = Field::new(
             "s",
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
@@ -2801,9 +2946,8 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        let rb =
-            RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
-                .unwrap();
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
             .unwrap();
@@ -3043,11 +3187,7 @@ mod tests {
         let mut b = IntervalMonthDayNanoBuilder::new();
         b.append_value(IntervalMonthDayNano::new(1, 1, 1));
         assert_unsupported_column(
-            Field::new(
-                "c",
-                DataType::Interval(IntervalUnit::MonthDayNano),
-                true,
-            ),
+            Field::new("c", DataType::Interval(IntervalUnit::MonthDayNano), true),
             Arc::new(b.finish()) as ArrayRef,
         );
     }
