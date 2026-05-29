@@ -311,6 +311,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_arrow_unsupported_column_kind
             }
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
+            _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -3628,9 +3629,9 @@ pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
     }
 }
 
-/// Selects the per-row designated-timestamp source for
-/// `line_sender_buffer_append_arrow`. Mirrors the three-variant Rust
-/// `DesignatedTimestamp` enum (Decision 9 in the design doc).
+/// Catches a Rust panic inside an `extern "C"` body and aborts. Active
+/// in debug/test builds; under this crate's release `panic = "abort"`
+/// profile (Cargo.toml) it compiles to a no-op tail call.
 #[cfg(feature = "arrow")]
 #[inline]
 fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
@@ -3641,42 +3642,45 @@ fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
 }
 
 #[cfg(feature = "arrow")]
-#[allow(dead_code)]
-#[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum line_sender_designated_timestamp_kind {
-    /// Pull per-row timestamp from a named column. The column's
-    /// Arrow DataType must be `Timestamp(_)`.
-    line_sender_designated_timestamp_column = 0,
-    /// Sample `TimestampNanos::now()` client-side per row.
-    line_sender_designated_timestamp_now = 1,
-    /// Omit the timestamp from the wire payload (server fills
-    /// arrival time when the destination table has a designated
-    /// timestamp; otherwise stores the row without one).
-    line_sender_designated_timestamp_server_now = 2,
-}
-
-/// Append every row of a `RecordBatch` (passed via the Apache Arrow
-/// C Data Interface) to `buffer`. `array` is consumed (release
-/// invoked by the imported `ArrayData`'s drop); `schema` is
-/// borrowed.
-#[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_append_arrow(
     buffer: *mut line_sender_buffer,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    ts_kind: line_sender_designated_timestamp_kind,
-    ts_column_name: *const c_char,
-    ts_column_name_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    panic_guard(|| unsafe { arrow_append_impl(buffer, table, array, schema, None, err_out) })
+}
+
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_append_arrow_at_column(
+    buffer: *mut line_sender_buffer,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: line_sender_column_name,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    panic_guard(|| unsafe {
+        arrow_append_impl(buffer, table, array, schema, Some(ts_column), err_out)
+    })
+}
+
+#[cfg(feature = "arrow")]
+unsafe fn arrow_append_impl(
+    buffer: *mut line_sender_buffer,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: Option<line_sender_column_name>,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
-    use questdb::ingress::{ColumnName, DesignatedTimestamp};
     use std::sync::Arc;
-    panic_guard(|| unsafe {
+    unsafe {
         if buffer.is_null() || array.is_null() || schema.is_null() {
             arrow_err_to_c_box(
                 err_out,
@@ -3685,57 +3689,25 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
             );
             return false;
         }
-        let inner = unwrap_buffer_mut(buffer);
-        let ts_name_owned: Option<String> = match ts_kind {
-            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_column => {
-                if ts_column_name.is_null() || ts_column_name_len == 0 {
-                    arrow_err_to_c_box(
-                        err_out,
-                        ErrorCode::InvalidApiCall,
-                        "line_sender_buffer_append_arrow: ts_kind=column requires non-NULL ts_column_name".to_string(),
-                    );
-                    return false;
-                }
-                let bytes = slice::from_raw_parts(ts_column_name as *const u8, ts_column_name_len);
-                match std::str::from_utf8(bytes) {
-                    Ok(s) => Some(s.to_string()),
-                    Err(e) => {
-                        arrow_err_to_c_box(
-                            err_out,
-                            ErrorCode::InvalidUtf8,
-                            format!("ts_column_name is not valid UTF-8: {}", e),
-                        );
-                        return false;
-                    }
-                }
-            }
-            _ => None,
-        };
+        // Clear `array.release` up-front so every early-return path drops
+        // imported buffers via `imported_array`'s Drop.
         let imported_array = std::ptr::read(array);
         (*array).release = None;
+        let inner = unwrap_buffer_mut(buffer);
         let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
             Ok(d) => d,
             Err(e) => {
-                arrow_err_to_c_box(
-                    err_out,
-                    ErrorCode::ArrowIngest,
-                    format!("from_ffi failed: {}", e),
-                );
+                arrow_err_to_c_box(err_out, ErrorCode::ArrowIngest, format!("from_ffi failed: {}", e));
                 return false;
             }
         };
         let rb = if matches!(array_data.data_type(), DataType::Struct(_)) {
-            let struct_array = StructArray::from(array_data);
-            RecordBatch::from(struct_array)
+            RecordBatch::from(StructArray::from(array_data))
         } else {
             let field = match Field::try_from(&*schema) {
                 Ok(f) => f,
                 Err(e) => {
-                    arrow_err_to_c_box(
-                        err_out,
-                        ErrorCode::ArrowIngest,
-                        format!("schema conversion failed: {}", e),
-                    );
+                    arrow_err_to_c_box(err_out, ErrorCode::ArrowIngest, format!("schema conversion failed: {}", e));
                     return false;
                 }
             };
@@ -3744,36 +3716,18 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
             match RecordBatch::try_new(rb_schema, vec![arr_ref]) {
                 Ok(rb) => rb,
                 Err(e) => {
-                    arrow_err_to_c_box(
-                        err_out,
-                        ErrorCode::ArrowIngest,
-                        format!("RecordBatch::try_new failed: {}", e),
-                    );
+                    arrow_err_to_c_box(err_out, ErrorCode::ArrowIngest, format!("RecordBatch::try_new failed: {}", e));
                     return false;
                 }
             }
         };
-        let ts = match ts_kind {
-            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_column => {
-                let name_str = ts_name_owned.as_deref().unwrap_or("");
-                match ColumnName::new(name_str) {
-                    Ok(n) => DesignatedTimestamp::Column(n),
-                    Err(e) => {
-                        arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
-                        return false;
-                    }
-                }
-            }
-            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_now => {
-                DesignatedTimestamp::Now
-            }
-            line_sender_designated_timestamp_kind::line_sender_designated_timestamp_server_now => {
-                DesignatedTimestamp::ServerNow
-            }
+        let result = match ts_column {
+            Some(ts) => inner.append_arrow_at_column(table.as_name(), &rb, ts.as_name()),
+            None => inner.append_arrow(table.as_name(), &rb),
         };
-        bubble_err_to_c!(err_out, inner.append_arrow(table.as_name(), &rb, ts));
+        bubble_err_to_c!(err_out, result);
         true
-    })
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -3835,6 +3789,9 @@ mod tests {
             (line_sender_error_invalid_decimal, 13),
             // New since 6.1.0 — must remain at the tail.
             (line_sender_error_server_rejection, 14),
+            // New since 7.0.0 — arrow feature. Append-only.
+            (line_sender_error_arrow_unsupported_column_kind, 15),
+            (line_sender_error_arrow_ingest, 16),
         ];
         for (variant, want) in expected {
             assert_eq!(

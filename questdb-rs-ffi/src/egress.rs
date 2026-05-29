@@ -1957,6 +1957,8 @@ pub unsafe extern "C" fn line_reader_query_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
+                        #[cfg(feature = "arrow")]
+                        arrow_schema_pin: None,
                         reader,
                     }))
                 }
@@ -2034,6 +2036,8 @@ pub unsafe extern "C" fn line_reader_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
+                        #[cfg(feature = "arrow")]
+                        arrow_schema_pin: None,
                         reader,
                     }))
                 }
@@ -2449,6 +2453,9 @@ pub struct line_reader_cursor {
     /// for the same reason as `cursor`. See the struct-level safety note —
     /// this field MUST be `None` whenever `&mut self.cursor` is exposed.
     current_batch: Option<BatchView<'static>>,
+    /// Pins the first Arrow batch's schema for mid-stream drift detection.
+    #[cfg(feature = "arrow")]
+    arrow_schema_pin: Option<arrow::datatypes::SchemaRef>,
     /// Backpointer to the originating reader, used to clear its `active`
     /// flag on `_cursor_free`. Always non-NULL for a valid cursor.
     reader: *mut line_reader,
@@ -3690,6 +3697,9 @@ mod tests {
             ErrorCode::ServerLimitExceeded,
             ErrorCode::Cancelled,
             ErrorCode::FailoverWouldDuplicate,
+            ErrorCode::SchemaDriftMidStream,
+            ErrorCode::NoSchema,
+            ErrorCode::ArrowExport,
         ];
         for code in codes {
             let c: line_reader_error_code = code.into();
@@ -3701,6 +3711,24 @@ mod tests {
                 line_reader_error_free(err);
             }
         }
+    }
+
+    #[test]
+    fn line_reader_error_code_arrow_discriminants_are_abi_stable() {
+        // Pin numeric values for the Arrow-related variants exposed to C/FFI
+        // consumers. Append-only past the existing tail at 21.
+        assert_eq!(
+            line_reader_error_code::line_reader_error_schema_drift as u32,
+            22
+        );
+        assert_eq!(
+            line_reader_error_code::line_reader_error_no_schema as u32,
+            23
+        );
+        assert_eq!(
+            line_reader_error_code::line_reader_error_arrow_export as u32,
+            24
+        );
     }
 
     #[test]
@@ -3949,10 +3977,14 @@ pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
             return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
         }
         let c = &mut *cursor;
+        let pinned = c.arrow_schema_pin.clone();
         let inner: &mut Cursor<'static> = c.cursor_for_mut();
-        let outcome = panic_guard(|| inner.next_arrow_batch_inner(None));
+        let outcome = panic_guard(|| inner.next_arrow_batch_inner(pinned.as_ref()));
         match outcome {
             Ok(Some(rb)) => {
+                if c.arrow_schema_pin.is_none() {
+                    c.arrow_schema_pin = Some(rb.schema());
+                }
                 let struct_array: StructArray = rb.into();
                 let array_data = struct_array.into_data();
                 match arrow::ffi::to_ffi(&array_data) {

@@ -97,19 +97,15 @@ std::shared_ptr<std::vector<uint8_t>> pack_le(const std::vector<T>& vs)
 
 namespace qdb = questdb::ingress;
 
-using ts_kind = qdb::line_sender_buffer::designated_timestamp_kind;
-
-// Releases the schema afterwards; the array's release is consumed by FFI.
 void append_ok(
     qdb::line_sender_buffer& buf,
     qdb::table_name_view tbl,
     ArrowArray& arr,
-    ArrowSchema& sch,
-    ts_kind kind = ts_kind::now)
+    ArrowSchema& sch)
 {
     try
     {
-        buf.append_arrow(tbl, arr, sch, kind);
+        buf.append_arrow(tbl, arr, sch);
     }
     catch (const qdb::line_sender_error& e)
     {
@@ -124,13 +120,12 @@ void append_expect_error(
     qdb::table_name_view tbl,
     ArrowArray& arr,
     ArrowSchema& sch,
-    ts_kind kind,
     qdb::line_sender_error_code expected_code)
 {
     bool thrown = false;
     try
     {
-        buf.append_arrow(tbl, arr, sch, kind);
+        buf.append_arrow(tbl, arr, sch);
     }
     catch (const qdb::line_sender_error& e)
     {
@@ -162,7 +157,7 @@ TEST_CASE("arrow ingress: Boolean column")
     auto values = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>{0b00000101});
     auto arr = make_array(3, 0, {nullptr, values});
     auto sch = make_schema("b", "flag");
-    append_ok(buf, "t_bool", arr, sch, ts_kind::now);
+    append_ok(buf, "t_bool", arr, sch);
 }
 
 TEST_CASE("arrow ingress: Int8 / Int16 / Int32 / Int64 columns")
@@ -172,28 +167,28 @@ TEST_CASE("arrow ingress: Int8 / Int16 / Int32 / Int64 columns")
         auto col = pack_le<int8_t>({-1, 0, 127});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("c", "by");
-        append_ok(buf, "t_i8", arr, sch, ts_kind::now);
+        append_ok(buf, "t_i8", arr, sch);
     }
     {
         auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int16_t>({-1234, 0, 31000});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("s", "sh");
-        append_ok(buf, "t_i16", arr, sch, ts_kind::now);
+        append_ok(buf, "t_i16", arr, sch);
     }
     {
         auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int32_t>({-1, 0, 0x7FFFFFFF});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("i", "in");
-        append_ok(buf, "t_i32", arr, sch, ts_kind::now);
+        append_ok(buf, "t_i32", arr, sch);
     }
     {
         auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<int64_t>({-1, 0, 0x7FFFFFFF'FFFFFFFFLL});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("l", "lo");
-        append_ok(buf, "t_i64", arr, sch, ts_kind::now);
+        append_ok(buf, "t_i64", arr, sch);
     }
 }
 
@@ -204,14 +199,14 @@ TEST_CASE("arrow ingress: Float32 / Float64 columns")
         auto col = pack_le<float>({1.5f, -2.5f, 3.14f});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("f", "f3");
-        append_ok(buf, "t_f32", arr, sch, ts_kind::now);
+        append_ok(buf, "t_f32", arr, sch);
     }
     {
         auto buf = qdb::line_sender_buffer::qwp_ws();
         auto col = pack_le<double>({1.5, -2.5, 3.14159});
         auto arr = make_array(3, 0, {nullptr, col});
         auto sch = make_schema("g", "f6");
-        append_ok(buf, "t_f64", arr, sch, ts_kind::now);
+        append_ok(buf, "t_f64", arr, sch);
     }
 }
 
@@ -232,7 +227,7 @@ TEST_CASE("arrow ingress: UInt16 + questdb.column_type=char routes to column_cha
         "\x04\x00\x00\x00"
         "char";
     sch.metadata = md;
-    append_ok(buf, "t_char", arr, sch, ts_kind::now);
+    append_ok(buf, "t_char", arr, sch);
 }
 
 TEST_CASE("arrow ingress: UInt32 + questdb.column_type=ipv4 routes to column_ipv4")
@@ -246,7 +241,7 @@ TEST_CASE("arrow ingress: UInt32 + questdb.column_type=ipv4 routes to column_ipv
         "\x13\x00\x00\x00questdb.column_type"
         "\x04\x00\x00\x00ipv4";
     sch.metadata = md;
-    append_ok(buf, "t_ipv4", arr, sch, ts_kind::now);
+    append_ok(buf, "t_ipv4", arr, sch);
 }
 
 TEST_CASE("arrow ingress: Utf8 / Binary / LargeUtf8 / LargeBinary")
@@ -268,14 +263,14 @@ TEST_CASE("arrow ingress: Utf8 / Binary / LargeUtf8 / LargeBinary")
         auto pair = build_utf8();
         auto arr = make_array(3, 0, {nullptr, pair.first, pair.second});
         auto sch = make_schema("u", "name");
-        append_ok(buf, "t_utf8", arr, sch, ts_kind::now);
+        append_ok(buf, "t_utf8", arr, sch);
     }
     {
         auto buf = qdb::line_sender_buffer::qwp_ws();
         auto pair = build_utf8();
         auto arr = make_array(3, 0, {nullptr, pair.first, pair.second});
         auto sch = make_schema("z", "blob");
-        append_ok(buf, "t_binary", arr, sch, ts_kind::now);
+        append_ok(buf, "t_binary", arr, sch);
     }
 }
 
@@ -294,7 +289,7 @@ TEST_CASE("arrow ingress: FixedSizeBinary(16) + arrow.uuid extension → column_
         "\x0A\x00\x00\x00"
         "arrow.uuid";
     sch.metadata = md;
-    append_ok(buf, "t_uuid", arr, sch, ts_kind::now);
+    append_ok(buf, "t_uuid", arr, sch);
 }
 
 TEST_CASE("arrow ingress: FixedSizeBinary(16) without UUID metadata → ArrowUnsupportedColumnKind")
@@ -308,7 +303,6 @@ TEST_CASE("arrow ingress: FixedSizeBinary(16) without UUID metadata → ArrowUns
         "t_unsup",
         arr,
         sch,
-        ts_kind::now,
         qdb::line_sender_error_code::arrow_unsupported_column_kind);
 }
 
@@ -318,7 +312,7 @@ TEST_CASE("arrow ingress: FixedSizeBinary(32) → column_long256")
     auto data = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>(64, 0xAB));
     auto arr = make_array(2, 0, {nullptr, data});
     auto sch = make_schema("w:32", "l256");
-    append_ok(buf, "t_l256", arr, sch, ts_kind::now);
+    append_ok(buf, "t_l256", arr, sch);
 }
 
 TEST_CASE("arrow ingress: Timestamp(µs) / Timestamp(ns) / Timestamp(ms)")
@@ -328,7 +322,7 @@ TEST_CASE("arrow ingress: Timestamp(µs) / Timestamp(ns) / Timestamp(ms)")
         auto col = pack_le<int64_t>({v0, v1});
         auto arr = make_array(2, 0, {nullptr, col});
         auto sch = make_schema(fmt, "ts");
-        append_ok(buf, "t_ts", arr, sch, ts_kind::server_now);
+        append_ok(buf, "t_ts", arr, sch);
     };
     build_ts_col("tsu:UTC", 1700000000000000LL, 1700000000000001LL);
     build_ts_col("tsn:UTC", 1700000000000000000LL, 1700000000000000001LL);
@@ -336,7 +330,7 @@ TEST_CASE("arrow ingress: Timestamp(µs) / Timestamp(ns) / Timestamp(ms)")
 }
 
 // ---------------------------------------------------------------------------
-// DesignatedTimestamp variants.
+// Designated-timestamp dispatch.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("arrow ingress: DTS=Column picks per-row ts from the named ts column")
@@ -394,22 +388,13 @@ TEST_CASE("arrow ingress: DTS=Column picks per-row ts from the named ts column")
     v_sch->release = nullptr;
 }
 
-TEST_CASE("arrow ingress: DTS=Now exercises client-side TimestampNanos::now()")
+TEST_CASE("arrow ingress: default append omits per-row timestamp (server stamps)")
 {
     auto buf = qdb::line_sender_buffer::qwp_ws();
     auto col = pack_le<int64_t>({10, 20});
     auto arr = make_array(2, 0, {nullptr, col});
     auto sch = make_schema("l", "v");
-    append_ok(buf, "t_dts_now", arr, sch, ts_kind::now);
-}
-
-TEST_CASE("arrow ingress: DTS=ServerNow omits per-row timestamp")
-{
-    auto buf = qdb::line_sender_buffer::qwp_ws();
-    auto col = pack_le<int64_t>({10, 20});
-    auto arr = make_array(2, 0, {nullptr, col});
-    auto sch = make_schema("l", "v");
-    append_ok(buf, "t_dts_snow", arr, sch, ts_kind::server_now);
+    append_ok(buf, "t_dts_default", arr, sch);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +411,7 @@ TEST_CASE("arrow ingress: Decimal64 / Decimal128 / Decimal256")
         auto col = pack_le<int64_t>({12345, 67890});
         auto arr = make_array(2, 0, {nullptr, col});
         auto sch = make_schema("d:18,2,64", "d64");
-        append_ok(buf, "t_d64", arr, sch, ts_kind::now);
+        append_ok(buf, "t_d64", arr, sch);
     }
     // Decimal128 (i128 mantissa, scale=3).
     {
@@ -434,7 +419,7 @@ TEST_CASE("arrow ingress: Decimal64 / Decimal128 / Decimal256")
         auto data = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>(32, 0));
         auto arr = make_array(2, 0, {nullptr, data});
         auto sch = make_schema("d:38,3", "d128");
-        append_ok(buf, "t_d128", arr, sch, ts_kind::now);
+        append_ok(buf, "t_d128", arr, sch);
     }
     // Decimal256 (i256 mantissa, scale=5).
     {
@@ -442,7 +427,7 @@ TEST_CASE("arrow ingress: Decimal64 / Decimal128 / Decimal256")
         auto data = std::make_shared<std::vector<uint8_t>>(std::vector<uint8_t>(64, 0));
         auto arr = make_array(2, 0, {nullptr, data});
         auto sch = make_schema("d:76,5,256", "d256");
-        append_ok(buf, "t_d256", arr, sch, ts_kind::now);
+        append_ok(buf, "t_d256", arr, sch);
     }
 }
 
@@ -457,5 +442,5 @@ TEST_CASE("arrow ingress: Int32 + questdb.geohash_bits routes to column_geohash"
         "\x14\x00\x00\x00" "questdb.geohash_bits"
         "\x02\x00\x00\x00" "20";
     sch.metadata = md;
-    append_ok(buf, "t_geo", arr, sch, ts_kind::now);
+    append_ok(buf, "t_geo", arr, sch);
 }

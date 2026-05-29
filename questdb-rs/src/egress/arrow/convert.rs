@@ -521,18 +521,29 @@ fn compute_per_level_counts(
                 row
             )
         })? as usize;
-        if hi == lo {
+        if hi < lo || hi > shapes.len() {
+            return Err(fmt!(
+                ProtocolError,
+                "row {} shape range [{}, {}) out of shapes len {}",
+                row,
+                lo,
+                hi,
+                shapes.len()
+            ));
+        }
+        let span = hi - lo;
+        if span == 0 {
             for level in &mut levels {
                 level.push(0);
             }
             continue;
         }
-        if hi - lo != ndim {
+        if span != ndim {
             return Err(fmt!(
                 ProtocolError,
                 "row {} has shape len {} expected ndim {}",
                 row,
-                hi - lo,
+                span,
                 ndim
             ));
         }
@@ -546,7 +557,14 @@ fn compute_per_level_counts(
                     levels[level].push(dim);
                 }
             }
-            group_count = group_count.saturating_mul(dim);
+            group_count = group_count.checked_mul(dim).ok_or_else(|| {
+                fmt!(
+                    ProtocolError,
+                    "row {} shape product overflows u32 at level {}",
+                    row,
+                    level
+                )
+            })?;
         }
     }
     Ok(levels)

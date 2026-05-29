@@ -16,9 +16,6 @@ import arrow_fuzz_common as afc
 from arrow_fuzz_common import KIND_REGISTRY, KindSpec
 from arrow_ffi import (
     ArrowSenderError,
-    DTS_COLUMN,
-    DTS_NOW,
-    DTS_SERVER_NOW,
     SenderErrorCode,
 )
 from questdb_line_sender import Buffer, Sender
@@ -405,7 +402,7 @@ class TestArrowIngressPerKind(afc.ArrowFuzzBase):
                 rb, vpc = _build_record_batch_with_ts(
                     self._master_rng, _ROWS_PER_BATCH, kinds, null_mode=null_mode,
                 )
-                afc.ingest_via_arrow(self._fixture, table, rb, ts_kind=DTS_COLUMN)
+                afc.ingest_via_arrow(self._fixture, table, rb)
                 afc.wait_for_rows(self._fixture, table, rb.num_rows)
                 expected_col = vpc[f"c_{kind_name}"]
                 if kind_name == "binary":
@@ -469,7 +466,7 @@ for _kind_name in list(KIND_REGISTRY.keys()):
     setattr(TestArrowIngressPerKind, f"test_kind_{_kind_name}", _make(_kind_name))
 
 class TestArrowIngressDesignatedTs(afc.ArrowFuzzBase):
-    """Each DesignatedTimestamp variant against a small mixed batch."""
+    """Each designated-timestamp mode (column / server-now) against a small mixed batch."""
 
     SUITE_LABEL = "arrow_ingress_dts"
 
@@ -488,7 +485,7 @@ class TestArrowIngressDesignatedTs(afc.ArrowFuzzBase):
         rb, kinds = self._build_small_batch()
         table = self.fresh_table("arrow_in_dts_col_us")
         afc.ingest_via_arrow(self._fixture, table, rb,
-                              ts_kind=DTS_COLUMN, ts_col=b"ts")
+                              ts_col=b"ts")
         afc.wait_for_rows(self._fixture, table, rb.num_rows)
         resp = self._fixture.http_sql_query(f"select count() from '{table}'")
         self.assertEqual(int(resp["dataset"][0][0]), rb.num_rows, self.label())
@@ -513,24 +510,10 @@ class TestArrowIngressDesignatedTs(afc.ArrowFuzzBase):
         rb = pa.RecordBatch.from_arrays([arr_int, ts_arr], schema=schema)
         table = self.fresh_table("arrow_in_dts_col_ns")
         afc.ingest_via_arrow(self._fixture, table, rb,
-                              ts_kind=DTS_COLUMN, ts_col=b"ts")
+                              ts_col=b"ts")
         afc.wait_for_rows(self._fixture, table, rb.num_rows)
 
-    def test_dts_now(self):
-        rb, kinds = self._build_small_batch()
-        # Drop the ts column for DTS_NOW (server stamps its own).
-        no_ts_fields = [f for f in rb.schema if f.name != "ts"]
-        no_ts_arrays = [rb.column(rb.schema.get_field_index(f.name))
-                         for f in no_ts_fields]
-        rb_no_ts = pa.RecordBatch.from_arrays(
-            no_ts_arrays, schema=pa.schema(no_ts_fields),
-        )
-        table = self.fresh_table("arrow_in_dts_now")
-        afc.ingest_via_arrow(self._fixture, table, rb_no_ts,
-                              ts_kind=DTS_NOW, ts_col=b"")
-        afc.wait_for_rows(self._fixture, table, rb_no_ts.num_rows)
-
-    def test_dts_server_now(self):
+    def test_dts_default(self):
         rb, kinds = self._build_small_batch()
         no_ts_fields = [f for f in rb.schema if f.name != "ts"]
         no_ts_arrays = [rb.column(rb.schema.get_field_index(f.name))
@@ -538,9 +521,8 @@ class TestArrowIngressDesignatedTs(afc.ArrowFuzzBase):
         rb_no_ts = pa.RecordBatch.from_arrays(
             no_ts_arrays, schema=pa.schema(no_ts_fields),
         )
-        table = self.fresh_table("arrow_in_dts_snow")
-        afc.ingest_via_arrow(self._fixture, table, rb_no_ts,
-                              ts_kind=DTS_SERVER_NOW, ts_col=b"")
+        table = self.fresh_table("arrow_in_dts_default")
+        afc.ingest_via_arrow(self._fixture, table, rb_no_ts, ts_col=None)
         afc.wait_for_rows(self._fixture, table, rb_no_ts.num_rows)
 
 class TestArrowIngressErrors(afc.ArrowFuzzBase):
@@ -549,13 +531,13 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
     SUITE_LABEL = "arrow_ingress_errors"
 
     def _expect_code(self, rb: pa.RecordBatch, expected_code: int, *,
-                    ts_kind: int = DTS_COLUMN, ts_col: bytes = b"ts",
+                    ts_col: Optional[bytes] = b"ts",
                     extras=None) -> ArrowSenderError:
         table = f"arrow_in_err_{self._master_rng.next_int(2**32):08x}"
         try:
             afc.ingest_via_arrow(
                 self._fixture, table, rb,
-                ts_kind=ts_kind, ts_col=ts_col,
+                ts_col=ts_col,
                 sender_conf_extras=extras or {},
             )
         except ArrowSenderError as e:
@@ -694,7 +676,7 @@ class TestArrowIngressExtraTypes(afc.ArrowFuzzBase):
         ])
         rb = pa.RecordBatch.from_arrays([col_arr, ts_arr], schema=schema)
         afc.ingest_via_arrow(self._fixture, table, rb,
-                              ts_kind=DTS_COLUMN, ts_col=b"ts")
+                              ts_col=b"ts")
         afc.wait_for_rows(self._fixture, table, len(col_arr))
 
     def test_extra_float16_widens_to_double(self):
@@ -749,7 +731,7 @@ class TestArrowIngressUnsupportedTypes(afc.ArrowFuzzBase):
         table = self.fresh_table("arrow_in_reject")
         try:
             afc.ingest_via_arrow(self._fixture, table, rb,
-                                  ts_kind=DTS_COLUMN, ts_col=b"ts")
+                                  ts_col=b"ts")
         except ArrowSenderError as e:
             self.assertEqual(
                 e.code, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND,
@@ -819,7 +801,7 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
                     buffer_append_arrow(
                         buf._impl, table_name,
                         ctypes.byref(arr), ctypes.byref(sch),
-                        DTS_COLUMN, b"ts",
+                        ts_column_name=b"ts",
                     )
                 finally:
                     if sch.release:
@@ -904,8 +886,7 @@ class TestArrowIngressFuzz(afc.ArrowFuzzBase):
                 )
                 table = self.fresh_table(f"arrow_in_fuzz_{it}")
                 afc.create_table_from_kinds(self._fixture, table, kinds)
-                afc.ingest_via_arrow(self._fixture, table, rb,
-                                      ts_kind=DTS_COLUMN)
+                afc.ingest_via_arrow(self._fixture, table, rb)
                 afc.wait_for_rows(self._fixture, table, rb.num_rows)
 
 def register(loop_registry):

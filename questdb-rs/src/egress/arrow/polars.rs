@@ -7,6 +7,28 @@ use polars::prelude::{Column, IntoColumn, PlSmallStr, Series};
 use crate::egress::Cursor;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 
+// Catch any drift between the two crates' Rust-side mirrors of the Arrow
+// C Data Interface structs at compile time. The transmutes below rely on
+// byte-identical layout.
+const _: () = assert!(
+    std::mem::size_of::<polars_arrow::ffi::ArrowArray>()
+        == std::mem::size_of::<arrow::ffi::FFI_ArrowArray>(),
+    "polars_arrow::ffi::ArrowArray size diverged from arrow::ffi::FFI_ArrowArray"
+);
+const _: () = assert!(
+    std::mem::size_of::<polars_arrow::ffi::ArrowSchema>()
+        == std::mem::size_of::<arrow::ffi::FFI_ArrowSchema>(),
+    "polars_arrow::ffi::ArrowSchema size diverged from arrow::ffi::FFI_ArrowSchema"
+);
+const _: () = assert!(
+    std::mem::align_of::<polars_arrow::ffi::ArrowArray>()
+        == std::mem::align_of::<arrow::ffi::FFI_ArrowArray>(),
+);
+const _: () = assert!(
+    std::mem::align_of::<polars_arrow::ffi::ArrowSchema>()
+        == std::mem::align_of::<arrow::ffi::FFI_ArrowSchema>(),
+);
+
 impl Cursor<'_> {
     /// Decode one batch as a Polars [`DataFrame`]. `Ok(None)` on stream end.
     pub fn next_polars(&mut self) -> Result<Option<DataFrame>> {

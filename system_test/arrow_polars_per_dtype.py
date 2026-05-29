@@ -8,7 +8,7 @@ from typing import Any, Callable, Optional
 import pyarrow as pa
 
 import arrow_fuzz_common as afc
-from arrow_ffi import ArrowSenderError, DTS_COLUMN, SenderErrorCode
+from arrow_ffi import ArrowSenderError, SenderErrorCode
 
 
 _ROWS = 4
@@ -53,8 +53,7 @@ def _create_table(fixture, table: str, ddl_body: str) -> None:
 def _try_ingest(testcase, table: str, df) -> Optional[Exception]:
     try:
         rb = _polars_to_rb(df)
-        afc.ingest_via_arrow(testcase._fixture, table, rb,
-                              ts_kind=DTS_COLUMN, ts_col=b"ts")
+        afc.ingest_via_arrow(testcase._fixture, table, rb, ts_col=b"ts")
         return None
     except Exception as e:
         return e

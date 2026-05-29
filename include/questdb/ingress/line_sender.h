@@ -1995,7 +1995,7 @@ int64_t line_sender_now_nanos(void);
 QUESTDB_CLIENT_API
 int64_t line_sender_now_micros(void);
 
-#ifdef QUESTDB_CLIENT_HAS_ARROW
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
 /* Apache Arrow C Data Interface (feature: arrow).
  * https://arrow.apache.org/docs/format/CDataInterface.html */
 
@@ -2035,30 +2035,18 @@ struct ArrowArray
 
 #endif /* ARROW_C_DATA_INTERFACE */
 
-typedef enum line_sender_designated_timestamp_kind
-{
-    line_sender_designated_timestamp_column = 0,
-    line_sender_designated_timestamp_now = 1,
-    line_sender_designated_timestamp_server_now = 2,
-} line_sender_designated_timestamp_kind;
-
 /**
  * Append every row of a `RecordBatch` (Arrow C Data Interface) to `buffer`.
+ * The per-row designated timestamp is not sent — the server stamps each row
+ * on arrival (same semantics as `line_sender_buffer_at_now`).
  *
  * `array` may be either:
  *   - A Struct array (one child per column, the standard RecordBatch shape), or
  *   - A non-Struct (single-column) array whose `schema->name` becomes the
  *     column name.
  *
- * On both success and failure this function takes ownership of `array`'s
- * release callback. `array->release` is set to NULL before returning; the
- * caller may invoke `array->release(array)` defensively (it becomes a no-op).
- * `schema` is borrowed (not consumed).
- *
- * When `ts_kind == column`, `ts_column_name` / `ts_column_name_len` name the
- * source column (UTF-8, not NUL-terminated). Both NULL and length 0 are
- * rejected as `line_sender_error_invalid_api_call`. When `ts_kind` is `now`
- * or `server_now`, both must be NULL / 0.
+ * `array` is consumed: `array->release` is set to NULL before returning on
+ * both success and failure. `schema` is borrowed.
  *
  * Server-side type-mismatch surfaces from the next `line_sender_flush`.
  */
@@ -2068,11 +2056,26 @@ bool line_sender_buffer_append_arrow(
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    line_sender_designated_timestamp_kind ts_kind,
-    const char* ts_column_name,
-    size_t ts_column_name_len,
     line_sender_error** err_out);
-#endif /* QUESTDB_CLIENT_HAS_ARROW */
+
+/**
+ * Append every row of a `RecordBatch`, sourcing the per-row designated
+ * timestamp from a named `Timestamp(_)` column inside the batch.
+ *
+ * Same ownership and shape contract as `line_sender_buffer_append_arrow`.
+ * `ts_column` must be initialised via `line_sender_column_name_init` and
+ * name a `Timestamp(Microsecond | Nanosecond | Millisecond, _)` column
+ * with no null rows.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_buffer_append_arrow_at_column(
+    line_sender_buffer* buffer,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    line_sender_error** err_out);
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
 }

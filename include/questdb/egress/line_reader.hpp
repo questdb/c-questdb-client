@@ -2462,7 +2462,7 @@ public:
         return egress::batch{p};
     }
 
-#ifdef QUESTDB_CLIENT_HAS_ARROW
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
     /**
      * Result of `next_arrow_batch`. Aggregate of the two Apache Arrow
      * C Data Interface structs the C entry point fills in.
@@ -2516,7 +2516,7 @@ public:
                 throw line_reader_error::from_c(c_err);
         }
     }
-#endif /* QUESTDB_CLIENT_HAS_ARROW */
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
     // ---- Introspection -----------------------------------------------------
 

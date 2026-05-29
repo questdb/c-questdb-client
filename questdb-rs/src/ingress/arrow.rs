@@ -44,31 +44,51 @@ use crate::error::{Error, ErrorCode};
 use crate::ingress::buffer::{
     ArrowBatchInfo, ArrowBulkCtx, ArrowDecimalSpec, QwpColumnKind, QwpWsColumnarBuffer,
 };
-use crate::ingress::{Buffer, ColumnName, TableName, TimestampNanos};
+use crate::ingress::{Buffer, ColumnName, TableName};
 use crate::{Result, fmt};
 
-/// Per-row designated-timestamp source for [`Buffer::append_arrow`].
-#[derive(Clone, Copy)]
-#[non_exhaustive]
-pub enum DesignatedTimestamp<'a> {
-    /// Pull from a named `Timestamp(_)` column.
-    Column(ColumnName<'a>),
-    /// `TimestampNanos::now()` per row.
-    Now,
-    /// Omit timestamp (server fills arrival time).
-    ServerNow,
-}
-
 impl Buffer {
-    /// Append every row of `batch` to this buffer via the QWP/WebSocket
-    /// columnar bulk path. Requires a QWP/WS buffer; row-by-row protocols
-    /// (ILP, QWP/UDP) reject the call. Type-mismatch against the
-    /// destination QuestDB table surfaces from the next flush.
-    pub fn append_arrow(
+    /// Append every row of `batch` to this buffer. The per-row
+    /// designated timestamp is not sent — the server stamps each row
+    /// on arrival, matching [`Buffer::at_now`](Buffer::at_now).
+    ///
+    /// Requires a QWP/WS buffer. Mid-batch errors roll the buffer back
+    /// to its pre-call state.
+    ///
+    /// Use [`Buffer::append_arrow_at_column`] to source the timestamp
+    /// from a batch column.
+    ///
+    /// # Errors
+    ///
+    /// * [`ErrorCode::ArrowUnsupportedColumnKind`] — column's Arrow
+    ///   type has no QWP wire mapping.
+    /// * [`ErrorCode::ArrowIngest`] — structural validation failed.
+    /// * [`ErrorCode::InvalidApiCall`] — called on a non-QWP/WS buffer
+    ///   or while a row-by-row row is in progress on the same table.
+    pub fn append_arrow(&mut self, table: TableName<'_>, batch: &RecordBatch) -> Result<()> {
+        self.append_arrow_inner(table, batch, None)
+    }
+
+    /// Append every row of `batch`, sourcing the per-row designated
+    /// timestamp from `ts_column`. The column must be a
+    /// `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with no
+    /// null rows; `Millisecond` is widened to µs on the wire.
+    ///
+    /// Other semantics match [`Buffer::append_arrow`].
+    pub fn append_arrow_at_column(
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        designated_timestamp: DesignatedTimestamp<'_>,
+        ts_column: ColumnName<'_>,
+    ) -> Result<()> {
+        self.append_arrow_inner(table, batch, Some(ts_column))
+    }
+
+    fn append_arrow_inner(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_column: Option<ColumnName<'_>>,
     ) -> Result<()> {
         let schema = batch.schema();
         let row_count = batch.num_rows();
@@ -84,9 +104,9 @@ impl Buffer {
         if row_count == 0 {
             return Ok(());
         }
-        let ts_col_idx = match designated_timestamp {
-            DesignatedTimestamp::Column(name) => Some(resolve_ts_column(batch, name)?),
-            DesignatedTimestamp::Now | DesignatedTimestamp::ServerNow => None,
+        let ts_col_idx = match ts_column {
+            Some(name) => Some(resolve_ts_column(batch, name)?),
+            None => None,
         };
         let effective_rows = u32::try_from(row_count)
             .map_err(|_| fmt!(ArrowIngest, "row count {} exceeds u32::MAX", row_count))?;
@@ -98,32 +118,65 @@ impl Buffer {
             )
         })?;
         let ctx = qwp_ws.arrow_bulk_begin(table)?;
-        for (idx, field) in schema.fields().iter().enumerate() {
-            if Some(idx) == ts_col_idx {
-                continue;
+        let inner_result = emit_arrow_batch(
+            qwp_ws,
+            &ctx,
+            batch,
+            &schema,
+            ts_col_idx,
+        );
+        match inner_result {
+            Ok(()) => match qwp_ws.arrow_bulk_commit(&ctx, effective_rows) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    qwp_ws.arrow_bulk_rollback(ctx);
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                qwp_ws.arrow_bulk_rollback(ctx);
+                Err(e)
             }
-            let col_name = ColumnName::new(field.name())?;
-            let kind = classify(field.as_ref(), batch.column(idx).as_ref())?;
-            emit_arrow_column(qwp_ws, &ctx, col_name, kind, batch.column(idx).as_ref())?;
         }
-        match designated_timestamp {
-            DesignatedTimestamp::Column(_) => {
-                let idx = ts_col_idx.unwrap();
-                let arr = batch.column(idx);
-                emit_arrow_designated_ts(
-                    qwp_ws,
-                    &ctx,
-                    schema.field(idx).data_type(),
-                    arr.as_ref(),
-                )?;
-            }
-            DesignatedTimestamp::Now => {
-                emit_arrow_designated_ts_now(qwp_ws, &ctx, effective_rows)?;
-            }
-            DesignatedTimestamp::ServerNow => {}
-        }
-        qwp_ws.arrow_bulk_commit(ctx, effective_rows)
     }
+}
+
+#[inline]
+fn emit_arrow_batch(
+    qwp_ws: &mut QwpWsColumnarBuffer,
+    ctx: &ArrowBulkCtx,
+    batch: &RecordBatch,
+    schema: &arrow_schema::SchemaRef,
+    ts_col_idx: Option<usize>,
+) -> Result<()> {
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if Some(idx) == ts_col_idx {
+            continue;
+        }
+        let col_name =
+            ColumnName::new(field.name()).map_err(|e| decorate_column(e, field.name()))?;
+        let kind = classify(field.as_ref(), batch.column(idx).as_ref())
+            .map_err(|e| decorate_column(e, field.name()))?;
+        emit_arrow_column(qwp_ws, ctx, col_name, kind, batch.column(idx).as_ref())
+            .map_err(|e| decorate_column(e, field.name()))?;
+    }
+    if let Some(idx) = ts_col_idx {
+        let arr = batch.column(idx);
+        let field_name = schema.field(idx).name();
+        emit_arrow_designated_ts(qwp_ws, ctx, schema.field(idx).data_type(), arr.as_ref())
+            .map_err(|e| decorate_column(e, field_name))?;
+    }
+    Ok(())
+}
+
+fn decorate_column(err: Error, column_name: &str) -> Error {
+    if err.msg().contains("column '") {
+        return err;
+    }
+    Error::new(
+        err.code(),
+        format!("column '{}': {}", column_name, err.msg()),
+    )
 }
 
 fn resolve_ts_column(batch: &RecordBatch, name: ColumnName<'_>) -> Result<usize> {
@@ -204,10 +257,17 @@ fn emit_arrow_designated_ts(
                 .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap();
             qwp_ws.arrow_bulk_set_designated_ts(ctx, QwpColumnKind::TimestampMicros, info, |out| {
-                non_null_le_into(out, arr, |row| {
-                    a.value(row).saturating_mul(1_000).to_le_bytes()
-                });
-                Ok(())
+                try_non_null_le_into(out, arr, |row| {
+                    let v = a.value(row);
+                    v.checked_mul(1_000).map(i64::to_le_bytes).ok_or_else(|| {
+                        fmt!(
+                            ArrowIngest,
+                            "designated timestamp ms→µs overflow at row {} (value {})",
+                            row,
+                            v
+                        )
+                    })
+                })
             })
         }
         other => Err(fmt!(
@@ -218,29 +278,6 @@ fn emit_arrow_designated_ts(
     }
 }
 
-fn emit_arrow_designated_ts_now(
-    qwp_ws: &mut QwpWsColumnarBuffer,
-    ctx: &ArrowBulkCtx,
-    row_count: u32,
-) -> Result<()> {
-    let now = TimestampNanos::now().as_i64().to_le_bytes();
-    qwp_ws.arrow_bulk_set_designated_ts(
-        ctx,
-        QwpColumnKind::TimestampNanos,
-        ArrowBatchInfo {
-            bitmap: None,
-            rows: row_count,
-            non_null: row_count,
-        },
-        |out| {
-            out.reserve(row_count as usize * 8);
-            for _ in 0..row_count {
-                out.extend_from_slice(&now);
-            }
-            Ok(())
-        },
-    )
-}
 
 fn full_with_sentinel_into<const N: usize>(
     out: &mut Vec<u8>,
@@ -272,6 +309,23 @@ fn non_null_le_into<const N: usize>(
         }
         out.extend_from_slice(&get_bytes(row));
     }
+}
+
+fn try_non_null_le_into<const N: usize>(
+    out: &mut Vec<u8>,
+    arr: &dyn Array,
+    mut get_bytes: impl FnMut(usize) -> Result<[u8; N]>,
+) -> Result<()> {
+    let row_count = arr.len();
+    out.reserve((row_count - arr.null_count()) * N);
+    for row in 0..row_count {
+        if arr.is_null(row) {
+            continue;
+        }
+        let bytes = get_bytes(row)?;
+        out.extend_from_slice(&bytes);
+    }
+    Ok(())
 }
 
 fn non_null_fsb_into(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray, size: usize) {
@@ -481,15 +535,33 @@ fn emit_arrow_column(
                     if null_count == 0 {
                         let src = a.values();
                         out.reserve(src.len() * 8);
-                        for &v in src {
-                            out.extend_from_slice(&v.saturating_mul(1_000_000).to_le_bytes());
+                        for (row, &v) in src.iter().enumerate() {
+                            let widened = v.checked_mul(1_000_000).ok_or_else(|| {
+                                fmt!(
+                                    ArrowIngest,
+                                    "Timestamp s→µs overflow at row {} (value {})",
+                                    row,
+                                    v
+                                )
+                            })?;
+                            out.extend_from_slice(&widened.to_le_bytes());
                         }
+                        Ok(())
                     } else {
-                        non_null_le_into(out, arr, |row| {
-                            a.value(row).saturating_mul(1_000_000).to_le_bytes()
-                        });
+                        try_non_null_le_into(out, arr, |row| {
+                            let v = a.value(row);
+                            v.checked_mul(1_000_000)
+                                .map(i64::to_le_bytes)
+                                .ok_or_else(|| {
+                                    fmt!(
+                                        ArrowIngest,
+                                        "Timestamp s→µs overflow at row {} (value {})",
+                                        row,
+                                        v
+                                    )
+                                })
+                        })
                     }
-                    Ok(())
                 },
             )
         }
@@ -553,16 +625,33 @@ fn emit_arrow_column(
                 if null_count == 0 {
                     let src = a.values();
                     out.reserve(src.len() * 8);
-                    for &d in src {
-                        out.extend_from_slice(&(d as i64).saturating_mul(86_400_000).to_le_bytes());
+                    for (row, &d) in src.iter().enumerate() {
+                        let ms = (d as i64).checked_mul(86_400_000).ok_or_else(|| {
+                            fmt!(
+                                ArrowIngest,
+                                "Date32 days→ms overflow at row {} (value {})",
+                                row,
+                                d
+                            )
+                        })?;
+                        out.extend_from_slice(&ms.to_le_bytes());
                     }
+                    Ok(())
                 } else {
-                    non_null_le_into(out, arr, |row| {
+                    try_non_null_le_into(out, arr, |row| {
                         let days = a.value(row) as i64;
-                        days.saturating_mul(86_400_000).to_le_bytes()
-                    });
+                        days.checked_mul(86_400_000)
+                            .map(i64::to_le_bytes)
+                            .ok_or_else(|| {
+                                fmt!(
+                                    ArrowIngest,
+                                    "Date32 days→ms overflow at row {} (value {})",
+                                    row,
+                                    days
+                                )
+                            })
+                    })
                 }
-                Ok(())
             })
         }
         ColumnKind::Date64Ms => {
@@ -875,23 +964,56 @@ fn varlen_no_null_i32_into(
     arr_len: usize,
     label: &str,
 ) -> Result<()> {
-    let used = arr_offsets[arr_len] as u32;
+    if arr_offsets.len() != arr_len + 1 {
+        return Err(fmt!(
+            ArrowIngest,
+            "{} offsets length {} != arr_len + 1 ({})",
+            label,
+            arr_offsets.len(),
+            arr_len + 1
+        ));
+    }
+    let first = arr_offsets[0];
+    let last = arr_offsets[arr_len];
+    if first < 0 || last < first {
+        return Err(fmt!(
+            ArrowIngest,
+            "{} offsets [{}, {}] not non-decreasing non-negative",
+            label,
+            first,
+            last
+        ));
+    }
+    let first_u = first as u32;
+    let last_u = last as u32;
+    let used = last_u - first_u;
+    let last_usize = last as usize;
+    if last_usize > arr_data.len() {
+        return Err(fmt!(
+            ArrowIngest,
+            "{} last offset {} exceeds data len {}",
+            label,
+            last_usize,
+            arr_data.len()
+        ));
+    }
     let data_base = varlen_data_base(data, label)?;
     data_base
         .checked_add(used)
         .ok_or_else(|| fmt!(ArrowIngest, "{} cumulative offset exceeds u32::MAX", label))?;
     offsets.reserve(arr_len);
-    if data_base == 0 {
-        // SAFETY: i32 and u32 share layout; Arrow byte-array offsets are >= 0.
+    let rebase = data_base.wrapping_sub(first_u);
+    if first == 0 && data_base == 0 {
+        // SAFETY: validated above that offsets are non-negative.
         let as_u32: &[u32] =
             unsafe { std::slice::from_raw_parts(arr_offsets[1..].as_ptr() as *const u32, arr_len) };
         offsets.extend_from_slice(as_u32);
     } else {
         for &off in &arr_offsets[1..] {
-            offsets.push(data_base + off as u32);
+            offsets.push(rebase.wrapping_add(off as u32));
         }
     }
-    data.extend_from_slice(&arr_data[..used as usize]);
+    data.extend_from_slice(&arr_data[first as usize..last_usize]);
     Ok(())
 }
 
@@ -1381,6 +1503,11 @@ struct SymbolPayload {
     dict_data: Vec<u8>,
 }
 
+/// Upper bound on dictionary entries accepted from an Arrow column. The
+/// limit caps `Vec::with_capacity` so a malformed or hostile FFI batch
+/// cannot trigger an allocator abort under `panic = "abort"`.
+const MAX_ARROW_DICT_VALUES: usize = 16 * 1024 * 1024;
+
 fn build_symbol_payload_dyn(
     arr: &dyn Array,
     key: DictKey,
@@ -1388,6 +1515,14 @@ fn build_symbol_payload_dyn(
 ) -> Result<SymbolPayload> {
     let values = dict_values_dyn(arr, key);
     let value_count = values.len();
+    if value_count > MAX_ARROW_DICT_VALUES {
+        return Err(fmt!(
+            ArrowIngest,
+            "SYMBOL dictionary has {} values exceeding limit {}",
+            value_count,
+            MAX_ARROW_DICT_VALUES
+        ));
+    }
     let mut entries: Vec<(u32, u32)> = Vec::with_capacity(value_count);
     let mut dict_data: Vec<u8> = Vec::new();
     let mut cumulative: u32 = 0;
@@ -2047,7 +2182,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(fields));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2060,7 +2195,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Float64, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(f64b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2097,7 +2232,7 @@ mod tests {
         ]));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::ServerNow)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 1);
     }
@@ -2109,9 +2244,9 @@ mod tests {
         s.append_value("");
         s.append_value("yo");
         let mut bin = BinaryBuilder::new();
-        bin.append_value(&[1u8, 2, 3]);
-        bin.append_value(&[]);
-        bin.append_value(&[0xFFu8]);
+        bin.append_value([1u8, 2, 3]);
+        bin.append_value([]);
+        bin.append_value([0xFFu8]);
         let cols: Vec<ArrayRef> = vec![Arc::new(s.finish()), Arc::new(bin.finish())];
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -2119,7 +2254,7 @@ mod tests {
         ]));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2143,7 +2278,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 1);
     }
@@ -2156,7 +2291,7 @@ mod tests {
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+            .append_arrow(table("t"), &rb)
             .unwrap_err();
         assert_eq!(
             err.code(),
@@ -2171,7 +2306,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("l", DataType::FixedSizeBinary(32), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 1);
     }
@@ -2196,7 +2331,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2215,7 +2350,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2235,7 +2370,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 1);
     }
@@ -2248,7 +2383,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal64(18, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 1);
     }
@@ -2261,7 +2396,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal128(38, 3), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 1);
     }
@@ -2293,7 +2428,7 @@ mod tests {
         .unwrap();
         let mut buf = fresh_buffer();
         let ts_col = ColumnName::new("ts").unwrap();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Column(ts_col))
+        buf.append_arrow_at_column(table("t"), &rb, ts_col)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2307,7 +2442,7 @@ mod tests {
         let mut buf = fresh_buffer();
         let missing = ColumnName::new("missing_ts").unwrap();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Column(missing))
+            .append_arrow_at_column(table("t"), &rb, missing)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
     }
@@ -2321,7 +2456,7 @@ mod tests {
         let mut buf = fresh_buffer();
         let v_col = ColumnName::new("v").unwrap();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Column(v_col))
+            .append_arrow_at_column(table("t"), &rb, v_col)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
     }
@@ -2342,7 +2477,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 1);
     }
@@ -2362,7 +2497,7 @@ mod tests {
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+            .append_arrow(table("t"), &rb)
             .unwrap_err();
         assert_eq!(
             err.code(),
@@ -2376,7 +2511,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(v.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 0);
     }
@@ -2389,7 +2524,7 @@ mod tests {
         let rb = RecordBatch::try_new(schema, vec![Arc::new(v.finish()) as ArrayRef]).unwrap();
         let mut buf = Buffer::new(crate::ingress::ProtocolVersion::V2);
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+            .append_arrow(table("t"), &rb)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::InvalidApiCall);
     }
@@ -2403,7 +2538,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("n", DataType::Int32, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2417,7 +2552,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("f", DataType::Float64, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2432,7 +2567,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2446,7 +2581,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Utf8, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2473,7 +2608,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 5);
     }
@@ -2487,7 +2622,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("amt", DataType::Decimal128(10, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2509,7 +2644,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2546,7 +2681,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2560,7 +2695,7 @@ mod tests {
             b.append_value(value);
             let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(b.finish()) as ArrayRef])
                 .unwrap();
-            buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+            buf.append_arrow(table("t"), &rb)
                 .unwrap();
         }
         assert_eq!(buf.row_count(), 3);
@@ -2573,7 +2708,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         let err = buf
             .table(table("t"))
@@ -2599,7 +2734,7 @@ mod tests {
         let mut buf = fresh_buffer();
         let ts_name = ColumnName::new("ts").unwrap();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Column(ts_name))
+            .append_arrow_at_column(table("t"), &rb, ts_name)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
     }
@@ -2617,7 +2752,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2635,7 +2770,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2653,7 +2788,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2670,7 +2805,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2691,7 +2826,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2713,7 +2848,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2737,7 +2872,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2757,7 +2892,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 4);
     }
@@ -2781,7 +2916,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2803,7 +2938,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2824,7 +2959,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2842,7 +2977,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2863,7 +2998,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2884,7 +3019,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2903,7 +3038,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 4);
     }
@@ -2923,7 +3058,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 4);
     }
@@ -2949,7 +3084,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -2966,7 +3101,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -2988,7 +3123,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -3011,7 +3146,7 @@ mod tests {
         .unwrap();
         let mut buf = fresh_buffer();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+            .append_arrow(table("t"), &rb)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
         assert!(
@@ -3049,7 +3184,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 2);
     }
@@ -3068,7 +3203,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -3086,7 +3221,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -3108,7 +3243,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -3124,7 +3259,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal32(9, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+        buf.append_arrow(table("t"), &rb)
             .unwrap();
         assert_eq!(buf.row_count(), 3);
     }
@@ -3139,7 +3274,7 @@ mod tests {
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+            .append_arrow(table("t"), &rb)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
     }
@@ -3148,7 +3283,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![arr]).unwrap();
         let mut buf = fresh_buffer();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
+            .append_arrow(table("t"), &rb)
             .unwrap_err();
         assert_eq!(
             err.code(),
@@ -3260,5 +3395,213 @@ mod tests {
         let arr = b.finish();
         let dtype = arr.data_type().clone();
         assert_unsupported_column(Field::new("c", dtype, true), Arc::new(arr) as ArrayRef);
+    }
+
+    #[test]
+    fn dict_values_with_null_entry_rejected_for_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let mut vb = StringBuilder::new();
+        vb.append_value("a");
+        vb.append_null();
+        vb.append_value("c");
+        let values = vb.finish();
+        let keys = arrow_array::UInt32Array::from(vec![0u32, 2, 0]);
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
+        let field = Field::new(
+            "sym",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .with_metadata(
+            [(crate::egress::arrow::metadata::SYMBOL.into(), "true".into())]
+                .into_iter()
+                .collect(),
+        );
+        let schema = arrow_schema_with(field);
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf
+            .append_arrow(table("t"), &rb)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("dictionary values"),
+            "unexpected error message: {}",
+            err.msg()
+        );
+        assert_eq!(buf.row_count(), 0, "buffer should roll back to 0 rows");
+    }
+
+    #[test]
+    fn dict_values_with_null_entry_rejected_for_varchar_fallback() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let mut vb = StringBuilder::new();
+        vb.append_value("a");
+        vb.append_null();
+        let values = vb.finish();
+        let keys = arrow_array::UInt32Array::from(vec![0u32, 0]);
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
+        let field = Field::new(
+            "v",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        );
+        let schema = arrow_schema_with(field);
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf
+            .append_arrow(table("t"), &rb)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("dictionary values"));
+    }
+
+    #[test]
+    fn timestamp_ms_designated_overflow_rejected() {
+        let mut b = TimestampMillisecondBuilder::new();
+        b.append_value(i64::MAX / 1000 + 1);
+        b.append_value(0);
+        let schema = arrow_schema_with(Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf
+            .append_arrow_at_column(
+                table("t"),
+                &rb,
+                ColumnName::new("ts").unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("ms→µs overflow"),
+            "expected overflow message, got: {}",
+            err.msg()
+        );
+        assert_eq!(buf.row_count(), 0);
+    }
+
+    #[test]
+    fn timestamp_second_to_micros_overflow_rejected() {
+        use arrow_array::builder::TimestampSecondBuilder;
+        let mut b = TimestampSecondBuilder::new();
+        b.append_value(i64::MAX / 1_000_000 + 1);
+        let schema = arrow_schema_with(Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        ));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf
+            .append_arrow(table("u"), &rb)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("s→µs overflow"),
+            "expected overflow message, got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn buffer_clear_after_arrow_allows_row_by_row_reuse() {
+        let mut buf = fresh_buffer();
+        let mut b = Int64Builder::new();
+        b.append_value(1);
+        b.append_value(2);
+        let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        buf.append_arrow(table("t"), &rb)
+            .unwrap();
+        assert_eq!(buf.row_count(), 2);
+        buf.clear();
+        assert_eq!(buf.row_count(), 0);
+        buf.table(table("t")).unwrap();
+        buf.column_i64("v", 99).unwrap();
+        buf.at_now().unwrap();
+        assert_eq!(buf.row_count(), 1);
+    }
+
+    #[test]
+    fn append_arrow_error_rolls_back_columns() {
+        // Two columns: the second one will fail classification (Map),
+        // so the first column's bytes must not stick.
+        use arrow_array::builder::{Int64Builder, MapBuilder, StringBuilder};
+        let mut col1 = Int64Builder::new();
+        col1.append_value(11);
+        col1.append_value(22);
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map.keys().append_value("k1");
+        map.values().append_value(1);
+        map.append(true).unwrap();
+        map.keys().append_value("k2");
+        map.values().append_value(2);
+        map.append(true).unwrap();
+        let map_arr = map.finish();
+        let map_dtype = map_arr.data_type().clone();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("good", DataType::Int64, false),
+            Field::new("bad", map_dtype, true),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(col1.finish()) as ArrayRef,
+                Arc::new(map_arr) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf
+            .append_arrow(table("t"), &rb)
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
+        assert_eq!(
+            buf.row_count(),
+            0,
+            "rollback should leave buffer with 0 rows"
+        );
+        // A retry on a valid batch must succeed cleanly.
+        let mut c2 = Int64Builder::new();
+        c2.append_value(7);
+        let schema2 = arrow_schema_with(Field::new("good", DataType::Int64, false));
+        let rb2 = RecordBatch::try_new(schema2, vec![Arc::new(c2.finish()) as ArrayRef]).unwrap();
+        buf.append_arrow(table("t"), &rb2).unwrap();
+        assert_eq!(buf.row_count(), 1);
+    }
+
+    #[test]
+    fn error_message_carries_column_name() {
+        let inner_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let mut b = Int32Builder::new();
+        b.append_value(1);
+        let inner_arr = b.finish();
+        let struct_arr = arrow_array::StructArray::from(vec![(
+            inner_field.clone(),
+            Arc::new(inner_arr) as ArrayRef,
+        )]);
+        let schema = arrow_schema_with(Field::new(
+            "my_struct_col",
+            DataType::Struct(vec![inner_field].into()),
+            true,
+        ));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(struct_arr) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf
+            .append_arrow(table("t"), &rb)
+            .unwrap_err();
+        assert!(
+            err.msg().contains("my_struct_col"),
+            "column name missing from error: {}",
+            err.msg()
+        );
     }
 }

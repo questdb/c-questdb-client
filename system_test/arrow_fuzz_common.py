@@ -22,9 +22,6 @@ from qwp_ws_fuzz import Rng, derive_master_seed, format_seed
 from arrow_ffi import (
     ArrowArray,
     ArrowSchema,
-    DTS_COLUMN,
-    DTS_NOW,
-    DTS_SERVER_NOW,
     NEXT_ARROW_BATCH_END,
     NEXT_ARROW_BATCH_ERROR,
     NEXT_ARROW_BATCH_OK,
@@ -51,9 +48,6 @@ __all__ = [
     "Rng",
     "derive_master_seed",
     "format_seed",
-    "DTS_COLUMN",
-    "DTS_NOW",
-    "DTS_SERVER_NOW",
     "ReaderError",
     "SenderError",
     "ArrowFuzzBase",
@@ -195,11 +189,11 @@ def ingest_via_arrow(
     table: str,
     record_batch: pa.RecordBatch,
     *,
-    ts_kind: int = DTS_COLUMN,
-    ts_col: bytes = b"ts",
+    ts_col: Optional[bytes] = b"ts",
     sender_conf_extras: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Ingest one RecordBatch through `line_sender_buffer_append_arrow`."""
+    """Ingest one RecordBatch through `line_sender_buffer_append_arrow`.
+    If `ts_col` is None the server stamps each row on arrival."""
     extras = sender_conf_extras or {}
     with existing_sender(fixture, **extras) as sender:
         buf = Buffer.from_sender(sender._impl)
@@ -209,7 +203,7 @@ def ingest_via_arrow(
             buffer_append_arrow(
                 buf._impl, table_name,
                 ctypes.byref(arr), ctypes.byref(sch),
-                ts_kind, ts_col if ts_kind == DTS_COLUMN else b"",
+                ts_column_name=ts_col,
             )
         finally:
             if sch.release:
