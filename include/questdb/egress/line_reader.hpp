@@ -2480,6 +2480,51 @@ public:
     {
         ::ArrowArray array;
         ::ArrowSchema schema;
+
+        arrow_batch() noexcept : array{}, schema{} {}
+        arrow_batch(const arrow_batch&) = delete;
+        arrow_batch& operator=(const arrow_batch&) = delete;
+
+        arrow_batch(arrow_batch&& other) noexcept
+            : array(other.array), schema(other.schema)
+        {
+            other.array.release = nullptr;
+            other.array.private_data = nullptr;
+            other.schema.release = nullptr;
+            other.schema.private_data = nullptr;
+        }
+
+        arrow_batch& operator=(arrow_batch&& other) noexcept
+        {
+            if (this != &other)
+            {
+                release_in_place();
+                array = other.array;
+                schema = other.schema;
+                other.array.release = nullptr;
+                other.array.private_data = nullptr;
+                other.schema.release = nullptr;
+                other.schema.private_data = nullptr;
+            }
+            return *this;
+        }
+
+        ~arrow_batch() noexcept { release_in_place(); }
+
+    private:
+        void release_in_place() noexcept
+        {
+            if (array.release)
+            {
+                array.release(&array);
+                array.release = nullptr;
+            }
+            if (schema.release)
+            {
+                schema.release(&schema);
+                schema.release = nullptr;
+            }
+        }
     };
 
     /**

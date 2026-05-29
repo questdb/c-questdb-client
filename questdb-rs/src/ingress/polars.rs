@@ -83,8 +83,7 @@ fn append_polars_chunked(
 }
 
 /// Convert `df` to one Arrow RecordBatch (via the Arrow C Data Interface),
-/// then yield zero-copy slices of at most `max_rows` rows each. Matches
-/// the semantics of pyarrow's `Table.to_batches(max_chunksize=N)`.
+/// then yield zero-copy slices of at most `max_rows` rows each.
 pub fn dataframe_to_batches(
     df: &DataFrame,
     max_rows: usize,
@@ -109,9 +108,11 @@ pub fn dataframe_to_batches(
 /// Bridge a polars [`DataFrame`] to an [`arrow_array::RecordBatch`] via
 /// the Arrow C Data Interface. Re-chunks each column.
 pub fn dataframe_to_record_batch(df: DataFrame) -> Result<RecordBatch> {
+    let height = df.height();
+    let width = df.width();
     let compat = CompatLevel::newest();
-    let mut fields: Vec<Field> = Vec::with_capacity(df.width());
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(df.width());
+    let mut fields: Vec<Field> = Vec::with_capacity(width);
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(width);
     for column in df.into_columns() {
         let name = column.name().as_str().to_string();
         let pa_field = polars_arrow::datatypes::Field::new(
@@ -134,6 +135,14 @@ pub fn dataframe_to_record_batch(df: DataFrame) -> Result<RecordBatch> {
         arrays.push(arrow_array::make_array(array_data));
     }
     let schema = Arc::new(ArrowSchema::new(fields));
+    if width == 0 {
+        return RecordBatch::try_new_with_options(
+            schema,
+            arrays,
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(height)),
+        )
+        .map_err(|e| fmt!(ArrowIngest, "RecordBatch::try_new_with_options failed: {}", e));
+    }
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| fmt!(ArrowIngest, "RecordBatch::try_new failed: {}", e))
 }

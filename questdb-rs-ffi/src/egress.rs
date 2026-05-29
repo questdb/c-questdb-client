@@ -4001,6 +4001,9 @@ pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
             }
             Ok(None) => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
             Err(e) => {
+                if matches!(e.code(), ErrorCode::SchemaDriftMidStream) {
+                    c.arrow_schema_pin = None;
+                }
                 write_err_box(err_out, e);
                 line_reader_arrow_batch_result::line_reader_arrow_batch_error
             }

@@ -38,10 +38,14 @@ impl Cursor<'_> {
         }
     }
 
-    /// Eagerly drain into one chunked Polars [`DataFrame`].
+    /// Eagerly drain into one chunked Polars [`DataFrame`]. A stream
+    /// that yields a schema but no batches becomes an empty DataFrame;
+    /// only a stream without a schema (e.g. cancelled pre-prelude)
+    /// errors as `NoSchema`.
     pub fn fetch_all_polars(&mut self) -> Result<DataFrame> {
         let mut acc: Option<DataFrame> = None;
         let reader = self.as_record_batch_reader()?;
+        let schema = reader.schema();
         for item in reader {
             let rb = item.map_err(|e| {
                 if let Some(qe) = crate::egress::arrow::try_downcast_questdb(&e) {
@@ -60,12 +64,10 @@ impl Cursor<'_> {
                 }
             });
         }
-        acc.ok_or_else(|| {
-            Error::new(
-                ErrorCode::NoSchema,
-                "fetch_all_polars: stream yielded no batches",
-            )
-        })
+        match acc {
+            Some(df) => Ok(df),
+            None => record_batch_to_dataframe(RecordBatch::new_empty(schema)),
+        }
     }
 }
 

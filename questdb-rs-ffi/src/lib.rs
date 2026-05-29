@@ -3697,7 +3697,11 @@ unsafe fn arrow_append_impl(
         let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
             Ok(d) => d,
             Err(e) => {
-                arrow_err_to_c_box(err_out, ErrorCode::ArrowIngest, format!("from_ffi failed: {}", e));
+                arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::ArrowIngest,
+                    format!("from_ffi failed: {}", e),
+                );
                 return false;
             }
         };
@@ -3707,7 +3711,11 @@ unsafe fn arrow_append_impl(
             let field = match Field::try_from(&*schema) {
                 Ok(f) => f,
                 Err(e) => {
-                    arrow_err_to_c_box(err_out, ErrorCode::ArrowIngest, format!("schema conversion failed: {}", e));
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::ArrowIngest,
+                        format!("schema conversion failed: {}", e),
+                    );
                     return false;
                 }
             };
@@ -3716,7 +3724,11 @@ unsafe fn arrow_append_impl(
             match RecordBatch::try_new(rb_schema, vec![arr_ref]) {
                 Ok(rb) => rb,
                 Err(e) => {
-                    arrow_err_to_c_box(err_out, ErrorCode::ArrowIngest, format!("RecordBatch::try_new failed: {}", e));
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::ArrowIngest,
+                        format!("RecordBatch::try_new failed: {}", e),
+                    );
                     return false;
                 }
             }

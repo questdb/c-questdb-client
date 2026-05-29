@@ -118,13 +118,7 @@ impl Buffer {
             )
         })?;
         let ctx = qwp_ws.arrow_bulk_begin(table)?;
-        let inner_result = emit_arrow_batch(
-            qwp_ws,
-            &ctx,
-            batch,
-            &schema,
-            ts_col_idx,
-        );
+        let inner_result = emit_arrow_batch(qwp_ws, &ctx, batch, &schema, ts_col_idx);
         match inner_result {
             Ok(()) => match qwp_ws.arrow_bulk_commit(&ctx, effective_rows) {
                 Ok(()) => Ok(()),
@@ -277,7 +271,6 @@ fn emit_arrow_designated_ts(
         )),
     }
 }
-
 
 fn full_with_sentinel_into<const N: usize>(
     out: &mut Vec<u8>,
@@ -2001,7 +1994,15 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         (DataType::Boolean, _, _) => ColumnKind::Bool,
         (DataType::Int8, Some("byte"), _) => ColumnKind::I8,
         (DataType::Int8, Some(name), _) if name.starts_with("geohash") => {
-            ColumnKind::Geohash(md_geo_bits.unwrap_or(8))
+            let bits = md_geo_bits.ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "column '{}' has column_type='{}' but missing or invalid 'questdb.geohash_bits' metadata (1..=60 expected)",
+                    field.name(),
+                    name
+                )
+            })?;
+            ColumnKind::Geohash(bits)
         }
         (DataType::Int8, _, _) if md_geo_bits.is_some() => {
             ColumnKind::Geohash(md_geo_bits.unwrap())
@@ -2182,8 +2183,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(fields));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2195,8 +2195,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Float64, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(f64b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2232,8 +2231,7 @@ mod tests {
         ]));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -2254,8 +2252,7 @@ mod tests {
         ]));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2278,8 +2275,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -2290,9 +2286,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("id", DataType::FixedSizeBinary(16), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(
             err.code(),
             crate::error::ErrorCode::ArrowUnsupportedColumnKind
@@ -2306,8 +2300,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("l", DataType::FixedSizeBinary(32), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -2331,8 +2324,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2350,8 +2342,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2370,8 +2361,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -2383,8 +2373,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal64(18, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -2396,8 +2385,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal128(38, 3), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -2428,8 +2416,7 @@ mod tests {
         .unwrap();
         let mut buf = fresh_buffer();
         let ts_col = ColumnName::new("ts").unwrap();
-        buf.append_arrow_at_column(table("t"), &rb, ts_col)
-            .unwrap();
+        buf.append_arrow_at_column(table("t"), &rb, ts_col).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2477,8 +2464,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -2496,9 +2482,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(
             err.code(),
             crate::error::ErrorCode::ArrowUnsupportedColumnKind
@@ -2511,8 +2495,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(v.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 0);
     }
 
@@ -2523,9 +2506,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(v.finish()) as ArrayRef]).unwrap();
         let mut buf = Buffer::new(crate::ingress::ProtocolVersion::V2);
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::InvalidApiCall);
     }
 
@@ -2538,8 +2519,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("n", DataType::Int32, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2552,8 +2532,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("f", DataType::Float64, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2567,8 +2546,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2581,8 +2559,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Utf8, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2608,8 +2585,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 5);
     }
 
@@ -2622,8 +2598,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("amt", DataType::Decimal128(10, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2644,8 +2619,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2681,8 +2655,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2695,8 +2668,7 @@ mod tests {
             b.append_value(value);
             let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(b.finish()) as ArrayRef])
                 .unwrap();
-            buf.append_arrow(table("t"), &rb)
-                .unwrap();
+            buf.append_arrow(table("t"), &rb).unwrap();
         }
         assert_eq!(buf.row_count(), 3);
     }
@@ -2708,8 +2680,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         let err = buf
             .table(table("t"))
             .and_then(|b| b.column_i64("v", 99))
@@ -2752,8 +2723,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2770,8 +2740,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2788,8 +2757,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2805,8 +2773,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2826,8 +2793,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2848,8 +2814,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2872,8 +2837,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2892,8 +2856,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 4);
     }
 
@@ -2916,8 +2879,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2938,8 +2900,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2959,8 +2920,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -2977,8 +2937,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -2998,8 +2957,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -3019,8 +2977,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -3038,8 +2995,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 4);
     }
 
@@ -3058,8 +3014,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 4);
     }
 
@@ -3084,8 +3039,7 @@ mod tests {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
             .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -3101,8 +3055,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -3123,8 +3076,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -3145,9 +3097,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
         assert!(
             format!("{err}").contains("ragged inner-list sizes"),
@@ -3184,8 +3134,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -3203,8 +3152,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -3221,8 +3169,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -3243,8 +3190,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -3259,8 +3205,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal32(9, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -3273,18 +3218,14 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal32(9, -2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
     }
 
     fn assert_unsupported_column(field: Field, arr: ArrayRef) {
         let rb = RecordBatch::try_new(arrow_schema_with(field), vec![arr]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(
             err.code(),
             crate::error::ErrorCode::ArrowUnsupportedColumnKind,
@@ -3422,9 +3363,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
         assert!(
             err.msg().contains("dictionary values"),
@@ -3453,9 +3392,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
         assert!(err.msg().contains("dictionary values"));
     }
@@ -3473,11 +3410,7 @@ mod tests {
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
         let err = buf
-            .append_arrow_at_column(
-                table("t"),
-                &rb,
-                ColumnName::new("ts").unwrap(),
-            )
+            .append_arrow_at_column(table("t"), &rb, ColumnName::new("ts").unwrap())
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
         assert!(
@@ -3500,9 +3433,7 @@ mod tests {
         ));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("u"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("u"), &rb).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
         assert!(
             err.msg().contains("s→µs overflow"),
@@ -3519,8 +3450,7 @@ mod tests {
         b.append_value(2);
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
-        buf.append_arrow(table("t"), &rb)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
         buf.clear();
         assert_eq!(buf.row_count(), 0);
@@ -3560,9 +3490,7 @@ mod tests {
         )
         .unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
         assert_eq!(
             buf.row_count(),
@@ -3595,9 +3523,7 @@ mod tests {
         ));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(struct_arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert!(
             err.msg().contains("my_struct_col"),
             "column name missing from error: {}",

@@ -298,6 +298,14 @@ fn varlen_binary_array(
 
 fn boolean_array(buf: ColumnBuffer, row_count: usize) -> Result<BooleanArray> {
     let nulls = buffer_null_buffer(&buf.validity, row_count)?;
+    if buf.values.len() < row_count {
+        return Err(fmt!(
+            ProtocolError,
+            "boolean wire payload truncated: have {} bytes, need {}",
+            buf.values.len(),
+            row_count
+        ));
+    }
     let mut packed = ABytes::with_capacity(64, row_count.div_ceil(8));
     packed.resize(row_count.div_ceil(8), 0);
     for (i, &b) in buf.values.iter().take(row_count).enumerate() {
@@ -336,6 +344,19 @@ fn geohash_array(
         }
     };
     let bw = byte_width as usize;
+    let required = row_count
+        .checked_mul(bw)
+        .ok_or_else(|| fmt!(ProtocolError, "geohash payload size overflows usize"))?;
+    if buf.values.len() < required {
+        return Err(fmt!(
+            ProtocolError,
+            "geohash wire payload truncated: have {} bytes, need row_count={} * byte_width={} = {}",
+            buf.values.len(),
+            row_count,
+            bw,
+            required
+        ));
+    }
     let values_buf = if bw == target_width {
         buffer_to_arrow(&buf.values)
     } else if bw < target_width {
@@ -371,9 +392,7 @@ fn widen_zero_extend(src: &Bytes, src_width: usize, dst_width: usize, row_count:
     for r in 0..row_count {
         let s = r * src_width;
         let d = r * dst_width;
-        if s + src_width <= src.len() {
-            out[d..d + src_width].copy_from_slice(&src[s..s + src_width]);
-        }
+        out[d..d + src_width].copy_from_slice(&src[s..s + src_width]);
     }
     Buffer::from(bytes_from_avec(out))
 }
