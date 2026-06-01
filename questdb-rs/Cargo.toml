@@ -77,7 +77,7 @@ arrow-data = { version = "58", optional = true, default-features = false }
 aligned-vec = { version = "0.6", optional = true }
 # Polars bridge via the Arrow C Data Interface. Tighter pin than arrow
 # because polars 0.x churns the ffi surface across minors.
-polars = { version = "0.53", optional = true, default-features = false, features = [] }
+polars = { version = "0.53", optional = true, default-features = false, features = ["dtype-categorical"] }
 polars-arrow = { version = "0.53", optional = true, default-features = false, features = ["compute"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -95,6 +95,9 @@ slugify = "0.1.0"
 indoc = "2"
 
 [dev-dependencies]
+# Pulled in transitively by `arrow-array`; named explicitly here so unit
+# tests under `ingress::arrow::tests` can build `Float16Array` payloads.
+half = "2"
 socket2 = "0.6.1"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
@@ -204,7 +207,7 @@ arrow = [
 ]
 
 ## Polars sub-feature. ~30 lines of wrappers on top of `arrow`.
-polars = ["arrow", "dep:polars", "dep:polars-arrow"]
+polars = ["arrow", "sync-reader-ws", "dep:polars", "dep:polars-arrow"]
 
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
@@ -297,6 +300,10 @@ required-features = ["sync-sender-qwp-ws"]
 [[example]]
 name = "qwp_ws_l1_quotes"
 required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "polars"
+required-features = ["polars"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR

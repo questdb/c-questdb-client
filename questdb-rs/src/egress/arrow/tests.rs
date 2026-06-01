@@ -96,11 +96,11 @@ fn boolean_bit_packs_on_export() {
         .as_any()
         .downcast_ref::<arrow_array::BooleanArray>()
         .unwrap();
-    assert_eq!(col.value(0), false);
-    assert_eq!(col.value(1), true);
-    assert_eq!(col.value(2), false);
-    assert_eq!(col.value(3), true);
-    assert_eq!(col.value(4), true);
+    assert!(!col.value(0));
+    assert!(col.value(1));
+    assert!(!col.value(2));
+    assert!(col.value(3));
+    assert!(col.value(4));
 }
 
 #[test]
@@ -331,11 +331,11 @@ fn schemas_equal_ignores_nullability_when_metadata_matches() {
     assert!(schemas_equal(&a, &b));
 }
 
-fn le_bytes_of<T: Copy>(values: &[T]) -> Vec<u8>
+fn le_bytes_of<T>(values: &[T]) -> Vec<u8>
 where
-    T: AsLeBytes,
+    T: Copy + AsLeBytes,
 {
-    let mut out = Vec::with_capacity(values.len() * std::mem::size_of::<T>());
+    let mut out = Vec::with_capacity(std::mem::size_of_val(values));
     for v in values {
         out.extend_from_slice(&v.as_le_slice());
     }

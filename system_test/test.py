@@ -47,31 +47,51 @@ import questdb_line_sender as qls
 import qwp_ws_fuzz
 import uuid
 
-from arrow_egress_fuzz import (  # noqa: F401
-    TestArrowEgressPerKind,
-    TestArrowEgressTierA,
-    TestArrowEgressEmpty,
-    TestArrowEgressFuzz,
-)
-from arrow_ingress_fuzz import (  # noqa: F401
-    TestArrowIngressPerKind,
-    TestArrowIngressDesignatedTs,
-    TestArrowIngressErrors,
-    TestArrowIngressMultiBatch,
-    TestArrowIngressFuzz,
-)
-from arrow_round_trip_fuzz import (  # noqa: F401
-    TestArrowRoundTripPerKind,
-    TestArrowRoundTripFuzz,
-)
-from arrow_alignment_fuzz import TestArrowAlignment  # noqa: F401
-from test_arrow_fuzz_common_unit import (  # noqa: F401
-    TestKindRegistryCompleteness,
-    TestCompareSemantics,
-    TestRngDeterminism,
-    TestBuildRecordBatch,
-    TestEdgeCorpora,
-)
+# Arrow test classes import pyarrow / polars at module load. When those
+# Python packages are absent (e.g. a non-arrow developer install), guard
+# the imports so the rest of the system test suite still runs.
+try:
+    from arrow_egress_fuzz import (  # noqa: F401
+        TestArrowEgressPerKind,
+        TestArrowEgressEmpty,
+        TestArrowEgressFuzz,
+    )
+    from arrow_ingress_fuzz import (  # noqa: F401
+        TestArrowIngressPerKind,
+        TestArrowIngressDesignatedTs,
+        TestArrowIngressErrors,
+        TestArrowIngressExtraTypes,
+        TestArrowIngressUnsupportedTypes,
+        TestArrowIngressMultiBatch,
+        TestArrowIngressFuzz,
+    )
+    from arrow_round_trip_fuzz import (  # noqa: F401
+        TestArrowRoundTripPerKind,
+        TestArrowRoundTripFuzz,
+    )
+    from arrow_polars_fuzz import (  # noqa: F401
+        TestArrowPolarsRoundTripPerKind,
+        TestArrowPolarsFuzz,
+    )
+    from arrow_polars_per_dtype import (  # noqa: F401
+        TestArrowPolarsPerDtype,
+    )
+    from arrow_alignment_fuzz import TestArrowAlignment  # noqa: F401
+    from test_arrow_fuzz_common_unit import (  # noqa: F401
+        TestKindRegistryCompleteness,
+        TestCompareSemantics,
+        TestRngDeterminism,
+        TestBuildRecordBatch,
+        TestEdgeCorpora,
+    )
+    ARROW_TESTS_AVAILABLE = True
+except ImportError as _arrow_import_err:
+    import sys as _sys
+    print(
+        f"WARN: skipping Arrow/Polars system tests — missing dep: {_arrow_import_err}",
+        file=_sys.stderr,
+    )
+    ARROW_TESTS_AVAILABLE = False
 from fixture import (
     Project,
     QuestDbFixtureBase,
@@ -114,6 +134,40 @@ def sql_query(query: str):
     return QDB_FIXTURE.http_sql_query(query)
 
 
+_QWP_WS_UNSUPPORTED_MARKERS = (
+    'unsupported protocol',
+    'unknown protocol',
+    'unknown scheme',
+    'missing endpoint',
+    'endpoint not found',
+    # Ingest (Sender → qwpws://) error phrasing
+    'websocket upgrade failed: http status 404',
+    'websocket upgrade failed: http status 405',
+    'websocket upgrade failed: http status 501',
+    # Egress (Reader → ws://) error phrasing
+    'websocket handshake failed with http 404',
+    'websocket handshake failed with http 405',
+    'websocket handshake failed with http 501',
+)
+
+
+def is_unsupported_qwp_ws_fixture_error(error) -> bool:
+    msg = str(error).lower()
+    return any(m in msg for m in _QWP_WS_UNSUPPORTED_MARKERS)
+
+
+def skip_if_unsupported_qwp_ws_fixture(error, fixture) -> None:
+    if not is_unsupported_qwp_ws_fixture_error(error):
+        return
+    root_dir = getattr(fixture, '_root_dir', None)
+    is_repo_master = root_dir is not None and root_dir.name == 'repo'
+    if is_repo_master:
+        return
+    raise unittest.SkipTest(
+        f'QWP/WebSocket is not supported by this QuestDB fixture: {error}'
+    ) from error
+
+
 class _ParsedUnittestProgram(unittest.TestProgram):
     def runTests(self):
         pass
@@ -146,7 +200,7 @@ def _suite_kind(test):
         return SUITE_QWP_WS_PROTOCOL
     if class_name == 'TestQwpWsRestart':
         return SUITE_QWP_WS_RESTART
-    if class_name == 'TestQwpWsFuzz':
+    if class_name == 'TestQwpWsFuzz' or class_name.startswith('TestArrow'):
         return SUITE_QWP_WS_FUZZ
     return SUITE_MATRIX
 
@@ -1513,21 +1567,6 @@ class QwpWsTestSupport:
             conf.append(f'{key}={value};')
         return ''.join(conf)
 
-    @staticmethod
-    def _is_unsupported_qwp_ws_fixture_error(error):
-        message = str(error).lower()
-        unsupported_markers = (
-            'unsupported protocol',
-            'unknown protocol',
-            'unknown scheme',
-            'missing endpoint',
-            'endpoint not found',
-            'websocket upgrade failed: http status 404',
-            'websocket upgrade failed: http status 405',
-            'websocket upgrade failed: http status 501',
-        )
-        return any(marker in message for marker in unsupported_markers)
-
     def _connect_sender(self, conf):
         sender = None
         try:
@@ -1537,12 +1576,7 @@ class QwpWsTestSupport:
         except qls.SenderError as e:
             if sender is not None:
                 sender.close(False)
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if (
-                    root_dir is not None and
-                    root_dir.name != 'repo' and
-                    self._is_unsupported_qwp_ws_fixture_error(e)):
-                self.skipTest(f'QWP/WebSocket is not supported by this QuestDB fixture: {e}')
+            skip_if_unsupported_qwp_ws_fixture(e, QDB_FIXTURE)
             raise
         return sender
 
@@ -1708,13 +1742,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             with self.assertRaises(qls.SenderError) as ctx:
                 sender.connect()
             native_error = ctx.exception.__cause__ or ctx.exception
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if (
-                    root_dir is not None and
-                    root_dir.name != 'repo' and
-                    self._is_unsupported_qwp_ws_fixture_error(native_error)):
-                self.skipTest(
-                    f'QWP/WebSocket is not supported by this QuestDB fixture: {native_error}')
+            skip_if_unsupported_qwp_ws_fixture(native_error, QDB_FIXTURE)
             self.assertRegex(
                 str(native_error),
                 r'(?i)(401|403|unauthor|forbidden|authentication)')

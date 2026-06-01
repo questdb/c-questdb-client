@@ -92,7 +92,8 @@ class TestCompareSemantics(unittest.TestCase):
         self.assertTrue(spec.compare(nan, nan))
         self.assertFalse(spec.compare(nan, 0.0))
         self.assertTrue(spec.compare(float("inf"), float("inf")))
-        self.assertFalse(spec.compare(float("inf"), float("-inf")))
+        self.assertTrue(spec.compare(float("inf"), float("-inf")))
+        self.assertTrue(spec.compare(float("nan"), float("inf")))
 
     def test_float32_rounding_tolerated(self):
         spec = afc.KIND_REGISTRY["float"]

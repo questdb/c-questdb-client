@@ -10,6 +10,8 @@ pub(crate) mod schema;
 mod tests;
 
 pub use convert::external_arrow_error;
+#[cfg(feature = "polars")]
+pub use polars::CursorPolarsIter;
 pub use reader::{CursorRecordBatchReader, try_downcast_questdb};
 
 pub(crate) use convert::batch_to_record_batch;

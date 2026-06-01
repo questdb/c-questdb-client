@@ -138,21 +138,6 @@ public:
             _backend_kind::qwp_ws};
     }
 
-    /**
-     * Designated-timestamp source for `append_arrow` when the timestamp is
-     * not pulled from a source column. To use a per-row timestamp from a
-     * named column, pass that column name to the `column_name_view`
-     * overload of `append_arrow` directly — this enum has no `column`
-     * variant by design.
-     */
-    enum class designated_timestamp_kind
-    {
-        /// `TimestampNanos::now()` evaluated client-side, per row.
-        now = 1,
-        /// Server stamps each row on arrival; no per-row timestamp shipped.
-        server_now = 2,
-    };
-
     line_sender_buffer(const line_sender_buffer& other)
         : _impl{
               other._impl
@@ -1169,43 +1154,22 @@ public:
         line_sender_error::wrapped_call(::line_sender_buffer_at_now, _impl);
     }
 
-#ifdef QUESTDB_CLIENT_HAS_ARROW
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
     /**
      * Append every row of an Apache Arrow `RecordBatch` to the buffer.
+     * Per-row timestamp is not sent; the server stamps each row on
+     * arrival (same semantics as `at_now()`).
      *
-     * Requires a QWP/WebSocket buffer — see `qwp_ws()` or
-     * `line_sender::new_buffer()` against a `qwpws://` sender. ILP and
-     * QWP/UDP buffers throw `line_sender_error` with code `invalid_api_call`.
-     *
-     * Accepts both `Struct` top-level arrays (standard RecordBatch shape,
-     * one child per column) and non-Struct single arrays (treated as a
-     * one-column batch using `schema.name`).
-     *
-     * Ownership:
-     *   - `array` is consumed. `array.release` is cleared to `nullptr`
-     *     before returning, on both success and failure. Defensive
-     *     `array.release(&array)` calls after this become no-ops.
-     *   - `schema` is borrowed; the caller still owns it and is responsible
-     *     for invoking `schema.release` once done.
-     *
-     * Server-side type mismatches surface from the next `flush()`, not from
-     * `append_arrow` itself.
-     *
-     * @param table     Destination table.
-     * @param array     Arrow C Data Interface array (consumed).
-     * @param schema    Arrow C Data Interface schema (borrowed).
-     * @param ts_kind   `now` (client-side per-row `TimestampNanos::now()`,
-     *                  default) or `server_now` (server stamps on arrival).
-     *                  For a column-sourced timestamp, use the
-     *                  `column_name_view` overload below.
+     * Requires a QWP/WebSocket buffer. `array` is consumed; `schema`
+     * is borrowed. `array` may be a Struct top-level array or a
+     * non-Struct single-column array.
      *
      * @throws line_sender_error on validation or classification failure.
      */
     void append_arrow(
         table_name_view table,
         ::ArrowArray& array,
-        const ::ArrowSchema& schema,
-        designated_timestamp_kind ts_kind = designated_timestamp_kind::now)
+        const ::ArrowSchema& schema)
     {
         may_init();
         line_sender_error::wrapped_call(
@@ -1213,53 +1177,31 @@ public:
             _impl,
             table._impl,
             &array,
-            &schema,
-            static_cast<::line_sender_designated_timestamp_kind>(ts_kind),
-            static_cast<const char*>(nullptr),
-            size_t{0});
+            &schema);
     }
 
     /**
-     * Append an Arrow `RecordBatch`, taking the designated timestamp from
-     * a named source column.
-     *
-     * Contract notes from the no-name overload apply unchanged (QWP/WS
-     * buffer required, Struct / single-array top-level, `array` consumed,
-     * `schema` borrowed, mismatches surface on flush).
-     *
-     * The named column must be a `Timestamp(Microsecond | Nanosecond |
-     * Millisecond, _)` Arrow column. `Millisecond` is widened to
-     * microseconds before going on the wire (the designated-timestamp
-     * wire format supports µs / ns only). Any null cell in the timestamp
-     * column raises `line_sender_error` with code `arrow_ingest`.
-     *
-     * @param table             Destination table.
-     * @param array             Arrow C Data Interface array (consumed).
-     * @param schema            Arrow C Data Interface schema (borrowed).
-     * @param ts_column_name    Name of the timestamp column inside the batch.
-     *
-     * @throws line_sender_error on validation, classification failure,
-     *         missing / wrong-typed timestamp column, or null timestamp
-     *         rows.
+     * Append an Arrow `RecordBatch`, sourcing the per-row designated
+     * timestamp from a named column inside the batch. The column must
+     * be `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with
+     * no null rows.
      */
     void append_arrow(
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        column_name_view ts_column_name)
+        column_name_view ts_column)
     {
         may_init();
         line_sender_error::wrapped_call(
-            ::line_sender_buffer_append_arrow,
+            ::line_sender_buffer_append_arrow_at_column,
             _impl,
             table._impl,
             &array,
             &schema,
-            ::line_sender_designated_timestamp_column,
-            ts_column_name._impl.buf,
-            ts_column_name._impl.len);
+            ts_column._impl);
     }
-#endif /* QUESTDB_CLIENT_HAS_ARROW */
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
     void check_can_flush() const
     {

@@ -1815,7 +1815,7 @@ static inline bool line_reader_column_data_get_symbol(
     return true;
 }
 
-#ifdef QUESTDB_CLIENT_HAS_ARROW
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
 /* Apache Arrow C Data Interface (feature: arrow).
  * https://arrow.apache.org/docs/format/CDataInterface.html */
 
@@ -1865,9 +1865,18 @@ typedef enum line_reader_arrow_batch_result
 /**
  * Advance the cursor by one RESULT_BATCH and export it as an Arrow
  * C Data Interface array + schema. `out_array` / `out_schema` must be
- * caller-allocated; on `_ok` they are filled in place and the caller
- * owns the release callback contract. On `_end` / `_error` they are
- * left untouched.
+ * caller-allocated AND uninitialised on each call: either zero-initialised
+ * memory or storage whose previous `release` callback has already been
+ * invoked. The implementation overwrites the slots without inspecting
+ * their prior contents, so a non-released previous result would leak its
+ * buffers. On `_ok` the slots are filled in place and the caller owns
+ * the new release callback contract. On `_end` / `_error` they are left
+ * untouched.
+ *
+ * Mid-stream schema drift (the underlying QuestDB table altered between
+ * batches) surfaces as `line_reader_error_schema_drift` (= 22) on the
+ * call that detects it; the cursor's pinned schema snapshot is then
+ * cleared so the next call snapshots the new schema and resumes.
  */
 QUESTDB_CLIENT_API
 line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(
@@ -1875,7 +1884,7 @@ line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema,
     line_reader_error** err_out);
-#endif /* QUESTDB_CLIENT_HAS_ARROW */
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
 }

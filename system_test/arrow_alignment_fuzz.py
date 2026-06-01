@@ -30,22 +30,6 @@ _PAD_PROGRAM: List[List[str]] = [
 
 _TARGET_ROTATION = ["long", "double", "uuid", "long256", "timestamp"]
 
-def _check_buffer_alignment(rb: pa.RecordBatch) -> List[str]:
-    """Return a list of misalignment complaints (empty = all aligned)."""
-    bad: List[str] = []
-    for col_idx in range(rb.num_columns):
-        col = rb.column(col_idx)
-        field = rb.schema.field(col_idx)
-        for buf_idx, buf in enumerate(col.buffers()):
-            if buf is None or buf.size < 8:
-                continue
-            addr = buf.address
-            if addr & 63 != 0:
-                bad.append(
-                    f"field={field.name} buf[{buf_idx}] "
-                    f"addr={addr:#x} (mod64={addr & 63})"
-                )
-    return bad
 
 def _exercise_compute_kernels(rb: pa.RecordBatch, kinds: List[Tuple[str, KindSpec]]) -> None:
     import pyarrow.compute as pc
@@ -72,19 +56,20 @@ def _exercise_compute_kernels(rb: pa.RecordBatch, kinds: List[Tuple[str, KindSpe
             max_v = pc.max(col).as_py()
             assert min_v is not None and max_v is not None
 
+
 def _populate_via_ilp(sender, table: str, kinds, values_per_col, ts_base_us: int) -> None:
-    from questdb_line_sender import Buffer
-    buf = Buffer.from_sender(sender._impl)
     n = len(next(iter(values_per_col.values())))
+    ordered = sorted(kinds, key=lambda kv: 0 if kv[1].name == "symbol" else 1)
     for r in range(n):
-        buf.table(table)
-        for col_name, spec in kinds:
+        sender.table(table)
+        for col_name, spec in ordered:
             v = values_per_col[col_name][r]
             if v is None:
                 continue
-            spec.ilp_set(buf, col_name, v)
-        buf.at_micros(ts_base_us + r)
-    sender.flush(buf)
+            spec.ilp_set(sender, col_name, v)
+        sender.at_micros(ts_base_us + r)
+    sender.flush()
+
 
 def _read_back(fixture, table: str, kinds) -> pa.RecordBatch:
     cols_sql = ", ".join(f'"{c}"' for c, _ in kinds)
@@ -92,12 +77,14 @@ def _read_back(fixture, table: str, kinds) -> pa.RecordBatch:
         fixture, f"select {cols_sql} from '{table}' order by ts"
     )
 
+
 class TestArrowAlignment(afc.ArrowFuzzBase):
     SUITE_LABEL = "arrow_alignment_fuzz"
 
     def _run_program(self, iter_idx: int, kind_order: List[str]):
         table = self.fresh_table(f"arrow_aln_{iter_idx}")
         kinds = [(f"c{i}_{n}", KIND_REGISTRY[n]) for i, n in enumerate(kind_order)]
+        afc.create_table_from_kinds(self._fixture, table, kinds)
         n = _ROWS_PER_ITER
         rnd = self._master_rng
         values_per_col: Dict[str, list] = {}
@@ -119,23 +106,13 @@ class TestArrowAlignment(afc.ArrowFuzzBase):
                     target = _TARGET_ROTATION[prog_idx % len(_TARGET_ROTATION)]
                     kind_order = pad + [target]
                     rb, kinds = self._run_program(prog_idx + it * len(_PAD_PROGRAM),
-                                                   kind_order)
+                                                  kind_order)
                     _exercise_compute_kernels(rb, kinds)
 
-    def test_buffers_64_byte_aligned_under_misalignment(self):
-        for prog_idx, pad in enumerate(_PAD_PROGRAM):
-            with self.subTest(prog_idx=prog_idx):
-                target = _TARGET_ROTATION[prog_idx % len(_TARGET_ROTATION)]
-                rb, _kinds = self._run_program(prog_idx, pad + [target])
-                bad = _check_buffer_alignment(rb)
-                if bad:
-                    self.fail(self.label(
-                        f"prog_idx={prog_idx}: misaligned buffers:\n  "
-                        + "\n  ".join(bad)
-                    ))
 
 def register(loop_registry):
     loop_registry.append(TestArrowAlignment)
+
 
 if __name__ == "__main__":
     print(

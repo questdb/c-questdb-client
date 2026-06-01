@@ -107,7 +107,7 @@ target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(QUESTDB_ENABLE_ARROW)
-    target_compile_definitions(questdb_client INTERFACE QUESTDB_CLIENT_HAS_ARROW)
+    target_compile_definitions(questdb_client INTERFACE QUESTDB_CLIENT_ENABLE_ARROW)
 endif()
 if(WIN32)
     set_target_properties(

@@ -21,7 +21,8 @@
  *      Float32/64, Utf8, Binary, FixedSizeBinary(16), FixedSizeBinary(32),
  *      Timestamp(µs)) and feed each through `line_sender_buffer_append_arrow`
  *      against a QWP buffer.
- *   5. DesignatedTimestamp dispatch — all 3 variants are exercised.
+ *   5. Designated-timestamp dispatch — both the default (server-now)
+ *      and the at-column variants are exercised.
  *   6. Error-path validation: the `arrow_unsupported_column_kind` and
  *      `arrow_ingest` error codes route from Rust through the FFI to
  *      the C error accessors.
@@ -166,13 +167,6 @@ TEST(test_tristate_egress_enum_values)
     CHECK(line_reader_arrow_batch_error == 2, "error = 2");
 }
 
-TEST(test_designated_timestamp_enum_values)
-{
-    CHECK(line_sender_designated_timestamp_column == 0, "column = 0");
-    CHECK(line_sender_designated_timestamp_now == 1, "now = 1");
-    CHECK(line_sender_designated_timestamp_server_now == 2, "server_now = 2");
-}
-
 TEST(test_appended_reader_error_codes_have_distinct_values)
 {
     CHECK(
@@ -230,9 +224,7 @@ TEST(test_ingress_null_buffer_returns_false)
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table("t");
-    bool ok = line_sender_buffer_append_arrow(
-        NULL, tbl, &arr, &sch,
-        line_sender_designated_timestamp_now, NULL, 0, &err);
+    bool ok = line_sender_buffer_append_arrow(NULL, tbl, &arr, &sch, &err);
     CHECK(!ok, "NULL buffer → false");
     CHECK(err != NULL, "err_out populated");
     if (err)
@@ -245,38 +237,12 @@ TEST(test_ingress_null_array_returns_false)
     struct ArrowSchema sch;
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
-    bool ok = line_sender_buffer_append_arrow(
-        buf, make_table("t"), NULL, &sch,
-        line_sender_designated_timestamp_now, NULL, 0, &err);
+    bool ok =
+        line_sender_buffer_append_arrow(buf, make_table("t"), NULL, &sch, &err);
     CHECK(!ok, "NULL array → false");
     CHECK(err != NULL, "err_out populated");
     if (err)
         line_sender_error_free(err);
-    line_sender_buffer_free(buf);
-}
-
-TEST(test_ingress_column_ts_kind_requires_name)
-{
-    /* Build a minimal Int64 column. */
-    int64_t values[2] = {10, 20};
-    struct ArrowArray arr;
-    struct ArrowSchema sch;
-    build_primitive(2, sizeof(int64_t), values, 1, "l", "v", &arr, &sch);
-
-    line_sender_buffer* buf = fresh_qwp_buffer();
-    line_sender_error* err = NULL;
-    bool ok = line_sender_buffer_append_arrow(
-        buf, make_table("t"), &arr, &sch,
-        line_sender_designated_timestamp_column,
-        NULL, 0, &err);
-    CHECK(!ok, "ts_kind=column with NULL name → false");
-    CHECK(err != NULL, "err_out populated");
-    if (err)
-        line_sender_error_free(err);
-    if (arr.release)
-        arr.release(&arr);
-    if (sch.release)
-        sch.release(&sch);
     line_sender_buffer_free(buf);
 }
 
@@ -297,14 +263,10 @@ static void run_append_and_accept(
     line_sender_table_name tbl,
     struct ArrowArray* arr,
     struct ArrowSchema* sch,
-    int ts_kind,
-    const char* ts_name,
-    size_t ts_name_len,
     const char* label)
 {
     line_sender_error* err = NULL;
-    bool ok = line_sender_buffer_append_arrow(
-        buf, tbl, arr, sch, ts_kind, ts_name, ts_name_len, &err);
+    bool ok = line_sender_buffer_append_arrow(buf, tbl, arr, sch, &err);
     if (!ok)
     {
         CHECK(err != NULL, "err_out populated on failure");
@@ -336,7 +298,6 @@ TEST(test_ingress_boolean_column)
     build_primitive(4, 1, values, 1, "b", "flag", &arr, &sch);
     line_sender_buffer* buf = fresh_qwp_buffer();
     run_append_and_accept(buf, make_table("bool_t"), &arr, &sch,
-                          line_sender_designated_timestamp_now, NULL, 0,
                           "boolean append accepted/structured-error");
     line_sender_buffer_free(buf);
 }
@@ -351,7 +312,6 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         build_primitive(3, sizeof(int8_t), values, 1, "c", "byte_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         run_append_and_accept(buf, make_table("i8_t"), &arr, &sch,
-                              line_sender_designated_timestamp_now, NULL, 0,
                               "int8 accepted/structured-error");
         line_sender_buffer_free(buf);
     }
@@ -363,7 +323,6 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         build_primitive(3, sizeof(int16_t), values, 1, "s", "short_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         run_append_and_accept(buf, make_table("i16_t"), &arr, &sch,
-                              line_sender_designated_timestamp_now, NULL, 0,
                               "int16 accepted/structured-error");
         line_sender_buffer_free(buf);
     }
@@ -375,7 +334,6 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         build_primitive(3, sizeof(int32_t), values, 1, "i", "int_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         run_append_and_accept(buf, make_table("i32_t"), &arr, &sch,
-                              line_sender_designated_timestamp_now, NULL, 0,
                               "int32 accepted/structured-error");
         line_sender_buffer_free(buf);
     }
@@ -387,7 +345,6 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         build_primitive(3, sizeof(int64_t), values, 1, "l", "long_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         run_append_and_accept(buf, make_table("i64_t"), &arr, &sch,
-                              line_sender_designated_timestamp_now, NULL, 0,
                               "int64 accepted/structured-error");
         line_sender_buffer_free(buf);
     }
@@ -403,7 +360,6 @@ TEST(test_ingress_float32_float64_columns)
         build_primitive(3, sizeof(float), values, 1, "f", "f32_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         run_append_and_accept(buf, make_table("f32_t"), &arr, &sch,
-                              line_sender_designated_timestamp_now, NULL, 0,
                               "float32 accepted/structured-error");
         line_sender_buffer_free(buf);
     }
@@ -415,7 +371,6 @@ TEST(test_ingress_float32_float64_columns)
         build_primitive(3, sizeof(double), values, 1, "g", "f64_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         run_append_and_accept(buf, make_table("f64_t"), &arr, &sch,
-                              line_sender_designated_timestamp_now, NULL, 0,
                               "float64 accepted/structured-error");
         line_sender_buffer_free(buf);
     }
@@ -430,49 +385,58 @@ TEST(test_ingress_timestamp_microseconds)
     build_primitive(2, sizeof(int64_t), values, 1, "tsu:UTC", "ts", &arr, &sch);
     line_sender_buffer* buf = fresh_qwp_buffer();
     run_append_and_accept(buf, make_table("ts_t"), &arr, &sch,
-                          line_sender_designated_timestamp_server_now, NULL, 0,
                           "timestamp(µs) accepted/structured-error");
     line_sender_buffer_free(buf);
 }
 
-TEST(test_ingress_all_three_designated_timestamp_variants)
+TEST(test_ingress_default_and_at_column_dispatch)
 {
-    /* Same data shape, three TS dispatches. */
     int64_t values[2] = {10, 20};
-    int kinds[3] = {
-        line_sender_designated_timestamp_now,
-        line_sender_designated_timestamp_server_now,
-        line_sender_designated_timestamp_column,
-    };
-    for (int i = 0; i < 3; ++i)
+
+    /* Default append: server stamps each row on arrival. */
     {
         struct ArrowArray arr;
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, 1, "l", "v", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         line_sender_error* err = NULL;
-        const char* ts_name = NULL;
-        size_t ts_len = 0;
-        if (kinds[i] == line_sender_designated_timestamp_column)
-        {
-            /* No timestamp column in the batch — the impl is expected
-             * to reject this with arrow_ingest. */
-            ts_name = "missing";
-            ts_len = strlen(ts_name);
-        }
         bool ok = line_sender_buffer_append_arrow(
-            buf, make_table("dts_t"), &arr, &sch, kinds[i],
-            ts_name, ts_len, &err);
+            buf, make_table("dts_default"), &arr, &sch, &err);
         if (!ok)
         {
             CHECK(err != NULL, "err_out populated on failure");
             if (err)
-            {
                 line_sender_error_free(err);
-            }
             if (arr.release)
                 arr.release(&arr);
         }
+        if (sch.release)
+            sch.release(&sch);
+        line_sender_buffer_free(buf);
+    }
+
+    /* at_column variant: a missing ts column must be rejected as arrow_ingest. */
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, 1, "l", "v", &arr, &sch);
+        line_sender_buffer* buf = fresh_qwp_buffer();
+        line_sender_error* err = NULL;
+        line_sender_column_name ts_col;
+        bool name_ok =
+            line_sender_column_name_init(&ts_col, strlen("missing"), "missing", &err);
+        CHECK(name_ok, "column name init");
+        bool ok = line_sender_buffer_append_arrow_at_column(
+            buf, make_table("dts_at_col"), &arr, &sch, ts_col, &err);
+        CHECK(!ok, "missing ts column → false");
+        if (err)
+        {
+            CHECK(line_sender_error_get_code(err) == line_sender_error_arrow_ingest,
+                  "missing ts column → arrow_ingest");
+            line_sender_error_free(err);
+        }
+        if (arr.release)
+            arr.release(&arr);
         if (sch.release)
             sch.release(&sch);
         line_sender_buffer_free(buf);
@@ -507,19 +471,17 @@ TEST(test_error_codes_survive_ffi_boundary)
 int main(void)
 {
     RUN(test_tristate_egress_enum_values);
-    RUN(test_designated_timestamp_enum_values);
     RUN(test_appended_reader_error_codes_have_distinct_values);
     RUN(test_appended_sender_error_codes_exist);
     RUN(test_egress_null_cursor_returns_error_tristate);
     RUN(test_egress_null_out_array_returns_error_tristate);
     RUN(test_ingress_null_buffer_returns_false);
     RUN(test_ingress_null_array_returns_false);
-    RUN(test_ingress_column_ts_kind_requires_name);
     RUN(test_ingress_boolean_column);
     RUN(test_ingress_int8_int16_int32_int64_columns);
     RUN(test_ingress_float32_float64_columns);
     RUN(test_ingress_timestamp_microseconds);
-    RUN(test_ingress_all_three_designated_timestamp_variants);
+    RUN(test_ingress_default_and_at_column_dispatch);
     RUN(test_error_codes_survive_ffi_boundary);
 
     fprintf(stderr,

@@ -26,13 +26,17 @@
 //! type-hint resolution follows Decision 14 of the design doc
 //! (`questdb.column_type` > `ARROW:extension:name` > Arrow type alone).
 
-use arrow_array::types::UInt32Type;
+use arrow_array::types::{UInt8Type, UInt16Type, UInt32Type};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Decimal64Array, Decimal128Array,
-    Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray,
-    ListArray, RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, UInt16Array, UInt32Array,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
+    DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+    DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray,
+    LargeStringArray, ListArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -40,31 +44,51 @@ use crate::error::{Error, ErrorCode};
 use crate::ingress::buffer::{
     ArrowBatchInfo, ArrowBulkCtx, ArrowDecimalSpec, QwpColumnKind, QwpWsColumnarBuffer,
 };
-use crate::ingress::{Buffer, ColumnName, TableName, TimestampNanos};
+use crate::ingress::{Buffer, ColumnName, TableName};
 use crate::{Result, fmt};
 
-/// Per-row designated-timestamp source for [`Buffer::append_arrow`].
-#[derive(Clone, Copy)]
-#[non_exhaustive]
-pub enum DesignatedTimestamp<'a> {
-    /// Pull from a named `Timestamp(_)` column.
-    Column(ColumnName<'a>),
-    /// `TimestampNanos::now()` per row.
-    Now,
-    /// Omit timestamp (server fills arrival time).
-    ServerNow,
-}
-
 impl Buffer {
-    /// Append every row of `batch` to this buffer via the QWP/WebSocket
-    /// columnar bulk path. Requires a QWP/WS buffer; row-by-row protocols
-    /// (ILP, QWP/UDP) reject the call. Type-mismatch against the
-    /// destination QuestDB table surfaces from the next flush.
-    pub fn append_arrow(
+    /// Append every row of `batch` to this buffer. The per-row
+    /// designated timestamp is not sent — the server stamps each row
+    /// on arrival, matching [`Buffer::at_now`](Buffer::at_now).
+    ///
+    /// Requires a QWP/WS buffer. Mid-batch errors roll the buffer back
+    /// to its pre-call state.
+    ///
+    /// Use [`Buffer::append_arrow_at_column`] to source the timestamp
+    /// from a batch column.
+    ///
+    /// # Errors
+    ///
+    /// * [`ErrorCode::ArrowUnsupportedColumnKind`] — column's Arrow
+    ///   type has no QWP wire mapping.
+    /// * [`ErrorCode::ArrowIngest`] — structural validation failed.
+    /// * [`ErrorCode::InvalidApiCall`] — called on a non-QWP/WS buffer
+    ///   or while a row-by-row row is in progress on the same table.
+    pub fn append_arrow(&mut self, table: TableName<'_>, batch: &RecordBatch) -> Result<()> {
+        self.append_arrow_inner(table, batch, None)
+    }
+
+    /// Append every row of `batch`, sourcing the per-row designated
+    /// timestamp from `ts_column`. The column must be a
+    /// `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with no
+    /// null rows; `Millisecond` is widened to µs on the wire.
+    ///
+    /// Other semantics match [`Buffer::append_arrow`].
+    pub fn append_arrow_at_column(
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
-        designated_timestamp: DesignatedTimestamp<'_>,
+        ts_column: ColumnName<'_>,
+    ) -> Result<()> {
+        self.append_arrow_inner(table, batch, Some(ts_column))
+    }
+
+    fn append_arrow_inner(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_column: Option<ColumnName<'_>>,
     ) -> Result<()> {
         let schema = batch.schema();
         let row_count = batch.num_rows();
@@ -80,9 +104,9 @@ impl Buffer {
         if row_count == 0 {
             return Ok(());
         }
-        let ts_col_idx = match designated_timestamp {
-            DesignatedTimestamp::Column(name) => Some(resolve_ts_column(batch, name)?),
-            DesignatedTimestamp::Now | DesignatedTimestamp::ServerNow => None,
+        let ts_col_idx = match ts_column {
+            Some(name) => Some(resolve_ts_column(batch, name)?),
+            None => None,
         };
         let effective_rows = u32::try_from(row_count)
             .map_err(|_| fmt!(ArrowIngest, "row count {} exceeds u32::MAX", row_count))?;
@@ -94,32 +118,59 @@ impl Buffer {
             )
         })?;
         let ctx = qwp_ws.arrow_bulk_begin(table)?;
-        for (idx, field) in schema.fields().iter().enumerate() {
-            if Some(idx) == ts_col_idx {
-                continue;
+        let inner_result = emit_arrow_batch(qwp_ws, &ctx, batch, &schema, ts_col_idx);
+        match inner_result {
+            Ok(()) => match qwp_ws.arrow_bulk_commit(&ctx, effective_rows) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    qwp_ws.arrow_bulk_rollback(ctx);
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                qwp_ws.arrow_bulk_rollback(ctx);
+                Err(e)
             }
-            let col_name = ColumnName::new(field.name())?;
-            let kind = classify(field.as_ref(), batch.column(idx).as_ref())?;
-            emit_arrow_column(qwp_ws, &ctx, col_name, kind, batch.column(idx).as_ref())?;
         }
-        match designated_timestamp {
-            DesignatedTimestamp::Column(_) => {
-                let idx = ts_col_idx.unwrap();
-                let arr = batch.column(idx);
-                emit_arrow_designated_ts(
-                    qwp_ws,
-                    &ctx,
-                    schema.field(idx).data_type(),
-                    arr.as_ref(),
-                )?;
-            }
-            DesignatedTimestamp::Now => {
-                emit_arrow_designated_ts_now(qwp_ws, &ctx, effective_rows)?;
-            }
-            DesignatedTimestamp::ServerNow => {}
-        }
-        qwp_ws.arrow_bulk_commit(ctx, effective_rows)
     }
+}
+
+#[inline]
+fn emit_arrow_batch(
+    qwp_ws: &mut QwpWsColumnarBuffer,
+    ctx: &ArrowBulkCtx,
+    batch: &RecordBatch,
+    schema: &arrow_schema::SchemaRef,
+    ts_col_idx: Option<usize>,
+) -> Result<()> {
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if Some(idx) == ts_col_idx {
+            continue;
+        }
+        let col_name =
+            ColumnName::new(field.name()).map_err(|e| decorate_column(e, field.name()))?;
+        let kind = classify(field.as_ref(), batch.column(idx).as_ref())
+            .map_err(|e| decorate_column(e, field.name()))?;
+        emit_arrow_column(qwp_ws, ctx, col_name, kind, batch.column(idx).as_ref())
+            .map_err(|e| decorate_column(e, field.name()))?;
+    }
+    if let Some(idx) = ts_col_idx {
+        let arr = batch.column(idx);
+        let field_name = schema.field(idx).name();
+        emit_arrow_designated_ts(qwp_ws, ctx, schema.field(idx).data_type(), arr.as_ref())
+            .map_err(|e| decorate_column(e, field_name))?;
+    }
+    Ok(())
+}
+
+fn decorate_column(err: Error, column_name: &str) -> Error {
+    if err.msg().contains("column '") {
+        return err;
+    }
+    Error::new(
+        err.code(),
+        format!("column '{}': {}", column_name, err.msg()),
+    )
 }
 
 fn resolve_ts_column(batch: &RecordBatch, name: ColumnName<'_>) -> Result<usize> {
@@ -200,10 +251,17 @@ fn emit_arrow_designated_ts(
                 .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap();
             qwp_ws.arrow_bulk_set_designated_ts(ctx, QwpColumnKind::TimestampMicros, info, |out| {
-                non_null_le_into(out, arr, |row| {
-                    a.value(row).saturating_mul(1_000).to_le_bytes()
-                });
-                Ok(())
+                try_non_null_le_into(out, arr, |row| {
+                    let v = a.value(row);
+                    v.checked_mul(1_000).map(i64::to_le_bytes).ok_or_else(|| {
+                        fmt!(
+                            ArrowIngest,
+                            "designated timestamp ms→µs overflow at row {} (value {})",
+                            row,
+                            v
+                        )
+                    })
+                })
             })
         }
         other => Err(fmt!(
@@ -212,30 +270,6 @@ fn emit_arrow_designated_ts(
             other
         )),
     }
-}
-
-fn emit_arrow_designated_ts_now(
-    qwp_ws: &mut QwpWsColumnarBuffer,
-    ctx: &ArrowBulkCtx,
-    row_count: u32,
-) -> Result<()> {
-    let now = TimestampNanos::now().as_i64().to_le_bytes();
-    qwp_ws.arrow_bulk_set_designated_ts(
-        ctx,
-        QwpColumnKind::TimestampNanos,
-        ArrowBatchInfo {
-            bitmap: None,
-            rows: row_count,
-            non_null: row_count,
-        },
-        |out| {
-            out.reserve(row_count as usize * 8);
-            for _ in 0..row_count {
-                out.extend_from_slice(&now);
-            }
-            Ok(())
-        },
-    )
 }
 
 fn full_with_sentinel_into<const N: usize>(
@@ -268,6 +302,23 @@ fn non_null_le_into<const N: usize>(
         }
         out.extend_from_slice(&get_bytes(row));
     }
+}
+
+fn try_non_null_le_into<const N: usize>(
+    out: &mut Vec<u8>,
+    arr: &dyn Array,
+    mut get_bytes: impl FnMut(usize) -> Result<[u8; N]>,
+) -> Result<()> {
+    let row_count = arr.len();
+    out.reserve((row_count - arr.null_count()) * N);
+    for row in 0..row_count {
+        if arr.is_null(row) {
+            continue;
+        }
+        let bytes = get_bytes(row)?;
+        out.extend_from_slice(&bytes);
+    }
+    Ok(())
 }
 
 fn non_null_fsb_into(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray, size: usize) {
@@ -364,6 +415,22 @@ fn emit_arrow_column(
                 Ok(())
             })
         }
+        ColumnKind::F16ToF32 => {
+            let a = arr.as_any().downcast_ref::<Float16Array>().unwrap();
+            qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::F32, info_full, |out| {
+                if null_count == 0 {
+                    out.reserve(a.values().len() * 4);
+                    for &h in a.values() {
+                        out.extend_from_slice(&h.to_f32().to_le_bytes());
+                    }
+                } else {
+                    full_with_sentinel_into(out, arr, f32::NAN.to_le_bytes(), |row| {
+                        a.value(row).to_f32().to_le_bytes()
+                    });
+                }
+                Ok(())
+            })
+        }
         ColumnKind::F32 => {
             let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
             qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::F32, info_full, |out| {
@@ -414,6 +481,15 @@ fn emit_arrow_column(
                 Ok(())
             })
         }
+        ColumnKind::U8WidenToI16 => {
+            let a = arr.as_any().downcast_ref::<UInt8Array>().unwrap();
+            qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::I16, info_full, |out| {
+                full_with_sentinel_into(out, arr, 0i16.to_le_bytes(), |row| {
+                    (a.value(row) as i16).to_le_bytes()
+                });
+                Ok(())
+            })
+        }
         ColumnKind::U16WidenToI32 => {
             let a = arr.as_any().downcast_ref::<UInt16Array>().unwrap();
             qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::I32, info_full, |out| {
@@ -431,6 +507,56 @@ fn emit_arrow_column(
                 });
                 Ok(())
             })
+        }
+        ColumnKind::U64ReinterpretAsI64 => {
+            let a = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+            qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::I64, info_full, |out| {
+                full_with_sentinel_into(out, arr, i64::MIN.to_le_bytes(), |row| {
+                    (a.value(row) as i64).to_le_bytes()
+                });
+                Ok(())
+            })
+        }
+        ColumnKind::TimestampSecondToMicros => {
+            let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+            qwp_ws.arrow_bulk_set_fixed(
+                ctx,
+                col_name,
+                QwpColumnKind::TimestampMicros,
+                info_sparse,
+                |out| {
+                    if null_count == 0 {
+                        let src = a.values();
+                        out.reserve(src.len() * 8);
+                        for (row, &v) in src.iter().enumerate() {
+                            let widened = v.checked_mul(1_000_000).ok_or_else(|| {
+                                fmt!(
+                                    ArrowIngest,
+                                    "Timestamp s→µs overflow at row {} (value {})",
+                                    row,
+                                    v
+                                )
+                            })?;
+                            out.extend_from_slice(&widened.to_le_bytes());
+                        }
+                        Ok(())
+                    } else {
+                        try_non_null_le_into(out, arr, |row| {
+                            let v = a.value(row);
+                            v.checked_mul(1_000_000)
+                                .map(i64::to_le_bytes)
+                                .ok_or_else(|| {
+                                    fmt!(
+                                        ArrowIngest,
+                                        "Timestamp s→µs overflow at row {} (value {})",
+                                        row,
+                                        v
+                                    )
+                                })
+                        })
+                    }
+                },
+            )
         }
         ColumnKind::TimestampMicros => {
             let a = arr
@@ -484,6 +610,62 @@ fn emit_arrow_column(
                     non_null_le_into(out, arr, |row| a.value(row).to_le_bytes());
                 }
                 Ok(())
+            })
+        }
+        ColumnKind::Date32Days => {
+            let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+            qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::Date, info_sparse, |out| {
+                if null_count == 0 {
+                    let src = a.values();
+                    out.reserve(src.len() * 8);
+                    for (row, &d) in src.iter().enumerate() {
+                        let ms = (d as i64).checked_mul(86_400_000).ok_or_else(|| {
+                            fmt!(
+                                ArrowIngest,
+                                "Date32 days→ms overflow at row {} (value {})",
+                                row,
+                                d
+                            )
+                        })?;
+                        out.extend_from_slice(&ms.to_le_bytes());
+                    }
+                    Ok(())
+                } else {
+                    try_non_null_le_into(out, arr, |row| {
+                        let days = a.value(row) as i64;
+                        days.checked_mul(86_400_000)
+                            .map(i64::to_le_bytes)
+                            .ok_or_else(|| {
+                                fmt!(
+                                    ArrowIngest,
+                                    "Date32 days→ms overflow at row {} (value {})",
+                                    row,
+                                    days
+                                )
+                            })
+                    })
+                }
+            })
+        }
+        ColumnKind::Date64Ms => {
+            let a = arr.as_any().downcast_ref::<Date64Array>().unwrap();
+            qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::Date, info_sparse, |out| {
+                if le_no_nulls {
+                    out.extend_from_slice(unsafe { typed_slice_as_le_bytes(a.values()) });
+                } else {
+                    non_null_le_into(out, arr, |row| a.value(row).to_le_bytes());
+                }
+                Ok(())
+            })
+        }
+        ColumnKind::TimeAsLong(unit) => {
+            qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::I64, info_full, |out| {
+                build_time_as_long_into(out, arr, unit)
+            })
+        }
+        ColumnKind::DurationAsLong(unit) => {
+            qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::I64, info_full, |out| {
+                build_duration_as_long_into(out, arr, unit)
             })
         }
         ColumnKind::Utf8 => {
@@ -577,25 +759,33 @@ fn emit_arrow_column(
                 build_geohash_bytes_into(out, arr, precision)
             })
         }
-        ColumnKind::SymbolDict => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-                .unwrap();
-            let (keys, entries, dict_data) = build_symbol_payload(dict)?;
-            qwp_ws.arrow_bulk_set_symbol(ctx, col_name, &keys, &entries, &dict_data, info_sparse)
-        }
-        ColumnKind::SymbolDictAsStr => {
-            let dict = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-                .unwrap();
-            qwp_ws.arrow_bulk_set_varlen(
+        ColumnKind::SymbolDict { key, value } => {
+            let payload = build_symbol_payload_dyn(arr, key, value)?;
+            qwp_ws.arrow_bulk_set_symbol(
                 ctx,
                 col_name,
-                QwpColumnKind::String,
+                &payload.keys,
+                &payload.entries,
+                &payload.dict_data,
                 info_sparse,
-                |offsets, data| build_varlen_from_dict_as_str_into(offsets, data, dict),
+            )
+        }
+        ColumnKind::Decimal32WidenToDecimal64 => {
+            let a = arr.as_any().downcast_ref::<Decimal32Array>().unwrap();
+            let scale = decimal_scale_u8(a.scale(), "Decimal32")?;
+            qwp_ws.arrow_bulk_set_decimal(
+                ctx,
+                col_name,
+                QwpColumnKind::Decimal64,
+                ArrowDecimalSpec {
+                    scale,
+                    element_width: 8,
+                },
+                info_sparse,
+                |out| {
+                    build_decimal_bytes_i32_widen_into(out, a);
+                    Ok(())
+                },
             )
         }
         ColumnKind::Decimal64 => {
@@ -657,7 +847,13 @@ fn emit_arrow_column(
                 },
                 info_sparse,
                 |out| {
-                    build_decimal_bytes_i256_into(out, a);
+                    if le_no_nulls {
+                        // SAFETY: i256 is `#[repr(C)] { low: u128, high: i128 }`;
+                        // on LE that's byte-identical to `to_le_bytes()` output.
+                        out.extend_from_slice(unsafe { typed_slice_as_le_bytes(a.values()) });
+                    } else {
+                        build_decimal_bytes_i256_into(out, a);
+                    }
                     Ok(())
                 },
             )
@@ -675,18 +871,25 @@ fn emit_arrow_column(
 fn pack_bool_bits(arr: &BooleanArray) -> Vec<u8> {
     let row_count = arr.len();
     let n_bytes = row_count.div_ceil(8);
-    if arr.null_count() == 0 {
-        let bb = arr.values();
-        if bb.offset().is_multiple_of(8) {
-            let start = bb.offset() / 8;
-            let mut packed = bb.values()[start..start + n_bytes].to_vec();
-            let trailing = row_count % 8;
-            if trailing != 0 {
-                let mask = (1u8 << trailing) - 1;
-                *packed.last_mut().unwrap() &= mask;
+    let value_buf = arr.values();
+    let null_buf = arr.nulls();
+    let nulls_aligned = null_buf.is_none_or(|nb| nb.offset().is_multiple_of(8));
+    if value_buf.offset().is_multiple_of(8) && nulls_aligned {
+        let v_start = value_buf.offset() / 8;
+        let mut packed = value_buf.values()[v_start..v_start + n_bytes].to_vec();
+        if let Some(nb) = null_buf {
+            let n_start = nb.offset() / 8;
+            let n_slice = &nb.buffer().as_slice()[n_start..n_start + n_bytes];
+            for (p, &v) in packed.iter_mut().zip(n_slice) {
+                *p &= v;
             }
-            return packed;
         }
+        let trailing = row_count % 8;
+        if trailing != 0 {
+            let mask = (1u8 << trailing) - 1;
+            *packed.last_mut().unwrap() &= mask;
+        }
+        return packed;
     }
     let mut packed = vec![0u8; n_bytes];
     for row in 0..row_count {
@@ -747,23 +950,56 @@ fn varlen_no_null_i32_into(
     arr_len: usize,
     label: &str,
 ) -> Result<()> {
-    let used = arr_offsets[arr_len] as u32;
+    if arr_offsets.len() != arr_len + 1 {
+        return Err(fmt!(
+            ArrowIngest,
+            "{} offsets length {} != arr_len + 1 ({})",
+            label,
+            arr_offsets.len(),
+            arr_len + 1
+        ));
+    }
+    let first = arr_offsets[0];
+    let last = arr_offsets[arr_len];
+    if first < 0 || last < first {
+        return Err(fmt!(
+            ArrowIngest,
+            "{} offsets [{}, {}] not non-decreasing non-negative",
+            label,
+            first,
+            last
+        ));
+    }
+    let first_u = first as u32;
+    let last_u = last as u32;
+    let used = last_u - first_u;
+    let last_usize = last as usize;
+    if last_usize > arr_data.len() {
+        return Err(fmt!(
+            ArrowIngest,
+            "{} last offset {} exceeds data len {}",
+            label,
+            last_usize,
+            arr_data.len()
+        ));
+    }
     let data_base = varlen_data_base(data, label)?;
     data_base
         .checked_add(used)
         .ok_or_else(|| fmt!(ArrowIngest, "{} cumulative offset exceeds u32::MAX", label))?;
     offsets.reserve(arr_len);
-    if data_base == 0 {
-        // SAFETY: i32 and u32 share layout; Arrow byte-array offsets are >= 0.
+    let rebase = data_base.wrapping_sub(first_u);
+    if first == 0 && data_base == 0 {
+        // SAFETY: validated above that offsets are non-negative.
         let as_u32: &[u32] =
             unsafe { std::slice::from_raw_parts(arr_offsets[1..].as_ptr() as *const u32, arr_len) };
         offsets.extend_from_slice(as_u32);
     } else {
         for &off in &arr_offsets[1..] {
-            offsets.push(data_base + off as u32);
+            offsets.push(rebase.wrapping_add(off as u32));
         }
     }
-    data.extend_from_slice(&arr_data[..used as usize]);
+    data.extend_from_slice(&arr_data[first as usize..last_usize]);
     Ok(())
 }
 
@@ -920,32 +1156,6 @@ fn build_varlen_from_binary_view_into(
     Ok(())
 }
 
-fn build_varlen_from_dict_as_str_into(
-    offsets: &mut Vec<u32>,
-    data: &mut Vec<u8>,
-    dict: &DictionaryArray<UInt32Type>,
-) -> Result<()> {
-    let row_count = dict.len();
-    let data_base = varlen_data_base(data, "VARCHAR")?;
-    let mut cumulative: u32 = 0;
-    offsets.reserve(row_count - dict.null_count());
-    for row in 0..row_count {
-        if dict.is_null(row) {
-            continue;
-        }
-        let s = dict_value_str(dict, row)?.as_bytes();
-        cumulative = cumulative
-            .checked_add(s.len() as u32)
-            .ok_or_else(|| fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX"))?;
-        let absolute = data_base
-            .checked_add(cumulative)
-            .ok_or_else(|| fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX"))?;
-        data.extend_from_slice(s);
-        offsets.push(absolute);
-    }
-    Ok(())
-}
-
 fn build_geohash_bytes_into(out: &mut Vec<u8>, arr: &dyn Array, precision_bits: u8) -> Result<()> {
     if !(1..=60).contains(&precision_bits) {
         return Err(fmt!(
@@ -968,51 +1178,6 @@ fn build_geohash_bytes_into(out: &mut Vec<u8>, arr: &dyn Array, precision_bits: 
     Ok(())
 }
 
-type SymbolPayload = (Vec<u32>, Vec<(u32, u32)>, Vec<u8>);
-
-fn build_symbol_payload(dict: &DictionaryArray<UInt32Type>) -> Result<SymbolPayload> {
-    let row_count = dict.len();
-    let values = dict
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            fmt!(
-                ArrowIngest,
-                "dictionary values must be Utf8 for SYMBOL ingress"
-            )
-        })?;
-    if values.null_count() > 0 {
-        return Err(fmt!(
-            ArrowIngest,
-            "dictionary values for SYMBOL must not contain nulls"
-        ));
-    }
-    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(values.len());
-    let mut dict_data: Vec<u8> = Vec::with_capacity(values.value_data().len());
-    let mut cumulative: u32 = 0;
-    for i in 0..values.len() {
-        let bytes = values.value(i).as_bytes();
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| fmt!(ArrowIngest, "SYMBOL entry length exceeds u32::MAX"))?;
-        entries.push((cumulative, len));
-        dict_data.extend_from_slice(bytes);
-        cumulative = cumulative
-            .checked_add(len)
-            .ok_or_else(|| fmt!(ArrowIngest, "SYMBOL cumulative data exceeds u32::MAX"))?;
-    }
-    let keys_src = dict.keys();
-    let mut keys: Vec<u32> = Vec::with_capacity(row_count);
-    for row in 0..row_count {
-        if dict.is_null(row) {
-            keys.push(0);
-            continue;
-        }
-        keys.push(keys_src.value(row));
-    }
-    Ok((keys, entries, dict_data))
-}
-
 fn decimal_scale_u8(scale_i8: i8, label: &str) -> Result<u8> {
     if scale_i8 < 0 {
         return Err(fmt!(
@@ -1023,6 +1188,25 @@ fn decimal_scale_u8(scale_i8: i8, label: &str) -> Result<u8> {
         ));
     }
     Ok(scale_i8 as u8)
+}
+
+fn build_decimal_bytes_i32_widen_into(out: &mut Vec<u8>, arr: &Decimal32Array) {
+    if arr.null_count() == 0 {
+        let src = arr.values();
+        out.reserve(src.len() * 8);
+        for &v in src {
+            out.extend_from_slice(&(v as i64).to_le_bytes());
+        }
+        return;
+    }
+    let row_count = arr.len();
+    out.reserve((row_count - arr.null_count()) * 8);
+    for row in 0..row_count {
+        if arr.is_null(row) {
+            continue;
+        }
+        out.extend_from_slice(&(arr.value(row) as i64).to_le_bytes());
+    }
 }
 
 fn build_decimal_bytes_i64_into(out: &mut Vec<u8>, arr: &Decimal64Array) {
@@ -1060,11 +1244,15 @@ fn build_decimal_bytes_i256_into(out: &mut Vec<u8>, arr: &Decimal256Array) {
 
 fn build_array_blob_data_into(data: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -> Result<()> {
     let row_count = arr.len();
+    let ndim_u8 =
+        u8::try_from(ndim).map_err(|_| fmt!(ArrowIngest, "ARRAY ndim {} exceeds u8::MAX", ndim))?;
+    let mut shape: Vec<usize> = Vec::with_capacity(ndim);
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
         }
-        let extract = extract_array_row(arr, ndim, row)?;
+        shape.clear();
+        let extract = extract_array_row(arr, ndim, row, &mut shape)?;
         let leaf = extract
             .leaf
             .as_any()
@@ -1079,15 +1267,8 @@ fn build_array_blob_data_into(data: &mut Vec<u8>, arr: &dyn Array, ndim: usize) 
                 )
             })?;
         let leaf_values = &leaf.values()[extract.leaf_start..extract.leaf_end];
-        let ndim_u8 = u8::try_from(extract.shape.len()).map_err(|_| {
-            fmt!(
-                ArrowIngest,
-                "ARRAY ndim {} exceeds u8::MAX",
-                extract.shape.len()
-            )
-        })?;
         data.push(ndim_u8);
-        for &dim in &extract.shape {
+        for &dim in shape.iter() {
             let dim_u32 = u32::try_from(dim)
                 .map_err(|_| fmt!(ArrowIngest, "ARRAY dimension {} exceeds u32::MAX", dim))?;
             data.extend_from_slice(&dim_u32.to_le_bytes());
@@ -1113,21 +1294,323 @@ fn walk_list_leaf(dt: &DataType) -> (DataType, usize) {
                 ndim += 1;
                 current = inner.data_type();
             }
+            DataType::FixedSizeList(inner, _) => {
+                ndim += 1;
+                current = inner.data_type();
+            }
             _ => return (current.clone(), ndim),
         }
     }
 }
 
+fn dict_key_for(dt: &DataType) -> Option<DictKey> {
+    match dt {
+        DataType::UInt8 => Some(DictKey::U8),
+        DataType::UInt16 => Some(DictKey::U16),
+        DataType::UInt32 => Some(DictKey::U32),
+        _ => None,
+    }
+}
+
+fn dict_value_for(dt: &DataType) -> Option<DictValue> {
+    match dt {
+        DataType::Utf8 => Some(DictValue::Utf8),
+        DataType::LargeUtf8 => Some(DictValue::LargeUtf8),
+        DataType::Utf8View => Some(DictValue::Utf8View),
+        _ => None,
+    }
+}
+
+fn emit_i32_widen_to_i64_full(out: &mut Vec<u8>, arr: &dyn Array, values: &[i32]) {
+    let sentinel = i64::MIN.to_le_bytes();
+    if arr.null_count() == 0 {
+        out.reserve(values.len() * 8);
+        for &v in values {
+            out.extend_from_slice(&(v as i64).to_le_bytes());
+        }
+    } else {
+        full_with_sentinel_into(out, arr, sentinel, |row| (values[row] as i64).to_le_bytes());
+    }
+}
+
+fn emit_i64_full(out: &mut Vec<u8>, arr: &dyn Array, values: &[i64]) {
+    let sentinel = i64::MIN.to_le_bytes();
+    if arr.null_count() == 0 && cfg!(target_endian = "little") {
+        // SAFETY: i64 has no padding; LE target → wire-format bytes.
+        out.extend_from_slice(unsafe { typed_slice_as_le_bytes(values) });
+    } else if arr.null_count() == 0 {
+        out.reserve(values.len() * 8);
+        for &v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    } else {
+        full_with_sentinel_into(out, arr, sentinel, |row| values[row].to_le_bytes());
+    }
+}
+
+fn build_time_as_long_into(out: &mut Vec<u8>, arr: &dyn Array, unit: TimeUnit) -> Result<()> {
+    match unit {
+        TimeUnit::Second => {
+            let a = arr.as_any().downcast_ref::<Time32SecondArray>().unwrap();
+            emit_i32_widen_to_i64_full(out, arr, a.values());
+        }
+        TimeUnit::Millisecond => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .unwrap();
+            emit_i32_widen_to_i64_full(out, arr, a.values());
+        }
+        TimeUnit::Microsecond => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .unwrap();
+            emit_i64_full(out, arr, a.values());
+        }
+        TimeUnit::Nanosecond => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .unwrap();
+            emit_i64_full(out, arr, a.values());
+        }
+    }
+    Ok(())
+}
+
+fn build_duration_as_long_into(out: &mut Vec<u8>, arr: &dyn Array, unit: TimeUnit) -> Result<()> {
+    match unit {
+        TimeUnit::Second => {
+            let a = arr.as_any().downcast_ref::<DurationSecondArray>().unwrap();
+            emit_i64_full(out, arr, a.values());
+        }
+        TimeUnit::Millisecond => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<DurationMillisecondArray>()
+                .unwrap();
+            emit_i64_full(out, arr, a.values());
+        }
+        TimeUnit::Microsecond => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<DurationMicrosecondArray>()
+                .unwrap();
+            emit_i64_full(out, arr, a.values());
+        }
+        TimeUnit::Nanosecond => {
+            let a = arr
+                .as_any()
+                .downcast_ref::<DurationNanosecondArray>()
+                .unwrap();
+            emit_i64_full(out, arr, a.values());
+        }
+    }
+    Ok(())
+}
+
+fn dict_lookup_str(values: &ArrayRef, key_idx: usize, value: DictValue) -> Result<&str> {
+    fn check<A: Array>(arr: &A, key_idx: usize) -> Result<()> {
+        if key_idx >= arr.len() {
+            return Err(fmt!(
+                ArrowIngest,
+                "dict key {} out of range (dict size {})",
+                key_idx,
+                arr.len()
+            ));
+        }
+        if arr.is_null(key_idx) {
+            return Err(fmt!(
+                ArrowIngest,
+                "dictionary values for SYMBOL / VARCHAR must not contain nulls"
+            ));
+        }
+        Ok(())
+    }
+    match value {
+        DictValue::Utf8 => {
+            let utf8 = values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    fmt!(
+                        ArrowIngest,
+                        "dictionary values must be Utf8 for this column"
+                    )
+                })?;
+            check(utf8, key_idx)?;
+            Ok(utf8.value(key_idx))
+        }
+        DictValue::LargeUtf8 => {
+            let utf8 = values
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    fmt!(
+                        ArrowIngest,
+                        "dictionary values must be LargeUtf8 for this column"
+                    )
+                })?;
+            check(utf8, key_idx)?;
+            Ok(utf8.value(key_idx))
+        }
+        DictValue::Utf8View => {
+            let utf8 = values
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    fmt!(
+                        ArrowIngest,
+                        "dictionary values must be Utf8View for this column"
+                    )
+                })?;
+            check(utf8, key_idx)?;
+            Ok(utf8.value(key_idx))
+        }
+    }
+}
+
+fn dict_values_dyn(arr: &dyn Array, key: DictKey) -> &ArrayRef {
+    match key {
+        DictKey::U32 => arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .unwrap()
+            .values(),
+        DictKey::U16 => arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt16Type>>()
+            .unwrap()
+            .values(),
+        DictKey::U8 => arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt8Type>>()
+            .unwrap()
+            .values(),
+    }
+}
+
+struct SymbolPayload {
+    keys: Vec<u32>,
+    entries: Vec<(u32, u32)>,
+    dict_data: Vec<u8>,
+}
+
+/// Upper bound on dictionary entries accepted from an Arrow column. The
+/// limit caps `Vec::with_capacity` so a malformed or hostile FFI batch
+/// cannot trigger an allocator abort under `panic = "abort"`.
+const MAX_ARROW_DICT_VALUES: usize = 16 * 1024 * 1024;
+
+fn build_symbol_payload_dyn(
+    arr: &dyn Array,
+    key: DictKey,
+    value: DictValue,
+) -> Result<SymbolPayload> {
+    let values = dict_values_dyn(arr, key);
+    let value_count = values.len();
+    if value_count > MAX_ARROW_DICT_VALUES {
+        return Err(fmt!(
+            ArrowIngest,
+            "SYMBOL dictionary has {} values exceeding limit {}",
+            value_count,
+            MAX_ARROW_DICT_VALUES
+        ));
+    }
+    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(value_count);
+    let mut dict_data: Vec<u8> = Vec::new();
+    let mut cumulative: u32 = 0;
+    for i in 0..value_count {
+        let s = dict_lookup_str(values, i, value)?;
+        let bytes = s.as_bytes();
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| fmt!(ArrowIngest, "SYMBOL entry length exceeds u32::MAX"))?;
+        entries.push((cumulative, len));
+        dict_data.extend_from_slice(bytes);
+        cumulative = cumulative
+            .checked_add(len)
+            .ok_or_else(|| fmt!(ArrowIngest, "SYMBOL cumulative data exceeds u32::MAX"))?;
+    }
+    let row_count = arr.len();
+    let mut keys: Vec<u32> = Vec::with_capacity(row_count);
+    fill_dict_keys_into(&mut keys, arr, key);
+    debug_assert_eq!(keys.len(), row_count);
+    Ok(SymbolPayload {
+        keys,
+        entries,
+        dict_data,
+    })
+}
+
+fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
+    let row_count = arr.len();
+    let has_nulls = arr.null_count() != 0;
+    match key {
+        DictKey::U32 => {
+            let dict = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap();
+            let raw = dict.keys().values();
+            if !has_nulls {
+                out.extend_from_slice(raw);
+                return;
+            }
+            out.reserve(row_count);
+            for (row, &k) in raw.iter().enumerate() {
+                out.push(if arr.is_null(row) { 0 } else { k });
+            }
+        }
+        DictKey::U16 => {
+            let dict = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+                .unwrap();
+            let raw = dict.keys().values();
+            out.reserve(row_count);
+            if !has_nulls {
+                for &k in raw {
+                    out.push(k as u32);
+                }
+            } else {
+                for (row, &k) in raw.iter().enumerate() {
+                    out.push(if arr.is_null(row) { 0 } else { k as u32 });
+                }
+            }
+        }
+        DictKey::U8 => {
+            let dict = arr
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt8Type>>()
+                .unwrap();
+            let raw = dict.keys().values();
+            out.reserve(row_count);
+            if !has_nulls {
+                for &k in raw {
+                    out.push(k as u32);
+                }
+            } else {
+                for (row, &k) in raw.iter().enumerate() {
+                    out.push(if arr.is_null(row) { 0 } else { k as u32 });
+                }
+            }
+        }
+    }
+}
+
 struct ArrayRowExtract {
-    shape: Vec<usize>,
     leaf: ArrayRef,
     leaf_start: usize,
     leaf_end: usize,
 }
 
-fn extract_array_row(outer: &dyn Array, ndim: usize, row: usize) -> Result<ArrayRowExtract> {
+fn extract_array_row(
+    outer: &dyn Array,
+    ndim: usize,
+    row: usize,
+    shape: &mut Vec<usize>,
+) -> Result<ArrayRowExtract> {
     let (mut start, mut end) = list_row_range(outer, row)?;
-    let mut shape: Vec<usize> = Vec::with_capacity(ndim);
     shape.push(end - start);
     let mut current_values: ArrayRef = list_values(outer)?;
     for _ in 1..ndim {
@@ -1139,7 +1622,6 @@ fn extract_array_row(outer: &dyn Array, ndim: usize, row: usize) -> Result<Array
         current_values = next_values;
     }
     Ok(ArrayRowExtract {
-        shape,
         leaf: current_values,
         leaf_start: start,
         leaf_end: end,
@@ -1153,10 +1635,13 @@ fn list_row_range(arr: &dyn Array, row: usize) -> Result<(usize, usize)> {
     } else if let Some(la) = arr.as_any().downcast_ref::<LargeListArray>() {
         let offsets = la.offsets();
         Ok((offsets[row] as usize, offsets[row + 1] as usize))
+    } else if let Some(la) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
+        let stride = la.value_length() as usize;
+        Ok((row * stride, (row + 1) * stride))
     } else {
         Err(fmt!(
             ArrowIngest,
-            "expected List / LargeList at outer ARRAY level, got {:?}",
+            "expected List / LargeList / FixedSizeList at outer ARRAY level, got {:?}",
             arr.data_type()
         ))
     }
@@ -1167,10 +1652,12 @@ fn list_values(arr: &dyn Array) -> Result<ArrayRef> {
         Ok(la.values().clone())
     } else if let Some(la) = arr.as_any().downcast_ref::<LargeListArray>() {
         Ok(la.values().clone())
+    } else if let Some(la) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
+        Ok(la.values().clone())
     } else {
         Err(fmt!(
             ArrowIngest,
-            "expected List / LargeList, got {:?}",
+            "expected List / LargeList / FixedSizeList, got {:?}",
             arr.data_type()
         ))
     }
@@ -1190,6 +1677,9 @@ fn list_level_descend(
         let first_end = offsets[start + 1] as usize;
         let dim = first_end - next_start;
         let next_end = offsets[end] as usize;
+        if next_end - next_start != dim * (end - start) {
+            return Err(ragged_inner_error_i32(&offsets[..], start, end, dim));
+        }
         Ok((next_start, next_end, dim, la.values().clone()))
     } else if let Some(la) = arr.as_any().downcast_ref::<LargeListArray>() {
         let offsets = la.offsets();
@@ -1200,44 +1690,65 @@ fn list_level_descend(
         let first_end = offsets[start + 1] as usize;
         let dim = first_end - next_start;
         let next_end = offsets[end] as usize;
+        if next_end - next_start != dim * (end - start) {
+            return Err(ragged_inner_error_i64(&offsets[..], start, end, dim));
+        }
         Ok((next_start, next_end, dim, la.values().clone()))
+    } else if let Some(la) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
+        let stride = la.value_length() as usize;
+        if end <= start {
+            return Ok((0, 0, 0, la.values().clone()));
+        }
+        Ok((start * stride, end * stride, stride, la.values().clone()))
     } else {
         Err(fmt!(
             ArrowIngest,
-            "expected List / LargeList in ARRAY descent, got {:?}",
+            "expected List / LargeList / FixedSizeList in ARRAY descent, got {:?}",
             arr.data_type()
         ))
     }
 }
 
-fn dict_value_str(dict: &DictionaryArray<UInt32Type>, row: usize) -> Result<&str> {
-    let key = dict.keys().value(row);
-    let values = dict.values();
-    let utf8 = values
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            fmt!(
+#[cold]
+#[inline(never)]
+fn ragged_inner_error_i32(offsets: &[i32], start: usize, end: usize, dim: usize) -> Error {
+    for i in start..end {
+        let sz = (offsets[i + 1] - offsets[i]) as usize;
+        if sz != dim {
+            return fmt!(
                 ArrowIngest,
-                "dictionary values must be Utf8 for SYMBOL / VARCHAR ingress"
-            )
-        })?;
-    let key_usize = key as usize;
-    if key_usize >= utf8.len() {
-        return Err(fmt!(
-            ArrowIngest,
-            "dict key {} out of range (dict size {})",
-            key,
-            utf8.len()
-        ));
+                "ARRAY row has ragged inner-list sizes: inner #{} has size {} but row's first inner is {}; N-dim ARRAY ingest requires uniform inner sizes per row",
+                i - start,
+                sz,
+                dim
+            );
+        }
     }
-    if utf8.is_null(key_usize) {
-        return Err(fmt!(
-            ArrowIngest,
-            "dictionary values for SYMBOL / VARCHAR must not contain nulls"
-        ));
+    fmt!(
+        ArrowIngest,
+        "ARRAY row has ragged inner-list sizes (unable to locate offending inner)"
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn ragged_inner_error_i64(offsets: &[i64], start: usize, end: usize, dim: usize) -> Error {
+    for i in start..end {
+        let sz = (offsets[i + 1] - offsets[i]) as usize;
+        if sz != dim {
+            return fmt!(
+                ArrowIngest,
+                "ARRAY row has ragged inner-list sizes: inner #{} has size {} but row's first inner is {}; N-dim ARRAY ingest requires uniform inner sizes per row",
+                i - start,
+                sz,
+                dim
+            );
+        }
     }
-    Ok(utf8.value(key_usize))
+    fmt!(
+        ArrowIngest,
+        "ARRAY row has ragged inner-list sizes (unable to locate offending inner)"
+    )
 }
 
 fn geohash_value_from_array(arr: &dyn Array, row: usize) -> Result<u64> {
@@ -1258,6 +1769,20 @@ fn geohash_value_from_array(arr: &dyn Array, row: usize) -> Result<u64> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DictKey {
+    U8,
+    U16,
+    U32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DictValue {
+    Utf8,
+    LargeUtf8,
+    Utf8View,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ColumnKind {
     Bool,
@@ -1265,15 +1790,23 @@ enum ColumnKind {
     I16,
     I32,
     I64,
+    F16ToF32,
     F32,
     F64,
     Char,
     Ipv4,
+    U8WidenToI16,
     U16WidenToI32,
     U32WidenToI64,
+    U64ReinterpretAsI64,
+    TimestampSecondToMicros,
     TimestampMicros,
     TimestampNanos,
     Date,
+    Date32Days,
+    Date64Ms,
+    TimeAsLong(TimeUnit),
+    DurationAsLong(TimeUnit),
     Utf8,
     LargeUtf8,
     Utf8View,
@@ -1283,8 +1816,8 @@ enum ColumnKind {
     Uuid,
     Long256,
     Geohash(u8),
-    SymbolDict,
-    SymbolDictAsStr,
+    SymbolDict { key: DictKey, value: DictValue },
+    Decimal32WidenToDecimal64,
     Decimal64,
     Decimal128,
     Decimal256,
@@ -1300,11 +1833,6 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         .metadata()
         .get(crate::egress::arrow::metadata::ARROW_EXTENSION_NAME)
         .map(String::as_str);
-    let md_symbol = field
-        .metadata()
-        .get(crate::egress::arrow::metadata::SYMBOL)
-        .map(String::as_str)
-        == Some("true");
     let md_geo_bits = field
         .metadata()
         .get(crate::egress::arrow::metadata::GEOHASH_BITS)
@@ -1313,7 +1841,15 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         (DataType::Boolean, _, _) => ColumnKind::Bool,
         (DataType::Int8, Some("byte"), _) => ColumnKind::I8,
         (DataType::Int8, Some(name), _) if name.starts_with("geohash") => {
-            ColumnKind::Geohash(md_geo_bits.unwrap_or(8))
+            let bits = md_geo_bits.ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "column '{}' has column_type='{}' but missing or invalid 'questdb.geohash_bits' metadata (1..=60 expected)",
+                    field.name(),
+                    name
+                )
+            })?;
+            ColumnKind::Geohash(bits)
         }
         (DataType::Int8, _, _) if md_geo_bits.is_some() => {
             ColumnKind::Geohash(md_geo_bits.unwrap())
@@ -1331,15 +1867,24 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
             ColumnKind::Geohash(md_geo_bits.unwrap())
         }
         (DataType::Int64, _, _) => ColumnKind::I64,
+        (DataType::Float16, _, _) => ColumnKind::F16ToF32,
         (DataType::Float32, _, _) => ColumnKind::F32,
         (DataType::Float64, _, _) => ColumnKind::F64,
+        (DataType::UInt8, _, _) => ColumnKind::U8WidenToI16,
         (DataType::UInt16, Some("char"), _) => ColumnKind::Char,
         (DataType::UInt16, _, _) => ColumnKind::U16WidenToI32,
         (DataType::UInt32, Some("ipv4"), _) => ColumnKind::Ipv4,
         (DataType::UInt32, _, _) => ColumnKind::U32WidenToI64,
+        (DataType::UInt64, _, _) => ColumnKind::U64ReinterpretAsI64,
+        (DataType::Timestamp(TimeUnit::Second, _), _, _) => ColumnKind::TimestampSecondToMicros,
         (DataType::Timestamp(TimeUnit::Microsecond, _), _, _) => ColumnKind::TimestampMicros,
         (DataType::Timestamp(TimeUnit::Nanosecond, _), _, _) => ColumnKind::TimestampNanos,
         (DataType::Timestamp(TimeUnit::Millisecond, _), _, _) => ColumnKind::Date,
+        (DataType::Date32, _, _) => ColumnKind::Date32Days,
+        (DataType::Date64, _, _) => ColumnKind::Date64Ms,
+        (DataType::Time32(unit), _, _) => ColumnKind::TimeAsLong(*unit),
+        (DataType::Time64(unit), _, _) => ColumnKind::TimeAsLong(*unit),
+        (DataType::Duration(unit), _, _) => ColumnKind::DurationAsLong(*unit),
         (DataType::Utf8, _, _) => ColumnKind::Utf8,
         (DataType::LargeUtf8, _, _) => ColumnKind::LargeUtf8,
         (DataType::Utf8View, _, _) => ColumnKind::Utf8View,
@@ -1359,18 +1904,17 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         }
         (DataType::FixedSizeBinary(32), _, _) => ColumnKind::Long256,
         (DataType::Dictionary(key, value), _, _)
-            if matches!(**key, DataType::UInt32) && matches!(**value, DataType::Utf8) =>
+            if dict_key_for(key).is_some() && dict_value_for(value).is_some() =>
         {
-            if md_symbol {
-                ColumnKind::SymbolDict
-            } else {
-                ColumnKind::SymbolDictAsStr
-            }
+            let k = dict_key_for(key).unwrap();
+            let v = dict_value_for(value).unwrap();
+            ColumnKind::SymbolDict { key: k, value: v }
         }
+        (DataType::Decimal32(_, _), _, _) => ColumnKind::Decimal32WidenToDecimal64,
         (DataType::Decimal64(_, _), _, _) => ColumnKind::Decimal64,
         (DataType::Decimal128(_, _), _, _) => ColumnKind::Decimal128,
         (DataType::Decimal256(_, _), _, _) => ColumnKind::Decimal256,
-        (DataType::List(_) | DataType::LargeList(_), _, _) => {
+        (DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _), _, _) => {
             let (leaf, ndim) = walk_list_leaf(field.data_type());
             match leaf {
                 DataType::Float64 => ColumnKind::ArrayDouble(ndim),
@@ -1412,7 +1956,7 @@ mod tests {
     };
     use arrow_array::types::UInt32Type;
     use arrow_array::{ArrayRef, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use arrow_schema::{DataType, Field, IntervalUnit, Schema as ArrowSchema, TimeUnit};
 
     use crate::ingress::{Buffer, TableName};
 
@@ -1482,8 +2026,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(fields));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -1495,8 +2038,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Float64, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(f64b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -1532,8 +2074,7 @@ mod tests {
         ]));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::ServerNow)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -1544,9 +2085,9 @@ mod tests {
         s.append_value("");
         s.append_value("yo");
         let mut bin = BinaryBuilder::new();
-        bin.append_value(&[1u8, 2, 3]);
-        bin.append_value(&[]);
-        bin.append_value(&[0xFFu8]);
+        bin.append_value([1u8, 2, 3]);
+        bin.append_value([]);
+        bin.append_value([0xFFu8]);
         let cols: Vec<ArrayRef> = vec![Arc::new(s.finish()), Arc::new(bin.finish())];
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -1554,8 +2095,7 @@ mod tests {
         ]));
         let rb = RecordBatch::try_new(schema, cols).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -1578,8 +2118,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -1590,9 +2129,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("id", DataType::FixedSizeBinary(16), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(
             err.code(),
             crate::error::ErrorCode::ArrowUnsupportedColumnKind
@@ -1606,8 +2143,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("l", DataType::FixedSizeBinary(32), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -1631,13 +2167,12 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
     #[test]
-    fn dictionary_without_symbol_metadata_falls_back_to_varchar() {
+    fn dictionary_without_metadata_routes_to_symbol() {
         let mut b = StringDictionaryBuilder::<UInt32Type>::new();
         b.append("x").unwrap();
         b.append("y").unwrap();
@@ -1650,8 +2185,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -1670,8 +2204,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -1683,8 +2216,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal64(18, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -1696,8 +2228,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("d", DataType::Decimal128(38, 3), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -1728,8 +2259,7 @@ mod tests {
         .unwrap();
         let mut buf = fresh_buffer();
         let ts_col = ColumnName::new("ts").unwrap();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Column(ts_col))
-            .unwrap();
+        buf.append_arrow_at_column(table("t"), &rb, ts_col).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -1742,7 +2272,7 @@ mod tests {
         let mut buf = fresh_buffer();
         let missing = ColumnName::new("missing_ts").unwrap();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Column(missing))
+            .append_arrow_at_column(table("t"), &rb, missing)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
     }
@@ -1756,7 +2286,7 @@ mod tests {
         let mut buf = fresh_buffer();
         let v_col = ColumnName::new("v").unwrap();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Column(v_col))
+            .append_arrow_at_column(table("t"), &rb, v_col)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
     }
@@ -1777,8 +2307,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 1);
     }
 
@@ -1796,9 +2325,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(
             err.code(),
             crate::error::ErrorCode::ArrowUnsupportedColumnKind
@@ -1811,8 +2338,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(v.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 0);
     }
 
@@ -1823,9 +2349,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(v.finish()) as ArrayRef]).unwrap();
         let mut buf = Buffer::new(crate::ingress::ProtocolVersion::V2);
-        let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap_err();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::InvalidApiCall);
     }
 
@@ -1838,8 +2362,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("n", DataType::Int32, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -1852,8 +2375,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("f", DataType::Float64, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -1867,8 +2389,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -1881,8 +2402,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Utf8, true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -1908,8 +2428,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 5);
     }
 
@@ -1922,8 +2441,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("amt", DataType::Decimal128(10, 2), true));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -1944,8 +2462,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 3);
     }
 
@@ -1981,8 +2498,7 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 2);
     }
 
@@ -1995,8 +2511,7 @@ mod tests {
             b.append_value(value);
             let rb = RecordBatch::try_new(schema.clone(), vec![Arc::new(b.finish()) as ArrayRef])
                 .unwrap();
-            buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-                .unwrap();
+            buf.append_arrow(table("t"), &rb).unwrap();
         }
         assert_eq!(buf.row_count(), 3);
     }
@@ -2008,8 +2523,7 @@ mod tests {
         let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb, DesignatedTimestamp::Now)
-            .unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
         let err = buf
             .table(table("t"))
             .and_then(|b| b.column_i64("v", 99))
@@ -2034,8 +2548,853 @@ mod tests {
         let mut buf = fresh_buffer();
         let ts_name = ColumnName::new("ts").unwrap();
         let err = buf
-            .append_arrow(table("t"), &rb, DesignatedTimestamp::Column(ts_name))
+            .append_arrow_at_column(table("t"), &rb, ts_name)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+    }
+
+    #[test]
+    fn uint8_widens_to_short_appends() {
+        use arrow_array::builder::UInt8Builder;
+        let mut u = UInt8Builder::new();
+        u.append_value(0);
+        u.append_value(0xFF);
+        u.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("v", DataType::UInt8, true)),
+            vec![Arc::new(u.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn uint64_reinterprets_as_long_appends() {
+        use arrow_array::builder::UInt64Builder;
+        let mut u = UInt64Builder::new();
+        u.append_value(0);
+        u.append_value(u64::MAX);
+        u.append_value(1 << 63);
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("v", DataType::UInt64, true)),
+            vec![Arc::new(u.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn date32_days_appends_as_date_ms() {
+        use arrow_array::builder::Date32Builder;
+        let mut d = Date32Builder::new();
+        d.append_value(0);
+        d.append_value(19_675);
+        d.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("d", DataType::Date32, true)),
+            vec![Arc::new(d.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn time32_seconds_appends() {
+        use arrow_array::builder::Time32SecondBuilder;
+        let mut t = Time32SecondBuilder::new();
+        t.append_value(0);
+        t.append_value(86_399);
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("t", DataType::Time32(TimeUnit::Second), true)),
+            vec![Arc::new(t.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn time64_nanoseconds_appends() {
+        use arrow_array::builder::Time64NanosecondBuilder;
+        let mut t = Time64NanosecondBuilder::new();
+        t.append_value(0);
+        t.append_value(86_399 * 1_000_000_000);
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "t",
+                DataType::Time64(TimeUnit::Nanosecond),
+                true,
+            )),
+            vec![Arc::new(t.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn duration_microseconds_appends() {
+        use arrow_array::builder::DurationMicrosecondBuilder;
+        let mut d = DurationMicrosecondBuilder::new();
+        d.append_value(1_000_000);
+        d.append_value(-1);
+        d.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "d",
+                DataType::Duration(TimeUnit::Microsecond),
+                true,
+            )),
+            vec![Arc::new(d.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn dict_u32_large_utf8_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let dict = DictionaryArray::<UInt32Type>::from_iter(
+            ["AAPL", "MSFT", "AAPL"].into_iter().map(Some),
+        );
+        let large_values = LargeStringArray::from(vec!["AAPL", "MSFT"]);
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(dict.keys().clone(), Arc::new(large_values))
+                .unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::LargeUtf8)),
+            true,
+        );
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn dict_u8_utf8_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt8Type;
+        let dict = DictionaryArray::<UInt8Type>::from_iter(
+            ["red", "green", "blue", "red"].into_iter().map(Some),
+        );
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 4);
+    }
+
+    #[test]
+    fn dict_u32_utf8_view_routes_to_symbol() {
+        // polars 0.53 emits Categorical as Dictionary(UInt32, Utf8View).
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let dict = DictionaryArray::<UInt32Type>::from_iter(
+            ["AAPL", "MSFT", "AAPL"].into_iter().map(Some),
+        );
+        let view_values = StringViewArray::from(vec!["AAPL", "MSFT"]);
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(dict.keys().clone(), Arc::new(view_values))
+                .unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8View)),
+            true,
+        );
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn fixed_size_list_float64_appends_as_array_1d() {
+        use arrow_array::builder::FixedSizeListBuilder;
+        let mut b = FixedSizeListBuilder::new(Float64Builder::new(), 3);
+        b.values().append_value(1.0);
+        b.values().append_value(2.0);
+        b.values().append_value(3.0);
+        b.append(true);
+        b.values().append_value(4.0);
+        b.values().append_value(5.0);
+        b.values().append_value(6.0);
+        b.append(true);
+        let arr = b.finish();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("a", arr.data_type().clone(), true)),
+            vec![Arc::new(arr) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn time32_milliseconds_appends() {
+        use arrow_array::builder::Time32MillisecondBuilder;
+        let mut t = Time32MillisecondBuilder::new();
+        t.append_value(0);
+        t.append_value(86_399_999);
+        t.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "t",
+                DataType::Time32(TimeUnit::Millisecond),
+                true,
+            )),
+            vec![Arc::new(t.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn time64_microseconds_appends() {
+        use arrow_array::builder::Time64MicrosecondBuilder;
+        let mut t = Time64MicrosecondBuilder::new();
+        t.append_value(0);
+        t.append_value(86_399_999_999);
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "t",
+                DataType::Time64(TimeUnit::Microsecond),
+                true,
+            )),
+            vec![Arc::new(t.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn duration_seconds_appends() {
+        use arrow_array::builder::DurationSecondBuilder;
+        let mut d = DurationSecondBuilder::new();
+        d.append_value(0);
+        d.append_value(-3600);
+        d.append_value(86_400);
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("d", DataType::Duration(TimeUnit::Second), true)),
+            vec![Arc::new(d.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn duration_milliseconds_appends() {
+        use arrow_array::builder::DurationMillisecondBuilder;
+        let mut d = DurationMillisecondBuilder::new();
+        d.append_value(1_500);
+        d.append_value(0);
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "d",
+                DataType::Duration(TimeUnit::Millisecond),
+                true,
+            )),
+            vec![Arc::new(d.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn duration_nanoseconds_appends() {
+        use arrow_array::builder::DurationNanosecondBuilder;
+        let mut d = DurationNanosecondBuilder::new();
+        d.append_value(0);
+        d.append_value(1_500_000_000);
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "d",
+                DataType::Duration(TimeUnit::Nanosecond),
+                true,
+            )),
+            vec![Arc::new(d.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn dict_u16_utf8_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt16Type;
+        let dict =
+            DictionaryArray::<UInt16Type>::from_iter(["x", "y", "x", "z"].into_iter().map(Some));
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 4);
+    }
+
+    #[test]
+    fn dict_u8_large_utf8_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt8Type;
+        let keys = arrow_array::UInt8Array::from(vec![0u8, 1, 0, 1]);
+        let values = LargeStringArray::from(vec!["alpha", "beta"]);
+        let dict = DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values)).unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::LargeUtf8)),
+            true,
+        );
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 4);
+    }
+
+    #[test]
+    fn symbol_dict_with_metadata_still_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let dict = DictionaryArray::<UInt32Type>::from_iter(["A", "B", "A"].into_iter().map(Some));
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .with_metadata(
+            [(
+                crate::egress::arrow::metadata::SYMBOL.to_string(),
+                "true".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn date32_all_null_appends() {
+        use arrow_array::builder::Date32Builder;
+        let mut d = Date32Builder::new();
+        d.append_null();
+        d.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("d", DataType::Date32, true)),
+            vec![Arc::new(d.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn time64_ns_all_null_appends() {
+        use arrow_array::builder::Time64NanosecondBuilder;
+        let mut t = Time64NanosecondBuilder::new();
+        t.append_null();
+        t.append_null();
+        t.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "t",
+                DataType::Time64(TimeUnit::Nanosecond),
+                true,
+            )),
+            vec![Arc::new(t.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn nested_list_ragged_inner_within_row_errors() {
+        use arrow_array::builder::ListBuilder;
+        let mut outer = ListBuilder::new(ListBuilder::new(Float64Builder::new()));
+        outer.values().values().append_value(1.0);
+        outer.values().values().append_value(2.0);
+        outer.values().append(true);
+        outer.values().values().append_value(3.0);
+        outer.values().append(true);
+        outer.append(true);
+        let arr = outer.finish();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("a", arr.data_type().clone(), true)),
+            vec![Arc::new(arr) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+        assert!(
+            format!("{err}").contains("ragged inner-list sizes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn large_list_nested_float64_appends_as_array_2d() {
+        use arrow_array::builder::LargeListBuilder;
+        let mut outer = LargeListBuilder::new(LargeListBuilder::new(Float64Builder::new()));
+        for v in [1.0, 2.0] {
+            outer.values().values().append_value(v);
+        }
+        outer.values().append(true);
+        for v in [3.0, 4.0] {
+            outer.values().values().append_value(v);
+        }
+        outer.values().append(true);
+        outer.append(true);
+        for v in [5.0, 6.0, 7.0] {
+            outer.values().values().append_value(v);
+        }
+        outer.values().append(true);
+        for v in [8.0, 9.0, 10.0] {
+            outer.values().values().append_value(v);
+        }
+        outer.values().append(true);
+        outer.append(true);
+        let arr = outer.finish();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("a", arr.data_type().clone(), true)),
+            vec![Arc::new(arr) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[test]
+    fn float16_appends_as_double() {
+        use arrow_array::builder::Float16Builder;
+        use half::f16;
+        let mut b = Float16Builder::new();
+        b.append_value(f16::from_f32(1.5));
+        b.append_value(f16::from_f32(-2.5));
+        b.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("h", DataType::Float16, true)),
+            vec![Arc::new(b.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn date64_ms_appends_as_date() {
+        use arrow_array::builder::Date64Builder;
+        let mut d = Date64Builder::new();
+        d.append_value(0);
+        d.append_value(1_700_000_000_000);
+        d.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new("d", DataType::Date64, true)),
+            vec![Arc::new(d.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn timestamp_second_widens_to_micros() {
+        use arrow_array::builder::TimestampSecondBuilder;
+        let mut ts = TimestampSecondBuilder::new();
+        ts.append_value(1_700_000_000);
+        ts.append_value(0);
+        ts.append_null();
+        let rb = RecordBatch::try_new(
+            arrow_schema_with(Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, None),
+                true,
+            )),
+            vec![Arc::new(ts.finish()) as ArrayRef],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn decimal32_widens_to_decimal64() {
+        use arrow_array::builder::Decimal32Builder;
+        let mut b = Decimal32Builder::new();
+        b.append_value(12345);
+        b.append_value(-678);
+        b.append_null();
+        let arr = b.finish().with_precision_and_scale(9, 2).unwrap();
+        let schema = arrow_schema_with(Field::new("d", DataType::Decimal32(9, 2), true));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
+    }
+
+    #[test]
+    fn decimal32_negative_scale_errors() {
+        use arrow_array::builder::Decimal32Builder;
+        let mut b = Decimal32Builder::new();
+        b.append_value(1);
+        let arr = b.finish().with_precision_and_scale(9, -2).unwrap();
+        let schema = arrow_schema_with(Field::new("d", DataType::Decimal32(9, -2), true));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(arr) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+    }
+
+    fn assert_unsupported_column(field: Field, arr: ArrayRef) {
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![arr]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::error::ErrorCode::ArrowUnsupportedColumnKind,
+            "expected ArrowUnsupportedColumnKind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn interval_year_month_rejected_as_unsupported() {
+        use arrow_array::builder::IntervalYearMonthBuilder;
+        let mut b = IntervalYearMonthBuilder::new();
+        b.append_value(12);
+        assert_unsupported_column(
+            Field::new("c", DataType::Interval(IntervalUnit::YearMonth), true),
+            Arc::new(b.finish()) as ArrayRef,
+        );
+    }
+
+    #[test]
+    fn interval_day_time_rejected_as_unsupported() {
+        use arrow_array::builder::IntervalDayTimeBuilder;
+        use arrow_array::types::IntervalDayTime;
+        let mut b = IntervalDayTimeBuilder::new();
+        b.append_value(IntervalDayTime::new(1, 0));
+        assert_unsupported_column(
+            Field::new("c", DataType::Interval(IntervalUnit::DayTime), true),
+            Arc::new(b.finish()) as ArrayRef,
+        );
+    }
+
+    #[test]
+    fn interval_month_day_nano_rejected_as_unsupported() {
+        use arrow_array::builder::IntervalMonthDayNanoBuilder;
+        use arrow_array::types::IntervalMonthDayNano;
+        let mut b = IntervalMonthDayNanoBuilder::new();
+        b.append_value(IntervalMonthDayNano::new(1, 1, 1));
+        assert_unsupported_column(
+            Field::new("c", DataType::Interval(IntervalUnit::MonthDayNano), true),
+            Arc::new(b.finish()) as ArrayRef,
+        );
+    }
+
+    #[test]
+    fn fixed_size_binary_non_uuid_rejected_as_unsupported() {
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        b.append_value([0u8; 16]).unwrap();
+        let arr = b.finish();
+        assert_unsupported_column(
+            Field::new("c", DataType::FixedSizeBinary(16), true),
+            Arc::new(arr) as ArrayRef,
+        );
+    }
+
+    #[test]
+    fn fixed_size_binary_arbitrary_width_rejected_as_unsupported() {
+        let mut b = FixedSizeBinaryBuilder::new(8);
+        b.append_value([0u8; 8]).unwrap();
+        assert_unsupported_column(
+            Field::new("c", DataType::FixedSizeBinary(8), true),
+            Arc::new(b.finish()) as ArrayRef,
+        );
+    }
+
+    #[test]
+    fn null_column_rejected_as_unsupported() {
+        use arrow_array::NullArray;
+        let arr = NullArray::new(3);
+        assert_unsupported_column(
+            Field::new("c", DataType::Null, true),
+            Arc::new(arr) as ArrayRef,
+        );
+    }
+
+    #[test]
+    fn struct_column_rejected_as_unsupported() {
+        use arrow_array::StructArray;
+        let mut inner = Int32Builder::new();
+        inner.append_value(1);
+        let inner_arr = Arc::new(inner.finish()) as ArrayRef;
+        let inner_field = Arc::new(Field::new("v", DataType::Int32, true));
+        let arr = StructArray::from(vec![(inner_field.clone(), inner_arr)]);
+        assert_unsupported_column(
+            Field::new("c", DataType::Struct(vec![inner_field].into()), true),
+            Arc::new(arr) as ArrayRef,
+        );
+    }
+
+    #[test]
+    fn map_column_rejected_as_unsupported() {
+        use arrow_array::builder::{MapBuilder, StringBuilder};
+        let mut b = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        b.keys().append_value("k");
+        b.values().append_value(1);
+        b.append(true).unwrap();
+        let arr = b.finish();
+        let dtype = arr.data_type().clone();
+        assert_unsupported_column(Field::new("c", dtype, true), Arc::new(arr) as ArrayRef);
+    }
+
+    #[test]
+    fn run_end_encoded_column_rejected_as_unsupported() {
+        use arrow_array::builder::PrimitiveRunBuilder;
+        use arrow_array::types::{Int32Type, Int64Type};
+        let mut b = PrimitiveRunBuilder::<Int32Type, Int64Type>::new();
+        b.append_value(42);
+        b.append_value(42);
+        b.append_value(7);
+        let arr = b.finish();
+        let dtype = arr.data_type().clone();
+        assert_unsupported_column(Field::new("c", dtype, true), Arc::new(arr) as ArrayRef);
+    }
+
+    #[test]
+    fn dict_values_with_null_entry_rejected_for_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let mut vb = StringBuilder::new();
+        vb.append_value("a");
+        vb.append_null();
+        vb.append_value("c");
+        let values = vb.finish();
+        let keys = arrow_array::UInt32Array::from(vec![0u32, 2, 0]);
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
+        let field = Field::new(
+            "sym",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .with_metadata(
+            [(crate::egress::arrow::metadata::SYMBOL.into(), "true".into())]
+                .into_iter()
+                .collect(),
+        );
+        let schema = arrow_schema_with(field);
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("dictionary values"),
+            "unexpected error message: {}",
+            err.msg()
+        );
+        assert_eq!(buf.row_count(), 0, "buffer should roll back to 0 rows");
+    }
+
+    #[test]
+    fn dict_values_with_null_entry_rejected() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let mut vb = StringBuilder::new();
+        vb.append_value("a");
+        vb.append_null();
+        let values = vb.finish();
+        let keys = arrow_array::UInt32Array::from(vec![0u32, 0]);
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
+        let field = Field::new(
+            "v",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        );
+        let schema = arrow_schema_with(field);
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("dictionary values"));
+    }
+
+    #[test]
+    fn timestamp_ms_designated_overflow_rejected() {
+        let mut b = TimestampMillisecondBuilder::new();
+        b.append_value(i64::MAX / 1000 + 1);
+        b.append_value(0);
+        let schema = arrow_schema_with(Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf
+            .append_arrow_at_column(table("t"), &rb, ColumnName::new("ts").unwrap())
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("ms→µs overflow"),
+            "expected overflow message, got: {}",
+            err.msg()
+        );
+        assert_eq!(buf.row_count(), 0);
+    }
+
+    #[test]
+    fn timestamp_second_to_micros_overflow_rejected() {
+        use arrow_array::builder::TimestampSecondBuilder;
+        let mut b = TimestampSecondBuilder::new();
+        b.append_value(i64::MAX / 1_000_000 + 1);
+        let schema = arrow_schema_with(Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        ));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("u"), &rb).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("s→µs overflow"),
+            "expected overflow message, got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn buffer_clear_after_arrow_allows_row_by_row_reuse() {
+        let mut buf = fresh_buffer();
+        let mut b = Int64Builder::new();
+        b.append_value(1);
+        b.append_value(2);
+        let schema = arrow_schema_with(Field::new("v", DataType::Int64, false));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 2);
+        buf.clear();
+        assert_eq!(buf.row_count(), 0);
+        buf.table(table("t")).unwrap();
+        buf.column_i64("v", 99).unwrap();
+        buf.at_now().unwrap();
+        assert_eq!(buf.row_count(), 1);
+    }
+
+    #[test]
+    fn append_arrow_error_rolls_back_columns() {
+        // Two columns: the second one will fail classification (Map),
+        // so the first column's bytes must not stick.
+        use arrow_array::builder::{Int64Builder, MapBuilder, StringBuilder};
+        let mut col1 = Int64Builder::new();
+        col1.append_value(11);
+        col1.append_value(22);
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map.keys().append_value("k1");
+        map.values().append_value(1);
+        map.append(true).unwrap();
+        map.keys().append_value("k2");
+        map.values().append_value(2);
+        map.append(true).unwrap();
+        let map_arr = map.finish();
+        let map_dtype = map_arr.data_type().clone();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("good", DataType::Int64, false),
+            Field::new("bad", map_dtype, true),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(col1.finish()) as ArrayRef,
+                Arc::new(map_arr) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
+        assert_eq!(
+            buf.row_count(),
+            0,
+            "rollback should leave buffer with 0 rows"
+        );
+        // A retry on a valid batch must succeed cleanly.
+        let mut c2 = Int64Builder::new();
+        c2.append_value(7);
+        let schema2 = arrow_schema_with(Field::new("good", DataType::Int64, false));
+        let rb2 = RecordBatch::try_new(schema2, vec![Arc::new(c2.finish()) as ArrayRef]).unwrap();
+        buf.append_arrow(table("t"), &rb2).unwrap();
+        assert_eq!(buf.row_count(), 1);
+    }
+
+    #[test]
+    fn error_message_carries_column_name() {
+        let inner_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let mut b = Int32Builder::new();
+        b.append_value(1);
+        let inner_arr = b.finish();
+        let struct_arr = arrow_array::StructArray::from(vec![(
+            inner_field.clone(),
+            Arc::new(inner_arr) as ArrayRef,
+        )]);
+        let schema = arrow_schema_with(Field::new(
+            "my_struct_col",
+            DataType::Struct(vec![inner_field].into()),
+            true,
+        ));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(struct_arr) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert!(
+            err.msg().contains("my_struct_col"),
+            "column name missing from error: {}",
+            err.msg()
+        );
     }
 }

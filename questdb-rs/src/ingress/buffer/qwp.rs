@@ -3552,11 +3552,47 @@ impl QwpWsColumnarBuffer {
             ));
         }
         self.current_table_idx = Some(idx);
-        let starting_rows = self.tables[idx].row_count;
+        let table = &self.tables[idx];
+        let starting_rows = table.row_count;
+        let table_mark = QwpWsTableRollbackMark {
+            row_count: table.row_count,
+            in_progress: table.in_progress,
+            in_progress_column_count: table.in_progress_column_count,
+            column_access_cursor: table.column_access_cursor,
+            columns_len: table.columns.len(),
+        };
+        let pre_column_marks = table.columns.iter().map(|c| c.arrow_snapshot()).collect();
         Ok(ArrowBulkCtx {
             table_idx: idx,
             starting_rows,
+            table_mark,
+            pre_column_marks,
         })
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_rollback(&mut self, ctx: ArrowBulkCtx) {
+        let table = &mut self.tables[ctx.table_idx];
+        let pre_count = ctx.table_mark.columns_len;
+        if table.columns.len() > pre_count {
+            table.columns.truncate(pre_count);
+        }
+        for (col, mark) in table
+            .columns
+            .iter_mut()
+            .zip(ctx.pre_column_marks.into_iter())
+        {
+            col.arrow_restore(mark);
+        }
+        table.row_count = ctx.table_mark.row_count;
+        table.in_progress = ctx.table_mark.in_progress;
+        table.in_progress_column_count = ctx.table_mark.in_progress_column_count;
+        table.column_access_cursor = ctx.table_mark.column_access_cursor;
+        table.row_mark = None;
+        table.rebuild_column_lookup();
+        if ctx.table_mark.row_count == 0 && !ctx.table_mark.in_progress {
+            self.current_table_idx = None;
+        }
     }
 
     #[cfg(feature = "arrow")]
@@ -3730,7 +3766,7 @@ impl QwpWsColumnarBuffer {
     #[cfg(feature = "arrow")]
     pub(crate) fn arrow_bulk_commit(
         &mut self,
-        ctx: ArrowBulkCtx,
+        ctx: &ArrowBulkCtx,
         batch_rows: u32,
     ) -> crate::Result<()> {
         let table = &mut self.tables[ctx.table_idx];
@@ -4201,6 +4237,13 @@ impl QwpWsColumnBuffer {
     fn clear_rows(&mut self) {
         self.last_written_row = None;
         self.non_null_count = 0;
+        // After Arrow bulk usage, reset the variant tag so the row-by-row
+        // setters don't reject the cleared column with type_mismatch_error_ws.
+        #[cfg(feature = "arrow")]
+        if self.arrow_row_count().is_some() {
+            self.values = QwpWsColumnValues::new(self.kind);
+            return;
+        }
         self.values.clear_rows();
     }
 
@@ -6241,6 +6284,297 @@ fn batched_type_change_error_ws(entry_name: &[u8]) -> crate::Error {
 pub(crate) struct ArrowBulkCtx {
     table_idx: usize,
     starting_rows: u32,
+    table_mark: QwpWsTableRollbackMark,
+    pre_column_marks: Vec<ArrowColRollbackMark>,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(feature = "arrow")]
+#[derive(Clone, Debug)]
+enum ArrowColRollbackMark {
+    NonArrow {
+        last_written_row: Option<u32>,
+        non_null_count: u32,
+    },
+    ArrowFixed {
+        bitmap_len: Option<usize>,
+        values_len: usize,
+        row_count: u32,
+    },
+    ArrowVarLen {
+        bitmap_len: Option<usize>,
+        offsets_len: usize,
+        data_len: usize,
+        row_count: u32,
+    },
+    ArrowBool {
+        bitmap_len: Option<usize>,
+        packed_bits_len: usize,
+        row_count: u32,
+    },
+    ArrowSymbol {
+        bitmap_len: Option<usize>,
+        dict_len: usize,
+        dict_data_len: usize,
+        keys_len: usize,
+        row_count: u32,
+    },
+    ArrowDecimal {
+        bitmap_len: Option<usize>,
+        values_len: usize,
+        row_count: u32,
+    },
+    ArrowGeohash {
+        bitmap_len: Option<usize>,
+        values_len: usize,
+        row_count: u32,
+    },
+    ArrowArray {
+        bitmap_len: Option<usize>,
+        data_len: usize,
+        row_count: u32,
+    },
+}
+
+#[cfg(feature = "arrow")]
+impl QwpWsColumnBuffer {
+    fn arrow_snapshot(&self) -> ArrowColRollbackMark {
+        let bitmap_to_len = |b: &Option<Vec<u8>>| b.as_ref().map(|v| v.len());
+        match &self.values {
+            QwpWsColumnValues::ArrowFixed {
+                bitmap,
+                values,
+                row_count,
+            } => ArrowColRollbackMark::ArrowFixed {
+                bitmap_len: bitmap_to_len(bitmap),
+                values_len: values.len(),
+                row_count: *row_count,
+            },
+            QwpWsColumnValues::ArrowVarLen {
+                bitmap,
+                offsets,
+                data,
+                row_count,
+            } => ArrowColRollbackMark::ArrowVarLen {
+                bitmap_len: bitmap_to_len(bitmap),
+                offsets_len: offsets.len(),
+                data_len: data.len(),
+                row_count: *row_count,
+            },
+            QwpWsColumnValues::ArrowBool {
+                bitmap,
+                packed_bits,
+                row_count,
+            } => ArrowColRollbackMark::ArrowBool {
+                bitmap_len: bitmap_to_len(bitmap),
+                packed_bits_len: packed_bits.len(),
+                row_count: *row_count,
+            },
+            QwpWsColumnValues::ArrowSymbol {
+                bitmap,
+                dict,
+                dict_data,
+                keys,
+                row_count,
+                ..
+            } => ArrowColRollbackMark::ArrowSymbol {
+                bitmap_len: bitmap_to_len(bitmap),
+                dict_len: dict.len(),
+                dict_data_len: dict_data.len(),
+                keys_len: keys.len(),
+                row_count: *row_count,
+            },
+            QwpWsColumnValues::ArrowDecimal {
+                bitmap,
+                values,
+                row_count,
+                ..
+            } => ArrowColRollbackMark::ArrowDecimal {
+                bitmap_len: bitmap_to_len(bitmap),
+                values_len: values.len(),
+                row_count: *row_count,
+            },
+            QwpWsColumnValues::ArrowGeohash {
+                bitmap,
+                values,
+                row_count,
+                ..
+            } => ArrowColRollbackMark::ArrowGeohash {
+                bitmap_len: bitmap_to_len(bitmap),
+                values_len: values.len(),
+                row_count: *row_count,
+            },
+            QwpWsColumnValues::ArrowArray {
+                bitmap,
+                data,
+                row_count,
+            } => ArrowColRollbackMark::ArrowArray {
+                bitmap_len: bitmap_to_len(bitmap),
+                data_len: data.len(),
+                row_count: *row_count,
+            },
+            _ => ArrowColRollbackMark::NonArrow {
+                last_written_row: self.last_written_row,
+                non_null_count: self.non_null_count,
+            },
+        }
+    }
+
+    fn arrow_restore(&mut self, mark: ArrowColRollbackMark) {
+        let restore_bitmap = |bitmap: &mut Option<Vec<u8>>, target: Option<usize>| match target {
+            None => {
+                *bitmap = None;
+            }
+            Some(len) => {
+                if let Some(b) = bitmap.as_mut() {
+                    b.truncate(len);
+                }
+            }
+        };
+        match (&mut self.values, mark) {
+            (
+                QwpWsColumnValues::ArrowFixed {
+                    bitmap,
+                    values,
+                    row_count,
+                },
+                ArrowColRollbackMark::ArrowFixed {
+                    bitmap_len,
+                    values_len,
+                    row_count: rc,
+                },
+            ) => {
+                restore_bitmap(bitmap, bitmap_len);
+                values.truncate(values_len);
+                *row_count = rc;
+            }
+            (
+                QwpWsColumnValues::ArrowVarLen {
+                    bitmap,
+                    offsets,
+                    data,
+                    row_count,
+                },
+                ArrowColRollbackMark::ArrowVarLen {
+                    bitmap_len,
+                    offsets_len,
+                    data_len,
+                    row_count: rc,
+                },
+            ) => {
+                restore_bitmap(bitmap, bitmap_len);
+                offsets.truncate(offsets_len);
+                data.truncate(data_len);
+                *row_count = rc;
+            }
+            (
+                QwpWsColumnValues::ArrowBool {
+                    bitmap,
+                    packed_bits,
+                    row_count,
+                },
+                ArrowColRollbackMark::ArrowBool {
+                    bitmap_len,
+                    packed_bits_len,
+                    row_count: rc,
+                },
+            ) => {
+                restore_bitmap(bitmap, bitmap_len);
+                packed_bits.truncate(packed_bits_len);
+                *row_count = rc;
+            }
+            (
+                QwpWsColumnValues::ArrowSymbol {
+                    bitmap,
+                    dict,
+                    dict_lookup,
+                    dict_data,
+                    keys,
+                    row_count,
+                },
+                ArrowColRollbackMark::ArrowSymbol {
+                    bitmap_len,
+                    dict_len,
+                    dict_data_len,
+                    keys_len,
+                    row_count: rc,
+                },
+            ) => {
+                restore_bitmap(bitmap, bitmap_len);
+                dict.truncate(dict_len);
+                dict_data.truncate(dict_data_len);
+                keys.truncate(keys_len);
+                dict_lookup.retain_local_ids_below(dict_len);
+                *row_count = rc;
+            }
+            (
+                QwpWsColumnValues::ArrowDecimal {
+                    bitmap,
+                    values,
+                    row_count,
+                    ..
+                },
+                ArrowColRollbackMark::ArrowDecimal {
+                    bitmap_len,
+                    values_len,
+                    row_count: rc,
+                },
+            ) => {
+                restore_bitmap(bitmap, bitmap_len);
+                values.truncate(values_len);
+                *row_count = rc;
+            }
+            (
+                QwpWsColumnValues::ArrowGeohash {
+                    bitmap,
+                    values,
+                    row_count,
+                    ..
+                },
+                ArrowColRollbackMark::ArrowGeohash {
+                    bitmap_len,
+                    values_len,
+                    row_count: rc,
+                },
+            ) => {
+                restore_bitmap(bitmap, bitmap_len);
+                values.truncate(values_len);
+                *row_count = rc;
+            }
+            (
+                QwpWsColumnValues::ArrowArray {
+                    bitmap,
+                    data,
+                    row_count,
+                },
+                ArrowColRollbackMark::ArrowArray {
+                    bitmap_len,
+                    data_len,
+                    row_count: rc,
+                },
+            ) => {
+                restore_bitmap(bitmap, bitmap_len);
+                data.truncate(data_len);
+                *row_count = rc;
+            }
+            (
+                _,
+                ArrowColRollbackMark::NonArrow {
+                    last_written_row,
+                    non_null_count,
+                },
+            ) => {
+                self.last_written_row = last_written_row;
+                self.non_null_count = non_null_count;
+                if self.arrow_row_count().is_some() {
+                    self.values = QwpWsColumnValues::new(self.kind);
+                }
+            }
+            _ => {
+                self.values.clear_rows();
+            }
+        }
+    }
 }
 
 #[cfg(feature = "arrow")]

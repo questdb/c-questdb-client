@@ -14,14 +14,12 @@ steps:
     displayName: "Update and set Rust toolchain"
   - script: |
       brew install numpy
+      python3 -m pip install --break-system-packages pyarrow polars
     condition: eq(variables['imageName'], 'macos-latest')
-    displayName: "Install numpy via brew on macOS"
+    displayName: "Install numpy + pyarrow + polars on macOS"
   - script: |
       python -m pip install --upgrade pip
-      pip install numpy
-    # hetzner-incus provisions numpy via apt (python3-numpy) before this
-    # template runs because Ubuntu 24.04+ enforces PEP 668 and rejects
-    # pip into the system interpreter.
+      pip install numpy pyarrow polars
     condition: |
       and(
         ne(variables['imageName'], 'macos-latest'),

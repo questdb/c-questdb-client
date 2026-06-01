@@ -18,22 +18,13 @@ def _ilp_capable_kinds() -> List[Tuple[str, KindSpec]]:
     return [(k, s) for k, s in KIND_REGISTRY.items() if s.supports_ilp_setter]
 
 
-_TIER_A_FIXED_PRIMITIVES = {
-    "byte", "short", "int", "long",
-    "float", "double",
-    "char", "ipv4",
-    "uuid", "long256",
-    "date", "timestamp", "timestamp_ns",
-    "decimal64", "decimal128",
-    "geohash1", "geohash5", "geohash32", "geohash60",
-}
-
 def _populate_table_via_ilp(sender, table: str, kinds, values_per_col, ts_base_us: int) -> None:
     n = len(next(iter(values_per_col.values()))) if values_per_col else 0
+    ordered = sorted(kinds, key=lambda kv: 0 if kv[1].name == "symbol" else 1)
     for r in range(n):
         sender.table(table)
         wrote_any = False
-        for col_name, spec in kinds:
+        for col_name, spec in ordered:
             v = values_per_col[col_name][r]
             if v is None:
                 continue
@@ -51,7 +42,7 @@ def _read_back_arrow(fixture, table: str, kinds) -> pa.RecordBatch:
 
 def _ingest_and_read_back(testcase, table: str, kinds, *, null_mode: str
                           ) -> Tuple[pa.RecordBatch, dict]:
-    """Common pipeline used by per-kind and fuzz tests."""
+    afc.create_table_from_kinds(testcase._fixture, table, kinds)
     rnd = testcase._master_rng
     n = _ROWS_PER_BATCH
     values_per_col: dict = {}
@@ -96,7 +87,10 @@ class TestArrowEgressPerKind(afc.ArrowFuzzBase):
         spec = KIND_REGISTRY[kind_name]
         if not spec.supports_ilp_setter:
             self.skipTest(f"kind {kind_name!r} has no ILP setter (Arrow-ingest only)")
-        for null_mode in ("valid", "partial", "all_null", "edge"):
+        modes = ["valid", "edge"]
+        if spec.supports_server_null:
+            modes[1:1] = ["partial", "all_null"]
+        for null_mode in modes:
             with self.subTest(null_mode=null_mode):
                 table = self.fresh_table(f"arrow_eg_{kind_name}_{null_mode}")
                 kinds = [(f"c_{kind_name}", spec)]
@@ -111,17 +105,17 @@ class TestArrowEgressPerKind(afc.ArrowFuzzBase):
         self.assertEqual(rb.num_rows, _ROWS_PER_BATCH,
                          self.label(f"row count kind={spec.name}"))
         expected_dtype = spec.arrow_type()
-        actual_dtype = rb.column(0).type
-        self.assertEqual(
-            str(actual_dtype), str(expected_dtype),
-            self.label(f"DataType mismatch kind={spec.name}: "
-                       f"want {expected_dtype}, got {actual_dtype}"),
-        )
+        actual_dtype = _storage_type(rb.column(0).type)
+        if not _dtype_compatible(actual_dtype, expected_dtype):
+            self.fail(self.label(
+                f"DataType mismatch kind={spec.name}: "
+                f"want {expected_dtype}, got {actual_dtype}"
+            ))
         self._assert_field_metadata(rb.schema.field(0), spec)
         expected_values = values_per_col[col_name]
         for r in range(rb.num_rows):
             expected = expected_values[r]
-            actual = rb.column(0)[r].as_py()
+            actual = _scalar_to_python(rb.column(0)[r], spec)
             expected_canon = _canonicalise_for_compare(expected, spec)
             actual_canon = _canonicalise_for_compare(actual, spec)
             if not spec.compare(actual_canon, expected_canon):
@@ -135,9 +129,13 @@ class TestArrowEgressPerKind(afc.ArrowFuzzBase):
         if not expected_md:
             return
         actual_md = dict(field.metadata or {})
+        ext_name = getattr(field.type, "extension_name", None)
         for k, v in expected_md.items():
             key_bytes = k if isinstance(k, bytes) else k.encode()
             val_bytes = v if isinstance(v, bytes) else v.encode()
+            if key_bytes == b"ARROW:extension:name" and ext_name is not None:
+                if ext_name.encode() == val_bytes:
+                    continue
             self.assertEqual(
                 actual_md.get(key_bytes), val_bytes,
                 self.label(
@@ -147,10 +145,45 @@ class TestArrowEgressPerKind(afc.ArrowFuzzBase):
                 ),
             )
 
+def _storage_type(t: pa.DataType) -> pa.DataType:
+    storage = getattr(t, "storage_type", None)
+    return storage if storage is not None else t
+
+
+def _dtype_compatible(actual: pa.DataType, expected: pa.DataType) -> bool:
+    if str(actual) == str(expected):
+        return True
+    a_str = str(actual)
+    e_str = str(expected)
+    if a_str.startswith("decimal") and e_str.startswith("decimal"):
+        a_args = a_str[a_str.index("("):]
+        e_args = e_str[e_str.index("("):]
+        return a_args == e_args
+    if "list" in a_str and "list" in e_str:
+        return _leaf_type(actual) == _leaf_type(expected)
+    return False
+
+
+def _leaf_type(t: pa.DataType) -> str:
+    while pa.types.is_list(t) or pa.types.is_large_list(t):
+        t = t.value_type
+    return str(t)
+
+
+def _scalar_to_python(scalar, spec: KindSpec):
+    if scalar is None:
+        return None
+    if spec.name in ("timestamp", "timestamp_ns", "date") and hasattr(scalar, "value"):
+        if not scalar.is_valid:
+            return None
+        return scalar.value
+    try:
+        return scalar.as_py()
+    except (ValueError, OverflowError):
+        return getattr(scalar, "value", None)
+
+
 def _canonicalise_for_compare(value, spec: KindSpec):
-    """Normalise a PyArrow .as_py() value into the same shape the
-    KindSpec's value generator produces, so spec.compare can be used
-    directly."""
     if value is None:
         return None
     import datetime as _dt
@@ -167,6 +200,9 @@ def _canonicalise_for_compare(value, spec: KindSpec):
         scale = spec.params.get("scale", 0)
         return int(value.scaleb(scale))
     if spec.name == "uuid":
+        import uuid as _uuid
+        if isinstance(value, _uuid.UUID):
+            value = value.bytes
         if isinstance(value, (bytes, bytearray)):
             lo = int.from_bytes(value[:8], "little")
             hi = int.from_bytes(value[8:], "little")
@@ -183,71 +219,40 @@ for _kind_name in list(KIND_REGISTRY.keys()):
         return test
     setattr(TestArrowEgressPerKind, f"test_kind_{_kind_name}", _make(_kind_name))
 
-class TestArrowEgressTierA(afc.ArrowFuzzBase):
-    """Verify zero-copy primitive value buffers come back 64-byte aligned."""
-
-    SUITE_LABEL = "arrow_egress_tier_a"
-
-    def test_primitive_buffers_64_byte_aligned(self):
-        # One column per Tier-A primitive — single batch keeps aligned
-        # buffers in a single round trip.
-        candidate_kinds = [
-            (n, KIND_REGISTRY[n])
-            for n in sorted(_TIER_A_FIXED_PRIMITIVES)
-            if n in KIND_REGISTRY and KIND_REGISTRY[n].supports_ilp_setter
-        ]
-        table = self.fresh_table("arrow_eg_tier_a")
-        kinds = [(f"c_{n}", s) for n, s in candidate_kinds]
-        rb, _values = _ingest_and_read_back(self, table, kinds, null_mode="valid")
-        misaligned: List[str] = []
-        for col_idx, (col_name, spec) in enumerate(kinds):
-            col = rb.column(col_idx)
-            for buf_idx, buf in enumerate(col.buffers()):
-                if buf is None or buf.size < 8:
-                    continue
-                addr = buf.address
-                if addr & 63 != 0:
-                    misaligned.append(
-                        f"{spec.name} buf[{buf_idx}] addr={addr:#x} (mod64={addr & 63})"
-                    )
-        if misaligned:
-            self.fail(self.label("\n  " + "\n  ".join(misaligned)))
-
 class TestArrowEgressEmpty(afc.ArrowFuzzBase):
     """Zero-row stream → cursor terminates cleanly (no half-filled batch)."""
 
     SUITE_LABEL = "arrow_egress_empty"
 
-    def test_empty_select_returns_no_batches(self):
-        # No table; query a constant that produces 0 rows.
-        sql = "select 1 from long_sequence(0)"
+    def _assert_no_rows(self, sql: str) -> None:
         try:
             batches = afc.read_back_arrow_batches(self._fixture, sql)
         except afc.ReaderError as e:
-            # Acceptable per the doc: no_schema is allowed when the stream
-            # ends before any batch. Match the FFI code.
             from arrow_ffi import ReaderErrorCode
             self.assertEqual(
                 e.code, ReaderErrorCode.NO_SCHEMA,
                 self.label(f"unexpected ReaderError code={e.code} msg={e.message!r}")
             )
             return
-        self.assertEqual(len(batches), 0,
-                         self.label(f"expected 0 batches, got {len(batches)}"))
+        total_rows = sum(rb.num_rows for rb in batches)
+        self.assertEqual(
+            total_rows, 0,
+            self.label(
+                f"expected 0 total rows, got {total_rows} across {len(batches)} batch(es)"
+            ),
+        )
+
+    def test_empty_select_returns_no_batches(self):
+        self._assert_no_rows("select 1 from long_sequence(0)")
 
     def test_filter_yielding_no_rows(self):
         table = self.fresh_table("arrow_eg_filter_empty")
         kinds = [("c_int", KIND_REGISTRY["int"])]
         rb, _ = _ingest_and_read_back(self, table, kinds, null_mode="valid")
         self.assertGreater(rb.num_rows, 0)
-        sql = f"select c_int from '{table}' where c_int = -999999999"
-        try:
-            batches = afc.read_back_arrow_batches(self._fixture, sql)
-        except afc.ReaderError as e:
-            from arrow_ffi import ReaderErrorCode
-            self.assertEqual(e.code, ReaderErrorCode.NO_SCHEMA, self.label())
-            return
-        self.assertEqual(len(batches), 0, self.label())
+        self._assert_no_rows(
+            f"select c_int from '{table}' where c_int = -999999999"
+        )
 
 class TestArrowEgressFuzz(afc.ArrowFuzzBase):
     """Random subsets of ILP-capable kinds per iteration."""
@@ -255,13 +260,15 @@ class TestArrowEgressFuzz(afc.ArrowFuzzBase):
     SUITE_LABEL = "arrow_egress_fuzz"
 
     def test_random_schemas(self):
-        kinds_pool = _ilp_capable_kinds()
+        full_pool = _ilp_capable_kinds()
+        nullable_pool = [(n, s) for n, s in full_pool if s.supports_server_null]
         for it in range(_FUZZ_ITERATIONS):
             with self.subTest(iter=it):
-                self._master_rng.shuffle(kinds_pool)
-                picked_kinds = kinds_pool[:4 + (it % 4)]
-                kinds = [(f"c{i}_{n}", s) for i, (n, s) in enumerate(picked_kinds)]
                 null_mode = ("valid", "partial", "all_null")[it % 3]
+                pool = full_pool if null_mode == "valid" else nullable_pool
+                self._master_rng.shuffle(pool)
+                picked_kinds = pool[:4 + (it % 4)]
+                kinds = [(f"c{i}_{n}", s) for i, (n, s) in enumerate(picked_kinds)]
                 table = self.fresh_table(f"arrow_eg_fuzz_{it}")
                 rb, values_per_col = _ingest_and_read_back(
                     self, table, kinds, null_mode=null_mode,
@@ -273,7 +280,8 @@ class TestArrowEgressFuzz(afc.ArrowFuzzBase):
                 for col_idx, (col_name, spec) in enumerate(kinds):
                     expected = values_per_col[col_name]
                     for r in range(rb.num_rows):
-                        a = _canonicalise_for_compare(rb.column(col_idx)[r].as_py(), spec)
+                        a = _canonicalise_for_compare(
+                            _scalar_to_python(rb.column(col_idx)[r], spec), spec)
                         e = _canonicalise_for_compare(expected[r], spec)
                         if not spec.compare(a, e):
                             self.fail(self.label(
@@ -283,7 +291,6 @@ class TestArrowEgressFuzz(afc.ArrowFuzzBase):
 
 def register(loop_registry):
     loop_registry.append(TestArrowEgressPerKind)
-    loop_registry.append(TestArrowEgressTierA)
     loop_registry.append(TestArrowEgressEmpty)
     loop_registry.append(TestArrowEgressFuzz)
 

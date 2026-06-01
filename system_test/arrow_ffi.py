@@ -100,11 +100,6 @@ NEXT_ARROW_BATCH_END = 1
 NEXT_ARROW_BATCH_ERROR = 2
 
 
-DTS_COLUMN = 0
-DTS_NOW = 1
-DTS_SERVER_NOW = 2
-
-
 class SenderErrorCode:
     """`line_sender_error_code` discriminants. Pinned in
     `questdb-rs-ffi/src/lib.rs::line_sender_error_code_discriminants_are_abi_stable`."""
@@ -178,9 +173,19 @@ _append_arrow = _setsig(
     _LineSenderTableName,
     ctypes.POINTER(ArrowArray),
     ctypes.POINTER(ArrowSchema),
-    ctypes.c_int,
-    ctypes.c_char_p,
-    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
+)
+
+from questdb_line_sender import c_line_sender_column_name  # noqa: E402
+
+_append_arrow_at_column = _setsig(
+    "line_sender_buffer_append_arrow_at_column",
+    ctypes.c_bool,
+    ctypes.POINTER(_LineSenderBuffer),
+    _LineSenderTableName,
+    ctypes.POINTER(ArrowArray),
+    ctypes.POINTER(ArrowSchema),
+    c_line_sender_column_name,
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
@@ -209,24 +214,33 @@ def buffer_append_arrow(
     table_name: _LineSenderTableName,
     array_ptr,
     schema_ptr,
-    ts_kind: int,
-    ts_column_name: bytes,
+    ts_column_name: Optional[bytes] = None,
 ) -> None:
-    """Drive `line_sender_buffer_append_arrow`. Consumes `array_ptr`'s
-    ownership; `schema_ptr` remains the caller's. Raises
-    `ArrowSenderError` with `.code` populated on failure."""
+    """Drive `line_sender_buffer_append_arrow` (or its `_at_column`
+    variant when `ts_column_name` is set). Consumes `array_ptr`'s
+    ownership; `schema_ptr` remains the caller's."""
     err_ref = ctypes.POINTER(_LineSenderError)()
-    name_bytes = ts_column_name if ts_column_name is not None else b""
-    ok = _append_arrow(
-        buf_ptr,
-        table_name,
-        array_ptr,
-        schema_ptr,
-        ctypes.c_int(ts_kind),
-        ctypes.c_char_p(name_bytes if name_bytes else None),
-        ctypes.c_size_t(len(name_bytes)),
-        ctypes.byref(err_ref),
-    )
+    if ts_column_name:
+        ts_col = c_line_sender_column_name(
+            len(ts_column_name),
+            ctypes.c_char_p(ts_column_name),
+        )
+        ok = _append_arrow_at_column(
+            buf_ptr,
+            table_name,
+            array_ptr,
+            schema_ptr,
+            ts_col,
+            ctypes.byref(err_ref),
+        )
+    else:
+        ok = _append_arrow(
+            buf_ptr,
+            table_name,
+            array_ptr,
+            schema_ptr,
+            ctypes.byref(err_ref),
+        )
     if not ok:
         raise _take_sender_error(err_ref)
 

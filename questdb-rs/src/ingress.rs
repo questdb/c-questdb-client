@@ -73,8 +73,6 @@ pub mod column_sender;
 
 #[cfg(feature = "arrow")]
 pub mod arrow;
-#[cfg(feature = "arrow")]
-pub use arrow::DesignatedTimestamp;
 #[cfg(feature = "polars")]
 pub mod polars;
 
