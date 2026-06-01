@@ -43,7 +43,7 @@ stages:
         pool:
           name: $(poolName)
           vmImage: $(imageName)
-        timeoutInMinutes: 60
+        timeoutInMinutes: 90
         steps:
           - checkout: self
             fetchDepth: 1
