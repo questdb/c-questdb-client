@@ -152,13 +152,15 @@ def is_unsupported_qwp_ws_fixture_error(error) -> bool:
 
 
 def skip_if_unsupported_qwp_ws_fixture(error, fixture) -> None:
+    if not is_unsupported_qwp_ws_fixture_error(error):
+        return
     root_dir = getattr(fixture, '_root_dir', None)
-    if (root_dir is not None
-            and root_dir.name != 'repo'
-            and is_unsupported_qwp_ws_fixture_error(error)):
-        raise unittest.SkipTest(
-            f'QWP/WebSocket is not supported by this QuestDB fixture: {error}'
-        ) from error
+    is_repo_master = root_dir is not None and root_dir.name == 'repo'
+    if is_repo_master:
+        return
+    raise unittest.SkipTest(
+        f'QWP/WebSocket is not supported by this QuestDB fixture: {error}'
+    ) from error
 
 
 class _ParsedUnittestProgram(unittest.TestProgram):
