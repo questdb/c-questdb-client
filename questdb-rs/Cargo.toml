@@ -77,7 +77,7 @@ arrow-data = { version = "58", optional = true, default-features = false }
 aligned-vec = { version = "0.6", optional = true }
 # Polars bridge via the Arrow C Data Interface. Tighter pin than arrow
 # because polars 0.x churns the ffi surface across minors.
-polars = { version = "0.53", optional = true, default-features = false, features = [] }
+polars = { version = "0.53", optional = true, default-features = false, features = ["dtype-categorical"] }
 polars-arrow = { version = "0.53", optional = true, default-features = false, features = ["compute"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -294,6 +294,10 @@ required-features = ["sync-reader-ws"]
 [[example]]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "polars"
+required-features = ["polars"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR

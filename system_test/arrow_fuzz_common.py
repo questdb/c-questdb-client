@@ -94,11 +94,14 @@ def ingress_conf(fixture, **extras: str) -> str:
 
 @contextlib.contextmanager
 def arrow_cursor(fixture, sql: str):
+    from test import skip_if_unsupported_qwp_ws_fixture
     conf_utf8 = _utf8(egress_conf(fixture))
     err_ref = ctypes.POINTER(_LineReaderError)()
     reader = _DLL.line_reader_from_conf(conf_utf8, ctypes.byref(err_ref))
     if not reader:
-        raise _take_error(err_ref)
+        err = _take_error(err_ref)
+        skip_if_unsupported_qwp_ws_fixture(err, fixture)
+        raise err
     try:
         sql_utf8 = _utf8(sql)
         err_ref = ctypes.POINTER(_LineReaderError)()

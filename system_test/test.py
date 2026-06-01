@@ -140,9 +140,14 @@ _QWP_WS_UNSUPPORTED_MARKERS = (
     'unknown scheme',
     'missing endpoint',
     'endpoint not found',
+    # Ingest (Sender → qwpws://) error phrasing
     'websocket upgrade failed: http status 404',
     'websocket upgrade failed: http status 405',
     'websocket upgrade failed: http status 501',
+    # Egress (Reader → ws://) error phrasing
+    'websocket handshake failed with http 404',
+    'websocket handshake failed with http 405',
+    'websocket handshake failed with http 501',
 )
 
 

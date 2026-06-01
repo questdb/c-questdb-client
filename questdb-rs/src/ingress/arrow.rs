@@ -770,13 +770,6 @@ fn emit_arrow_column(
                 info_sparse,
             )
         }
-        ColumnKind::SymbolDictAsStr { key, value } => qwp_ws.arrow_bulk_set_varlen(
-            ctx,
-            col_name,
-            QwpColumnKind::String,
-            info_sparse,
-            |offsets, data| build_varlen_from_dict_as_str_dyn(offsets, data, arr, key, value),
-        ),
         ColumnKind::Decimal32WidenToDecimal64 => {
             let a = arr.as_any().downcast_ref::<Decimal32Array>().unwrap();
             let scale = decimal_scale_u8(a.scale(), "Decimal32")?;
@@ -1323,6 +1316,7 @@ fn dict_value_for(dt: &DataType) -> Option<DictValue> {
     match dt {
         DataType::Utf8 => Some(DictValue::Utf8),
         DataType::LargeUtf8 => Some(DictValue::LargeUtf8),
+        DataType::Utf8View => Some(DictValue::Utf8View),
         _ => None,
     }
 }
@@ -1416,57 +1410,64 @@ fn build_duration_as_long_into(out: &mut Vec<u8>, arr: &dyn Array, unit: TimeUni
     Ok(())
 }
 
-fn dict_lookup_str(values: &ArrayRef, key_idx: usize, large: bool) -> Result<&str> {
-    if large {
-        let utf8 = values
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .ok_or_else(|| {
-                fmt!(
-                    ArrowIngest,
-                    "dictionary values must be LargeUtf8 for this column"
-                )
-            })?;
-        if key_idx >= utf8.len() {
+fn dict_lookup_str(values: &ArrayRef, key_idx: usize, value: DictValue) -> Result<&str> {
+    fn check<A: Array>(arr: &A, key_idx: usize) -> Result<()> {
+        if key_idx >= arr.len() {
             return Err(fmt!(
                 ArrowIngest,
                 "dict key {} out of range (dict size {})",
                 key_idx,
-                utf8.len()
+                arr.len()
             ));
         }
-        if utf8.is_null(key_idx) {
+        if arr.is_null(key_idx) {
             return Err(fmt!(
                 ArrowIngest,
                 "dictionary values for SYMBOL / VARCHAR must not contain nulls"
             ));
         }
-        Ok(utf8.value(key_idx))
-    } else {
-        let utf8 = values
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                fmt!(
-                    ArrowIngest,
-                    "dictionary values must be Utf8 for this column"
-                )
-            })?;
-        if key_idx >= utf8.len() {
-            return Err(fmt!(
-                ArrowIngest,
-                "dict key {} out of range (dict size {})",
-                key_idx,
-                utf8.len()
-            ));
+        Ok(())
+    }
+    match value {
+        DictValue::Utf8 => {
+            let utf8 = values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    fmt!(
+                        ArrowIngest,
+                        "dictionary values must be Utf8 for this column"
+                    )
+                })?;
+            check(utf8, key_idx)?;
+            Ok(utf8.value(key_idx))
         }
-        if utf8.is_null(key_idx) {
-            return Err(fmt!(
-                ArrowIngest,
-                "dictionary values for SYMBOL / VARCHAR must not contain nulls"
-            ));
+        DictValue::LargeUtf8 => {
+            let utf8 = values
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    fmt!(
+                        ArrowIngest,
+                        "dictionary values must be LargeUtf8 for this column"
+                    )
+                })?;
+            check(utf8, key_idx)?;
+            Ok(utf8.value(key_idx))
         }
-        Ok(utf8.value(key_idx))
+        DictValue::Utf8View => {
+            let utf8 = values
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| {
+                    fmt!(
+                        ArrowIngest,
+                        "dictionary values must be Utf8View for this column"
+                    )
+                })?;
+            check(utf8, key_idx)?;
+            Ok(utf8.value(key_idx))
+        }
     }
 }
 
@@ -1520,7 +1521,7 @@ fn build_symbol_payload_dyn(
     let mut dict_data: Vec<u8> = Vec::new();
     let mut cumulative: u32 = 0;
     for i in 0..value_count {
-        let s = dict_lookup_str(values, i, value == DictValue::LargeUtf8)?;
+        let s = dict_lookup_str(values, i, value)?;
         let bytes = s.as_bytes();
         let len = u32::try_from(bytes.len())
             .map_err(|_| fmt!(ArrowIngest, "SYMBOL entry length exceeds u32::MAX"))?;
@@ -1595,155 +1596,6 @@ fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
             }
         }
     }
-}
-
-fn validate_dict_values_for_str(values: &ArrayRef, large: bool) -> Result<()> {
-    if large {
-        let utf8 = values
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .ok_or_else(|| {
-                fmt!(
-                    ArrowIngest,
-                    "dictionary values must be LargeUtf8 for this column"
-                )
-            })?;
-        if utf8.null_count() != 0 {
-            return Err(fmt!(
-                ArrowIngest,
-                "dictionary values for SYMBOL / VARCHAR must not contain nulls"
-            ));
-        }
-    } else {
-        let utf8 = values
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                fmt!(
-                    ArrowIngest,
-                    "dictionary values must be Utf8 for this column"
-                )
-            })?;
-        if utf8.null_count() != 0 {
-            return Err(fmt!(
-                ArrowIngest,
-                "dictionary values for SYMBOL / VARCHAR must not contain nulls"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn build_varlen_from_dict_as_str_dyn(
-    offsets: &mut Vec<u32>,
-    data: &mut Vec<u8>,
-    arr: &dyn Array,
-    key: DictKey,
-    value: DictValue,
-) -> Result<()> {
-    let row_count = arr.len();
-    let data_base = varlen_data_base(data, "VARCHAR")?;
-    let values = dict_values_dyn(arr, key);
-    validate_dict_values_for_str(values, value == DictValue::LargeUtf8)?;
-    offsets.reserve(row_count - arr.null_count());
-
-    // Each match arm grabs the typed key and value arrays once, then runs a
-    // tight per-row loop that does direct index lookups (no per-row downcast,
-    // no per-row dict-null check — both validated upfront).
-    macro_rules! run {
-        ($keys:expr, $values:expr) => {{
-            let keys = $keys;
-            let values = $values;
-            let mut cumulative: u32 = 0;
-            for row in 0..row_count {
-                if arr.is_null(row) {
-                    continue;
-                }
-                let key_idx = keys.value(row) as usize;
-                if key_idx >= values.len() {
-                    return Err(fmt!(
-                        ArrowIngest,
-                        "dict key {} out of range (dict size {})",
-                        key_idx,
-                        values.len()
-                    ));
-                }
-                let s = values.value(key_idx).as_bytes();
-                cumulative = cumulative.checked_add(s.len() as u32).ok_or_else(|| {
-                    fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX")
-                })?;
-                let absolute = data_base.checked_add(cumulative).ok_or_else(|| {
-                    fmt!(ArrowIngest, "VARCHAR cumulative offset exceeds u32::MAX")
-                })?;
-                data.extend_from_slice(s);
-                offsets.push(absolute);
-            }
-        }};
-    }
-
-    match (key, value) {
-        (DictKey::U32, DictValue::Utf8) => {
-            let d = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-                .unwrap();
-            let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
-            run!(d.keys(), v);
-        }
-        (DictKey::U16, DictValue::Utf8) => {
-            let d = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt16Type>>()
-                .unwrap();
-            let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
-            run!(d.keys(), v);
-        }
-        (DictKey::U8, DictValue::Utf8) => {
-            let d = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt8Type>>()
-                .unwrap();
-            let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
-            run!(d.keys(), v);
-        }
-        (DictKey::U32, DictValue::LargeUtf8) => {
-            let d = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt32Type>>()
-                .unwrap();
-            let v = d
-                .values()
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .unwrap();
-            run!(d.keys(), v);
-        }
-        (DictKey::U16, DictValue::LargeUtf8) => {
-            let d = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt16Type>>()
-                .unwrap();
-            let v = d
-                .values()
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .unwrap();
-            run!(d.keys(), v);
-        }
-        (DictKey::U8, DictValue::LargeUtf8) => {
-            let d = arr
-                .as_any()
-                .downcast_ref::<DictionaryArray<UInt8Type>>()
-                .unwrap();
-            let v = d
-                .values()
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .unwrap();
-            run!(d.keys(), v);
-        }
-    }
-    Ok(())
 }
 
 struct ArrayRowExtract {
@@ -1928,6 +1780,7 @@ enum DictKey {
 enum DictValue {
     Utf8,
     LargeUtf8,
+    Utf8View,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1964,7 +1817,6 @@ enum ColumnKind {
     Long256,
     Geohash(u8),
     SymbolDict { key: DictKey, value: DictValue },
-    SymbolDictAsStr { key: DictKey, value: DictValue },
     Decimal32WidenToDecimal64,
     Decimal64,
     Decimal128,
@@ -1981,11 +1833,6 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         .metadata()
         .get(crate::egress::arrow::metadata::ARROW_EXTENSION_NAME)
         .map(String::as_str);
-    let md_symbol = field
-        .metadata()
-        .get(crate::egress::arrow::metadata::SYMBOL)
-        .map(String::as_str)
-        == Some("true");
     let md_geo_bits = field
         .metadata()
         .get(crate::egress::arrow::metadata::GEOHASH_BITS)
@@ -2061,11 +1908,7 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         {
             let k = dict_key_for(key).unwrap();
             let v = dict_value_for(value).unwrap();
-            if md_symbol {
-                ColumnKind::SymbolDict { key: k, value: v }
-            } else {
-                ColumnKind::SymbolDictAsStr { key: k, value: v }
-            }
+            ColumnKind::SymbolDict { key: k, value: v }
         }
         (DataType::Decimal32(_, _), _, _) => ColumnKind::Decimal32WidenToDecimal64,
         (DataType::Decimal64(_, _), _, _) => ColumnKind::Decimal64,
@@ -2329,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_without_symbol_metadata_falls_back_to_varchar() {
+    fn dictionary_without_metadata_routes_to_symbol() {
         let mut b = StringDictionaryBuilder::<UInt32Type>::new();
         b.append("x").unwrap();
         b.append("y").unwrap();
@@ -2819,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn dict_u32_large_utf8_appends_as_varchar() {
+    fn dict_u32_large_utf8_routes_to_symbol() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt32Type;
         let dict = DictionaryArray::<UInt32Type>::from_iter(
@@ -2842,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn dict_u8_utf8_appends_as_varchar() {
+    fn dict_u8_utf8_routes_to_symbol() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt8Type;
         let dict = DictionaryArray::<UInt8Type>::from_iter(
@@ -2858,6 +2701,30 @@ mod tests {
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 4);
+    }
+
+    #[test]
+    fn dict_u32_utf8_view_routes_to_symbol() {
+        // polars 0.53 emits Categorical as Dictionary(UInt32, Utf8View).
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let dict = DictionaryArray::<UInt32Type>::from_iter(
+            ["AAPL", "MSFT", "AAPL"].into_iter().map(Some),
+        );
+        let view_values = StringViewArray::from(vec!["AAPL", "MSFT"]);
+        let dict =
+            DictionaryArray::<UInt32Type>::try_new(dict.keys().clone(), Arc::new(view_values))
+                .unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8View)),
+            true,
+        );
+        let rb = RecordBatch::try_new(arrow_schema_with(field), vec![Arc::new(dict) as ArrayRef])
+            .unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 3);
     }
 
     #[test]
@@ -2982,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn dict_u16_utf8_appends_as_varchar() {
+    fn dict_u16_utf8_routes_to_symbol() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt16Type;
         let dict =
@@ -3000,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn dict_u8_large_utf8_appends_as_varchar() {
+    fn dict_u8_large_utf8_routes_to_symbol() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt8Type;
         let keys = arrow_array::UInt8Array::from(vec![0u8, 1, 0, 1]);
@@ -3019,7 +2886,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_dict_metadata_routes_to_symbol_not_varchar() {
+    fn symbol_dict_with_metadata_still_routes_to_symbol() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt32Type;
         let dict = DictionaryArray::<UInt32Type>::from_iter(["A", "B", "A"].into_iter().map(Some));
@@ -3374,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn dict_values_with_null_entry_rejected_for_varchar_fallback() {
+    fn dict_values_with_null_entry_rejected() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::UInt32Type;
         let mut vb = StringBuilder::new();

@@ -55,6 +55,9 @@ def _try_ingest(testcase, table: str, df) -> Optional[Exception]:
         rb = _polars_to_rb(df)
         afc.ingest_via_arrow(testcase._fixture, table, rb, ts_col=b"ts")
         return None
+    except unittest.SkipTest:
+        # Let unittest propagate the skip; never wrap it as a returned error.
+        raise
     except Exception as e:
         return e
 
@@ -272,7 +275,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
         table = self.fresh_table("polars_decimal")
         self._expect_success(table, df, '"c" DECIMAL(18,4)')
 
-    def test_dtype_categorical_becomes_varchar(self):
+    def test_dtype_categorical_becomes_symbol(self):
         import polars as pl
         df = self._maybe_skip(
             lambda: pl.DataFrame({
@@ -283,9 +286,9 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             "polars Categorical DataFrame construction",
         )
         table = self.fresh_table("polars_cat")
-        self._expect_success(table, df, '"c" VARCHAR')
+        self._expect_success(table, df, '"c" SYMBOL')
 
-    def test_dtype_enum_becomes_varchar(self):
+    def test_dtype_enum_becomes_symbol(self):
         import polars as pl
         enum_factory = getattr(pl, "Enum", None)
         if enum_factory is None:
@@ -302,7 +305,7 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
             "polars Enum DataFrame construction",
         )
         table = self.fresh_table("polars_enum")
-        self._expect_success(table, df, '"c" VARCHAR')
+        self._expect_success(table, df, '"c" SYMBOL')
 
     def test_dtype_datetime_us_naive(self):
         import polars as pl

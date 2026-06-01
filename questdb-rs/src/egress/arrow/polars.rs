@@ -1,6 +1,7 @@
 //! Polars sub-feature: `RecordBatch ↔ DataFrame` via Arrow C Data Interface.
 
 use arrow_array::{Array, RecordBatch};
+use arrow_schema::SchemaRef;
 use polars::frame::DataFrame;
 use polars::prelude::{Column, IntoColumn, PlSmallStr, Series};
 
@@ -30,7 +31,17 @@ const _: () = assert!(
 );
 
 impl Cursor<'_> {
-    /// Decode one batch as a Polars [`DataFrame`]. `Ok(None)` on stream end.
+    /// Decode one batch as a Polars [`DataFrame`]. `Ok(None)` on
+    /// stream end.
+    ///
+    /// This is the low-level per-batch entry point and does **not**
+    /// detect mid-stream Arrow schema drift; if a later batch's
+    /// schema differs from earlier ones the resulting DataFrames will
+    /// simply disagree on columns. Use
+    /// [`Cursor::iter_polars`](crate::egress::Cursor::iter_polars)
+    /// for a drift-checked iterator, or
+    /// [`Cursor::fetch_all_polars`] / [`Cursor::as_record_batch_reader`]
+    /// for higher-level adapters that pin the schema on first batch.
     pub fn next_polars(&mut self) -> Result<Option<DataFrame>> {
         match self.next_arrow_batch_inner(None)? {
             None => Ok(None),
@@ -41,20 +52,13 @@ impl Cursor<'_> {
     /// Eagerly drain into one chunked Polars [`DataFrame`]. A stream
     /// that yields a schema but no batches becomes an empty DataFrame;
     /// only a stream without a schema (e.g. cancelled pre-prelude)
-    /// errors as `NoSchema`.
+    /// errors as `NoSchema`. Drift detection is inherited from
+    /// [`Cursor::iter_polars`].
     pub fn fetch_all_polars(&mut self) -> Result<DataFrame> {
+        let mut iter = self.iter_polars()?;
         let mut acc: Option<DataFrame> = None;
-        let reader = self.as_record_batch_reader()?;
-        let schema = reader.schema();
-        for item in reader {
-            let rb = item.map_err(|e| {
-                if let Some(qe) = crate::egress::arrow::try_downcast_questdb(&e) {
-                    qe.clone()
-                } else {
-                    Error::new(ErrorCode::ArrowExport, e.to_string())
-                }
-            })?;
-            let df = record_batch_to_dataframe(rb)?;
+        for item in iter.by_ref() {
+            let df = item?;
             acc = Some(match acc {
                 None => df,
                 Some(mut prev) => {
@@ -64,10 +68,69 @@ impl Cursor<'_> {
                 }
             });
         }
+        let schema = iter.schema();
         match acc {
             Some(df) => Ok(df),
             None => record_batch_to_dataframe(RecordBatch::new_empty(schema)),
         }
+    }
+}
+
+/// Drift-checked iterator yielding Polars [`DataFrame`]s, one per
+/// QWP batch. Built by [`Cursor::iter_polars`]. Snapshots the first
+/// batch's Arrow schema at construction and poisons (terminates) on
+/// mid-stream schema drift.
+pub struct CursorPolarsIter<'r, 'c> {
+    cursor: &'c mut Cursor<'r>,
+    schema: SchemaRef,
+    pending: Option<RecordBatch>,
+    poisoned: bool,
+}
+
+impl<'r, 'c> CursorPolarsIter<'r, 'c> {
+    pub(crate) fn new(cursor: &'c mut Cursor<'r>) -> Result<Self> {
+        let first = cursor.next_arrow_batch_inner(None)?.ok_or_else(|| {
+            Error::new(
+                ErrorCode::NoSchema,
+                "no batch produced; nothing to snapshot",
+            )
+        })?;
+        let schema = first.schema();
+        Ok(Self {
+            cursor,
+            schema,
+            pending: Some(first),
+            poisoned: false,
+        })
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Iterator for CursorPolarsIter<'_, '_> {
+    type Item = Result<DataFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.poisoned {
+            return None;
+        }
+        let rb = if let Some(rb) = self.pending.take() {
+            rb
+        } else {
+            match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
+                Ok(Some(rb)) => rb,
+                Ok(None) => return None,
+                Err(e) => {
+                    if e.code() == ErrorCode::SchemaDriftMidStream {
+                        self.poisoned = true;
+                    }
+                    return Some(Err(e));
+                }
+            }
+        };
+        Some(record_batch_to_dataframe(rb))
     }
 }
 
@@ -101,15 +164,16 @@ pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
                 )
             })?;
         let pa_array_box =
-            unsafe { polars_arrow::ffi::import_array_from_c(pa_array, pa_field.dtype.clone()) }
-                .map_err(|e| {
+            unsafe { polars_arrow::ffi::import_array_from_c(pa_array, pa_field.dtype) }.map_err(
+                |e| {
                     fmt!(
                         ArrowExport,
                         "import_array_from_c('{}'): {}",
                         field.name(),
                         e
                     )
-                })?;
+                },
+            )?;
         let name: PlSmallStr = field.name().as_str().into();
         let series = Series::from_arrow(name, pa_array_box)
             .map_err(|e| fmt!(ArrowExport, "Series::from_arrow('{}'): {}", field.name(), e))?;

@@ -1460,6 +1460,19 @@ impl<'r> Cursor<'r> {
         crate::egress::arrow::CursorRecordBatchReader::new(self)
     }
 
+    /// Drift-checked iterator over Polars [`DataFrame`](polars::frame::DataFrame)s,
+    /// one per QWP batch. Snapshots the first batch's Arrow schema
+    /// and yields `Err(SchemaDriftMidStream)` then terminates if a
+    /// later batch diverges. Returns `Err(NoSchema)` if the stream
+    /// ends before any batch is produced.
+    ///
+    /// Use this in preference to a `while let Some(df) = cursor.next_polars()?`
+    /// loop when you care about schema consistency mid-stream.
+    #[cfg(feature = "polars")]
+    pub fn iter_polars<'c>(&'c mut self) -> Result<crate::egress::arrow::CursorPolarsIter<'r, 'c>> {
+        crate::egress::arrow::CursorPolarsIter::new(self)
+    }
+
     #[cfg(feature = "arrow")]
     #[doc(hidden)]
     pub fn next_arrow_batch_inner(
