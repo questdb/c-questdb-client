@@ -466,9 +466,7 @@ mod tests {
     fn polars_categorical_routes_through_dictionary_to_symbol() {
         use crate::ingress::{Buffer, TableName};
         use arrow_schema::DataType as ArrowDataType;
-        use polars::prelude::{
-            CategoricalPhysical, Categories, DataType as PlDataType,
-        };
+        use polars::prelude::{CategoricalPhysical, Categories, DataType as PlDataType};
 
         // Polars Categorical → arrow Dictionary(UInt32, LargeUtf8)
         let cats = Categories::new(
@@ -490,7 +488,10 @@ mod tests {
 
         // Arrow side must be Dictionary-encoded for the SYMBOL routing to kick in.
         assert!(
-            matches!(rb.schema().field(0).data_type(), ArrowDataType::Dictionary(_, _)),
+            matches!(
+                rb.schema().field(0).data_type(),
+                ArrowDataType::Dictionary(_, _)
+            ),
             "expected Dictionary column, got {:?}",
             rb.schema().field(0).data_type()
         );
