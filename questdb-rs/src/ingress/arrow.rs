@@ -52,6 +52,9 @@ impl Buffer {
     /// designated timestamp is not sent — the server stamps each row
     /// on arrival, matching [`Buffer::at_now`](Buffer::at_now).
     ///
+    /// Arrow columns classified as QuestDB `TIMESTAMP` must have no
+    /// null rows and no values before the Unix epoch.
+    ///
     /// Requires a QWP/WS buffer. Mid-batch errors roll the buffer back
     /// to its pre-call state.
     ///
@@ -72,7 +75,8 @@ impl Buffer {
     /// Append every row of `batch`, sourcing the per-row designated
     /// timestamp from `ts_column`. The column must be a
     /// `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with no
-    /// null rows; `Millisecond` is widened to µs on the wire.
+    /// null rows and no values before the Unix epoch; `Millisecond` is
+    /// widened to µs on the wire.
     ///
     /// Other semantics match [`Buffer::append_arrow`].
     pub fn append_arrow_at_column(
@@ -173,6 +177,26 @@ fn decorate_column(err: Error, column_name: &str) -> Error {
     )
 }
 
+fn ensure_timestamp_no_nulls(arr: &dyn Array, label: &str) -> Result<()> {
+    if arr.null_count() > 0 {
+        return Err(fmt!(ArrowIngest, "{} must have no null rows", label));
+    }
+    Ok(())
+}
+
+fn ensure_timestamp_values_non_negative(values: &[i64], label: &str) -> Result<()> {
+    if let Some((row, &value)) = values.iter().enumerate().find(|(_, value)| **value < 0) {
+        return Err(fmt!(
+            ArrowIngest,
+            "{} cannot contain timestamps before the Unix epoch at row {} (value {})",
+            label,
+            row,
+            value
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_ts_column(batch: &RecordBatch, name: ColumnName<'_>) -> Result<usize> {
     let target = name.as_ref();
     for (idx, field) in batch.schema().fields().iter().enumerate() {
@@ -201,12 +225,8 @@ fn emit_arrow_designated_ts(
     dtype: &DataType,
     arr: &dyn Array,
 ) -> Result<()> {
-    if arr.null_count() > 0 {
-        return Err(fmt!(
-            ArrowIngest,
-            "designated timestamp column must have no null rows"
-        ));
-    }
+    let label = "designated timestamp column";
+    ensure_timestamp_no_nulls(arr, label)?;
     let rows = arr.len() as u32;
     let info = ArrowBatchInfo {
         bitmap: None,
@@ -220,6 +240,7 @@ fn emit_arrow_designated_ts(
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             qwp_ws.arrow_bulk_set_designated_ts(ctx, QwpColumnKind::TimestampMicros, info, |out| {
                 if le {
                     // SAFETY: i64 has no padding; LE target → wire-format bytes.
@@ -235,6 +256,7 @@ fn emit_arrow_designated_ts(
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             qwp_ws.arrow_bulk_set_designated_ts(ctx, QwpColumnKind::TimestampNanos, info, |out| {
                 if le {
                     out.extend_from_slice(unsafe { typed_slice_as_le_bytes(a.values()) });
@@ -250,6 +272,7 @@ fn emit_arrow_designated_ts(
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap();
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             qwp_ws.arrow_bulk_set_designated_ts(ctx, QwpColumnKind::TimestampMicros, info, |out| {
                 try_non_null_le_into(out, arr, |row| {
                     let v = a.value(row);
@@ -519,6 +542,9 @@ fn emit_arrow_column(
         }
         ColumnKind::TimestampSecondToMicros => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+            let label = "timestamp field column";
+            ensure_timestamp_no_nulls(arr, label)?;
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             qwp_ws.arrow_bulk_set_fixed(
                 ctx,
                 col_name,
@@ -563,6 +589,9 @@ fn emit_arrow_column(
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
+            let label = "timestamp field column";
+            ensure_timestamp_no_nulls(arr, label)?;
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             qwp_ws.arrow_bulk_set_fixed(
                 ctx,
                 col_name,
@@ -583,6 +612,9 @@ fn emit_arrow_column(
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
+            let label = "timestamp field column";
+            ensure_timestamp_no_nulls(arr, label)?;
+            ensure_timestamp_values_non_negative(a.values(), label)?;
             qwp_ws.arrow_bulk_set_fixed(
                 ctx,
                 col_name,
@@ -2380,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_arrow_encodes_nulls_via_bitmap() {
+    fn timestamp_arrow_nulls_are_rejected() {
         let mut b = TimestampMicrosecondBuilder::new();
         b.append_value(1_700_000_000_000_000);
         b.append_null();
@@ -2389,8 +2421,33 @@ mod tests {
         let schema = arrow_schema_with(field);
         let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
         let mut buf = fresh_buffer();
-        buf.append_arrow(table("t"), &rb).unwrap();
-        assert_eq!(buf.row_count(), 3);
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("must have no null rows"),
+            "unexpected error message: {}",
+            err.msg()
+        );
+        assert_eq!(buf.row_count(), 0);
+    }
+
+    #[test]
+    fn timestamp_arrow_negative_values_are_rejected() {
+        let mut b = TimestampMicrosecondBuilder::new();
+        b.append_value(1_700_000_000_000_000);
+        b.append_value(-1);
+        let field = Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true);
+        let schema = arrow_schema_with(field);
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        let err = buf.append_arrow(table("t"), &rb).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("before the Unix epoch"),
+            "unexpected error message: {}",
+            err.msg()
+        );
+        assert_eq!(buf.row_count(), 0);
     }
 
     #[test]
@@ -2551,6 +2608,32 @@ mod tests {
             .append_arrow_at_column(table("t"), &rb, ts_name)
             .unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+    }
+
+    #[test]
+    fn designated_ts_with_negative_value_rejects() {
+        let mut v = Int64Builder::new();
+        v.append_value(1);
+        let mut ts = TimestampMicrosecondBuilder::new();
+        ts.append_value(-1);
+        let cols: Vec<ArrayRef> = vec![Arc::new(v.finish()), Arc::new(ts.finish())];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("v", DataType::Int64, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]));
+        let rb = RecordBatch::try_new(schema, cols).unwrap();
+        let mut buf = fresh_buffer();
+        let ts_name = ColumnName::new("ts").unwrap();
+        let err = buf
+            .append_arrow_at_column(table("t"), &rb, ts_name)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("before the Unix epoch"),
+            "unexpected error message: {}",
+            err.msg()
+        );
+        assert_eq!(buf.row_count(), 0);
     }
 
     #[test]
@@ -3046,7 +3129,6 @@ mod tests {
         let mut ts = TimestampSecondBuilder::new();
         ts.append_value(1_700_000_000);
         ts.append_value(0);
-        ts.append_null();
         let rb = RecordBatch::try_new(
             arrow_schema_with(Field::new(
                 "ts",
@@ -3058,7 +3140,7 @@ mod tests {
         .unwrap();
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb).unwrap();
-        assert_eq!(buf.row_count(), 3);
+        assert_eq!(buf.row_count(), 2);
     }
 
     #[test]

@@ -2048,6 +2048,9 @@ struct ArrowArray
  * `array` is consumed: `array->release` is set to NULL before returning on
  * both success and failure. `schema` is borrowed.
  *
+ * Arrow columns classified as QuestDB TIMESTAMP must contain no null rows and
+ * no values before the Unix epoch.
+ *
  * Server-side type-mismatch surfaces from the next `line_sender_flush`.
  */
 QUESTDB_CLIENT_API
@@ -2065,7 +2068,7 @@ bool line_sender_buffer_append_arrow(
  * Same ownership and shape contract as `line_sender_buffer_append_arrow`.
  * `ts_column` must be initialised via `line_sender_column_name_init` and
  * name a `Timestamp(Microsecond | Nanosecond | Millisecond, _)` column
- * with no null rows.
+ * with no null rows and no values before the Unix epoch.
  */
 QUESTDB_CLIENT_API
 bool line_sender_buffer_append_arrow_at_column(
