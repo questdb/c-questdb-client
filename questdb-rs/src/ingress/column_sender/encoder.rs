@@ -321,8 +321,6 @@ fn resolve_symbols(
             continue;
         };
         let dict_len = dict_offsets_len - 1;
-        // SAFETY: pointers were validated to be in-bounds at append time.
-        let offsets = unsafe { slice::from_raw_parts(dict_offsets, dict_offsets_len) };
         let dict_bytes_slice = unsafe { slice::from_raw_parts(dict_bytes, dict_bytes_len) };
         // Pass 1: mark referenced dict slots + count non-null rows.
         let mut referenced = vec![false; dict_len];
@@ -345,8 +343,10 @@ fn resolve_symbols(
             if !*mark {
                 continue;
             }
-            let start = offsets[slot] as usize;
-            let end = offsets[slot + 1] as usize;
+            // SAFETY: pointers and monotonic in-buffer offsets were validated
+            // at append time.
+            let start = unsafe { dict_offsets.read_i64(slot) } as usize;
+            let end = unsafe { dict_offsets.read_i64(slot + 1) } as usize;
             let entry_bytes = &dict_bytes_slice[start..end];
             let (gid, is_new) = symbol_dict.intern(entry_bytes);
             if is_new {
@@ -934,6 +934,24 @@ mod tests {
         let mut chunk = Chunk::new("trades");
         chunk
             .symbol_dict_i32("sym", &codes, &dict_offsets, dict_bytes, None)
+            .unwrap();
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+        let mut out = Vec::new();
+        let mut reg = SchemaRegistry::new();
+        let mut dict = SymbolGlobalDict::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        assert_eq!(dict.next_id(), 2, "alpha + gamma only, beta unsent");
+    }
+
+    #[test]
+    fn symbol_dict_large_utf8_emits_only_referenced_entries() {
+        let codes = [0i32, 2, 0, 2];
+        let dict_offsets = [0i64, 5, 9, 14];
+        let dict_bytes = b"alphabetagamma";
+        let ts = [1i64, 2, 3, 4];
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .symbol_dict_large_i32("sym", &codes, &dict_offsets, dict_bytes, None)
             .unwrap();
         chunk.designated_timestamp_nanos(&ts).unwrap();
         let mut out = Vec::new();

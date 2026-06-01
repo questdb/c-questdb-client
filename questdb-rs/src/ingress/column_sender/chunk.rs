@@ -39,6 +39,7 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
+use std::slice;
 
 use crate::{Result, error};
 
@@ -162,7 +163,7 @@ pub(crate) enum ColumnKind {
     // ---- Symbol (dictionary-encoded) ----
     Symbol {
         codes: SymbolCodesPtr,
-        dict_offsets: *const i32,
+        dict_offsets: SymbolOffsetsPtr,
         /// dict cardinality + 1
         dict_offsets_len: usize,
         dict_bytes: *const u8,
@@ -188,6 +189,27 @@ impl SymbolCodesPtr {
                 SymbolCodesPtr::I8(p) => *p.add(i) as i64,
                 SymbolCodesPtr::I16(p) => *p.add(i) as i64,
                 SymbolCodesPtr::I32(p) => *p.add(i) as i64,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SymbolOffsetsPtr {
+    I32(*const i32),
+    I64(*const i64),
+}
+
+impl SymbolOffsetsPtr {
+    /// Read the dict byte offset for entry `i`, widened to `i64` so the
+    /// encoder can consume Arrow UTF-8 and LargeUtf8 dictionaries uniformly.
+    /// SAFETY: caller's offsets buffer must still be alive.
+    #[inline]
+    pub(crate) unsafe fn read_i64(&self, i: usize) -> i64 {
+        unsafe {
+            match self {
+                SymbolOffsetsPtr::I32(p) => *p.add(i) as i64,
+                SymbolOffsetsPtr::I64(p) => *p.add(i),
             }
         }
     }
@@ -633,7 +655,8 @@ impl<'a> Chunk<'a> {
             name,
             SymbolCodesPtr::I8(codes.as_ptr()),
             codes.len(),
-            dict_offsets,
+            SymbolOffsetsPtr::I32(dict_offsets.as_ptr()),
+            dict_offsets.len(),
             dict_bytes,
             validity,
         )
@@ -651,7 +674,8 @@ impl<'a> Chunk<'a> {
             name,
             SymbolCodesPtr::I16(codes.as_ptr()),
             codes.len(),
-            dict_offsets,
+            SymbolOffsetsPtr::I32(dict_offsets.as_ptr()),
+            dict_offsets.len(),
             dict_bytes,
             validity,
         )
@@ -669,7 +693,65 @@ impl<'a> Chunk<'a> {
             name,
             SymbolCodesPtr::I32(codes.as_ptr()),
             codes.len(),
-            dict_offsets,
+            SymbolOffsetsPtr::I32(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    pub fn symbol_dict_large_i8(
+        &mut self,
+        name: &str,
+        codes: &'a [i8],
+        dict_offsets: &'a [i64],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I8(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I64(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    pub fn symbol_dict_large_i16(
+        &mut self,
+        name: &str,
+        codes: &'a [i16],
+        dict_offsets: &'a [i64],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I16(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I64(dict_offsets.as_ptr()),
+            dict_offsets.len(),
+            dict_bytes,
+            validity,
+        )
+    }
+
+    pub fn symbol_dict_large_i32(
+        &mut self,
+        name: &str,
+        codes: &'a [i32],
+        dict_offsets: &'a [i64],
+        dict_bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        self.push_symbol(
+            name,
+            SymbolCodesPtr::I32(codes.as_ptr()),
+            codes.len(),
+            SymbolOffsetsPtr::I64(dict_offsets.as_ptr()),
+            dict_offsets.len(),
             dict_bytes,
             validity,
         )
@@ -680,19 +762,29 @@ impl<'a> Chunk<'a> {
         name: &str,
         codes: SymbolCodesPtr,
         codes_len: usize,
-        dict_offsets: &'a [i32],
+        dict_offsets: SymbolOffsetsPtr,
+        dict_offsets_len: usize,
         dict_bytes: &'a [u8],
         validity: Option<&Validity<'a>>,
     ) -> Result<&mut Self> {
         let row_count = check_row_count(self.row_count, codes_len, validity)?;
-        if dict_offsets.is_empty() {
+        if dict_offsets_len == 0 {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "symbol dict offsets must have at least one entry (dict_len + 1)"
             ));
         }
-        validate_varchar_offsets(dict_offsets, dict_bytes.len())?;
-        let dict_len = dict_offsets.len() - 1;
+        match dict_offsets {
+            SymbolOffsetsPtr::I32(p) => {
+                let offsets = unsafe { slice::from_raw_parts(p, dict_offsets_len) };
+                validate_varchar_offsets(offsets, dict_bytes.len())?;
+            }
+            SymbolOffsetsPtr::I64(p) => {
+                let offsets = unsafe { slice::from_raw_parts(p, dict_offsets_len) };
+                validate_varchar_offsets_i64(offsets, dict_bytes.len())?;
+            }
+        }
+        let dict_len = dict_offsets_len - 1;
 
         // Range-check codes for non-null rows. The encoder relies on
         // every non-null code being a valid dict index, so we surface
@@ -713,8 +805,8 @@ impl<'a> Chunk<'a> {
             QWP_TYPE_SYMBOL,
             ColumnKind::Symbol {
                 codes,
-                dict_offsets: dict_offsets.as_ptr(),
-                dict_offsets_len: dict_offsets.len(),
+                dict_offsets,
+                dict_offsets_len,
                 dict_bytes: dict_bytes.as_ptr(),
                 dict_bytes_len: dict_bytes.len(),
             },

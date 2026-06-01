@@ -963,15 +963,55 @@ unsafe fn arrow_buffer<T>(
     Some(p)
 }
 
+#[derive(Clone, Copy)]
+enum ArrowDictionaryOffsets<'a> {
+    Utf8(&'a [i32]),
+    LargeUtf8(&'a [i64]),
+}
+
+unsafe fn arrow_bytes_len_from_last_offset(
+    last_offset: i64,
+    err_out: *mut *mut line_sender_error,
+    what: &str,
+) -> Option<usize> {
+    if last_offset < 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{what} last offset must be non-negative: {last_offset}"),
+                ),
+            );
+        }
+        return None;
+    }
+    match usize::try_from(last_offset) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!("{what} last offset does not fit usize: {last_offset}"),
+                    ),
+                );
+            }
+            None
+        }
+    }
+}
+
 /// Inspect the Arrow dictionary subtree for a Categorical-style column.
-/// Returns the (dict_offsets, dict_offsets_len, dict_bytes, dict_bytes_len)
-/// tuple ready to feed into `Chunk::symbol_dict_i*`. Rejects any dict
-/// type other than UTF-8 with int32 offsets (`u`) for now.
+/// Returns the dictionary offsets and bytes ready to feed into
+/// `Chunk::symbol_dict_i*` / `Chunk::symbol_dict_large_i*`. Rejects any
+/// dict value type other than UTF-8 (`u`) or LargeUtf8 (`U`).
 unsafe fn arrow_dictionary_utf8<'a>(
     schema: &ArrowSchema,
     array: &ArrowArray,
     err_out: *mut *mut line_sender_error,
-) -> Option<(&'a [i32], &'a [u8])> {
+) -> Option<(ArrowDictionaryOffsets<'a>, &'a [u8])> {
     if schema.dictionary.is_null() || array.dictionary.is_null() {
         unsafe {
             set_err_out_from_error(
@@ -990,7 +1030,7 @@ unsafe fn arrow_dictionary_utf8<'a>(
         return None;
     }
     let dict_format = unsafe { arrow_format_str(dict_schema, err_out) }?;
-    if dict_format != "u" {
+    if dict_format != "u" && dict_format != "U" {
         unsafe {
             set_err_out_from_error(
                 err_out,
@@ -998,7 +1038,7 @@ unsafe fn arrow_dictionary_utf8<'a>(
                     ErrorCode::InvalidApiCall,
                     format!(
                         "dictionary value type {dict_format:?} is not \
-                         supported (only UTF-8 'u' for now)"
+                         supported (only UTF-8 'u' or LargeUtf8 'U')"
                     ),
                 ),
             );
@@ -1021,15 +1061,6 @@ unsafe fn arrow_dictionary_utf8<'a>(
         return None;
     }
     let dict_len = dict_array.length as usize;
-    let offsets_ptr = unsafe {
-        arrow_buffer::<i32>(
-            dict_array,
-            1,
-            /* allow_null = */ false,
-            err_out,
-            "dict offsets",
-        )
-    }?;
     let bytes_ptr = unsafe {
         arrow_buffer::<u8>(
             dict_array,
@@ -1039,11 +1070,48 @@ unsafe fn arrow_dictionary_utf8<'a>(
             "dict bytes",
         )
     }?;
-    let offsets = unsafe { slice::from_raw_parts(offsets_ptr, dict_len + 1) };
-    let bytes_len = if dict_len == 0 {
-        0
+    let (offsets, bytes_len) = if dict_format == "u" {
+        let offsets_ptr = unsafe {
+            arrow_buffer::<i32>(
+                dict_array,
+                1,
+                /* allow_null = */ false,
+                err_out,
+                "dict offsets",
+            )
+        }?;
+        let offsets = unsafe { slice::from_raw_parts(offsets_ptr, dict_len + 1) };
+        let bytes_len = if dict_len == 0 {
+            0
+        } else {
+            unsafe {
+                arrow_bytes_len_from_last_offset(
+                    offsets[dict_len] as i64,
+                    err_out,
+                    "dictionary UTF-8",
+                )
+            }?
+        };
+        (ArrowDictionaryOffsets::Utf8(offsets), bytes_len)
     } else {
-        offsets[dict_len] as usize
+        let offsets_ptr = unsafe {
+            arrow_buffer::<i64>(
+                dict_array,
+                1,
+                /* allow_null = */ false,
+                err_out,
+                "dict offsets",
+            )
+        }?;
+        let offsets = unsafe { slice::from_raw_parts(offsets_ptr, dict_len + 1) };
+        let bytes_len = if dict_len == 0 {
+            0
+        } else {
+            unsafe {
+                arrow_bytes_len_from_last_offset(offsets[dict_len], err_out, "dictionary LargeUtf8")
+            }?
+        };
+        (ArrowDictionaryOffsets::LargeUtf8(offsets), bytes_len)
     };
     let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
         &[][..]
@@ -1073,7 +1141,8 @@ unsafe fn arrow_dictionary_utf8<'a>(
 ///   - `tsn:...`                   timestamp nanos (timezone ignored)
 ///   - `tsu:...`                   timestamp micros (timezone ignored)
 ///   - dictionary-typed schema with the index format above and a
-///     UTF-8 `u` value type → routes to `symbol_dict_i*`.
+///     UTF-8 `u` or LargeUtf8 `U` value type → routes to
+///     `symbol_dict_i*`.
 ///
 /// Other formats return `line_sender_error_invalid_api_call`.
 ///
@@ -1171,10 +1240,28 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                         None => return false,
                     };
                 let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
-                bubble!(
-                    err_out,
-                    chunk.symbol_dict_i8(name, codes, dict_offsets, dict_bytes, validity.as_ref())
-                );
+                match dict_offsets {
+                    ArrowDictionaryOffsets::Utf8(dict_offsets) => bubble!(
+                        err_out,
+                        chunk.symbol_dict_i8(
+                            name,
+                            codes,
+                            dict_offsets,
+                            dict_bytes,
+                            validity.as_ref()
+                        )
+                    ),
+                    ArrowDictionaryOffsets::LargeUtf8(dict_offsets) => bubble!(
+                        err_out,
+                        chunk.symbol_dict_large_i8(
+                            name,
+                            codes,
+                            dict_offsets,
+                            dict_bytes,
+                            validity.as_ref()
+                        )
+                    ),
+                };
             }
             "s" => {
                 let codes_ptr = match unsafe {
@@ -1184,10 +1271,28 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                     None => return false,
                 };
                 let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
-                bubble!(
-                    err_out,
-                    chunk.symbol_dict_i16(name, codes, dict_offsets, dict_bytes, validity.as_ref())
-                );
+                match dict_offsets {
+                    ArrowDictionaryOffsets::Utf8(dict_offsets) => bubble!(
+                        err_out,
+                        chunk.symbol_dict_i16(
+                            name,
+                            codes,
+                            dict_offsets,
+                            dict_bytes,
+                            validity.as_ref()
+                        )
+                    ),
+                    ArrowDictionaryOffsets::LargeUtf8(dict_offsets) => bubble!(
+                        err_out,
+                        chunk.symbol_dict_large_i16(
+                            name,
+                            codes,
+                            dict_offsets,
+                            dict_bytes,
+                            validity.as_ref()
+                        )
+                    ),
+                };
             }
             "i" => {
                 let codes_ptr = match unsafe {
@@ -1197,10 +1302,28 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
                     None => return false,
                 };
                 let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
-                bubble!(
-                    err_out,
-                    chunk.symbol_dict_i32(name, codes, dict_offsets, dict_bytes, validity.as_ref())
-                );
+                match dict_offsets {
+                    ArrowDictionaryOffsets::Utf8(dict_offsets) => bubble!(
+                        err_out,
+                        chunk.symbol_dict_i32(
+                            name,
+                            codes,
+                            dict_offsets,
+                            dict_bytes,
+                            validity.as_ref()
+                        )
+                    ),
+                    ArrowDictionaryOffsets::LargeUtf8(dict_offsets) => bubble!(
+                        err_out,
+                        chunk.symbol_dict_large_i32(
+                            name,
+                            codes,
+                            dict_offsets,
+                            dict_bytes,
+                            validity.as_ref()
+                        )
+                    ),
+                };
             }
             other => {
                 unsafe {
@@ -1613,6 +1736,7 @@ fn reject_null_chunk(err_out: *mut *mut line_sender_error) -> bool {
 mod tests {
     use super::*;
     use crate::line_sender_error_free;
+    use std::ffi::c_void;
 
     // Most behaviour is already covered by the questdb-rs lib tests; this
     // module's tests focus on the FFI surface — pointer handling, NULL
@@ -1748,6 +1872,93 @@ mod tests {
         assert!(!ok);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn append_arrow_dictionary_accepts_large_utf8_values() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        let index_format = b"i\0";
+        let value_format = b"U\0";
+        let mut dict_schema = ArrowSchema {
+            format: value_format.as_ptr() as *const c_char,
+            name: std::ptr::null(),
+            metadata: std::ptr::null(),
+            flags: 0,
+            n_children: 0,
+            children: std::ptr::null(),
+            dictionary: std::ptr::null_mut(),
+            release: None,
+            private_data: std::ptr::null_mut(),
+        };
+        let schema = ArrowSchema {
+            format: index_format.as_ptr() as *const c_char,
+            name: std::ptr::null(),
+            metadata: std::ptr::null(),
+            flags: 0,
+            n_children: 0,
+            children: std::ptr::null(),
+            dictionary: &mut dict_schema,
+            release: None,
+            private_data: std::ptr::null_mut(),
+        };
+
+        let codes = [0i32, 1, 0];
+        let dict_offsets = [0i64, 5, 9];
+        let dict_bytes = b"alphabeta";
+        let array_buffers = [std::ptr::null(), codes.as_ptr() as *const c_void];
+        let dict_buffers = [
+            std::ptr::null(),
+            dict_offsets.as_ptr() as *const c_void,
+            dict_bytes.as_ptr() as *const c_void,
+        ];
+        let mut dict_array = ArrowArray {
+            length: 2,
+            null_count: 0,
+            offset: 0,
+            n_buffers: 3,
+            n_children: 0,
+            buffers: dict_buffers.as_ptr(),
+            children: std::ptr::null(),
+            dictionary: std::ptr::null_mut(),
+            release: None,
+            private_data: std::ptr::null_mut(),
+        };
+        let array = ArrowArray {
+            length: 3,
+            null_count: 0,
+            offset: 0,
+            n_buffers: 2,
+            n_children: 0,
+            buffers: array_buffers.as_ptr(),
+            children: std::ptr::null(),
+            dictionary: &mut dict_array,
+            release: None,
+            private_data: std::ptr::null_mut(),
+        };
+
+        let name = b"sym";
+        let ok = unsafe {
+            column_sender_chunk_append_arrow_column(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                &array,
+                &schema,
+                0,
+                codes.len(),
+                &mut err,
+            )
+        };
+        assert!(ok, "LargeUtf8 dictionary values should be accepted");
+        assert!(err.is_null());
+        assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, codes.len());
         unsafe { column_sender_chunk_free(chunk) };
     }
 
