@@ -134,6 +134,33 @@ def sql_query(query: str):
     return QDB_FIXTURE.http_sql_query(query)
 
 
+_QWP_WS_UNSUPPORTED_MARKERS = (
+    'unsupported protocol',
+    'unknown protocol',
+    'unknown scheme',
+    'missing endpoint',
+    'endpoint not found',
+    'websocket upgrade failed: http status 404',
+    'websocket upgrade failed: http status 405',
+    'websocket upgrade failed: http status 501',
+)
+
+
+def is_unsupported_qwp_ws_fixture_error(error) -> bool:
+    msg = str(error).lower()
+    return any(m in msg for m in _QWP_WS_UNSUPPORTED_MARKERS)
+
+
+def skip_if_unsupported_qwp_ws_fixture(error, fixture) -> None:
+    root_dir = getattr(fixture, '_root_dir', None)
+    if (root_dir is not None
+            and root_dir.name != 'repo'
+            and is_unsupported_qwp_ws_fixture_error(error)):
+        raise unittest.SkipTest(
+            f'QWP/WebSocket is not supported by this QuestDB fixture: {error}'
+        ) from error
+
+
 class _ParsedUnittestProgram(unittest.TestProgram):
     def runTests(self):
         pass
@@ -1533,21 +1560,6 @@ class QwpWsTestSupport:
             conf.append(f'{key}={value};')
         return ''.join(conf)
 
-    @staticmethod
-    def _is_unsupported_qwp_ws_fixture_error(error):
-        message = str(error).lower()
-        unsupported_markers = (
-            'unsupported protocol',
-            'unknown protocol',
-            'unknown scheme',
-            'missing endpoint',
-            'endpoint not found',
-            'websocket upgrade failed: http status 404',
-            'websocket upgrade failed: http status 405',
-            'websocket upgrade failed: http status 501',
-        )
-        return any(marker in message for marker in unsupported_markers)
-
     def _connect_sender(self, conf):
         sender = None
         try:
@@ -1557,12 +1569,7 @@ class QwpWsTestSupport:
         except qls.SenderError as e:
             if sender is not None:
                 sender.close(False)
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if (
-                    root_dir is not None and
-                    root_dir.name != 'repo' and
-                    self._is_unsupported_qwp_ws_fixture_error(e)):
-                self.skipTest(f'QWP/WebSocket is not supported by this QuestDB fixture: {e}')
+            skip_if_unsupported_qwp_ws_fixture(e, QDB_FIXTURE)
             raise
         return sender
 
@@ -1728,13 +1735,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             with self.assertRaises(qls.SenderError) as ctx:
                 sender.connect()
             native_error = ctx.exception.__cause__ or ctx.exception
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if (
-                    root_dir is not None and
-                    root_dir.name != 'repo' and
-                    self._is_unsupported_qwp_ws_fixture_error(native_error)):
-                self.skipTest(
-                    f'QWP/WebSocket is not supported by this QuestDB fixture: {native_error}')
+            skip_if_unsupported_qwp_ws_fixture(native_error, QDB_FIXTURE)
             self.assertRegex(
                 str(native_error),
                 r'(?i)(401|403|unauthor|forbidden|authentication)')

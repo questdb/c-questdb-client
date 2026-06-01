@@ -115,13 +115,18 @@ def arrow_cursor(fixture, sql: str):
 @contextlib.contextmanager
 def existing_sender(fixture, *, sender_id: Optional[str] = None,
                     **conf_extras: str):
+    from test import skip_if_unsupported_qwp_ws_fixture
     with tempfile.TemporaryDirectory(prefix="arrow_sfa_") as sf_dir:
         sid = sender_id or f"arrow-{uuid.uuid4().hex[:8]}"
         conf = ingress_conf(fixture, sender_id=sid, sf_dir=sf_dir,
                             **conf_extras)
         sender = Sender.from_conf(conf)
         try:
-            sender.connect()
+            try:
+                sender.connect()
+            except SenderError as e:
+                skip_if_unsupported_qwp_ws_fixture(e, fixture)
+                raise
             sender._buffer = Buffer.from_sender(sender._impl)
             yield sender
             sender.flush()

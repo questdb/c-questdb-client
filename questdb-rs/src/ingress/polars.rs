@@ -141,7 +141,13 @@ pub fn dataframe_to_record_batch(df: DataFrame) -> Result<RecordBatch> {
             arrays,
             &arrow_array::RecordBatchOptions::new().with_row_count(Some(height)),
         )
-        .map_err(|e| fmt!(ArrowIngest, "RecordBatch::try_new_with_options failed: {}", e));
+        .map_err(|e| {
+            fmt!(
+                ArrowIngest,
+                "RecordBatch::try_new_with_options failed: {}",
+                e
+            )
+        });
     }
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| fmt!(ArrowIngest, "RecordBatch::try_new failed: {}", e))
