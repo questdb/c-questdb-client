@@ -39,7 +39,7 @@ use questdb::ingress::column_sender::{
 };
 use questdb::{Error, ErrorCode};
 
-use crate::{line_sender_error, set_err_out_from_error};
+use crate::{line_sender_buffer, line_sender_error, set_err_out_from_error};
 
 // ===========================================================================
 // Opaque handles
@@ -1679,6 +1679,57 @@ pub unsafe extern "C" fn column_sender_flush(
         None => return reject_null_chunk(err_out),
     };
     bubble!(err_out, sender.flush(chunk));
+    true
+}
+
+/// Publish a QWP/WebSocket `line_sender_buffer` through a pooled
+/// `qwpws_conn`.
+///
+/// This is the pooled counterpart to the row-sender `line_sender_flush`
+/// path for callers that populated a QWP/WebSocket buffer through
+/// `line_sender_buffer_append_arrow`. It applies the same deferred-flush
+/// and final `column_sender_sync` contract as `column_sender_flush`.
+///
+/// On success, `buffer` is cleared and the call returns `true`. On
+/// failure, `buffer` is left untouched and `false` is returned (with
+/// `*err_out` set if provided).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_buffer(
+    conn: *mut qwpws_conn,
+    buffer: *mut line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let sender = match unsafe { conn.as_mut() } {
+        Some(c) => c.0.get_mut(),
+        None => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        "column_sender_flush_buffer: conn pointer is NULL".to_string(),
+                    ),
+                );
+            }
+            return false;
+        }
+    };
+    let buffer = match unsafe { buffer.as_mut() } {
+        Some(b) => &mut b.buffer,
+        None => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        "column_sender_flush_buffer: buffer pointer is NULL".to_string(),
+                    ),
+                );
+            }
+            return false;
+        }
+    };
+    bubble!(err_out, sender.flush_buffer(buffer));
     true
 }
 

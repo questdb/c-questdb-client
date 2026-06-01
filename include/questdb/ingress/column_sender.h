@@ -616,6 +616,23 @@ bool column_sender_flush(
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
+/**
+ * Publish a QWP/WebSocket `line_sender_buffer` through a borrowed pooled
+ * connection.
+ *
+ * Intended for buffers populated via `line_sender_buffer_append_arrow` /
+ * `line_sender_buffer_append_arrow_at_column`. Applies the same deferred
+ * flush contract as `column_sender_flush`; call `column_sender_sync` after
+ * the last buffer flush to send the commit frame and wait for ACKs.
+ *
+ * On success, `buffer` is cleared. On failure, `buffer` is left untouched.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_buffer(
+    qwpws_conn* conn,
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
 QUESTDB_CLIENT_API
 bool column_sender_sync(
     qwpws_conn* conn,

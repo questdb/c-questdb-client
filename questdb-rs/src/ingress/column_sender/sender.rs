@@ -32,12 +32,14 @@
 
 use std::fmt::{self, Debug, Formatter};
 
-use crate::ingress::buffer::SymbolGlobalDict;
+use crate::ErrorCode;
+use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use crate::{Result, error};
 
 use super::chunk::Chunk;
 use super::conn::ColumnConn;
 use super::encoder::{self, SchemaRegistry};
+use super::wire::QWP_VERSION_1;
 
 /// Acknowledgement level for [`ColumnSender::sync`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -57,6 +59,7 @@ pub struct ColumnSender {
     pub(crate) conn: ColumnConn,
     pub(crate) schema_registry: SchemaRegistry,
     pub(crate) symbol_dict: SymbolGlobalDict,
+    buffer_scratch: QwpWsEncodeScratch,
     /// The first frame is sent without `FLAG_DEFER_COMMIT` so the server
     /// commits it immediately. This lets the WAL segment roll and update
     /// `initialSymbolCount`, warming the server's `ClientSymbolCache` for
@@ -83,6 +86,7 @@ impl ColumnSender {
             conn,
             schema_registry,
             symbol_dict,
+            buffer_scratch: QwpWsEncodeScratch::new(),
             first_frame_sent: false,
         }
     }
@@ -134,6 +138,32 @@ impl ColumnSender {
         Ok(())
     }
 
+    /// Publish a QWP/WebSocket [`Buffer`] through this pooled connection.
+    ///
+    /// This exists for FFI callers that build a Rust `Buffer` through the
+    /// public Arrow batch path and need the same pooled connection,
+    /// deferred-commit, and closing-sync behavior as [`flush`](Self::flush).
+    /// On success, `buffer` is cleared.
+    pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
+        let qwp = buffer.as_qwp_ws().ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "column sender pooled flush requires a QWP/WebSocket buffer"
+            )
+        })?;
+        qwp.check_can_flush()?;
+        if qwp.is_empty() {
+            buffer.clear();
+            return Ok(());
+        }
+
+        let defer = self.first_frame_sent;
+        self.flush_buffer_inner(qwp, defer)?;
+        self.first_frame_sent = true;
+        buffer.clear();
+        Ok(())
+    }
+
     /// Block until all in-flight frames are acknowledged at the
     /// requested [`AckLevel`].
     ///
@@ -177,6 +207,52 @@ impl ColumnSender {
 
         self.conn.push_pending(published.fsn);
         chunk.clear();
+        Ok(())
+    }
+
+    fn flush_buffer_inner(
+        &mut self,
+        buffer: &QwpWsColumnarBuffer,
+        defer_commit: bool,
+    ) -> Result<()> {
+        self.conn.try_drain_acks()?;
+
+        if defer_commit && !self.conn.has_sync_commit_slot() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "column sender deferred flush capacity exhausted; call sync() \
+                 before flushing more chunks."
+            ));
+        }
+
+        if self.conn.at_in_flight_cap() {
+            self.conn.drain_one_ack_blocking()?;
+        }
+
+        let dict_mark = self.symbol_dict.mark();
+        let scratch = &mut self.buffer_scratch;
+        let symbol_dict = &mut self.symbol_dict;
+        let result = self.conn.publish_qwp(|out| {
+            buffer.encode_ws_replay_message_with_defer(
+                scratch,
+                symbol_dict,
+                QWP_VERSION_1,
+                defer_commit,
+            )?;
+            out.extend_from_slice(&scratch.message);
+            Ok(())
+        });
+        let published = match result {
+            Ok(published) => published,
+            Err(err) => {
+                if err.code() != ErrorCode::SocketError {
+                    self.symbol_dict.rollback(dict_mark);
+                }
+                return Err(err);
+            }
+        };
+
+        self.conn.push_pending(published.fsn);
         Ok(())
     }
 }

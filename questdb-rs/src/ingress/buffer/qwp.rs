@@ -3924,6 +3924,16 @@ impl QwpWsColumnarBuffer {
         global_dict: &mut SymbolGlobalDict,
         version: u8,
     ) -> crate::Result<()> {
+        self.encode_ws_replay_message_with_defer(scratch, global_dict, version, false)
+    }
+
+    pub(crate) fn encode_ws_replay_message_with_defer(
+        &self,
+        scratch: &mut QwpWsEncodeScratch,
+        global_dict: &mut SymbolGlobalDict,
+        version: u8,
+        defer_commit: bool,
+    ) -> crate::Result<()> {
         self.check_can_flush()?;
         let out = &mut scratch.message;
         out.clear();
@@ -4035,7 +4045,11 @@ impl QwpWsColumnarBuffer {
         let header = QwpMessageHeader {
             magic: *b"QWP1",
             version,
-            flags: QWP_FLAG_DELTA_SYMBOL_DICT,
+            flags: if defer_commit {
+                QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_DEFER_COMMIT
+            } else {
+                QWP_FLAG_DELTA_SYMBOL_DICT
+            },
             table_count,
             payload_len: checked_qwp_u32(
                 out.len() - payload_start,
@@ -6688,6 +6702,8 @@ fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
 
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 
 /// Connection-scoped global symbol dictionary used by the QWP/WebSocket
 /// transport's delta-symbol-dict mode.
