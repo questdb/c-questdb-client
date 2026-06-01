@@ -48,7 +48,7 @@ use crate::egress::symbol_dict::SymbolDict;
 
 type ABytes = AVec<u8, ConstAlign<64>>;
 
-pub fn batch_to_record_batch(
+pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
     batch: DecodedBatch,
@@ -404,34 +404,54 @@ fn symbol_array(
     row_count: usize,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let mut remap: HashMap<u32, u32> = HashMap::new();
-    let mut union_offsets: Vec<i32> = vec![0];
+    let mut remap: HashMap<u32, u32> = HashMap::with_capacity(codes.len().min(64));
+    let mut union_offsets: Vec<i32> = Vec::with_capacity(codes.len().min(64) + 1);
+    union_offsets.push(0);
     let mut union_bytes: ABytes = ABytes::new(64);
     let mut dense = ABytes::with_capacity(64, codes.len() * 4);
     dense.resize(codes.len() * 4, 0);
-    for (row, &code) in codes.iter().enumerate() {
-        let is_null = nulls.as_ref().map(|n| !n.is_valid(row)).unwrap_or(false);
-        if is_null {
-            continue;
+
+    fn resolve(
+        code: u32,
+        remap: &mut HashMap<u32, u32>,
+        union_offsets: &mut Vec<i32>,
+        union_bytes: &mut ABytes,
+        dict: &SymbolDict,
+    ) -> Result<u32> {
+        if let Some(&dense_code) = remap.get(&code) {
+            return Ok(dense_code);
         }
-        let dense_code = match remap.get(&code) {
-            Some(c) => *c,
-            None => {
-                let s = dict
-                    .get(code)
-                    .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
-                union_bytes.extend_from_slice(s.as_bytes());
-                let next_off = union_bytes.len() as i32;
-                union_offsets.push(next_off);
-                let assigned = (union_offsets.len() - 2) as u32;
-                remap.insert(code, assigned);
-                assigned
-            }
-        };
-        let bytes = dense_code.to_le_bytes();
-        let base = row * 4;
-        dense[base..base + 4].copy_from_slice(&bytes);
+        let s = dict
+            .get(code)
+            .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+        union_bytes.extend_from_slice(s.as_bytes());
+        let next_off = union_bytes.len() as i32;
+        union_offsets.push(next_off);
+        let assigned = (union_offsets.len() - 2) as u32;
+        remap.insert(code, assigned);
+        Ok(assigned)
     }
+
+    match nulls.as_ref() {
+        None => {
+            for (row, &code) in codes.iter().enumerate() {
+                let dense_code =
+                    resolve(code, &mut remap, &mut union_offsets, &mut union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+        Some(n) => {
+            for row in n.valid_indices() {
+                let code = codes[row];
+                let dense_code =
+                    resolve(code, &mut remap, &mut union_offsets, &mut union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+    }
+
     let mut union_offsets_avec = ABytes::with_capacity(64, union_offsets.len() * 4);
     for off in &union_offsets {
         union_offsets_avec.extend_from_slice(&off.to_le_bytes());
@@ -474,7 +494,7 @@ fn array_column_to_arrow(
     leaf: ArrayLeaf,
 ) -> Result<ArrayRef> {
     let ArrayBuffers {
-        data_offsets: _,
+        data_offsets,
         data,
         shapes,
         shape_offsets,
@@ -486,7 +506,23 @@ fn array_column_to_arrow(
         ArrayLeaf::Int64 => DataType::Int64,
     };
     let elem_size = 8usize;
+    if !data.len().is_multiple_of(elem_size) {
+        return Err(to_arrow_export(format!(
+            "ARRAY wire data length {} not a multiple of element size {}",
+            data.len(),
+            elem_size
+        )));
+    }
     let total_elements = data.len() / elem_size;
+    if let Some(&last_off) = data_offsets.last()
+        && last_off as usize != data.len()
+    {
+        return Err(to_arrow_export(format!(
+            "ARRAY data_offsets tail {} disagrees with data length {}",
+            last_off,
+            data.len()
+        )));
+    }
     let ndim = ndim_from_field(field)?;
     let leaf_buf = bytes_to_arrow(data);
     let leaf_data = ArrayDataBuilder::new(leaf_dtype)
@@ -702,12 +738,6 @@ fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Optio
     inverted.extend_from_slice(&bytes[..needed]);
     for b in inverted.iter_mut() {
         *b = !*b;
-    }
-    let tail_bits = row_count & 7;
-    if tail_bits != 0 {
-        let last = inverted.len() - 1;
-        let mask: u8 = (1u16.wrapping_shl(tail_bits as u32).wrapping_sub(1)) as u8;
-        inverted[last] &= mask;
     }
     Ok(Some(NullBuffer::new(arrow_buffer::BooleanBuffer::new(
         Buffer::from(bytes_from_avec(inverted)),

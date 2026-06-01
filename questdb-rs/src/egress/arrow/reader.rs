@@ -75,16 +75,30 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
             return Some(Ok(rb));
         }
         match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
-            Ok(Some(rb)) => Some(Ok(rb)),
-            Ok(None) => None,
-            Err(e) => {
-                if e.code() == ErrorCode::SchemaDriftMidStream {
-                    self.poisoned = true;
+            Ok(Some(rb)) => {
+                if has_tentative_array(&self.schema) {
+                    self.schema = rb.schema();
                 }
+                Some(Ok(rb))
+            }
+            Ok(None) => {
+                self.poisoned = true;
+                None
+            }
+            Err(e) => {
+                self.poisoned = true;
                 Some(Err(external_arrow_error(e)))
             }
         }
     }
+}
+
+fn has_tentative_array(schema: &SchemaRef) -> bool {
+    schema.fields().iter().any(|f| {
+        f.metadata()
+            .get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
+            .is_some_and(|v| v == "true")
+    })
 }
 
 impl RecordBatchReader for CursorRecordBatchReader<'_, '_> {

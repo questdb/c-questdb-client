@@ -103,14 +103,10 @@ static void release_schema_noop(struct ArrowSchema* sch)
     sch->release = NULL;
 }
 
-/* Build an ArrowArray for a single fixed-width column. `values_size` is
- * `row_count * elem_size`. `format` is the Apache Arrow format string
- * (e.g. "l" for Int64, "g" for Float64, etc.). */
 static void build_primitive(
     int64_t row_count,
     size_t elem_size,
     const void* values_bytes,
-    int has_null_bitmap_buffer_slot,
     const char* format,
     const char* name,
     struct ArrowArray* out_arr,
@@ -127,7 +123,7 @@ static void build_primitive(
     out_arr->length = row_count;
     out_arr->null_count = 0;
     out_arr->offset = 0;
-    out_arr->n_buffers = has_null_bitmap_buffer_slot ? 2 : 2;
+    out_arr->n_buffers = 2;
     out_arr->n_children = 0;
     out_arr->buffers = pd->buffers;
     out_arr->release = release_array_with_priv;
@@ -135,6 +131,41 @@ static void build_primitive(
 
     memset(out_sch, 0, sizeof(*out_sch));
     out_sch->format = format;
+    out_sch->name = name;
+    out_sch->flags = ARROW_FLAG_NULLABLE;
+    out_sch->release = release_schema_noop;
+}
+
+static void build_bool_bitpacked(
+    int64_t row_count,
+    const bool* values,
+    const char* name,
+    struct ArrowArray* out_arr,
+    struct ArrowSchema* out_sch)
+{
+    size_t n_bytes = ((size_t)row_count + 7) / 8;
+    struct PrivBytes* pd = (struct PrivBytes*)calloc(1, sizeof(*pd));
+    pd->values_buffer = calloc(1, n_bytes);
+    uint8_t* packed = (uint8_t*)pd->values_buffer;
+    for (int64_t i = 0; i < row_count; ++i)
+        if (values[i])
+            packed[i / 8] |= (uint8_t)(1u << (i % 8));
+    pd->buffers[0] = NULL;
+    pd->buffers[1] = pd->values_buffer;
+    pd->buffers[2] = NULL;
+
+    memset(out_arr, 0, sizeof(*out_arr));
+    out_arr->length = row_count;
+    out_arr->null_count = 0;
+    out_arr->offset = 0;
+    out_arr->n_buffers = 2;
+    out_arr->n_children = 0;
+    out_arr->buffers = pd->buffers;
+    out_arr->release = release_array_with_priv;
+    out_arr->private_data = pd;
+
+    memset(out_sch, 0, sizeof(*out_sch));
+    out_sch->format = "b";
     out_sch->name = name;
     out_sch->flags = ARROW_FLAG_NULLABLE;
     out_sch->release = release_schema_noop;
@@ -247,18 +278,14 @@ TEST(test_ingress_null_array_returns_false)
 }
 
 /* ---------------------------------------------------------------------------
- * Section 3: ingress per-type round-trip into a QWP buffer.
+ * Section 3: ingress per-type round-trip into a QWP-WS buffer.
  *
- * Each test builds a small ArrowArray of the given type and feeds it to
- * `line_sender_buffer_append_arrow`. The QWP-UDP buffer (which is what
- * `_new_qwp` returns) may not support every column kind via the
- * append_arrow path — the test accepts either:
- *   * `ok == true`   (kind is supported and the row was buffered), or
- *   * `ok == false`  with a documented Arrow-side error code, proving the
- *                    rejection is structured and not a crash.
+ * `run_append_strict_ok` requires a clean `ok == true` from
+ * `line_sender_buffer_append_arrow`; a structured error is treated as a
+ * test failure, not a "we accept any documented rejection" pass.
  * ------------------------------------------------------------------------- */
 
-static void run_append_and_accept(
+static void run_append_strict_ok(
     line_sender_buffer* buf,
     line_sender_table_name tbl,
     struct ArrowArray* arr,
@@ -269,36 +296,31 @@ static void run_append_and_accept(
     bool ok = line_sender_buffer_append_arrow(buf, tbl, arr, sch, &err);
     if (!ok)
     {
-        CHECK(err != NULL, "err_out populated on failure");
         if (err)
         {
-            int code = (int)line_sender_error_get_code(err);
-            int accepted =
-                code == line_sender_error_invalid_api_call ||
-                code == line_sender_error_arrow_ingest ||
-                code == line_sender_error_arrow_unsupported_column_kind;
-            CHECK(accepted, label);
+            size_t msg_len = 0;
+            const char* msg = line_sender_error_msg(err, &msg_len);
+            fprintf(stderr, "STRICT %s: %.*s\n", label, (int)msg_len, msg);
             line_sender_error_free(err);
         }
-        /* On failure the array ownership stays with the caller, so we
-         * release it ourselves. */
+        CHECK(ok, label);
         if (arr->release)
             arr->release(arr);
     }
-    /* Schema is always owned by the caller. */
     if (sch->release)
         sch->release(sch);
 }
 
 TEST(test_ingress_boolean_column)
 {
-    uint8_t values[4] = {1, 0, 1, 0};
+    bool values[10] = {
+        true, false, true, false, true, false, true, false, true, false};
     struct ArrowArray arr;
     struct ArrowSchema sch;
-    build_primitive(4, 1, values, 1, "b", "flag", &arr, &sch);
+    build_bool_bitpacked(10, values, "flag", &arr, &sch);
     line_sender_buffer* buf = fresh_qwp_buffer();
-    run_append_and_accept(buf, make_table("bool_t"), &arr, &sch,
-                          "boolean append accepted/structured-error");
+    run_append_strict_ok(
+        buf, make_table("bool_t"), &arr, &sch, "bit-packed boolean strict ok");
     line_sender_buffer_free(buf);
 }
 
@@ -309,10 +331,10 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         int8_t values[3] = {-1, 0, 127};
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(3, sizeof(int8_t), values, 1, "c", "byte_col", &arr, &sch);
+        build_primitive(3, sizeof(int8_t), values, "c", "byte_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
-        run_append_and_accept(buf, make_table("i8_t"), &arr, &sch,
-                              "int8 accepted/structured-error");
+        run_append_strict_ok(
+            buf, make_table("i8_t"), &arr, &sch, "int8 strict ok");
         line_sender_buffer_free(buf);
     }
     /* Int16 */
@@ -320,10 +342,11 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         int16_t values[3] = {-1234, 0, 31000};
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(3, sizeof(int16_t), values, 1, "s", "short_col", &arr, &sch);
+        build_primitive(
+            3, sizeof(int16_t), values, "s", "short_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
-        run_append_and_accept(buf, make_table("i16_t"), &arr, &sch,
-                              "int16 accepted/structured-error");
+        run_append_strict_ok(
+            buf, make_table("i16_t"), &arr, &sch, "int16 strict ok");
         line_sender_buffer_free(buf);
     }
     /* Int32 */
@@ -331,10 +354,10 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         int32_t values[3] = {-1, 0, 0x7FFFFFFF};
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(3, sizeof(int32_t), values, 1, "i", "int_col", &arr, &sch);
+        build_primitive(3, sizeof(int32_t), values, "i", "int_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
-        run_append_and_accept(buf, make_table("i32_t"), &arr, &sch,
-                              "int32 accepted/structured-error");
+        run_append_strict_ok(
+            buf, make_table("i32_t"), &arr, &sch, "int32 strict ok");
         line_sender_buffer_free(buf);
     }
     /* Int64 */
@@ -342,10 +365,11 @@ TEST(test_ingress_int8_int16_int32_int64_columns)
         int64_t values[3] = {100, 200, 300};
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(3, sizeof(int64_t), values, 1, "l", "long_col", &arr, &sch);
+        build_primitive(
+            3, sizeof(int64_t), values, "l", "long_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
-        run_append_and_accept(buf, make_table("i64_t"), &arr, &sch,
-                              "int64 accepted/structured-error");
+        run_append_strict_ok(
+            buf, make_table("i64_t"), &arr, &sch, "int64 strict ok");
         line_sender_buffer_free(buf);
     }
 }
@@ -357,10 +381,10 @@ TEST(test_ingress_float32_float64_columns)
         float values[3] = {1.5f, -2.5f, 3.14f};
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(3, sizeof(float), values, 1, "f", "f32_col", &arr, &sch);
+        build_primitive(3, sizeof(float), values, "f", "f32_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
-        run_append_and_accept(buf, make_table("f32_t"), &arr, &sch,
-                              "float32 accepted/structured-error");
+        run_append_strict_ok(
+            buf, make_table("f32_t"), &arr, &sch, "float32 strict ok");
         line_sender_buffer_free(buf);
     }
     /* Float64 */
@@ -368,10 +392,10 @@ TEST(test_ingress_float32_float64_columns)
         double values[3] = {1.5, -2.5, 3.14159};
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(3, sizeof(double), values, 1, "g", "f64_col", &arr, &sch);
+        build_primitive(3, sizeof(double), values, "g", "f64_col", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
-        run_append_and_accept(buf, make_table("f64_t"), &arr, &sch,
-                              "float64 accepted/structured-error");
+        run_append_strict_ok(
+            buf, make_table("f64_t"), &arr, &sch, "float64 strict ok");
         line_sender_buffer_free(buf);
     }
 }
@@ -382,10 +406,10 @@ TEST(test_ingress_timestamp_microseconds)
     int64_t values[2] = {1700000000000000LL, 1700000000000001LL};
     struct ArrowArray arr;
     struct ArrowSchema sch;
-    build_primitive(2, sizeof(int64_t), values, 1, "tsu:UTC", "ts", &arr, &sch);
+    build_primitive(2, sizeof(int64_t), values, "tsu:UTC", "ts", &arr, &sch);
     line_sender_buffer* buf = fresh_qwp_buffer();
-    run_append_and_accept(buf, make_table("ts_t"), &arr, &sch,
-                          "timestamp(µs) accepted/structured-error");
+    run_append_strict_ok(
+        buf, make_table("ts_t"), &arr, &sch, "timestamp(µs) strict ok");
     line_sender_buffer_free(buf);
 }
 
@@ -397,7 +421,7 @@ TEST(test_ingress_default_and_at_column_dispatch)
     {
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(2, sizeof(int64_t), values, 1, "l", "v", &arr, &sch);
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         line_sender_error* err = NULL;
         bool ok = line_sender_buffer_append_arrow(
@@ -419,7 +443,7 @@ TEST(test_ingress_default_and_at_column_dispatch)
     {
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        build_primitive(2, sizeof(int64_t), values, 1, "l", "v", &arr, &sch);
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_buffer* buf = fresh_qwp_buffer();
         line_sender_error* err = NULL;
         line_sender_column_name ts_col;

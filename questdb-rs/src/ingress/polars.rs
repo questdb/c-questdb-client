@@ -43,9 +43,10 @@ use crate::{Result, fmt};
 /// Suggested default chunk size for [`dataframe_to_batches`].
 pub const DEFAULT_MAX_BATCH_ROWS: usize = 10_000;
 
-// `polars_arrow::ffi` and `arrow::ffi` are independent `#[repr(C)]` mirrors
-// of the Arrow C Data Interface; the bridge below transmutes between them.
-// Assert layout parity so a future crate bump can't silently break soundness.
+// `transmute_copy` below relies on layout parity with `arrow::ffi`.
+// These asserts catch size/alignment drift; field order is NOT
+// verifiable across crate boundaries — re-check the Arrow C Data
+// Interface field order on every `polars-arrow` version bump.
 const _: () = assert!(
     std::mem::size_of::<polars_arrow::ffi::ArrowArray>()
         == std::mem::size_of::<arrow::ffi::FFI_ArrowArray>(),

@@ -2045,8 +2045,11 @@ struct ArrowArray
  *   - A non-Struct (single-column) array whose `schema->name` becomes the
  *     column name.
  *
- * `array` is consumed: `array->release` is set to NULL before returning on
- * both success and failure. `schema` is borrowed.
+ * Ownership: `array` is consumed once input validation passes
+ * (non-NULL pointers, schema depth within bounds) — `array->release`
+ * is cleared and the imported buffers are dropped on every subsequent
+ * return path. If validation fails first (NULL or over-deep schema),
+ * `array->release` is left untouched. `schema` is always borrowed.
  *
  * Server-side type-mismatch surfaces from the next `line_sender_flush`.
  */

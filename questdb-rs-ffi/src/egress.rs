@@ -2467,9 +2467,17 @@ impl line_reader_cursor {
     /// "no-`current_batch`-while-`&mut cursor`" invariant documented on
     /// `line_reader_cursor`. Mutating cursor ops MUST go through here
     /// instead of taking `&mut self.cursor` directly.
+    ///
+    /// Also clears any Arrow schema pin — switching back from the raw
+    /// `BatchView` path to `_next_arrow_batch` should re-snapshot the
+    /// schema, not compare against a stale one from before the detour.
     fn cursor_for_mut(&mut self) -> &mut Cursor<'static> {
         self.current_batch = None;
         debug_assert!(self.current_batch.is_none());
+        #[cfg(feature = "arrow")]
+        {
+            self.arrow_schema_pin = None;
+        }
         &mut self.cursor
     }
 }
@@ -3977,33 +3985,30 @@ pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
             return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
         }
         let c = &mut *cursor;
+        // Clone the pin BEFORE `cursor_for_mut`, which clears it.
         let pinned = c.arrow_schema_pin.clone();
         let inner: &mut Cursor<'static> = c.cursor_for_mut();
-        let outcome = panic_guard(|| inner.next_arrow_batch_inner(pinned.as_ref()));
-        match outcome {
-            Ok(Some(rb)) => {
-                if c.arrow_schema_pin.is_none() {
-                    c.arrow_schema_pin = Some(rb.schema());
-                }
-                let struct_array: StructArray = rb.into();
-                let array_data = struct_array.into_data();
-                match arrow::ffi::to_ffi(&array_data) {
-                    Ok((ffi_array, ffi_schema)) => {
-                        std::ptr::write(out_array, ffi_array);
-                        std::ptr::write(out_schema, ffi_schema);
-                        line_reader_arrow_batch_result::line_reader_arrow_batch_ok
-                    }
-                    Err(e) => {
-                        write_err_box(err_out, Error::new(ErrorCode::ArrowExport, e.to_string()));
-                        line_reader_arrow_batch_result::line_reader_arrow_batch_error
-                    }
-                }
+        let result = panic_guard(|| -> Result<Option<(arrow::ffi::FFI_ArrowArray, arrow::ffi::FFI_ArrowSchema, arrow::datatypes::SchemaRef)>, Error> {
+            let rb = match inner.next_arrow_batch_inner(pinned.as_ref())? {
+                Some(rb) => rb,
+                None => return Ok(None),
+            };
+            let schema_ref = rb.schema();
+            let struct_array: StructArray = rb.into();
+            let array_data = struct_array.into_data();
+            let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&array_data)
+                .map_err(|e| Error::new(ErrorCode::ArrowExport, e.to_string()))?;
+            Ok(Some((ffi_array, ffi_schema, schema_ref)))
+        });
+        match result {
+            Ok(Some((ffi_array, ffi_schema, schema_ref))) => {
+                c.arrow_schema_pin = Some(schema_ref);
+                std::ptr::write(out_array, ffi_array);
+                std::ptr::write(out_schema, ffi_schema);
+                line_reader_arrow_batch_result::line_reader_arrow_batch_ok
             }
             Ok(None) => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
             Err(e) => {
-                if matches!(e.code(), ErrorCode::SchemaDriftMidStream) {
-                    c.arrow_schema_pin = None;
-                }
                 write_err_box(err_out, e);
                 line_reader_arrow_batch_result::line_reader_arrow_batch_error
             }

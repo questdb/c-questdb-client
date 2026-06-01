@@ -311,6 +311,9 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_arrow_unsupported_column_kind
             }
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
+            // ErrorCode is `#[non_exhaustive]`; future variants fall back
+            // here. Extend both this match and the ABI discriminant test
+            // before shipping a new variant through the C surface.
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -936,6 +939,9 @@ pub unsafe extern "C" fn line_sender_buffer_new_qwp() -> *mut line_sender_buffer
     }))
 }
 
+/// Construct a QWP/WebSocket columnar `line_sender_buffer` with the
+/// default 127-byte name length limit. Required by
+/// `line_sender_buffer_append_arrow*`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws() -> *mut line_sender_buffer {
     let buffer = Buffer::new_qwp_ws();
@@ -3629,9 +3635,10 @@ pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
     }
 }
 
-/// Catches a Rust panic inside an `extern "C"` body and aborts. Active
-/// in debug/test builds; under this crate's release `panic = "abort"`
-/// profile (Cargo.toml) it compiles to a no-op tail call.
+/// Catches a Rust panic inside an `extern "C"` body and aborts. Compiles
+/// to a tail call under this crate's `panic = "abort"` profiles
+/// (release + dev); the `Err(_)` arm only fires under `cargo test`,
+/// which forces unwind.
 #[cfg(feature = "arrow")]
 #[inline]
 fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
@@ -3641,6 +3648,16 @@ fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Append every row of an Apache Arrow `RecordBatch` (Arrow C Data
+/// Interface) to `buffer`. The per-row designated timestamp is not
+/// sent — the server stamps each row on arrival.
+///
+/// `array` may be either a Struct array (one child per column, the
+/// standard RecordBatch shape) or a non-Struct single-column array
+/// whose `schema->name` becomes the column name.
+///
+/// Ownership: see the corresponding declaration in
+/// `include/questdb/ingress/line_sender.h`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_append_arrow(
@@ -3653,6 +3670,11 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
     panic_guard(|| unsafe { arrow_append_impl(buffer, table, array, schema, None, err_out) })
 }
 
+/// Variant of `line_sender_buffer_append_arrow` that sources each
+/// row's designated timestamp from a named `Timestamp(_)` column
+/// inside the batch. The column must be `Timestamp(Microsecond |
+/// Nanosecond | Millisecond, _)` with no null rows. Same ownership
+/// contract as `line_sender_buffer_append_arrow`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_append_arrow_at_column(
@@ -3666,6 +3688,55 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow_at_column(
     panic_guard(|| unsafe {
         arrow_append_impl(buffer, table, array, schema, Some(ts_column), err_out)
     })
+}
+
+// `arrow::ffi::from_ffi` walks `children` recursively; the iterative
+// pre-walk in `validate_arrow_schema_depth` keeps an adversarial schema
+// from blowing the stack inside arrow-rs before our depth check runs.
+#[cfg(feature = "arrow")]
+const MAX_ARROW_SCHEMA_DEPTH: usize = 64;
+
+#[cfg(feature = "arrow")]
+unsafe fn validate_arrow_schema_depth(
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+) -> questdb::Result<()> {
+    unsafe {
+        let mut stack: Vec<(*const arrow::ffi::FFI_ArrowSchema, usize)> = Vec::new();
+        stack.push((schema, 0));
+        while let Some((s, depth)) = stack.pop() {
+            if depth > MAX_ARROW_SCHEMA_DEPTH {
+                return Err(Error::new(
+                    ErrorCode::ArrowIngest,
+                    format!(
+                        "Arrow schema nesting depth exceeds {}",
+                        MAX_ARROW_SCHEMA_DEPTH
+                    ),
+                ));
+            }
+            let n = (*s).n_children;
+            if n <= 0 {
+                continue;
+            }
+            let children = (*s).children;
+            if children.is_null() {
+                return Err(Error::new(
+                    ErrorCode::ArrowIngest,
+                    "Arrow schema declares children but pointer is NULL".to_string(),
+                ));
+            }
+            for i in 0..n as usize {
+                let child = *children.add(i);
+                if child.is_null() {
+                    return Err(Error::new(
+                        ErrorCode::ArrowIngest,
+                        "Arrow schema child pointer is NULL".to_string(),
+                    ));
+                }
+                stack.push((child as *const _, depth + 1));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -3689,8 +3760,14 @@ unsafe fn arrow_append_impl(
             );
             return false;
         }
-        // Clear `array.release` up-front so every early-return path drops
-        // imported buffers via `imported_array`'s Drop.
+        // Schema depth validated before any consume so the caller keeps
+        // ownership of `array->release` if validation fails.
+        if let Err(e) = validate_arrow_schema_depth(schema) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return false;
+        }
+        // Move the FFI struct out and null the caller's slot; every
+        // subsequent return path drops `imported_array` exactly once.
         let imported_array = std::ptr::read(array);
         (*array).release = None;
         let inner = unwrap_buffer_mut(buffer);
@@ -3706,6 +3783,17 @@ unsafe fn arrow_append_impl(
             }
         };
         let rb = if matches!(array_data.data_type(), DataType::Struct(_)) {
+            // `RecordBatch::from(StructArray)` asserts on root nulls;
+            // surface that as `ArrowIngest` to avoid a process abort.
+            if array_data.nulls().is_some_and(|n| n.null_count() > 0) {
+                arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::ArrowIngest,
+                    "top-level Struct array must have no null rows for RecordBatch ingest"
+                        .to_string(),
+                );
+                return false;
+            }
             RecordBatch::from(StructArray::from(array_data))
         } else {
             let field = match Field::try_from(&*schema) {

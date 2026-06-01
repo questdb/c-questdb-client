@@ -497,6 +497,153 @@ TEST_CASE("arrow egress: stream exhaustion — second call returns nullopt")
     CHECK(!h.cursor.next_arrow_batch().has_value());
 }
 
+TEST_CASE("arrow egress: schema drift — dtype change between batches throws schema_drift")
+{
+    qm::ColumnSpec b1_col{
+        "v", qm::COL_LONG,
+        qm::fixed_column_bytes(2, pack_le<int64_t>({10, 20}))};
+    qm::ColumnSpec b2_col{
+        "v", qm::COL_INT,
+        qm::fixed_column_bytes(2, pack_le<int32_t>({30, 40}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[b1_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 2, {b1_col});
+        }},
+        qm::ActionSendBuilt{[b2_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 1, 2, 2, {b2_col});
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto h = open_cursor(srv, "select v from t");
+
+    auto first = h.cursor.next_arrow_batch();
+    REQUIRE(first.has_value());
+    CHECK(first->array.length == 2);
+    CHECK(std::string(first->schema.children[0]->format) == "l");
+    release_pair(&first->array, &first->schema);
+
+    try
+    {
+        (void)h.cursor.next_arrow_batch();
+        FAIL("expected schema_drift on second batch with changed dtype");
+    }
+    catch (const egress::line_reader_error& e)
+    {
+        CHECK(e.code() == egress::error_code::schema_drift);
+    }
+}
+
+TEST_CASE("arrow egress: schema drift — column rename between batches throws schema_drift")
+{
+    qm::ColumnSpec b1_col{
+        "v", qm::COL_LONG,
+        qm::fixed_column_bytes(1, pack_le<int64_t>({1}))};
+    qm::ColumnSpec b2_col{
+        "w", qm::COL_LONG,
+        qm::fixed_column_bytes(1, pack_le<int64_t>({2}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[b1_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 1, {b1_col});
+        }},
+        qm::ActionSendBuilt{[b2_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 1, 2, 1, {b2_col});
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto h = open_cursor(srv, "select v from t");
+
+    auto first = h.cursor.next_arrow_batch();
+    REQUIRE(first.has_value());
+    release_pair(&first->array, &first->schema);
+
+    try
+    {
+        (void)h.cursor.next_arrow_batch();
+        FAIL("expected schema_drift on column rename");
+    }
+    catch (const egress::line_reader_error& e)
+    {
+        CHECK(e.code() == egress::error_code::schema_drift);
+    }
+}
+
+TEST_CASE("arrow egress: schema drift — column count change throws schema_drift")
+{
+    qm::ColumnSpec b1_v{
+        "v", qm::COL_LONG,
+        qm::fixed_column_bytes(1, pack_le<int64_t>({1}))};
+    qm::ColumnSpec b2_v{
+        "v", qm::COL_LONG,
+        qm::fixed_column_bytes(1, pack_le<int64_t>({2}))};
+    qm::ColumnSpec b2_extra{
+        "extra", qm::COL_INT,
+        qm::fixed_column_bytes(1, pack_le<int32_t>({3}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[b1_v](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 1, {b1_v});
+        }},
+        qm::ActionSendBuilt{[b2_v, b2_extra](int64_t rid) {
+            return qm::result_batch_frame(rid, 1, 2, 1, {b2_v, b2_extra});
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto h = open_cursor(srv, "select * from t");
+
+    auto first = h.cursor.next_arrow_batch();
+    REQUIRE(first.has_value());
+    release_pair(&first->array, &first->schema);
+
+    try
+    {
+        (void)h.cursor.next_arrow_batch();
+        FAIL("expected schema_drift on column count change");
+    }
+    catch (const egress::line_reader_error& e)
+    {
+        CHECK(e.code() == egress::error_code::schema_drift);
+    }
+}
+
+TEST_CASE("arrow egress: schema drift — same schema across batches does NOT drift")
+{
+    qm::ColumnSpec b_col{
+        "v", qm::COL_LONG,
+        qm::fixed_column_bytes(2, pack_le<int64_t>({10, 20}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[b_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 2, {b_col});
+        }},
+        qm::ActionSendBuilt{[b_col](int64_t rid) {
+            return qm::result_batch_frame(rid, 1, 2, 2, {b_col});
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto h = open_cursor(srv, "select v from t");
+
+    auto first = h.cursor.next_arrow_batch();
+    REQUIRE(first.has_value());
+    release_pair(&first->array, &first->schema);
+
+    auto second = h.cursor.next_arrow_batch();
+    REQUIRE(second.has_value());
+    CHECK(second->array.length == 2);
+    release_pair(&second->array, &second->schema);
+
+    CHECK(!h.cursor.next_arrow_batch().has_value());
+}
+
 // Tristate / NULL-pointer contract tests for the C ABI live in
 // `test_arrow_c.c`. The C++ wrapper returns `std::optional<arrow_batch>`
 // directly, so those cases are unrepresentable at the call site.

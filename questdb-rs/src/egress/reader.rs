@@ -190,6 +190,25 @@ const _: fn() = || {
     assert_send_sync::<HostHealthTracker>();
 };
 
+// Two blanket impls of the same trait force method-resolution ambiguity
+// iff the target type IS `Send`; the call thus compiles only when the
+// type is `!Send`.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn _disambiguate() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    fn assert_not_send<T: ?Sized>() {
+        let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
+    }
+    assert_not_send::<crate::egress::Cursor<'_>>();
+    #[cfg(feature = "arrow")]
+    assert_not_send::<crate::egress::arrow::CursorRecordBatchReader<'_, '_>>();
+    #[cfg(feature = "polars")]
+    assert_not_send::<crate::egress::arrow::polars::CursorPolarsIter<'_, '_>>();
+};
+
 impl Reader {
     /// Open a new connection from a connect string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
@@ -1460,6 +1479,31 @@ impl<'r> Cursor<'r> {
         crate::egress::arrow::CursorRecordBatchReader::new(self)
     }
 
+    /// Eagerly drain every batch and return them together with the
+    /// pinned Arrow schema. Symmetric with
+    /// [`Cursor::fetch_all_polars`](crate::egress::Cursor::fetch_all_polars).
+    /// Errors as [`ErrorCode::NoSchema`] if the stream ends without
+    /// producing a batch; surfaces drift as
+    /// [`ErrorCode::SchemaDriftMidStream`].
+    ///
+    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
+    /// [`ErrorCode::SchemaDriftMidStream`]: crate::egress::ErrorCode::SchemaDriftMidStream
+    #[cfg(feature = "arrow")]
+    pub fn fetch_all_arrow(
+        &mut self,
+    ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>)> {
+        let mut reader = self.as_record_batch_reader()?;
+        let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        for item in reader.by_ref() {
+            batches.push(item.map_err(|e| {
+                crate::egress::arrow::try_downcast_questdb(&e)
+                    .cloned()
+                    .unwrap_or_else(|| fmt!(ArrowExport, "{}", e))
+            })?);
+        }
+        Ok((reader.schema(), batches))
+    }
+
     /// Drift-checked iterator over Polars [`DataFrame`](polars::frame::DataFrame)s,
     /// one per QWP batch. Snapshots the first batch's Arrow schema
     /// and yields `Err(SchemaDriftMidStream)` then terminates if a
@@ -1482,7 +1526,22 @@ impl<'r> Cursor<'r> {
         use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch, schemas_equal};
         use std::sync::Arc;
 
-        match self.next_batch_inner()? {
+        if self.done {
+            return match self.terminal_error.as_ref() {
+                Some(e) => Err(e.clone()),
+                None => Ok(None),
+            };
+        }
+        let outcome = match self.next_batch_inner() {
+            Ok(o) => o,
+            Err(e) => {
+                if self.done && self.terminal_error.is_none() {
+                    self.terminal_error = Some(e.clone());
+                }
+                return Err(e);
+            }
+        };
+        match outcome {
             NextOutcome::Done => Ok(None),
             NextOutcome::HaveBatch => {
                 let decoded = self
@@ -1511,8 +1570,12 @@ impl<'r> Cursor<'r> {
                         decoded.batch_seq
                     ));
                 }
-                let dict_clone = self.reader.dict.clone();
-                let rb = batch_to_record_batch(arrow_schema, &egress_schema, decoded, &dict_clone)?;
+                let rb = batch_to_record_batch(
+                    arrow_schema,
+                    &egress_schema,
+                    decoded,
+                    &self.reader.dict,
+                )?;
                 Ok(Some(rb))
             }
         }

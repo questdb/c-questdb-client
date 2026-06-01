@@ -102,20 +102,17 @@ public:
     }
 
     /**
-     * Construct a standalone QWP/WebSocket columnar buffer.
+     * Construct a standalone QWP/WebSocket columnar buffer. Required
+     * by `append_arrow`; also accepts the row-by-row `table` /
+     * `symbol` / `column` / `at` API.
      *
-     * This is the buffer kind required by `append_arrow`. Unlike the ILP
-     * and QWP/UDP buffers, QWP/WS stores rows in column-major form, so the
-     * row-by-row API (`table`/`symbol`/`column`/`at`) is unavailable on
-     * this buffer kind — use `append_arrow` instead.
+     * For protocol-neutral construction tied to a sender instance,
+     * prefer `line_sender::new_buffer()`.
      *
-     * For protocol-neutral construction tied to a sender instance, prefer
-     * `line_sender::new_buffer()` (it returns the buffer kind matching the
-     * sender's protocol automatically).
-     *
-     * @param init_buf_size Hint passed to `line_sender_buffer_reserve` for
-     *                      the initial capacity of the underlying column
-     *                      storage.
+     * @param init_buf_size Hint passed to `line_sender_buffer_reserve`
+     *                      for the initial capacity of the underlying
+     *                      column storage.
+     * @throws line_sender_error if the initial reserve fails.
      */
     static line_sender_buffer qwp_ws(size_t init_buf_size = 64 * 1024)
     {
@@ -1160,9 +1157,12 @@ public:
      * Per-row timestamp is not sent; the server stamps each row on
      * arrival (same semantics as `at_now()`).
      *
-     * Requires a QWP/WebSocket buffer. `array` is consumed; `schema`
-     * is borrowed. `array` may be a Struct top-level array or a
-     * non-Struct single-column array.
+     * Requires a QWP/WebSocket buffer. `schema` is borrowed.
+     * `array` is consumed once control reaches the underlying C call;
+     * if `may_init()` throws first (e.g. lazy buffer reserve fails),
+     * `array` is left untouched and the caller retains ownership.
+     * `array` may be a Struct top-level array or a non-Struct
+     * single-column array.
      *
      * @throws line_sender_error on validation or classification failure.
      */

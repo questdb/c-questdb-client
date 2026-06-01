@@ -8,9 +8,10 @@ use polars::prelude::{Column, IntoColumn, PlSmallStr, Series};
 use crate::egress::Cursor;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 
-// Catch any drift between the two crates' Rust-side mirrors of the Arrow
-// C Data Interface structs at compile time. The transmutes below rely on
-// byte-identical layout.
+// `transmute_copy` below relies on layout parity with `arrow::ffi`.
+// These asserts catch size/alignment drift; field order is NOT
+// verifiable across crate boundaries — re-check the Arrow C Data
+// Interface field order on every `polars-arrow` version bump.
 const _: () = assert!(
     std::mem::size_of::<polars_arrow::ffi::ArrowArray>()
         == std::mem::size_of::<arrow::ffi::FFI_ArrowArray>(),
@@ -120,18 +121,32 @@ impl Iterator for CursorPolarsIter<'_, '_> {
             rb
         } else {
             match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
-                Ok(Some(rb)) => rb,
-                Ok(None) => return None,
-                Err(e) => {
-                    if e.code() == ErrorCode::SchemaDriftMidStream {
-                        self.poisoned = true;
+                Ok(Some(rb)) => {
+                    if has_tentative_array(&self.schema) {
+                        self.schema = rb.schema();
                     }
+                    rb
+                }
+                Ok(None) => {
+                    self.poisoned = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.poisoned = true;
                     return Some(Err(e));
                 }
             }
         };
         Some(record_batch_to_dataframe(rb))
     }
+}
+
+fn has_tentative_array(schema: &SchemaRef) -> bool {
+    schema.fields().iter().any(|f| {
+        f.metadata()
+            .get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
+            .is_some_and(|v| v == "true")
+    })
 }
 
 pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {

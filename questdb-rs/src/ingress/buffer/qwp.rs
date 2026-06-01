@@ -111,7 +111,7 @@ pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
 const QWP_LONG256_BYTES: usize = 32;
 pub(crate) const QWP_VERSION_1: u8 = 1;
 const QWP_INLINE_SCHEMA_ID: u64 = 0;
-const QWP_DECIMAL_MAX_SCALE: u8 = 76;
+pub(crate) const QWP_DECIMAL_MAX_SCALE: u8 = 76;
 const QWP_DECIMAL_SCALE_UNSET: u8 = u8::MAX;
 const QWP_DECIMAL_MAG_LIMBS: usize = 4;
 const QWP_DECIMAL_MAG_BYTES: usize = QWP_DECIMAL_MAG_LIMBS * 8;
@@ -3543,6 +3543,7 @@ impl QwpWsColumnarBuffer {
         self.check_op(Op::Table)?;
         let table_bytes = table_name.as_ref().as_bytes();
         self.validate_max_name_len(table_name.as_ref())?;
+        let tables_len_before = self.tables.len();
         let idx = self.lookup_or_create_table(table_bytes)?;
         if self.tables[idx].in_progress {
             return Err(error::fmt!(
@@ -3567,6 +3568,7 @@ impl QwpWsColumnarBuffer {
             starting_rows,
             table_mark,
             pre_column_marks,
+            tables_len_before,
         })
     }
 
@@ -3592,6 +3594,10 @@ impl QwpWsColumnarBuffer {
         table.rebuild_column_lookup();
         if ctx.table_mark.row_count == 0 && !ctx.table_mark.in_progress {
             self.current_table_idx = None;
+        }
+        if self.tables.len() > ctx.tables_len_before {
+            self.tables.truncate(ctx.tables_len_before);
+            self.rebuild_table_lookup();
         }
     }
 
@@ -6286,6 +6292,7 @@ pub(crate) struct ArrowBulkCtx {
     starting_rows: u32,
     table_mark: QwpWsTableRollbackMark,
     pre_column_marks: Vec<ArrowColRollbackMark>,
+    tables_len_before: usize,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -6643,6 +6650,17 @@ fn append_packed_bits(
     if existing.len() < total_bytes {
         existing.resize(total_bytes, 0);
     }
+    if existing_rows.is_multiple_of(8) {
+        let dst_off = existing_rows / 8;
+        let full_bytes = incoming_rows / 8;
+        existing[dst_off..dst_off + full_bytes].copy_from_slice(&incoming[..full_bytes]);
+        let trailing = incoming_rows % 8;
+        if trailing != 0 {
+            let mask = (1u8 << trailing) - 1;
+            existing[dst_off + full_bytes] |= incoming[full_bytes] & mask;
+        }
+        return;
+    }
     for i in 0..incoming_rows {
         if (incoming[i / 8] >> (i % 8)) & 1 == 1 {
             let target = existing_rows + i;
@@ -6651,6 +6669,8 @@ fn append_packed_bits(
     }
 }
 
+// Arrow validity is valid=1; QWP wants null=1. OR-with-NOT inverts; the
+// trailing-byte mask prevents setting nulls past `incoming_rows`.
 #[cfg(feature = "arrow")]
 fn extend_qwp_bitmap(
     existing: &mut Option<Vec<u8>>,
@@ -6669,11 +6689,29 @@ fn extend_qwp_bitmap(
     if bm.len() < total_bytes {
         bm.resize(total_bytes, 0);
     }
-    if let Some(nulls) = incoming {
-        for i in 0..incoming_rows {
-            if nulls.is_null(i) {
-                let target = existing_rows + i;
-                bm[target / 8] |= 1 << (target % 8);
+    if let Some(nulls) = incoming
+        && nulls.null_count() > 0
+    {
+        let arrow_offset_bits = nulls.offset();
+        if arrow_offset_bits.is_multiple_of(8) && existing_rows.is_multiple_of(8) {
+            let src = nulls.validity();
+            let src_off = arrow_offset_bits / 8;
+            let dst_off = existing_rows / 8;
+            let full_bytes = incoming_rows / 8;
+            for i in 0..full_bytes {
+                bm[dst_off + i] |= !src[src_off + i];
+            }
+            let trailing = incoming_rows % 8;
+            if trailing != 0 {
+                let mask = (1u8 << trailing) - 1;
+                bm[dst_off + full_bytes] |= (!src[src_off + full_bytes]) & mask;
+            }
+        } else {
+            for i in 0..incoming_rows {
+                if nulls.is_null(i) {
+                    let target = existing_rows + i;
+                    bm[target / 8] |= 1 << (target % 8);
+                }
             }
         }
     }
