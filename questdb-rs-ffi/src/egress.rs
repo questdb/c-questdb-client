@@ -4028,8 +4028,15 @@ pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
             }
             NextArrow::End => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
             NextArrow::Err(e, pin_to_restore) => {
-                if let Some(pin) = pin_to_restore {
-                    c.arrow_schema_pin = Some(pin);
+                match pin_to_restore {
+                    Some(pin) => {
+                        c.arrow_schema_pin = Some(pin);
+                    }
+                    None => {
+                        if e.code() != ErrorCode::SchemaDrift {
+                            c.arrow_schema_pin = pinned;
+                        }
+                    }
                 }
                 write_err_box(err_out, e);
                 line_reader_arrow_batch_result::line_reader_arrow_batch_error

@@ -155,7 +155,7 @@ impl Buffer {
         let qwp_ws = self.as_qwp_ws_mut().ok_or_else(|| {
             Error::new(
                 ErrorCode::InvalidApiCall,
-                "Buffer::append_arrow requires a QWP/WebSocket buffer (Buffer::new_qwp)"
+                "Buffer::append_arrow requires a QWP/WebSocket buffer (Buffer::new_qwp_ws)"
                     .to_string(),
             )
         })?;
@@ -1038,7 +1038,7 @@ fn emit_arrow_column(
         }
         ColumnKind::Decimal32WidenToDecimal64 => {
             let a = arr.as_any().downcast_ref::<Decimal32Array>().unwrap();
-            let scale = decimal_scale_u8(a.scale(), "Decimal32")?;
+            let scale = decimal_scale_u8(a.scale(), "Decimal32", 9)?;
             qwp_ws.arrow_bulk_set_decimal(
                 ctx,
                 col_name,
@@ -1056,7 +1056,7 @@ fn emit_arrow_column(
         }
         ColumnKind::Decimal64 => {
             let a = arr.as_any().downcast_ref::<Decimal64Array>().unwrap();
-            let scale = decimal_scale_u8(a.scale(), "Decimal64")?;
+            let scale = decimal_scale_u8(a.scale(), "Decimal64", 18)?;
             qwp_ws.arrow_bulk_set_decimal(
                 ctx,
                 col_name,
@@ -1081,7 +1081,7 @@ fn emit_arrow_column(
         }
         ColumnKind::Decimal128 => {
             let a = arr.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let scale = decimal_scale_u8(a.scale(), "Decimal128")?;
+            let scale = decimal_scale_u8(a.scale(), "Decimal128", 38)?;
             qwp_ws.arrow_bulk_set_decimal(
                 ctx,
                 col_name,
@@ -1106,7 +1106,7 @@ fn emit_arrow_column(
         }
         ColumnKind::Decimal256 => {
             let a = arr.as_any().downcast_ref::<Decimal256Array>().unwrap();
-            let scale = decimal_scale_u8(a.scale(), "Decimal256")?;
+            let scale = decimal_scale_u8(a.scale(), "Decimal256", QWP_DECIMAL_MAX_SCALE)?;
             qwp_ws.arrow_bulk_set_decimal(
                 ctx,
                 col_name,
@@ -1664,7 +1664,7 @@ fn build_geohash_bytes_into(out: &mut Vec<u8>, arr: &dyn Array, precision_bits: 
     Ok(())
 }
 
-fn decimal_scale_u8(scale_i8: i8, label: &str) -> Result<u8> {
+fn decimal_scale_u8(scale_i8: i8, label: &str, max_scale: u8) -> Result<u8> {
     if scale_i8 < 0 {
         return Err(fmt!(
             ArrowIngest,
@@ -1674,13 +1674,13 @@ fn decimal_scale_u8(scale_i8: i8, label: &str) -> Result<u8> {
         ));
     }
     let scale = scale_i8 as u8;
-    if scale > QWP_DECIMAL_MAX_SCALE {
+    if scale > max_scale {
         return Err(fmt!(
             ArrowIngest,
-            "Arrow {} scale {} exceeds QWP-WS maximum {}",
+            "Arrow {} scale {} exceeds maximum {} for this Arrow decimal width",
             label,
             scale,
-            QWP_DECIMAL_MAX_SCALE
+            max_scale
         ));
     }
     Ok(scale)
@@ -3945,6 +3945,42 @@ mod tests {
         let mut buf = fresh_buffer();
         let err = buf.append_arrow(table("t"), &rb).unwrap_err();
         assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+    }
+
+    #[test]
+    fn decimal_scale_u8_enforces_per_width_caps() {
+        assert!(decimal_scale_u8(9, "Decimal32", 9).is_ok());
+        let err = decimal_scale_u8(10, "Decimal32", 9).unwrap_err();
+        assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("Decimal32"));
+        assert!(err.msg().contains("scale 10"));
+
+        assert!(decimal_scale_u8(18, "Decimal64", 18).is_ok());
+        assert!(decimal_scale_u8(19, "Decimal64", 18).is_err());
+
+        assert!(decimal_scale_u8(38, "Decimal128", 38).is_ok());
+        assert!(decimal_scale_u8(39, "Decimal128", 38).is_err());
+
+        assert!(
+            decimal_scale_u8(
+                QWP_DECIMAL_MAX_SCALE as i8,
+                "Decimal256",
+                QWP_DECIMAL_MAX_SCALE
+            )
+            .is_ok()
+        );
+        assert!(
+            decimal_scale_u8(
+                (QWP_DECIMAL_MAX_SCALE as i8).saturating_add(1),
+                "Decimal256",
+                QWP_DECIMAL_MAX_SCALE,
+            )
+            .is_err()
+        );
+
+        let err = decimal_scale_u8(-1, "Decimal64", 18).unwrap_err();
+        assert_eq!(err.code(), crate::error::ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("negative"));
     }
 
     fn assert_unsupported_column(field: Field, arr: ArrayRef) {
