@@ -113,8 +113,14 @@ impl Iterator for CursorPolarsIter<'_, '_> {
         } else {
             match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
                 Ok(Some(rb)) => {
-                    if has_tentative_array(&self.schema) {
-                        self.schema = rb.schema();
+                    if has_tentative_array(&self.schema) && rb.schema() != self.schema {
+                        self.poisoned = true;
+                        return Some(Err(Error::new(
+                            ErrorCode::SchemaDrift,
+                            "tentative→firm ndim upgrade mid-stream; the \
+                             iterator pins the first batch's schema. Use \
+                             Cursor::next_polars to handle drift explicitly",
+                        )));
                     }
                     rb
                 }

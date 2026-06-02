@@ -311,10 +311,6 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_arrow_unsupported_column_kind
             }
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
-            // ErrorCode is `#[non_exhaustive]`; future variants fall back
-            // here. Extend both this match and the ABI discriminant test
-            // before shipping a new variant through the C surface.
-            _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -3693,6 +3689,12 @@ const MAX_ARROW_SCHEMA_DEPTH: usize = 64;
 const MAX_ARROW_SCHEMA_CHILDREN_PER_NODE: i64 = 65_536;
 #[cfg(feature = "arrow")]
 const MAX_ARROW_SCHEMA_TOTAL_NODES: usize = 4_096;
+// Mirrors `MAX_ARROW_INGEST_ROWS` in `questdb-rs::ingress::arrow`.
+// `arrow::ffi::from_ffi` reads `(*a).length` as i64 and casts to
+// usize before the inner crate gets to check the row cap, so a
+// negative or `i64::MAX` length must be rejected here.
+#[cfg(feature = "arrow")]
+const MAX_ARROW_ARRAY_LENGTH: i64 = 16 * 1024 * 1024;
 
 #[cfg(feature = "arrow")]
 fn arrow_ingest_err(msg: impl Into<String>) -> Error {
@@ -3738,7 +3740,9 @@ unsafe fn validate_arrow_schema_depth(
         stack.push((schema, 0));
         while let Some((s, depth)) = stack.pop() {
             if !visited.insert(s) {
-                continue;
+                return Err(arrow_ingest_err(
+                    "Arrow schema contains a cycle (revisited node)",
+                ));
             }
             total += 1;
             if total > MAX_ARROW_SCHEMA_TOTAL_NODES {
@@ -3816,7 +3820,9 @@ unsafe fn validate_arrow_array_depth(
         stack.push((array, schema, 0));
         while let Some((a, s, depth)) = stack.pop() {
             if !visited.insert(a) {
-                continue;
+                return Err(arrow_ingest_err(
+                    "Arrow array contains a cycle (revisited node)",
+                ));
             }
             total += 1;
             if total > MAX_ARROW_SCHEMA_TOTAL_NODES {
@@ -3829,6 +3835,32 @@ unsafe fn validate_arrow_array_depth(
                 return Err(arrow_ingest_err(format!(
                     "Arrow array nesting depth exceeds {}",
                     MAX_ARROW_SCHEMA_DEPTH
+                )));
+            }
+            let length = (*a).length;
+            let offset = (*a).offset;
+            if length < 0 {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array length {} is negative",
+                    length
+                )));
+            }
+            if offset < 0 {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array offset {} is negative",
+                    offset
+                )));
+            }
+            if length > MAX_ARROW_ARRAY_LENGTH {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array length {} exceeds {}",
+                    length, MAX_ARROW_ARRAY_LENGTH
+                )));
+            }
+            if offset > MAX_ARROW_ARRAY_LENGTH {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array offset {} exceeds {}",
+                    offset, MAX_ARROW_ARRAY_LENGTH
                 )));
             }
             let na = (*a).n_children;
@@ -4856,6 +4888,117 @@ mod tests {
                 assert!(
                     err.msg().contains("disagrees"),
                     "expected n_children-disagreement error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn schema_self_dictionary_cycle_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let raw = std::alloc::alloc_zeroed(layout) as *mut FFI_ArrowSchema;
+                (*raw).format = format.as_ptr();
+                (*raw).dictionary = raw;
+                let res = validate_arrow_schema_depth(raw);
+                (*raw).dictionary = std::ptr::null_mut();
+                std::alloc::dealloc(raw as *mut u8, layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("cycle"),
+                    "expected cycle error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_self_dictionary_cycle_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                (*s_raw).dictionary = s_raw;
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).dictionary = a_raw;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                (*s_raw).dictionary = std::ptr::null_mut();
+                (*a_raw).dictionary = std::ptr::null_mut();
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("cycle"),
+                    "expected cycle error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_negative_length_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).length = -1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("length"),
+                    "expected negative-length error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_negative_offset_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).offset = -1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("offset"),
+                    "expected negative-offset error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_length_above_cap_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).length = MAX_ARROW_ARRAY_LENGTH + 1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("length"),
+                    "expected length-cap error, got: {}",
                     err.msg()
                 );
             }

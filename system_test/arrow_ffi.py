@@ -25,14 +25,6 @@ from qwp_egress_reader import (  # type: ignore[attr-defined]
 )
 
 
-# The wider Python wrapper registered `line_sender_error_get_code` with the
-# wrong restype/argtypes (it never called the function, so the bug went
-# unnoticed). Re-register it here with the correct C ABI — ctypes uses a
-# single Function object per DLL symbol, so the override is global.
-_DLL.line_sender_error_get_code.restype = ctypes.c_int
-_DLL.line_sender_error_get_code.argtypes = [_LineSenderErrorPtr]
-
-
 class ArrowSenderError(_SenderError):
     """`SenderError` carrying the `line_sender_error_code` discriminant."""
 

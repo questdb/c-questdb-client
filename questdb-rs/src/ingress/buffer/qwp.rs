@@ -2433,8 +2433,9 @@ struct QwpWsTableBuffer {
 #[derive(Clone, Debug)]
 struct QwpWsColumnBuffer {
     name: Vec<u8>,
-    lower_ascii_name: Vec<u8>,
+    lower_name: Vec<u8>,
     packed_lower_ascii_name: u64,
+    name_is_ascii: bool,
     kind: ColumnKind,
     last_written_row: Option<u32>,
     non_null_count: u32,
@@ -2792,8 +2793,7 @@ impl QwpWsColumnarBuffer {
             cap += table.table_name.capacity();
             cap += table.columns.capacity() * std::mem::size_of::<QwpWsColumnBuffer>();
             for column in &table.columns {
-                cap +=
-                    column.name.capacity() + column.lower_ascii_name.capacity() + column.capacity();
+                cap += column.name.capacity() + column.lower_name.capacity() + column.capacity();
             }
         }
         cap
@@ -4133,9 +4133,12 @@ impl QwpWsTableBuffer {
 
     #[inline(always)]
     fn lookup_column(&mut self, name: &[u8]) -> crate::Result<Option<usize>> {
-        if self.column_access_cursor < self.columns.len()
+        let name_is_ascii = name.is_ascii();
+        if name_is_ascii
+            && self.column_access_cursor < self.columns.len()
+            && self.columns[self.column_access_cursor].name_is_ascii
             && names_equal_lower_ascii(
-                &self.columns[self.column_access_cursor].lower_ascii_name,
+                &self.columns[self.column_access_cursor].lower_name,
                 self.columns[self.column_access_cursor].packed_lower_ascii_name,
                 name,
             )
@@ -4143,24 +4146,22 @@ impl QwpWsTableBuffer {
             return Ok(Some(self.column_access_cursor));
         }
 
-        // Stack-buffered lowercase key — avoids the per-call heap alloc
-        // on the lookup miss path (a missed cursor lookup happens once
-        // per new column per batch, before `create_column` inserts).
-        let mut stack: [u8; 128] = [0; 128];
-        if name.len() <= stack.len() {
-            for (dst, src) in stack[..name.len()].iter_mut().zip(name.iter()) {
-                *dst = src.to_ascii_lowercase();
-            }
-            if let Some(&idx) = self.column_lookup.get(&stack[..name.len()]) {
-                return Ok(Some(idx));
-            }
-        } else {
-            let lookup_key = column_lookup_key(name)?;
-            if let Some(&idx) = self.column_lookup.get(&lookup_key[..]) {
-                return Ok(Some(idx));
+        if name_is_ascii {
+            let mut stack: [u8; 128] = [0; 128];
+            if name.len() <= stack.len() {
+                for (dst, src) in stack[..name.len()].iter_mut().zip(name.iter()) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                if let Some(&idx) = self.column_lookup.get(&stack[..name.len()]) {
+                    return Ok(Some(idx));
+                }
+                return Ok(None);
             }
         }
-
+        let lookup_key = column_lookup_key(name)?;
+        if let Some(&idx) = self.column_lookup.get(&lookup_key[..]) {
+            return Ok(Some(idx));
+        }
         Ok(None)
     }
 
@@ -4186,10 +4187,16 @@ impl QwpWsTableBuffer {
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsColumnBuffer {
     fn new(name: &[u8], kind: ColumnKind) -> Self {
+        let name_is_ascii = name.is_ascii();
         Self {
             name: name.to_vec(),
-            lower_ascii_name: lowercase_ascii_bytes(name),
-            packed_lower_ascii_name: packed_lower_ascii_name(name),
+            lower_name: lowercase_name_bytes(name, name_is_ascii),
+            packed_lower_ascii_name: if name_is_ascii {
+                packed_lower_ascii_name(name)
+            } else {
+                0
+            },
+            name_is_ascii,
             kind,
             last_written_row: None,
             non_null_count: 0,
@@ -6227,8 +6234,14 @@ impl QwpWsColumnValues {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn lowercase_ascii_bytes(name: &[u8]) -> Vec<u8> {
-    name.iter().map(|byte| byte.to_ascii_lowercase()).collect()
+fn lowercase_name_bytes(name: &[u8], is_ascii: bool) -> Vec<u8> {
+    if is_ascii {
+        return name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    }
+    match std::str::from_utf8(name) {
+        Ok(s) => s.to_lowercase().into_bytes(),
+        Err(_) => name.iter().map(|b| b.to_ascii_lowercase()).collect(),
+    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -6286,9 +6299,7 @@ fn names_equal_lower_ascii(left_lower: &[u8], packed_left_lower: u64, right: &[u
 
 #[cfg(feature = "_sender-qwp-ws")]
 fn column_lookup_key(name: &[u8]) -> crate::Result<Box<[u8]>> {
-    let mut buf = Vec::with_capacity(name.len());
-    buf.extend(name.iter().map(|b| b.to_ascii_lowercase()));
-    Ok(buf.into_boxed_slice())
+    Ok(lowercase_name_bytes(name, name.is_ascii()).into_boxed_slice())
 }
 
 #[cfg(feature = "_sender-qwp-ws")]

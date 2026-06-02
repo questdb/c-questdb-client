@@ -78,8 +78,15 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
         }
         match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
             Ok(Some(rb)) => {
-                if has_tentative_array(&self.schema) {
-                    self.schema = rb.schema();
+                if has_tentative_array(&self.schema) && rb.schema() != self.schema {
+                    self.poisoned = true;
+                    return Some(Err(external_arrow_error(Error::new(
+                        ErrorCode::SchemaDrift,
+                        "tentative→firm ndim upgrade is not representable in \
+                         RecordBatchReader (schema must be stable for the \
+                         reader's lifetime); use Cursor::next_arrow_batch \
+                         to handle drift explicitly",
+                    ))));
                 }
                 Some(Ok(rb))
             }

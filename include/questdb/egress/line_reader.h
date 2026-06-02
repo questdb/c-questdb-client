@@ -1767,10 +1767,16 @@ static inline bool line_reader_column_data_get_symbol(
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 
+/**
+ * Tri-state return for `line_reader_cursor_next_arrow_batch`.
+ */
 typedef enum line_reader_arrow_batch_result
 {
+    /** A batch was decoded and `out_array` / `out_schema` are populated. */
     line_reader_arrow_batch_ok = 0,
+    /** End of stream; `out_*` are unchanged and no error was produced. */
     line_reader_arrow_batch_end = 1,
+    /** Decode failed; `out_*` are unchanged and `out_err` is populated. */
     line_reader_arrow_batch_error = 2,
 } line_reader_arrow_batch_result;
 

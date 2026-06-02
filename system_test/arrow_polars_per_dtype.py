@@ -17,7 +17,7 @@ _TS_BASE_US = 1_700_000_000_000_000
 
 def _require_polars(testcase: unittest.TestCase):
     try:
-        import polars as pl  # noqa: F401
+        import polars as pl
     except ImportError:
         testcase.skipTest("polars is required for the Arrow-Polars dtype coverage tests")
 

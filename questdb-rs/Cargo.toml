@@ -297,7 +297,7 @@ required-features = ["sync-sender-qwp-ws"]
 
 [[example]]
 name = "polars"
-required-features = ["polars"]
+required-features = ["polars", "sync-sender-qwp-ws"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR

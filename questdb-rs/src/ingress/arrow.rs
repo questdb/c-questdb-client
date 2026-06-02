@@ -160,22 +160,43 @@ impl Buffer {
             )
         })?;
         let ctx = qwp_ws.arrow_bulk_begin(table)?;
-        let inner_result = emit_arrow_batch(qwp_ws, &ctx, batch, &schema, ts_col_idx);
+        let mut guard = BulkGuard {
+            qwp_ws,
+            ctx: Some(ctx),
+        };
+        let inner_result = emit_arrow_batch(
+            guard.qwp_ws,
+            guard.ctx.as_ref().expect("ctx is Some until committed"),
+            batch,
+            &schema,
+            ts_col_idx,
+        );
         match inner_result {
-            Ok(()) => match qwp_ws.arrow_bulk_commit(&ctx, effective_rows) {
-                Ok(()) => {
-                    qwp_ws.arrow_bulk_finish(ctx);
-                    Ok(())
+            Ok(()) => {
+                let ctx = guard.ctx.as_ref().expect("ctx is Some until committed");
+                match guard.qwp_ws.arrow_bulk_commit(ctx, effective_rows) {
+                    Ok(()) => {
+                        let ctx = guard.ctx.take().expect("ctx is Some until committed");
+                        guard.qwp_ws.arrow_bulk_finish(ctx);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => {
-                    qwp_ws.arrow_bulk_rollback(ctx);
-                    Err(e)
-                }
-            },
-            Err(e) => {
-                qwp_ws.arrow_bulk_rollback(ctx);
-                Err(e)
             }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+struct BulkGuard<'a> {
+    qwp_ws: &'a mut QwpWsColumnarBuffer,
+    ctx: Option<ArrowBulkCtx>,
+}
+
+impl Drop for BulkGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.ctx.take() {
+            self.qwp_ws.arrow_bulk_rollback(ctx);
         }
     }
 }
@@ -326,6 +347,17 @@ fn try_reserve_bytes(out: &mut Vec<u8>, additional: usize, label: &str) -> Resul
         fmt!(
             ArrowIngest,
             "{}: allocator could not reserve {} bytes",
+            label,
+            additional
+        )
+    })
+}
+
+fn try_reserve_typed<T>(v: &mut Vec<T>, additional: usize, label: &str) -> Result<()> {
+    v.try_reserve(additional).map_err(|_| {
+        fmt!(
+            ArrowIngest,
+            "{}: allocator could not reserve {} elements",
             label,
             additional
         )
@@ -750,9 +782,10 @@ fn emit_arrow_column(
                 |out| {
                     if null_count == 0 {
                         let src = a.values();
-                        out.reserve(src.len().checked_mul(8).ok_or_else(|| {
-                            fmt!(ArrowIngest, "decimal byte-buffer reservation overflow")
-                        })?);
+                        let bytes = src.len().checked_mul(8).ok_or_else(|| {
+                            fmt!(ArrowIngest, "TimestampSecond→µs reservation overflow")
+                        })?;
+                        try_reserve_bytes(out, bytes, "TimestampSecond column")?;
                         for (row, &v) in src.iter().enumerate() {
                             let widened = v.checked_mul(1_000_000).ok_or_else(|| {
                                 fmt!(
@@ -846,9 +879,11 @@ fn emit_arrow_column(
             qwp_ws.arrow_bulk_set_fixed(ctx, col_name, QwpColumnKind::Date, info_sparse, |out| {
                 if null_count == 0 {
                     let src = a.values();
-                    out.reserve(src.len().checked_mul(8).ok_or_else(|| {
-                        fmt!(ArrowIngest, "decimal byte-buffer reservation overflow")
-                    })?);
+                    let bytes = src
+                        .len()
+                        .checked_mul(8)
+                        .ok_or_else(|| fmt!(ArrowIngest, "Date32 days→ms reservation overflow"))?;
+                    try_reserve_bytes(out, bytes, "Date32 column")?;
                     for (row, &d) in src.iter().enumerate() {
                         let ms = (d as i64).checked_mul(86_400_000).ok_or_else(|| {
                             fmt!(
@@ -1221,8 +1256,12 @@ fn build_varlen_from_string_into(
     let row_count = arr.len();
     let data_base = varlen_data_base(data, "VARCHAR")?;
     let mut cumulative: u32 = 0;
-    offsets.reserve(non_null_count(arr, "VARCHAR column")?);
-    data.reserve(arr.value_data().len());
+    try_reserve_typed(
+        offsets,
+        non_null_count(arr, "VARCHAR column")?,
+        "VARCHAR offsets",
+    )?;
+    try_reserve_bytes(data, arr.value_data().len(), "VARCHAR data")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1304,7 +1343,8 @@ fn varlen_no_null_i32_into(
     data_base
         .checked_add(used)
         .ok_or_else(|| fmt!(ArrowIngest, "{} cumulative offset exceeds u32::MAX", label))?;
-    offsets.reserve(arr_len);
+    try_reserve_typed(offsets, arr_len, "varlen offsets")?;
+    try_reserve_bytes(data, used as usize, "varlen data")?;
     let rebase = data_base.wrapping_sub(first_u);
     if first == 0 && data_base == 0 {
         // SAFETY: every offset validated non-negative above; i32 and u32
@@ -1395,7 +1435,8 @@ fn varlen_no_null_i64_narrow_into(
     data_base
         .checked_add(used)
         .ok_or_else(|| fmt!(ArrowIngest, "{} cumulative offset exceeds u32::MAX", label))?;
-    offsets.reserve(arr_len);
+    try_reserve_typed(offsets, arr_len, "varlen offsets")?;
+    try_reserve_bytes(data, used as usize, "varlen data")?;
     let rebase = data_base.wrapping_sub(first_u);
     for &off in &arr_offsets[1..] {
         offsets.push(rebase.wrapping_add(off as u32));
@@ -1422,8 +1463,12 @@ fn build_varlen_from_large_string_into(
     let row_count = arr.len();
     let data_base = varlen_data_base(data, "LargeUtf8")?;
     let mut cumulative: u32 = 0;
-    offsets.reserve(non_null_count(arr, "LargeUtf8 column")?);
-    data.reserve(arr.value_data().len());
+    try_reserve_typed(
+        offsets,
+        non_null_count(arr, "LargeUtf8 column")?,
+        "LargeUtf8 offsets",
+    )?;
+    try_reserve_bytes(data, arr.value_data().len(), "LargeUtf8 data")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1451,7 +1496,11 @@ fn build_varlen_from_string_view_into(
     let row_count = arr.len();
     let data_base = varlen_data_base(data, "VARCHAR")?;
     let mut cumulative: u32 = 0;
-    offsets.reserve(non_null_count(arr, "Utf8View column")?);
+    try_reserve_typed(
+        offsets,
+        non_null_count(arr, "Utf8View column")?,
+        "Utf8View offsets",
+    )?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1487,8 +1536,12 @@ fn build_varlen_from_binary_into(
     let row_count = arr.len();
     let data_base = varlen_data_base(data, "BINARY")?;
     let mut cumulative: u32 = 0;
-    offsets.reserve(non_null_count(arr, "Binary column")?);
-    data.reserve(arr.value_data().len());
+    try_reserve_typed(
+        offsets,
+        non_null_count(arr, "Binary column")?,
+        "Binary offsets",
+    )?;
+    try_reserve_bytes(data, arr.value_data().len(), "Binary data")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1524,8 +1577,12 @@ fn build_varlen_from_large_binary_into(
     let row_count = arr.len();
     let data_base = varlen_data_base(data, "LargeBinary")?;
     let mut cumulative: u32 = 0;
-    offsets.reserve(non_null_count(arr, "LargeBinary column")?);
-    data.reserve(arr.value_data().len());
+    try_reserve_typed(
+        offsets,
+        non_null_count(arr, "LargeBinary column")?,
+        "LargeBinary offsets",
+    )?;
+    try_reserve_bytes(data, arr.value_data().len(), "LargeBinary data")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1559,7 +1616,11 @@ fn build_varlen_from_binary_view_into(
     let row_count = arr.len();
     let data_base = varlen_data_base(data, "BINARY")?;
     let mut cumulative: u32 = 0;
-    offsets.reserve(non_null_count(arr, "BinaryView column")?);
+    try_reserve_typed(
+        offsets,
+        non_null_count(arr, "BinaryView column")?,
+        "BinaryView offsets",
+    )?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1587,7 +1648,11 @@ fn build_geohash_bytes_into(out: &mut Vec<u8>, arr: &dyn Array, precision_bits: 
     }
     let row_count = arr.len();
     let width = (precision_bits as usize).div_ceil(8);
-    out.reserve(non_null_count(arr, "Geohash column")? * width);
+    let non_null = non_null_count(arr, "Geohash column")?;
+    let bytes = non_null
+        .checked_mul(width)
+        .ok_or_else(|| fmt!(ArrowIngest, "Geohash byte-buffer reservation overflow"))?;
+    try_reserve_bytes(out, bytes, "Geohash column")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1624,11 +1689,11 @@ fn decimal_scale_u8(scale_i8: i8, label: &str) -> Result<u8> {
 fn build_decimal_bytes_i32_widen_into(out: &mut Vec<u8>, arr: &Decimal32Array) -> Result<()> {
     if arr.null_count() == 0 {
         let src = arr.values();
-        out.reserve(
-            src.len()
-                .checked_mul(8)
-                .ok_or_else(|| fmt!(ArrowIngest, "decimal byte-buffer reservation overflow"))?,
-        );
+        let bytes = src
+            .len()
+            .checked_mul(8)
+            .ok_or_else(|| fmt!(ArrowIngest, "Decimal32 byte-buffer reservation overflow"))?;
+        try_reserve_bytes(out, bytes, "Decimal32 column")?;
         for &v in src {
             out.extend_from_slice(&(v as i64).to_le_bytes());
         }
@@ -1636,7 +1701,10 @@ fn build_decimal_bytes_i32_widen_into(out: &mut Vec<u8>, arr: &Decimal32Array) -
     }
     let non_null = non_null_count(arr, "Decimal32 column")?;
     let row_count = arr.len();
-    out.reserve(non_null * 8);
+    let bytes = non_null
+        .checked_mul(8)
+        .ok_or_else(|| fmt!(ArrowIngest, "Decimal32 byte-buffer reservation overflow"))?;
+    try_reserve_bytes(out, bytes, "Decimal32 column")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1649,7 +1717,10 @@ fn build_decimal_bytes_i32_widen_into(out: &mut Vec<u8>, arr: &Decimal32Array) -
 fn build_decimal_bytes_i64_into(out: &mut Vec<u8>, arr: &Decimal64Array) -> Result<()> {
     let non_null = non_null_count(arr, "Decimal64 column")?;
     let row_count = arr.len();
-    out.reserve(non_null * 8);
+    let bytes = non_null
+        .checked_mul(8)
+        .ok_or_else(|| fmt!(ArrowIngest, "Decimal64 byte-buffer reservation overflow"))?;
+    try_reserve_bytes(out, bytes, "Decimal64 column")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1662,7 +1733,10 @@ fn build_decimal_bytes_i64_into(out: &mut Vec<u8>, arr: &Decimal64Array) -> Resu
 fn build_decimal_bytes_i128_into(out: &mut Vec<u8>, arr: &Decimal128Array) -> Result<()> {
     let non_null = non_null_count(arr, "Decimal128 column")?;
     let row_count = arr.len();
-    out.reserve(non_null * 16);
+    let bytes = non_null
+        .checked_mul(16)
+        .ok_or_else(|| fmt!(ArrowIngest, "Decimal128 byte-buffer reservation overflow"))?;
+    try_reserve_bytes(out, bytes, "Decimal128 column")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1675,7 +1749,10 @@ fn build_decimal_bytes_i128_into(out: &mut Vec<u8>, arr: &Decimal128Array) -> Re
 fn build_decimal_bytes_i256_into(out: &mut Vec<u8>, arr: &Decimal256Array) -> Result<()> {
     let non_null = non_null_count(arr, "Decimal256 column")?;
     let row_count = arr.len();
-    out.reserve(non_null * 32);
+    let bytes = non_null
+        .checked_mul(32)
+        .ok_or_else(|| fmt!(ArrowIngest, "Decimal256 byte-buffer reservation overflow"))?;
+    try_reserve_bytes(out, bytes, "Decimal256 column")?;
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -1998,6 +2075,10 @@ fn check_array_data_bounds_inner(arr: &dyn Array, depth: usize) -> Result<()> {
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
             .map(|a| (*width as usize).saturating_mul(a.len())),
+        DataType::Float64 => arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| a.values().len().saturating_mul(8)),
         _ => None,
     };
     if let Some(b) = bytes
@@ -2051,13 +2132,16 @@ fn build_symbol_payload_dyn(
         ));
     }
     let row_count = arr.len();
-    let mut keys: Vec<u32> = Vec::with_capacity(row_count);
+    let mut keys: Vec<u32> = Vec::new();
+    try_reserve_typed(&mut keys, row_count, "SYMBOL keys")?;
     fill_dict_keys_into(&mut keys, arr, key);
     debug_assert_eq!(keys.len(), row_count);
     // Skip unreferenced dict entries (Polars/Datafusion may leave
     // nulls there after filter/projection); emit zero-length stubs
     // so key→entry indexing on the wire stays intact.
-    let mut referenced = vec![false; value_count];
+    let mut referenced: Vec<bool> = Vec::new();
+    try_reserve_typed(&mut referenced, value_count, "SYMBOL referenced bitmap")?;
+    referenced.resize(value_count, false);
     let has_nulls = arr.null_count() != 0;
     for (row, &k) in keys.iter().enumerate() {
         if has_nulls && arr.is_null(row) {
@@ -2075,7 +2159,8 @@ fn build_symbol_payload_dyn(
         }
         referenced[idx] = true;
     }
-    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(value_count);
+    let mut entries: Vec<(u32, u32)> = Vec::new();
+    try_reserve_typed(&mut entries, value_count, "SYMBOL entries")?;
     let mut dict_data: Vec<u8> = Vec::new();
     let mut cumulative: u32 = 0;
     for (i, used) in referenced.iter().enumerate() {
@@ -2087,11 +2172,21 @@ fn build_symbol_payload_dyn(
         let bytes = s.as_bytes();
         let len = u32::try_from(bytes.len())
             .map_err(|_| fmt!(ArrowIngest, "SYMBOL entry length exceeds u32::MAX"))?;
-        entries.push((cumulative, len));
-        dict_data.extend_from_slice(bytes);
-        cumulative = cumulative
+        let next_cumulative = cumulative
             .checked_add(len)
             .ok_or_else(|| fmt!(ArrowIngest, "SYMBOL cumulative data exceeds u32::MAX"))?;
+        if (next_cumulative as usize) > MAX_ARROW_INGEST_DATA_BYTES {
+            return Err(fmt!(
+                ArrowIngest,
+                "SYMBOL cumulative data {} exceeds {} byte cap",
+                next_cumulative,
+                MAX_ARROW_INGEST_DATA_BYTES
+            ));
+        }
+        try_reserve_bytes(&mut dict_data, bytes.len(), "SYMBOL dict_data")?;
+        dict_data.extend_from_slice(bytes);
+        entries.push((cumulative, len));
+        cumulative = next_cumulative;
     }
     Ok(SymbolPayload {
         keys,
@@ -2101,7 +2196,6 @@ fn build_symbol_payload_dyn(
 }
 
 fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
-    let row_count = arr.len();
     let has_nulls = arr.null_count() != 0;
     match key {
         DictKey::U32 => {
@@ -2114,7 +2208,6 @@ fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
                 out.extend_from_slice(raw);
                 return;
             }
-            out.reserve(row_count);
             for (row, &k) in raw.iter().enumerate() {
                 out.push(if arr.is_null(row) { 0 } else { k });
             }
@@ -2125,7 +2218,6 @@ fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
                 .downcast_ref::<DictionaryArray<UInt16Type>>()
                 .unwrap();
             let raw = dict.keys().values();
-            out.reserve(row_count);
             if !has_nulls {
                 for &k in raw {
                     out.push(k as u32);
@@ -2142,7 +2234,6 @@ fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
                 .downcast_ref::<DictionaryArray<UInt8Type>>()
                 .unwrap();
             let raw = dict.keys().values();
-            out.reserve(row_count);
             if !has_nulls {
                 for &k in raw {
                     out.push(k as u32);
@@ -4371,7 +4462,7 @@ mod tests {
     }
 
     #[test]
-    fn row_count_above_cap_rejected() {
+    fn single_row_int64_appends_one_row() {
         let mut b = Int64Builder::new();
         b.append_value(0);
         let rb = RecordBatch::try_new(

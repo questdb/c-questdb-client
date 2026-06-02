@@ -420,13 +420,16 @@ impl Buffer {
     }
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-    /// Creates a new QWP/UDP buffer with default parameters.
+    /// Creates a new row-major QWP buffer with default parameters.
+    /// Used by the QWP/UDP transport and any QWP path that does not
+    /// require columnar layout. For the QWP/WebSocket Arrow ingest
+    /// path see [`Buffer::new_qwp_ws`].
     pub fn new_qwp() -> Self {
         Self::qwp_with_max_name_len(127)
     }
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-    /// Creates a new QWP/UDP buffer with a custom maximum name length.
+    /// Like [`Buffer::new_qwp`] with an explicit maximum name length.
     pub fn qwp_with_max_name_len(max_name_len: usize) -> Self {
         Self {
             inner: BufferInner::Qwp(Box::new(QwpBuffer::new(max_name_len))),

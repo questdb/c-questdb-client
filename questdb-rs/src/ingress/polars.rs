@@ -24,6 +24,19 @@
 //!   sizes (10 K rows ≈ µs of cast vs ms of wire send) but worth
 //!   knowing if you slice into many small batches.
 //!
+//! # Per-chunk dtype stability
+//!
+//! `Categorical` (and other dictionary-backed) columns may emit
+//! different Arrow value dtypes across chunks (e.g. `Utf8` vs
+//! `LargeUtf8`) depending on per-chunk statistics. The iterator pins
+//! the first chunk's dtype as the wire schema and rejects subsequent
+//! chunks whose dtype differs with [`ErrorCode::ArrowIngest`]. To
+//! avoid this, rechunk via `DataFrame::rechunk()` before calling
+//! `dataframe_to_batches`, or cast Categorical columns to plain
+//! `String` upstream.
+//!
+//! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
+//!
 //! Flushing is the caller's responsibility:
 //!
 //! ```ignore

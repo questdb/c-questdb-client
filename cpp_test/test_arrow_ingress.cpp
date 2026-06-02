@@ -103,6 +103,8 @@ void append_ok(
     ArrowArray& arr,
     ArrowSchema& sch)
 {
+    const size_t size_before = buf.size();
+    const size_t row_count_before = buf.row_count();
     try
     {
         buf.append_arrow(tbl, arr, sch);
@@ -113,6 +115,8 @@ void append_ok(
     }
     if (sch.release)
         sch.release(&sch);
+    CHECK(buf.size() > size_before);
+    CHECK(buf.row_count() > row_count_before);
 }
 
 void append_expect_error(
