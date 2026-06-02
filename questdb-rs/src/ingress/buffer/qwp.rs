@@ -4888,11 +4888,7 @@ impl QwpWsColumnBuffer {
     }
 
     #[cfg(feature = "arrow")]
-    fn append_arrow_bool_batch<F>(
-        &mut self,
-        info: ArrowBatchInfo<'_>,
-        pack: F,
-    ) -> crate::Result<()>
+    fn append_arrow_bool_batch<F>(&mut self, info: ArrowBatchInfo<'_>, pack: F) -> crate::Result<()>
     where
         F: FnOnce(&mut Vec<u8>, usize) -> crate::Result<()>,
     {

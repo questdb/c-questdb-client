@@ -659,9 +659,10 @@ fn emit_arrow_column(
                 if null_count == 0 {
                     try_reserve_bytes(
                         out,
-                        a.values().len().checked_mul(4).ok_or_else(|| {
-                            fmt!(ArrowIngest, "U8 widen reservation overflow")
-                        })?,
+                        a.values()
+                            .len()
+                            .checked_mul(4)
+                            .ok_or_else(|| fmt!(ArrowIngest, "U8 widen reservation overflow"))?,
                         "U8 widen column",
                     )?;
                     for &v in a.values() {
@@ -681,9 +682,10 @@ fn emit_arrow_column(
                 if null_count == 0 {
                     try_reserve_bytes(
                         out,
-                        a.values().len().checked_mul(4).ok_or_else(|| {
-                            fmt!(ArrowIngest, "U16 widen reservation overflow")
-                        })?,
+                        a.values()
+                            .len()
+                            .checked_mul(4)
+                            .ok_or_else(|| fmt!(ArrowIngest, "U16 widen reservation overflow"))?,
                         "U16 widen column",
                     )?;
                     for &v in a.values() {
@@ -703,9 +705,10 @@ fn emit_arrow_column(
                 if null_count == 0 {
                     try_reserve_bytes(
                         out,
-                        a.values().len().checked_mul(8).ok_or_else(|| {
-                            fmt!(ArrowIngest, "U32 widen reservation overflow")
-                        })?,
+                        a.values()
+                            .len()
+                            .checked_mul(8)
+                            .ok_or_else(|| fmt!(ArrowIngest, "U32 widen reservation overflow"))?,
                         "U32 widen column",
                     )?;
                     for &v in a.values() {
@@ -792,7 +795,9 @@ fn emit_arrow_column(
                 info_sparse,
                 |out| {
                     if le_no_nulls {
-                        extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })?;
+                        extend_le_bytes_checked(out, unsafe {
+                            typed_slice_as_le_bytes(a.values())
+                        })?;
                     } else {
                         non_null_le_into(out, arr, |row| a.value(row).to_le_bytes())?;
                     }
@@ -812,7 +817,9 @@ fn emit_arrow_column(
                 info_sparse,
                 |out| {
                     if le_no_nulls {
-                        extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })?;
+                        extend_le_bytes_checked(out, unsafe {
+                            typed_slice_as_le_bytes(a.values())
+                        })?;
                     } else {
                         non_null_le_into(out, arr, |row| a.value(row).to_le_bytes())?;
                     }
@@ -1027,7 +1034,9 @@ fn emit_arrow_column(
                 |out| {
                     if le_no_nulls {
                         // SAFETY: i64 has no padding; LE target → wire-format bytes.
-                        extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })?;
+                        extend_le_bytes_checked(out, unsafe {
+                            typed_slice_as_le_bytes(a.values())
+                        })?;
                     } else {
                         build_decimal_bytes_i64_into(out, a)?;
                     }
@@ -1050,7 +1059,9 @@ fn emit_arrow_column(
                 |out| {
                     if le_no_nulls {
                         // SAFETY: i128 has no padding; LE target → wire-format bytes.
-                        extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })?;
+                        extend_le_bytes_checked(out, unsafe {
+                            typed_slice_as_le_bytes(a.values())
+                        })?;
                     } else {
                         build_decimal_bytes_i128_into(out, a)?;
                     }
@@ -1082,7 +1093,9 @@ fn emit_arrow_column(
                         };
                         #[cfg(target_endian = "big")]
                         compile_error!("Decimal256 LE fast-path requires little-endian host");
-                        extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })?;
+                        extend_le_bytes_checked(out, unsafe {
+                            typed_slice_as_le_bytes(a.values())
+                        })?;
                     } else {
                         build_decimal_bytes_i256_into(out, a)?;
                     }
@@ -1104,11 +1117,7 @@ fn emit_arrow_column(
 /// already present. Skips the intermediate `Vec<u8>` allocation the old
 /// `pack_bool_bits` returned. The destination is the column's owned
 /// `packed_bits` buffer.
-fn pack_bool_bits_into(
-    out: &mut Vec<u8>,
-    existing_rows: usize,
-    arr: &BooleanArray,
-) -> Result<()> {
+fn pack_bool_bits_into(out: &mut Vec<u8>, existing_rows: usize, arr: &BooleanArray) -> Result<()> {
     let row_count = arr.len();
     let total_rows = existing_rows + row_count;
     let total_bytes = total_rows.div_ceil(8);
