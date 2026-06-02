@@ -48,6 +48,27 @@ use crate::egress::symbol_dict::SymbolDict;
 
 type ABytes = AVec<u8, ConstAlign<64>>;
 
+// `Bytes::from_owner` requires the owner to be `Send + Sync + 'static`.
+// arrow-rs's RecordBatch can be dropped on any thread (Python consumers
+// release on a worker pool), so the AVec we hand it must satisfy these
+// bounds. A future aligned-vec release that adds a !Send field would
+// silently break the FFI export path — this static check fails to
+// compile if that happens.
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<ABytes>();
+};
+
+/// Working buffers reused across SYMBOL columns in one batch. Reuses the
+/// remap HashMap allocation per `batch_to_record_batch` call so a wide
+/// batch with N SYMBOL columns does not pay N independent `HashMap::new()`
+/// costs. The hasher is `std::collections::hash_map::RandomState` —
+/// changing to a u32-tuned hasher is a follow-up.
+#[derive(Default)]
+struct SymbolBuildScratch {
+    remap: HashMap<u32, u32>,
+}
+
 pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
@@ -66,13 +87,21 @@ pub(crate) fn batch_to_record_batch(
         ));
     }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    let mut sym_scratch = SymbolBuildScratch::default();
     for (idx, decoded) in columns.into_iter().enumerate() {
         let field = schema_ref.field(idx);
         let kind = egress_schema
             .column(idx)
             .map(|c| c.kind)
             .ok_or_else(|| fmt!(InvalidApiCall, "egress schema missing column {}", idx))?;
-        arrays.push(column_to_array(field, kind, decoded, row_count, dict)?);
+        arrays.push(column_to_array(
+            field,
+            kind,
+            decoded,
+            row_count,
+            dict,
+            &mut sym_scratch,
+        )?);
     }
     RecordBatch::try_new(schema_ref, arrays).map_err(|e| to_arrow_export(e.to_string()))
 }
@@ -83,6 +112,7 @@ fn column_to_array(
     decoded: DecodedColumn,
     row_count: usize,
     dict: &SymbolDict,
+    sym_scratch: &mut SymbolBuildScratch,
 ) -> Result<ArrayRef> {
     Ok(match (kind, decoded) {
         (ColumnKind::Boolean, DecodedColumn::Boolean(buf)) => {
@@ -167,7 +197,7 @@ fn column_to_array(
             },
         ) => {
             let active = local_dict.as_ref().unwrap_or(dict);
-            symbol_array(codes, validity, active, row_count)?
+            symbol_array(codes, validity, active, row_count, sym_scratch)?
         }
         (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => {
             array_column_to_arrow(field, b, row_count, ArrayLeaf::Float64)?
@@ -402,9 +432,16 @@ fn symbol_array(
     validity: Option<Bytes>,
     dict: &SymbolDict,
     row_count: usize,
+    scratch: &mut SymbolBuildScratch,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let mut remap: HashMap<u32, u32> = HashMap::with_capacity(codes.len().min(64));
+    scratch.remap.clear();
+    if scratch.remap.capacity() < codes.len().min(64) {
+        scratch
+            .remap
+            .reserve(codes.len().min(64) - scratch.remap.capacity());
+    }
+    let remap = &mut scratch.remap;
     let mut union_offsets: Vec<i32> = Vec::with_capacity(codes.len().min(64) + 1);
     union_offsets.push(0);
     let mut union_bytes: ABytes = ABytes::new(64);
@@ -435,8 +472,13 @@ fn symbol_array(
     match nulls.as_ref() {
         None => {
             for (row, &code) in codes.iter().enumerate() {
-                let dense_code =
-                    resolve(code, &mut remap, &mut union_offsets, &mut union_bytes, dict)?;
+                let dense_code = resolve(
+                    code,
+                    &mut *remap,
+                    &mut union_offsets,
+                    &mut union_bytes,
+                    dict,
+                )?;
                 let base = row * 4;
                 dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
             }
@@ -444,8 +486,13 @@ fn symbol_array(
         Some(n) => {
             for row in n.valid_indices() {
                 let code = codes[row];
-                let dense_code =
-                    resolve(code, &mut remap, &mut union_offsets, &mut union_bytes, dict)?;
+                let dense_code = resolve(
+                    code,
+                    &mut *remap,
+                    &mut union_offsets,
+                    &mut union_bytes,
+                    dict,
+                )?;
                 let base = row * 4;
                 dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
             }

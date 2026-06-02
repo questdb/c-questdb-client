@@ -1,33 +1,3 @@
-/*
- * Pure-C exhaustive test for the Apache Arrow C Data Interface exports.
- *
- * Runs under the C compiler (not C++), proving that the FFI is usable
- * by Cython / cffi / hand-rolled C consumers that link the shared
- * library directly. The C++ tests in `test_arrow_egress.cpp` and
- * `test_arrow_ingress.cpp` cover the mock-server-driven scenarios on
- * top of this baseline.
- *
- * Coverage:
- *   1. Enum constants exposed by the C ABI compile and have the
- *      documented values (line_reader_arrow_batch_result tristate,
- *      designated-timestamp kinds, appended error codes).
- *   2. ArrowArray + ArrowSchema struct layouts match the Apache Arrow
- *      spec and can be allocated on the C stack.
- *   3. NULL-safety: NULL cursor / array / schema on both egress and
- *      ingress entry points produce _error / false with a populated
- *      `err_out`.
- *   4. Ingress build path: manually allocate ArrowArray / ArrowSchema
- *      for every primitive Arrow type we support (Boolean, Int8/16/32/64,
- *      Float32/64, Utf8, Binary, FixedSizeBinary(16), FixedSizeBinary(32),
- *      Timestamp(µs)) and feed each through `line_sender_buffer_append_arrow`
- *      against a QWP buffer.
- *   5. Designated-timestamp dispatch — both the default (server-now)
- *      and the at-column variants are exercised.
- *   6. Error-path validation: the `arrow_unsupported_column_kind` and
- *      `arrow_ingest` error codes route from Rust through the FFI to
- *      the C error accessors.
- */
-
 #include <questdb/egress/line_reader.h>
 #include <questdb/ingress/line_sender.h>
 
@@ -73,11 +43,6 @@ static int tests = 0;
                     #name, errors - before);                                   \
         }                                                                      \
     } while (0)
-
-/* ---------------------------------------------------------------------------
- * Helpers — ArrowArray / ArrowSchema builders backed by `private_data`
- * that owns the heap allocations and frees them in the release callback.
- * ------------------------------------------------------------------------- */
 
 struct PrivBytes
 {
@@ -186,11 +151,6 @@ static line_sender_buffer* fresh_qwp_buffer(void)
     return line_sender_buffer_new_qwp_ws();
 }
 
-/* ---------------------------------------------------------------------------
- * Section 1: enum constants are accessible from C and have the documented
- * discriminants.
- * ------------------------------------------------------------------------- */
-
 TEST(test_tristate_egress_enum_values)
 {
     CHECK(line_reader_arrow_batch_ok == 0, "ok = 0");
@@ -215,10 +175,6 @@ TEST(test_appended_sender_error_codes_exist)
               line_sender_error_arrow_ingest,
           "sender error codes distinct");
 }
-
-/* ---------------------------------------------------------------------------
- * Section 2: NULL-safety on both directions.
- * ------------------------------------------------------------------------- */
 
 TEST(test_egress_null_cursor_returns_error_tristate)
 {
@@ -277,13 +233,77 @@ TEST(test_ingress_null_array_returns_false)
     line_sender_buffer_free(buf);
 }
 
-/* ---------------------------------------------------------------------------
- * Section 3: ingress per-type round-trip into a QWP-WS buffer.
- *
- * `run_append_strict_ok` requires a clean `ok == true` from
- * `line_sender_buffer_append_arrow`; a structured error is treated as a
- * test failure, not a "we accept any documented rejection" pass.
- * ------------------------------------------------------------------------- */
+TEST(test_ingress_null_schema_returns_false)
+{
+    line_sender_buffer* buf = fresh_qwp_buffer();
+    struct ArrowArray arr;
+    memset(&arr, 0, sizeof(arr));
+    line_sender_error* err = NULL;
+    bool ok =
+        line_sender_buffer_append_arrow(buf, make_table("t"), &arr, NULL, &err);
+    CHECK(!ok, "NULL schema → false");
+    CHECK(err != NULL, "err_out populated");
+    if (err)
+        line_sender_error_free(err);
+    line_sender_buffer_free(buf);
+}
+
+TEST(test_ingress_at_column_null_buffer_returns_false)
+{
+    struct ArrowArray arr;
+    struct ArrowSchema sch;
+    memset(&arr, 0, sizeof(arr));
+    memset(&sch, 0, sizeof(sch));
+    line_sender_error* err = NULL;
+    line_sender_column_name ts_col;
+    bool name_ok =
+        line_sender_column_name_init(&ts_col, strlen("ts"), "ts", &err);
+    CHECK(name_ok, "column name init");
+    bool ok = line_sender_buffer_append_arrow_at_column(
+        NULL, make_table("t"), &arr, &sch, ts_col, &err);
+    CHECK(!ok, "NULL buffer → false");
+    CHECK(err != NULL, "err_out populated");
+    if (err)
+        line_sender_error_free(err);
+}
+
+TEST(test_ingress_at_column_null_array_returns_false)
+{
+    line_sender_buffer* buf = fresh_qwp_buffer();
+    struct ArrowSchema sch;
+    memset(&sch, 0, sizeof(sch));
+    line_sender_error* err = NULL;
+    line_sender_column_name ts_col;
+    bool name_ok =
+        line_sender_column_name_init(&ts_col, strlen("ts"), "ts", &err);
+    CHECK(name_ok, "column name init");
+    bool ok = line_sender_buffer_append_arrow_at_column(
+        buf, make_table("t"), NULL, &sch, ts_col, &err);
+    CHECK(!ok, "NULL array → false");
+    CHECK(err != NULL, "err_out populated");
+    if (err)
+        line_sender_error_free(err);
+    line_sender_buffer_free(buf);
+}
+
+TEST(test_ingress_at_column_null_schema_returns_false)
+{
+    line_sender_buffer* buf = fresh_qwp_buffer();
+    struct ArrowArray arr;
+    memset(&arr, 0, sizeof(arr));
+    line_sender_error* err = NULL;
+    line_sender_column_name ts_col;
+    bool name_ok =
+        line_sender_column_name_init(&ts_col, strlen("ts"), "ts", &err);
+    CHECK(name_ok, "column name init");
+    bool ok = line_sender_buffer_append_arrow_at_column(
+        buf, make_table("t"), &arr, NULL, ts_col, &err);
+    CHECK(!ok, "NULL schema → false");
+    CHECK(err != NULL, "err_out populated");
+    if (err)
+        line_sender_error_free(err);
+    line_sender_buffer_free(buf);
+}
 
 static void run_append_strict_ok(
     line_sender_buffer* buf,
@@ -467,11 +487,6 @@ TEST(test_ingress_default_and_at_column_dispatch)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * Section 4: error wire-through — make sure the new error codes survive
- * the FFI boundary and `_get_code` returns the right integer.
- * ------------------------------------------------------------------------- */
-
 TEST(test_error_codes_survive_ffi_boundary)
 {
     /* Triggering a real `arrow_unsupported_column_kind` from C alone
@@ -488,10 +503,6 @@ TEST(test_error_codes_survive_ffi_boundary)
     CHECK(no_schema_code != export_code, "reader codes distinct");
 }
 
-/* ---------------------------------------------------------------------------
- * Driver.
- * ------------------------------------------------------------------------- */
-
 int main(void)
 {
     RUN(test_tristate_egress_enum_values);
@@ -501,6 +512,10 @@ int main(void)
     RUN(test_egress_null_out_array_returns_error_tristate);
     RUN(test_ingress_null_buffer_returns_false);
     RUN(test_ingress_null_array_returns_false);
+    RUN(test_ingress_null_schema_returns_false);
+    RUN(test_ingress_at_column_null_buffer_returns_false);
+    RUN(test_ingress_at_column_null_array_returns_false);
+    RUN(test_ingress_at_column_null_schema_returns_false);
     RUN(test_ingress_boolean_column);
     RUN(test_ingress_int8_int16_int32_int64_columns);
     RUN(test_ingress_float32_float64_columns);

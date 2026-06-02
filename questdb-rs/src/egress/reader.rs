@@ -1473,7 +1473,7 @@ impl<'r> Cursor<'r> {
     /// [`RecordBatchReader`]: arrow_array::RecordBatchReader
     /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
     #[cfg(feature = "arrow")]
-    pub fn as_record_batch_reader<'c>(
+    pub fn as_arrow_reader<'c>(
         &'c mut self,
     ) -> Result<crate::egress::arrow::CursorRecordBatchReader<'r, 'c>> {
         crate::egress::arrow::CursorRecordBatchReader::new(self)
@@ -1484,15 +1484,15 @@ impl<'r> Cursor<'r> {
     /// [`Cursor::fetch_all_polars`](crate::egress::Cursor::fetch_all_polars).
     /// Errors as [`ErrorCode::NoSchema`] if the stream ends without
     /// producing a batch; surfaces drift as
-    /// [`ErrorCode::SchemaDriftMidStream`].
+    /// [`ErrorCode::SchemaDrift`].
     ///
     /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
-    /// [`ErrorCode::SchemaDriftMidStream`]: crate::egress::ErrorCode::SchemaDriftMidStream
+    /// [`ErrorCode::SchemaDrift`]: crate::egress::ErrorCode::SchemaDrift
     #[cfg(feature = "arrow")]
     pub fn fetch_all_arrow(
         &mut self,
     ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>)> {
-        let mut reader = self.as_record_batch_reader()?;
+        let mut reader = self.as_arrow_reader()?;
         let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
         for item in reader.by_ref() {
             batches.push(item.map_err(|e| {
@@ -1506,7 +1506,7 @@ impl<'r> Cursor<'r> {
 
     /// Drift-checked iterator over Polars [`DataFrame`](polars::frame::DataFrame)s,
     /// one per QWP batch. Snapshots the first batch's Arrow schema
-    /// and yields `Err(SchemaDriftMidStream)` then terminates if a
+    /// and yields `Err(SchemaDrift)` then terminates if a
     /// later batch diverges. Returns `Err(NoSchema)` if the stream
     /// ends before any batch is produced.
     ///
@@ -1520,7 +1520,7 @@ impl<'r> Cursor<'r> {
     /// Next batch as an Arrow [`RecordBatch`](arrow_array::RecordBatch).
     /// `Ok(None)` on stream end; replays terminal errors like
     /// [`Cursor::next_batch`]. No drift check — use
-    /// [`Cursor::as_record_batch_reader`] for that.
+    /// [`Cursor::as_arrow_reader`] for that.
     #[cfg(feature = "arrow")]
     pub fn next_arrow_batch(&mut self) -> Result<Option<arrow_array::RecordBatch>> {
         self.next_arrow_batch_inner(None)
@@ -1580,11 +1580,12 @@ impl<'r> Cursor<'r> {
                     && !schemas_equal(expected.as_ref(), arrow_schema.as_ref())
                 {
                     let e = fmt!(
-                        SchemaDriftMidStream,
+                        SchemaDrift,
                         "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
                         decoded.batch_seq
                     );
-                    self.stash_arrow_terminal_error(&e);
+                    // Discard the drift batch but keep the cursor live —
+                    // the caller may re-pin and resume from the next batch.
                     return Err(e);
                 }
                 match batch_to_record_batch(

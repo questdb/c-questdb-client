@@ -194,10 +194,12 @@ typedef enum line_reader_error_code
      *  and remains transparent. */
     line_reader_error_failover_would_duplicate = 21,
     /** Streaming Arrow adapter saw a mid-stream schema change. The
-     *  cursor is still usable; re-wrap with
-     *  `line_reader_cursor_next_arrow_batch` after dropping any
-     *  partial state to snapshot the new schema. Only emitted when
-     *  the `arrow` feature is enabled. */
+     *  cursor remains usable; its pinned schema snapshot is cleared
+     *  by this error, so the next
+     *  `line_reader_cursor_next_arrow_batch` call snapshots the new
+     *  schema and resumes streaming. The batch that triggered the
+     *  drift is discarded — re-issue the query if you need it. Only
+     *  emitted when the `arrow` feature is enabled. */
     line_reader_error_schema_drift = 22,
     /** `line_reader_cursor_next_arrow_batch` was called on a stream
      *  that terminated before any batch was produced — no schema to
@@ -1786,7 +1788,8 @@ typedef enum line_reader_arrow_batch_result
  * Mid-stream schema drift (the underlying QuestDB table altered between
  * batches) surfaces as `line_reader_error_schema_drift` (= 22) on the
  * call that detects it; the cursor's pinned schema snapshot is then
- * cleared so the next call snapshots the new schema and resumes.
+ * cleared so the next call snapshots the new schema and resumes. The
+ * batch that triggered the drift is discarded.
  */
 QUESTDB_CLIENT_API
 line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(

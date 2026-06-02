@@ -21,7 +21,7 @@ impl Cursor<'_> {
     /// simply disagree on columns. Use
     /// [`Cursor::iter_polars`](crate::egress::Cursor::iter_polars)
     /// for a drift-checked iterator, or
-    /// [`Cursor::fetch_all_polars`] / [`Cursor::as_record_batch_reader`]
+    /// [`Cursor::fetch_all_polars`] / [`Cursor::as_arrow_reader`]
     /// for higher-level adapters that pin the schema on first batch.
     pub fn next_polars(&mut self) -> Result<Option<DataFrame>> {
         match self.next_arrow_batch_inner(None)? {
@@ -43,9 +43,18 @@ impl Cursor<'_> {
             acc = Some(match acc {
                 None => df,
                 Some(mut prev) => {
-                    prev.vstack_mut_owned(df)
-                        .map_err(|e| fmt!(ArrowExport, "polars vstack failed: {}", e))?;
-                    prev
+                    // Tentative→firm schema upgrade: the prior batch was a
+                    // placeholder (e.g. empty ndim=1 array column) and this
+                    // batch supplied the firm dtype. vstack would reject the
+                    // mismatched dtypes; replace the placeholder accumulator
+                    // outright.
+                    if prev.height() == 0 && prev.schema() != df.schema() {
+                        df
+                    } else {
+                        prev.vstack_mut_owned(df)
+                            .map_err(|e| fmt!(ArrowExport, "polars vstack failed: {}", e))?;
+                        prev
+                    }
                 }
             });
         }

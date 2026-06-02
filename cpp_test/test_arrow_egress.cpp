@@ -100,7 +100,7 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
     // `next_arrow_batch` snapshots schema eagerly. With ZERO batches the
     // adapter must EITHER:
     //   - throw `line_reader_error_no_schema` (when QWP protocol path
-    //     reaches `as_record_batch_reader` with no first batch), OR
+    //     reaches `as_arrow_reader` with no first batch), OR
     //   - return `nullopt` directly (when the inner pump terminates
     //     first).
     try

@@ -2488,10 +2488,12 @@ public:
         arrow_batch(arrow_batch&& other) noexcept
             : array(other.array), schema(other.schema)
         {
-            other.array.release = nullptr;
-            other.array.private_data = nullptr;
-            other.schema.release = nullptr;
-            other.schema.private_data = nullptr;
+            // Zero the source so its destructor skips release() and so
+            // any post-move access (`other.array.length`, `.buffers[0]`,
+            // children, etc.) reads zeros instead of pointers that now
+            // alias destination-owned memory.
+            std::memset(&other.array, 0, sizeof(other.array));
+            std::memset(&other.schema, 0, sizeof(other.schema));
         }
 
         arrow_batch& operator=(arrow_batch&& other) noexcept
@@ -2501,10 +2503,8 @@ public:
                 release_in_place();
                 array = other.array;
                 schema = other.schema;
-                other.array.release = nullptr;
-                other.array.private_data = nullptr;
-                other.schema.release = nullptr;
-                other.schema.private_data = nullptr;
+                std::memset(&other.array, 0, sizeof(other.array));
+                std::memset(&other.schema, 0, sizeof(other.schema));
             }
             return *this;
         }

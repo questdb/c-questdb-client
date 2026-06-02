@@ -2425,7 +2425,7 @@ struct QwpWsTableBuffer {
     in_progress_column_count: usize,
     column_access_cursor: usize,
     columns: Vec<QwpWsColumnBuffer>,
-    column_lookup: std::collections::HashMap<String, usize>,
+    column_lookup: std::collections::HashMap<Box<[u8]>, usize>,
     row_mark: Option<QwpWsRowRollbackMark>,
 }
 
@@ -2679,6 +2679,8 @@ pub(crate) struct QwpWsColumnarBuffer {
     bookmark: StoredBookmark<QwpWsMarker>,
     snapshots: Vec<QwpWsSnapshot>,
     max_name_len: usize,
+    #[cfg(feature = "arrow")]
+    arrow_rollback_marks_cache: Vec<ArrowColRollbackMark>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2696,6 +2698,8 @@ impl Clone for QwpWsColumnarBuffer {
             bookmark: self.bookmark,
             snapshots: self.snapshots.clone(),
             max_name_len: self.max_name_len,
+            #[cfg(feature = "arrow")]
+            arrow_rollback_marks_cache: Vec::new(),
         }
     }
 }
@@ -2712,6 +2716,8 @@ impl QwpWsColumnarBuffer {
             bookmark: StoredBookmark::new(),
             snapshots: Vec::new(),
             max_name_len,
+            #[cfg(feature = "arrow")]
+            arrow_rollback_marks_cache: Vec::new(),
         }
     }
 
@@ -3568,7 +3574,12 @@ impl QwpWsColumnarBuffer {
             column_access_cursor: table.column_access_cursor,
             columns_len: table.columns.len(),
         };
-        let pre_column_marks = table.columns.iter().map(|c| c.arrow_snapshot()).collect();
+        // Recycle the rollback-marks Vec across `append_arrow` calls.
+        // Avoids the per-batch heap allocation that scales with column
+        // count on wide schemas.
+        let mut pre_column_marks = std::mem::take(&mut self.arrow_rollback_marks_cache);
+        pre_column_marks.clear();
+        pre_column_marks.extend(table.columns.iter().map(|c| c.arrow_snapshot()));
         Ok(ArrowBulkCtx {
             table_idx: idx,
             starting_rows,
@@ -3579,17 +3590,13 @@ impl QwpWsColumnarBuffer {
     }
 
     #[cfg(feature = "arrow")]
-    pub(crate) fn arrow_bulk_rollback(&mut self, ctx: ArrowBulkCtx) {
+    pub(crate) fn arrow_bulk_rollback(&mut self, mut ctx: ArrowBulkCtx) {
         let table = &mut self.tables[ctx.table_idx];
         let pre_count = ctx.table_mark.columns_len;
         if table.columns.len() > pre_count {
             table.columns.truncate(pre_count);
         }
-        for (col, mark) in table
-            .columns
-            .iter_mut()
-            .zip(ctx.pre_column_marks.into_iter())
-        {
+        for (col, mark) in table.columns.iter_mut().zip(ctx.pre_column_marks.drain(..)) {
             col.arrow_restore(mark);
         }
         table.row_count = ctx.table_mark.row_count;
@@ -3605,6 +3612,18 @@ impl QwpWsColumnarBuffer {
             self.tables.truncate(ctx.tables_len_before);
             self.rebuild_table_lookup();
         }
+        self.arrow_rollback_marks_cache = std::mem::take(&mut ctx.pre_column_marks);
+    }
+
+    /// Reclaim the `pre_column_marks` Vec from a finished bulk-arrow ctx
+    /// into the per-buffer recycle cache. Call from the success path
+    /// (after `arrow_bulk_commit`) so the next batch can reuse the
+    /// allocation. No-op if the ctx has already been consumed by
+    /// `arrow_bulk_rollback`.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn arrow_bulk_finish(&mut self, mut ctx: ArrowBulkCtx) {
+        ctx.pre_column_marks.clear();
+        self.arrow_rollback_marks_cache = std::mem::take(&mut ctx.pre_column_marks);
     }
 
     #[cfg(feature = "arrow")]
@@ -3648,17 +3667,20 @@ impl QwpWsColumnarBuffer {
     }
 
     #[cfg(feature = "arrow")]
-    pub(crate) fn arrow_bulk_set_bool(
+    pub(crate) fn arrow_bulk_set_bool<F>(
         &mut self,
         ctx: &ArrowBulkCtx,
         column_name: ColumnName<'_>,
-        batch_packed_bits: &[u8],
         info: ArrowBatchInfo<'_>,
-    ) -> crate::Result<()> {
+        pack: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>, usize) -> crate::Result<()>,
+    {
         let col_bytes = column_name.as_ref().as_bytes();
         self.validate_max_name_len(column_name.as_ref())?;
         let col_idx = self.lookup_or_create_arrow_column(ctx, col_bytes, ColumnKind::Bool)?;
-        self.tables[ctx.table_idx].columns[col_idx].append_arrow_bool_batch(batch_packed_bits, info)
+        self.tables[ctx.table_idx].columns[col_idx].append_arrow_bool_batch(info, pack)
     }
 
     #[cfg(feature = "arrow")]
@@ -4121,9 +4143,22 @@ impl QwpWsTableBuffer {
             return Ok(Some(self.column_access_cursor));
         }
 
-        let lookup_key = column_lookup_key(name)?;
-        if let Some(&idx) = self.column_lookup.get(&lookup_key) {
-            return Ok(Some(idx));
+        // Stack-buffered lowercase key — avoids the per-call heap alloc
+        // on the lookup miss path (a missed cursor lookup happens once
+        // per new column per batch, before `create_column` inserts).
+        let mut stack: [u8; 128] = [0; 128];
+        if name.len() <= stack.len() {
+            for (dst, src) in stack[..name.len()].iter_mut().zip(name.iter()) {
+                *dst = src.to_ascii_lowercase();
+            }
+            if let Some(&idx) = self.column_lookup.get(&stack[..name.len()]) {
+                return Ok(Some(idx));
+            }
+        } else {
+            let lookup_key = column_lookup_key(name)?;
+            if let Some(&idx) = self.column_lookup.get(&lookup_key[..]) {
+                return Ok(Some(idx));
+            }
         }
 
         Ok(None)
@@ -4853,22 +4888,16 @@ impl QwpWsColumnBuffer {
     }
 
     #[cfg(feature = "arrow")]
-    fn append_arrow_bool_batch(
+    fn append_arrow_bool_batch<F>(
         &mut self,
-        batch_packed_bits: &[u8],
         info: ArrowBatchInfo<'_>,
-    ) -> crate::Result<()> {
+        pack: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>, usize) -> crate::Result<()>,
+    {
         if self.kind != ColumnKind::Bool {
             return Err(type_mismatch_error_ws(&self.name));
-        }
-        if batch_packed_bits.len() != (info.rows as usize).div_ceil(8) {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "QWP/WS arrow-bool expects {} packed bytes for {} rows, got {}",
-                (info.rows as usize).div_ceil(8),
-                info.rows,
-                batch_packed_bits.len()
-            ));
         }
         if !matches!(self.values, QwpWsColumnValues::ArrowBool { .. }) {
             if !self.is_fresh() {
@@ -4894,12 +4923,7 @@ impl QwpWsColumnBuffer {
         else {
             unreachable!()
         };
-        append_packed_bits(
-            packed_bits,
-            prior_rows as usize,
-            batch_packed_bits,
-            info.rows as usize,
-        );
+        pack(packed_bits, prior_rows as usize)?;
         extend_qwp_bitmap(bitmap, prior_rows as usize, info.bitmap, info.rows as usize);
         *row_count = new_row_count;
         self.non_null_count = new_non_null;
@@ -6265,15 +6289,10 @@ fn names_equal_lower_ascii(left_lower: &[u8], packed_left_lower: u64, right: &[u
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn column_lookup_key(name: &[u8]) -> crate::Result<String> {
-    let name = std::str::from_utf8(name).map_err(|err| {
-        error::fmt!(
-            InvalidApiCall,
-            "internal QWP/WS column name is not UTF-8: {}",
-            err
-        )
-    })?;
-    Ok(name.to_lowercase())
+fn column_lookup_key(name: &[u8]) -> crate::Result<Box<[u8]>> {
+    let mut buf = Vec::with_capacity(name.len());
+    buf.extend(name.iter().map(|b| b.to_ascii_lowercase()));
+    Ok(buf.into_boxed_slice())
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -6456,6 +6475,12 @@ impl QwpWsColumnBuffer {
                 *bitmap = None;
             }
             Some(len) => {
+                debug_assert!(
+                    bitmap.is_some(),
+                    "arrow_restore: bitmap was Some({}) at snapshot but is None now \
+                     — invariant violated by a mid-batch reset",
+                    len
+                );
                 if let Some(b) = bitmap.as_mut() {
                     b.truncate(len);
                 }
@@ -6676,37 +6701,6 @@ fn arrow_bulk_mixing_error(column_name: &[u8]) -> crate::Error {
     )
 }
 
-#[cfg(feature = "arrow")]
-fn append_packed_bits(
-    existing: &mut Vec<u8>,
-    existing_rows: usize,
-    incoming: &[u8],
-    incoming_rows: usize,
-) {
-    let total_rows = existing_rows + incoming_rows;
-    let total_bytes = total_rows.div_ceil(8);
-    if existing.len() < total_bytes {
-        existing.resize(total_bytes, 0);
-    }
-    if existing_rows.is_multiple_of(8) {
-        let dst_off = existing_rows / 8;
-        let full_bytes = incoming_rows / 8;
-        existing[dst_off..dst_off + full_bytes].copy_from_slice(&incoming[..full_bytes]);
-        let trailing = incoming_rows % 8;
-        if trailing != 0 {
-            let mask = (1u8 << trailing) - 1;
-            existing[dst_off + full_bytes] |= incoming[full_bytes] & mask;
-        }
-        return;
-    }
-    for i in 0..incoming_rows {
-        if (incoming[i / 8] >> (i % 8)) & 1 == 1 {
-            let target = existing_rows + i;
-            existing[target / 8] |= 1 << (target % 8);
-        }
-    }
-}
-
 // Arrow validity is valid=1; QWP wants null=1. OR-with-NOT inverts; the
 // trailing-byte mask prevents setting nulls past `incoming_rows`.
 #[cfg(feature = "arrow")]
@@ -6731,20 +6725,54 @@ fn extend_qwp_bitmap(
         && nulls.null_count() > 0
     {
         let arrow_offset_bits = nulls.offset();
-        if arrow_offset_bits.is_multiple_of(8) && existing_rows.is_multiple_of(8) {
+        let src_off_byte = arrow_offset_bits / 8;
+        let shift = arrow_offset_bits % 8;
+        if shift == 0 && existing_rows.is_multiple_of(8) {
+            // Byte-aligned source AND byte-aligned destination: straight
+            // bitwise NOT into place.
             let src = nulls.validity();
-            let src_off = arrow_offset_bits / 8;
             let dst_off = existing_rows / 8;
             let full_bytes = incoming_rows / 8;
             for i in 0..full_bytes {
-                bm[dst_off + i] |= !src[src_off + i];
+                bm[dst_off + i] |= !src[src_off_byte + i];
             }
             let trailing = incoming_rows % 8;
             if trailing != 0 {
                 let mask = (1u8 << trailing) - 1;
-                bm[dst_off + full_bytes] |= (!src[src_off + full_bytes]) & mask;
+                bm[dst_off + full_bytes] |= (!src[src_off_byte + full_bytes]) & mask;
+            }
+        } else if existing_rows.is_multiple_of(8) {
+            // Bit-misaligned source (Polars slice at non-byte boundary),
+            // byte-aligned destination: shift-and-OR pass. Each destination
+            // byte combines the high (8 - shift) bits of one source byte
+            // with the low `shift` bits of the next, then is bitwise-NOTted.
+            let src = nulls.validity();
+            let dst_off = existing_rows / 8;
+            let full_bytes = incoming_rows / 8;
+            let inv_shift = 8 - shift;
+            for i in 0..full_bytes {
+                let lo = src[src_off_byte + i] >> shift;
+                let hi = src[src_off_byte + i + 1] << inv_shift;
+                bm[dst_off + i] |= !(lo | hi);
+            }
+            let trailing = incoming_rows % 8;
+            if trailing != 0 {
+                let mask = (1u8 << trailing) - 1;
+                // The last byte may need one or two source bytes depending on
+                // whether the trailing window crosses a source byte boundary.
+                let lo = src[src_off_byte + full_bytes] >> shift;
+                let needs_next = shift + trailing > 8;
+                let merged = if needs_next {
+                    lo | (src[src_off_byte + full_bytes + 1] << inv_shift)
+                } else {
+                    lo
+                };
+                bm[dst_off + full_bytes] |= (!merged) & mask;
             }
         } else {
+            // Non-byte-aligned destination — rare (would require a prior
+            // batch with a non-multiple-of-8 row count). Stay on the
+            // per-row loop.
             for i in 0..incoming_rows {
                 if nulls.is_null(i) {
                     let target = existing_rows + i;

@@ -195,7 +195,7 @@ compression-zstd = ["_egress", "dep:zstd"]
 ## RecordBatch → Buffer (ingress). Both directions ride QWP/WS.
 ## See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
 arrow = [
-    "_egress",
+    "sync-reader-ws",
     "_sender-qwp-ws",
     "dep:arrow",
     "dep:arrow-array",

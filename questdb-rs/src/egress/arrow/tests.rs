@@ -861,3 +861,28 @@ fn schemas_equal_detects_array_dim_drift_when_both_firm() {
     .unwrap();
     assert!(!schemas_equal(&s1, &s2));
 }
+
+// Force `ArrayDataBuilder::build()` to reject a malformed Decimal64
+// payload (10 rows promised, only 8 bytes supplied — one row's worth)
+// and verify the failure surfaces as `ErrorCode::ArrowExport` through
+// `batch_to_record_batch`. Regression guard against the export wrap
+// being dropped on a future refactor: without it, the underlying
+// arrow-rs error would propagate as a different code (or panic under
+// `panic = "abort"`).
+#[test]
+fn arrow_export_surfaces_on_malformed_decimal64() {
+    use crate::egress::error::ErrorCode;
+    let values = vec![0u8; 8];
+    let s = schema_of(&[("d", ColumnKind::Decimal64)]);
+    let b = decoded_of(
+        10,
+        vec![DecodedColumn::Decimal64 {
+            buffer: buf(values, None),
+            scale: 2,
+        }],
+    );
+    let arrow_schema = Arc::new(batch_arrow_schema(&s, &b).unwrap());
+    let err = batch_to_record_batch(arrow_schema, &s, b, &SymbolDict::new())
+        .expect_err("malformed Decimal64 must error, not panic");
+    assert_eq!(err.code(), ErrorCode::ArrowExport);
+}

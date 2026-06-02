@@ -3,20 +3,26 @@
 //!
 //! [`dataframe_to_batches`] is the primary entry point. It returns an
 //! iterator that yields slices of at most `max_rows` rows each. Each
-//! emitted slice is taken from a single polars chunk per column, so
-//! row data is never copied — the Arrow C Data Interface only bumps
-//! refcounts. Two costs survive:
+//! emitted slice is taken from a single polars chunk per column. The
+//! conversion cost depends on the dtype:
 //!
-//! * `Column::Scalar` columns are materialised once by polars (cached
-//!   in the column's `OnceLock`); subsequent batches slice from that
-//!   cache zero-copy. Sending a scalar as columnar data requires the
-//!   value to actually exist in memory N times — there is no
-//!   zero-copy alternative.
-//! * Polars *logical* dtypes that arrow-rs does not have natively
-//!   (Datetime, Date, Time, Duration, Categorical, Enum) incur a
-//!   per-chunk `cast_default` at the polars→arrow conversion step.
-//!   Primitive, String, Binary, and Decimal columns at the newest
-//!   compat level are pure refcount bumps.
+//! * **Primitive, String, Binary, Decimal at the newest compat level**:
+//!   the per-chunk Arrow C Data Interface handoff is a pure refcount
+//!   bump and the per-batch slice is zero-copy.
+//! * **`Column::Scalar` columns**: materialised once by polars (cached
+//!   in the column's `OnceLock`); subsequent batches slice that cache
+//!   zero-copy. Sending a scalar as columnar data requires the value to
+//!   exist in memory N times — there is no zero-copy alternative.
+//! * **Polars *logical* dtypes that arrow-rs lacks natively** (Datetime,
+//!   Date, Time, Duration, Categorical, Enum): incur a `cast_default`
+//!   per chunk per emitted batch. The converted Arrow chunk is cached
+//!   only for the lifetime of the current chunk within the iterator
+//!   (not across `dataframe_to_batches` calls or across chunk
+//!   boundaries within one call), so a multi-chunk DataFrame with
+//!   timestamp/categorical columns re-pays the cast each time the
+//!   iterator crosses a chunk boundary. Acceptable for typical batch
+//!   sizes (10 K rows ≈ µs of cast vs ms of wire send) but worth
+//!   knowing if you slice into many small batches.
 //!
 //! Flushing is the caller's responsibility:
 //!
