@@ -6,30 +6,10 @@ use polars::frame::DataFrame;
 use polars::prelude::{Column, IntoColumn, PlSmallStr, Series};
 
 use crate::egress::Cursor;
+use crate::egress::arrow::has_tentative_array;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 
-// `transmute_copy` below relies on layout parity with `arrow::ffi`.
-// These asserts catch size/alignment drift; field order is NOT
-// verifiable across crate boundaries — re-check the Arrow C Data
-// Interface field order on every `polars-arrow` version bump.
-const _: () = assert!(
-    std::mem::size_of::<polars_arrow::ffi::ArrowArray>()
-        == std::mem::size_of::<arrow::ffi::FFI_ArrowArray>(),
-    "polars_arrow::ffi::ArrowArray size diverged from arrow::ffi::FFI_ArrowArray"
-);
-const _: () = assert!(
-    std::mem::size_of::<polars_arrow::ffi::ArrowSchema>()
-        == std::mem::size_of::<arrow::ffi::FFI_ArrowSchema>(),
-    "polars_arrow::ffi::ArrowSchema size diverged from arrow::ffi::FFI_ArrowSchema"
-);
-const _: () = assert!(
-    std::mem::align_of::<polars_arrow::ffi::ArrowArray>()
-        == std::mem::align_of::<arrow::ffi::FFI_ArrowArray>(),
-);
-const _: () = assert!(
-    std::mem::align_of::<polars_arrow::ffi::ArrowSchema>()
-        == std::mem::align_of::<arrow::ffi::FFI_ArrowSchema>(),
-);
+// FFI cross-crate helpers in `crate::ingress::polars`.
 
 impl Cursor<'_> {
     /// Decode one batch as a Polars [`DataFrame`]. `Ok(None)` on
@@ -105,6 +85,8 @@ impl<'r, 'c> CursorPolarsIter<'r, 'c> {
         })
     }
 
+    /// First batch's schema. Upgrades on tentative→firm ndim
+    /// (see [`has_tentative_array`]).
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -137,18 +119,17 @@ impl Iterator for CursorPolarsIter<'_, '_> {
                 }
             }
         };
-        Some(record_batch_to_dataframe(rb))
+        let df = record_batch_to_dataframe(rb);
+        if df.is_err() {
+            self.poisoned = true;
+        }
+        Some(df)
     }
 }
 
-fn has_tentative_array(schema: &SchemaRef) -> bool {
-    schema.fields().iter().any(|f| {
-        f.metadata()
-            .get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
-            .is_some_and(|v| v == "true")
-    })
-}
-
+/// [`RecordBatch`] → Polars [`DataFrame`] via Arrow C Data Interface.
+/// Zero-copy for primitive/string/binary. [`ErrorCode::ArrowExport`] on
+/// handoff failure.
 pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
     let schema = rb.schema();
     let row_count = rb.num_rows();
@@ -163,12 +144,8 @@ pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
                 e
             )
         })?;
-        let pa_schema: polars_arrow::ffi::ArrowSchema =
-            unsafe { std::mem::transmute_copy(&rs_schema) };
-        std::mem::forget(rs_schema);
-        let pa_array: polars_arrow::ffi::ArrowArray =
-            unsafe { std::mem::transmute_copy(&rs_array) };
-        std::mem::forget(rs_array);
+        let pa_schema = unsafe { crate::ingress::polars::rs_schema_into_pa(rs_schema) };
+        let pa_array = unsafe { crate::ingress::polars::rs_array_into_pa(rs_array) };
         let pa_field =
             unsafe { polars_arrow::ffi::import_field_from_c(&pa_schema) }.map_err(|e| {
                 fmt!(

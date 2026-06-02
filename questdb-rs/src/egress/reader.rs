@@ -1517,6 +1517,15 @@ impl<'r> Cursor<'r> {
         crate::egress::arrow::CursorPolarsIter::new(self)
     }
 
+    /// Next batch as an Arrow [`RecordBatch`](arrow_array::RecordBatch).
+    /// `Ok(None)` on stream end; replays terminal errors like
+    /// [`Cursor::next_batch`]. No drift check — use
+    /// [`Cursor::as_record_batch_reader`] for that.
+    #[cfg(feature = "arrow")]
+    pub fn next_arrow_batch(&mut self) -> Result<Option<arrow_array::RecordBatch>> {
+        self.next_arrow_batch_inner(None)
+    }
+
     #[cfg(feature = "arrow")]
     #[doc(hidden)]
     pub fn next_arrow_batch_inner(
@@ -1548,36 +1557,59 @@ impl<'r> Cursor<'r> {
                     .last_batch
                     .take()
                     .expect("HaveBatch implies last_batch");
-                let egress_schema = self
-                    .reader
-                    .registry
-                    .get(decoded.schema_id)
-                    .ok_or_else(|| {
-                        fmt!(
+                let egress_schema = match self.reader.registry.get(decoded.schema_id) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let e = fmt!(
                             ProtocolError,
                             "schema id {} missing from registry",
                             decoded.schema_id
-                        )
-                    })?
-                    .clone();
-                let arrow_schema = Arc::new(batch_arrow_schema(&egress_schema, &decoded)?);
+                        );
+                        self.stash_arrow_terminal_error(&e);
+                        return Err(e);
+                    }
+                };
+                let arrow_schema = match batch_arrow_schema(&egress_schema, &decoded) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        self.stash_arrow_terminal_error(&e);
+                        return Err(e);
+                    }
+                };
                 if let Some(expected) = expected_schema
                     && !schemas_equal(expected.as_ref(), arrow_schema.as_ref())
                 {
-                    return Err(fmt!(
+                    let e = fmt!(
                         SchemaDriftMidStream,
                         "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
                         decoded.batch_seq
-                    ));
+                    );
+                    self.stash_arrow_terminal_error(&e);
+                    return Err(e);
                 }
-                let rb = batch_to_record_batch(
+                match batch_to_record_batch(
                     arrow_schema,
                     &egress_schema,
                     decoded,
                     &self.reader.dict,
-                )?;
-                Ok(Some(rb))
+                ) {
+                    Ok(rb) => Ok(Some(rb)),
+                    Err(e) => {
+                        self.stash_arrow_terminal_error(&e);
+                        Err(e)
+                    }
+                }
             }
+        }
+    }
+
+    // Replay-contract stash for errors that bypass `next_batch_inner`
+    // (schema drift, batch_to_record_batch). Cursor stays live.
+    #[cfg(feature = "arrow")]
+    fn stash_arrow_terminal_error(&mut self, err: &Error) {
+        self.done = true;
+        if self.terminal_error.is_none() {
+            self.terminal_error = Some(err.clone());
         }
     }
 

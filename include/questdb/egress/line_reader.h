@@ -35,7 +35,7 @@ extern "C" {
 
 /* Reuse `line_sender_utf8` for validated UTF-8 strings, and the
    `QUESTDB_CLIENT_API` / `QUESTDB_CLIENT_DYN_LIB` linkage macros. */
-#include "../ingress/line_sender.h"
+#include <questdb/ingress/line_sender.h>
 
 /////////// Thread safety.
 //
@@ -1764,44 +1764,6 @@ static inline bool line_reader_column_data_get_symbol(
 }
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
-/* Apache Arrow C Data Interface (feature: arrow).
- * https://arrow.apache.org/docs/format/CDataInterface.html */
-
-#    ifndef ARROW_C_DATA_INTERFACE
-#        define ARROW_C_DATA_INTERFACE
-
-#        define ARROW_FLAG_DICTIONARY_ORDERED 1
-#        define ARROW_FLAG_NULLABLE 2
-#        define ARROW_FLAG_MAP_KEYS_SORTED 4
-
-struct ArrowSchema
-{
-    const char* format;
-    const char* name;
-    const char* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-
-struct ArrowArray
-{
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-#    endif /* ARROW_C_DATA_INTERFACE */
 
 typedef enum line_reader_arrow_batch_result
 {

@@ -739,6 +739,14 @@ fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Optio
     for b in inverted.iter_mut() {
         *b = !*b;
     }
+    // Mask post-inversion trailing bits — pads were 0, would flip to 1
+    // (=valid) and pollute downstream raw-bitmap hashers/copiers.
+    let trailing_bits = row_count % 8;
+    if trailing_bits != 0
+        && let Some(last) = inverted.last_mut()
+    {
+        *last &= (1u8 << trailing_bits) - 1;
+    }
     Ok(Some(NullBuffer::new(arrow_buffer::BooleanBuffer::new(
         Buffer::from(bytes_from_avec(inverted)),
         0,
@@ -746,6 +754,8 @@ fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Optio
     ))))
 }
 
+/// Boxes a QuestDB [`Error`] as an [`ArrowError::ExternalError`].
+/// Recover via [`try_downcast_questdb`](super::reader::try_downcast_questdb).
 pub fn external_arrow_error(e: Error) -> ArrowError {
     ArrowError::ExternalError(Box::new(e))
 }

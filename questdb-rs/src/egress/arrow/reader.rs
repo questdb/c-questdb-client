@@ -59,6 +59,8 @@ impl<'r, 'c> CursorRecordBatchReader<'r, 'c> {
         })
     }
 
+    /// Snapshotted schema. Same as the [`RecordBatchReader::schema`]
+    /// trait method, exposed for callers without the trait imported.
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -93,7 +95,9 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
     }
 }
 
-fn has_tentative_array(schema: &SchemaRef) -> bool {
+/// True if any field carries [`metadata::ARRAY_DIM_TENTATIVE`](crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE).
+/// Gates the tentative→firm ndim mid-stream upgrade.
+pub fn has_tentative_array(schema: &SchemaRef) -> bool {
     schema.fields().iter().any(|f| {
         f.metadata()
             .get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)

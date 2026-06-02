@@ -12,7 +12,7 @@ mod tests;
 pub use convert::external_arrow_error;
 #[cfg(feature = "polars")]
 pub use polars::CursorPolarsIter;
-pub use reader::{CursorRecordBatchReader, try_downcast_questdb};
+pub use reader::{CursorRecordBatchReader, has_tentative_array, try_downcast_questdb};
 
 pub(crate) use convert::batch_to_record_batch;
 pub(crate) use schema::{batch_arrow_schema, schemas_equal};

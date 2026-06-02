@@ -942,6 +942,7 @@ pub unsafe extern "C" fn line_sender_buffer_new_qwp() -> *mut line_sender_buffer
 /// Construct a QWP/WebSocket columnar `line_sender_buffer` with the
 /// default 127-byte name length limit. Required by
 /// `line_sender_buffer_append_arrow*`.
+#[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws() -> *mut line_sender_buffer {
     let buffer = Buffer::new_qwp_ws();
@@ -3635,18 +3636,9 @@ pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
     }
 }
 
-/// Catches a Rust panic inside an `extern "C"` body and aborts. Compiles
-/// to a tail call under this crate's `panic = "abort"` profiles
-/// (release + dev); the `Err(_)` arm only fires under `cargo test`,
-/// which forces unwind.
-#[cfg(feature = "arrow")]
-#[inline]
-fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(r) => r,
-        Err(_) => std::process::abort(),
-    }
-}
+// Crate is `panic = "abort"`; `catch_unwind` would be a no-op in
+// shipped builds and harms `cargo test` diagnostics. Validation
+// happens up-front in `arrow_append_impl`.
 
 /// Append every row of an Apache Arrow `RecordBatch` (Arrow C Data
 /// Interface) to `buffer`. The per-row designated timestamp is not
@@ -3667,7 +3659,7 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
     schema: *const arrow::ffi::FFI_ArrowSchema,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    panic_guard(|| unsafe { arrow_append_impl(buffer, table, array, schema, None, err_out) })
+    unsafe { arrow_append_impl(buffer, table, array, schema, None, err_out) }
 }
 
 /// Variant of `line_sender_buffer_append_arrow` that sources each
@@ -3685,16 +3677,20 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow_at_column(
     ts_column: line_sender_column_name,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    panic_guard(|| unsafe {
-        arrow_append_impl(buffer, table, array, schema, Some(ts_column), err_out)
-    })
+    unsafe { arrow_append_impl(buffer, table, array, schema, Some(ts_column), err_out) }
 }
 
 // `arrow::ffi::from_ffi` walks `children` recursively; the iterative
-// pre-walk in `validate_arrow_schema_depth` keeps an adversarial schema
+// pre-walk in `validate_arrow_ffi_shape` keeps an adversarial schema
 // from blowing the stack inside arrow-rs before our depth check runs.
 #[cfg(feature = "arrow")]
 const MAX_ARROW_SCHEMA_DEPTH: usize = 64;
+
+// Per-node breadth cap. Without this an adversarial single-level schema
+// with `n_children = i64::MAX` would drive `Vec::push` past available
+// RAM before the depth check fires.
+#[cfg(feature = "arrow")]
+const MAX_ARROW_SCHEMA_CHILDREN_PER_NODE: i64 = 65_536;
 
 #[cfg(feature = "arrow")]
 unsafe fn validate_arrow_schema_depth(
@@ -3717,6 +3713,15 @@ unsafe fn validate_arrow_schema_depth(
             if n <= 0 {
                 continue;
             }
+            if n > MAX_ARROW_SCHEMA_CHILDREN_PER_NODE {
+                return Err(Error::new(
+                    ErrorCode::ArrowIngest,
+                    format!(
+                        "Arrow schema n_children {} exceeds per-node cap {}",
+                        n, MAX_ARROW_SCHEMA_CHILDREN_PER_NODE
+                    ),
+                ));
+            }
             let children = (*s).children;
             if children.is_null() {
                 return Err(Error::new(
@@ -3730,6 +3735,58 @@ unsafe fn validate_arrow_schema_depth(
                     return Err(Error::new(
                         ErrorCode::ArrowIngest,
                         "Arrow schema child pointer is NULL".to_string(),
+                    ));
+                }
+                stack.push((child as *const _, depth + 1));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "arrow")]
+unsafe fn validate_arrow_array_depth(
+    array: *const arrow::ffi::FFI_ArrowArray,
+) -> questdb::Result<()> {
+    unsafe {
+        let mut stack: Vec<(*const arrow::ffi::FFI_ArrowArray, usize)> = Vec::new();
+        stack.push((array, 0));
+        while let Some((a, depth)) = stack.pop() {
+            if depth > MAX_ARROW_SCHEMA_DEPTH {
+                return Err(Error::new(
+                    ErrorCode::ArrowIngest,
+                    format!(
+                        "Arrow array nesting depth exceeds {}",
+                        MAX_ARROW_SCHEMA_DEPTH
+                    ),
+                ));
+            }
+            let n = (*a).n_children;
+            if n <= 0 {
+                continue;
+            }
+            if n > MAX_ARROW_SCHEMA_CHILDREN_PER_NODE {
+                return Err(Error::new(
+                    ErrorCode::ArrowIngest,
+                    format!(
+                        "Arrow array n_children {} exceeds per-node cap {}",
+                        n, MAX_ARROW_SCHEMA_CHILDREN_PER_NODE
+                    ),
+                ));
+            }
+            let children = (*a).children;
+            if children.is_null() {
+                return Err(Error::new(
+                    ErrorCode::ArrowIngest,
+                    "Arrow array declares children but pointer is NULL".to_string(),
+                ));
+            }
+            for i in 0..n as usize {
+                let child = *children.add(i);
+                if child.is_null() {
+                    return Err(Error::new(
+                        ErrorCode::ArrowIngest,
+                        "Arrow array child pointer is NULL".to_string(),
                     ));
                 }
                 stack.push((child as *const _, depth + 1));
@@ -3760,14 +3817,18 @@ unsafe fn arrow_append_impl(
             );
             return false;
         }
-        // Schema depth validated before any consume so the caller keeps
-        // ownership of `array->release` if validation fails.
+        // Depth/breadth bound on both children trees BEFORE consume,
+        // so a rejection leaves caller-owned `array->release` intact.
         if let Err(e) = validate_arrow_schema_depth(schema) {
             arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
             return false;
         }
-        // Move the FFI struct out and null the caller's slot; every
-        // subsequent return path drops `imported_array` exactly once.
+        if let Err(e) = validate_arrow_array_depth(array) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return false;
+        }
+        // Move out + null caller's release; every return path now
+        // drops `imported_array` exactly once.
         let imported_array = std::ptr::read(array);
         (*array).release = None;
         let inner = unwrap_buffer_mut(buffer);
@@ -3782,9 +3843,17 @@ unsafe fn arrow_append_impl(
                 return false;
             }
         };
+        // `from_ffi` uses `new_unchecked`; this is the trust boundary.
+        // A skipped bound here aborts the host under `panic = "abort"`.
+        if let Err(e) = array_data.validate_full() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::ArrowIngest,
+                format!("Arrow array validation failed: {}", e),
+            );
+            return false;
+        }
         let rb = if matches!(array_data.data_type(), DataType::Struct(_)) {
-            // `RecordBatch::from(StructArray)` asserts on root nulls;
-            // surface that as `ArrowIngest` to avoid a process abort.
             if array_data.nulls().is_some_and(|n| n.null_count() > 0) {
                 arrow_err_to_c_box(
                     err_out,
@@ -3794,7 +3863,30 @@ unsafe fn arrow_append_impl(
                 );
                 return false;
             }
-            RecordBatch::from(StructArray::from(array_data))
+            let struct_arr = match StructArray::try_from(array_data) {
+                Ok(s) => s,
+                Err(e) => {
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::ArrowIngest,
+                        format!("StructArray::try_from failed: {}", e),
+                    );
+                    return false;
+                }
+            };
+            let rb_schema = Arc::new(Schema::new(struct_arr.fields().clone()));
+            let columns: Vec<ArrayRef> = struct_arr.columns().to_vec();
+            match RecordBatch::try_new(rb_schema, columns) {
+                Ok(rb) => rb,
+                Err(e) => {
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::ArrowIngest,
+                        format!("RecordBatch::try_new failed: {}", e),
+                    );
+                    return false;
+                }
+            }
         } else {
             let field = match Field::try_from(&*schema) {
                 Ok(f) => f,

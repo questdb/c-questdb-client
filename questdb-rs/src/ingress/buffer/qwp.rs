@@ -3546,6 +3546,12 @@ impl QwpWsColumnarBuffer {
         let tables_len_before = self.tables.len();
         let idx = self.lookup_or_create_table(table_bytes)?;
         if self.tables[idx].in_progress {
+            // Roll back any new entry pushed by `lookup_or_create_table`
+            // so a failed `arrow_bulk_begin` is byte-identical to no-op.
+            if self.tables.len() > tables_len_before {
+                self.tables.truncate(tables_len_before);
+                self.table_lookup.remove(table_bytes);
+            }
             return Err(error::fmt!(
                 InvalidApiCall,
                 "QWP/WS bulk arrow append cannot start while a row is in progress on table '{}'",
@@ -5647,9 +5653,11 @@ impl QwpWsColumnValues {
             }
             Self::LongArray { data, .. } => data.len(),
             #[cfg(feature = "arrow")]
-            Self::ArrowFixed { values, .. }
-            | Self::ArrowGeohash { values, .. }
-            | Self::ArrowDecimal { values, .. } => values.len(),
+            Self::ArrowFixed { values, .. } => values.len(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowDecimal { values, .. } => 1 + values.len(),
+            #[cfg(feature = "arrow")]
+            Self::ArrowGeohash { values, .. } => 1 + values.len(),
             #[cfg(feature = "arrow")]
             Self::ArrowVarLen { offsets, data, .. } => offsets.len().saturating_mul(4) + data.len(),
             #[cfg(feature = "arrow")]
@@ -6307,17 +6315,20 @@ enum ArrowColRollbackMark {
         bitmap_len: Option<usize>,
         values_len: usize,
         row_count: u32,
+        non_null_count: u32,
     },
     ArrowVarLen {
         bitmap_len: Option<usize>,
         offsets_len: usize,
         data_len: usize,
         row_count: u32,
+        non_null_count: u32,
     },
     ArrowBool {
         bitmap_len: Option<usize>,
         packed_bits_len: usize,
         row_count: u32,
+        non_null_count: u32,
     },
     ArrowSymbol {
         bitmap_len: Option<usize>,
@@ -6325,21 +6336,25 @@ enum ArrowColRollbackMark {
         dict_data_len: usize,
         keys_len: usize,
         row_count: u32,
+        non_null_count: u32,
     },
     ArrowDecimal {
         bitmap_len: Option<usize>,
         values_len: usize,
         row_count: u32,
+        non_null_count: u32,
     },
     ArrowGeohash {
         bitmap_len: Option<usize>,
         values_len: usize,
         row_count: u32,
+        non_null_count: u32,
     },
     ArrowArray {
         bitmap_len: Option<usize>,
         data_len: usize,
         row_count: u32,
+        non_null_count: u32,
     },
 }
 
@@ -6347,6 +6362,7 @@ enum ArrowColRollbackMark {
 impl QwpWsColumnBuffer {
     fn arrow_snapshot(&self) -> ArrowColRollbackMark {
         let bitmap_to_len = |b: &Option<Vec<u8>>| b.as_ref().map(|v| v.len());
+        let non_null_count = self.non_null_count;
         match &self.values {
             QwpWsColumnValues::ArrowFixed {
                 bitmap,
@@ -6356,6 +6372,7 @@ impl QwpWsColumnBuffer {
                 bitmap_len: bitmap_to_len(bitmap),
                 values_len: values.len(),
                 row_count: *row_count,
+                non_null_count,
             },
             QwpWsColumnValues::ArrowVarLen {
                 bitmap,
@@ -6367,6 +6384,7 @@ impl QwpWsColumnBuffer {
                 offsets_len: offsets.len(),
                 data_len: data.len(),
                 row_count: *row_count,
+                non_null_count,
             },
             QwpWsColumnValues::ArrowBool {
                 bitmap,
@@ -6376,6 +6394,7 @@ impl QwpWsColumnBuffer {
                 bitmap_len: bitmap_to_len(bitmap),
                 packed_bits_len: packed_bits.len(),
                 row_count: *row_count,
+                non_null_count,
             },
             QwpWsColumnValues::ArrowSymbol {
                 bitmap,
@@ -6390,6 +6409,7 @@ impl QwpWsColumnBuffer {
                 dict_data_len: dict_data.len(),
                 keys_len: keys.len(),
                 row_count: *row_count,
+                non_null_count,
             },
             QwpWsColumnValues::ArrowDecimal {
                 bitmap,
@@ -6400,6 +6420,7 @@ impl QwpWsColumnBuffer {
                 bitmap_len: bitmap_to_len(bitmap),
                 values_len: values.len(),
                 row_count: *row_count,
+                non_null_count,
             },
             QwpWsColumnValues::ArrowGeohash {
                 bitmap,
@@ -6410,6 +6431,7 @@ impl QwpWsColumnBuffer {
                 bitmap_len: bitmap_to_len(bitmap),
                 values_len: values.len(),
                 row_count: *row_count,
+                non_null_count,
             },
             QwpWsColumnValues::ArrowArray {
                 bitmap,
@@ -6419,10 +6441,11 @@ impl QwpWsColumnBuffer {
                 bitmap_len: bitmap_to_len(bitmap),
                 data_len: data.len(),
                 row_count: *row_count,
+                non_null_count,
             },
             _ => ArrowColRollbackMark::NonArrow {
                 last_written_row: self.last_written_row,
-                non_null_count: self.non_null_count,
+                non_null_count,
             },
         }
     }
@@ -6449,11 +6472,13 @@ impl QwpWsColumnBuffer {
                     bitmap_len,
                     values_len,
                     row_count: rc,
+                    non_null_count: nn,
                 },
             ) => {
                 restore_bitmap(bitmap, bitmap_len);
                 values.truncate(values_len);
                 *row_count = rc;
+                self.non_null_count = nn;
             }
             (
                 QwpWsColumnValues::ArrowVarLen {
@@ -6467,12 +6492,14 @@ impl QwpWsColumnBuffer {
                     offsets_len,
                     data_len,
                     row_count: rc,
+                    non_null_count: nn,
                 },
             ) => {
                 restore_bitmap(bitmap, bitmap_len);
                 offsets.truncate(offsets_len);
                 data.truncate(data_len);
                 *row_count = rc;
+                self.non_null_count = nn;
             }
             (
                 QwpWsColumnValues::ArrowBool {
@@ -6484,11 +6511,13 @@ impl QwpWsColumnBuffer {
                     bitmap_len,
                     packed_bits_len,
                     row_count: rc,
+                    non_null_count: nn,
                 },
             ) => {
                 restore_bitmap(bitmap, bitmap_len);
                 packed_bits.truncate(packed_bits_len);
                 *row_count = rc;
+                self.non_null_count = nn;
             }
             (
                 QwpWsColumnValues::ArrowSymbol {
@@ -6505,6 +6534,7 @@ impl QwpWsColumnBuffer {
                     dict_data_len,
                     keys_len,
                     row_count: rc,
+                    non_null_count: nn,
                 },
             ) => {
                 restore_bitmap(bitmap, bitmap_len);
@@ -6513,6 +6543,7 @@ impl QwpWsColumnBuffer {
                 keys.truncate(keys_len);
                 dict_lookup.retain_local_ids_below(dict_len);
                 *row_count = rc;
+                self.non_null_count = nn;
             }
             (
                 QwpWsColumnValues::ArrowDecimal {
@@ -6525,11 +6556,13 @@ impl QwpWsColumnBuffer {
                     bitmap_len,
                     values_len,
                     row_count: rc,
+                    non_null_count: nn,
                 },
             ) => {
                 restore_bitmap(bitmap, bitmap_len);
                 values.truncate(values_len);
                 *row_count = rc;
+                self.non_null_count = nn;
             }
             (
                 QwpWsColumnValues::ArrowGeohash {
@@ -6542,11 +6575,13 @@ impl QwpWsColumnBuffer {
                     bitmap_len,
                     values_len,
                     row_count: rc,
+                    non_null_count: nn,
                 },
             ) => {
                 restore_bitmap(bitmap, bitmap_len);
                 values.truncate(values_len);
                 *row_count = rc;
+                self.non_null_count = nn;
             }
             (
                 QwpWsColumnValues::ArrowArray {
@@ -6558,11 +6593,13 @@ impl QwpWsColumnBuffer {
                     bitmap_len,
                     data_len,
                     row_count: rc,
+                    non_null_count: nn,
                 },
             ) => {
                 restore_bitmap(bitmap, bitmap_len);
                 data.truncate(data_len);
                 *row_count = rc;
+                self.non_null_count = nn;
             }
             (
                 _,
@@ -6579,6 +6616,7 @@ impl QwpWsColumnBuffer {
             }
             _ => {
                 self.values.clear_rows();
+                self.non_null_count = 0;
             }
         }
     }
