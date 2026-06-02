@@ -36,7 +36,6 @@ macro_rules! fmt {
 ///
 /// Accessible via Error's [`code`](Error::code) method.
 #[derive(Debug, Copy, Clone, PartialEq)]
-#[non_exhaustive]
 pub enum ErrorCode {
     /// The host, port, or interface was incorrect.
     CouldNotResolveAddr,

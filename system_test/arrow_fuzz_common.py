@@ -1275,7 +1275,7 @@ class ArrowFuzzBase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         try:
-            import pyarrow  # noqa: F401
+            import pyarrow
         except ImportError:
             self.skipTest("pyarrow is required for the Arrow system tests")
         self._fixture = get_live_fixture(self)

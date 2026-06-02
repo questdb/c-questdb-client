@@ -79,65 +79,66 @@ extern "C" {
 /** An error that occurred when using the line sender. */
 typedef struct line_sender_error line_sender_error;
 
-/** Category of error. */
+/** Category of error.
+ *
+ * Append-only: reordering or inserting in the middle breaks ABI. */
 typedef enum line_sender_error_code
 {
     /** The host, port, or interface was incorrect. */
-    line_sender_error_could_not_resolve_addr,
+    line_sender_error_could_not_resolve_addr = 0,
 
     /** Called methods in the wrong order. E.g. `symbol` after `column`. */
-    line_sender_error_invalid_api_call,
+    line_sender_error_invalid_api_call = 1,
 
     /** A network error connecting or flushing data out. */
-    line_sender_error_socket_error,
+    line_sender_error_socket_error = 2,
 
     /** The string or symbol field is not encoded in valid UTF-8. */
-    line_sender_error_invalid_utf8,
+    line_sender_error_invalid_utf8 = 3,
 
     /** The table name or column name contains bad characters. */
-    line_sender_error_invalid_name,
+    line_sender_error_invalid_name = 4,
 
     /** The supplied timestamp is invalid. */
-    line_sender_error_invalid_timestamp,
+    line_sender_error_invalid_timestamp = 5,
 
     /** Error during the authentication process. */
-    line_sender_error_auth_error,
+    line_sender_error_auth_error = 6,
 
     /** Error during TLS handshake. */
-    line_sender_error_tls_error,
+    line_sender_error_tls_error = 7,
 
     /** The server does not support ILP over HTTP. */
-    line_sender_error_http_not_supported,
+    line_sender_error_http_not_supported = 8,
 
     /** Error sent back from the server during flush. */
-    line_sender_error_server_flush_error,
+    line_sender_error_server_flush_error = 9,
 
     /** Bad configuration. */
-    line_sender_error_config_error,
+    line_sender_error_config_error = 10,
 
     /** There was an error serializing an array. */
-    line_sender_error_array_error,
+    line_sender_error_array_error = 11,
 
     /**  Line sender protocol version error. */
-    line_sender_error_protocol_version_error,
+    line_sender_error_protocol_version_error = 12,
 
     /** The supplied decimal is invalid. */
-    line_sender_error_invalid_decimal,
+    line_sender_error_invalid_decimal = 13,
 
     /** QWP/WebSocket server rejection or terminal protocol violation. */
-    line_sender_error_server_rejection,
+    line_sender_error_server_rejection = 14,
 
-    /** `line_sender_buffer_append_arrow` was passed a column whose Arrow
-     *  / QuestDB kind cannot be persisted to a QuestDB table (e.g.
-     *  `LONG128` ingest is not yet wired; `ARRAY(LONG, N-D)` is
-     *  egress-only). Only emitted with the `arrow` feature enabled. */
-    line_sender_error_arrow_unsupported_column_kind,
+    /** Arrow column whose kind cannot be persisted (e.g.
+     *  `FixedSizeBinary(16)` without `arrow.uuid` extension metadata;
+     *  `ARRAY(LONG, N-D)` is egress-only; nested-list leaf must be
+     *  `Float64`). `arrow` feature only. */
+    line_sender_error_arrow_unsupported_column_kind = 15,
 
-    /** `line_sender_buffer_append_arrow` rejected a `RecordBatch` at
-     *  client-side structural validation (column count, name encoding,
-     *  Arrow C Data Interface struct contract). Only emitted with the
-     *  `arrow` feature enabled. */
-    line_sender_error_arrow_ingest,
+    /** RecordBatch failed client-side structural validation
+     *  (column count, name encoding, C Data Interface contract).
+     *  `arrow` feature only. */
+    line_sender_error_arrow_ingest = 16,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -2045,8 +2046,11 @@ struct ArrowArray
  *   - A non-Struct (single-column) array whose `schema->name` becomes the
  *     column name.
  *
- * `array` is consumed: `array->release` is set to NULL before returning on
- * both success and failure. `schema` is borrowed.
+ * Ownership: `array` is consumed once input validation passes
+ * (non-NULL pointers, schema depth within bounds) — `array->release`
+ * is cleared and the imported buffers are dropped on every subsequent
+ * return path. If validation fails first (NULL or over-deep schema),
+ * `array->release` is left untouched. `schema` is always borrowed.
  *
  * Server-side type-mismatch surfaces from the next `line_sender_flush`.
  */

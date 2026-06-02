@@ -157,7 +157,7 @@ impl From<ErrorCode> for line_reader_error_code {
             ErrorCode::ServerLimitExceeded => line_reader_error_server_limit_exceeded,
             ErrorCode::Cancelled => line_reader_error_cancelled,
             ErrorCode::FailoverWouldDuplicate => line_reader_error_failover_would_duplicate,
-            ErrorCode::SchemaDriftMidStream => line_reader_error_schema_drift,
+            ErrorCode::SchemaDrift => line_reader_error_schema_drift,
             ErrorCode::NoSchema => line_reader_error_no_schema,
             ErrorCode::ArrowExport => line_reader_error_arrow_export,
             // ErrorCode is `#[non_exhaustive]`. Any future variant added
@@ -2557,7 +2557,25 @@ impl line_reader_cursor {
     /// "no-`current_batch`-while-`&mut cursor`" invariant documented on
     /// `line_reader_cursor`. Mutating cursor ops MUST go through here
     /// instead of taking `&mut self.cursor` directly.
+    ///
+    /// Also clears any Arrow schema pin — switching back from the raw
+    /// `BatchView` path to `_next_arrow_batch` should re-snapshot the
+    /// schema, not compare against a stale one from before the detour.
     fn cursor_for_mut(&mut self) -> &mut Cursor<'static> {
+        self.current_batch = None;
+        debug_assert!(self.current_batch.is_none());
+        #[cfg(feature = "arrow")]
+        {
+            self.arrow_schema_pin = None;
+        }
+        &mut self.cursor
+    }
+
+    /// Like `cursor_for_mut` but preserves any Arrow schema pin. For
+    /// auxiliary cursor ops (`cancel`, `add_credit`) that do not advance
+    /// the stream and therefore must not lose the drift-detection
+    /// snapshot established by a prior `_next_arrow_batch`.
+    fn cursor_for_aux(&mut self) -> &mut Cursor<'static> {
         self.current_batch = None;
         debug_assert!(self.current_batch.is_none());
         &mut self.cursor
@@ -2983,13 +3001,10 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
             );
             return false;
         }
-        // Routes through `cursor_for_mut` to maintain the BatchView /
-        // &mut Cursor exclusion invariant — see line_reader_cursor docs.
-        // `cancel()` runs the drain loop which can panic (decoder paths).
-        // The `catch_unwind` + abort below is a no-op in shipped builds
-        // under `panic = abort` and active in test builds; see
-        // `panic_guard` docstring.
-        let inner = (*cursor).cursor_for_mut();
+        // `cursor_for_aux` keeps the Arrow schema pin intact — `cancel`
+        // is a terminal op so the pin is about to be irrelevant, but
+        // sharing the helper with `add_credit` keeps the contract uniform.
+        let inner = (*cursor).cursor_for_aux();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.cancel()));
         let res = match result {
             Ok(r) => r,
@@ -3022,11 +3037,10 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
             );
             return false;
         }
-        // Routes through `cursor_for_mut` — see line_reader_cursor docs.
-        // The `catch_unwind` + abort below is a no-op in shipped builds
-        // under `panic = abort` and active in test builds; see
-        // `panic_guard` docstring.
-        let inner = (*cursor).cursor_for_mut();
+        // `cursor_for_aux` keeps the Arrow schema pin intact across this
+        // flow-control call; otherwise a subsequent `_next_arrow_batch`
+        // would lose its drift snapshot.
+        let inner = (*cursor).cursor_for_aux();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             inner.add_credit(additional_bytes)
         }));
@@ -3789,7 +3803,7 @@ mod tests {
             ErrorCode::ServerLimitExceeded,
             ErrorCode::Cancelled,
             ErrorCode::FailoverWouldDuplicate,
-            ErrorCode::SchemaDriftMidStream,
+            ErrorCode::SchemaDrift,
             ErrorCode::NoSchema,
             ErrorCode::ArrowExport,
         ];
@@ -4068,33 +4082,53 @@ pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
             );
             return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
         }
+        enum NextArrow {
+            Ok(
+                arrow::ffi::FFI_ArrowArray,
+                arrow::ffi::FFI_ArrowSchema,
+                arrow::datatypes::SchemaRef,
+            ),
+            End,
+            Err(Error, Option<arrow::datatypes::SchemaRef>),
+        }
         let c = &mut *cursor;
         let pinned = c.arrow_schema_pin.clone();
         let inner: &mut Cursor<'static> = c.cursor_for_mut();
-        let outcome = panic_guard(|| inner.next_arrow_batch_inner(pinned.as_ref()));
-        match outcome {
-            Ok(Some(rb)) => {
-                if c.arrow_schema_pin.is_none() {
-                    c.arrow_schema_pin = Some(rb.schema());
-                }
-                let struct_array: StructArray = rb.into();
-                let array_data = struct_array.into_data();
-                match arrow::ffi::to_ffi(&array_data) {
-                    Ok((ffi_array, ffi_schema)) => {
-                        std::ptr::write(out_array, ffi_array);
-                        std::ptr::write(out_schema, ffi_schema);
-                        line_reader_arrow_batch_result::line_reader_arrow_batch_ok
-                    }
-                    Err(e) => {
-                        write_err_box(err_out, Error::new(ErrorCode::ArrowExport, e.to_string()));
-                        line_reader_arrow_batch_result::line_reader_arrow_batch_error
-                    }
-                }
+        let outcome = panic_guard(|| -> NextArrow {
+            let rb = match inner.next_arrow_batch_inner(pinned.as_ref()) {
+                Ok(Some(rb)) => rb,
+                Ok(None) => return NextArrow::End,
+                Err(e) => return NextArrow::Err(e, None),
+            };
+            let schema_ref = rb.schema();
+            let struct_array: StructArray = rb.into();
+            let array_data = struct_array.into_data();
+            match arrow::ffi::to_ffi(&array_data) {
+                Ok((ffi_array, ffi_schema)) => NextArrow::Ok(ffi_array, ffi_schema, schema_ref),
+                Err(e) => NextArrow::Err(
+                    Error::new(ErrorCode::ArrowExport, e.to_string()),
+                    Some(schema_ref),
+                ),
             }
-            Ok(None) => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
-            Err(e) => {
-                if matches!(e.code(), ErrorCode::SchemaDriftMidStream) {
-                    c.arrow_schema_pin = None;
+        });
+        match outcome {
+            NextArrow::Ok(ffi_array, ffi_schema, schema_ref) => {
+                c.arrow_schema_pin = Some(schema_ref);
+                std::ptr::write(out_array, ffi_array);
+                std::ptr::write(out_schema, ffi_schema);
+                line_reader_arrow_batch_result::line_reader_arrow_batch_ok
+            }
+            NextArrow::End => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
+            NextArrow::Err(e, pin_to_restore) => {
+                match pin_to_restore {
+                    Some(pin) => {
+                        c.arrow_schema_pin = Some(pin);
+                    }
+                    None => {
+                        if e.code() != ErrorCode::SchemaDrift {
+                            c.arrow_schema_pin = pinned;
+                        }
+                    }
                 }
                 write_err_box(err_out, e);
                 line_reader_arrow_batch_result::line_reader_arrow_batch_error

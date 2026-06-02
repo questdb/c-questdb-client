@@ -11,7 +11,7 @@ categories = ["database"]
 authors = ["Adam Cimarosti <adam@questdb.io>"]
 
 [package.metadata.docs.rs]
-features = ["almost-all-features"]
+features = ["almost-all-features", "arrow", "polars"]
 
 [lib]
 name = "questdb"
@@ -195,7 +195,7 @@ compression-zstd = ["_egress", "dep:zstd"]
 ## RecordBatch → Buffer (ingress). Both directions ride QWP/WS.
 ## See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
 arrow = [
-    "_egress",
+    "sync-reader-ws",
     "_sender-qwp-ws",
     "dep:arrow",
     "dep:arrow-array",
@@ -303,7 +303,7 @@ required-features = ["sync-sender-qwp-ws"]
 
 [[example]]
 name = "polars"
-required-features = ["polars"]
+required-features = ["polars", "sync-sender-qwp-ws"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR

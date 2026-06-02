@@ -566,6 +566,7 @@ fn decimal256_carries_precision_and_scale() {
         }
         other => panic!("expected Decimal256(_, _), got {:?}", other),
     }
+    let _ = batch_to_record_batch(arrow_schema, &s, b, &SymbolDict::new()).unwrap();
 }
 
 #[test]
@@ -743,4 +744,145 @@ fn schemas_equal_detects_dtype_drift() {
     )
     .unwrap();
     assert!(!schemas_equal(&a, &b));
+}
+
+#[test]
+fn empty_array_batch_emits_tentative_ndim_marker() {
+    let buffers = crate::egress::decoder::ArrayBuffers {
+        data_offsets: vec![],
+        data: bytes::Bytes::new(),
+        shapes: vec![],
+        shape_offsets: vec![],
+        validity: None,
+    };
+    let s = schema_of(&[("a", ColumnKind::DoubleArray)]);
+    let b = decoded_of(0, vec![DecodedColumn::DoubleArray(buffers)]);
+    let arrow_schema = batch_arrow_schema(&s, &b).unwrap();
+    let md = arrow_schema.field(0).metadata();
+    assert_eq!(
+        md.get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[test]
+fn firm_array_batch_has_no_tentative_marker() {
+    let mut data = Vec::new();
+    for v in [1.0f64, 2.0, 3.0] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let buffers = crate::egress::decoder::ArrayBuffers {
+        data_offsets: vec![0, 24],
+        data: bytes::Bytes::from(data),
+        shapes: vec![3],
+        shape_offsets: vec![0, 1],
+        validity: None,
+    };
+    let s = schema_of(&[("a", ColumnKind::DoubleArray)]);
+    let b = decoded_of(1, vec![DecodedColumn::DoubleArray(buffers)]);
+    let arrow_schema = batch_arrow_schema(&s, &b).unwrap();
+    let md = arrow_schema.field(0).metadata();
+    assert!(
+        md.get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
+            .is_none()
+    );
+}
+
+#[test]
+fn schemas_equal_accepts_tentative_to_firm_array_upgrade() {
+    let empty_buffers = crate::egress::decoder::ArrayBuffers {
+        data_offsets: vec![],
+        data: bytes::Bytes::new(),
+        shapes: vec![],
+        shape_offsets: vec![],
+        validity: None,
+    };
+    let tentative = batch_arrow_schema(
+        &schema_of(&[("a", ColumnKind::DoubleArray)]),
+        &decoded_of(0, vec![DecodedColumn::DoubleArray(empty_buffers)]),
+    )
+    .unwrap();
+
+    let mut data = Vec::new();
+    for v in [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let firm_buffers = crate::egress::decoder::ArrayBuffers {
+        data_offsets: vec![0, 64],
+        data: bytes::Bytes::from(data),
+        shapes: vec![2, 2, 2],
+        shape_offsets: vec![0, 3],
+        validity: None,
+    };
+    let firm = batch_arrow_schema(
+        &schema_of(&[("a", ColumnKind::DoubleArray)]),
+        &decoded_of(1, vec![DecodedColumn::DoubleArray(firm_buffers)]),
+    )
+    .unwrap();
+
+    assert!(schemas_equal(&tentative, &firm));
+    assert!(schemas_equal(&firm, &tentative));
+}
+
+#[test]
+fn schemas_equal_detects_array_dim_drift_when_both_firm() {
+    let mut data1 = Vec::new();
+    for v in [1.0f64, 2.0, 3.0] {
+        data1.extend_from_slice(&v.to_le_bytes());
+    }
+    let b1 = crate::egress::decoder::ArrayBuffers {
+        data_offsets: vec![0, 24],
+        data: bytes::Bytes::from(data1),
+        shapes: vec![3],
+        shape_offsets: vec![0, 1],
+        validity: None,
+    };
+    let s1 = batch_arrow_schema(
+        &schema_of(&[("a", ColumnKind::DoubleArray)]),
+        &decoded_of(1, vec![DecodedColumn::DoubleArray(b1)]),
+    )
+    .unwrap();
+    let mut data2 = Vec::new();
+    for v in [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0] {
+        data2.extend_from_slice(&v.to_le_bytes());
+    }
+    let b2 = crate::egress::decoder::ArrayBuffers {
+        data_offsets: vec![0, 64],
+        data: bytes::Bytes::from(data2),
+        shapes: vec![2, 2, 2],
+        shape_offsets: vec![0, 3],
+        validity: None,
+    };
+    let s2 = batch_arrow_schema(
+        &schema_of(&[("a", ColumnKind::DoubleArray)]),
+        &decoded_of(1, vec![DecodedColumn::DoubleArray(b2)]),
+    )
+    .unwrap();
+    assert!(!schemas_equal(&s1, &s2));
+}
+
+// Force `ArrayDataBuilder::build()` to reject a malformed Decimal64
+// payload (10 rows promised, only 8 bytes supplied — one row's worth)
+// and verify the failure surfaces as `ErrorCode::ArrowExport` through
+// `batch_to_record_batch`. Regression guard against the export wrap
+// being dropped on a future refactor: without it, the underlying
+// arrow-rs error would propagate as a different code (or panic under
+// `panic = "abort"`).
+#[test]
+fn arrow_export_surfaces_on_malformed_decimal64() {
+    use crate::egress::error::ErrorCode;
+    let values = vec![0u8; 8];
+    let s = schema_of(&[("d", ColumnKind::Decimal64)]);
+    let b = decoded_of(
+        10,
+        vec![DecodedColumn::Decimal64 {
+            buffer: buf(values, None),
+            scale: 2,
+        }],
+    );
+    let arrow_schema = Arc::new(batch_arrow_schema(&s, &b).unwrap());
+    let err = batch_to_record_batch(arrow_schema, &s, b, &SymbolDict::new())
+        .expect_err("malformed Decimal64 must error, not panic");
+    assert_eq!(err.code(), ErrorCode::ArrowExport);
 }

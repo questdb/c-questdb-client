@@ -47,51 +47,39 @@ import questdb_line_sender as qls
 import qwp_ws_fuzz
 import uuid
 
-# Arrow test classes import pyarrow / polars at module load. When those
-# Python packages are absent (e.g. a non-arrow developer install), guard
-# the imports so the rest of the system test suite still runs.
-try:
-    from arrow_egress_fuzz import (  # noqa: F401
-        TestArrowEgressPerKind,
-        TestArrowEgressEmpty,
-        TestArrowEgressFuzz,
-    )
-    from arrow_ingress_fuzz import (  # noqa: F401
-        TestArrowIngressPerKind,
-        TestArrowIngressDesignatedTs,
-        TestArrowIngressErrors,
-        TestArrowIngressExtraTypes,
-        TestArrowIngressUnsupportedTypes,
-        TestArrowIngressMultiBatch,
-        TestArrowIngressFuzz,
-    )
-    from arrow_round_trip_fuzz import (  # noqa: F401
-        TestArrowRoundTripPerKind,
-        TestArrowRoundTripFuzz,
-    )
-    from arrow_polars_fuzz import (  # noqa: F401
-        TestArrowPolarsRoundTripPerKind,
-        TestArrowPolarsFuzz,
-    )
-    from arrow_polars_per_dtype import (  # noqa: F401
-        TestArrowPolarsPerDtype,
-    )
-    from arrow_alignment_fuzz import TestArrowAlignment  # noqa: F401
-    from test_arrow_fuzz_common_unit import (  # noqa: F401
-        TestKindRegistryCompleteness,
-        TestCompareSemantics,
-        TestRngDeterminism,
-        TestBuildRecordBatch,
-        TestEdgeCorpora,
-    )
-    ARROW_TESTS_AVAILABLE = True
-except ImportError as _arrow_import_err:
-    import sys as _sys
-    print(
-        f"WARN: skipping Arrow/Polars system tests — missing dep: {_arrow_import_err}",
-        file=_sys.stderr,
-    )
-    ARROW_TESTS_AVAILABLE = False
+from arrow_egress_fuzz import (
+    TestArrowEgressPerKind,
+    TestArrowEgressEmpty,
+    TestArrowEgressFuzz,
+)
+from arrow_ingress_fuzz import (
+    TestArrowIngressPerKind,
+    TestArrowIngressDesignatedTs,
+    TestArrowIngressErrors,
+    TestArrowIngressExtraTypes,
+    TestArrowIngressUnsupportedTypes,
+    TestArrowIngressMultiBatch,
+    TestArrowIngressFuzz,
+)
+from arrow_round_trip_fuzz import (
+    TestArrowRoundTripPerKind,
+    TestArrowRoundTripFuzz,
+)
+from arrow_polars_fuzz import (
+    TestArrowPolarsRoundTripPerKind,
+    TestArrowPolarsFuzz,
+)
+from arrow_polars_per_dtype import (
+    TestArrowPolarsPerDtype,
+)
+from arrow_alignment_fuzz import TestArrowAlignment
+from test_arrow_fuzz_common_unit import (
+    TestKindRegistryCompleteness,
+    TestCompareSemantics,
+    TestRngDeterminism,
+    TestBuildRecordBatch,
+    TestEdgeCorpora,
+)
 from fixture import (
     Project,
     QuestDbFixtureBase,

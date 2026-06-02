@@ -35,7 +35,7 @@ extern "C" {
 
 /* Reuse `line_sender_utf8` for validated UTF-8 strings, and the
    `QUESTDB_CLIENT_API` / `QUESTDB_CLIENT_DYN_LIB` linkage macros. */
-#include "../ingress/line_sender.h"
+#include <questdb/ingress/line_sender.h>
 
 /////////// Thread safety.
 //
@@ -194,10 +194,12 @@ typedef enum line_reader_error_code
      *  and remains transparent. */
     line_reader_error_failover_would_duplicate = 21,
     /** Streaming Arrow adapter saw a mid-stream schema change. The
-     *  cursor is still usable; re-wrap with
-     *  `line_reader_cursor_next_arrow_batch` after dropping any
-     *  partial state to snapshot the new schema. Only emitted when
-     *  the `arrow` feature is enabled. */
+     *  cursor remains usable; its pinned schema snapshot is cleared
+     *  by this error, so the next
+     *  `line_reader_cursor_next_arrow_batch` call snapshots the new
+     *  schema and resumes streaming. The batch that triggered the
+     *  drift is discarded — re-issue the query if you need it. Only
+     *  emitted when the `arrow` feature is enabled. */
     line_reader_error_schema_drift = 22,
     /** `line_reader_cursor_next_arrow_batch` was called on a stream
      *  that terminated before any batch was produced — no schema to
@@ -1816,49 +1818,17 @@ static inline bool line_reader_column_data_get_symbol(
 }
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
-/* Apache Arrow C Data Interface (feature: arrow).
- * https://arrow.apache.org/docs/format/CDataInterface.html */
 
-#    ifndef ARROW_C_DATA_INTERFACE
-#        define ARROW_C_DATA_INTERFACE
-
-#        define ARROW_FLAG_DICTIONARY_ORDERED 1
-#        define ARROW_FLAG_NULLABLE 2
-#        define ARROW_FLAG_MAP_KEYS_SORTED 4
-
-struct ArrowSchema
-{
-    const char* format;
-    const char* name;
-    const char* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-
-struct ArrowArray
-{
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-#    endif /* ARROW_C_DATA_INTERFACE */
-
+/**
+ * Tri-state return for `line_reader_cursor_next_arrow_batch`.
+ */
 typedef enum line_reader_arrow_batch_result
 {
+    /** A batch was decoded and `out_array` / `out_schema` are populated. */
     line_reader_arrow_batch_ok = 0,
+    /** End of stream; `out_*` are unchanged and no error was produced. */
     line_reader_arrow_batch_end = 1,
+    /** Decode failed; `out_*` are unchanged and `out_err` is populated. */
     line_reader_arrow_batch_error = 2,
 } line_reader_arrow_batch_result;
 
@@ -1876,7 +1846,8 @@ typedef enum line_reader_arrow_batch_result
  * Mid-stream schema drift (the underlying QuestDB table altered between
  * batches) surfaces as `line_reader_error_schema_drift` (= 22) on the
  * call that detects it; the cursor's pinned schema snapshot is then
- * cleared so the next call snapshots the new schema and resumes.
+ * cleared so the next call snapshots the new schema and resumes. The
+ * batch that triggered the drift is discarded.
  */
 QUESTDB_CLIENT_API
 line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(

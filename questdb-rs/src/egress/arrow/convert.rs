@@ -48,7 +48,28 @@ use crate::egress::symbol_dict::SymbolDict;
 
 type ABytes = AVec<u8, ConstAlign<64>>;
 
-pub fn batch_to_record_batch(
+// `Bytes::from_owner` requires the owner to be `Send + Sync + 'static`.
+// arrow-rs's RecordBatch can be dropped on any thread (Python consumers
+// release on a worker pool), so the AVec we hand it must satisfy these
+// bounds. A future aligned-vec release that adds a !Send field would
+// silently break the FFI export path — this static check fails to
+// compile if that happens.
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<ABytes>();
+};
+
+/// Working buffers reused across SYMBOL columns in one batch. Reuses the
+/// remap HashMap allocation per `batch_to_record_batch` call so a wide
+/// batch with N SYMBOL columns does not pay N independent `HashMap::new()`
+/// costs. The hasher is `std::collections::hash_map::RandomState` —
+/// changing to a u32-tuned hasher is a follow-up.
+#[derive(Default)]
+struct SymbolBuildScratch {
+    remap: HashMap<u32, u32>,
+}
+
+pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
     batch: DecodedBatch,
@@ -66,13 +87,21 @@ pub fn batch_to_record_batch(
         ));
     }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    let mut sym_scratch = SymbolBuildScratch::default();
     for (idx, decoded) in columns.into_iter().enumerate() {
         let field = schema_ref.field(idx);
         let kind = egress_schema
             .column(idx)
             .map(|c| c.kind)
             .ok_or_else(|| fmt!(InvalidApiCall, "egress schema missing column {}", idx))?;
-        arrays.push(column_to_array(field, kind, decoded, row_count, dict)?);
+        arrays.push(column_to_array(
+            field,
+            kind,
+            decoded,
+            row_count,
+            dict,
+            &mut sym_scratch,
+        )?);
     }
     RecordBatch::try_new(schema_ref, arrays).map_err(|e| to_arrow_export(e.to_string()))
 }
@@ -83,6 +112,7 @@ fn column_to_array(
     decoded: DecodedColumn,
     row_count: usize,
     dict: &SymbolDict,
+    sym_scratch: &mut SymbolBuildScratch,
 ) -> Result<ArrayRef> {
     Ok(match (kind, decoded) {
         (ColumnKind::Boolean, DecodedColumn::Boolean(buf)) => {
@@ -167,7 +197,7 @@ fn column_to_array(
             },
         ) => {
             let active = local_dict.as_ref().unwrap_or(dict);
-            symbol_array(codes, validity, active, row_count)?
+            symbol_array(codes, validity, active, row_count, sym_scratch)?
         }
         (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => {
             array_column_to_arrow(field, b, row_count, ArrayLeaf::Float64)?
@@ -402,36 +432,73 @@ fn symbol_array(
     validity: Option<Bytes>,
     dict: &SymbolDict,
     row_count: usize,
+    scratch: &mut SymbolBuildScratch,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let mut remap: HashMap<u32, u32> = HashMap::new();
-    let mut union_offsets: Vec<i32> = vec![0];
+    scratch.remap.clear();
+    if scratch.remap.capacity() < codes.len().min(64) {
+        scratch
+            .remap
+            .reserve(codes.len().min(64) - scratch.remap.capacity());
+    }
+    let remap = &mut scratch.remap;
+    let mut union_offsets: Vec<i32> = Vec::with_capacity(codes.len().min(64) + 1);
+    union_offsets.push(0);
     let mut union_bytes: ABytes = ABytes::new(64);
     let mut dense = ABytes::with_capacity(64, codes.len() * 4);
     dense.resize(codes.len() * 4, 0);
-    for (row, &code) in codes.iter().enumerate() {
-        let is_null = nulls.as_ref().map(|n| !n.is_valid(row)).unwrap_or(false);
-        if is_null {
-            continue;
+
+    fn resolve(
+        code: u32,
+        remap: &mut HashMap<u32, u32>,
+        union_offsets: &mut Vec<i32>,
+        union_bytes: &mut ABytes,
+        dict: &SymbolDict,
+    ) -> Result<u32> {
+        if let Some(&dense_code) = remap.get(&code) {
+            return Ok(dense_code);
         }
-        let dense_code = match remap.get(&code) {
-            Some(c) => *c,
-            None => {
-                let s = dict
-                    .get(code)
-                    .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
-                union_bytes.extend_from_slice(s.as_bytes());
-                let next_off = union_bytes.len() as i32;
-                union_offsets.push(next_off);
-                let assigned = (union_offsets.len() - 2) as u32;
-                remap.insert(code, assigned);
-                assigned
-            }
-        };
-        let bytes = dense_code.to_le_bytes();
-        let base = row * 4;
-        dense[base..base + 4].copy_from_slice(&bytes);
+        let s = dict
+            .get(code)
+            .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+        union_bytes.extend_from_slice(s.as_bytes());
+        let next_off = union_bytes.len() as i32;
+        union_offsets.push(next_off);
+        let assigned = (union_offsets.len() - 2) as u32;
+        remap.insert(code, assigned);
+        Ok(assigned)
     }
+
+    match nulls.as_ref() {
+        None => {
+            for (row, &code) in codes.iter().enumerate() {
+                let dense_code = resolve(
+                    code,
+                    &mut *remap,
+                    &mut union_offsets,
+                    &mut union_bytes,
+                    dict,
+                )?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+        Some(n) => {
+            for row in n.valid_indices() {
+                let code = codes[row];
+                let dense_code = resolve(
+                    code,
+                    &mut *remap,
+                    &mut union_offsets,
+                    &mut union_bytes,
+                    dict,
+                )?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+    }
+
     let mut union_offsets_avec = ABytes::with_capacity(64, union_offsets.len() * 4);
     for off in &union_offsets {
         union_offsets_avec.extend_from_slice(&off.to_le_bytes());
@@ -474,7 +541,7 @@ fn array_column_to_arrow(
     leaf: ArrayLeaf,
 ) -> Result<ArrayRef> {
     let ArrayBuffers {
-        data_offsets: _,
+        data_offsets,
         data,
         shapes,
         shape_offsets,
@@ -486,7 +553,23 @@ fn array_column_to_arrow(
         ArrayLeaf::Int64 => DataType::Int64,
     };
     let elem_size = 8usize;
+    if !data.len().is_multiple_of(elem_size) {
+        return Err(to_arrow_export(format!(
+            "ARRAY wire data length {} not a multiple of element size {}",
+            data.len(),
+            elem_size
+        )));
+    }
     let total_elements = data.len() / elem_size;
+    if let Some(&last_off) = data_offsets.last()
+        && last_off as usize != data.len()
+    {
+        return Err(to_arrow_export(format!(
+            "ARRAY data_offsets tail {} disagrees with data length {}",
+            last_off,
+            data.len()
+        )));
+    }
     let ndim = ndim_from_field(field)?;
     let leaf_buf = bytes_to_arrow(data);
     let leaf_data = ArrayDataBuilder::new(leaf_dtype)
@@ -703,11 +786,13 @@ fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Optio
     for b in inverted.iter_mut() {
         *b = !*b;
     }
-    let tail_bits = row_count & 7;
-    if tail_bits != 0 {
-        let last = inverted.len() - 1;
-        let mask: u8 = (1u16.wrapping_shl(tail_bits as u32).wrapping_sub(1)) as u8;
-        inverted[last] &= mask;
+    // Mask post-inversion trailing bits — pads were 0, would flip to 1
+    // (=valid) and pollute downstream raw-bitmap hashers/copiers.
+    let trailing_bits = row_count % 8;
+    if trailing_bits != 0
+        && let Some(last) = inverted.last_mut()
+    {
+        *last &= (1u8 << trailing_bits) - 1;
     }
     Ok(Some(NullBuffer::new(arrow_buffer::BooleanBuffer::new(
         Buffer::from(bytes_from_avec(inverted)),
@@ -716,6 +801,8 @@ fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Optio
     ))))
 }
 
+/// Boxes a QuestDB [`Error`] as an [`ArrowError::ExternalError`].
+/// Recover via [`try_downcast_questdb`](super::reader::try_downcast_questdb).
 pub fn external_arrow_error(e: Error) -> ArrowError {
     ArrowError::ExternalError(Box::new(e))
 }

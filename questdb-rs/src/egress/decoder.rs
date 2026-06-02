@@ -795,6 +795,21 @@ fn decode_decimal_wide(
             crate::egress::binds::MAX_DECIMAL_SCALE
         ));
     }
+    let per_width_max: i8 = match width {
+        8 => 18,
+        16 => 38,
+        32 => crate::egress::binds::MAX_DECIMAL_SCALE,
+        _ => crate::egress::binds::MAX_DECIMAL_SCALE,
+    };
+    if scale > per_width_max {
+        return Err(fmt!(
+            ProtocolError,
+            "DECIMAL{} scale {} exceeds per-width maximum {}",
+            width * 8,
+            scale,
+            per_width_max
+        ));
+    }
     // DECIMAL64 NULL is `Long.MIN_VALUE` (spec §11.5). DECIMAL128 NULL is
     // both halves `Long.MIN_VALUE` (server: `lo == LONG_NULL && hi ==
     // LONG_NULL`); DECIMAL256 NULL is four halves `Long.MIN_VALUE`
