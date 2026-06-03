@@ -35,7 +35,7 @@ use crate::egress::decoder::{DecodedBatch, DecodedColumn};
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 use crate::egress::schema::Schema;
 
-pub fn batch_arrow_schema(schema: &Schema, batch: &DecodedBatch) -> Result<ArrowSchema> {
+pub(crate) fn batch_arrow_schema(schema: &Schema, batch: &DecodedBatch) -> Result<ArrowSchema> {
     if schema.len() != batch.columns.len() {
         return Err(fmt!(
             ProtocolError,
@@ -52,30 +52,38 @@ pub fn batch_arrow_schema(schema: &Schema, batch: &DecodedBatch) -> Result<Arrow
     Ok(ArrowSchema::new(fields))
 }
 
-pub fn schemas_equal(a: &ArrowSchema, b: &ArrowSchema) -> bool {
+pub(crate) fn schemas_equal(a: &ArrowSchema, b: &ArrowSchema) -> bool {
     if a.fields().len() != b.fields().len() {
         return false;
     }
     for (fa, fb) in a.fields().iter().zip(b.fields().iter()) {
-        if fa.name() != fb.name()
-            || fa.data_type() != fb.data_type()
-            || fa.is_nullable() != fb.is_nullable()
-        {
+        if fa.name() != fb.name() || fa.is_nullable() != fb.is_nullable() {
             return false;
         }
-        for key in [
-            COLUMN_TYPE,
-            GEOHASH_BITS,
-            SYMBOL,
-            ARRAY_DIM,
-            ARROW_EXTENSION_NAME,
-        ] {
+        let tentative_a = is_tentative_array(fa);
+        let tentative_b = is_tentative_array(fb);
+        if !tentative_a && !tentative_b && fa.data_type() != fb.data_type() {
+            return false;
+        }
+        for key in [COLUMN_TYPE, GEOHASH_BITS, SYMBOL, ARROW_EXTENSION_NAME] {
             if fa.metadata().get(key) != fb.metadata().get(key) {
                 return false;
             }
         }
+        if !tentative_a
+            && !tentative_b
+            && fa.metadata().get(ARRAY_DIM) != fb.metadata().get(ARRAY_DIM)
+        {
+            return false;
+        }
     }
     true
+}
+
+fn is_tentative_array(f: &Field) -> bool {
+    f.metadata()
+        .get(ARRAY_DIM_TENTATIVE)
+        .is_some_and(|v| v == "true")
 }
 
 fn arrow_field(name: &str, kind: ColumnKind, decoded: &DecodedColumn) -> Result<Field> {
@@ -190,7 +198,10 @@ fn build_array_field(
     shapes: &[u32],
     shape_offsets: &[u32],
 ) -> Result<(DataType, HashMap<String, String>)> {
-    let ndim = ndim_from_shapes(shapes, shape_offsets)?;
+    let (ndim, tentative) = match ndim_from_shapes(shapes, shape_offsets)? {
+        Some(n) => (n, false),
+        None => (1, true),
+    };
     if ndim == 0 {
         return Err(fmt!(
             ProtocolError,
@@ -204,15 +215,25 @@ fn build_array_field(
     }
     let mut md = md_for(kind);
     md.insert(ARRAY_DIM.into(), ndim.to_string());
+    if tentative {
+        md.insert(ARRAY_DIM_TENTATIVE.into(), "true".into());
+    }
     Ok((dtype, md))
 }
 
-fn ndim_from_shapes(shapes: &[u32], shape_offsets: &[u32]) -> Result<usize> {
+fn ndim_from_shapes(shapes: &[u32], shape_offsets: &[u32]) -> Result<Option<usize>> {
     if shape_offsets.len() < 2 {
-        return Ok(1);
+        return Ok(None);
     }
     for w in shape_offsets.windows(2) {
-        let dims = (w[1] - w[0]) as usize;
+        let dims = w[1].checked_sub(w[0]).ok_or_else(|| {
+            fmt!(
+                ProtocolError,
+                "shape_offsets not monotonic: {} < {}",
+                w[1],
+                w[0]
+            )
+        })? as usize;
         if dims > 0 {
             if dims > shapes.len() {
                 return Err(fmt!(
@@ -222,12 +243,12 @@ fn ndim_from_shapes(shapes: &[u32], shape_offsets: &[u32]) -> Result<usize> {
                     shapes.len()
                 ));
             }
-            return Ok(dims);
+            return Ok(Some(dims));
         }
     }
-    Ok(1)
+    Ok(None)
 }
 
-pub fn to_arrow_export(msg: impl Into<String>) -> Error {
+pub(crate) fn to_arrow_export(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::ArrowExport, msg.into())
 }

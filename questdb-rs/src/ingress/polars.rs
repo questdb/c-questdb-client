@@ -3,20 +3,39 @@
 //!
 //! [`dataframe_to_batches`] is the primary entry point. It returns an
 //! iterator that yields slices of at most `max_rows` rows each. Each
-//! emitted slice is taken from a single polars chunk per column, so
-//! row data is never copied — the Arrow C Data Interface only bumps
-//! refcounts. Two costs survive:
+//! emitted slice is taken from a single polars chunk per column. The
+//! conversion cost depends on the dtype:
 //!
-//! * `Column::Scalar` columns are materialised once by polars (cached
-//!   in the column's `OnceLock`); subsequent batches slice from that
-//!   cache zero-copy. Sending a scalar as columnar data requires the
-//!   value to actually exist in memory N times — there is no
-//!   zero-copy alternative.
-//! * Polars *logical* dtypes that arrow-rs does not have natively
-//!   (Datetime, Date, Time, Duration, Categorical, Enum) incur a
-//!   per-chunk `cast_default` at the polars→arrow conversion step.
-//!   Primitive, String, Binary, and Decimal columns at the newest
-//!   compat level are pure refcount bumps.
+//! * **Primitive, String, Binary, Decimal at the newest compat level**:
+//!   the per-chunk Arrow C Data Interface handoff is a pure refcount
+//!   bump and the per-batch slice is zero-copy.
+//! * **`Column::Scalar` columns**: materialised once by polars (cached
+//!   in the column's `OnceLock`); subsequent batches slice that cache
+//!   zero-copy. Sending a scalar as columnar data requires the value to
+//!   exist in memory N times — there is no zero-copy alternative.
+//! * **Polars *logical* dtypes that arrow-rs lacks natively** (Datetime,
+//!   Date, Time, Duration, Categorical, Enum): incur a `cast_default`
+//!   per chunk per emitted batch. The converted Arrow chunk is cached
+//!   only for the lifetime of the current chunk within the iterator
+//!   (not across `dataframe_to_batches` calls or across chunk
+//!   boundaries within one call), so a multi-chunk DataFrame with
+//!   timestamp/categorical columns re-pays the cast each time the
+//!   iterator crosses a chunk boundary. Acceptable for typical batch
+//!   sizes (10 K rows ≈ µs of cast vs ms of wire send) but worth
+//!   knowing if you slice into many small batches.
+//!
+//! # Per-chunk dtype stability
+//!
+//! `Categorical` (and other dictionary-backed) columns may emit
+//! different Arrow value dtypes across chunks (e.g. `Utf8` vs
+//! `LargeUtf8`) depending on per-chunk statistics. The iterator pins
+//! the first chunk's dtype as the wire schema and rejects subsequent
+//! chunks whose dtype differs with [`ErrorCode::ArrowIngest`]. To
+//! avoid this, rechunk via `DataFrame::rechunk()` before calling
+//! `dataframe_to_batches`, or cast Categorical columns to plain
+//! `String` upstream.
+//!
+//! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
 //!
 //! Flushing is the caller's responsibility:
 //!
@@ -43,18 +62,16 @@ use crate::{Result, fmt};
 /// Suggested default chunk size for [`dataframe_to_batches`].
 pub const DEFAULT_MAX_BATCH_ROWS: usize = 10_000;
 
-// `polars_arrow::ffi` and `arrow::ffi` are independent `#[repr(C)]` mirrors
-// of the Arrow C Data Interface; the bridge below transmutes between them.
-// Assert layout parity so a future crate bump can't silently break soundness.
+// Both crates are `#[repr(C)]` impls of the same Arrow C Data Interface
+// struct; size/align pinned by the spec, field order verified by the
+// `dataframe_round_trip_*` tests. Re-validate on `polars-arrow` bumps.
 const _: () = assert!(
     std::mem::size_of::<polars_arrow::ffi::ArrowArray>()
         == std::mem::size_of::<arrow::ffi::FFI_ArrowArray>(),
-    "polars_arrow::ffi::ArrowArray size diverged from arrow::ffi::FFI_ArrowArray"
 );
 const _: () = assert!(
     std::mem::size_of::<polars_arrow::ffi::ArrowSchema>()
         == std::mem::size_of::<arrow::ffi::FFI_ArrowSchema>(),
-    "polars_arrow::ffi::ArrowSchema size diverged from arrow::ffi::FFI_ArrowSchema"
 );
 const _: () = assert!(
     std::mem::align_of::<polars_arrow::ffi::ArrowArray>()
@@ -64,6 +81,39 @@ const _: () = assert!(
     std::mem::align_of::<polars_arrow::ffi::ArrowSchema>()
         == std::mem::align_of::<arrow::ffi::FFI_ArrowSchema>(),
 );
+
+/// SAFETY: layout-identical `#[repr(C)]` Arrow C Data Interface structs;
+/// release-callback ownership transfers — caller must not reuse input.
+#[inline]
+unsafe fn pa_array_into_rs(pa: polars_arrow::ffi::ArrowArray) -> arrow::ffi::FFI_ArrowArray {
+    unsafe { std::mem::transmute::<polars_arrow::ffi::ArrowArray, arrow::ffi::FFI_ArrowArray>(pa) }
+}
+
+/// SAFETY: see [`pa_array_into_rs`].
+#[inline]
+unsafe fn pa_schema_into_rs(pa: polars_arrow::ffi::ArrowSchema) -> arrow::ffi::FFI_ArrowSchema {
+    unsafe {
+        std::mem::transmute::<polars_arrow::ffi::ArrowSchema, arrow::ffi::FFI_ArrowSchema>(pa)
+    }
+}
+
+/// SAFETY: see [`pa_array_into_rs`].
+#[inline]
+pub(crate) unsafe fn rs_array_into_pa(
+    rs: arrow::ffi::FFI_ArrowArray,
+) -> polars_arrow::ffi::ArrowArray {
+    unsafe { std::mem::transmute::<arrow::ffi::FFI_ArrowArray, polars_arrow::ffi::ArrowArray>(rs) }
+}
+
+/// SAFETY: see [`pa_array_into_rs`].
+#[inline]
+pub(crate) unsafe fn rs_schema_into_pa(
+    rs: arrow::ffi::FFI_ArrowSchema,
+) -> polars_arrow::ffi::ArrowSchema {
+    unsafe {
+        std::mem::transmute::<arrow::ffi::FFI_ArrowSchema, polars_arrow::ffi::ArrowSchema>(rs)
+    }
+}
 
 /// Yield [`RecordBatch`] slices of `df`, each capped at `max_rows`
 /// rows. `None` uses [`DEFAULT_MAX_BATCH_ROWS`]. Every emitted slice
@@ -89,10 +139,13 @@ pub fn dataframe_to_batches(
         rows_emitted: 0,
         cursors,
         schema: None,
+        poisoned: false,
     }
 }
 
-/// Iterator returned by [`dataframe_to_batches`].
+/// Iterator returned by [`dataframe_to_batches`]. One-shot error
+/// contract: a `Some(Err(_))` poisons the iterator; subsequent
+/// `next()` returns `None`.
 pub struct DataFrameBatches<'a> {
     max_rows: usize,
     compat: CompatLevel,
@@ -100,6 +153,7 @@ pub struct DataFrameBatches<'a> {
     rows_emitted: usize,
     cursors: Vec<ColumnCursor<'a>>,
     schema: Option<Arc<ArrowSchema>>,
+    poisoned: bool,
 }
 
 struct ColumnCursor<'a> {
@@ -169,7 +223,7 @@ impl Iterator for DataFrameBatches<'_> {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cursors.is_empty() || self.rows_emitted >= self.total_rows {
+        if self.poisoned || self.cursors.is_empty() || self.rows_emitted >= self.total_rows {
             return None;
         }
         for cursor in &mut self.cursors {
@@ -196,7 +250,7 @@ impl Iterator for DataFrameBatches<'_> {
             let array_data = match ffi_polars_to_arrow_rs(&cursor.pa_field, sliced, &cursor.name) {
                 Ok(d) => d,
                 Err(e) => {
-                    self.rows_emitted = self.total_rows;
+                    self.poisoned = true;
                     return Some(Err(e));
                 }
             };
@@ -220,7 +274,7 @@ impl Iterator for DataFrameBatches<'_> {
         let rb = match RecordBatch::try_new(schema, arrays) {
             Ok(rb) => rb,
             Err(e) => {
-                self.rows_emitted = self.total_rows;
+                self.poisoned = true;
                 return Some(Err(fmt!(ArrowIngest, "RecordBatch::try_new failed: {}", e)));
             }
         };
@@ -239,10 +293,8 @@ fn ffi_polars_to_arrow_rs(
 ) -> Result<arrow_data::ArrayData> {
     let pa_schema = polars_arrow::ffi::export_field_to_c(pa_field);
     let pa_array = polars_arrow::ffi::export_array_to_c(pa_array_box);
-    let rs_schema: arrow::ffi::FFI_ArrowSchema = unsafe { std::mem::transmute_copy(&pa_schema) };
-    std::mem::forget(pa_schema);
-    let rs_array: arrow::ffi::FFI_ArrowArray = unsafe { std::mem::transmute_copy(&pa_array) };
-    std::mem::forget(pa_array);
+    let rs_schema = unsafe { pa_schema_into_rs(pa_schema) };
+    let rs_array = unsafe { pa_array_into_rs(pa_array) };
     unsafe { arrow::ffi::from_ffi(rs_array, &rs_schema) }
         .map_err(|e| fmt!(ArrowIngest, "from_ffi('{}'): {}", col_name, e))
 }

@@ -59,6 +59,8 @@ impl<'r, 'c> CursorRecordBatchReader<'r, 'c> {
         })
     }
 
+    /// Snapshotted schema. Same as the [`RecordBatchReader::schema`]
+    /// trait method, exposed for callers without the trait imported.
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -75,16 +77,39 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
             return Some(Ok(rb));
         }
         match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
-            Ok(Some(rb)) => Some(Ok(rb)),
-            Ok(None) => None,
-            Err(e) => {
-                if e.code() == ErrorCode::SchemaDriftMidStream {
+            Ok(Some(rb)) => {
+                if has_tentative_array(&self.schema) && rb.schema() != self.schema {
                     self.poisoned = true;
+                    return Some(Err(external_arrow_error(Error::new(
+                        ErrorCode::SchemaDrift,
+                        "tentative→firm ndim upgrade is not representable in \
+                         RecordBatchReader (schema must be stable for the \
+                         reader's lifetime); use Cursor::next_arrow_batch \
+                         to handle drift explicitly",
+                    ))));
                 }
+                Some(Ok(rb))
+            }
+            Ok(None) => {
+                self.poisoned = true;
+                None
+            }
+            Err(e) => {
+                self.poisoned = true;
                 Some(Err(external_arrow_error(e)))
             }
         }
     }
+}
+
+/// True if any field carries [`metadata::ARRAY_DIM_TENTATIVE`](crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE).
+/// Gates the tentative→firm ndim mid-stream upgrade.
+pub fn has_tentative_array(schema: &SchemaRef) -> bool {
+    schema.fields().iter().any(|f| {
+        f.metadata()
+            .get(crate::egress::arrow::metadata::ARRAY_DIM_TENTATIVE)
+            .is_some_and(|v| v == "true")
+    })
 }
 
 impl RecordBatchReader for CursorRecordBatchReader<'_, '_> {

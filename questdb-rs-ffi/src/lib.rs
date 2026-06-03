@@ -314,7 +314,6 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_arrow_unsupported_column_kind
             }
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
-            _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -939,6 +938,9 @@ pub unsafe extern "C" fn line_sender_buffer_new_qwp() -> *mut line_sender_buffer
     }))
 }
 
+/// Construct a QWP/WebSocket columnar `line_sender_buffer` with the
+/// default 127-byte name length limit. Required by
+/// `line_sender_buffer_append_arrow*`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws() -> *mut line_sender_buffer {
     let buffer = Buffer::new_qwp_ws();
@@ -3632,18 +3634,20 @@ pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
     }
 }
 
-/// Catches a Rust panic inside an `extern "C"` body and aborts. Active
-/// in debug/test builds; under this crate's release `panic = "abort"`
-/// profile (Cargo.toml) it compiles to a no-op tail call.
-#[cfg(feature = "arrow")]
-#[inline]
-fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(r) => r,
-        Err(_) => std::process::abort(),
-    }
-}
+// Crate is `panic = "abort"`; `catch_unwind` would be a no-op in
+// shipped builds and harms `cargo test` diagnostics. Validation
+// happens up-front in `arrow_append_impl`.
 
+/// Append every row of an Apache Arrow `RecordBatch` (Arrow C Data
+/// Interface) to `buffer`. The per-row designated timestamp is not
+/// sent — the server stamps each row on arrival.
+///
+/// `array` may be either a Struct array (one child per column, the
+/// standard RecordBatch shape) or a non-Struct single-column array
+/// whose `schema->name` becomes the column name.
+///
+/// Ownership: see the corresponding declaration in
+/// `include/questdb/ingress/line_sender.h`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_append_arrow(
@@ -3653,9 +3657,14 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow(
     schema: *const arrow::ffi::FFI_ArrowSchema,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    panic_guard(|| unsafe { arrow_append_impl(buffer, table, array, schema, None, err_out) })
+    unsafe { arrow_append_impl(buffer, table, array, schema, None, err_out) }
 }
 
+/// Variant of `line_sender_buffer_append_arrow` that sources each
+/// row's designated timestamp from a named `Timestamp(_)` column
+/// inside the batch. The column must be `Timestamp(Microsecond |
+/// Nanosecond | Millisecond, _)` with no null rows. Same ownership
+/// contract as `line_sender_buffer_append_arrow`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_append_arrow_at_column(
@@ -3666,9 +3675,261 @@ pub unsafe extern "C" fn line_sender_buffer_append_arrow_at_column(
     ts_column: line_sender_column_name,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    panic_guard(|| unsafe {
-        arrow_append_impl(buffer, table, array, schema, Some(ts_column), err_out)
-    })
+    unsafe { arrow_append_impl(buffer, table, array, schema, Some(ts_column), err_out) }
+}
+
+// Bounds for the pre-walk that protects `arrow::ffi::from_ffi` against
+// adversarial FFI input. Three independent caps:
+//   * `MAX_ARROW_SCHEMA_DEPTH` bounds recursion depth (children + dictionary
+//     chain). arrow-rs unrolls both onto the host stack; without this cap
+//     a deep schema would stack-overflow inside `from_ffi`.
+//   * `MAX_ARROW_SCHEMA_CHILDREN_PER_NODE` bounds breadth per node.
+//   * `MAX_ARROW_SCHEMA_TOTAL_NODES` bounds the whole tree (depth × breadth
+//     would otherwise be combinatorial under shared children / cyclic DAGs).
+#[cfg(feature = "arrow")]
+const MAX_ARROW_SCHEMA_DEPTH: usize = 64;
+#[cfg(feature = "arrow")]
+const MAX_ARROW_SCHEMA_CHILDREN_PER_NODE: i64 = 65_536;
+#[cfg(feature = "arrow")]
+const MAX_ARROW_SCHEMA_TOTAL_NODES: usize = 4_096;
+// Mirrors `MAX_ARROW_INGEST_ROWS` in `questdb-rs::ingress::arrow`.
+// `arrow::ffi::from_ffi` reads `(*a).length` as i64 and casts to
+// usize before the inner crate gets to check the row cap, so a
+// negative or `i64::MAX` length must be rejected here.
+#[cfg(feature = "arrow")]
+const MAX_ARROW_ARRAY_LENGTH: i64 = 16 * 1024 * 1024;
+
+#[cfg(feature = "arrow")]
+fn arrow_ingest_err(msg: impl Into<String>) -> Error {
+    Error::new(ErrorCode::ArrowIngest, msg.into())
+}
+
+// Format strings the Arrow C Data Interface accepts; trusted on a cheap
+// prefix match. We do NOT enforce the full grammar — arrow-rs's own
+// `DataType::try_from` does the structural parse and returns an Err on
+// unknown variants. We only reject the inputs that would panic inside
+// `FFI_ArrowSchema::format()` (NULL pointer / non-UTF-8) before reaching
+// the parser.
+#[cfg(feature = "arrow")]
+unsafe fn validate_format_str(s: *const arrow::ffi::FFI_ArrowSchema) -> questdb::Result<()> {
+    unsafe {
+        let p = (*s).format;
+        if p.is_null() {
+            return Err(arrow_ingest_err("Arrow schema format pointer is NULL"));
+        }
+        let cstr = std::ffi::CStr::from_ptr(p);
+        cstr.to_str()
+            .map_err(|_| arrow_ingest_err("Arrow schema format string is not UTF-8"))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "arrow")]
+unsafe fn try_reserve_one<T>(v: &mut Vec<T>) -> questdb::Result<()> {
+    v.try_reserve(1)
+        .map_err(|_| arrow_ingest_err("Arrow schema pre-walk: reservation failed"))
+}
+
+#[cfg(feature = "arrow")]
+unsafe fn validate_arrow_schema_depth(
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+) -> questdb::Result<()> {
+    unsafe {
+        let mut stack: Vec<(*const arrow::ffi::FFI_ArrowSchema, usize)> = Vec::new();
+        let mut visited: std::collections::HashSet<*const arrow::ffi::FFI_ArrowSchema> =
+            std::collections::HashSet::new();
+        let mut total: usize = 0;
+        try_reserve_one(&mut stack)?;
+        stack.push((schema, 0));
+        while let Some((s, depth)) = stack.pop() {
+            if !visited.insert(s) {
+                return Err(arrow_ingest_err(
+                    "Arrow schema contains a cycle (revisited node)",
+                ));
+            }
+            total += 1;
+            if total > MAX_ARROW_SCHEMA_TOTAL_NODES {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow schema total node count exceeds {}",
+                    MAX_ARROW_SCHEMA_TOTAL_NODES
+                )));
+            }
+            if depth > MAX_ARROW_SCHEMA_DEPTH {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow schema nesting depth exceeds {}",
+                    MAX_ARROW_SCHEMA_DEPTH
+                )));
+            }
+            validate_format_str(s)?;
+            let n = (*s).n_children;
+            if n < 0 {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow schema n_children {} is negative",
+                    n
+                )));
+            }
+            if n > MAX_ARROW_SCHEMA_CHILDREN_PER_NODE {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow schema n_children {} exceeds per-node cap {}",
+                    n, MAX_ARROW_SCHEMA_CHILDREN_PER_NODE
+                )));
+            }
+            let dict = (*s).dictionary;
+            if !dict.is_null() {
+                try_reserve_one(&mut stack)?;
+                stack.push((dict as *const _, depth + 1));
+            }
+            if n == 0 {
+                continue;
+            }
+            let children = (*s).children;
+            if children.is_null() {
+                return Err(arrow_ingest_err(
+                    "Arrow schema declares children but pointer is NULL",
+                ));
+            }
+            for i in 0..n as usize {
+                let child = *children.add(i);
+                if child.is_null() {
+                    return Err(arrow_ingest_err("Arrow schema child pointer is NULL"));
+                }
+                try_reserve_one(&mut stack)?;
+                stack.push((child as *const _, depth + 1));
+            }
+        }
+        Ok(())
+    }
+}
+
+// Cross-walk schema + array in lockstep. arrow-rs's `from_ffi` asserts on
+// mismatches between the two trees (`n_children` agreement for Struct /
+// Union, `n_buffers` consistency, etc.); under `panic = "abort"` that
+// assert aborts the host. We pre-check everything we can.
+#[cfg(feature = "arrow")]
+unsafe fn validate_arrow_array_depth(
+    array: *const arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+) -> questdb::Result<()> {
+    unsafe {
+        let mut stack: Vec<(
+            *const arrow::ffi::FFI_ArrowArray,
+            *const arrow::ffi::FFI_ArrowSchema,
+            usize,
+        )> = Vec::new();
+        let mut visited: std::collections::HashSet<*const arrow::ffi::FFI_ArrowArray> =
+            std::collections::HashSet::new();
+        let mut total: usize = 0;
+        try_reserve_one(&mut stack)?;
+        stack.push((array, schema, 0));
+        while let Some((a, s, depth)) = stack.pop() {
+            if !visited.insert(a) {
+                return Err(arrow_ingest_err(
+                    "Arrow array contains a cycle (revisited node)",
+                ));
+            }
+            total += 1;
+            if total > MAX_ARROW_SCHEMA_TOTAL_NODES {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array total node count exceeds {}",
+                    MAX_ARROW_SCHEMA_TOTAL_NODES
+                )));
+            }
+            if depth > MAX_ARROW_SCHEMA_DEPTH {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array nesting depth exceeds {}",
+                    MAX_ARROW_SCHEMA_DEPTH
+                )));
+            }
+            let length = (*a).length;
+            let offset = (*a).offset;
+            if length < 0 {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array length {} is negative",
+                    length
+                )));
+            }
+            if offset < 0 {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array offset {} is negative",
+                    offset
+                )));
+            }
+            if length > MAX_ARROW_ARRAY_LENGTH {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array length {} exceeds {}",
+                    length, MAX_ARROW_ARRAY_LENGTH
+                )));
+            }
+            if offset > MAX_ARROW_ARRAY_LENGTH {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array offset {} exceeds {}",
+                    offset, MAX_ARROW_ARRAY_LENGTH
+                )));
+            }
+            let na = (*a).n_children;
+            let ns = (*s).n_children;
+            if na < 0 {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array n_children {} is negative",
+                    na
+                )));
+            }
+            if na != ns {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array n_children {} disagrees with schema n_children {}",
+                    na, ns
+                )));
+            }
+            if na > MAX_ARROW_SCHEMA_CHILDREN_PER_NODE {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array n_children {} exceeds per-node cap {}",
+                    na, MAX_ARROW_SCHEMA_CHILDREN_PER_NODE
+                )));
+            }
+            if (*a).n_buffers < 0 {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array n_buffers {} is negative",
+                    (*a).n_buffers
+                )));
+            }
+            let dict_a = (*a).dictionary;
+            let dict_s = (*s).dictionary;
+            match (dict_a.is_null(), dict_s.is_null()) {
+                (true, true) => {}
+                (false, false) => {
+                    try_reserve_one(&mut stack)?;
+                    stack.push((dict_a as *const _, dict_s as *const _, depth + 1));
+                }
+                _ => {
+                    return Err(arrow_ingest_err(
+                        "Arrow array / schema disagree on dictionary presence",
+                    ));
+                }
+            }
+            if na == 0 {
+                continue;
+            }
+            let a_children = (*a).children;
+            let s_children = (*s).children;
+            if a_children.is_null() || s_children.is_null() {
+                return Err(arrow_ingest_err(
+                    "Arrow array or schema declares children but pointer is NULL",
+                ));
+            }
+            for i in 0..na as usize {
+                let child_a = *a_children.add(i);
+                let child_s = *s_children.add(i);
+                if child_a.is_null() || child_s.is_null() {
+                    return Err(arrow_ingest_err(
+                        "Arrow array or schema child pointer is NULL",
+                    ));
+                }
+                try_reserve_one(&mut stack)?;
+                stack.push((child_a as *const _, child_s as *const _, depth + 1));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -3692,8 +3953,22 @@ unsafe fn arrow_append_impl(
             );
             return false;
         }
-        // Clear `array.release` up-front so every early-return path drops
-        // imported buffers via `imported_array`'s Drop.
+        // Bound depth, breadth and total node count on both trees BEFORE
+        // consuming the array, so a rejection leaves caller-owned
+        // `array->release` intact. Walks include the dictionary chain
+        // (which `arrow::ffi::from_ffi` recurses through) and cross-checks
+        // array/schema `n_children` agreement to fend off the asserts
+        // inside arrow-rs that would otherwise abort under `panic = "abort"`.
+        if let Err(e) = validate_arrow_schema_depth(schema) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return false;
+        }
+        if let Err(e) = validate_arrow_array_depth(array, schema) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return false;
+        }
+        // Move out + null caller's release; every return path now
+        // drops `imported_array` exactly once.
         let imported_array = std::ptr::read(array);
         (*array).release = None;
         let inner = unwrap_buffer_mut(buffer);
@@ -3708,8 +3983,40 @@ unsafe fn arrow_append_impl(
                 return false;
             }
         };
+        // `from_ffi` uses `new_unchecked`; this is the trust boundary.
+        // A skipped bound here aborts the host under `panic = "abort"`.
+        if let Err(e) = array_data.validate_full() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::ArrowIngest,
+                format!("Arrow array validation failed: {}", e),
+            );
+            return false;
+        }
         let rb = if matches!(array_data.data_type(), DataType::Struct(_)) {
-            RecordBatch::from(StructArray::from(array_data))
+            if array_data.nulls().is_some_and(|n| n.null_count() > 0) {
+                arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::ArrowIngest,
+                    "top-level Struct array must have no null rows for RecordBatch ingest"
+                        .to_string(),
+                );
+                return false;
+            }
+            let struct_arr = StructArray::from(array_data);
+            let rb_schema = Arc::new(Schema::new(struct_arr.fields().clone()));
+            let columns: Vec<ArrayRef> = struct_arr.columns().to_vec();
+            match RecordBatch::try_new(rb_schema, columns) {
+                Ok(rb) => rb,
+                Err(e) => {
+                    arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::ArrowIngest,
+                        format!("RecordBatch::try_new failed: {}", e),
+                    );
+                    return false;
+                }
+            }
         } else {
             let field = match Field::try_from(&*schema) {
                 Ok(f) => f,
@@ -4426,6 +4733,278 @@ mod tests {
             assert!(!line_sender_error_qwpws_get_view(raw, ptr::null_mut()));
 
             line_sender_error_free(raw);
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    mod arrow_validator_tests {
+        use super::super::*;
+        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+        use std::ffi::CString;
+
+        // Build a chain of FFI_ArrowSchemas via the `dictionary` pointer
+        // of length `depth`. Each parent owns one child via a leaked
+        // `Box<FFI_ArrowSchema>` so the test can free the chain manually
+        // at teardown. The chain reuses the inner `format = "i"` Int32
+        // tag — that's all `validate_arrow_schema_depth` reads.
+        unsafe fn build_dict_chain(depth: usize) -> *mut FFI_ArrowSchema {
+            let format = CString::new("i").unwrap();
+            let mut head: *mut FFI_ArrowSchema = std::ptr::null_mut();
+            for _ in 0..depth {
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let raw = unsafe { std::alloc::alloc_zeroed(layout) } as *mut FFI_ArrowSchema;
+                unsafe {
+                    (*raw).format = format.as_ptr();
+                    (*raw).dictionary = head;
+                }
+                head = raw;
+            }
+            std::mem::forget(format);
+            head
+        }
+
+        unsafe fn drop_dict_chain(mut node: *mut FFI_ArrowSchema) {
+            while !node.is_null() {
+                let next = unsafe { (*node).dictionary };
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                unsafe { std::alloc::dealloc(node as *mut u8, layout) };
+                node = next;
+            }
+        }
+
+        #[test]
+        fn schema_dictionary_chain_at_depth_cap_succeeds() {
+            unsafe {
+                let head = build_dict_chain(MAX_ARROW_SCHEMA_DEPTH);
+                let res = validate_arrow_schema_depth(head);
+                drop_dict_chain(head);
+                assert!(res.is_ok(), "depth = cap should be accepted: {:?}", res);
+            }
+        }
+
+        #[test]
+        fn schema_dictionary_chain_above_depth_cap_rejected() {
+            unsafe {
+                let head = build_dict_chain(MAX_ARROW_SCHEMA_DEPTH + 2);
+                let res = validate_arrow_schema_depth(head);
+                drop_dict_chain(head);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("depth"),
+                    "expected depth-cap error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn schema_null_format_rejected() {
+            unsafe {
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let raw = std::alloc::alloc_zeroed(layout) as *mut FFI_ArrowSchema;
+                let res = validate_arrow_schema_depth(raw);
+                std::alloc::dealloc(raw as *mut u8, layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("format"),
+                    "expected format-NULL error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn schema_negative_n_children_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let raw = std::alloc::alloc_zeroed(layout) as *mut FFI_ArrowSchema;
+                (*raw).format = format.as_ptr();
+                (*raw).n_children = -1;
+                let res = validate_arrow_schema_depth(raw);
+                std::alloc::dealloc(raw as *mut u8, layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("negative"),
+                    "expected negative-n_children error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn schema_breadth_above_cap_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let raw = std::alloc::alloc_zeroed(layout) as *mut FFI_ArrowSchema;
+                (*raw).format = format.as_ptr();
+                (*raw).n_children = MAX_ARROW_SCHEMA_CHILDREN_PER_NODE + 1;
+                let res = validate_arrow_schema_depth(raw);
+                std::alloc::dealloc(raw as *mut u8, layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("n_children"),
+                    "expected n_children-cap error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_n_buffers_negative_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).n_buffers = -1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("n_buffers"),
+                    "expected n_buffers-negative error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_schema_n_children_mismatch_rejected() {
+            unsafe {
+                let format = CString::new("+s").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                (*s_raw).n_children = 0;
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).n_children = 5;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("disagrees"),
+                    "expected n_children-disagreement error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn schema_self_dictionary_cycle_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let raw = std::alloc::alloc_zeroed(layout) as *mut FFI_ArrowSchema;
+                (*raw).format = format.as_ptr();
+                (*raw).dictionary = raw;
+                let res = validate_arrow_schema_depth(raw);
+                (*raw).dictionary = std::ptr::null_mut();
+                std::alloc::dealloc(raw as *mut u8, layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("cycle"),
+                    "expected cycle error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_self_dictionary_cycle_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                (*s_raw).dictionary = s_raw;
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).dictionary = a_raw;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                (*s_raw).dictionary = std::ptr::null_mut();
+                (*a_raw).dictionary = std::ptr::null_mut();
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("cycle"),
+                    "expected cycle error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_negative_length_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).length = -1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("length"),
+                    "expected negative-length error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_negative_offset_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).offset = -1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("offset"),
+                    "expected negative-offset error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_length_above_cap_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).length = MAX_ARROW_ARRAY_LENGTH + 1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("length"),
+                    "expected length-cap error, got: {}",
+                    err.msg()
+                );
+            }
         }
     }
 }

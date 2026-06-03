@@ -70,6 +70,9 @@ def main():
     run_cmd('cargo', 'test',
             '--features=almost-all-features,arrow,polars',
             '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-ws,arrow',
+            '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
     run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
     for _, path in test_paths:

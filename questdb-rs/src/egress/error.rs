@@ -127,12 +127,12 @@ pub enum ErrorCode {
     /// the snapshot captured at adapter construction. The adapter is
     /// poisoned; the underlying [`crate::egress::Cursor`] remains
     /// usable and the caller may re-wrap it with a fresh
-    /// `as_record_batch_reader()` call to snapshot the new schema.
+    /// `as_arrow_reader()` call to snapshot the new schema.
     ///
     /// Only emitted on the `arrow` feature.
-    SchemaDriftMidStream,
+    SchemaDrift,
 
-    /// `Cursor::as_record_batch_reader()` was called on a stream that
+    /// `Cursor::as_arrow_reader()` was called on a stream that
     /// terminated before any `RESULT_BATCH` was decoded — there is no
     /// schema to snapshot. Recoverable: the caller can either treat
     /// this as a "no rows" result, or re-execute the query.

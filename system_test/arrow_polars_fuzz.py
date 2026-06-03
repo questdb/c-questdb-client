@@ -15,7 +15,7 @@ _ROWS_PER_BATCH = int(os.environ.get("ARROW_POLARS_FUZZ_ROWS", "10"))
 
 def _require_polars(testcase: unittest.TestCase):
     try:
-        import polars as pl  # noqa: F401
+        import polars as pl
     except ImportError:
         testcase.skipTest("polars is required for the Arrow-Polars round-trip tests")
 
