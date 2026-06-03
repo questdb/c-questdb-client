@@ -48,7 +48,7 @@ def main():
     ]
 
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    qdb_v = '9.2.0'  # The version of QuestDB we'll test against.
+    qdb_v = '9.4.1'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
