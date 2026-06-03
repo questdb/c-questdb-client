@@ -43,11 +43,6 @@ impl Cursor<'_> {
             acc = Some(match acc {
                 None => df,
                 Some(mut prev) => {
-                    // Tentative→firm schema upgrade: the prior batch was a
-                    // placeholder (e.g. empty ndim=1 array column) and this
-                    // batch supplied the firm dtype. vstack would reject the
-                    // mismatched dtypes; replace the placeholder accumulator
-                    // outright.
                     if prev.height() == 0 && prev.schema() != df.schema() {
                         df
                     } else {
