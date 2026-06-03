@@ -450,13 +450,6 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
     )
     .unwrap();
-    // max_schemas_per_connection was removed from QWP; it is explicitly rejected
-    // (not silently ignored) so a stale config surfaces a clear error.
-    assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_schemas_per_connection=1024;"),
-        "\"max_schemas_per_connection\" is not a supported QWP/WebSocket configuration key; QWP no longer uses per-connection schema references.",
-    );
-
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=16;").unwrap();
     assert_conf_err(

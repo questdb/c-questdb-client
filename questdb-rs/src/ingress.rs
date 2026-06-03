@@ -832,11 +832,6 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "request_durable_ack" => builder.request_durable_ack(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "max_schemas_per_connection" => builder.reject_unsupported_qwp_ws_setting(
-                    "max_schemas_per_connection",
-                    "QWP no longer uses per-connection schema references",
-                )?,
-                #[cfg(feature = "_sender-qwp-ws")]
                 "durable_ack_keepalive_interval_millis" => {
                     builder.durable_ack_keepalive_interval_millis(val)?
                 }
@@ -1755,30 +1750,6 @@ impl SenderBuilder {
             .error_inbox_capacity
             .set_specified("error_inbox_capacity", value)?;
         Ok(self)
-    }
-
-    /// Rejects a recognised-but-unsupported QWP/WebSocket connect-string key
-    /// with a clear `ConfigError`. The connect-string parser otherwise silently
-    /// ignores unknown keys (for cross-version forward compatibility), so keys
-    /// that must be surfaced as errors -- e.g. options removed from the
-    /// protocol -- are routed here explicitly.
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn reject_unsupported_qwp_ws_setting(
-        self,
-        setting_name: &'static str,
-        reason: &'static str,
-    ) -> Result<Self> {
-        if self.qwp_ws.is_none() {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"{setting_name}\" setting is only supported for QWP/WebSocket."
-            ));
-        }
-
-        Err(error::fmt!(
-            ConfigError,
-            "\"{setting_name}\" is not a supported QWP/WebSocket configuration key; {reason}."
-        ))
     }
 
     /// Configure how long to wait for messages from the QuestDB server during
