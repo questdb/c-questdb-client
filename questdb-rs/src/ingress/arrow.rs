@@ -39,6 +39,7 @@ use arrow_array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
+use std::collections::HashMap;
 
 use crate::error::{Error, ErrorCode};
 use crate::ingress::buffer::{
@@ -728,6 +729,57 @@ fn emit_arrow_column(
                 QwpColumnKind::String,
                 info_sparse,
                 |offsets, data| build_varlen_from_string_view_into(offsets, data, a),
+            )
+        }
+        ColumnKind::SymbolUtf8 => {
+            let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
+            let payload = build_symbol_payload_from_strings(
+                a.len(),
+                a.null_count(),
+                |row| a.is_null(row),
+                |row| a.value(row),
+            )?;
+            qwp_ws.arrow_bulk_set_symbol(
+                ctx,
+                col_name,
+                &payload.keys,
+                &payload.entries,
+                &payload.dict_data,
+                info_sparse,
+            )
+        }
+        ColumnKind::SymbolLargeUtf8 => {
+            let a = arr.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let payload = build_symbol_payload_from_strings(
+                a.len(),
+                a.null_count(),
+                |row| a.is_null(row),
+                |row| a.value(row),
+            )?;
+            qwp_ws.arrow_bulk_set_symbol(
+                ctx,
+                col_name,
+                &payload.keys,
+                &payload.entries,
+                &payload.dict_data,
+                info_sparse,
+            )
+        }
+        ColumnKind::SymbolUtf8View => {
+            let a = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
+            let payload = build_symbol_payload_from_strings(
+                a.len(),
+                a.null_count(),
+                |row| a.is_null(row),
+                |row| a.value(row),
+            )?;
+            qwp_ws.arrow_bulk_set_symbol(
+                ctx,
+                col_name,
+                &payload.keys,
+                &payload.entries,
+                &payload.dict_data,
+                info_sparse,
             )
         }
         ColumnKind::Binary => {
@@ -1574,6 +1626,56 @@ fn build_symbol_payload_dyn(
     })
 }
 
+fn build_symbol_payload_from_strings<'a>(
+    row_count: usize,
+    null_count: usize,
+    mut is_null: impl FnMut(usize) -> bool,
+    mut value_at: impl FnMut(usize) -> &'a str,
+) -> Result<SymbolPayload> {
+    let mut keys: Vec<u32> = Vec::with_capacity(row_count);
+    let mut entries: Vec<(u32, u32)> = Vec::new();
+    let mut dict_data: Vec<u8> = Vec::new();
+    let mut seen: HashMap<&'a str, u32> = HashMap::new();
+    let mut cumulative: u32 = 0;
+
+    for row in 0..row_count {
+        if null_count != 0 && is_null(row) {
+            keys.push(0);
+            continue;
+        }
+        let value = value_at(row);
+        if let Some(&key) = seen.get(value) {
+            keys.push(key);
+            continue;
+        }
+        if seen.len() >= MAX_ARROW_DICT_VALUES {
+            return Err(fmt!(
+                ArrowIngest,
+                "SYMBOL dictionary has more than {} values",
+                MAX_ARROW_DICT_VALUES
+            ));
+        }
+        let key = u32::try_from(entries.len())
+            .map_err(|_| fmt!(ArrowIngest, "SYMBOL dictionary exceeds u32::MAX entries"))?;
+        let bytes = value.as_bytes();
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| fmt!(ArrowIngest, "SYMBOL entry length exceeds u32::MAX"))?;
+        entries.push((cumulative, len));
+        dict_data.extend_from_slice(bytes);
+        cumulative = cumulative
+            .checked_add(len)
+            .ok_or_else(|| fmt!(ArrowIngest, "SYMBOL cumulative data exceeds u32::MAX"))?;
+        seen.insert(value, key);
+        keys.push(key);
+    }
+
+    Ok(SymbolPayload {
+        keys,
+        entries,
+        dict_data,
+    })
+}
+
 fn fill_dict_keys_into(out: &mut Vec<u32>, arr: &dyn Array, key: DictKey) {
     let row_count = arr.len();
     let has_nulls = arr.null_count() != 0;
@@ -1842,6 +1944,9 @@ enum ColumnKind {
     Utf8,
     LargeUtf8,
     Utf8View,
+    SymbolUtf8,
+    SymbolLargeUtf8,
+    SymbolUtf8View,
     Binary,
     LargeBinary,
     BinaryView,
@@ -1869,6 +1974,11 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         .metadata()
         .get(crate::egress::arrow::metadata::GEOHASH_BITS)
         .and_then(|s| s.parse::<u8>().ok());
+    let wants_symbol = md_type == Some("symbol")
+        || field
+            .metadata()
+            .get(crate::egress::arrow::metadata::SYMBOL)
+            .is_some_and(|v| v == "true");
     Ok(match (field.data_type(), md_type, md_ext) {
         (DataType::Boolean, _, _) => ColumnKind::Bool,
         (DataType::Int8, Some("byte"), _) => ColumnKind::I8,
@@ -1917,8 +2027,11 @@ fn classify(field: &arrow_schema::Field, _array: &dyn Array) -> Result<ColumnKin
         (DataType::Time32(unit), _, _) => ColumnKind::TimeAsLong(*unit),
         (DataType::Time64(unit), _, _) => ColumnKind::TimeAsLong(*unit),
         (DataType::Duration(unit), _, _) => ColumnKind::DurationAsLong(*unit),
+        (DataType::Utf8, _, _) if wants_symbol => ColumnKind::SymbolUtf8,
         (DataType::Utf8, _, _) => ColumnKind::Utf8,
+        (DataType::LargeUtf8, _, _) if wants_symbol => ColumnKind::SymbolLargeUtf8,
         (DataType::LargeUtf8, _, _) => ColumnKind::LargeUtf8,
+        (DataType::Utf8View, _, _) if wants_symbol => ColumnKind::SymbolUtf8View,
         (DataType::Utf8View, _, _) => ColumnKind::Utf8View,
         (DataType::Binary, _, _) => ColumnKind::Binary,
         (DataType::LargeBinary, _, _) => ColumnKind::LargeBinary,
@@ -2487,6 +2600,25 @@ mod tests {
         let mut buf = fresh_buffer();
         buf.append_arrow(table("t"), &rb).unwrap();
         assert_eq!(buf.row_count(), 5);
+    }
+
+    #[test]
+    fn utf8_with_symbol_metadata_builds_symbol_dictionary() {
+        let mut b = StringBuilder::new();
+        b.append_value("us-east");
+        b.append_value("us-west");
+        b.append_value("us-east");
+        b.append_null();
+        let field = Field::new("region", DataType::Utf8, true).with_metadata(
+            [(crate::egress::arrow::metadata::SYMBOL.into(), "true".into())]
+                .into_iter()
+                .collect(),
+        );
+        let schema = arrow_schema_with(field);
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(b.finish()) as ArrayRef]).unwrap();
+        let mut buf = fresh_buffer();
+        buf.append_arrow(table("t"), &rb).unwrap();
+        assert_eq!(buf.row_count(), 4);
     }
 
     #[test]

@@ -2050,6 +2050,8 @@ struct ArrowArray
  *
  * Arrow columns classified as QuestDB TIMESTAMP must contain no null rows and
  * no values before the Unix epoch.
+ * Utf8, LargeUtf8, and Utf8View fields with `questdb.symbol=true` metadata are
+ * emitted as QuestDB SYMBOL columns.
  *
  * Server-side type-mismatch surfaces from the next `line_sender_flush`.
  */
