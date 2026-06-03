@@ -28,10 +28,10 @@
 
 use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
 use crate::egress::error::{Result, fmt};
-use crate::egress::schema::SchemaRegistry;
+use crate::egress::schema::Schema;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
-use crate::egress::wire::cache_reset::{resets_dict, resets_schemas};
+use crate::egress::wire::cache_reset::resets_dict;
 use crate::egress::wire::capabilities::has_zone;
 use crate::egress::wire::header::FrameHeader;
 use crate::egress::wire::msg_kind::{MsgKind, StatusCode};
@@ -160,14 +160,14 @@ pub enum ServerEvent {
 
 /// Decode one full frame (already split into header + payload).
 ///
-/// `dict` and `registry` are mutated in place where the message demands it
-/// (delta dict, full schema, cache reset). The returned event is what the
+/// `dict` and `query_schema` are mutated in place where the message demands
+/// it (delta dict, batch-0 inline schema). The returned event is what the
 /// caller's cursor / state machine should react to.
 pub fn decode_frame(
     header: FrameHeader,
     payload: &Bytes,
     dict: &mut SymbolDict,
-    registry: &mut SchemaRegistry,
+    query_schema: &mut Option<Schema>,
     zstd_scratch: &mut ZstdScratch,
 ) -> Result<ServerEvent> {
     if payload.is_empty() {
@@ -198,13 +198,13 @@ pub fn decode_frame(
             payload,
             header.flags,
             dict,
-            registry,
+            query_schema,
             zstd_scratch,
         )?)),
         MsgKind::ResultEnd => decode_result_end(payload),
         MsgKind::QueryError => decode_query_error(payload),
         MsgKind::ExecDone => decode_exec_done(payload),
-        MsgKind::CacheReset => decode_cache_reset(payload, dict, registry),
+        MsgKind::CacheReset => decode_cache_reset(payload, dict),
         MsgKind::ServerInfo => decode_server_info(payload),
         // Server should never send these to us.
         MsgKind::QueryRequest | MsgKind::Cancel | MsgKind::Credit => Err(fmt!(
@@ -265,11 +265,7 @@ fn decode_exec_done(payload: &[u8]) -> Result<ServerEvent> {
     })
 }
 
-fn decode_cache_reset(
-    payload: &[u8],
-    dict: &mut SymbolDict,
-    registry: &mut SchemaRegistry,
-) -> Result<ServerEvent> {
+fn decode_cache_reset(payload: &[u8], dict: &mut SymbolDict) -> Result<ServerEvent> {
     let mut r = ByteReader::new(payload);
     expect_kind(&mut r, MsgKind::CacheReset)?;
     let mask = r.read_u8()?;
@@ -281,9 +277,6 @@ fn decode_cache_reset(
     // CACHE_RESET that carries the new bit alongside the known ones.
     if resets_dict(mask) {
         dict.reset();
-    }
-    if resets_schemas(mask) {
-        registry.reset();
     }
     Ok(ServerEvent::CacheReset { mask })
 }
@@ -393,7 +386,7 @@ mod tests {
     fn decode_result_end_ok() {
         let payload = build_result_end(42, 7, 1_000);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
@@ -431,7 +424,7 @@ mod tests {
     fn decode_query_error_ok() {
         let payload = build_query_error(9, StatusCode::ParseError, "bad SQL");
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
@@ -459,7 +452,7 @@ mod tests {
         let payload = build_query_error(1, StatusCode::InternalError, "details");
         let truncated = payload.slice(..payload.len() - 3);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_frame(
             header(truncated.len()),
             &truncated,
@@ -480,7 +473,7 @@ mod tests {
         p.extend_from_slice(&[0xFF, 0xFE]);
         let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_frame(
             header(p.len()),
             &p,
@@ -502,7 +495,7 @@ mod tests {
         encode_u64(0, &mut p); // rows_affected for DDL
         let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let event = decode_frame(
             header(p.len()),
             &p,
@@ -532,85 +525,42 @@ mod tests {
     }
 
     #[test]
-    fn cache_reset_clears_dict_only() {
+    fn cache_reset_clears_dict() {
         let mut dict = SymbolDict::new();
         dict.apply_delta(0, [b"x".as_slice()]).unwrap();
-        let mut reg = SchemaRegistry::new();
-        reg.insert(1, crate::egress::schema::Schema::new());
+        let mut query_schema: Option<Schema> = None;
 
         let payload = build_cache_reset(0x01);
         let event = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut query_schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
         assert!(matches!(event, ServerEvent::CacheReset { mask: 0x01 }));
         assert_eq!(dict.len(), 0);
-        assert_eq!(reg.len(), 1);
-    }
-
-    #[test]
-    fn cache_reset_clears_schemas_only() {
-        let mut dict = SymbolDict::new();
-        dict.apply_delta(0, [b"x".as_slice()]).unwrap();
-        let mut reg = SchemaRegistry::new();
-        reg.insert(1, crate::egress::schema::Schema::new());
-
-        let payload = build_cache_reset(0x02);
-        decode_frame(
-            header(payload.len()),
-            &payload,
-            &mut dict,
-            &mut reg,
-            &mut ZstdScratch::new(),
-        )
-        .unwrap();
-        assert_eq!(dict.len(), 1);
-        assert_eq!(reg.len(), 0);
-    }
-
-    #[test]
-    fn cache_reset_clears_both() {
-        let mut dict = SymbolDict::new();
-        dict.apply_delta(0, [b"x".as_slice()]).unwrap();
-        let mut reg = SchemaRegistry::new();
-        reg.insert(1, crate::egress::schema::Schema::new());
-
-        let payload = build_cache_reset(0x03);
-        decode_frame(
-            header(payload.len()),
-            &payload,
-            &mut dict,
-            &mut reg,
-            &mut ZstdScratch::new(),
-        )
-        .unwrap();
-        assert_eq!(dict.len(), 0);
-        assert_eq!(reg.len(), 0);
     }
 
     #[test]
     fn cache_reset_ignores_reserved_bits() {
         // Spec §11.7: "Reserved bits MUST be zero on transmit; recipients
-        // MUST ignore any reserved bits that are set." A future spec
-        // revision adding a new reset bit alongside the known ones must
-        // not break older clients — the known bits still apply, unknown
-        // bits are silently dropped.
+        // MUST ignore any reserved bits that are set." The schemas bit (0x02)
+        // is now reserved (the schema registry is gone); only the DICT bit is
+        // defined. A mask carrying DICT plus reserved bits must still apply
+        // DICT and not error.
         let mut dict = SymbolDict::new();
         dict.apply_delta(0, [b"x".as_slice()]).unwrap();
-        let mut reg = SchemaRegistry::new();
-        reg.insert(1, crate::egress::schema::Schema::new());
+        let mut query_schema: Option<Schema> = None;
 
-        // 0x83 = bit 0 (DICT) + bit 1 (SCHEMAS) + bit 7 (reserved future).
+        // 0x83 = bit 0 (DICT) + bit 1 (reserved) + bit 7 (reserved future).
         let payload = build_cache_reset(0x83);
         let event = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut query_schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -618,12 +568,7 @@ mod tests {
         assert_eq!(
             dict.len(),
             0,
-            "DICT bit must apply even with reserved bit set"
-        );
-        assert_eq!(
-            reg.len(),
-            0,
-            "SCHEMAS bit must apply even with reserved bit set"
+            "DICT bit must apply even with reserved bits set"
         );
     }
 
@@ -662,7 +607,7 @@ mod tests {
     fn decode_server_info_primary() {
         let payload = build_server_info(0x01, "cluster-A", "node-1");
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
@@ -687,7 +632,7 @@ mod tests {
     fn unknown_role_byte_is_other_variant() {
         let payload = build_server_info(0x55, "c", "n");
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
@@ -713,7 +658,7 @@ mod tests {
             Some("eu-west-1a"),
         );
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
@@ -746,7 +691,7 @@ mod tests {
             None, // no trailing zone_id despite CAP_ZONE
         );
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_frame(
             header(payload.len()),
             &payload,
@@ -771,7 +716,7 @@ mod tests {
         payload.extend_from_slice(&[0xDE, 0xAD]);
         let payload = Bytes::from(payload);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_frame(
             header(payload.len()),
             &payload,
@@ -788,7 +733,7 @@ mod tests {
     #[test]
     fn empty_payload_rejected() {
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let empty = Bytes::new();
         let err = decode_frame(
             header(0),
@@ -804,7 +749,7 @@ mod tests {
     #[test]
     fn unknown_msg_kind_rejected() {
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let p = Bytes::from(vec![0xAA]);
         let err =
             decode_frame(header(1), &p, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
@@ -819,7 +764,7 @@ mod tests {
             MsgKind::Credit.as_u8(),
         ] {
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let p = Bytes::from(vec![k]);
             let err = decode_frame(header(1), &p, &mut dict, &mut reg, &mut ZstdScratch::new())
                 .unwrap_err();
@@ -835,7 +780,7 @@ mod tests {
         bytes_vec.push(0xFF);
         let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_frame(
             header(payload.len()),
             &payload,

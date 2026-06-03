@@ -47,7 +47,7 @@
 use proptest::prelude::*;
 
 use questdb::egress::_bench_internals::{
-    Bytes, SchemaRegistry, SymbolDict, ZstdScratch, decode_result_batch,
+    Bytes, Schema, SymbolDict, ZstdScratch, decode_result_batch,
 };
 use questdb::egress::ColumnKind;
 
@@ -56,7 +56,6 @@ use questdb::egress::ColumnKind;
 // ---------------------------------------------------------------------------
 
 const MSG_KIND_RESULT_BATCH: u8 = 0x11;
-const SCHEMA_MODE_FULL: u8 = 0x00;
 const NULL_FLAG_NONE: u8 = 0x00;
 const NULL_FLAG_PRESENT: u8 = 0x01;
 
@@ -375,9 +374,7 @@ fn generate_valid_message(seed: u64) -> Vec<u8> {
     varint_u64(row_count as u64, &mut out);
     varint_u64(col_count as u64, &mut out);
 
-    // Schema section: Full mode, fresh id.
-    out.push(SCHEMA_MODE_FULL);
-    varint_u64(1, &mut out);
+    // Columns inline: per-column (name, kind). No schema-mode byte, no schema id.
     for i in 0..col_count {
         varint_u64(names[i].len() as u64, &mut out);
         out.extend_from_slice(names[i].as_bytes());
@@ -399,7 +396,7 @@ fn generate_valid_message(seed: u64) -> Vec<u8> {
 
 fn sanity_check_decode(message: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg = SchemaRegistry::new();
+    let mut reg: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     decode_result_batch(
         &Bytes::copy_from_slice(message),
@@ -422,7 +419,7 @@ fn sanity_check_decode(message: &[u8]) {
 /// shrinkable failure.
 fn attempt_decode_no_panic(bytes: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg = SchemaRegistry::new();
+    let mut reg: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     let _ = decode_result_batch(
         &Bytes::copy_from_slice(bytes),

@@ -106,7 +106,7 @@ pub use symbol_dict::{SymbolDict, SymbolEntry};
 #[cfg(feature = "sync-reader-ws")]
 pub mod _bench_internals {
     pub use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
-    pub use crate::egress::schema::SchemaRegistry;
+    pub use crate::egress::schema::Schema;
     pub use crate::egress::symbol_dict::SymbolDict;
     pub use bytes::Bytes;
 }

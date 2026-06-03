@@ -53,7 +53,7 @@ use crate::egress::decoder::DecodedBatch;
 use crate::egress::decoder::ZstdScratch;
 use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET};
-use crate::egress::schema::{Schema, SchemaRegistry};
+use crate::egress::schema::Schema;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::tracker::HostHealthTracker;
@@ -95,7 +95,7 @@ pub struct ReaderStats {
 }
 
 /// Per-connection reader. Owns the WebSocket transport and the
-/// connection-scoped symbol dictionary + schema registry.
+/// connection-scoped symbol dictionary.
 pub struct Reader {
     /// Snapshot of the config used to open this connection. Owned (not
     /// borrowed) because the cursor's failover machinery needs to outlive
@@ -121,7 +121,14 @@ pub struct Reader {
     /// [`Reader::transport_mut`] to access — they assert this invariant.
     transport: Option<WsTransport>,
     dict: SymbolDict,
-    registry: SchemaRegistry,
+    /// Schema for the in-flight query. Populated from the first
+    /// `RESULT_BATCH` (`batch_seq == 0`) and reused by continuation
+    /// batches; `ReaderQuery::execute` clears it at query start and the
+    /// reconnect path clears it on failover so a replayed query re-reads
+    /// it from the new node's batch 0. A single slot suffices because a
+    /// `Reader` runs one cursor at a time; pipelined `request_id`s would
+    /// need a map keyed by request id.
+    query_schema: Option<Schema>,
     next_request_id: i64,
     cursor_active: bool,
     /// Server's `SERVER_INFO` (`0x18`) — `None` when negotiated v1.
@@ -285,7 +292,7 @@ impl Reader {
             addr_idx: walk.session.idx,
             transport: Some(walk.session.transport),
             dict: SymbolDict::new(),
-            registry: SchemaRegistry::new(),
+            query_schema: None,
             next_request_id: 1,
             cursor_active: false,
             server_info: walk.session.server_info,
@@ -524,7 +531,7 @@ impl Reader {
                     self.transport = Some(walk.session.transport);
                     self.server_info = walk.session.server_info;
                     self.dict = SymbolDict::new();
-                    self.registry = SchemaRegistry::new();
+                    self.query_schema = None;
                     self.addr_idx = walk.session.idx;
                     return Ok(total_dials);
                 }
@@ -674,11 +681,6 @@ impl Reader {
     /// Connection-scoped symbol dictionary.
     pub fn symbol_dict(&self) -> &SymbolDict {
         &self.dict
-    }
-
-    /// Connection-scoped schema registry.
-    pub fn schema_registry(&self) -> &SchemaRegistry {
-        &self.registry
     }
 
     /// Begin building a parametrised query. The returned `ReaderQuery`
@@ -1100,6 +1102,10 @@ impl<'r> ReaderQuery<'r> {
             ));
         }
         let request_id = self.reader.alloc_request_id();
+        // The schema rides the first RESULT_BATCH (batch_seq == 0) of each
+        // query; clear any schema left from the prior query so a stray
+        // continuation batch can't bind rows to a stale schema.
+        self.reader.query_schema = None;
         let req = self.builder.request_id(request_id).build()?;
         let credit_enabled = req.initial_credit() > 0;
         // Encode the QUERY_REQUEST once and stash the bytes on the
@@ -1426,9 +1432,9 @@ impl<'r> Cursor<'r> {
                     .expect("HaveBatch implies last_batch populated");
                 let schema = self
                     .reader
-                    .registry
-                    .get(last.schema_id)
-                    .expect("schema validated by inner");
+                    .query_schema
+                    .as_ref()
+                    .expect("schema populated by inner decode");
                 Ok(Some(BatchView {
                     decoded: last,
                     dict: &self.reader.dict,
@@ -1509,7 +1515,7 @@ impl<'r> Cursor<'r> {
                 header,
                 &payload,
                 &mut self.reader.dict,
-                &mut self.reader.registry,
+                &mut self.reader.query_schema,
                 &mut self.reader.zstd_scratch,
             );
             // Account for decode time on both arms — the error path is
@@ -1568,13 +1574,13 @@ impl<'r> Cursor<'r> {
                         self.terminate_with_close();
                         return Err(e);
                     }
-                    let schema_id = b.schema_id;
-                    if self.reader.registry.get(schema_id).is_none() {
-                        let err = fmt!(
-                            ProtocolError,
-                            "RESULT_BATCH references schema {} not in registry",
-                            schema_id
-                        );
+                    // decode_result_batch guarantees `query_schema` is
+                    // populated on Ok (batch_seq == 0 sets it; > 0 errors
+                    // when it's absent). Defensive check rather than an
+                    // `.expect()` so an internal-invariant violation can't
+                    // abort the process across the FFI boundary.
+                    if self.reader.query_schema.is_none() {
+                        let err = fmt!(ProtocolError, "RESULT_BATCH decoded without a schema");
                         self.terminate_with_close();
                         return Err(err);
                     }
@@ -1588,11 +1594,10 @@ impl<'r> Cursor<'r> {
                     // BatchView construction is hoisted to `next_batch`
                     // (the wrapper) so the inner returns a borrow-free
                     // discriminant; the wrapper re-acquires the borrows
-                    // on `last_batch`, `dict`, and `registry` itself.
-                    // `last`/`schema_id` are still in scope here only
-                    // for the side effects (insert + data_delivered).
+                    // on `last_batch`, `dict`, and `query_schema` itself.
+                    // `last` is still in scope here only for the side
+                    // effects (insert + data_delivered).
                     let _ = last;
-                    let _ = schema_id;
                     return Ok(NextOutcome::HaveBatch);
                 }
                 ServerEvent::End {
@@ -2596,13 +2601,13 @@ fn read_server_info_frame(transport: &mut WsTransport, timeout: Duration) -> Res
     transport.set_read_timeout(None);
     let (header, payload) = result?;
     let mut dict = SymbolDict::new();
-    let mut registry = SchemaRegistry::new();
+    let mut query_schema: Option<Schema> = None;
     let mut zstd_scratch = ZstdScratch::new();
     let event = decode_frame(
         header,
         &payload,
         &mut dict,
-        &mut registry,
+        &mut query_schema,
         &mut zstd_scratch,
     )?;
     match event {

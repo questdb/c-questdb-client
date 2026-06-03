@@ -450,9 +450,11 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
     )
     .unwrap();
+    // max_schemas_per_connection was removed from QWP; it is explicitly rejected
+    // (not silently ignored) so a stale config surfaces a clear error.
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_schemas_per_connection=1024;"),
-        "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
+        "\"max_schemas_per_connection\" is not a supported QWP/WebSocket configuration key; QWP no longer uses per-connection schema references.",
     );
 
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
@@ -461,6 +463,23 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=15;"),
         "error_inbox_capacity must be >= 16: 15",
     );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_rejects_unknown_config_key_but_tolerates_egress_keys() {
+    // Per the connect-string spec, a genuinely unknown key on a QWP/WebSocket
+    // connect string is rejected (typo / unsupported-option safety net).
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;totally_bogus_key=1;"),
+        "Unknown config key \"totally_bogus_key\"",
+    );
+    // Egress query-client keys are tolerated so a single ws:: connect string can
+    // drive both the ingress sender and the QwpQueryClient.
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;target=primary;compression=zstd;failover=on;zone=eu-1;max_batch_rows=1000;",
+    )
+    .unwrap();
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]

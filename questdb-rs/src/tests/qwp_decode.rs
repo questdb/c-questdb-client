@@ -71,7 +71,6 @@ pub(crate) struct DecodedDatagram {
 pub(crate) struct DecodedTable {
     pub(crate) name: String,
     pub(crate) row_count: u64,
-    pub(crate) schema_mode: u8,
     pub(crate) columns: Vec<DecodedColumn>,
     pub(crate) rows: Vec<Vec<DecodedValue>>,
 }
@@ -259,14 +258,6 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
     let table_name = decoder.read_string()?;
     let row_count = decoder.read_varint()?;
     let column_count = decoder.read_varint()? as usize;
-    let schema_mode = decoder.read_u8()?;
-    if schema_mode != 0 {
-        return Err(format!(
-            "decoder only supports full inline schemas, got schema mode {}",
-            schema_mode
-        ));
-    }
-    let _schema_id = decoder.read_varint()?;
 
     let mut columns = Vec::with_capacity(column_count);
     for _ in 0..column_count {
@@ -805,7 +796,6 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
         table: DecodedTable {
             name: table_name,
             row_count,
-            schema_mode,
             columns,
             rows,
         },

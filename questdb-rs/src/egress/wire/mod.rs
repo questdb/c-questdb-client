@@ -35,7 +35,7 @@ pub mod varint;
 
 pub(crate) use byte_reader::ByteReader;
 
-pub use cache_reset::{RESET_MASK_DICT, RESET_MASK_SCHEMAS};
+pub use cache_reset::RESET_MASK_DICT;
 pub use capabilities::CAP_ZONE;
 pub use header::{FrameHeader, HEADER_LEN, MAGIC, flags};
 pub use msg_kind::{MsgKind, StatusCode};

@@ -80,9 +80,6 @@ pub(crate) const QWP_MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<QwpMessage
 const _: () = assert!(QWP_MESSAGE_HEADER_SIZE == 12);
 const _: () = assert!(MAX_ARRAY_DIMS <= u8::MAX as usize);
 
-pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
-pub(crate) const QWP_SCHEMA_MODE_REFERENCE: u8 = 0x01;
 pub(crate) const QWP_TYPE_BOOLEAN: u8 = 0x01;
 pub(crate) const QWP_TYPE_BYTE: u8 = 0x02;
 pub(crate) const QWP_TYPE_SHORT: u8 = 0x03;
@@ -108,7 +105,6 @@ pub(crate) const QWP_TYPE_BINARY: u8 = 0x17;
 pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
 const QWP_LONG256_BYTES: usize = 32;
 pub(crate) const QWP_VERSION_1: u8 = 1;
-const QWP_INLINE_SCHEMA_ID: u64 = 0;
 const QWP_DECIMAL_MAX_SCALE: u8 = 76;
 const QWP_DECIMAL_SCALE_UNSET: u8 = u8::MAX;
 const QWP_DECIMAL_MAG_LIMBS: usize = 4;
@@ -2685,7 +2681,6 @@ impl QwpWsColumnarBuffer {
             total += qwp_string_byte_len(table.table_name.len());
             total += qwp_varint_size(table.row_count as u64);
             total += qwp_varint_size(table.columns.len() as u64);
-            total += 1 + qwp_varint_size(QWP_INLINE_SCHEMA_ID);
             for column in &table.columns {
                 total += qwp_string_byte_len(column.name.len()) + 1;
                 total += column.estimated_payload_len(table.row_count as usize);
@@ -3608,7 +3603,6 @@ impl QwpWsColumnarBuffer {
             write_qwp_bytes(out, bytes);
         }
 
-        scratch.replay_schema_count = 0;
         let table_count = checked_qwp_u16(
             self.tables
                 .iter()
@@ -3632,13 +3626,8 @@ impl QwpWsColumnarBuffer {
                     column.uses_null_bitmap(table.row_count as usize),
                 ));
             }
-            let schema_id = intern_replay_schema_signature(
-                &mut scratch.replay_schema_signatures,
-                &mut scratch.replay_schema_count,
-                &scratch.schema_signature,
-            );
-            out.push(QWP_SCHEMA_MODE_FULL);
-            write_qwp_varint(out, schema_id);
+            // Columns always travel inline: name + wire-type per column, right
+            // after col_count. No schema-mode byte, no schema id.
             out.extend_from_slice(&scratch.schema_signature);
 
             for (col_idx, column) in table.columns.iter().enumerate() {
@@ -5110,15 +5099,11 @@ pub(crate) struct QwpWsEncodeScratch {
     /// Populated during the pre-pass of `encode_ws_message` and consumed by
     /// the symbol-column writer.
     per_segment_symbol_globals: Vec<Vec<Vec<u64>>>,
-    /// Reusable buffer holding the on-the-wire bytes of one schema's column
-    /// definitions: `(varint name_len, name, type_code)*`. Doubles as the
-    /// signature key for the schema registry and as the payload to splice into
-    /// the message in full mode, avoiding a second pass over the columns.
+    /// Reusable buffer holding the on-the-wire bytes of one table's column
+    /// definitions: `(varint name_len, name, type_code)*`, spliced inline into
+    /// the message right after `col_count` (avoiding a second pass over the
+    /// columns).
     schema_signature: Vec<u8>,
-    /// Reusable per-message schema signatures for the self-sufficient replay
-    /// encoder.
-    replay_schema_signatures: Vec<Vec<u8>>,
-    replay_schema_count: usize,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5128,72 +5113,8 @@ impl QwpWsEncodeScratch {
             message: Vec::with_capacity(16 * 1024),
             per_segment_symbol_globals: Vec::new(),
             schema_signature: Vec::new(),
-            replay_schema_signatures: Vec::new(),
-            replay_schema_count: 0,
         }
     }
-}
-
-/// Connection-scoped schema registry used by the QWP/WebSocket transport's
-/// reference-mode schemas (§9). The first time a particular column-set
-/// signature is seen on a connection, the encoder assigns a fresh id and emits
-/// it in full mode; subsequent batches with the same signature emit reference
-/// mode (just the id), saving the per-message column-definition bytes.
-///
-/// Two tables that happen to have the same column shape may share an id — the
-/// server's registry stores the column set only, and the table name lives in
-/// the table header.
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
-#[derive(Debug, Default)]
-pub(crate) struct SchemaRegistry {
-    map: std::collections::HashMap<Vec<u8>, u64>,
-    next_id: u64,
-}
-
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
-impl SchemaRegistry {
-    pub(crate) fn new() -> Self {
-        Self {
-            map: std::collections::HashMap::new(),
-            next_id: 0,
-        }
-    }
-
-    /// Returns `(schema_id, is_new)`. When `is_new` is true the caller must
-    /// emit full-mode (column definitions inline) so the server registers the
-    /// id; otherwise it should emit reference-mode (just the id).
-    fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
-        if let Some(&id) = self.map.get(signature) {
-            return (id, false);
-        }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        self.map.insert(signature.to_vec(), id);
-        (id, true)
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn intern_replay_schema_signature(
-    signatures: &mut Vec<Vec<u8>>,
-    active_count: &mut usize,
-    signature: &[u8],
-) -> u64 {
-    for (index, stored) in signatures.iter().take(*active_count).enumerate() {
-        if stored.as_slice() == signature {
-            return index as u64;
-        }
-    }
-
-    if *active_count == signatures.len() {
-        signatures.push(Vec::new());
-    }
-    let stored = &mut signatures[*active_count];
-    stored.clear();
-    stored.extend_from_slice(signature);
-    let id = *active_count as u64;
-    *active_count += 1;
-    id
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5209,7 +5130,6 @@ impl QwpBuffer {
         &self,
         scratch: &mut QwpWsEncodeScratch,
         global_dict: &mut SymbolGlobalDict,
-        schema_registry: &mut SchemaRegistry,
         version: u8,
     ) -> crate::Result<()> {
         if self.pending.table.is_some() {
@@ -5283,9 +5203,8 @@ impl QwpBuffer {
             write_qwp_varint(out, row_count as u64);
             write_qwp_varint(out, planner.columns.len() as u64);
 
-            // Schema: build the column-definition byte sequence once. It is
-            // both the registry key (column-set signature) and the payload we
-            // splice inline when emitting full mode.
+            // Columns always travel inline: name + wire-type per column, right
+            // after col_count. No schema-mode byte, no schema id.
             scratch.schema_signature.clear();
             for col in &planner.columns {
                 write_qwp_bytes(
@@ -5296,15 +5215,7 @@ impl QwpBuffer {
                     .schema_signature
                     .push(wire_type_byte(col.kind, col.uses_null_bitmap(row_count)));
             }
-            let (schema_id, is_new) = schema_registry.intern(&scratch.schema_signature);
-            if is_new {
-                out.push(QWP_SCHEMA_MODE_FULL);
-                write_qwp_varint(out, schema_id);
-                out.extend_from_slice(&scratch.schema_signature);
-            } else {
-                out.push(QWP_SCHEMA_MODE_REFERENCE);
-                write_qwp_varint(out, schema_id);
-            }
+            out.extend_from_slice(&scratch.schema_signature);
 
             // Column payloads
             for (col_idx, col) in planner.columns.iter().enumerate() {
@@ -5415,7 +5326,6 @@ impl QwpBuffer {
         }
 
         // ---- Table blocks ----
-        scratch.replay_schema_count = 0;
         let table_count: u16 = checked_qwp_u16(self.segments.len(), "WS message table count")?;
         for (seg_idx, segment) in self.segments.iter().enumerate() {
             let planner = self.size_hint.segment_planner(seg_idx)?;
@@ -5427,9 +5337,8 @@ impl QwpBuffer {
             write_qwp_varint(out, row_count as u64);
             write_qwp_varint(out, planner.columns.len() as u64);
 
-            // Always emit full schema. The schema id is still included because
-            // it is part of QWP full-schema mode, but this replay path never
-            // emits reference-only table blocks.
+            // Columns always travel inline: name + wire-type per column, right
+            // after col_count. No schema-mode byte, no schema id.
             scratch.schema_signature.clear();
             for col in &planner.columns {
                 write_qwp_bytes(
@@ -5440,13 +5349,6 @@ impl QwpBuffer {
                     .schema_signature
                     .push(wire_type_byte(col.kind, col.uses_null_bitmap(row_count)));
             }
-            let schema_id = intern_replay_schema_signature(
-                &mut scratch.replay_schema_signatures,
-                &mut scratch.replay_schema_count,
-                &scratch.schema_signature,
-            );
-            out.push(QWP_SCHEMA_MODE_FULL);
-            write_qwp_varint(out, schema_id);
             out.extend_from_slice(&scratch.schema_signature);
 
             // Column payloads
@@ -6679,8 +6581,6 @@ fn base_datagram_len(table_name_len: usize, row_count: usize, column_count: usiz
         + qwp_string_byte_len(table_name_len)
         + qwp_varint_size(row_count as u64)
         + qwp_varint_size(column_count as u64)
-        + 1
-        + qwp_varint_size(QWP_INLINE_SCHEMA_ID)
 }
 
 fn qwp_string_byte_len(byte_len: usize) -> usize {
@@ -6820,14 +6720,12 @@ fn encode_row_group_from_scratch(
     out.extend_from_slice(&[0u8; QWP_MESSAGE_HEADER_SIZE]);
     let payload_start = out.len();
 
-    // Payload: table name, row count, column count, schema mode, schema id
+    // Payload: table name, row count, column count, then inline columns.
     write_qwp_bytes(out, table_name);
     write_qwp_varint(out, row_count as u64);
     write_qwp_varint(out, planner.columns.len() as u64);
-    out.push(QWP_SCHEMA_MODE_FULL);
-    write_qwp_varint(out, QWP_INLINE_SCHEMA_ID);
 
-    // Schema
+    // Schema: columns always travel inline (no schema-mode byte, no schema id).
     for col in &planner.columns {
         write_qwp_bytes(out, &name_bytes[col.name.0.as_range()]);
         out.push(wire_type_byte(col.kind, col.uses_null_bitmap(row_count)));
@@ -7410,15 +7308,6 @@ mod tests {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    fn first_ws_schema_mode(message: &[u8]) -> u8 {
-        let (_, _, mut pos) = ws_delta_entries(message);
-        let _table_name = read_test_bytes(message, &mut pos);
-        let _row_count = read_test_varint(message, &mut pos);
-        let _column_count = read_test_varint(message, &mut pos);
-        message[pos]
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
     #[test]
     fn qwp_ws_local_symbol_lookup_handles_hash_collisions() {
         let mut lookup = QwpWsLocalSymbolLookup::default();
@@ -7462,9 +7351,6 @@ mod tests {
             let row_count = read_test_varint(message, &mut pos) as usize;
             let column_count = read_test_varint(message, &mut pos);
             assert_eq!(column_count, 1);
-            assert_eq!(message[pos], QWP_SCHEMA_MODE_FULL);
-            pos += 1;
-            let _schema_id = read_test_varint(message, &mut pos);
             let column_name = String::from_utf8(read_test_bytes(message, &mut pos)).unwrap();
             assert_eq!(message[pos], QWP_TYPE_LONG);
             pos += 1;
@@ -9073,7 +8959,6 @@ mod tests {
         let (delta_start, entries, _) = ws_delta_entries(&first);
         assert_eq!(delta_start, 0);
         assert_eq!(entries, vec![b"BTC-USD".to_vec()]);
-        assert_eq!(first_ws_schema_mode(&first), QWP_SCHEMA_MODE_FULL);
 
         buf.clear();
         add_trade_row(&mut buf, "BTC-USD", 2);
@@ -9087,7 +8972,6 @@ mod tests {
             vec![b"BTC-USD".to_vec()],
             "replay frames must re-emit already-known symbols"
         );
-        assert_eq!(first_ws_schema_mode(&second), QWP_SCHEMA_MODE_FULL);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -9115,56 +8999,6 @@ mod tests {
             entries,
             vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
             "a frame referencing id 2 must carry the dense 0..=2 prefix"
-        );
-        assert_eq!(first_ws_schema_mode(&replay), QWP_SCHEMA_MODE_FULL);
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    #[test]
-    fn qwp_ws_replay_does_not_mutate_delta_encoder_schema_refs() {
-        let mut buf = QwpBuffer::new(127);
-        let mut replay_scratch = QwpWsEncodeScratch::new();
-        let mut replay_dict = SymbolGlobalDict::new();
-        let mut delta_scratch = QwpWsEncodeScratch::new();
-        let mut delta_dict = SymbolGlobalDict::new();
-        let mut schema_registry = SchemaRegistry::new();
-
-        add_trade_row(&mut buf, "ETH-USD", 1);
-        buf.encode_ws_message(
-            &mut delta_scratch,
-            &mut delta_dict,
-            &mut schema_registry,
-            QWP_VERSION_1,
-        )
-        .unwrap();
-        buf.encode_ws_replay_message(&mut replay_scratch, &mut replay_dict, QWP_VERSION_1)
-            .unwrap();
-        assert_eq!(
-            first_ws_schema_mode(&replay_scratch.message),
-            QWP_SCHEMA_MODE_FULL
-        );
-
-        buf.clear();
-        add_trade_row(&mut buf, "ETH-USD", 2);
-        buf.encode_ws_message(
-            &mut delta_scratch,
-            &mut delta_dict,
-            &mut schema_registry,
-            QWP_VERSION_1,
-        )
-        .unwrap();
-        assert_eq!(
-            first_ws_schema_mode(&delta_scratch.message),
-            QWP_SCHEMA_MODE_REFERENCE,
-            "existing delta encoder should keep reference-schema behavior"
-        );
-
-        buf.encode_ws_replay_message(&mut replay_scratch, &mut replay_dict, QWP_VERSION_1)
-            .unwrap();
-        assert_eq!(
-            first_ws_schema_mode(&replay_scratch.message),
-            QWP_SCHEMA_MODE_FULL,
-            "replay encoder must always emit full schema"
         );
     }
 

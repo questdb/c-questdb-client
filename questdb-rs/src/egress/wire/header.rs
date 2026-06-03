@@ -38,6 +38,10 @@ use crate::egress::error::{Result, fmt};
 /// `"QWP1"` interpreted as a little-endian `u32`.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"QWP1");
 
+/// The single QWP protocol version. Every frame's `version` byte is written
+/// as this value and validated to equal it on parse.
+pub const PROTOCOL_VERSION: u8 = 1;
+
 /// Length of the wire frame header in bytes.
 pub const HEADER_LEN: usize = 12;
 
@@ -80,8 +84,19 @@ impl FrameHeader {
                 MAGIC
             ));
         }
+        // QWP runs at a single version. Each frame fails fast on its own here,
+        // independently of the negotiated version checked in `transport.rs`.
+        let version = bytes[4];
+        if version != PROTOCOL_VERSION {
+            return Err(fmt!(
+                ProtocolError,
+                "unsupported QWP frame version {} (expected {})",
+                version,
+                PROTOCOL_VERSION
+            ));
+        }
         Ok(FrameHeader {
-            version: bytes[4],
+            version,
             flags: bytes[5],
             table_count: u16::from_le_bytes([bytes[6], bytes[7]]),
             payload_length: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
@@ -118,7 +133,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let h = FrameHeader {
-            version: 2,
+            version: 1,
             flags: flags::GORILLA | flags::DELTA_SYMBOL_DICT,
             table_count: 1,
             payload_length: 0xDEAD_BEEF,

@@ -75,7 +75,7 @@ use crate::ingress::CertificateAuthority;
 pub const DEFAULT_PATH: &str = "/read/v1";
 
 /// Highest QWP version this client can speak.
-pub const HIGHEST_KNOWN_VERSION: u8 = 2;
+pub const HIGHEST_KNOWN_VERSION: u8 = 1;
 
 /// Default WS port (matches QuestDB HTTP / ILP-HTTP convention).
 const DEFAULT_PLAIN_PORT: &str = "9000";
@@ -544,7 +544,6 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // QWP-WS lifecycle / observability
     "close_flush_timeout_millis",
     "request_durable_ack",
-    "max_schemas_per_connection",
     "durable_ack_keepalive_interval_millis",
     "drain_orphans",
     "max_background_drainers",
@@ -1494,7 +1493,7 @@ mod tests {
         let h = c.upgrade_headers();
         // Always emit max_version + accept-encoding; nothing else by default.
         assert_eq!(h.len(), 2);
-        assert_eq!(h[0], ("X-QWP-Max-Version", "2".to_string()));
+        assert_eq!(h[0], ("X-QWP-Max-Version", "1".to_string()));
         assert_eq!(h[1], ("X-QWP-Accept-Encoding", "raw".to_string()));
     }
 

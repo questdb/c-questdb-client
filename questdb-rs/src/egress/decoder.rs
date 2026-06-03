@@ -67,7 +67,7 @@ use crate::egress::column::{
 };
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Error, Result, fmt};
-use crate::egress::schema::SchemaRegistry;
+use crate::egress::schema::Schema;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
 use crate::egress::wire::header::flags;
@@ -195,7 +195,6 @@ pub struct ArrayBuffers {
 pub struct DecodedBatch {
     pub request_id: i64,
     pub batch_seq: u64,
-    pub schema_id: u64,
     pub row_count: usize,
     pub columns: Vec<DecodedColumn>,
     /// Per-batch wire flags from the frame header (`FLAG_GORILLA`,
@@ -352,13 +351,14 @@ fn validity_from_opt<'a>(validity: &'a Option<Bytes>, row_count: usize) -> Resul
 // ---------------------------------------------------------------------------
 
 /// Decode a `RESULT_BATCH` payload (the bytes following the 12-byte frame
-/// header). Mutates `dict` if the batch carries a delta dict section, and
-/// `registry` if the batch carries a full schema.
+/// header). Mutates `dict` if the batch carries a delta dict section. On
+/// `batch_seq == 0` it parses the inline schema and stores it in
+/// `query_schema`; continuation batches reuse the schema held there.
 pub fn decode_result_batch(
     payload: &Bytes,
     flags_byte: u8,
     dict: &mut SymbolDict,
-    registry: &mut SchemaRegistry,
+    query_schema: &mut Option<Schema>,
     zstd_scratch: &mut ZstdScratch,
 ) -> Result<DecodedBatch> {
     let mut r = ByteReader::new(payload);
@@ -431,50 +431,36 @@ pub fn decode_result_batch(
             MAX_ROWS_PER_BATCH
         ));
     }
-    let col_count = r.read_varint_usize()?;
-    if col_count > MAX_COLUMNS_PER_TABLE {
-        return Err(fmt!(
-            ProtocolError,
-            "table block declares {} columns; max supported is {}",
-            col_count,
-            MAX_COLUMNS_PER_TABLE
-        ));
+    // Schema. The full column list rides only the first batch of a query
+    // (batch_seq == 0): col_count followed by the inline column descriptors.
+    // Continuation batches (batch_seq > 0) carry rows only and reuse the
+    // schema parsed from batch 0, which the caller holds in `query_schema`.
+    if batch_seq == 0 {
+        let col_count = r.read_varint_usize()?;
+        if col_count > MAX_COLUMNS_PER_TABLE {
+            return Err(fmt!(
+                ProtocolError,
+                "table block declares {} columns; max supported is {}",
+                col_count,
+                MAX_COLUMNS_PER_TABLE
+            ));
+        }
+        let (schema, consumed) = Schema::decode_inline(r.remaining(), col_count)?;
+        r.advance(consumed)?;
+        *query_schema = Some(schema);
     }
-
-    // Schema section. col_count comes from the table block above; the
-    // schema section itself does not re-emit it.
-    let (schema_id, schema_bytes) = {
-        let schema_section = r.remaining();
-        let dec = registry.decode_section(schema_section, col_count)?;
-        (dec.schema_id, dec.bytes_consumed)
-    };
-    r.advance(schema_bytes)?;
-    // `decode_section` registers the schema before returning Ok; the lookup
-    // below cannot fail under the current implementation. We still propagate
-    // a `ProtocolError` rather than `.expect()` so a future refactor of
-    // `decode_section` can't silently turn an internal-invariant violation
-    // into a process-abort across the FFI boundary.
-    let schema = registry.get(schema_id).ok_or_else(|| {
+    let schema = query_schema.as_ref().ok_or_else(|| {
         fmt!(
             ProtocolError,
-            "schema {} missing from registry after decode_section",
-            schema_id
+            "RESULT_BATCH batch_seq={} arrived before the schema-bearing batch_seq=0",
+            batch_seq
         )
     })?;
-    let schema_cols = schema.len();
-    if schema_cols != col_count {
-        return Err(fmt!(
-            ProtocolError,
-            "schema {} has {} columns but batch announced {}",
-            schema_id,
-            schema_cols,
-            col_count
-        ));
-    }
+    let col_count = schema.len();
 
-    // The shared borrow of `registry` via `schema` lives until the end
+    // The shared borrow of `query_schema` via `schema` lives until the end
     // of this batch decode; `decode_column` below takes neither
-    // `registry` nor `dict`, so iterating `schema.columns()` directly
+    // `query_schema` nor `dict`, so iterating `schema.columns()` directly
     // is borrow-check clean and avoids a per-batch `Vec<ColumnKind>`
     // allocation that scales with column count.
     let mut columns = Vec::with_capacity(col_count);
@@ -509,7 +495,6 @@ pub fn decode_result_batch(
     Ok(DecodedBatch {
         request_id,
         batch_seq,
-        schema_id,
         row_count,
         columns,
         flags: flags_byte,
@@ -1705,7 +1690,7 @@ fn is_null_at_opt(validity: &Option<Bytes>, row: usize) -> bool {
 mod tests {
     use super::*;
     use crate::egress::error::ErrorCode;
-    use crate::egress::schema::{Schema, SchemaColumn, SchemaMode};
+    use crate::egress::schema::{Schema, SchemaColumn};
     use crate::egress::wire::varint::encode_u64;
 
     /// Reference implementation kept inline in the test: byte-by-byte
@@ -1790,7 +1775,7 @@ mod tests {
         let payload = Bytes::from(payload);
 
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
@@ -1842,8 +1827,6 @@ mod tests {
         delta_start: u64,
         row_count: usize,
         cols: Vec<(String, ColumnKind)>,
-        schema_mode: SchemaMode,
-        schema_id: u64,
         column_data: Vec<Vec<u8>>,
     }
 
@@ -1857,8 +1840,6 @@ mod tests {
                 delta_start: 0,
                 row_count,
                 cols: Vec::new(),
-                schema_mode: SchemaMode::Full,
-                schema_id: 1,
                 column_data: Vec::new(),
             }
         }
@@ -1873,13 +1854,8 @@ mod tests {
             self.delta = Some(entries);
             self
         }
-        fn with_schema_ref(mut self, id: u64) -> Self {
-            self.schema_mode = SchemaMode::Reference;
-            self.schema_id = id;
-            self
-        }
-        fn with_schema_id(mut self, id: u64) -> Self {
-            self.schema_id = id;
+        fn with_batch_seq(mut self, seq: u64) -> Self {
+            self.batch_seq = seq;
             self
         }
         fn add_column(mut self, name: &str, kind: ColumnKind, data: Vec<u8>) -> Self {
@@ -1903,16 +1879,13 @@ mod tests {
                 }
             }
 
-            // Table block.
+            // Table block. The schema (col_count + inline column descriptors)
+            // rides only the first batch (batch_seq == 0); continuation batches
+            // carry rows only.
             encode_u64(0, &mut out); // name_len
             encode_u64(self.row_count as u64, &mut out);
-            encode_u64(self.cols.len() as u64, &mut out);
-
-            // Schema section. col_count is in the table block above; the
-            // schema section itself does not re-emit it.
-            out.push(self.schema_mode as u8);
-            encode_u64(self.schema_id, &mut out);
-            if matches!(self.schema_mode, SchemaMode::Full) {
+            if self.batch_seq == 0 {
+                encode_u64(self.cols.len() as u64, &mut out);
                 for (name, kind) in &self.cols {
                     encode_u64(name.len() as u64, &mut out);
                     out.extend_from_slice(name.as_bytes());
@@ -1956,7 +1929,7 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -1992,7 +1965,7 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2026,7 +1999,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2104,7 +2077,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2141,7 +2114,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2170,7 +2143,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2254,7 +2227,7 @@ mod tests {
                 .add_column("v", *kind, col_with_bitmap(&bitmap, value_bytes))
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let batch = decode_result_batch(
                 &payload,
                 flags_byte,
@@ -2292,7 +2265,7 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, geo_payload)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2325,7 +2298,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2358,7 +2331,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2387,7 +2360,7 @@ mod tests {
             .add_column("b", ColumnKind::Boolean, col_no_nulls(&[0x0D]))
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2453,7 +2426,7 @@ mod tests {
     fn assert_non_nullable_rejects_bitmap(kind: ColumnKind, kind_name: &str, body: Vec<u8>) {
         let (flags_byte, payload) = BatchBuilder::new(5).add_column("c", kind, body).build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -2512,7 +2485,7 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2542,7 +2515,7 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2575,7 +2548,7 @@ mod tests {
             .add_column("b", ColumnKind::Symbol, col_b)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2605,7 +2578,7 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -2627,7 +2600,7 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -2649,7 +2622,7 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -2677,7 +2650,7 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2709,7 +2682,7 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -2748,7 +2721,7 @@ mod tests {
             let (flags_byte, payload) = BatchBuilder::new(1).add_column("p", kind, data).build();
 
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
@@ -2775,7 +2748,7 @@ mod tests {
             .add_column("p", ColumnKind::Decimal64, data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -2788,32 +2761,44 @@ mod tests {
     }
 
     #[test]
-    fn schema_reference_after_full() {
+    fn schema_reused_across_continuation_batches() {
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
 
-        // First batch: full schema id=7, one Long column, 2 rows.
+        // First batch (batch_seq == 0) carries the full inline schema.
         let (f1, p1) = BatchBuilder::new(2)
-            .with_schema_id(7)
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[1, 2])))
             .build();
         decode_result_batch(&p1, f1, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
-        assert!(reg.get(7).is_some());
+        assert!(reg.is_some());
 
-        // Second batch references id 7. We still need the column metadata
-        // to know how to decode, so add the same cols on the builder side
-        // (but it emits a Reference frame; the decoder reads kinds from the
-        // registry).
+        // Continuation batch (batch_seq == 1) carries rows only and reuses the
+        // schema parsed from batch 0.
         let (f2, p2) = BatchBuilder::new(1)
-            .with_schema_ref(7)
+            .with_batch_seq(1)
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[42])))
             .build();
         let b2 =
             decode_result_batch(&p2, f2, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
-        assert_eq!(b2.schema_id, 7);
+        assert_eq!(b2.batch_seq, 1);
         let view = b2.column_view(0, &dict).unwrap();
         let ColumnView::Long(c) = view else { panic!() };
         assert_eq!(c.value(0), 42);
+    }
+
+    #[test]
+    fn continuation_before_schema_rejected() {
+        let mut dict = SymbolDict::new();
+        let mut reg: Option<Schema> = None;
+        // A batch_seq > 0 arriving before any batch_seq == 0 has no schema to
+        // bind rows to and must be rejected.
+        let (f, p) = BatchBuilder::new(1)
+            .with_batch_seq(1)
+            .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[42])))
+            .build();
+        let err =
+            decode_result_batch(&p, f, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
     }
 
     #[cfg(feature = "compression-zstd")]
@@ -2846,7 +2831,7 @@ mod tests {
         let zstd_payload = Bytes::from(zstd_payload);
 
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &zstd_payload,
             flags::ZSTD,
@@ -3001,7 +2986,7 @@ mod tests {
         payload.extend_from_slice(&[0u8, 0, 0, 0]); // not a zstd frame
         let payload = Bytes::from(payload);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
@@ -3074,7 +3059,7 @@ mod tests {
 
         let payload = zstd_payload_with_body(&body);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
@@ -3108,7 +3093,7 @@ mod tests {
 
         let payload = zstd_payload_with_body(&frame);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
@@ -3160,7 +3145,7 @@ mod tests {
 
         let payload = zstd_payload_with_body(&body);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
@@ -3183,7 +3168,7 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::GORILLA,
@@ -3213,7 +3198,7 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
@@ -3243,7 +3228,7 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
@@ -3272,7 +3257,7 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
@@ -3301,7 +3286,7 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
@@ -3409,7 +3394,7 @@ mod tests {
             .add_column("ts", kind, body)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
@@ -3510,7 +3495,7 @@ mod tests {
             .add_column("a", ColumnKind::DoubleArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3543,7 +3528,7 @@ mod tests {
             .add_column("a", ColumnKind::LongArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3575,7 +3560,7 @@ mod tests {
             .add_column("a", ColumnKind::DoubleArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -3597,7 +3582,7 @@ mod tests {
             .add_column("a", ColumnKind::LongArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -3648,7 +3633,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3679,7 +3664,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3712,7 +3697,7 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -3740,7 +3725,7 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -3764,7 +3749,7 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3793,7 +3778,7 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3821,7 +3806,7 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -3851,7 +3836,7 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3885,7 +3870,7 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3915,7 +3900,7 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -3935,7 +3920,7 @@ mod tests {
             .add_column("p", ColumnKind::Decimal128, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3964,7 +3949,7 @@ mod tests {
             .add_column("p", ColumnKind::Decimal256, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -3992,7 +3977,7 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4021,7 +4006,7 @@ mod tests {
         bytes_vec.push(0xAA); // trailing byte
         let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -4041,7 +4026,7 @@ mod tests {
             .build();
         payload.truncate(payload.len() - 4); // chop value bytes
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
@@ -4070,7 +4055,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4115,7 +4100,7 @@ mod tests {
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[])))
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4143,7 +4128,7 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, varchar_col_no_nulls(&[]))
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4183,7 +4168,7 @@ mod tests {
             })
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4227,7 +4212,7 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4269,7 +4254,7 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4313,7 +4298,7 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4369,7 +4354,7 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
@@ -4463,7 +4448,7 @@ mod tests {
                 .add_column("a", ColumnKind::DoubleArray, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             decode_result_batch(
                 &payload,
                 flags_byte,
@@ -4484,7 +4469,7 @@ mod tests {
                 .add_column("a", ColumnKind::DoubleArray, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             decode_result_batch(
                 &payload,
                 flags_byte,
@@ -4510,7 +4495,7 @@ mod tests {
                 .add_column("g", ColumnKind::Geohash, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
@@ -4536,7 +4521,7 @@ mod tests {
                 .add_column("g", ColumnKind::Geohash, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
@@ -4575,7 +4560,7 @@ mod tests {
 
             let payload = Bytes::from(out);
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let err =
                 decode_result_batch(&payload, 0, &mut dict, &mut reg, &mut ZstdScratch::new())
                     .expect_err("decoder must reject huge table name length");
@@ -4604,7 +4589,7 @@ mod tests {
                 .add_column("s", ColumnKind::Symbol, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
@@ -4642,7 +4627,7 @@ mod tests {
                 .add_column("v", ColumnKind::Varchar, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
@@ -4674,7 +4659,7 @@ mod tests {
                 .add_column("v", ColumnKind::Varchar, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg = SchemaRegistry::new();
+            let mut reg: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
@@ -4688,45 +4673,6 @@ mod tests {
                 "error must say first offset must start at 0, got: {}",
                 err.msg()
             );
-        }
-
-        // -----------------------------------------------------------------
-        // Schema-id range.
-        // -----------------------------------------------------------------
-
-        /// Ports `testHugeSchemaIdIsRejected`. The registry cap
-        /// (`MAX_SCHEMAS_PER_CONNECTION = 65_535`) bounds the per-
-        /// connection schema map; a single huge schema_id without a
-        /// prior cache reset is fine the first time (the registry is
-        /// keyed by id, not by insertion order), but repeatedly
-        /// growing past the cap must fail. Here we just register up to
-        /// the cap and assert the (cap+1)-th distinct id is rejected.
-        #[test]
-        fn huge_schema_id_overflows_registry() {
-            // We can't realistically register 65535 schemas in a unit
-            // test, so just confirm the cap path is reachable via a
-            // direct registry test: register cap entries, then attempt
-            // one more.
-            use crate::egress::schema::{MAX_SCHEMAS_PER_CONNECTION, SchemaRegistry};
-            let mut reg = SchemaRegistry::new();
-            // The cap is a compile-time constant; test exercises the
-            // boundary cheaply by directly poking the registry rather
-            // than rolling 65535 frames through decode_result_batch.
-            // This still pins the constant against accidental relaxation.
-            assert_eq!(
-                MAX_SCHEMAS_PER_CONNECTION, 65_535,
-                "MAX_SCHEMAS_PER_CONNECTION constant unexpectedly changed; \
-                 review the bound carries through to the wire-level test"
-            );
-            // Stamp a single full schema; verify registry accepts it.
-            let mut full_section = vec![SchemaMode::Full as u8];
-            encode_u64(7, &mut full_section); // schema_id
-            encode_u64(1, &mut full_section); // col name len
-            full_section.push(b'x');
-            full_section.push(ColumnKind::Long.as_u8());
-            let _ = reg
-                .decode_section(&full_section, 1)
-                .expect("baseline schema must register");
         }
     }
 }
