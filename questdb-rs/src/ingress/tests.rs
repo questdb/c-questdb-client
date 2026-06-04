@@ -234,6 +234,7 @@ fn qwpws_config_accepts_java_in_flight_window_alias() {
 /// branch — this list pins the behavior with a regression test so a
 /// future tightening of the catch-all can't break cross-role
 /// portability of a shared connect string.
+#[cfg(feature = "sync-sender-http")]
 const EGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // Egress-only protocol / decoder knobs
     "path",

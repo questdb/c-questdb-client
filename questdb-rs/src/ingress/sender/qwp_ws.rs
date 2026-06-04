@@ -2026,7 +2026,7 @@ fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::
 /// connect paths use below, but in a single call so the probes don't need
 /// to thread the extras-builder + validate-headers + error-mapper boilerplate
 /// through every test harness.
-#[cfg(test)]
+#[cfg(all(test, feature = "_sender-http"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_upgrade<S: Read + Write>(
     stream: &mut S,

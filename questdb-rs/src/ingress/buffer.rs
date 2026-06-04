@@ -41,7 +41,7 @@ pub(crate) use self::ilp::F64Serializer;
 pub(crate) use self::qwp::QwpBuffer;
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpSendScratch;
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
+#[cfg(all(test, feature = "_sender-qwp-ws", feature = "_sender-http"))]
 pub(crate) use self::qwp::SchemaRegistry;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
@@ -455,7 +455,10 @@ impl Buffer {
         }
     }
 
-    #[cfg(any(feature = "_sender-qwp-udp", all(test, feature = "_sender-qwp-ws")))]
+    #[cfg(any(
+        feature = "_sender-qwp-udp",
+        all(test, feature = "_sender-qwp-ws", feature = "_sender-http")
+    ))]
     pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
         match &self.inner {
             BufferInner::Ilp(_) => None,

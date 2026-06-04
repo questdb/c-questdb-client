@@ -800,8 +800,12 @@ wider wire type; `pack` = byte-per-row to LSB-first bitmap.
 | `timedelta64_s` / `ms` / `us` / `ns` | LONG        | direct (signed seconds/millis/micros/nanos) |
 | `s16`                           | UUID             | direct (16 bytes/row) |
 | `s32`                           | LONG256          | direct (32 bytes/row) |
-| `i8` / `i16` / `i32`            | LONG             | widen (sign-extend) |
-| `u8` / `u16` / `u32`            | LONG             | widen (zero-extend) |
+| `i8`                            | BYTE             | direct (1B/row, sentinel = 0; source value 0 ⇒ null) |
+| `i16`                           | SHORT            | direct (2B/row, sentinel = 0; source value 0 ⇒ null) |
+| `i32`                           | INT              | direct (4B/row, sentinel = i32::MIN) |
+| `u8`                            | INT              | widen u8→i32 (4B/row; BYTE/SHORT use 0 as null so u8 can't fit there) |
+| `u16`                           | INT              | widen u16→i32 (4B/row) |
+| `u32`                           | LONG             | widen u32→i64 (8B/row) |
 | `u64`                           | LONG             | widen (bit-reinterpret; values > i64::MAX wrap negative) |
 | `f32`                           | DOUBLE           | widen      |
 | `f16`                           | FLOAT            | widen (per-row f16→f32) |

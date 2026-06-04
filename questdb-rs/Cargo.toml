@@ -139,7 +139,7 @@ sync-sender-http = [
 sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
 
 ## Sync QWP/WebSocket
-sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand", "_keystore-roots"]
+sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand", "dep:socket2", "_keystore-roots"]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]

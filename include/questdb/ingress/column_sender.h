@@ -606,18 +606,28 @@ bool column_sender_chunk_append_arrow_column(
 
 typedef enum column_sender_numpy_dtype
 {
-    /* Original 11 (preserved) */
-    column_sender_numpy_i8 = 0,
-    column_sender_numpy_i16 = 1,
-    column_sender_numpy_i32 = 2,
-    column_sender_numpy_i64 = 3,
-    column_sender_numpy_u8 = 4,
-    column_sender_numpy_u16 = 5,
-    column_sender_numpy_u32 = 6,
-    column_sender_numpy_u64 = 7,
-    column_sender_numpy_f32 = 8,
-    column_sender_numpy_f64 = 9,
-    column_sender_numpy_bool = 10,
+    /* Signed integers — emit at source width (identity, 1 memcpy/no-null).
+       NOTE: BYTE / SHORT use value 0 as the wire null sentinel, so source
+       values of 0 round-trip as NULL on the server side. Callers wanting
+       0 to round-trip as 0 must widen to INT (i32) themselves. */
+    column_sender_numpy_i8 = 0,  /* → BYTE  (1B/row, sentinel = 0)              */
+    column_sender_numpy_i16 = 1, /* → SHORT (2B/row, sentinel = 0)              */
+    column_sender_numpy_i32 = 2, /* → INT   (4B/row, sentinel = i32::MIN)       */
+    column_sender_numpy_i64 = 3, /* → LONG  (8B/row, sentinel = i64::MIN)       */
+
+    /* Unsigned integers — widen to the smallest signed wire that holds the
+       source range WITHOUT colliding with the null sentinel. BYTE/SHORT
+       use value 0 as null, so u8 cannot use either; INT (i32::MIN sentinel)
+       is the minimum safe target for u8. */
+    column_sender_numpy_u8 = 4,  /* → INT   (4B/row, widen u8→i32)              */
+    column_sender_numpy_u16 = 5, /* → INT   (4B/row, widen u16→i32)             */
+    column_sender_numpy_u32 = 6, /* → LONG  (8B/row, widen u32→i64)             */
+    column_sender_numpy_u64 = 7, /* → LONG  (8B/row, bit-reinterpret u64→i64;
+                                    values > i64::MAX wrap to negative)         */
+
+    column_sender_numpy_f32 = 8, /* → DOUBLE (8B/row, widen f32→f64)            */
+    column_sender_numpy_f64 = 9, /* → DOUBLE (8B/row, sentinel = NaN)           */
+    column_sender_numpy_bool = 10, /* → BOOLEAN (bit-packed)                    */
 
     /* Half-precision + time */
     column_sender_numpy_f16 = 11,
