@@ -398,6 +398,8 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     # always build alongside the rest of the suite.
     compile_test(
         test_arrow_c
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/qwp_mock_c.cpp
         cpp_test/test_arrow_c.c)
     compile_test(
         test_arrow_egress
@@ -405,6 +407,7 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         cpp_test/test_arrow_egress.cpp)
     compile_test(
         test_arrow_ingress
+        cpp_test/qwp_mock_server.cpp
         cpp_test/test_arrow_ingress.cpp)
 
     # System testing Python3 script.

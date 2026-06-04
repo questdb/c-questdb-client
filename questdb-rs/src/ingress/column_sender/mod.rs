@@ -39,17 +39,21 @@
 //!   [`ColumnSender::sync`] to commit and wait at the requested [`AckLevel`].
 //! - Drop the [`BorrowedSender`] to return its connection to the pool.
 
+#[cfg(feature = "arrow")]
+mod arrow_batch;
 mod chunk;
 mod conf;
 mod conn;
 mod db;
 mod encoder;
+mod numpy_wire;
 mod sender;
 mod validity;
 mod wire;
 
-pub use chunk::{Chunk, NumpyDtype};
+pub use chunk::Chunk;
 pub use db::{BorrowedSender, QuestDb};
+pub use numpy_wire::NumpyDtype;
 pub use sender::{AckLevel, ColumnSender};
 pub use validity::Validity;
 

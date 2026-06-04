@@ -32,14 +32,21 @@
 
 use std::fmt::{self, Debug, Formatter};
 
+#[cfg(feature = "arrow")]
 use crate::ErrorCode;
-use crate::ingress::buffer::{Buffer, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+use crate::ingress::buffer::SymbolGlobalDict;
+#[cfg(feature = "arrow")]
+use crate::ingress::{ColumnName, TableName};
 use crate::{Result, error};
 
+#[cfg(feature = "arrow")]
+use super::arrow_batch;
 use super::chunk::Chunk;
 use super::conn::ColumnConn;
 use super::encoder::{self, SchemaRegistry};
-use super::wire::QWP_VERSION_1;
+
+#[cfg(feature = "arrow")]
+use arrow_array::RecordBatch;
 
 /// Acknowledgement level for [`ColumnSender::sync`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,7 +66,6 @@ pub struct ColumnSender {
     pub(crate) conn: ColumnConn,
     pub(crate) schema_registry: SchemaRegistry,
     pub(crate) symbol_dict: SymbolGlobalDict,
-    buffer_scratch: QwpWsEncodeScratch,
     /// The first frame is sent without `FLAG_DEFER_COMMIT` so the server
     /// commits it immediately. This lets the WAL segment roll and update
     /// `initialSymbolCount`, warming the server's `ClientSymbolCache` for
@@ -86,7 +92,6 @@ impl ColumnSender {
             conn,
             schema_registry,
             symbol_dict,
-            buffer_scratch: QwpWsEncodeScratch::new(),
             first_frame_sent: false,
         }
     }
@@ -138,29 +143,44 @@ impl ColumnSender {
         Ok(())
     }
 
-    /// Publish a QWP/WebSocket [`Buffer`] through this pooled connection.
+    /// Encode `batch` as a single QWP/WebSocket frame for `table` and
+    /// publish it through this pooled connection in one pass — no
+    /// intermediate buffer staging, no per-column copy. The
+    /// per-row designated timestamp is omitted; the server stamps each
+    /// row on arrival (matches [`Self::flush`] when called on a
+    /// time-stamp-less chunk).
     ///
-    /// This exists for FFI callers that build a Rust `Buffer` through the
-    /// public Arrow batch path and need the same pooled connection,
-    /// deferred-commit, and closing-sync behavior as [`flush`](Self::flush).
-    /// On success, `buffer` is cleared.
-    pub fn flush_buffer(&mut self, buffer: &mut Buffer) -> Result<()> {
-        let qwp = buffer.as_qwp_ws().ok_or_else(|| {
-            error::fmt!(
-                InvalidApiCall,
-                "column sender pooled flush requires a QWP/WebSocket buffer"
-            )
-        })?;
-        qwp.check_can_flush()?;
-        if qwp.is_empty() {
-            buffer.clear();
-            return Ok(());
-        }
-
+    /// Use [`Self::flush_arrow_batch_at_column`] to source the
+    /// designated timestamp from a `Timestamp(_)` column in `batch`.
+    ///
+    /// The first frame is sent as an immediate commit so the server can
+    /// warm its symbol cache; later frames are sent with
+    /// `FLAG_DEFER_COMMIT`. Call [`Self::sync`] to trigger commit for
+    /// all accumulated rows.
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch(&mut self, table: TableName<'_>, batch: &RecordBatch) -> Result<()> {
         let defer = self.first_frame_sent;
-        self.flush_buffer_inner(qwp, defer)?;
+        self.flush_arrow_batch_inner(table, batch, None, defer)?;
         self.first_frame_sent = true;
-        buffer.clear();
+        Ok(())
+    }
+
+    /// Variant of [`Self::flush_arrow_batch`] that sources the per-row
+    /// designated timestamp from `ts_column`. The column must be a
+    /// `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with no
+    /// null rows and no values before the Unix epoch; `Millisecond` is
+    /// widened to µs on the wire.
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch_at_column(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+    ) -> Result<()> {
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        let defer = self.first_frame_sent;
+        self.flush_arrow_batch_inner(table, batch, Some(ts_col_idx), defer)?;
+        self.first_frame_sent = true;
         Ok(())
     }
 
@@ -210,9 +230,12 @@ impl ColumnSender {
         Ok(())
     }
 
-    fn flush_buffer_inner(
+    #[cfg(feature = "arrow")]
+    fn flush_arrow_batch_inner(
         &mut self,
-        buffer: &QwpWsColumnarBuffer,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_col_idx: Option<usize>,
         defer_commit: bool,
     ) -> Result<()> {
         self.conn.try_drain_acks()?;
@@ -221,7 +244,7 @@ impl ColumnSender {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "column sender deferred flush capacity exhausted; call sync() \
-                 before flushing more chunks."
+                 before flushing more arrow batches."
             ));
         }
 
@@ -230,20 +253,21 @@ impl ColumnSender {
         }
 
         let dict_mark = self.symbol_dict.mark();
-        let scratch = &mut self.buffer_scratch;
-        let symbol_dict = &mut self.symbol_dict;
+        let schema = &mut self.schema_registry;
+        let dict = &mut self.symbol_dict;
         let result = self.conn.publish_qwp(|out| {
-            buffer.encode_ws_replay_message_with_defer(
-                scratch,
-                symbol_dict,
-                QWP_VERSION_1,
+            arrow_batch::encode_arrow_batch_into(
+                out,
+                table,
+                batch,
+                ts_col_idx,
+                schema,
+                dict,
                 defer_commit,
-            )?;
-            out.extend_from_slice(&scratch.message);
-            Ok(())
+            )
         });
         let published = match result {
-            Ok(published) => published,
+            Ok(p) => p,
             Err(err) => {
                 if err.code() != ErrorCode::SocketError {
                     self.symbol_dict.rollback(dict_mark);

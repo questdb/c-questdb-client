@@ -268,12 +268,12 @@ pub enum line_sender_error_code {
     /// QWP/WebSocket server rejection or terminal protocol violation.
     line_sender_error_server_rejection,
 
-    /// `line_sender_buffer_append_arrow` was passed a column whose
+    /// `column_sender_flush_arrow_batch` was passed a column whose
     /// Arrow / QuestDB kind cannot be persisted to a QuestDB table.
     /// Only emitted with the `arrow` feature enabled.
     line_sender_error_arrow_unsupported_column_kind,
 
-    /// `line_sender_buffer_append_arrow` rejected a `RecordBatch` at
+    /// `column_sender_flush_arrow_batch` rejected a `RecordBatch` at
     /// client-side structural validation (column count, name encoding,
     /// FFI struct contract). Only emitted with the `arrow` feature
     /// enabled.
@@ -932,18 +932,6 @@ pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_qwp() -> *mut line_sender_buffer {
     let buffer = Buffer::new_qwp();
-    Box::into_raw(Box::new(line_sender_buffer {
-        buffer,
-        empty_peek_buf_is_null: true,
-    }))
-}
-
-/// Construct a QWP/WebSocket columnar `line_sender_buffer` with the
-/// default 127-byte name length limit. Required by
-/// `line_sender_buffer_append_arrow*`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws() -> *mut line_sender_buffer {
-    let buffer = Buffer::new_qwp_ws();
     Box::into_raw(Box::new(line_sender_buffer {
         buffer,
         empty_peek_buf_is_null: true,
@@ -3636,47 +3624,7 @@ pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
 
 // Crate is `panic = "abort"`; `catch_unwind` would be a no-op in
 // shipped builds and harms `cargo test` diagnostics. Validation
-// happens up-front in `arrow_append_impl`.
-
-/// Append every row of an Apache Arrow `RecordBatch` (Arrow C Data
-/// Interface) to `buffer`. The per-row designated timestamp is not
-/// sent — the server stamps each row on arrival.
-///
-/// `array` may be either a Struct array (one child per column, the
-/// standard RecordBatch shape) or a non-Struct single-column array
-/// whose `schema->name` becomes the column name.
-///
-/// Ownership: see the corresponding declaration in
-/// `include/questdb/ingress/line_sender.h`.
-#[cfg(feature = "arrow")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_buffer_append_arrow(
-    buffer: *mut line_sender_buffer,
-    table: line_sender_table_name,
-    array: *mut arrow::ffi::FFI_ArrowArray,
-    schema: *const arrow::ffi::FFI_ArrowSchema,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    unsafe { arrow_append_impl(buffer, table, array, schema, None, err_out) }
-}
-
-/// Variant of `line_sender_buffer_append_arrow` that sources each
-/// row's designated timestamp from a named `Timestamp(_)` column
-/// inside the batch. The column must be `Timestamp(Microsecond |
-/// Nanosecond | Millisecond, _)` with no null rows. Same ownership
-/// contract as `line_sender_buffer_append_arrow`.
-#[cfg(feature = "arrow")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_buffer_append_arrow_at_column(
-    buffer: *mut line_sender_buffer,
-    table: line_sender_table_name,
-    array: *mut arrow::ffi::FFI_ArrowArray,
-    schema: *const arrow::ffi::FFI_ArrowSchema,
-    ts_column: line_sender_column_name,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    unsafe { arrow_append_impl(buffer, table, array, schema, Some(ts_column), err_out) }
-}
+// happens up-front in `arrow_ffi_import_record_batch`.
 
 // Bounds for the pre-walk that protects `arrow::ffi::from_ffi` against
 // adversarial FFI input. Three independent caps:
@@ -3932,46 +3880,43 @@ unsafe fn validate_arrow_array_depth(
     }
 }
 
+/// Validate, import (Arrow C Data Interface → arrow-rs), and bundle into
+/// a `RecordBatch`. NULL array/schema or any validation failure sets
+/// `*err_out` and returns `None`. On `Some`, the caller's
+/// `array->release` has been consumed.
+///
+/// Shared by every FFI entry point that consumes a caller-built Arrow
+/// C Data Interface pair (currently
+/// `column_sender_flush_arrow_batch[_at_column]`).
 #[cfg(feature = "arrow")]
-unsafe fn arrow_append_impl(
-    buffer: *mut line_sender_buffer,
-    table: line_sender_table_name,
+pub(crate) unsafe fn arrow_ffi_import_record_batch(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    ts_column: Option<line_sender_column_name>,
+    fn_name: &str,
     err_out: *mut *mut line_sender_error,
-) -> bool {
+) -> Option<arrow_array::RecordBatch> {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
     use std::sync::Arc;
     unsafe {
-        if buffer.is_null() || array.is_null() || schema.is_null() {
+        if array.is_null() || schema.is_null() {
             arrow_err_to_c_box(
                 err_out,
                 ErrorCode::InvalidApiCall,
-                "line_sender_buffer_append_arrow: NULL buffer / array / schema".to_string(),
+                format!("{fn_name}: NULL array / schema"),
             );
-            return false;
+            return None;
         }
-        // Bound depth, breadth and total node count on both trees BEFORE
-        // consuming the array, so a rejection leaves caller-owned
-        // `array->release` intact. Walks include the dictionary chain
-        // (which `arrow::ffi::from_ffi` recurses through) and cross-checks
-        // array/schema `n_children` agreement to fend off the asserts
-        // inside arrow-rs that would otherwise abort under `panic = "abort"`.
         if let Err(e) = validate_arrow_schema_depth(schema) {
             arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
-            return false;
+            return None;
         }
         if let Err(e) = validate_arrow_array_depth(array, schema) {
             arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
-            return false;
+            return None;
         }
-        // Move out + null caller's release; every return path now
-        // drops `imported_array` exactly once.
         let imported_array = std::ptr::read(array);
         (*array).release = None;
-        let inner = unwrap_buffer_mut(buffer);
         let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
             Ok(d) => d,
             Err(e) => {
@@ -3980,18 +3925,16 @@ unsafe fn arrow_append_impl(
                     ErrorCode::ArrowIngest,
                     format!("from_ffi failed: {}", e),
                 );
-                return false;
+                return None;
             }
         };
-        // `from_ffi` uses `new_unchecked`; this is the trust boundary.
-        // A skipped bound here aborts the host under `panic = "abort"`.
         if let Err(e) = array_data.validate_full() {
             arrow_err_to_c_box(
                 err_out,
                 ErrorCode::ArrowIngest,
                 format!("Arrow array validation failed: {}", e),
             );
-            return false;
+            return None;
         }
         let rb = if matches!(array_data.data_type(), DataType::Struct(_)) {
             if array_data.nulls().is_some_and(|n| n.null_count() > 0) {
@@ -4001,7 +3944,7 @@ unsafe fn arrow_append_impl(
                     "top-level Struct array must have no null rows for RecordBatch ingest"
                         .to_string(),
                 );
-                return false;
+                return None;
             }
             let struct_arr = StructArray::from(array_data);
             let rb_schema = Arc::new(Schema::new(struct_arr.fields().clone()));
@@ -4014,7 +3957,7 @@ unsafe fn arrow_append_impl(
                         ErrorCode::ArrowIngest,
                         format!("RecordBatch::try_new failed: {}", e),
                     );
-                    return false;
+                    return None;
                 }
             }
         } else {
@@ -4026,7 +3969,7 @@ unsafe fn arrow_append_impl(
                         ErrorCode::ArrowIngest,
                         format!("schema conversion failed: {}", e),
                     );
-                    return false;
+                    return None;
                 }
             };
             let arr_ref: ArrayRef = make_array(array_data);
@@ -4039,21 +3982,106 @@ unsafe fn arrow_append_impl(
                         ErrorCode::ArrowIngest,
                         format!("RecordBatch::try_new failed: {}", e),
                     );
-                    return false;
+                    return None;
                 }
             }
         };
-        let result = match ts_column {
-            Some(ts) => inner.append_arrow_at_column(table.as_name(), &rb, ts.as_name()),
-            None => inner.append_arrow(table.as_name(), &rb),
+        Some(rb)
+    }
+}
+
+/// Validate, import, and slice a single Arrow C Data Interface array
+/// into an `ArrayRef`. `[row_offset, row_offset + row_count)` must lie
+/// within the imported array's length. NULL pointers, depth-cap
+/// violations, FFI-import failures, and out-of-range slices all set
+/// `*err_out` and return `None`. On `Some`, the caller's
+/// `array->release` has been consumed and the returned `ArrayRef`'s
+/// Arc keeper owns the underlying buffer lifetime.
+#[cfg(feature = "arrow")]
+pub(crate) unsafe fn arrow_ffi_import_array_sliced(
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    row_offset: usize,
+    row_count: usize,
+    fn_name: &str,
+    err_out: *mut *mut line_sender_error,
+) -> Option<arrow_array::ArrayRef> {
+    use arrow_array::make_array;
+    unsafe {
+        if array.is_null() || schema.is_null() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{fn_name}: NULL array / schema"),
+            );
+            return None;
+        }
+        if let Err(e) = validate_arrow_schema_depth(schema) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return None;
+        }
+        if let Err(e) = validate_arrow_array_depth(array, schema) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return None;
+        }
+        let imported_array = std::ptr::read(array);
+        (*array).release = None;
+        let array_data = match arrow::ffi::from_ffi(imported_array, &*schema) {
+            Ok(d) => d,
+            Err(e) => {
+                arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::ArrowIngest,
+                    format!("from_ffi failed: {}", e),
+                );
+                return None;
+            }
         };
-        bubble_err_to_c!(err_out, result);
-        true
+        if let Err(e) = array_data.validate_full() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::ArrowIngest,
+                format!("Arrow array validation failed: {}", e),
+            );
+            return None;
+        }
+        let full = make_array(array_data);
+        let array_len = full.len();
+        let slice_end = match row_offset.checked_add(row_count) {
+            Some(end) => end,
+            None => {
+                arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: row_offset {row_offset} + row_count {row_count} overflows",),
+                );
+                return None;
+            }
+        };
+        if slice_end > array_len {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!(
+                    "{fn_name}: slice [{row_offset}, {slice_end}) out of range for array length {array_len}",
+                ),
+            );
+            return None;
+        }
+        Some(if row_offset == 0 && row_count == array_len {
+            full
+        } else {
+            full.slice(row_offset, row_count)
+        })
     }
 }
 
 #[cfg(feature = "arrow")]
-fn arrow_err_to_c_box(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
+pub(crate) fn arrow_err_to_c_box(
+    err_out: *mut *mut line_sender_error,
+    code: ErrorCode,
+    msg: String,
+) {
     unsafe {
         if err_out.is_null() {
             return;

@@ -1,3 +1,5 @@
+#include <questdb/ingress/column_sender.h>
+#include <questdb/ingress/column_sender.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
 #include <arrow/array/builder_primitive.h>
@@ -14,6 +16,7 @@
 namespace {
 
 namespace qdb = questdb::ingress;
+using namespace questdb::ingress::literals;
 
 std::shared_ptr<arrow::RecordBatch> build_batch()
 {
@@ -38,12 +41,32 @@ std::shared_ptr<arrow::RecordBatch> build_batch()
 
 bool example(const std::string& host, const std::string& port)
 {
+    const std::string conf_str = "qwpws::addr=" + host + ":" + port + ";";
+    ::line_sender_error* err = nullptr;
+    ::questdb_db* db =
+        ::questdb_db_connect(conf_str.data(), conf_str.size(), &err);
+    if (!db)
+    {
+        std::fprintf(
+            stderr, "questdb_db_connect: %s\n",
+            ::line_sender_error_msg(err, nullptr));
+        ::line_sender_error_free(err);
+        return false;
+    }
+    ::qwpws_conn* raw_conn = ::questdb_db_borrow_conn(db, &err);
+    if (!raw_conn)
+    {
+        std::fprintf(
+            stderr, "questdb_db_borrow_conn: %s\n",
+            ::line_sender_error_msg(err, nullptr));
+        ::line_sender_error_free(err);
+        ::questdb_db_close(db);
+        return false;
+    }
+
+    bool ok = false;
     try
     {
-        const std::string conf_str = "qwpws::addr=" + host + ":" + port + ";";
-        auto sender = qdb::line_sender::from_conf(conf_str);
-        auto buffer = sender.new_buffer();
-
         auto batch = build_batch();
         ArrowArray c_arr{};
         ArrowSchema c_sch{};
@@ -51,24 +74,40 @@ bool example(const std::string& host, const std::string& port)
         if (!st.ok())
         {
             std::fprintf(stderr, "ExportRecordBatch: %s\n", st.ToString().c_str());
-            return false;
         }
-
-        // Designated timestamp pulled from the "ts" column. `c_arr` is
-        // consumed by the call; `c_sch` is borrowed (we release it).
-        buffer.append_arrow(
-            "cpp_arrow_trades", c_arr, c_sch, qdb::column_name_view{"ts"});
-        if (c_sch.release)
-            c_sch.release(&c_sch);
-
-        sender.flush(buffer);
-        return true;
+        else
+        {
+            // Designated timestamp pulled from the "ts" column. On
+            // success `c_arr` is consumed by the conn-level flush;
+            // `c_sch` is borrowed (we release it).
+            qdb::column_sender_conn conn{raw_conn};
+            conn.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
+            if (c_sch.release)
+                c_sch.release(&c_sch);
+            if (!::column_sender_sync(raw_conn, ::column_sender_ack_level_ok, &err))
+            {
+                std::fprintf(
+                    stderr, "column_sender_sync: %s\n",
+                    ::line_sender_error_msg(err, nullptr));
+                ::line_sender_error_free(err);
+            }
+            else
+            {
+                ok = true;
+            }
+        }
     }
     catch (const qdb::line_sender_error& e)
     {
         std::fprintf(stderr, "Error: %s\n", e.what());
-        return false;
     }
+
+    if (::qwpws_conn_must_close(raw_conn))
+        ::questdb_db_drop_conn(db, raw_conn);
+    else
+        ::questdb_db_return_conn(db, raw_conn);
+    ::questdb_db_close(db);
+    return ok;
 }
 
 } // namespace

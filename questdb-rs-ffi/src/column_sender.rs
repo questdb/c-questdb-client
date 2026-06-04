@@ -34,12 +34,15 @@ use libc::{c_char, size_t};
 use std::slice;
 use std::str;
 
+use questdb::ingress::MAX_ARRAY_DIMS;
 use questdb::ingress::column_sender::{
     AckLevel, Chunk, NumpyDtype, OwnedSender, QuestDb, Validity,
 };
 use questdb::{Error, ErrorCode};
 
-use crate::{line_sender_buffer, line_sender_error, set_err_out_from_error};
+#[cfg(feature = "arrow")]
+use crate::{line_sender_column_name, line_sender_table_name};
+use crate::{line_sender_error, set_err_out_from_error};
 
 // ===========================================================================
 // Opaque handles
@@ -777,383 +780,30 @@ symbol_fn!(
 // Generic Arrow column appender
 // ===========================================================================
 
-/// Read the Arrow schema's format string. Returns `None` on a NULL ptr
-/// or invalid UTF-8.
-unsafe fn arrow_format_str(
-    schema: &ArrowSchema,
-    err_out: *mut *mut line_sender_error,
-) -> Option<&str> {
-    if schema.format.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "ArrowSchema.format is NULL".to_string(),
-                ),
-            );
-        }
-        return None;
-    }
-    let bytes = unsafe { std::ffi::CStr::from_ptr(schema.format) }.to_bytes();
-    match str::from_utf8(bytes) {
-        Ok(s) => Some(s),
-        Err(_) => {
-            unsafe {
-                set_err_out_from_error(
-                    err_out,
-                    Error::new(
-                        ErrorCode::InvalidUtf8,
-                        "ArrowSchema.format is not valid UTF-8".to_string(),
-                    ),
-                );
-            }
-            None
-        }
-    }
-}
-
-/// Reject Arrow arrays with a non-zero logical offset — the current
-/// validity / offset slicing logic assumes the array starts at bit 0
-/// of buffers[0] and offset 0 of buffers[1]. Sliced arrays must be
-/// consolidated by the caller.
-unsafe fn arrow_check_offset(array: &ArrowArray, err_out: *mut *mut line_sender_error) -> bool {
-    if array.offset != 0 {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "ArrowArray.offset is {} (only 0 is supported); \
-                         consolidate the array before passing it in.",
-                        array.offset
-                    ),
-                ),
-            );
-        }
-        return false;
-    }
-    true
-}
-
-/// Build a Validity from the slice `[row_offset .. row_offset + row_count)`
-/// of the array's validity buffer (buffers[0]). Returns `Some(None)` when
-/// the array has no nulls (so no validity is passed to the column writer),
-/// `Some(Some(_))` when validity is present, and `None` on error.
-///
-/// `row_offset` must be a multiple of 8 when validity is present, because
-/// the QWP encoder reads the bitmap byte-aligned. Callers planning
-/// non-aligned chunk boundaries must either align them or rebuild the
-/// bitmap.
-unsafe fn arrow_validity<'a>(
-    array: &ArrowArray,
-    row_offset: usize,
-    row_count: usize,
-    err_out: *mut *mut line_sender_error,
-) -> Option<Option<Validity<'a>>> {
-    if array.null_count == 0 {
-        return Some(None);
-    }
-    if array.n_buffers < 1 || array.buffers.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "ArrowArray has nulls but no buffers".to_string(),
-                ),
-            );
-        }
-        return None;
-    }
-    let validity_buf = unsafe { *array.buffers.add(0) } as *const u8;
-    if validity_buf.is_null() {
-        // Arrow spec: `null_count = -1` means "unknown". When the
-        // bitmap pointer is also NULL the producer is signalling "I
-        // don't know how many nulls there are, and I'm not exposing a
-        // bitmap" — most producers (pyarrow, polars) only emit this
-        // shape when the column has no nulls. Treat it as no-nulls
-        // here; downstream encoders read the data buffer densely.
-        if array.null_count < 0 {
-            return Some(None);
-        }
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "ArrowArray.null_count > 0 but validity buffer is NULL".to_string(),
-                ),
-            );
-        }
-        return None;
-    }
-    if !row_offset.is_multiple_of(8) {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "ArrowArray validity slice requires row_offset to be a \
-                         multiple of 8 (got {row_offset}); align chunk \
-                         boundaries or rebuild the bitmap."
-                    ),
-                ),
-            );
-        }
-        return None;
-    }
-    let shifted = unsafe { validity_buf.add(row_offset / 8) };
-    let required = row_count.div_ceil(8);
-    let bytes = unsafe { slice::from_raw_parts(shifted, required) };
-    match Validity::from_bitmap(bytes, row_count) {
-        Ok(v) => Some(Some(v)),
-        Err(err) => {
-            unsafe { set_err_out_from_error(err_out, err) };
-            None
-        }
-    }
-}
-
-/// Read the i-th buffer pointer from `array.buffers`, cast to `*const T`.
-///
-/// `allow_null` lets caller opt in to a NULL buffer pointer (only the
-/// bytes buffer of an empty varchar/symbol-dict array does this). All
-/// other call sites must pass `allow_null = false` so a malformed Arrow
-/// array (length > 0 with a NULL data buffer) is rejected with an
-/// `InvalidApiCall` rather than dereferenced.
-unsafe fn arrow_buffer<T>(
-    array: &ArrowArray,
-    idx: i64,
-    allow_null: bool,
-    err_out: *mut *mut line_sender_error,
-    what: &'static str,
-) -> Option<*const T> {
-    if array.n_buffers <= idx || array.buffers.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "ArrowArray missing buffer #{idx} for {what} \
-                         (n_buffers={})",
-                        array.n_buffers
-                    ),
-                ),
-            );
-        }
-        return None;
-    }
-    let p = unsafe { *array.buffers.add(idx as usize) } as *const T;
-    if !allow_null && p.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!("ArrowArray buffer #{idx} for {what} is NULL"),
-                ),
-            );
-        }
-        return None;
-    }
-    Some(p)
-}
-
-#[derive(Clone, Copy)]
-enum ArrowDictionaryOffsets<'a> {
-    Utf8(&'a [i32]),
-    LargeUtf8(&'a [i64]),
-}
-
-unsafe fn arrow_bytes_len_from_last_offset(
-    last_offset: i64,
-    err_out: *mut *mut line_sender_error,
-    what: &str,
-) -> Option<usize> {
-    if last_offset < 0 {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!("{what} last offset must be non-negative: {last_offset}"),
-                ),
-            );
-        }
-        return None;
-    }
-    match usize::try_from(last_offset) {
-        Ok(v) => Some(v),
-        Err(_) => {
-            unsafe {
-                set_err_out_from_error(
-                    err_out,
-                    Error::new(
-                        ErrorCode::InvalidApiCall,
-                        format!("{what} last offset does not fit usize: {last_offset}"),
-                    ),
-                );
-            }
-            None
-        }
-    }
-}
-
-/// Inspect the Arrow dictionary subtree for a Categorical-style column.
-/// Returns the dictionary offsets and bytes ready to feed into
-/// `Chunk::symbol_dict_i*` / `Chunk::symbol_dict_large_i*`. Rejects any
-/// dict value type other than UTF-8 (`u`) or LargeUtf8 (`U`).
-unsafe fn arrow_dictionary_utf8<'a>(
-    schema: &ArrowSchema,
-    array: &ArrowArray,
-    err_out: *mut *mut line_sender_error,
-) -> Option<(ArrowDictionaryOffsets<'a>, &'a [u8])> {
-    if schema.dictionary.is_null() || array.dictionary.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "dictionary type missing dictionary array or schema".to_string(),
-                ),
-            );
-        }
-        return None;
-    }
-    let dict_schema = unsafe { &*schema.dictionary };
-    let dict_array = unsafe { &*array.dictionary };
-    if !unsafe { arrow_check_offset(dict_array, err_out) } {
-        return None;
-    }
-    let dict_format = unsafe { arrow_format_str(dict_schema, err_out) }?;
-    if dict_format != "u" && dict_format != "U" {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "dictionary value type {dict_format:?} is not \
-                         supported (only UTF-8 'u' or LargeUtf8 'U')"
-                    ),
-                ),
-            );
-        }
-        return None;
-    }
-    if dict_array.length < 0 {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "ArrowArray dictionary length is negative: {}",
-                        dict_array.length
-                    ),
-                ),
-            );
-        }
-        return None;
-    }
-    let dict_len = dict_array.length as usize;
-    let bytes_ptr = unsafe {
-        arrow_buffer::<u8>(
-            dict_array,
-            2,
-            /* allow_null = */ true,
-            err_out,
-            "dict bytes",
-        )
-    }?;
-    let (offsets, bytes_len) = if dict_format == "u" {
-        let offsets_ptr = unsafe {
-            arrow_buffer::<i32>(
-                dict_array,
-                1,
-                /* allow_null = */ false,
-                err_out,
-                "dict offsets",
-            )
-        }?;
-        let offsets = unsafe { slice::from_raw_parts(offsets_ptr, dict_len + 1) };
-        let bytes_len = if dict_len == 0 {
-            0
-        } else {
-            unsafe {
-                arrow_bytes_len_from_last_offset(
-                    offsets[dict_len] as i64,
-                    err_out,
-                    "dictionary UTF-8",
-                )
-            }?
-        };
-        (ArrowDictionaryOffsets::Utf8(offsets), bytes_len)
-    } else {
-        let offsets_ptr = unsafe {
-            arrow_buffer::<i64>(
-                dict_array,
-                1,
-                /* allow_null = */ false,
-                err_out,
-                "dict offsets",
-            )
-        }?;
-        let offsets = unsafe { slice::from_raw_parts(offsets_ptr, dict_len + 1) };
-        let bytes_len = if dict_len == 0 {
-            0
-        } else {
-            unsafe {
-                arrow_bytes_len_from_last_offset(offsets[dict_len], err_out, "dictionary LargeUtf8")
-            }?
-        };
-        (ArrowDictionaryOffsets::LargeUtf8(offsets), bytes_len)
-    };
-    let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
-        &[][..]
-    } else {
-        unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
-    };
-    Some((offsets, bytes))
-}
-
-/// Append a slice of one column from an Arrow C Data interface array.
-/// Delegates to the appropriate `column_sender_chunk_column_*` /
-/// `_symbol_dict_*` path based on the schema's format string.
+/// Append a slice of one column from an Arrow C Data Interface array.
+/// Routes through the same encoding infrastructure as
+/// `column_sender_flush_arrow_batch`; supports the full 43-variant
+/// Arrow type matrix (`arrow_batch::classify`).
 ///
 /// `row_offset` and `row_count` describe the slice of the array to
-/// append; pass `row_offset=0, row_count=array->length` to send the
-/// whole array. When the array has nulls, `row_offset` must be a
-/// multiple of 8 (the QWP encoder reads the validity bitmap
-/// byte-aligned).
+/// append; pass `row_offset=0, row_count=array->length` for the whole
+/// array.
 ///
-/// Supported formats (see Apache Arrow C Data Interface spec):
-///   - `c`, `s`, `i`, `l`          int8 / int16 / int32 / int64
-///   - `f`, `g`                    float32 / float64
-///   - `b`                         bool (LSB-first bitmap)
-///   - `u`                         UTF-8 string (int32 offsets)
-///   - `U`                         LargeUtf8 string (int64 offsets;
-///     narrowed to u32 at encode time)
-///   - `tsn:...`                   timestamp nanos (timezone ignored)
-///   - `tsu:...`                   timestamp micros (timezone ignored)
-///   - dictionary-typed schema with the index format above and a
-///     UTF-8 `u` or LargeUtf8 `U` value type → routes to
-///     `symbol_dict_i*`.
+/// Ownership: on success, `array->release` is consumed (set to NULL);
+/// the chunk holds the underlying buffers via an internal Arc until
+/// `column_sender_flush` returns. On failure, `array->release` is
+/// untouched. `schema` is always borrowed; the caller retains
+/// `schema->release` in all cases.
 ///
-/// Other formats return `line_sender_error_invalid_api_call`.
-///
-/// The array must have `offset == 0` (consolidate slices upstream of
-/// this call).
+/// `array->offset` is honored (the Arrow C Data Interface logical
+/// offset); `row_offset` further sub-slices within the call.
+#[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
     chunk: *mut column_sender_chunk,
     name: *const c_char,
     name_len: size_t,
-    array: *const ArrowArray,
+    array: *mut ArrowArray,
     schema: *const ArrowSchema,
     row_offset: size_t,
     row_count: size_t,
@@ -1167,339 +817,37 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
         Some(s) => s,
         None => return false,
     };
-    if array.is_null() || schema.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    "ArrowArray and ArrowSchema must be non-NULL".to_string(),
-                ),
-            );
-        }
-        return false;
-    }
-    let array_ref = unsafe { &*array };
-    let schema_ref = unsafe { &*schema };
-    if !unsafe { arrow_check_offset(array_ref, err_out) } {
-        return false;
-    }
-    if array_ref.length < 0 {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!("ArrowArray.length is negative: {}", array_ref.length),
-                ),
-            );
-        }
-        return false;
-    }
-    let array_total_len = array_ref.length as usize;
-    if row_offset > array_total_len || row_count > array_total_len - row_offset {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!(
-                        "slice [{row_offset}, {row_offset}+{row_count}) \
-                         out of range for ArrowArray.length={array_total_len}"
-                    ),
-                ),
-            );
-        }
-        return false;
-    }
-
-    let format = match unsafe { arrow_format_str(schema_ref, err_out) } {
-        Some(s) => s,
+    let ffi_array = array as *mut arrow::ffi::FFI_ArrowArray;
+    let ffi_schema = schema as *const arrow::ffi::FFI_ArrowSchema;
+    let arr_ref = match unsafe {
+        crate::arrow_ffi_import_array_sliced(
+            ffi_array,
+            ffi_schema,
+            row_offset,
+            row_count,
+            "column_sender_chunk_append_arrow_column",
+            err_out,
+        )
+    } {
+        Some(a) => a,
         None => return false,
     };
-    let validity = match unsafe { arrow_validity(array_ref, row_offset, row_count, err_out) } {
-        Some(v) => v,
-        None => return false,
-    };
-
-    // Dictionary types dispatch to symbol_dict_*; the outer format is
-    // the index width. The dictionary array is shared across chunks;
-    // only the per-row codes are sliced by row_offset.
-    if !schema_ref.dictionary.is_null() {
-        let (dict_offsets, dict_bytes) =
-            match unsafe { arrow_dictionary_utf8(schema_ref, array_ref, err_out) } {
-                Some(t) => t,
-                None => return false,
-            };
-        match format {
-            "c" => {
-                let codes_ptr =
-                    match unsafe { arrow_buffer::<i8>(array_ref, 1, false, err_out, "dict codes") }
-                    {
-                        Some(p) => p,
-                        None => return false,
-                    };
-                let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
-                match dict_offsets {
-                    ArrowDictionaryOffsets::Utf8(dict_offsets) => bubble!(
-                        err_out,
-                        chunk.symbol_dict_i8(
-                            name,
-                            codes,
-                            dict_offsets,
-                            dict_bytes,
-                            validity.as_ref()
-                        )
-                    ),
-                    ArrowDictionaryOffsets::LargeUtf8(dict_offsets) => bubble!(
-                        err_out,
-                        chunk.symbol_dict_large_i8(
-                            name,
-                            codes,
-                            dict_offsets,
-                            dict_bytes,
-                            validity.as_ref()
-                        )
-                    ),
-                };
-            }
-            "s" => {
-                let codes_ptr = match unsafe {
-                    arrow_buffer::<i16>(array_ref, 1, false, err_out, "dict codes")
-                } {
-                    Some(p) => p,
-                    None => return false,
-                };
-                let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
-                match dict_offsets {
-                    ArrowDictionaryOffsets::Utf8(dict_offsets) => bubble!(
-                        err_out,
-                        chunk.symbol_dict_i16(
-                            name,
-                            codes,
-                            dict_offsets,
-                            dict_bytes,
-                            validity.as_ref()
-                        )
-                    ),
-                    ArrowDictionaryOffsets::LargeUtf8(dict_offsets) => bubble!(
-                        err_out,
-                        chunk.symbol_dict_large_i16(
-                            name,
-                            codes,
-                            dict_offsets,
-                            dict_bytes,
-                            validity.as_ref()
-                        )
-                    ),
-                };
-            }
-            "i" => {
-                let codes_ptr = match unsafe {
-                    arrow_buffer::<i32>(array_ref, 1, false, err_out, "dict codes")
-                } {
-                    Some(p) => p,
-                    None => return false,
-                };
-                let codes = unsafe { slice::from_raw_parts(codes_ptr.add(row_offset), row_count) };
-                match dict_offsets {
-                    ArrowDictionaryOffsets::Utf8(dict_offsets) => bubble!(
-                        err_out,
-                        chunk.symbol_dict_i32(
-                            name,
-                            codes,
-                            dict_offsets,
-                            dict_bytes,
-                            validity.as_ref()
-                        )
-                    ),
-                    ArrowDictionaryOffsets::LargeUtf8(dict_offsets) => bubble!(
-                        err_out,
-                        chunk.symbol_dict_large_i32(
-                            name,
-                            codes,
-                            dict_offsets,
-                            dict_bytes,
-                            validity.as_ref()
-                        )
-                    ),
-                };
-            }
-            other => {
-                unsafe {
-                    set_err_out_from_error(
-                        err_out,
-                        Error::new(
-                            ErrorCode::InvalidApiCall,
-                            format!(
-                                "dictionary index type {other:?} is not \
-                                 supported (only c / s / i for now)"
-                            ),
-                        ),
-                    );
-                }
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Plain (non-dictionary) types. Data lives in buffers[1] for fixed-
-    // width primitives; varchar additionally uses buffers[2] for bytes.
-    //
-    // The Arrow C Data Interface puts a `:`-prefixed parameter (e.g.
-    // timezone) only on timestamp / date / time formats. For everything
-    // else we exact-match the format string so e.g. a malformed `"u:foo"`
-    // doesn't spuriously dispatch to the varchar arm.
-    macro_rules! primitive {
-        ($ty:ty, $method:ident, $what:literal) => {{
-            let ptr = match unsafe { arrow_buffer::<$ty>(array_ref, 1, false, err_out, $what) } {
-                Some(p) => p,
-                None => return false,
-            };
-            let data = unsafe { slice::from_raw_parts(ptr.add(row_offset), row_count) };
-            bubble!(err_out, chunk.$method(name, data, validity.as_ref()));
-        }};
-    }
-    match format {
-        "c" => primitive!(i8, column_i8, "i8 column data"),
-        "s" => primitive!(i16, column_i16, "i16 column data"),
-        "i" => primitive!(i32, column_i32, "i32 column data"),
-        "l" => primitive!(i64, column_i64, "i64 column data"),
-        "f" => primitive!(f32, column_f32, "f32 column data"),
-        "g" => primitive!(f64, column_f64, "f64 column data"),
-        "b" => {
-            // Bool bitmap: callers using row_offset on a packed bitmap
-            // must align by 8 just like validity. Rust crate's
-            // column_bool reads bit-shifted only off the byte boundary.
-            if !row_offset.is_multiple_of(8) {
-                unsafe {
-                    set_err_out_from_error(
-                        err_out,
-                        Error::new(
-                            ErrorCode::InvalidApiCall,
-                            format!(
-                                "Arrow bool column slice requires row_offset \
-                                 to be a multiple of 8 (got {row_offset})."
-                            ),
-                        ),
-                    );
-                }
-                return false;
-            }
-            let ptr =
-                match unsafe { arrow_buffer::<u8>(array_ref, 1, false, err_out, "bool bitmap") } {
-                    Some(p) => p,
-                    None => return false,
-                };
-            let shifted = unsafe { ptr.add(row_offset / 8) };
-            let len = row_count.div_ceil(8);
-            let bits = unsafe { slice::from_raw_parts(shifted, len) };
-            bubble!(
-                err_out,
-                chunk.column_bool(name, bits, row_count, validity.as_ref())
-            );
-        }
-        // Timestamp formats carry a `:<tz>` (or `:`) suffix per the
-        // Arrow C Data Interface. We ignore the timezone — the QWP
-        // wire stores absolute instants, and Pandas / Polars give us
-        // UTC-normalised values by convention.
-        f if f.starts_with("tsn:") => {
-            primitive!(i64, column_ts_nanos, "ts_nanos column data")
-        }
-        f if f.starts_with("tsu:") => {
-            primitive!(i64, column_ts_micros, "ts_micros column data")
-        }
-        "u" => {
-            // UTF-8 string column with int32 offsets. buffers[1] = offsets,
-            // buffers[2] = bytes. The offsets array has length array.length
-            // + 1; slicing means starting at offsets[row_offset] and
-            // reading row_count + 1 entries.
-            let offsets_ptr = match unsafe {
-                arrow_buffer::<i32>(array_ref, 1, false, err_out, "varchar offsets")
-            } {
-                Some(p) => p,
-                None => return false,
-            };
-            let bytes_ptr =
-                match unsafe { arrow_buffer::<u8>(array_ref, 2, true, err_out, "varchar bytes") } {
-                    Some(p) => p,
-                    None => return false,
-                };
-            let offsets =
-                unsafe { slice::from_raw_parts(offsets_ptr.add(row_offset), row_count + 1) };
-            // bytes_len passed to Chunk::column_varchar is the high-water
-            // mark of the slice — the Rust encoder reads bytes in the
-            // range [offsets[0], offsets[row_count]); pass the full
-            // original bytes buffer length so validate_varchar_offsets
-            // doesn't complain.
-            let bytes_len = if array_total_len == 0 {
-                0
-            } else {
-                // Read original offsets[array_total_len] as the bytes-buffer
-                // upper bound. Avoids slicing the bytes; the encoder
-                // does its own rebase.
-                unsafe { *offsets_ptr.add(array_total_len) as usize }
-            };
-            let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
-                &[][..]
-            } else {
-                unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
-            };
-            bubble!(
-                err_out,
-                chunk.column_varchar(name, offsets, bytes, validity.as_ref())
-            );
-        }
-        "U" => {
-            // LargeUtf8 column with int64 offsets. Same shape as `u`
-            // but offsets are i64.
-            let offsets_ptr = match unsafe {
-                arrow_buffer::<i64>(array_ref, 1, false, err_out, "large_varchar offsets")
-            } {
-                Some(p) => p,
-                None => return false,
-            };
-            let bytes_ptr = match unsafe {
-                arrow_buffer::<u8>(array_ref, 2, true, err_out, "large_varchar bytes")
-            } {
-                Some(p) => p,
-                None => return false,
-            };
-            let offsets =
-                unsafe { slice::from_raw_parts(offsets_ptr.add(row_offset), row_count + 1) };
-            let bytes_len = if array_total_len == 0 {
-                0
-            } else {
-                unsafe { *offsets_ptr.add(array_total_len) as usize }
-            };
-            let bytes = if bytes_len == 0 || bytes_ptr.is_null() {
-                &[][..]
-            } else {
-                unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
-            };
-            bubble!(
-                err_out,
-                chunk.column_varchar_large(name, offsets, bytes, validity.as_ref())
-            );
-        }
-        other => {
+    let field = match arrow::datatypes::Field::try_from(unsafe { &*ffi_schema }) {
+        Ok(f) => f,
+        Err(e) => {
             unsafe {
                 set_err_out_from_error(
                     err_out,
                     Error::new(
-                        ErrorCode::InvalidApiCall,
-                        format!(
-                            "Arrow column format {other:?} (full: {format:?}) \
-                             is not yet supported by \
-                             column_sender_chunk_append_arrow_column"
-                        ),
+                        ErrorCode::ArrowIngest,
+                        format!("schema conversion failed: {e}"),
                     ),
                 );
             }
             return false;
         }
-    }
+    };
+    bubble!(err_out, chunk.push_arrow_column(name, &field, arr_ref));
     true
 }
 
@@ -1515,10 +863,11 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
 // client) consolidates upstream.
 // ===========================================================================
 
-/// NumPy source dtype, mirrored to the C ABI as `int32` values. Keep
-/// in sync with the Cython `cdef enum column_sender_numpy_dtype` and
-/// the Rust [`NumpyDtype`] enum (see `Chunk::column_numpy` for the
-/// widening / packing rules).
+/// NumPy source dtype tag. Mirrored to the C ABI as a 32-bit enum; the
+/// discriminants and order must match `column_sender_numpy_dtype` in the
+/// C header. The dtype tells the encoder how to walk `data` at flush and
+/// which QWP wire kind to emit; for `decimal_*` and `geohash_*`, the
+/// per-call parameter rides on `column_sender_numpy_extras`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum column_sender_numpy_dtype {
@@ -1533,35 +882,297 @@ pub enum column_sender_numpy_dtype {
     column_sender_numpy_f32 = 8,
     column_sender_numpy_f64 = 9,
     column_sender_numpy_bool = 10,
+
+    column_sender_numpy_f16 = 11,
+    column_sender_numpy_datetime64_s = 12,
+    column_sender_numpy_datetime64_ms = 13,
+    column_sender_numpy_datetime64_us = 14,
+    column_sender_numpy_datetime64_ns = 15,
+    column_sender_numpy_timedelta64_s = 16,
+    column_sender_numpy_timedelta64_ms = 17,
+    column_sender_numpy_timedelta64_us = 18,
+    column_sender_numpy_timedelta64_ns = 19,
+
+    column_sender_numpy_s16 = 20,
+    column_sender_numpy_s32 = 21,
+
+    column_sender_numpy_decimal_s8 = 22,
+    column_sender_numpy_decimal_s16 = 23,
+    column_sender_numpy_decimal_s32 = 24,
+
+    column_sender_numpy_u32_ipv4 = 25,
+    column_sender_numpy_u16_char = 26,
+
+    column_sender_numpy_geohash_i8 = 27,
+    column_sender_numpy_geohash_i16 = 28,
+    column_sender_numpy_geohash_i32 = 29,
+    column_sender_numpy_geohash_i64 = 30,
+
+    column_sender_numpy_f64_ndarray = 31,
 }
 
-impl From<column_sender_numpy_dtype> for NumpyDtype {
-    fn from(value: column_sender_numpy_dtype) -> Self {
-        match value {
-            column_sender_numpy_dtype::column_sender_numpy_i8 => NumpyDtype::I8,
-            column_sender_numpy_dtype::column_sender_numpy_i16 => NumpyDtype::I16,
-            column_sender_numpy_dtype::column_sender_numpy_i32 => NumpyDtype::I32,
-            column_sender_numpy_dtype::column_sender_numpy_i64 => NumpyDtype::I64,
-            column_sender_numpy_dtype::column_sender_numpy_u8 => NumpyDtype::U8,
-            column_sender_numpy_dtype::column_sender_numpy_u16 => NumpyDtype::U16,
-            column_sender_numpy_dtype::column_sender_numpy_u32 => NumpyDtype::U32,
-            column_sender_numpy_dtype::column_sender_numpy_u64 => NumpyDtype::U64,
-            column_sender_numpy_dtype::column_sender_numpy_f32 => NumpyDtype::F32,
-            column_sender_numpy_dtype::column_sender_numpy_f64 => NumpyDtype::F64,
-            column_sender_numpy_dtype::column_sender_numpy_bool => NumpyDtype::Bool,
+/// Companion to [`column_sender_chunk_append_numpy_column`] carrying
+/// dtype-specific parameters. Pass NULL unless the chosen dtype reads
+/// from a field (decimal scale, geohash bits).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct column_sender_numpy_extras {
+    pub decimal_scale: i8,
+    pub geohash_bits: u8,
+    /// Number of dimensions per row for `column_sender_numpy_f64_ndarray`.
+    /// Must be in `1..=MAX_ARRAY_DIMS` (`32`).
+    pub array_ndim: u8,
+    /// Per-row shape (length = `array_ndim`). Each dim must be >= 1. The
+    /// pointer is borrowed for the duration of the FFI call only.
+    pub array_shape: *const u32,
+}
+
+unsafe fn validate_decimal_scale(
+    extras: Option<&column_sender_numpy_extras>,
+    max_scale: i8,
+    label: &str,
+    err_out: *mut *mut line_sender_error,
+) -> Option<u8> {
+    let Some(extras) = extras else {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "{label} column requires non-NULL column_sender_numpy_extras with decimal_scale set"
+                    ),
+                ),
+            );
         }
+        return None;
+    };
+    let scale = extras.decimal_scale;
+    if scale < 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("decimal_scale must be >= 0, got {scale}"),
+                ),
+            );
+        }
+        return None;
     }
+    if scale > max_scale {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("decimal_scale must be <= {max_scale} for {label}, got {scale}"),
+                ),
+            );
+        }
+        return None;
+    }
+    Some(scale as u8)
+}
+
+unsafe fn validate_geohash_bits(
+    extras: Option<&column_sender_numpy_extras>,
+    max_bits: u8,
+    err_out: *mut *mut line_sender_error,
+) -> Option<u8> {
+    let Some(extras) = extras else {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "GEOHASH iN column requires non-NULL column_sender_numpy_extras with geohash_bits set".to_string(),
+                ),
+            );
+        }
+        return None;
+    };
+    let bits = extras.geohash_bits;
+    if bits == 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "geohash_bits must be >= 1, got 0".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
+    if bits > max_bits {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("geohash_bits must be <= {max_bits} for GEOHASH iN, got {bits}"),
+                ),
+            );
+        }
+        return None;
+    }
+    Some(bits)
+}
+
+unsafe fn validate_f64_ndarray(
+    extras: Option<&column_sender_numpy_extras>,
+    err_out: *mut *mut line_sender_error,
+) -> Option<(u8, [u32; MAX_ARRAY_DIMS])> {
+    let Some(extras) = extras else {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "f64_ndarray column requires non-NULL column_sender_numpy_extras with array_ndim and array_shape set".to_string(),
+                ),
+            );
+        }
+        return None;
+    };
+    let ndim = extras.array_ndim;
+    if ndim == 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "array_ndim must be >= 1, got 0".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
+    if (ndim as usize) > MAX_ARRAY_DIMS {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("array_ndim must be <= {MAX_ARRAY_DIMS} (MAX_ARRAY_DIMS), got {ndim}"),
+                ),
+            );
+        }
+        return None;
+    }
+    if extras.array_shape.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "f64_ndarray column requires non-NULL array_shape".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
+    let mut shape = [0u32; MAX_ARRAY_DIMS];
+    for (i, slot) in shape.iter_mut().take(ndim as usize).enumerate() {
+        let dim = unsafe { *extras.array_shape.add(i) };
+        if dim == 0 {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!("array_shape[{i}] must be >= 1, got 0"),
+                    ),
+                );
+            }
+            return None;
+        }
+        *slot = dim;
+    }
+    Some((ndim, shape))
+}
+
+unsafe fn resolve_numpy_dtype(
+    dtype: column_sender_numpy_dtype,
+    extras: *const column_sender_numpy_extras,
+    err_out: *mut *mut line_sender_error,
+) -> Option<NumpyDtype> {
+    use column_sender_numpy_dtype as D;
+    let extras = unsafe { extras.as_ref() };
+    Some(match dtype {
+        D::column_sender_numpy_i64 => NumpyDtype::I64Direct,
+        D::column_sender_numpy_f64 => NumpyDtype::F64Direct,
+        D::column_sender_numpy_datetime64_ms => NumpyDtype::DateI64Direct,
+        D::column_sender_numpy_datetime64_us => NumpyDtype::TimestampMicrosDirect,
+        D::column_sender_numpy_datetime64_ns => NumpyDtype::TimestampNanosDirect,
+        D::column_sender_numpy_timedelta64_s
+        | D::column_sender_numpy_timedelta64_ms
+        | D::column_sender_numpy_timedelta64_us
+        | D::column_sender_numpy_timedelta64_ns => NumpyDtype::LongDirect,
+        D::column_sender_numpy_s16 => NumpyDtype::UuidDirect,
+        D::column_sender_numpy_s32 => NumpyDtype::Long256Direct,
+        D::column_sender_numpy_u32_ipv4 => NumpyDtype::Ipv4Direct,
+        D::column_sender_numpy_u16_char => NumpyDtype::CharDirect,
+
+        D::column_sender_numpy_i8 => NumpyDtype::I8Widen,
+        D::column_sender_numpy_i16 => NumpyDtype::I16Widen,
+        D::column_sender_numpy_i32 => NumpyDtype::I32Widen,
+        D::column_sender_numpy_u8 => NumpyDtype::U8Widen,
+        D::column_sender_numpy_u16 => NumpyDtype::U16Widen,
+        D::column_sender_numpy_u32 => NumpyDtype::U32Widen,
+        D::column_sender_numpy_u64 => NumpyDtype::U64Widen,
+        D::column_sender_numpy_f32 => NumpyDtype::F32Widen,
+        D::column_sender_numpy_f16 => NumpyDtype::F16Widen,
+        D::column_sender_numpy_bool => NumpyDtype::Bool,
+        D::column_sender_numpy_datetime64_s => NumpyDtype::DatetimeSecToMicros,
+
+        D::column_sender_numpy_decimal_s8 => NumpyDtype::Decimal64 {
+            scale: unsafe { validate_decimal_scale(extras, 18, "DECIMAL64", err_out)? },
+        },
+        D::column_sender_numpy_decimal_s16 => NumpyDtype::Decimal128 {
+            scale: unsafe { validate_decimal_scale(extras, 38, "DECIMAL128", err_out)? },
+        },
+        D::column_sender_numpy_decimal_s32 => NumpyDtype::Decimal256 {
+            scale: unsafe { validate_decimal_scale(extras, 76, "DECIMAL256", err_out)? },
+        },
+
+        D::column_sender_numpy_geohash_i8 => NumpyDtype::GeohashI8 {
+            bits: unsafe { validate_geohash_bits(extras, 8, err_out)? },
+        },
+        D::column_sender_numpy_geohash_i16 => NumpyDtype::GeohashI16 {
+            bits: unsafe { validate_geohash_bits(extras, 16, err_out)? },
+        },
+        D::column_sender_numpy_geohash_i32 => NumpyDtype::GeohashI32 {
+            bits: unsafe { validate_geohash_bits(extras, 32, err_out)? },
+        },
+        D::column_sender_numpy_geohash_i64 => NumpyDtype::GeohashI64 {
+            bits: unsafe { validate_geohash_bits(extras, 60, err_out)? },
+        },
+
+        D::column_sender_numpy_f64_ndarray => {
+            let (ndim, shape) = unsafe { validate_f64_ndarray(extras, err_out)? };
+            NumpyDtype::F64Ndarray { ndim, shape }
+        }
+    })
 }
 
 /// Append one column from a contiguous, native-endian NumPy buffer.
-/// Widening (narrower int / float → wire type) and NumPy bool packing
-/// (byte-per-row → LSB-bitmap) happen inside Rust at append time; the
-/// caller's `data` buffer is read once and not retained.
+/// The buffer is walked at flush time straight into the outbound frame;
+/// no per-column copy is taken at append. Caller MUST keep `data` (and
+/// `validity->bits`, if any) alive until the next
+/// `column_sender_flush` / `column_sender_sync` returns.
 ///
-/// `data` must point to at least `row_count * sizeof(dtype)` bytes
-/// (for `column_sender_numpy_bool`: `row_count` bytes, one byte per
-/// row, NumPy native layout). Strided / non-native-endian arrays are
-/// rejected by convention — the caller consolidates upstream.
+/// `dtype` selects from 31 supported NumPy → QuestDB wire mappings (see
+/// the C header for the full coverage matrix). For `decimal_*`,
+/// `geohash_*`, and `f64_ndarray` dtypes, `extras` must be non-NULL and
+/// supply the corresponding fields (`decimal_scale` 0..=18/38/76;
+/// `geohash_bits` 1..=8/16/32/60; `array_ndim` 1..=32 with `array_shape`
+/// pointing at `array_ndim` per-dim u32 sizes, each >= 1). For every
+/// other dtype, `extras` is ignored and may be NULL.
+///
+/// Strided and non-native-endian arrays are not supported; consolidate
+/// upstream.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
     chunk: *mut column_sender_chunk,
@@ -1571,6 +1182,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
     data: *const u8,
     row_count: size_t,
     validity: *const column_sender_validity,
+    extras: *const column_sender_numpy_extras,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let chunk = match unsafe { chunk.as_mut() } {
@@ -1585,9 +1197,12 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
         Some(v) => v,
         None => return false,
     };
-    let dtype: NumpyDtype = dtype.into();
+    let dtype = match unsafe { resolve_numpy_dtype(dtype, extras, err_out) } {
+        Some(d) => d,
+        None => return false,
+    };
     bubble!(err_out, unsafe {
-        chunk.column_numpy(name, dtype, data, row_count, validity.as_ref())
+        chunk.push_numpy_deferred(name, dtype, data, row_count, validity.as_ref())
     });
     true
 }
@@ -1682,54 +1297,90 @@ pub unsafe extern "C" fn column_sender_flush(
     true
 }
 
-/// Publish a QWP/WebSocket `line_sender_buffer` through a pooled
-/// `qwpws_conn`.
+/// Encode an Apache Arrow `RecordBatch` (Arrow C Data Interface) as a
+/// single QWP/WebSocket frame for `table` and publish it through `conn`
+/// in one pass — no intermediate buffer staging, no per-column copy.
 ///
-/// This is the pooled counterpart to the row-sender `line_sender_flush`
-/// path for callers that populated a QWP/WebSocket buffer through
-/// `line_sender_buffer_append_arrow`. It applies the same deferred-flush
-/// and final `column_sender_sync` contract as `column_sender_flush`.
+/// `array` may be either a Struct array (one child per column, standard
+/// RecordBatch shape) or a non-Struct single-column array whose
+/// `schema->name` becomes the column name.
 ///
-/// On success, `buffer` is cleared and the call returns `true`. On
-/// failure, `buffer` is left untouched and `false` is returned (with
-/// `*err_out` set if provided).
+/// The per-row designated timestamp is omitted; the server stamps each
+/// row on arrival. Use [`column_sender_flush_arrow_batch_at_column`] to
+/// source the timestamp from a `Timestamp(_)` column inside the batch.
+///
+/// Ownership: on success, the consumer invokes `array->release` /
+/// `schema->release`; on failure, the caller retains ownership and may
+/// retry or free them.
+///
+/// Returns `true` on success, `false` on error (with `*err_out` set).
+#[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_flush_buffer(
+pub unsafe extern "C" fn column_sender_flush_arrow_batch(
     conn: *mut qwpws_conn,
-    buffer: *mut line_sender_buffer,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe { arrow_batch_impl(conn, table, array, schema, None, err_out) }
+}
+
+/// Variant of [`column_sender_flush_arrow_batch`] that sources each
+/// row's designated timestamp from a named `Timestamp(_)` column inside
+/// the batch. The column must be `Timestamp(Microsecond | Nanosecond |
+/// Millisecond, _)` with no null rows and no values before the Unix
+/// epoch. Same ownership contract.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
+    conn: *mut qwpws_conn,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: line_sender_column_name,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe { arrow_batch_impl(conn, table, array, schema, Some(ts_column), err_out) }
+}
+
+#[cfg(feature = "arrow")]
+unsafe fn arrow_batch_impl(
+    conn: *mut qwpws_conn,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: Option<line_sender_column_name>,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let sender = match unsafe { conn.as_mut() } {
         Some(c) => c.0.get_mut(),
         None => {
-            unsafe {
-                set_err_out_from_error(
-                    err_out,
-                    Error::new(
-                        ErrorCode::InvalidApiCall,
-                        "column_sender_flush_buffer: conn pointer is NULL".to_string(),
-                    ),
-                );
-            }
+            crate::arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "column_sender_flush_arrow_batch: conn pointer is NULL".to_string(),
+            );
             return false;
         }
     };
-    let buffer = match unsafe { buffer.as_mut() } {
-        Some(b) => &mut b.buffer,
-        None => {
-            unsafe {
-                set_err_out_from_error(
-                    err_out,
-                    Error::new(
-                        ErrorCode::InvalidApiCall,
-                        "column_sender_flush_buffer: buffer pointer is NULL".to_string(),
-                    ),
-                );
-            }
-            return false;
-        }
+    let rb = match unsafe {
+        crate::arrow_ffi_import_record_batch(
+            array,
+            schema,
+            "column_sender_flush_arrow_batch",
+            err_out,
+        )
+    } {
+        Some(rb) => rb,
+        None => return false,
     };
-    bubble!(err_out, sender.flush_buffer(buffer));
+    let table_name = unsafe { table.as_name() };
+    let result = match ts_column {
+        Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name()),
+        None => sender.flush_arrow_batch(table_name, &rb),
+    };
+    bubble!(err_out, result);
     true
 }
 
@@ -1981,7 +1632,7 @@ mod tests {
             release: None,
             private_data: std::ptr::null_mut(),
         };
-        let array = ArrowArray {
+        let mut array = ArrowArray {
             length: 3,
             null_count: 0,
             offset: 0,
@@ -2000,7 +1651,7 @@ mod tests {
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
-                &array,
+                &mut array,
                 &schema,
                 0,
                 codes.len(),

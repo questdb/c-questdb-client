@@ -37,9 +37,12 @@ use std::slice;
 use crate::ingress::buffer::SymbolGlobalDict;
 use crate::{Result, error};
 
+#[cfg(feature = "arrow")]
+use super::arrow_batch;
 use super::chunk::{
     Chunk, ColumnDescriptor, ColumnKind, DesignatedTsDescriptor, SymbolCodesPtr, ValidityDescriptor,
 };
+use super::numpy_wire;
 use super::wire::{
     F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, MAX_NAME_LEN, QWP_FLAG_DEFER_COMMIT,
     QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_SCHEMA_MODE_FULL,
@@ -63,7 +66,7 @@ impl SchemaRegistry {
         Self::default()
     }
 
-    fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
+    pub(super) fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
         if let Some(&id) = self.by_signature.get(signature) {
             return (id, false);
         }
@@ -247,6 +250,13 @@ fn estimate_frame_size(
                 4 * (row_count + 1) + bytes_len
             }
             ColumnKind::Symbol { .. } => 5 * row_count, // varint upper bound
+            // Conservative upper bound covering the widest Arrow body
+            // (Decimal256 = scale + 32 B/row, ARRAY DOUBLE per-row blob).
+            // Under-estimation only costs a Vec realloc inside the
+            // encoder; over-estimation costs a one-shot reservation.
+            #[cfg(feature = "arrow")]
+            ColumnKind::ArrowDeferred { .. } => 64 * row_count,
+            ColumnKind::NumpyDeferred { dtype, .. } => dtype.bytes_per_row() * row_count,
         };
         total += null_overhead + payload_size;
     }
@@ -286,17 +296,27 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
 struct SymbolResolution {
     delta_start: u64,
     new_symbols: Vec<Vec<u8>>,
-    /// One entry per column slot. `Some` for symbol columns; carries the
-    /// per-row internal-index→global-id map keyed by the dict slot the
-    /// row references.
-    per_column: Vec<Option<ResolvedSymbolColumn>>,
+    /// One entry per column slot. `Some` for symbol-bearing columns;
+    /// the variant tracks which source (row-by-row vs Arrow) so the
+    /// encoder picks the matching emit path without re-classifying.
+    per_column: Vec<Option<ResolvedColumn>>,
 }
 
-struct ResolvedSymbolColumn {
+pub(crate) enum ResolvedColumn {
+    /// Row-by-row `ColumnKind::Symbol`: slot → global-id table plus
+    /// the non-null row count used to size the dense varint output.
+    Row(RowResolvedSymbol),
+    /// `ColumnKind::ArrowDeferred` whose `arrow_kind` is a symbol
+    /// variant. Per-non-null-row global ids are pre-computed.
+    #[cfg(feature = "arrow")]
+    Arrow(arrow_batch::ArrowResolvedSymbolColumn),
+}
+
+pub(crate) struct RowResolvedSymbol {
     /// Indexed by dict slot. `u64::MAX` for slots the column never
     /// references (we only intern referenced slots).
-    local_to_global: Vec<u64>,
-    non_null_count: usize,
+    pub(crate) local_to_global: Vec<u64>,
+    pub(crate) non_null_count: usize,
 }
 
 fn resolve_symbols(
@@ -305,59 +325,70 @@ fn resolve_symbols(
 ) -> Result<SymbolResolution> {
     let delta_start = symbol_dict.next_id();
     let mut new_symbols: Vec<Vec<u8>> = Vec::new();
-    let mut per_column: Vec<Option<ResolvedSymbolColumn>> = Vec::with_capacity(chunk.columns.len());
+    let mut per_column: Vec<Option<ResolvedColumn>> = Vec::with_capacity(chunk.columns.len());
     let row_count = chunk.row_count();
 
     for col in &chunk.columns {
-        let ColumnKind::Symbol {
-            codes,
-            dict_offsets,
-            dict_offsets_len,
-            dict_bytes,
-            dict_bytes_len,
-        } = col.kind
-        else {
-            per_column.push(None);
-            continue;
-        };
-        let dict_len = dict_offsets_len - 1;
-        let dict_bytes_slice = unsafe { slice::from_raw_parts(dict_bytes, dict_bytes_len) };
-        // Pass 1: mark referenced dict slots + count non-null rows.
-        let mut referenced = vec![false; dict_len];
-        let mut non_null_count = 0usize;
-        for i in 0..row_count {
-            if !is_valid_row(col.validity.as_ref(), i) {
-                continue;
+        match col.kind {
+            ColumnKind::Symbol {
+                codes,
+                dict_offsets,
+                dict_offsets_len,
+                dict_bytes,
+                dict_bytes_len,
+            } => {
+                let dict_len = dict_offsets_len - 1;
+                let dict_bytes_slice = unsafe { slice::from_raw_parts(dict_bytes, dict_bytes_len) };
+                let mut referenced = vec![false; dict_len];
+                let mut non_null_count = 0usize;
+                for i in 0..row_count {
+                    if !is_valid_row(col.validity.as_ref(), i) {
+                        continue;
+                    }
+                    // SAFETY: codes ptr was validated to have row_count elements.
+                    let slot = unsafe { codes.read_i64(i) } as usize;
+                    referenced[slot] = true;
+                    non_null_count += 1;
+                }
+                // The encoder reads `codes` directly at emit time —
+                // no compacted codes copy needed (~400 KB saved on a
+                // 100k-row chunk).
+                let mut local_to_global = vec![u64::MAX; dict_len];
+                for (slot, mark) in referenced.iter().enumerate() {
+                    if !*mark {
+                        continue;
+                    }
+                    // SAFETY: pointers and monotonic in-buffer offsets
+                    // were validated at append time.
+                    let start = unsafe { dict_offsets.read_i64(slot) } as usize;
+                    let end = unsafe { dict_offsets.read_i64(slot + 1) } as usize;
+                    let entry_bytes = &dict_bytes_slice[start..end];
+                    let (gid, is_new) = symbol_dict.intern(entry_bytes);
+                    if is_new {
+                        new_symbols.push(entry_bytes.to_vec());
+                    }
+                    local_to_global[slot] = gid;
+                }
+                per_column.push(Some(ResolvedColumn::Row(RowResolvedSymbol {
+                    local_to_global,
+                    non_null_count,
+                })));
             }
-            // SAFETY: codes ptr was validated to have row_count elements.
-            let slot = unsafe { codes.read_i64(i) } as usize;
-            referenced[slot] = true;
-            non_null_count += 1;
+            #[cfg(feature = "arrow")]
+            ColumnKind::ArrowDeferred {
+                arrow_kind,
+                ref arr,
+            } => {
+                let resolved = arrow_batch::resolve_arrow_symbol_column(
+                    arr.as_ref(),
+                    arrow_kind,
+                    symbol_dict,
+                    &mut new_symbols,
+                )?;
+                per_column.push(resolved.map(ResolvedColumn::Arrow));
+            }
+            _ => per_column.push(None),
         }
-        // Pass 2: intern referenced slots, build local_to_global. The
-        // encoder reads `codes` directly at emit time — no separate
-        // compact-codes pass / allocation needed (~400 KB saved on a
-        // 100k-row chunk).
-        let mut local_to_global = vec![u64::MAX; dict_len];
-        for (slot, mark) in referenced.iter().enumerate() {
-            if !*mark {
-                continue;
-            }
-            // SAFETY: pointers and monotonic in-buffer offsets were validated
-            // at append time.
-            let start = unsafe { dict_offsets.read_i64(slot) } as usize;
-            let end = unsafe { dict_offsets.read_i64(slot + 1) } as usize;
-            let entry_bytes = &dict_bytes_slice[start..end];
-            let (gid, is_new) = symbol_dict.intern(entry_bytes);
-            if is_new {
-                new_symbols.push(entry_bytes.to_vec());
-            }
-            local_to_global[slot] = gid;
-        }
-        per_column.push(Some(ResolvedSymbolColumn {
-            local_to_global,
-            non_null_count,
-        }));
     }
     Ok(SymbolResolution {
         delta_start,
@@ -449,12 +480,35 @@ unsafe fn encode_column(
             );
         },
         ColumnKind::Symbol { codes, .. } => {
-            let resolved = resolution.per_column[col_idx]
-                .as_ref()
-                .expect("symbol resolution missing for symbol column");
+            let resolved = match resolution.per_column[col_idx].as_ref() {
+                Some(ResolvedColumn::Row(r)) => r,
+                _ => panic!("row-based symbol resolution missing for ColumnKind::Symbol"),
+            };
             unsafe {
                 encode_symbol(out, codes, resolved, row_count, validity);
             }
+        }
+        #[cfg(feature = "arrow")]
+        ColumnKind::ArrowDeferred {
+            arrow_kind,
+            ref arr,
+        } => {
+            let sym_res = match resolution.per_column.get(col_idx).and_then(Option::as_ref) {
+                Some(ResolvedColumn::Arrow(r)) => Some(r),
+                Some(ResolvedColumn::Row(_)) => {
+                    panic!("arrow symbol resolution missing for ArrowDeferred column")
+                }
+                None => None,
+            };
+            arrow_batch::write_arrow_column_body(out, arrow_kind, arr.as_ref(), sym_res)?;
+        }
+        ColumnKind::NumpyDeferred {
+            dtype,
+            data,
+            row_count: numpy_rows,
+        } => {
+            debug_assert_eq!(numpy_rows, row_count);
+            unsafe { numpy_wire::emit_into_wire(out, dtype, data, numpy_rows, validity)? };
         }
     }
     Ok(())
@@ -717,7 +771,7 @@ unsafe fn encode_varchar_large(
 unsafe fn encode_symbol(
     out: &mut Vec<u8>,
     codes: SymbolCodesPtr,
-    resolved: &ResolvedSymbolColumn,
+    resolved: &RowResolvedSymbol,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
 ) {
@@ -998,5 +1052,97 @@ mod tests {
         // patched correctly.
         let payload_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         assert_eq!(12 + payload_len, bytes.len());
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn arrow_deferred_i64_column_matches_row_by_row() {
+        use crate::ingress::column_sender::arrow_batch;
+        use arrow_array::{ArrayRef, Int64Array};
+        use std::sync::Arc;
+
+        let values = [10i64, 20, 30];
+
+        let row_by_row = make_chunk_i64("price", &values);
+
+        let arr: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .push_arrow_deferred("price", arrow_batch::ColumnKind::I64, arr)
+            .unwrap();
+        chunk.designated_timestamp_nanos(&values).unwrap();
+        let mut out = Vec::new();
+        let mut reg = SchemaRegistry::new();
+        let mut dict = SymbolGlobalDict::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+
+        assert_eq!(
+            row_by_row, out,
+            "ArrowDeferred I64 must produce byte-identical wire to column_i64"
+        );
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn arrow_deferred_symbol_column_interns_into_shared_dict() {
+        use crate::ingress::column_sender::arrow_batch;
+        use arrow_array::{ArrayRef, StringArray};
+        use std::sync::Arc;
+
+        let sym = StringArray::from(vec!["AAPL", "MSFT", "AAPL"]);
+        let ts = [1i64, 2, 3];
+        let arr: ArrayRef = Arc::new(sym);
+        let mut chunk = Chunk::new("trades");
+        chunk
+            .push_arrow_deferred("sym", arrow_batch::ColumnKind::SymbolUtf8, arr)
+            .unwrap();
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+
+        let mut out = Vec::new();
+        let mut reg = SchemaRegistry::new();
+        let mut dict = SymbolGlobalDict::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+
+        assert_eq!(&out[..4], b"QWP1");
+        assert_eq!(dict.next_id(), 2, "two unique symbols interned");
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn arrow_deferred_symbol_failure_rolls_back_dict() {
+        use crate::ingress::column_sender::arrow_batch;
+        use arrow_array::types::UInt32Type;
+        use arrow_array::{ArrayRef, DictionaryArray, UInt32Array};
+        use std::sync::Arc;
+
+        let mut vb = arrow_array::builder::StringBuilder::new();
+        vb.append_value("alpha");
+        vb.append_null();
+        let values = vb.finish();
+        let keys = UInt32Array::from(vec![0u32, 1]);
+        let dict_arr =
+            DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
+        let arr: ArrayRef = Arc::new(dict_arr);
+        let kind = arrow_batch::ColumnKind::SymbolDict {
+            key: arrow_batch::DictKey::U32,
+            value: arrow_batch::DictValue::Utf8,
+        };
+
+        let ts = [1i64, 2];
+        let mut chunk = Chunk::new("trades");
+        chunk.push_arrow_deferred("sym", kind, arr).unwrap();
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+
+        let mut out = Vec::new();
+        let mut reg = SchemaRegistry::new();
+        let mut dict = SymbolGlobalDict::new();
+        let prior_next = dict.next_id();
+        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+        assert_eq!(
+            dict.next_id(),
+            prior_next,
+            "global dict must roll back on symbol resolution failure",
+        );
     }
 }

@@ -97,14 +97,15 @@ enum class line_sender_error_code
     /** QWP/WebSocket server rejection or terminal protocol violation. */
     server_rejection,
 
-    /** `line_sender_buffer::append_arrow` was passed a column whose Arrow
-     *  type / metadata combination has no QuestDB ingress mapping.
+    /** `column_sender_conn::flush_arrow_batch` was passed a column whose
+     *  Arrow type / metadata combination has no QuestDB ingress mapping.
      *  Only raised with the `arrow` feature enabled. */
     arrow_unsupported_column_kind,
 
-    /** `line_sender_buffer::append_arrow` rejected a `RecordBatch` at the
-     *  contract layer (invalid format, structural error against the Arrow
-     *  C Data Interface). Only raised with the `arrow` feature enabled. */
+    /** `column_sender_conn::flush_arrow_batch` rejected a `RecordBatch` at
+     *  the contract layer (invalid format, structural error against the
+     *  Arrow C Data Interface). Only raised with the `arrow` feature
+     *  enabled. */
     arrow_ingest,
 };
 
@@ -304,6 +305,7 @@ private:
     friend class line_sender;
     friend class line_sender_buffer;
     friend class opts;
+    friend class column_sender_conn;
 
     template <
         typename T,

@@ -639,7 +639,278 @@ bool column_sender_chunk_symbol_dict_i32(
 
 ---
 
-## 10. Designated timestamp
+## 10. Per-column Arrow appender
+
+Single entry point that consumes one column from an Apache Arrow C
+Data Interface array and routes through the same classifier and
+encoder used by `column_sender_flush_arrow_batch` (§13.1). Coverage is
+the full 43-variant `ColumnKind` matrix — all primitives, timestamps,
+dates, decimals (Decimal32/64/128/256), UUID, LONG256, geohash,
+dictionary-encoded symbols across every key/value combination, and
+varlen UTF8 / Binary in their three Arrow encodings.
+
+Available only when the FFI is built with the `arrow` feature
+(`QUESTDB_CLIENT_ENABLE_ARROW`).
+
+```c
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+QUESTDB_CLIENT_API
+bool column_sender_chunk_append_arrow_column(
+    column_sender_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    size_t row_offset,
+    size_t row_count,
+    line_sender_error** err_out);
+#endif
+```
+
+**Slicing.** `row_offset` and `row_count` sub-slice within the call.
+The Arrow C Data Interface `array->offset` is honoured and composes
+with `row_offset` — the resulting view is `array[array->offset +
+row_offset ..][.. row_count]`. Slicing is metadata-only; no buffer is
+copied.
+
+**Naming.** The `name` argument is authoritative — it overrides
+`schema->name`. The C entry takes the name separately so callers don't
+have to mutate the schema struct.
+
+**Ownership.**
+- On success, `array->release` is consumed (set to NULL). The chunk
+  holds the array's buffer lifetime via an internal `Arc` until the
+  next `column_sender_flush` returns; the caller may free the
+  `ArrowArray` struct shell immediately after this call.
+- On failure, `array->release` is left intact and the caller retains
+  ownership.
+- `schema` is borrowed in all cases; the caller always retains
+  `schema->release`.
+
+**Row-count lock.** The chunk's row-count lock applies as with any
+other appender — the first column to append sets the count;
+subsequent appends must agree.
+
+**Wire-type fixing.** The column's QWP wire type is fixed at append
+time by classifying the Arrow `Field` (including QuestDB-specific
+metadata: `questdb.column_type`, `questdb.geohash_bits`,
+`questdb.symbol`) together with the `Array`.
+
+**Errors.** Same mapping as the batch flush (§13.1):
+
+- `line_sender_error_arrow_unsupported_column_kind` — Arrow type has
+  no QWP wire mapping (`Null`, `Struct`, `Map`, `RunEndEncoded`,
+  `Interval(*)`, `FixedSizeBinary` outside UUID/LONG256, non-Float64
+  `List` leaves, etc.).
+- `line_sender_error_arrow_ingest` — structural validation failure
+  (bad offsets, validity-count mismatch, decimal scale out of range,
+  ms→µs overflow on a timestamp column, etc.).
+
+---
+
+## 11. NumPy column appender
+
+Companion to §10 for callers holding a raw, contiguous, native-endian
+NumPy buffer. Widening, packing, and per-row conversion happen
+single-pass at flush — the chunk allocates nothing per column.
+
+```c
+typedef struct column_sender_numpy_extras
+{
+    int8_t          decimal_scale;   /* decimal_s8 / s16 / s32 only */
+    uint8_t         geohash_bits;    /* geohash_i8 / i16 / i32 / i64 only */
+    uint8_t         array_ndim;      /* f64_ndarray only (1..=32) */
+    const uint32_t* array_shape;     /* f64_ndarray only (array_ndim dims) */
+} column_sender_numpy_extras;
+
+typedef enum column_sender_numpy_dtype
+{
+    /* Original 11 (preserved) */
+    column_sender_numpy_i8              = 0,
+    column_sender_numpy_i16             = 1,
+    column_sender_numpy_i32             = 2,
+    column_sender_numpy_i64             = 3,
+    column_sender_numpy_u8              = 4,
+    column_sender_numpy_u16             = 5,
+    column_sender_numpy_u32             = 6,
+    column_sender_numpy_u64             = 7,
+    column_sender_numpy_f32             = 8,
+    column_sender_numpy_f64             = 9,
+    column_sender_numpy_bool            = 10,
+
+    /* Half-precision + time */
+    column_sender_numpy_f16             = 11,
+    column_sender_numpy_datetime64_s    = 12,
+    column_sender_numpy_datetime64_ms   = 13,
+    column_sender_numpy_datetime64_us   = 14,
+    column_sender_numpy_datetime64_ns   = 15,
+    column_sender_numpy_timedelta64_s   = 16,
+    column_sender_numpy_timedelta64_ms  = 17,
+    column_sender_numpy_timedelta64_us  = 18,
+    column_sender_numpy_timedelta64_ns  = 19,
+
+    /* Fixed-size bytes */
+    column_sender_numpy_s16             = 20,
+    column_sender_numpy_s32             = 21,
+
+    /* Decimals (read decimal_scale from extras) */
+    column_sender_numpy_decimal_s8      = 22,
+    column_sender_numpy_decimal_s16     = 23,
+    column_sender_numpy_decimal_s32     = 24,
+
+    /* Metadata-disambiguated narrow ints */
+    column_sender_numpy_u32_ipv4        = 25,
+    column_sender_numpy_u16_char        = 26,
+
+    /* Geohash (read geohash_bits from extras) */
+    column_sender_numpy_geohash_i8      = 27,
+    column_sender_numpy_geohash_i16     = 28,
+    column_sender_numpy_geohash_i32     = 29,
+    column_sender_numpy_geohash_i64     = 30,
+
+    /* f64 ndarray (read array_ndim + array_shape from extras) */
+    column_sender_numpy_f64_ndarray     = 31
+} column_sender_numpy_dtype;
+
+QUESTDB_CLIENT_API
+bool column_sender_chunk_append_numpy_column(
+    column_sender_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    column_sender_numpy_dtype dtype,
+    const uint8_t* data,
+    size_t row_count,
+    const column_sender_validity* validity,
+    const column_sender_numpy_extras* extras,
+    line_sender_error** err_out);
+```
+
+### 11.1 Dtype coverage matrix
+
+`Direct` = zero-copy bulk emit; `widen` = per-row conversion to the
+wider wire type; `pack` = byte-per-row to LSB-first bitmap.
+
+| `column_sender_numpy_dtype`     | QWP wire kind    | Conversion |
+|---------------------------------|------------------|------------|
+| `i64`                           | LONG             | direct     |
+| `f64`                           | DOUBLE           | direct     |
+| `datetime64_ms`                 | DATE             | direct     |
+| `datetime64_us`                 | TIMESTAMP        | direct     |
+| `datetime64_ns`                 | TIMESTAMP_NANOS  | direct     |
+| `timedelta64_s` / `ms` / `us` / `ns` | LONG        | direct (signed seconds/millis/micros/nanos) |
+| `s16`                           | UUID             | direct (16 bytes/row) |
+| `s32`                           | LONG256          | direct (32 bytes/row) |
+| `i8` / `i16` / `i32`            | LONG             | widen (sign-extend) |
+| `u8` / `u16` / `u32`            | LONG             | widen (zero-extend) |
+| `u64`                           | LONG             | widen (bit-reinterpret; values > i64::MAX wrap negative) |
+| `f32`                           | DOUBLE           | widen      |
+| `f16`                           | FLOAT            | widen (per-row f16→f32) |
+| `datetime64_s`                  | TIMESTAMP        | widen (×10⁶) |
+| `bool`                          | BOOLEAN          | pack (byte-per-row → bitmap) |
+| `decimal_s8` + scale            | DECIMAL64        | direct (i64 mantissa) |
+| `decimal_s16` + scale           | DECIMAL128       | direct (i128 mantissa) |
+| `decimal_s32` + scale           | DECIMAL256       | direct (32-byte little-endian mantissa) |
+| `u32_ipv4`                      | IPV4             | direct     |
+| `u16_char`                      | CHAR             | direct     |
+| `geohash_i8` + bits             | GEOHASH          | direct     |
+| `geohash_i16` + bits            | GEOHASH          | direct     |
+| `geohash_i32` + bits            | GEOHASH          | direct     |
+| `geohash_i64` + bits            | GEOHASH          | direct     |
+| `f64_ndarray` + ndim + shape    | DOUBLE_ARRAY     | multi-dim (rectangular tensor; all rows share shape) |
+
+VARCHAR, SYMBOL, and BINARY are not reachable from NumPy. Use §10
+(`column_sender_chunk_append_arrow_column`) with the matching Arrow array
+type instead. Ragged float64 arrays (per-row shapes differ) also require
+Arrow `List<Float64>` — `f64_ndarray` accepts only NumPy's rectangular
+ndarrays.
+
+### 11.2 Extras channel
+
+`extras` carries per-call parameters that are not part of the dtype
+enum:
+
+- `decimal_scale` (`int8_t`) — digits to the right of the decimal
+  point. Range `0..=18` for `decimal_s8`, `0..=38` for `decimal_s16`,
+  `0..=76` for `decimal_s32`. The field is signed so negative inputs
+  are rejected explicitly rather than wrapping.
+- `geohash_bits` (`uint8_t`) — precision in bits. Range `1..=8` /
+  `1..=16` / `1..=32` / `1..=60` for `geohash_i8` / `i16` / `i32` /
+  `i64`.
+- `array_ndim` (`uint8_t`) + `array_shape` (`const uint32_t*`) —
+  `f64_ndarray` only. `array_ndim` is the per-row tensor rank
+  (`1..=32`, matching the QuestDB-wide `MAX_ARRAY_DIMS`); `array_shape`
+  points at `array_ndim` consecutive `uint32_t` dimension sizes (each
+  `>= 1`). All rows share this shape. The pointer is borrowed for the
+  duration of the call only.
+
+Pass `extras = NULL` for every dtype except `decimal_*`, `geohash_*`,
+and `f64_ndarray`. Unused fields are ignored.
+
+### 11.3 Errors
+
+- `line_sender_error_invalid_api_call`:
+  - `extras == NULL` when the dtype is `decimal_*`, `geohash_*`, or
+    `f64_ndarray` (message points at the missing field).
+  - `decimal_scale < 0` — `"decimal_scale must be >= 0, got <N>"`.
+  - `decimal_scale > cap` — `"decimal_scale must be <= <CAP> for
+    <DECIMALxx>, got <N>"` (cap = 18 / 38 / 76).
+  - `geohash_bits == 0` — `"geohash_bits must be >= 1, got 0"`.
+  - `geohash_bits > cap` — `"geohash_bits must be <= <CAP> for
+    GEOHASH iN, got <N>"` (cap = 8 / 16 / 32 / 60).
+  - `array_ndim == 0` — `"array_ndim must be >= 1, got 0"`.
+  - `array_ndim > 32` — `"array_ndim must be <= 32 (MAX_ARRAY_DIMS),
+    got <N>"`.
+  - `array_shape == NULL` for `f64_ndarray` — `"f64_ndarray column
+    requires non-NULL array_shape"`.
+  - `array_shape[i] == 0` — `"array_shape[<i>] must be >= 1, got 0"`.
+  - Row-count mismatch against the chunk's locked count.
+- Standard `name_len > 127`, name validation, and NULL-data
+  (with `row_count > 0`) errors apply.
+
+### 11.4 Buffer-lifetime contract
+
+`data` (and `validity->bits`, if any) MUST stay alive until the next
+`column_sender_flush` / `column_sender_sync` returns. The chunk
+borrows raw pointers; no copy is taken at append. This matches the
+universal §2.3 contract — `column_sender_chunk_append_numpy_column`
+is a thin wrapper around the same lifetime rules.
+
+Strided NumPy arrays and non-native-endian buffers are not supported;
+the FFI takes a raw byte pointer and assumes contiguous, native-endian
+rows. The Python wrapper must consolidate upstream (e.g. with
+`numpy.ascontiguousarray` + `.astype(..., copy=False)`).
+
+### 11.5 ndarray-of-float64 (DOUBLE_ARRAY)
+
+`column_sender_numpy_f64_ndarray` lets a caller hand the FFI a single
+contiguous NumPy `float64` buffer whose first axis is the row axis and
+whose remaining `array_ndim` axes are the per-row tensor. Because NumPy
+ndarrays are rectangular, every row carries the same `(array_ndim,
+array_shape)` — they are column metadata, not per-row data. Ragged
+inputs must be sent through Arrow `List<Float64>` via §10.
+
+Per-row wire layout (when the row is non-null):
+
+```
+1 byte                : array_ndim
+4 × array_ndim bytes  : array_shape[i] as uint32_t LE
+8 × prod(array_shape) : f64 values in C / row-major order, little-endian
+```
+
+Null rows contribute zero payload bytes — they are signalled by the
+column's leading `null_flag` + bitmap prefix (Arrow LSB-first
+validity). The source buffer still reserves `prod(array_shape) × 8`
+bytes for each row regardless of validity; null rows are skipped on
+emit, not on read.
+
+The wire format matches what `column_sender_chunk_append_arrow_column`
+emits for an Arrow `FixedSizeList`/`List<Float64>` column declared as
+`ArrayDouble(ndim)`. Sending the same logical data through NumPy and
+through Arrow produces byte-identical column bodies.
+
+---
+
+## 12. Designated timestamp
 
 Required exactly once per chunk before `flush`. Two variants picking
 the on-wire type:
@@ -682,7 +953,7 @@ per row.)
 
 ---
 
-## 11. Flush and sync
+## 13. Flush and sync
 
 ```c
 /**
@@ -763,9 +1034,53 @@ bool column_sender_sync(
     line_sender_error** err_out);
 ```
 
+### 13.1 Arrow `RecordBatch` direct flush (feature: `arrow`)
+
+Conn-level 1-copy entry that bypasses the `column_sender_chunk` and
+`line_sender_buffer` staging layers. The Arrow C Data Interface
+(`ArrowArray` + `ArrowSchema`) is consumed end-to-end into the
+outgoing QWP frame in a single pass.
+
+- **Designated timestamp**: omitted (`flush_arrow_batch`) → server
+  stamps each row on arrival; or sourced from a named `Timestamp(_)`
+  column (`flush_arrow_batch_at_column`).
+- **Ownership**: on success, the consumer invokes `array->release` /
+  `schema->release`; on failure the caller retains ownership.
+- **Deferred-commit semantics**: identical to `column_sender_flush`;
+  the first frame after a sync is sent as an immediate commit,
+  later frames defer. Call `column_sender_sync` to drain.
+
+```c
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch(
+    qwpws_conn* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    struct ArrowSchema* schema,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_at_column(
+    qwpws_conn* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    line_sender_error** err_out);
+#endif
+```
+
+Coverage matches the Rust `ColumnSender::flush_arrow_batch` —
+all 43 classified `ColumnKind` variants from
+`column_sender::arrow_batch::classify`. Failure paths surface as
+`line_sender_error_arrow_unsupported_column_kind` (column kind has no
+QWP wire mapping) or `line_sender_error_arrow_ingest` (structural
+validation failed: bad offsets, null in designated TS, etc.).
+
 ---
 
-## 12. Versioning
+## 14. Versioning
 
 This API is **draft / unstable** until first ship. Once shipped:
 
@@ -777,7 +1092,7 @@ This API is **draft / unstable** until first ship. Once shipped:
 
 ---
 
-## 13. Minimal C example
+## 15. Minimal C example
 
 Pool/borrow shape: one `questdb_db` per process, borrow a conn per
 unit of work, return it when done.
@@ -846,7 +1161,7 @@ int main(void) {
 
 ---
 
-## 14. Notes for the Python wrapper
+## 16. Notes for the Python wrapper
 
 These are not part of the C ABI; they are guidance for the Python repo
 agent.

@@ -101,40 +101,6 @@ public:
             _backend_kind::qwp_udp};
     }
 
-    /**
-     * Construct a standalone QWP/WebSocket columnar buffer. Required
-     * by `append_arrow`; also accepts the row-by-row `table` /
-     * `symbol` / `column` / `at` API.
-     *
-     * For protocol-neutral construction tied to a sender instance,
-     * prefer `line_sender::new_buffer()`.
-     *
-     * @param init_buf_size Hint passed to `line_sender_buffer_reserve`
-     *                      for the initial capacity of the underlying
-     *                      column storage.
-     * @throws line_sender_error if the initial reserve fails.
-     */
-    static line_sender_buffer qwp_ws(size_t init_buf_size = 64 * 1024)
-    {
-        auto* raw_buffer = ::line_sender_buffer_new_qwp_ws();
-        try
-        {
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
-        }
-        catch (...)
-        {
-            ::line_sender_buffer_free(raw_buffer);
-            throw;
-        }
-        return line_sender_buffer{
-            raw_buffer,
-            protocol_version::v1,
-            init_buf_size,
-            127,
-            _backend_kind::qwp_ws};
-    }
-
     line_sender_buffer(const line_sender_buffer& other)
         : _impl{
               other._impl
@@ -1151,58 +1117,6 @@ public:
         line_sender_error::wrapped_call(::line_sender_buffer_at_now, _impl);
     }
 
-#ifdef QUESTDB_CLIENT_ENABLE_ARROW
-    /**
-     * Append every row of an Apache Arrow `RecordBatch` to the buffer.
-     * Per-row timestamp is not sent; the server stamps each row on
-     * arrival (same semantics as `at_now()`).
-     *
-     * Requires a QWP/WebSocket buffer. `schema` is borrowed.
-     * `array` is consumed once control reaches the underlying C call;
-     * if `may_init()` throws first (e.g. lazy buffer reserve fails),
-     * `array` is left untouched and the caller retains ownership.
-     * `array` may be a Struct top-level array or a non-Struct
-     * single-column array.
-     *
-     * @throws line_sender_error on validation or classification failure.
-     */
-    void append_arrow(
-        table_name_view table,
-        ::ArrowArray& array,
-        const ::ArrowSchema& schema)
-    {
-        may_init();
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_append_arrow,
-            _impl,
-            table._impl,
-            &array,
-            &schema);
-    }
-
-    /**
-     * Append an Arrow `RecordBatch`, sourcing the per-row designated
-     * timestamp from a named column inside the batch. The column must
-     * be `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with
-     * no null rows.
-     */
-    void append_arrow(
-        table_name_view table,
-        ::ArrowArray& array,
-        const ::ArrowSchema& schema,
-        column_name_view ts_column)
-    {
-        may_init();
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_append_arrow_at_column,
-            _impl,
-            table._impl,
-            &array,
-            &schema,
-            ts_column._impl);
-    }
-#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
-
     void check_can_flush() const
     {
         if (!_impl)
@@ -1226,8 +1140,7 @@ private:
     enum class _backend_kind
     {
         ilp,
-        qwp_udp,
-        qwp_ws
+        qwp_udp
     };
 
     line_sender_buffer(
@@ -1251,9 +1164,6 @@ private:
             ::line_sender_buffer* tmp = nullptr;
             switch (_backend)
             {
-            case _backend_kind::qwp_ws:
-                tmp = ::line_sender_buffer_new_qwp_ws();
-                break;
             case _backend_kind::qwp_udp:
                 tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
                     _max_name_len);
@@ -1898,13 +1808,17 @@ public:
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto sender_protocol = this->protocol();
+        if (sender_protocol == protocol::qwpws ||
+            sender_protocol == protocol::qwpwss)
+        {
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket senders do not produce row-by-row buffers; "
+                "use the column_sender chunk API instead."};
+        }
         auto backend = line_sender_buffer::_backend_kind::ilp;
         if (sender_protocol == protocol::qwpudp)
             backend = line_sender_buffer::_backend_kind::qwp_udp;
-        else if (
-            sender_protocol == protocol::qwpws ||
-            sender_protocol == protocol::qwpwss)
-            backend = line_sender_buffer::_backend_kind::qwp_ws;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         try
         {

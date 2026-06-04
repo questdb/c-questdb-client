@@ -71,8 +71,6 @@ pub use decimal::DecimalView;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub mod column_sender;
 
-#[cfg(feature = "arrow")]
-pub mod arrow;
 #[cfg(feature = "polars")]
 pub mod polars;
 

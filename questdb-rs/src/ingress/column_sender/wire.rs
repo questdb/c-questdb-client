@@ -54,14 +54,22 @@ pub(crate) const QWP_TYPE_INT: u8 = 0x04;
 pub(crate) const QWP_TYPE_LONG: u8 = 0x05;
 pub(crate) const QWP_TYPE_FLOAT: u8 = 0x06;
 pub(crate) const QWP_TYPE_DOUBLE: u8 = 0x07;
+pub(crate) const QWP_TYPE_SYMBOL: u8 = 0x09;
 pub(crate) const QWP_TYPE_TIMESTAMP: u8 = 0x0A;
 pub(crate) const QWP_TYPE_DATE: u8 = 0x0B;
 pub(crate) const QWP_TYPE_UUID: u8 = 0x0C;
 pub(crate) const QWP_TYPE_LONG256: u8 = 0x0D;
-pub(crate) const QWP_TYPE_TIMESTAMP_NANOS: u8 = 0x10;
-pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
+pub(crate) const QWP_TYPE_GEOHASH: u8 = 0x0E;
 pub(crate) const QWP_TYPE_VARCHAR: u8 = 0x0F;
-pub(crate) const QWP_TYPE_SYMBOL: u8 = 0x09;
+pub(crate) const QWP_TYPE_TIMESTAMP_NANOS: u8 = 0x10;
+pub(crate) const QWP_TYPE_DOUBLE_ARRAY: u8 = 0x11;
+pub(crate) const QWP_TYPE_DECIMAL64: u8 = 0x13;
+pub(crate) const QWP_TYPE_DECIMAL128: u8 = 0x14;
+pub(crate) const QWP_TYPE_DECIMAL256: u8 = 0x15;
+pub(crate) const QWP_TYPE_CHAR: u8 = 0x16;
+#[cfg(feature = "arrow")]
+pub(crate) const QWP_TYPE_BINARY: u8 = 0x17;
+pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
 
 /// Maximum bytes a UTF-8 column or table name is allowed to occupy on the
 /// wire. Matches the row-API + Java client cap.

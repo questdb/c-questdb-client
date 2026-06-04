@@ -25,7 +25,14 @@ from arrow_ffi import (
     NEXT_ARROW_BATCH_END,
     NEXT_ARROW_BATCH_ERROR,
     NEXT_ARROW_BATCH_OK,
-    buffer_append_arrow,
+    column_sender_sync,
+    conn_flush_arrow_batch,
+    conn_must_close,
+    db_borrow_conn,
+    db_close,
+    db_connect,
+    db_drop_conn,
+    db_return_conn,
     next_arrow_batch,
     pyarrow_export_record_batch,
     pyarrow_import_record_batch,
@@ -64,6 +71,7 @@ __all__ = [
     "EDGE_GEOHASH_BITS",
     "arrow_cursor",
     "existing_sender",
+    "borrowed_conn",
     "temp_sf_dir",
     "wait_for_rows",
     "make_table_name",
@@ -192,6 +200,40 @@ def drop_table_safe(fixture, table: str) -> None:
             f"[arrow_fuzz_common] table drop failed for {table!r}: {e!r}\n"
         )
 
+@contextlib.contextmanager
+def borrowed_conn(fixture, **conf_extras: str):
+    """Open a `questdb_db*` pool from the fixture, borrow one
+    `qwpws_conn*`, and yield the raw conn pointer. Returns the conn
+    to the pool on exit (or drops it if the conn latched as terminal)
+    and closes the pool."""
+    from test import skip_if_unsupported_qwp_ws_fixture
+    conf = ingress_conf(fixture, **conf_extras).encode("utf-8")
+    try:
+        db = db_connect(conf)
+    except SenderError as e:
+        skip_if_unsupported_qwp_ws_fixture(e, fixture)
+        raise
+    try:
+        try:
+            conn = db_borrow_conn(db)
+        except SenderError as e:
+            skip_if_unsupported_qwp_ws_fixture(e, fixture)
+            raise
+        try:
+            yield conn
+            try:
+                column_sender_sync(conn, 0)
+            except SenderError:
+                pass
+        finally:
+            if conn_must_close(conn):
+                db_drop_conn(db, conn)
+            else:
+                db_return_conn(db, conn)
+    finally:
+        db_close(db)
+
+
 def ingest_via_arrow(
     fixture,
     table: str,
@@ -200,23 +242,21 @@ def ingest_via_arrow(
     ts_col: Optional[bytes] = b"ts",
     sender_conf_extras: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Ingest one RecordBatch through `line_sender_buffer_append_arrow`.
+    """Ingest one RecordBatch through `column_sender_flush_arrow_batch`.
     If `ts_col` is None the server stamps each row on arrival."""
     extras = sender_conf_extras or {}
-    with existing_sender(fixture, **extras) as sender:
-        buf = Buffer.from_sender(sender._impl)
+    with borrowed_conn(fixture, **extras) as conn:
         table_name = _c_table_name(table)
         arr, sch = pyarrow_export_record_batch(record_batch)
         try:
-            buffer_append_arrow(
-                buf._impl, table_name,
+            conn_flush_arrow_batch(
+                conn, table_name,
                 ctypes.byref(arr), ctypes.byref(sch),
                 ts_column_name=ts_col,
             )
         finally:
             if sch.release:
                 sch.release(ctypes.byref(sch))
-        sender.flush(buf)
 
 def read_back_arrow_batches(fixture, sql: str) -> List[pa.RecordBatch]:
     batches: List[pa.RecordBatch] = []

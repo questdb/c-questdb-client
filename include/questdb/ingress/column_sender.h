@@ -458,55 +458,92 @@ bool column_sender_chunk_symbol_dict_i32(
  * Generic Arrow column appender
  *
  * Single entry point that consumes an Apache Arrow C Data Interface
- * `ArrowArray` + `ArrowSchema` pair and routes to the appropriate
- * per-type writer. Avoids the per-column dispatch every Python /
- * Polars caller would otherwise have to write.
- *
- * Supported schema formats (see Apache Arrow C Data Interface spec):
- *   - "c", "s", "i", "l"       int8 / int16 / int32 / int64
- *   - "f", "g"                  float32 / float64
- *   - "b"                       bool (LSB-first bitmap)
- *   - "u"                       UTF-8 string (int32 offsets)
- *   - "U"                       LargeUtf8 string (int64 offsets;
- *                               narrowed to u32 at encode time, no
- *                               caller-side cast needed)
- *   - "tsn:..."                 timestamp nanos (timezone ignored)
- *   - "tsu:..."                 timestamp micros (timezone ignored)
- *   - dictionary-typed schema with the index format above and a
- *     UTF-8 "u" value type → routes to symbol_dict_i*.
+ * `ArrowArray` + `ArrowSchema` pair and routes to the same encoding
+ * infrastructure as `column_sender_flush_arrow_batch`. Supports the
+ * full Arrow type matrix (43 classifications including all primitives,
+ * timestamps, dates, decimals, UUID, LONG256, geohash, dictionary-
+ * encoded symbols across all key/value variants, and varlen
+ * UTF8/Binary in three encodings).
  *
  * `row_offset` and `row_count` describe which slice of the array to
  * append. Use `row_offset=0, row_count=array->length` for the whole
- * array. When the array has nulls, `row_offset` must be a multiple of 8
- * (the QWP encoder reads the validity bitmap byte-aligned).
+ * array.
+ *
+ * Ownership:
+ *  - On success, `array->release` is consumed (set to NULL); the chunk
+ *    holds the array's buffer lifetime via an internal Arc until
+ *    `column_sender_flush` returns. The caller may free the
+ *    `ArrowArray` struct shell immediately after this call returns.
+ *  - On failure, `array->release` is left intact and the caller
+ *    retains ownership.
+ *  - `schema` is borrowed; the caller retains `schema->release` in
+ *    all cases.
  *
  * Constraints:
- *  - `array->offset` must be 0. Consolidate sliced arrays caller-side
- *    before passing them in.
+ *  - `array->offset` is honored as the Arrow C Data Interface logical
+ *    offset; `row_offset` / `row_count` further sub-slice within this
+ *    call.
  *  - The chunk's row-count lock applies as with any other appender:
  *    the first column to append sets the count; subsequent appends
  *    must agree.
- *  - LargeUtf8 column total bytes must fit in `uint32_t` (the QWP wire
- *    offset table). Larger columns fail with
- *    `line_sender_error_invalid_api_call` at chunk-build time.
  *
- * Other formats — decimal, struct, list, and non-UTF-8 dictionary
- * values — currently return `line_sender_error_invalid_api_call`.
- * Coverage broadens in subsequent patches.
+ * Type rejections (any Arrow type with no QuestDB mapping — `Null`,
+ * `Struct`, `Map`, `RunEndEncoded`, `Interval(*)`, `FixedSizeBinary`
+ * outside UUID/LONG256, non-Float64 `List` leaves) return
+ * `line_sender_error_arrow_unsupported_column_kind`. Structural
+ * failures (validity-count mismatch, ms→µs overflow, decimal scale
+ * out of range, etc.) return `line_sender_error_arrow_ingest`.
  * ------------------------------------------------------------------------- */
 
-/** Forward declarations of Apache Arrow C Data Interface structs.
- *  We never construct or release them — the caller owns lifetime —
- *  and consume them via opaque pointers in the appender call below. */
-struct ArrowArray;
-struct ArrowSchema;
+/* Apache Arrow C Data Interface boilerplate. Guarded by
+ * `ARROW_C_DATA_INTERFACE` so it composes safely with arrow.h,
+ * nanoarrow, polars-arrow, and any other header that ships the same
+ * canonical block. The caller owns lifetimes of `ArrowArray` /
+ * `ArrowSchema`; we consume `array->release` on success in the
+ * column_sender entry points below, and leave it intact on failure.
+ * https://arrow.apache.org/docs/format/CDataInterface.html */
+#ifndef ARROW_C_DATA_INTERFACE
+#    define ARROW_C_DATA_INTERFACE
+
+#    define ARROW_FLAG_DICTIONARY_ORDERED 1
+#    define ARROW_FLAG_NULLABLE 2
+#    define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema
+{
+    const char* format;
+    const char* name;
+    const char* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
+    void (*release)(struct ArrowSchema*);
+    void* private_data;
+};
+
+struct ArrowArray
+{
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
 
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_arrow_column(
     column_sender_chunk* chunk,
     const char* name,
     size_t name_len,
-    const struct ArrowArray* array,
+    struct ArrowArray* array,
     const struct ArrowSchema* schema,
     size_t row_offset,
     size_t row_count,
@@ -516,46 +553,133 @@ bool column_sender_chunk_append_arrow_column(
  * Generic NumPy column appender
  *
  * Companion to `column_sender_chunk_append_arrow_column` for callers
- * holding a raw NumPy buffer. Widening (narrower int / float → wire
- * type) and bool packing (NumPy byte-per-row → Arrow LSB-bitmap) happen
- * inside Rust at append time, into a chunk-owned scratch arena. The
- * caller's `data` buffer is read once and need not outlive this call.
+ * holding a raw, contiguous, native-endian NumPy buffer. The buffer is
+ * walked at flush time, single pass, straight into the connection's
+ * outbound frame — no chunk-side scratch arena, no per-column heap copy.
  *
- * Supported dtypes and their widening rules:
- *   - `i8/i16/i32`   sign-extend to `i64`  (wire = LONG)
- *   - `u8/u16/u32`   zero-extend to `i64`  (wire = LONG)
- *   - `i64`           pass-through         (wire = LONG)
- *   - `u64`           bit-reinterpret as `i64` (values > i64::MAX wrap
- *                     to negative on the wire — matches the row-path's
- *                     C-cast behaviour)
- *   - `f32`           widen to `f64`       (wire = DOUBLE)
- *   - `f64`           pass-through         (wire = DOUBLE)
- *   - `bool`          NumPy byte-per-row → Arrow LSB-bitmap (wire =
- *                     BOOLEAN)
+ * Caller contract: `data` (and `validity->bits`, if any) MUST stay alive
+ * until the next `column_sender_flush` / `column_sender_sync` returns.
+ *
+ * Coverage matrix (dtype → wire kind):
+ *   Direct (zero-copy at flush):
+ *     i64          → LONG
+ *     f64          → DOUBLE
+ *     datetime64[ms] → DATE
+ *     datetime64[us] → TIMESTAMP
+ *     datetime64[ns] → TIMESTAMP_NANOS
+ *     timedelta64[s/ms/us/ns] → LONG
+ *     S16          → UUID            (16 bytes per row)
+ *     S32          → LONG256         (32 bytes per row)
+ *     u32_ipv4     → IPV4
+ *     u16_char     → CHAR
+ *   Widen (single pass at flush):
+ *     i8/i16/i32   → LONG (sign-extend)
+ *     u8/u16/u32   → LONG (zero-extend)
+ *     u64          → LONG (bit-reinterpret; values > i64::MAX wrap negative)
+ *     f32          → DOUBLE
+ *     f16          → FLOAT
+ *     datetime64[s] → TIMESTAMP (×10^6)
+ *   Packing:
+ *     bool         → BOOLEAN (NumPy byte-per-row → LSB-first bitmap)
+ *   Decimals (require `extras.decimal_scale`):
+ *     decimal_s8   → DECIMAL64  (i64 mantissa, scale ∈ 0..=18)
+ *     decimal_s16  → DECIMAL128 (i128 mantissa, scale ∈ 0..=38)
+ *     decimal_s32  → DECIMAL256 (i256 mantissa, scale ∈ 0..=76)
+ *   Geohash (require `extras.geohash_bits`):
+ *     geohash_i8   → GEOHASH (bits ∈ 1..=8)
+ *     geohash_i16  → GEOHASH (bits ∈ 1..=16)
+ *     geohash_i32  → GEOHASH (bits ∈ 1..=32)
+ *     geohash_i64  → GEOHASH (bits ∈ 1..=60)
+ *   Multi-dim float64 (require `extras.array_ndim` + `extras.array_shape`):
+ *     f64_ndarray  → DOUBLE_ARRAY (rectangular tensor; all rows share the
+ *                    same per-row shape — ragged inputs must go through
+ *                    Arrow `List<Float64>` via the Arrow appender)
  *
  * Constraints:
- *   - `data` must be contiguous and native-endian. Strided arrays and
- *     non-native-endian arrays are not supported; the caller should
- *     consolidate upstream.
- *   - `validity` follows the same Arrow LSB-first convention used by
- *     the per-type appenders.
+ *   - Strided and non-native-endian buffers are not supported; consolidate
+ *     upstream.
+ *   - `validity` follows the Arrow LSB-first convention (bit = 1 → valid).
  *   - The chunk's row-count lock applies as elsewhere.
+ *   - VARCHAR / SYMBOL / BINARY wire kinds are not reachable from NumPy —
+ *     use `column_sender_chunk_append_arrow_column` instead.
  * ------------------------------------------------------------------------- */
 
 typedef enum column_sender_numpy_dtype
 {
-    column_sender_numpy_i8   = 0,
-    column_sender_numpy_i16  = 1,
-    column_sender_numpy_i32  = 2,
-    column_sender_numpy_i64  = 3,
-    column_sender_numpy_u8   = 4,
-    column_sender_numpy_u16  = 5,
-    column_sender_numpy_u32  = 6,
-    column_sender_numpy_u64  = 7,
-    column_sender_numpy_f32  = 8,
-    column_sender_numpy_f64  = 9,
-    column_sender_numpy_bool = 10
+    /* Original 11 (preserved) */
+    column_sender_numpy_i8 = 0,
+    column_sender_numpy_i16 = 1,
+    column_sender_numpy_i32 = 2,
+    column_sender_numpy_i64 = 3,
+    column_sender_numpy_u8 = 4,
+    column_sender_numpy_u16 = 5,
+    column_sender_numpy_u32 = 6,
+    column_sender_numpy_u64 = 7,
+    column_sender_numpy_f32 = 8,
+    column_sender_numpy_f64 = 9,
+    column_sender_numpy_bool = 10,
+
+    /* Half-precision + time */
+    column_sender_numpy_f16 = 11,
+    column_sender_numpy_datetime64_s = 12,
+    column_sender_numpy_datetime64_ms = 13,
+    column_sender_numpy_datetime64_us = 14,
+    column_sender_numpy_datetime64_ns = 15,
+    column_sender_numpy_timedelta64_s = 16,
+    column_sender_numpy_timedelta64_ms = 17,
+    column_sender_numpy_timedelta64_us = 18,
+    column_sender_numpy_timedelta64_ns = 19,
+
+    /* Fixed-size bytes */
+    column_sender_numpy_s16 = 20, /* 16B/row → UUID */
+    column_sender_numpy_s32 = 21, /* 32B/row → LONG256 */
+
+    /* Decimals (read decimal_scale from column_sender_numpy_extras) */
+    column_sender_numpy_decimal_s8 = 22,  /*  8B i64 mantissa  → DECIMAL64  */
+    column_sender_numpy_decimal_s16 = 23, /* 16B i128 mantissa → DECIMAL128 */
+    column_sender_numpy_decimal_s32 = 24, /* 32B i256 mantissa → DECIMAL256 */
+
+    /* Metadata-disambiguated narrow ints */
+    column_sender_numpy_u32_ipv4 = 25,
+    column_sender_numpy_u16_char = 26,
+
+    /* Geohash (read geohash_bits from column_sender_numpy_extras) */
+    column_sender_numpy_geohash_i8 = 27,
+    column_sender_numpy_geohash_i16 = 28,
+    column_sender_numpy_geohash_i32 = 29,
+    column_sender_numpy_geohash_i64 = 30,
+
+    /* f64 ndarray: rectangular tensor (read array_ndim + array_shape from
+       column_sender_numpy_extras). All rows share the same shape. */
+    column_sender_numpy_f64_ndarray = 31
 } column_sender_numpy_dtype;
+
+/* Companion struct for `column_sender_chunk_append_numpy_column` carrying
+ * dtype-specific parameters. Pass NULL when the dtype needs none of these
+ * (everything except `decimal_*`, `geohash_*`, and `f64_ndarray`).
+ *
+ *  - decimal_scale: digits to the right of the decimal point. Range
+ *    0..=N where N is the dtype's cap (18 for s8 / DECIMAL64, 38 for s16
+ *    / DECIMAL128, 76 for s32 / DECIMAL256). Signed type so an out-of-
+ *    range negative value is rejected explicitly rather than wrapping.
+ *  - geohash_bits: precision in bits. Range 1..=8 / 1..=16 / 1..=32 /
+ *    1..=60 for i8 / i16 / i32 / i64 respectively.
+ *  - array_ndim / array_shape: for `column_sender_numpy_f64_ndarray`
+ *    only. `array_ndim` is the per-row tensor rank (1..=32, matching
+ *    QuestDB's MAX_ARRAY_DIMS); `array_shape` points at `array_ndim`
+ *    consecutive `uint32_t` dim sizes (each >= 1). The pointer is
+ *    borrowed for the duration of the call only.
+ *
+ * Unused fields are ignored.
+ */
+typedef struct column_sender_numpy_extras
+{
+    int8_t decimal_scale;
+    uint8_t geohash_bits;
+    /* For column_sender_numpy_f64_ndarray only. */
+    uint8_t array_ndim;          /* 1..=32 */
+    const uint32_t* array_shape; /* array_ndim entries, each >= 1 */
+} column_sender_numpy_extras;
 
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_numpy_column(
@@ -566,6 +690,7 @@ bool column_sender_chunk_append_numpy_column(
     const uint8_t* data,
     size_t row_count,
     const column_sender_validity* validity,
+    const column_sender_numpy_extras* extras,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
@@ -616,28 +741,31 @@ bool column_sender_flush(
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
-/**
- * Publish a QWP/WebSocket `line_sender_buffer` through a borrowed pooled
- * connection.
- *
- * Intended for buffers populated via `line_sender_buffer_append_arrow` /
- * `line_sender_buffer_append_arrow_at_column`. Applies the same deferred
- * flush contract as `column_sender_flush`; call `column_sender_sync` after
- * the last buffer flush to send the commit frame and wait for ACKs.
- *
- * On success, `buffer` is cleared. On failure, `buffer` is left untouched.
- */
-QUESTDB_CLIENT_API
-bool column_sender_flush_buffer(
-    qwpws_conn* conn,
-    line_sender_buffer* buffer,
-    line_sender_error** err_out);
-
 QUESTDB_CLIENT_API
 bool column_sender_sync(
     qwpws_conn* conn,
     column_sender_ack_level ack_level,
     line_sender_error** err_out);
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch(
+    qwpws_conn* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    struct ArrowSchema* schema,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_at_column(
+    qwpws_conn* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    line_sender_error** err_out);
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
 } /* extern "C" */

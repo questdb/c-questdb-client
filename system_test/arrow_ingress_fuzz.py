@@ -18,7 +18,6 @@ from arrow_ffi import (
     ArrowSenderError,
     SenderErrorCode,
 )
-from questdb_line_sender import Buffer, Sender
 
 _FUZZ_ITERATIONS = int(os.environ.get("ARROW_INGRESS_FUZZ_ITERATIONS", "6"))
 _ROWS_PER_BATCH = int(os.environ.get("ARROW_INGRESS_FUZZ_ROWS", "12"))
@@ -782,31 +781,31 @@ class TestArrowIngressUnsupportedTypes(afc.ArrowFuzzBase):
 
 
 class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
-    """Multiple `buffer_append_arrow` calls on one Buffer before flush."""
+    """Multiple `column_sender_flush_arrow_batch` calls on one
+    borrowed conn — verifies cross-frame schema-registry / symbol-dict
+    reuse against the live server."""
 
     SUITE_LABEL = "arrow_ingress_multi_batch"
 
     def _ingest_two_batches(self, table: str, rb1: pa.RecordBatch,
                             rb2: pa.RecordBatch) -> None:
         from arrow_ffi import (
-            buffer_append_arrow, pyarrow_export_record_batch,
+            conn_flush_arrow_batch, pyarrow_export_record_batch,
         )
         from questdb_line_sender import _table_name as _c_table_name
-        with afc.existing_sender(self._fixture) as sender:
-            buf = Buffer.from_sender(sender._impl)
+        with afc.borrowed_conn(self._fixture) as conn:
             for rb in (rb1, rb2):
                 table_name = _c_table_name(table)
                 arr, sch = pyarrow_export_record_batch(rb)
                 try:
-                    buffer_append_arrow(
-                        buf._impl, table_name,
+                    conn_flush_arrow_batch(
+                        conn, table_name,
                         ctypes.byref(arr), ctypes.byref(sch),
                         ts_column_name=b"ts",
                     )
                 finally:
                     if sch.release:
                         sch.release(ctypes.byref(sch))
-            sender.flush(buf)
 
     def test_identical_schema_two_batches_accumulate(self):
         table = self.fresh_table("arrow_in_mb_same")
@@ -821,10 +820,10 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
         self._ingest_two_batches(table, rb1, rb2)
         afc.wait_for_rows(self._fixture, table, 12)
 
-    def test_schema_grows_new_column_in_batch2_rejected(self):
-        # QWP/WS Arrow ingest requires consistent column set per buffer:
-        # adding a column in batch 2 leaves batch-1 columns short of rows
-        # and is rejected client-side.
+    def test_schema_grows_new_column_in_batch2_accepted(self):
+        # Conn-level `flush_arrow_batch` treats each call as an independent
+        # buffer with its own schema (registered under a fresh schema_id);
+        # adding a column in batch 2 is allowed and both batches land.
         table = self.fresh_table("arrow_in_mb_grow")
         kinds1 = [("c_int", KIND_REGISTRY["int"])]
         rb1, _ = _build_record_batch_with_ts(
@@ -838,12 +837,10 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
             self._master_rng, 4, kinds2, null_mode="valid",
             ts_base_us=1_700_000_010_000_000,
         )
-        with self.assertRaises(ArrowSenderError) as cm:
-            self._ingest_two_batches(table, rb1, rb2)
-        self.assertEqual(cm.exception.code, SenderErrorCode.INVALID_API_CALL,
-                         self.label(f"msg={cm.exception}"))
+        self._ingest_two_batches(table, rb1, rb2)
+        afc.wait_for_rows(self._fixture, table, 8)
 
-    def test_schema_drops_column_in_batch2_rejected(self):
+    def test_schema_drops_column_in_batch2_accepted(self):
         table = self.fresh_table("arrow_in_mb_drop")
         kinds_a = [
             ("c_int", KIND_REGISTRY["int"]),
@@ -857,10 +854,8 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
             self._master_rng, 4, kinds_b, null_mode="valid",
             ts_base_us=1_700_000_010_000_000,
         )
-        with self.assertRaises(ArrowSenderError) as cm:
-            self._ingest_two_batches(table, rb1, rb2)
-        self.assertEqual(cm.exception.code, SenderErrorCode.INVALID_API_CALL,
-                         self.label(f"msg={cm.exception}"))
+        self._ingest_two_batches(table, rb1, rb2)
+        afc.wait_for_rows(self._fixture, table, 8)
 
 class TestArrowIngressFuzz(afc.ArrowFuzzBase):
     """Random subsets of kinds × random null modes × random DTS variants."""

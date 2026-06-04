@@ -14,7 +14,7 @@ use std::num::NonZeroUsize;
 use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
 use questdb::{
     egress::Reader,
-    ingress::{Sender, TableName, polars::dataframe_to_batches},
+    ingress::{TableName, column_sender::QuestDb},
 };
 
 const TABLE: &str = "trades_polars_demo";
@@ -44,15 +44,12 @@ fn build_df() -> DataFrame {
 }
 
 fn ingest(host: &str, port: &str, df: &DataFrame) -> Result<(), Box<dyn Error>> {
-    let mut sender = Sender::from_conf(format!("qwpws::addr={host}:{port};"))?;
-    let mut buffer = sender.new_buffer();
+    let db = QuestDb::connect(&format!("qwpws::addr={host}:{port};"))?;
+    let mut sender = db.borrow_sender()?;
     let table = TableName::new(TABLE)?;
     let max_rows = NonZeroUsize::new(10_000);
-    for rb in dataframe_to_batches(df, max_rows) {
-        let rb = rb?;
-        buffer.append_arrow(table, &rb)?;
-        sender.flush(&mut buffer)?;
-    }
+    sender.flush_polars_dataframe(table, df, max_rows)?;
+    sender.sync(Default::default())?;
     Ok(())
 }
 

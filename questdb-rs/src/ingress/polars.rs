@@ -1,5 +1,6 @@
 //! Polars sub-feature: convert a [`DataFrame`] into Arrow
-//! [`RecordBatch`]es for consumption by [`Buffer::append_arrow`].
+//! [`RecordBatch`]es for consumption by
+//! [`ColumnSender::flush_arrow_batch`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch].
 //!
 //! [`dataframe_to_batches`] is the primary entry point. It returns an
 //! iterator that yields slices of at most `max_rows` rows each. Each
@@ -37,17 +38,17 @@
 //!
 //! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
 //!
-//! Flushing is the caller's responsibility:
+//! The one-call shortcut is [`ColumnSender::flush_polars_dataframe`].
+//! For full control over slicing and per-batch retry, drive the
+//! iterator directly:
 //!
 //! ```ignore
 //! for rb in questdb::ingress::polars::dataframe_to_batches(&df, None) {
-//!     let rb = rb?;
-//!     buf.append_arrow(table, &rb)?;
-//!     sender.flush(&mut buf)?;
+//!     sender.flush_arrow_batch(table, &rb?)?;
 //! }
 //! ```
 //!
-//! [`Buffer::append_arrow`]: crate::ingress::Buffer::append_arrow
+//! [`ColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::ColumnSender::flush_polars_dataframe
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -286,6 +287,35 @@ impl Iterator for DataFrameBatches<'_> {
     }
 }
 
+impl crate::ingress::column_sender::ColumnSender {
+    /// Slice `df` into [`RecordBatch`]es of at most `max_rows` rows each
+    /// (defaults to [`DEFAULT_MAX_BATCH_ROWS`]) and publish every slice
+    /// through this pooled connection via
+    /// [`ColumnSender::flush_arrow_batch`].
+    ///
+    /// One QWP/WebSocket frame per slice. The first frame is sent as
+    /// an immediate commit and later frames are deferred; call
+    /// [`ColumnSender::sync`] after the last frame to drain ACKs.
+    ///
+    /// On error, partial frames may already have hit the wire; failed
+    /// flushes follow the same connection-latching semantics as
+    /// [`ColumnSender::flush_arrow_batch`].
+    ///
+    /// [`ColumnSender::flush_arrow_batch`]: crate::ingress::column_sender::ColumnSender::flush_arrow_batch
+    /// [`ColumnSender::sync`]: crate::ingress::column_sender::ColumnSender::sync
+    pub fn flush_polars_dataframe(
+        &mut self,
+        table: crate::ingress::TableName<'_>,
+        df: &DataFrame,
+        max_rows: Option<NonZeroUsize>,
+    ) -> Result<()> {
+        for rb in dataframe_to_batches(df, max_rows) {
+            self.flush_arrow_batch(table, &rb?)?;
+        }
+        Ok(())
+    }
+}
+
 fn ffi_polars_to_arrow_rs(
     pa_field: &polars_arrow::datatypes::Field,
     pa_array_box: Box<dyn polars_arrow::array::Array>,
@@ -515,12 +545,15 @@ mod tests {
     }
 
     #[test]
-    fn polars_categorical_routes_through_dictionary_to_symbol() {
-        use crate::ingress::{Buffer, TableName};
+    fn polars_categorical_routes_through_dictionary() {
         use arrow_schema::DataType as ArrowDataType;
         use polars::prelude::{CategoricalPhysical, Categories, DataType as PlDataType};
 
-        // Polars Categorical → arrow Dictionary(UInt32, LargeUtf8)
+        // Polars Categorical → arrow Dictionary(UInt32, LargeUtf8). The
+        // downstream SYMBOL routing is covered by
+        // `dict_u32_large_utf8_routes_to_symbol` in
+        // `column_sender::arrow_batch::tests` — here we only verify the
+        // polars→arrow translation produces a Dictionary array.
         let cats = Categories::new(
             PlSmallStr::from("syms"),
             PlSmallStr::from("test"),
@@ -538,7 +571,6 @@ mod tests {
         assert_eq!(batches.len(), 1);
         let rb = &batches[0];
 
-        // Arrow side must be Dictionary-encoded for the SYMBOL routing to kick in.
         assert!(
             matches!(
                 rb.schema().field(0).data_type(),
@@ -547,11 +579,6 @@ mod tests {
             "expected Dictionary column, got {:?}",
             rb.schema().field(0).data_type()
         );
-
-        // Buffer::append_arrow classifies Dictionary → SymbolDict → SYMBOL wire.
-        let mut buf = Buffer::qwp_ws_with_max_name_len(127);
-        let t = TableName::new("polars_cat_sym").unwrap();
-        buf.append_arrow(t, rb).unwrap();
-        assert_eq!(buf.row_count(), 4);
+        assert_eq!(rb.num_rows(), 4);
     }
 }

@@ -43,11 +43,6 @@ pub(crate) use self::qwp::QwpBuffer;
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
 pub(crate) use self::qwp::SchemaRegistry;
-#[cfg(all(feature = "_sender-qwp-ws", feature = "arrow"))]
-pub(crate) use self::qwp::{
-    ArrowBatchInfo, ArrowBulkCtx, ArrowDecimalSpec, ColumnKind as QwpColumnKind,
-    QWP_DECIMAL_MAX_SCALE,
-};
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
@@ -420,10 +415,6 @@ impl Buffer {
     }
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-    /// Creates a new row-major QWP buffer with default parameters.
-    /// Used by the QWP/UDP transport and any QWP path that does not
-    /// require columnar layout. For the QWP/WebSocket Arrow ingest
-    /// path see [`Buffer::new_qwp_ws`].
     pub fn new_qwp() -> Self {
         Self::qwp_with_max_name_len(127)
     }
@@ -437,8 +428,10 @@ impl Buffer {
     }
 
     /// Creates a new QWP/WebSocket columnar buffer with a 127-byte name
-    /// length limit. Required by [`Buffer::append_arrow`]; also accepts
-    /// the row-by-row `table` / `symbol` / `column_*` / `at` API.
+    /// length limit. Accepts the row-by-row `table` / `symbol` /
+    /// `column_*` / `at` API; consumed by [`Sender::flush`].
+    ///
+    /// [`Sender::flush`]: crate::ingress::Sender::flush
     #[cfg(feature = "_sender-qwp-ws")]
     pub fn new_qwp_ws() -> Self {
         Self::qwp_ws_with_max_name_len(127)
@@ -479,16 +472,6 @@ impl Buffer {
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(_) => None,
             BufferInner::QwpWs(inner) => Some(inner.as_ref()),
-        }
-    }
-
-    #[cfg(all(feature = "_sender-qwp-ws", feature = "arrow"))]
-    pub(crate) fn as_qwp_ws_mut(&mut self) -> Option<&mut QwpWsColumnarBuffer> {
-        match &mut self.inner {
-            BufferInner::Ilp(_) => None,
-            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-            BufferInner::Qwp(_) => None,
-            BufferInner::QwpWs(inner) => Some(inner.as_mut()),
         }
     }
 

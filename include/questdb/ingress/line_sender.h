@@ -441,14 +441,6 @@ QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
     size_t max_name_len);
 
-/**
- * Construct a QWP/WebSocket columnar `line_sender_buffer` with a 127-byte
- * name length limit. This is the buffer kind required by
- * `line_sender_buffer_append_arrow`.
- */
-QUESTDB_CLIENT_API
-line_sender_buffer* line_sender_buffer_new_qwp_ws(void);
-
 /** Release the `line_sender_buffer` object. */
 QUESTDB_CLIENT_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
@@ -1995,96 +1987,6 @@ int64_t line_sender_now_nanos(void);
 /** Get the current time in microseconds since the Unix epoch (UTC). */
 QUESTDB_CLIENT_API
 int64_t line_sender_now_micros(void);
-
-#ifdef QUESTDB_CLIENT_ENABLE_ARROW
-/* Apache Arrow C Data Interface (feature: arrow).
- * https://arrow.apache.org/docs/format/CDataInterface.html */
-
-#ifndef ARROW_C_DATA_INTERFACE
-#    define ARROW_C_DATA_INTERFACE
-
-#    define ARROW_FLAG_DICTIONARY_ORDERED 1
-#    define ARROW_FLAG_NULLABLE 2
-#    define ARROW_FLAG_MAP_KEYS_SORTED 4
-
-struct ArrowSchema
-{
-    const char* format;
-    const char* name;
-    const char* metadata;
-    int64_t flags;
-    int64_t n_children;
-    struct ArrowSchema** children;
-    struct ArrowSchema* dictionary;
-    void (*release)(struct ArrowSchema*);
-    void* private_data;
-};
-
-struct ArrowArray
-{
-    int64_t length;
-    int64_t null_count;
-    int64_t offset;
-    int64_t n_buffers;
-    int64_t n_children;
-    const void** buffers;
-    struct ArrowArray** children;
-    struct ArrowArray* dictionary;
-    void (*release)(struct ArrowArray*);
-    void* private_data;
-};
-
-#endif /* ARROW_C_DATA_INTERFACE */
-
-/**
- * Append every row of a `RecordBatch` (Arrow C Data Interface) to `buffer`.
- * The per-row designated timestamp is not sent — the server stamps each row
- * on arrival (same semantics as `line_sender_buffer_at_now`).
- *
- * `array` may be either:
- *   - A Struct array (one child per column, the standard RecordBatch shape), or
- *   - A non-Struct (single-column) array whose `schema->name` becomes the
- *     column name.
- *
- * Ownership: `array` is consumed once input validation passes
- * (non-NULL pointers, schema depth within bounds) — `array->release`
- * is cleared and the imported buffers are dropped on every subsequent
- * return path. If validation fails first (NULL or over-deep schema),
- * `array->release` is left untouched. `schema` is always borrowed.
- *
- * Arrow columns classified as QuestDB TIMESTAMP must contain no null rows and
- * no values before the Unix epoch.
- * Utf8, LargeUtf8, and Utf8View fields with `questdb.symbol=true` metadata are
- * emitted as QuestDB SYMBOL columns.
- *
- * Server-side type-mismatch surfaces from the next `line_sender_flush`.
- */
-QUESTDB_CLIENT_API
-bool line_sender_buffer_append_arrow(
-    line_sender_buffer* buffer,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    line_sender_error** err_out);
-
-/**
- * Append every row of a `RecordBatch`, sourcing the per-row designated
- * timestamp from a named `Timestamp(_)` column inside the batch.
- *
- * Same ownership and shape contract as `line_sender_buffer_append_arrow`.
- * `ts_column` must be initialised via `line_sender_column_name_init` and
- * name a `Timestamp(Microsecond | Nanosecond | Millisecond, _)` column
- * with no null rows and no values before the Unix epoch.
- */
-QUESTDB_CLIENT_API
-bool line_sender_buffer_append_arrow_at_column(
-    line_sender_buffer* buffer,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    line_sender_column_name ts_column,
-    line_sender_error** err_out);
-#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
 }
