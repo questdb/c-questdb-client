@@ -87,6 +87,11 @@ pub enum NumpyDtype {
     // ---- Other per-row conversions ----
     Bool,
     DatetimeSecToMicros,
+    DatetimeMinuteToMicros,
+    DatetimeHourToMicros,
+    DatetimeDayToMicros,
+    DatetimeMonthToMicros,
+    DatetimeYearToMicros,
 
     // ---- Decimal (scale carried) ----
     Decimal64 {
@@ -136,7 +141,13 @@ impl NumpyDtype {
             D::F16Widen => QWP_TYPE_FLOAT,
             D::Bool => QWP_TYPE_BOOLEAN,
             D::DateI64Direct => QWP_TYPE_DATE,
-            D::TimestampMicrosDirect | D::DatetimeSecToMicros => QWP_TYPE_TIMESTAMP,
+            D::TimestampMicrosDirect
+            | D::DatetimeSecToMicros
+            | D::DatetimeMinuteToMicros
+            | D::DatetimeHourToMicros
+            | D::DatetimeDayToMicros
+            | D::DatetimeMonthToMicros
+            | D::DatetimeYearToMicros => QWP_TYPE_TIMESTAMP,
             D::TimestampNanosDirect => QWP_TYPE_TIMESTAMP_NANOS,
             D::UuidDirect => QWP_TYPE_UUID,
             D::Long256Direct => QWP_TYPE_LONG256,
@@ -172,6 +183,11 @@ impl NumpyDtype {
             | D::TimestampMicrosDirect
             | D::TimestampNanosDirect
             | D::DatetimeSecToMicros
+            | D::DatetimeMinuteToMicros
+            | D::DatetimeHourToMicros
+            | D::DatetimeDayToMicros
+            | D::DatetimeMonthToMicros
+            | D::DatetimeYearToMicros
             | D::U32WidenToI64
             | D::U64WidenToI64
             | D::F32Widen
@@ -307,8 +323,34 @@ pub(crate) unsafe fn emit_into_wire(
         // ---- Bool (byte-per-row → packed LSB-first bitmap) ----
         D::Bool => unsafe { emit_bool(out, data, row_count, validity) },
 
-        // ---- datetime64[s] → ×10^6 → TIMESTAMP (bitmap) ----
-        D::DatetimeSecToMicros => unsafe { emit_sec_to_micros(out, data, row_count, validity)? },
+        // ---- datetime64[s/m/h/D] → ×K → TIMESTAMP (bitmap) ----
+        D::DatetimeSecToMicros => unsafe {
+            emit_i64_to_micros(out, data, row_count, validity, "s", |v| {
+                v.checked_mul(1_000_000)
+            })?
+        },
+        D::DatetimeMinuteToMicros => unsafe {
+            emit_i64_to_micros(out, data, row_count, validity, "m", |v| {
+                v.checked_mul(60_000_000)
+            })?
+        },
+        D::DatetimeHourToMicros => unsafe {
+            emit_i64_to_micros(out, data, row_count, validity, "h", |v| {
+                v.checked_mul(3_600_000_000)
+            })?
+        },
+        D::DatetimeDayToMicros => unsafe {
+            emit_i64_to_micros(out, data, row_count, validity, "D", |v| {
+                v.checked_mul(86_400_000_000)
+            })?
+        },
+        // ---- datetime64[M/Y] → calendar → TIMESTAMP (bitmap) ----
+        D::DatetimeMonthToMicros => unsafe {
+            emit_i64_to_micros(out, data, row_count, validity, "M", month_offset_to_micros)?
+        },
+        D::DatetimeYearToMicros => unsafe {
+            emit_i64_to_micros(out, data, row_count, validity, "Y", year_offset_to_micros)?
+        },
 
         // ---- Decimal (scale byte + bitmap-encoded fixed-width) ----
         D::Decimal64 { scale } => unsafe {
@@ -660,29 +702,39 @@ unsafe fn emit_bool(
     }
 }
 
-/// datetime64[s] → TIMESTAMP (microseconds, bitmap-encoded). Rejects
-/// overflow on `value * 1_000_000`.
-unsafe fn emit_sec_to_micros(
+/// datetime64[unit] → TIMESTAMP (microseconds, bitmap-encoded). The
+/// `convert` closure maps one source `i64` to a microsecond `i64`,
+/// returning `None` on overflow / out-of-range so the caller surfaces a
+/// `InvalidApiCall` error pointing at the offending row.
+#[inline]
+unsafe fn emit_i64_to_micros<F>(
     out: &mut Vec<u8>,
     data: *const u8,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
-) -> Result<()> {
+    unit_label: &str,
+    convert: F,
+) -> Result<()>
+where
+    F: Fn(i64) -> Option<i64>,
+{
     let typed = data as *const i64;
+    let make_err = |i: usize, value: i64| {
+        error::fmt!(
+            InvalidApiCall,
+            "datetime64[{}] value at row {} ({}) overflows i64 when converted to microseconds",
+            unit_label,
+            i,
+            value
+        )
+    };
     match validity {
         None => {
             out.push(0);
             out.reserve(8 * row_count);
             for i in 0..row_count {
-                let sec = unsafe { *typed.add(i) };
-                let micros = sec.checked_mul(1_000_000).ok_or_else(|| {
-                    error::fmt!(
-                        InvalidApiCall,
-                        "datetime64[s] value at row {} ({}) overflows i64 when converted to microseconds",
-                        i,
-                        sec
-                    )
-                })?;
+                let value = unsafe { *typed.add(i) };
+                let micros = convert(value).ok_or_else(|| make_err(i, value))?;
                 out.extend_from_slice(&micros.to_le_bytes());
             }
         }
@@ -694,20 +746,53 @@ unsafe fn emit_sec_to_micros(
                 if !unsafe { v.is_valid(i) } {
                     continue;
                 }
-                let sec = unsafe { *typed.add(i) };
-                let micros = sec.checked_mul(1_000_000).ok_or_else(|| {
-                    error::fmt!(
-                        InvalidApiCall,
-                        "datetime64[s] value at row {} ({}) overflows i64 when converted to microseconds",
-                        i,
-                        sec
-                    )
-                })?;
+                let value = unsafe { *typed.add(i) };
+                let micros = convert(value).ok_or_else(|| make_err(i, value))?;
                 out.extend_from_slice(&micros.to_le_bytes());
             }
         }
     }
     Ok(())
+}
+
+/// Microseconds at the start of `1970 + year_offset` (proleptic
+/// Gregorian). Returns `None` on overflow.
+fn year_offset_to_micros(year_offset: i64) -> Option<i64> {
+    // Cap so the final `days * 86_400_000_000` always fits in i64.
+    // i64::MAX / 86_400_000_000 ≈ 1.067e8 days ≈ 292_277 years.
+    if !(-292_277..=292_277).contains(&year_offset) {
+        return None;
+    }
+    let year = 1970 + year_offset;
+    let days = days_from_civil(year, 1, 1);
+    days.checked_mul(86_400_000_000)
+}
+
+/// Microseconds at the start of `(1970-01) + month_offset` (proleptic
+/// Gregorian). Negative offsets are calendar-correct via euclidean mod.
+fn month_offset_to_micros(month_offset: i64) -> Option<i64> {
+    let year_offset = month_offset.div_euclid(12);
+    let month_in_year = month_offset.rem_euclid(12) as u32 + 1; // 1..=12
+    if !(-292_277..=292_277).contains(&year_offset) {
+        return None;
+    }
+    let year = 1970 + year_offset;
+    let days = days_from_civil(year, month_in_year, 1);
+    days.checked_mul(86_400_000_000)
+}
+
+/// Days from the Unix epoch (1970-01-01) to the given proleptic
+/// Gregorian (year, month, day). Howard Hinnant's `days_from_civil`
+/// (public-domain algorithm, http://howardhinnant.github.io/date_algorithms.html).
+/// Safe for `|year| < ~2.5e16`; callers above cap year first.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let m_adj = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * m_adj + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146_096]
+    era * 146_097 + doe as i64 - 719_468
 }
 
 /// Decimal wire: `null_flag` + optional bitmap + `scale` byte + dense
@@ -1098,6 +1183,118 @@ mod tests {
             bytes_a, bytes_b,
             "TimestampNanosDirect must produce byte-identical wire to column_ts_nanos"
         );
+    }
+
+    /// Helper: encode one numpy datetime column + a fixed ts, return wire bytes.
+    fn encode_datetime_col(dtype: NumpyDtype, src_le_bytes: &[u8], row_count: usize) -> Vec<u8> {
+        let ts: Vec<i64> = (0..row_count as i64).collect();
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred("v", dtype, src_le_bytes.as_ptr(), row_count, None)
+                .unwrap();
+        }
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+        encode(&chunk)
+    }
+
+    /// Helper: encode `column_ts_micros(values)` + fixed ts, return wire bytes.
+    fn encode_micros_col(values: &[i64]) -> Vec<u8> {
+        let ts: Vec<i64> = (0..values.len() as i64).collect();
+        let mut chunk = Chunk::new("t");
+        chunk.column_ts_micros("v", values, None).unwrap();
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+        encode(&chunk)
+    }
+
+    #[test]
+    fn datetime_day_matches_column_ts_micros() {
+        let src = [0i64, 1, 18262]; // epoch, +1d, 2020-01-01
+        let expected = [0i64, 86_400_000_000, 18262 * 86_400_000_000];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            encode_datetime_col(NumpyDtype::DatetimeDayToMicros, &raw, src.len()),
+            encode_micros_col(&expected),
+        );
+    }
+
+    #[test]
+    fn datetime_hour_matches_column_ts_micros() {
+        let src = [0i64, 1, 24];
+        let expected = [0i64, 3_600_000_000, 24 * 3_600_000_000];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            encode_datetime_col(NumpyDtype::DatetimeHourToMicros, &raw, src.len()),
+            encode_micros_col(&expected),
+        );
+    }
+
+    #[test]
+    fn datetime_minute_matches_column_ts_micros() {
+        let src = [0i64, 1, 60];
+        let expected = [0i64, 60_000_000, 60 * 60_000_000];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            encode_datetime_col(NumpyDtype::DatetimeMinuteToMicros, &raw, src.len()),
+            encode_micros_col(&expected),
+        );
+    }
+
+    #[test]
+    fn datetime_year_matches_calendar() {
+        // y=0 → 1970-01-01, y=50 → 2020-01-01 (18262 days), y=-1 → 1969-01-01 (-365 days)
+        let src = [0i64, 50, -1];
+        let expected = [0i64, 18262 * 86_400_000_000, -365 * 86_400_000_000];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            encode_datetime_col(NumpyDtype::DatetimeYearToMicros, &raw, src.len()),
+            encode_micros_col(&expected),
+        );
+    }
+
+    #[test]
+    fn datetime_month_matches_calendar() {
+        // m=0 → 1970-01-01, m=1 → 1970-02-01 (31 days), m=13 → 1971-02-01 (365+31 days),
+        // m=-1 → 1969-12-01 (-31 days)
+        let src = [0i64, 1, 13, -1];
+        let expected = [
+            0i64,
+            31 * 86_400_000_000,
+            (365 + 31) * 86_400_000_000,
+            -31 * 86_400_000_000,
+        ];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            encode_datetime_col(NumpyDtype::DatetimeMonthToMicros, &raw, src.len()),
+            encode_micros_col(&expected),
+        );
+    }
+
+    #[test]
+    fn datetime_year_out_of_range_rejected() {
+        let bad = [10_000_000i64]; // far beyond the ±292_277 cap
+        let ts = [1i64];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "ts",
+                    NumpyDtype::DatetimeYearToMicros,
+                    bad.as_ptr() as *const u8,
+                    bad.len(),
+                    None,
+                )
+                .unwrap();
+        }
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+        let err = {
+            let mut out = Vec::new();
+            let mut reg = SchemaRegistry::new();
+            let mut dict = SymbolGlobalDict::new();
+            encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap_err()
+        };
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("overflows"));
     }
 
     #[test]

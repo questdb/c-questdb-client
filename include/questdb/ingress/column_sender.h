@@ -661,7 +661,17 @@ typedef enum column_sender_numpy_dtype
 
     /* f64 ndarray: rectangular tensor (read array_ndim + array_shape from
        column_sender_numpy_extras). All rows share the same shape. */
-    column_sender_numpy_f64_ndarray = 31
+    column_sender_numpy_f64_ndarray = 31,
+
+    /* Coarser datetime64 units → TIMESTAMP (microseconds).
+       Y / M are proleptic Gregorian, anchored at the start of the
+       referenced year / month. D / h / m are constant multipliers. All
+       reject overflow with InvalidApiCall. */
+    column_sender_numpy_datetime64_m = 32, /* minute × 60_000_000          */
+    column_sender_numpy_datetime64_h = 33, /* hour   × 3_600_000_000       */
+    column_sender_numpy_datetime64_D = 34, /* day    × 86_400_000_000      */
+    column_sender_numpy_datetime64_M = 35, /* month  → start of 1970-01+M  */
+    column_sender_numpy_datetime64_Y = 36  /* year   → start of 1970+Y     */
 } column_sender_numpy_dtype;
 
 /* Companion struct for `column_sender_chunk_append_numpy_column` carrying

@@ -769,7 +769,14 @@ typedef enum column_sender_numpy_dtype
     column_sender_numpy_geohash_i64     = 30,
 
     /* f64 ndarray (read array_ndim + array_shape from extras) */
-    column_sender_numpy_f64_ndarray     = 31
+    column_sender_numpy_f64_ndarray     = 31,
+
+    /* Coarser datetime64 units → TIMESTAMP (microseconds) */
+    column_sender_numpy_datetime64_m    = 32,  /* minute × 60_000_000          */
+    column_sender_numpy_datetime64_h    = 33,  /* hour   × 3_600_000_000       */
+    column_sender_numpy_datetime64_D    = 34,  /* day    × 86_400_000_000      */
+    column_sender_numpy_datetime64_M    = 35,  /* month  → start of 1970-01+M  */
+    column_sender_numpy_datetime64_Y    = 36   /* year   → start of 1970+Y     */
 } column_sender_numpy_dtype;
 
 QUESTDB_CLIENT_API
@@ -810,6 +817,11 @@ wider wire type; `pack` = byte-per-row to LSB-first bitmap.
 | `f32`                           | DOUBLE           | widen      |
 | `f16`                           | FLOAT            | widen (per-row f16→f32) |
 | `datetime64_s`                  | TIMESTAMP        | widen (×10⁶) |
+| `datetime64_m`                  | TIMESTAMP        | widen (×60·10⁶) |
+| `datetime64_h`                  | TIMESTAMP        | widen (×3600·10⁶) |
+| `datetime64_D`                  | TIMESTAMP        | widen (×86400·10⁶) |
+| `datetime64_M`                  | TIMESTAMP        | calendar (start of 1970-01 + N months, proleptic Gregorian) |
+| `datetime64_Y`                  | TIMESTAMP        | calendar (start of 1970 + N years, proleptic Gregorian) |
 | `bool`                          | BOOLEAN          | pack (byte-per-row → bitmap) |
 | `decimal_s8` + scale            | DECIMAL64        | direct (i64 mantissa) |
 | `decimal_s16` + scale           | DECIMAL128       | direct (i128 mantissa) |

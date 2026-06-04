@@ -909,6 +909,12 @@ pub enum column_sender_numpy_dtype {
     column_sender_numpy_geohash_i64 = 30,
 
     column_sender_numpy_f64_ndarray = 31,
+
+    column_sender_numpy_datetime64_m = 32,
+    column_sender_numpy_datetime64_h = 33,
+    column_sender_numpy_datetime64_D = 34,
+    column_sender_numpy_datetime64_M = 35,
+    column_sender_numpy_datetime64_Y = 36,
 }
 
 /// Companion to [`column_sender_chunk_append_numpy_column`] carrying
@@ -1126,6 +1132,11 @@ unsafe fn resolve_numpy_dtype(
         D::column_sender_numpy_f16 => NumpyDtype::F16Widen,
         D::column_sender_numpy_bool => NumpyDtype::Bool,
         D::column_sender_numpy_datetime64_s => NumpyDtype::DatetimeSecToMicros,
+        D::column_sender_numpy_datetime64_m => NumpyDtype::DatetimeMinuteToMicros,
+        D::column_sender_numpy_datetime64_h => NumpyDtype::DatetimeHourToMicros,
+        D::column_sender_numpy_datetime64_D => NumpyDtype::DatetimeDayToMicros,
+        D::column_sender_numpy_datetime64_M => NumpyDtype::DatetimeMonthToMicros,
+        D::column_sender_numpy_datetime64_Y => NumpyDtype::DatetimeYearToMicros,
 
         D::column_sender_numpy_decimal_s8 => NumpyDtype::Decimal64 {
             scale: unsafe { validate_decimal_scale(extras, 18, "DECIMAL64", err_out)? },
