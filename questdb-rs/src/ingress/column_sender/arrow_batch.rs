@@ -3201,7 +3201,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_arrow_nulls_are_rejected() {
+    fn designated_timestamp_arrow_nulls_are_rejected() {
         let mut ts = TimestampMicrosecondBuilder::new();
         ts.append_value(1);
         ts.append_null();
@@ -3209,7 +3209,7 @@ mod tests {
             Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             ts.finish(),
         );
-        let err = encode_err(&rb);
+        let err = encode_err_at_ts(&rb, 0);
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
     }
 
