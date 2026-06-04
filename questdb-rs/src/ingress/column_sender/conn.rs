@@ -265,8 +265,8 @@ impl ColumnConn {
         Ok(())
     }
 
-    /// Drain any ack responses available without blocking. Returns the
-    /// number of OK acks consumed.
+    /// Drain any QWP responses available without blocking. Returns the
+    /// number of responses consumed (OK acks, durable acks, etc.).
     pub(crate) fn try_drain_acks(&mut self) -> Result<u32> {
         let mut drained = 0u32;
         loop {
@@ -419,17 +419,14 @@ impl ColumnConn {
         err
     }
 
-    fn set_timeouts(&self, read: Option<Duration>, write: Option<Duration>) -> Result<()> {
-        // WsStream::set_timeouts is `fn` (not pub(crate)). We replicate
-        // the socket timeout setting via the tcp_stream accessor, but
-        // since WsStream::set_timeouts is private we have to use the
-        // Read/Write IO directly. Skip explicit timeout muting here:
-        // the underlying socket already has timeouts set during connect
-        // (see establish_connection in qwp_ws.rs). If they need refresh
-        // for long flushes, expose a setter on WsStream.
-        let _ = read;
-        let _ = write;
-        Ok(())
+    fn set_timeouts(&mut self, read: Option<Duration>, write: Option<Duration>) -> Result<()> {
+        self.stream.set_timeouts(read, write).map_err(|e| {
+            self.latch(error::fmt!(
+                SocketError,
+                "QWP/WebSocket socket set_timeouts failed: {}",
+                e
+            ))
+        })
     }
 
     /// Non-blocking attempt to read one QWP/WS data frame. Returns

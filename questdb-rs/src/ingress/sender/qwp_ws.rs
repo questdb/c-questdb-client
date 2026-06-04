@@ -77,7 +77,11 @@ pub(crate) enum WsStream {
 }
 
 impl WsStream {
-    fn set_timeouts(&self, read: Option<Duration>, write: Option<Duration>) -> std::io::Result<()> {
+    pub(crate) fn set_timeouts(
+        &self,
+        read: Option<Duration>,
+        write: Option<Duration>,
+    ) -> std::io::Result<()> {
         let sock = match self {
             WsStream::Plain(s) => s,
             WsStream::Tls(s) => s.get_ref(),
