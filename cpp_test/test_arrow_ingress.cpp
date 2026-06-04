@@ -537,7 +537,7 @@ TEST_CASE("flush_arrow_batch: Decimal64 / Decimal128 / Decimal256")
         MockConn mc;
         auto col = pack_le<int64_t>({12345, 67890});
         auto arr = make_array(2, 0, {nullptr, col});
-        auto sch = make_schema("d:18,2", "d64");
+        auto sch = make_schema("d:18,2,64", "d64");
         expect_flush_ok(mc, "t_d64", arr, sch);
     }
     SUBCASE("Decimal128")

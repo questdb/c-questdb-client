@@ -963,7 +963,7 @@ TEST(test_mock_ingress_at_column_empty_name_via_real_conn)
 
 TEST(test_mock_ingress_boolean_column)
 {
-    uint8_t values[1] = {0x05}; /* bit-packed: rows 0+2 true, row 1 false */
+    uint8_t values[3] = {0x05, 0, 0};
     struct ArrowArray arr;
     struct ArrowSchema sch;
     build_primitive(3, 1, values, "b", "flag", &arr, &sch);
