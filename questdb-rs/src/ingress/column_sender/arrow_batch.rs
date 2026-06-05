@@ -391,17 +391,7 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Binary, _, _) => ColumnKind::Binary,
         (DataType::LargeBinary, _, _) => ColumnKind::LargeBinary,
         (DataType::BinaryView, _, _) => ColumnKind::BinaryView,
-        (DataType::FixedSizeBinary(16), Some("uuid"), _) => ColumnKind::Uuid,
-        (DataType::FixedSizeBinary(16), _, Some("arrow.uuid")) => ColumnKind::Uuid,
-        (DataType::FixedSizeBinary(16), _, _) => {
-            return Err(Error::new(
-                ErrorCode::ArrowUnsupportedColumnKind,
-                format!(
-                    "FixedSizeBinary(16) column '{}' lacks UUID metadata; LONG128 ingress is not yet wired",
-                    field.name()
-                ),
-            ));
-        }
+        (DataType::FixedSizeBinary(16), _, _) => ColumnKind::Uuid,
         (DataType::FixedSizeBinary(32), _, _) => ColumnKind::Long256,
         (DataType::Dictionary(key, value), _, _)
             if dict_key_for(key).is_some() && dict_value_for(value).is_some() =>
@@ -2529,6 +2519,7 @@ pub(crate) fn write_arrow_column_body(
         }
         ColumnKind::TimestampSecondToMicros => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+            ensure_timestamp_no_nulls(arr, "timestamp field column")?;
             ensure_timestamp_values_non_negative(arr, a.values(), "timestamp field column")?;
             try_non_null_le::<8>(out, arr, |row| {
                 let v = a.value(row);
@@ -2548,6 +2539,7 @@ pub(crate) fn write_arrow_column_body(
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
+            ensure_timestamp_no_nulls(arr, "timestamp field column")?;
             ensure_timestamp_values_non_negative(arr, a.values(), "timestamp field column")?;
             if !use_bitmap && cfg!(target_endian = "little") {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
@@ -2560,6 +2552,7 @@ pub(crate) fn write_arrow_column_body(
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
+            ensure_timestamp_no_nulls(arr, "timestamp field column")?;
             ensure_timestamp_values_non_negative(arr, a.values(), "timestamp field column")?;
             if !use_bitmap && cfg!(target_endian = "little") {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
@@ -3531,12 +3524,12 @@ mod tests {
     }
 
     #[test]
-    fn uuid_without_metadata_rejected() {
+    fn uuid_without_metadata_routes_to_column_uuid() {
         let mut b = FixedSizeBinaryBuilder::new(16);
         b.append_value([0u8; 16]).unwrap();
         let field = Field::new("id", DataType::FixedSizeBinary(16), true);
         let rb = single_col_batch(field, b.finish());
-        assert_classify_rejects(&rb);
+        assert_ok_with_table_count(&rb, 1);
     }
 
     #[test]
@@ -3721,6 +3714,19 @@ mod tests {
         ts.append_value(-1);
         let rb = single_col_batch(
             Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            ts.finish(),
+        );
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+    }
+
+    #[test]
+    fn timestamp_field_nulls_are_rejected() {
+        let mut ts = TimestampMicrosecondBuilder::new();
+        ts.append_value(1);
+        ts.append_null();
+        let rb = single_col_batch(
+            Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             ts.finish(),
         );
         let err = encode_err(&rb);
@@ -4426,16 +4432,6 @@ mod tests {
         b.append_value(IntervalMonthDayNano::new(1, 1, 1));
         assert_unsupported_column_with(
             Field::new("c", DataType::Interval(IntervalUnit::MonthDayNano), true),
-            Arc::new(b.finish()) as ArrayRef,
-        );
-    }
-
-    #[test]
-    fn fixed_size_binary_non_uuid_rejected_as_unsupported() {
-        let mut b = FixedSizeBinaryBuilder::new(16);
-        b.append_value([0u8; 16]).unwrap();
-        assert_unsupported_column_with(
-            Field::new("c", DataType::FixedSizeBinary(16), true),
             Arc::new(b.finish()) as ArrayRef,
         );
     }
