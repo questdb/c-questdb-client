@@ -410,6 +410,11 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_arrow_ingress.cpp)
 
+    compile_test(
+        test_column_sender
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/test_column_sender.cpp)
+
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,
     # thus will also require a Java 11 installation to run the tests.

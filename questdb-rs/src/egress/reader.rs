@@ -640,6 +640,14 @@ impl Reader {
         self.stats.bytes_received.load(Ordering::Relaxed)
     }
 
+    /// `true` when the underlying transport has been torn down (mid-stream
+    /// cursor abandonment, fatal socket error, role-mismatch failover that
+    /// couldn't find a replacement). Pool return paths should treat such a
+    /// reader as must-close.
+    pub fn transport_torn_down(&self) -> bool {
+        self.transport.is_none()
+    }
+
     /// Total bytes granted to the server via CREDIT (`0x15`) frames
     /// since this connection was opened. Useful for verifying that
     /// flow-control replenishment behaves as expected — in particular,
@@ -2385,11 +2393,12 @@ impl Drop for Cursor<'_> {
         // paths clear `cursor_active` whenever they leave the
         // transport `None`), `Drop` should never panic.
         if self.reader.cursor_active {
-            if let Some(t) = self.reader.transport.as_mut() {
+            if let Some(mut t) = self.reader.transport.take() {
                 if !self.cancelling {
                     t.try_write_cancel(self.request_id);
                 }
                 t.close_in_place();
+                drop(t);
             }
             self.reader.cursor_active = false;
         }

@@ -82,6 +82,28 @@ impl SchemaRegistry {
     }
 }
 
+/// Per-sender reusable scratch state for one flush. The contained `Vec`s
+/// are cleared (not reallocated) between flushes so a long-lived
+/// connection pays at most one allocation per growth point per Vec.
+#[derive(Default)]
+pub(crate) struct EncodeScratch {
+    pub(crate) signature: Vec<u8>,
+    pub(crate) new_symbols: Vec<Vec<u8>>,
+    pub(crate) per_column: Vec<Option<ResolvedColumn>>,
+}
+
+impl EncodeScratch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        self.signature.clear();
+        self.new_symbols.clear();
+        self.per_column.clear();
+    }
+}
+
 /// Encode `chunk` into `out` as a complete QWP/WebSocket frame body. The
 /// caller has already reserved any prefix bytes it needs in `out` (the
 /// connection layer reserves the WS header); the encoder appends QWP
@@ -91,8 +113,10 @@ pub(crate) fn encode_chunk_into(
     chunk: &Chunk<'_>,
     schema_registry: &mut SchemaRegistry,
     symbol_dict: &mut SymbolGlobalDict,
+    scratch: &mut EncodeScratch,
     defer_commit: bool,
 ) -> Result<()> {
+    scratch.reset();
     if chunk.is_empty() {
         emit_header_only_frame(out, defer_commit);
         return Ok(());
@@ -133,8 +157,13 @@ pub(crate) fn encode_chunk_into(
     // later fails — symbol entries that never hit the wire must not be
     // remembered. ---
     let dict_mark = symbol_dict.mark();
-    let resolution = match resolve_symbols(chunk, symbol_dict) {
-        Ok(r) => r,
+    let delta_start = match resolve_symbols(
+        chunk,
+        symbol_dict,
+        &mut scratch.new_symbols,
+        &mut scratch.per_column,
+    ) {
+        Ok(d) => d,
         Err(e) => {
             symbol_dict.rollback(dict_mark);
             return Err(e);
@@ -143,19 +172,23 @@ pub(crate) fn encode_chunk_into(
 
     // --- Schema signature ---
     let column_count = chunk.columns.len() + 1; // +1 for designated timestamp
-    let mut signature = Vec::with_capacity(column_count * 8);
+    scratch.signature.reserve(column_count * 8);
     for col in &chunk.columns {
-        write_qwp_bytes(&mut signature, col.name.as_bytes());
-        signature.push(col.wire_type);
+        write_qwp_bytes(&mut scratch.signature, col.name.as_bytes());
+        scratch.signature.push(col.wire_type);
     }
-    write_qwp_bytes(&mut signature, &[]); // designated_ts has empty name
-    signature.push(designated.wire_type);
+    write_qwp_bytes(&mut scratch.signature, &[]); // designated_ts has empty name
+    scratch.signature.push(designated.wire_type);
 
-    let (schema_id, is_new_schema) = schema_registry.intern(&signature);
+    let (schema_id, is_new_schema) = schema_registry.intern(&scratch.signature);
 
-    // --- Reserve total expected frame size up front. Avoids the
-    // geometric-growth memcpy pattern when the column data is large. ---
-    let estimated = estimate_frame_size(chunk, row_count, &signature, &resolution);
+    let estimated = estimate_frame_size(
+        chunk,
+        row_count,
+        &scratch.signature,
+        &scratch.new_symbols,
+        &scratch.per_column,
+    );
     out.reserve(estimated);
 
     // --- Reserve frame header placeholder ---
@@ -163,42 +196,43 @@ pub(crate) fn encode_chunk_into(
     write_header_placeholder(out, /* table_count = */ 1, defer_commit);
     let payload_start = out.len();
 
-    // --- Delta-symbol-dict prefix ---
-    write_qwp_varint(out, resolution.delta_start);
-    write_qwp_varint(out, resolution.new_symbols.len() as u64);
-    for bytes in &resolution.new_symbols {
+    write_qwp_varint(out, delta_start);
+    write_qwp_varint(out, scratch.new_symbols.len() as u64);
+    for bytes in &scratch.new_symbols {
         write_qwp_bytes(out, bytes);
     }
 
-    // --- Table block header ---
     write_qwp_bytes(out, table_bytes);
     write_qwp_varint(out, row_count as u64);
     write_qwp_varint(out, column_count as u64);
 
-    // --- Schema section ---
     if is_new_schema {
         out.push(QWP_SCHEMA_MODE_FULL);
         write_qwp_varint(out, schema_id);
-        out.extend_from_slice(&signature);
+        out.extend_from_slice(&scratch.signature);
     } else {
         out.push(QWP_SCHEMA_MODE_REFERENCE);
         write_qwp_varint(out, schema_id);
     }
 
-    // --- Column payloads ---
     for (col_idx, col) in chunk.columns.iter().enumerate() {
-        // SAFETY: caller buffers are required by Chunk's `'a` (or the
-        // FFI's documented contract) to outlive this call.
         unsafe {
-            encode_column(out, col, row_count, col_idx, &resolution)?;
+            encode_column(out, col, row_count, col_idx, &scratch.per_column)?;
         }
     }
 
     // --- Designated timestamp ---
     encode_designated_ts(out, designated, row_count);
 
-    // --- Patch payload_len ---
-    let payload_len = (out.len() - payload_start) as u32;
+    let payload_len_usize = out.len() - payload_start;
+    let payload_len = u32::try_from(payload_len_usize).map_err(|_| {
+        error::fmt!(
+            InvalidApiCall,
+            "QWP frame payload size {} bytes exceeds u32::MAX; \
+             split into smaller chunks",
+            payload_len_usize
+        )
+    })?;
     let header = &mut out[frame_start..payload_start];
     header[8..12].copy_from_slice(&payload_len.to_le_bytes());
 
@@ -213,12 +247,12 @@ fn estimate_frame_size(
     chunk: &Chunk<'_>,
     row_count: usize,
     signature: &[u8],
-    resolution: &SymbolResolution,
+    new_symbols: &[Vec<u8>],
+    _per_column: &[Option<ResolvedColumn>],
 ) -> usize {
     let mut total = QWP_HEADER_LEN;
-    // delta-symbol-dict prefix
     total += 10 + 10; // delta_start + new_symbols_count varints
-    for s in &resolution.new_symbols {
+    for s in new_symbols {
         total += 10 + s.len();
     }
     // table block header + schema section
@@ -246,9 +280,9 @@ fn estimate_frame_size(
             ColumnKind::Bool { .. } => bitmap_bytes,
             ColumnKind::Uuid { .. } => 16 * row_count,
             ColumnKind::Long256 { .. } => 32 * row_count,
-            ColumnKind::Varchar { bytes_len, .. } | ColumnKind::VarcharLarge { bytes_len, .. } => {
-                4 * (row_count + 1) + bytes_len
-            }
+            ColumnKind::Varchar { bytes_len, .. }
+            | ColumnKind::VarcharLarge { bytes_len, .. }
+            | ColumnKind::Binary { bytes_len, .. } => 4 * (row_count + 1) + bytes_len,
             ColumnKind::Symbol { .. } => 5 * row_count, // varint upper bound
             // Conservative upper bound covering the widest Arrow body
             // (Decimal256 = scale + 32 B/row, ARRAY DOUBLE per-row blob).
@@ -293,15 +327,6 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
 // Symbol resolution (pre-pass)
 // ===========================================================================
 
-struct SymbolResolution {
-    delta_start: u64,
-    new_symbols: Vec<Vec<u8>>,
-    /// One entry per column slot. `Some` for symbol-bearing columns;
-    /// the variant tracks which source (row-by-row vs Arrow) so the
-    /// encoder picks the matching emit path without re-classifying.
-    per_column: Vec<Option<ResolvedColumn>>,
-}
-
 pub(crate) enum ResolvedColumn {
     /// Row-by-row `ColumnKind::Symbol`: slot → global-id table plus
     /// the non-null row count used to size the dense varint output.
@@ -319,13 +344,19 @@ pub(crate) struct RowResolvedSymbol {
     pub(crate) non_null_count: usize,
 }
 
+/// Walk symbol columns, intern referenced entries against the
+/// connection-scoped global dict, and emit one [`ResolvedColumn`] per
+/// chunk column into `per_column` (length == `chunk.columns.len()`).
+/// Non-symbol columns push `None`. Returns the `delta_start` watermark
+/// the encoder writes into the frame's delta-dict prefix.
 fn resolve_symbols(
     chunk: &Chunk<'_>,
     symbol_dict: &mut SymbolGlobalDict,
-) -> Result<SymbolResolution> {
+    new_symbols: &mut Vec<Vec<u8>>,
+    per_column: &mut Vec<Option<ResolvedColumn>>,
+) -> Result<u64> {
     let delta_start = symbol_dict.next_id();
-    let mut new_symbols: Vec<Vec<u8>> = Vec::new();
-    let mut per_column: Vec<Option<ResolvedColumn>> = Vec::with_capacity(chunk.columns.len());
+    per_column.reserve(chunk.columns.len());
     let row_count = chunk.row_count();
 
     for col in &chunk.columns {
@@ -345,25 +376,19 @@ fn resolve_symbols(
                     if !is_valid_row(col.validity.as_ref(), i) {
                         continue;
                     }
-                    // SAFETY: codes ptr was validated to have row_count elements.
                     let slot = unsafe { codes.read_i64(i) } as usize;
                     referenced[slot] = true;
                     non_null_count += 1;
                 }
-                // The encoder reads `codes` directly at emit time —
-                // no compacted codes copy needed (~400 KB saved on a
-                // 100k-row chunk).
                 let mut local_to_global = vec![u64::MAX; dict_len];
                 for (slot, mark) in referenced.iter().enumerate() {
                     if !*mark {
                         continue;
                     }
-                    // SAFETY: pointers and monotonic in-buffer offsets
-                    // were validated at append time.
                     let start = unsafe { dict_offsets.read_i64(slot) } as usize;
                     let end = unsafe { dict_offsets.read_i64(slot + 1) } as usize;
                     let entry_bytes = &dict_bytes_slice[start..end];
-                    let (gid, is_new) = symbol_dict.intern(entry_bytes);
+                    let (gid, is_new) = symbol_dict.intern(entry_bytes)?;
                     if is_new {
                         new_symbols.push(entry_bytes.to_vec());
                     }
@@ -383,18 +408,14 @@ fn resolve_symbols(
                     arr.as_ref(),
                     arrow_kind,
                     symbol_dict,
-                    &mut new_symbols,
+                    new_symbols,
                 )?;
                 per_column.push(resolved.map(ResolvedColumn::Arrow));
             }
             _ => per_column.push(None),
         }
     }
-    Ok(SymbolResolution {
-        delta_start,
-        new_symbols,
-        per_column,
-    })
+    Ok(delta_start)
 }
 
 // ===========================================================================
@@ -408,7 +429,7 @@ unsafe fn encode_column(
     col: &ColumnDescriptor,
     row_count: usize,
     col_idx: usize,
-    resolution: &SymbolResolution,
+    per_column: &[Option<ResolvedColumn>],
 ) -> Result<()> {
     let validity = col.validity.as_ref();
     match col.kind {
@@ -479,10 +500,32 @@ unsafe fn encode_column(
                 validity,
             );
         },
+        ColumnKind::Binary {
+            offsets,
+            offsets_len,
+            bytes,
+            bytes_len,
+        } => unsafe {
+            encode_varchar(
+                out,
+                offsets,
+                offsets_len,
+                bytes,
+                bytes_len,
+                row_count,
+                validity,
+            );
+        },
         ColumnKind::Symbol { codes, .. } => {
-            let resolved = match resolution.per_column[col_idx].as_ref() {
+            let resolved = match per_column[col_idx].as_ref() {
                 Some(ResolvedColumn::Row(r)) => r,
-                _ => panic!("row-based symbol resolution missing for ColumnKind::Symbol"),
+                _ => {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "internal: row-based symbol resolution missing for ColumnKind::Symbol \
+                         at column index {col_idx}"
+                    ));
+                }
             };
             unsafe {
                 encode_symbol(out, codes, resolved, row_count, validity);
@@ -493,10 +536,14 @@ unsafe fn encode_column(
             arrow_kind,
             ref arr,
         } => {
-            let sym_res = match resolution.per_column.get(col_idx).and_then(Option::as_ref) {
+            let sym_res = match per_column.get(col_idx).and_then(Option::as_ref) {
                 Some(ResolvedColumn::Arrow(r)) => Some(r),
                 Some(ResolvedColumn::Row(_)) => {
-                    panic!("arrow symbol resolution missing for ArrowDeferred column")
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "internal: arrow symbol resolution missing for ArrowDeferred column \
+                         at column index {col_idx}"
+                    ));
                 }
                 None => None,
             };
@@ -840,12 +887,16 @@ unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescript
     let full_bytes = v.bit_len / 8;
     let trailing_bits = v.bit_len % 8;
     let src = unsafe { slice::from_raw_parts(v.bits, v.byte_len()) };
-    for &byte in &src[..full_bytes] {
-        out.push(!byte);
+    let bitmap_bytes = full_bytes + usize::from(trailing_bits != 0);
+    let dst_start = out.len();
+    out.resize(dst_start + bitmap_bytes, 0);
+    let dst = &mut out[dst_start..dst_start + bitmap_bytes];
+    for (d, &s) in dst[..full_bytes].iter_mut().zip(&src[..full_bytes]) {
+        *d = !s;
     }
     if trailing_bits != 0 {
         let mask = (1u8 << trailing_bits) - 1;
-        out.push((!src[full_bytes]) & mask);
+        dst[full_bytes] = (!src[full_bytes]) & mask;
     }
 }
 
@@ -871,7 +922,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
         out
     }
 
@@ -881,7 +933,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(out.len(), 14);
         assert_eq!(&out[0..4], b"QWP1");
         assert_eq!(out[5], QWP_FLAG_DELTA_SYMBOL_DICT);
@@ -894,7 +947,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, true).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, true).unwrap();
         assert_eq!(out[5] & QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DEFER_COMMIT);
         assert_eq!(
             out[5] & QWP_FLAG_DELTA_SYMBOL_DICT,
@@ -910,7 +964,9 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap_err();
+        let mut scratch = EncodeScratch::new();
+        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
+            .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("designated"));
     }
@@ -919,20 +975,21 @@ mod tests {
     fn second_encode_with_same_schema_uses_reference() {
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
 
         let p1 = [1i64, 2];
         let mut c1 = Chunk::new("trades");
         c1.column_i64("price", &p1, None).unwrap();
         c1.designated_timestamp_nanos(&p1).unwrap();
         let mut out1 = Vec::new();
-        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, false).unwrap();
+        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, &mut scratch, false).unwrap();
 
         let p2 = [3i64, 4];
         let mut c2 = Chunk::new("trades");
         c2.column_i64("price", &p2, None).unwrap();
         c2.designated_timestamp_nanos(&p2).unwrap();
         let mut out2 = Vec::new();
-        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, false).unwrap();
+        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, &mut scratch, false).unwrap();
 
         assert!(out2.len() < out1.len());
         assert_eq!(reg.len(), 1, "schema signature interned once");
@@ -946,12 +1003,13 @@ mod tests {
     fn distinct_schemas_get_distinct_ids() {
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
         let x = [1i64];
         let mut a = Chunk::new("a");
         a.column_i64("x", &x, None).unwrap();
         a.designated_timestamp_nanos(&x).unwrap();
         let mut oa = Vec::new();
-        encode_chunk_into(&mut oa, &a, &mut reg, &mut dict, false).unwrap();
+        encode_chunk_into(&mut oa, &a, &mut reg, &mut dict, &mut scratch, false).unwrap();
 
         let y = [1.0f64];
         let ts = [1i64];
@@ -959,7 +1017,7 @@ mod tests {
         b.column_f64("y", &y, None).unwrap();
         b.designated_timestamp_nanos(&ts).unwrap();
         let mut ob = Vec::new();
-        encode_chunk_into(&mut ob, &b, &mut reg, &mut dict, false).unwrap();
+        encode_chunk_into(&mut ob, &b, &mut reg, &mut dict, &mut scratch, false).unwrap();
 
         assert_eq!(reg.len(), 2);
     }
@@ -975,7 +1033,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
         assert!(out.len() > 32);
     }
 
@@ -993,7 +1052,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2, "alpha + gamma only, beta unsent");
     }
 
@@ -1011,7 +1071,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2, "alpha + gamma only, beta unsent");
     }
 
@@ -1019,6 +1080,7 @@ mod tests {
     fn symbol_dict_second_frame_resends_only_new_entries() {
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
         let dict_offsets = [0i32, 5, 9, 14];
         let dict_bytes = b"alphabetagamma";
 
@@ -1029,7 +1091,7 @@ mod tests {
             .unwrap();
         c1.designated_timestamp_nanos(&ts1).unwrap();
         let mut out1 = Vec::new();
-        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, false).unwrap();
+        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2);
 
         let codes2 = [0i32, 2];
@@ -1039,7 +1101,7 @@ mod tests {
             .unwrap();
         c2.designated_timestamp_nanos(&ts2).unwrap();
         let mut out2 = Vec::new();
-        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, false).unwrap();
+        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 3, "gamma added on second frame");
     }
 
@@ -1074,7 +1136,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
 
         assert_eq!(
             row_by_row, out,
@@ -1101,7 +1164,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
 
         assert_eq!(&out[..4], b"QWP1");
         assert_eq!(dict.next_id(), 2, "two unique symbols interned");
@@ -1136,8 +1200,10 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
         let prior_next = dict.next_id();
-        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap_err();
+        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
+            .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
         assert_eq!(
             dict.next_id(),

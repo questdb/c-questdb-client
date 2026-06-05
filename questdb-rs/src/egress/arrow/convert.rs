@@ -217,7 +217,7 @@ fn column_to_array(
 }
 
 fn primitive_array(buf: ColumnBuffer, row_count: usize, dtype: DataType) -> Result<ArrayRef> {
-    let nulls = buffer_null_buffer(&buf.validity, row_count)?;
+    let nulls = bytes_null_buffer(&buf.validity, row_count)?;
     let values = buffer_to_arrow(&buf.values);
     let data = ArrayDataBuilder::new(dtype)
         .len(row_count)
@@ -230,7 +230,7 @@ fn primitive_array(buf: ColumnBuffer, row_count: usize, dtype: DataType) -> Resu
 }
 
 fn decimal_array(buf: ColumnBuffer, row_count: usize, dtype: DataType) -> Result<ArrayRef> {
-    let nulls = buffer_null_buffer(&buf.validity, row_count)?;
+    let nulls = bytes_null_buffer(&buf.validity, row_count)?;
     let values = buffer_to_arrow(&buf.values);
     let data = ArrayDataBuilder::new(dtype.clone())
         .len(row_count)
@@ -248,7 +248,7 @@ fn decimal_array(buf: ColumnBuffer, row_count: usize, dtype: DataType) -> Result
 }
 
 fn timestamp_array(buf: ColumnBuffer, row_count: usize, unit: TimeUnit) -> Result<ArrayRef> {
-    let nulls = buffer_null_buffer(&buf.validity, row_count)?;
+    let nulls = bytes_null_buffer(&buf.validity, row_count)?;
     let values = buffer_to_arrow(&buf.values);
     let dtype = DataType::Timestamp(unit, Some(Arc::from("UTC")));
     let data = ArrayDataBuilder::new(dtype)
@@ -274,7 +274,7 @@ fn timestamp_array(buf: ColumnBuffer, row_count: usize, unit: TimeUnit) -> Resul
 }
 
 fn fixed_bytes_array(buf: ColumnBuffer, row_count: usize, n: i32) -> Result<ArrayRef> {
-    let nulls = buffer_null_buffer(&buf.validity, row_count)?;
+    let nulls = bytes_null_buffer(&buf.validity, row_count)?;
     let values = buffer_to_arrow(&buf.values);
     let data = ArrayDataBuilder::new(DataType::FixedSizeBinary(n))
         .len(row_count)
@@ -327,7 +327,7 @@ fn varlen_binary_array(
 }
 
 fn boolean_array(buf: ColumnBuffer, row_count: usize) -> Result<BooleanArray> {
-    let nulls = buffer_null_buffer(&buf.validity, row_count)?;
+    let nulls = bytes_null_buffer(&buf.validity, row_count)?;
     if buf.values.len() < row_count {
         return Err(fmt!(
             ProtocolError,
@@ -359,7 +359,7 @@ fn geohash_array(
     precision_bits: u8,
     row_count: usize,
 ) -> Result<ArrayRef> {
-    let nulls = buffer_null_buffer(&buf.validity, row_count)?;
+    let nulls = bytes_null_buffer(&buf.validity, row_count)?;
     let (dtype, target_width) = match precision_bits {
         1..=7 => (DataType::Int8, 1usize),
         8..=15 => (DataType::Int16, 2),
@@ -760,10 +760,6 @@ fn bytes_to_arrow(b: Bytes) -> Buffer {
 
 fn bytes_from_avec(v: ABytes) -> Bytes {
     Bytes::from_owner(v)
-}
-
-fn buffer_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Option<NullBuffer>> {
-    bytes_null_buffer(validity, row_count)
 }
 
 fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Option<NullBuffer>> {

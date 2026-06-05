@@ -37,6 +37,8 @@ pub(crate) use self::ilp::Buffer as IlpBuffer;
 #[allow(unused_imports)]
 pub(crate) use self::ilp::F64Serializer;
 
+#[cfg(all(feature = "_sender-qwp-ws", feature = "arrow"))]
+pub(crate) use self::qwp::QWP_DECIMAL_MAX_SCALE;
 #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
 pub(crate) use self::qwp::QwpBuffer;
 #[cfg(feature = "_sender-qwp-udp")]

@@ -48,9 +48,10 @@ use super::arrow_batch;
 use super::numpy_wire;
 use super::validity::{Validity, check_row_count};
 use super::wire::{
-    MAX_NAME_LEN, QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_DATE, QWP_TYPE_DOUBLE, QWP_TYPE_FLOAT,
-    QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT, QWP_TYPE_SYMBOL,
-    QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, QWP_TYPE_VARCHAR, validate_name,
+    MAX_NAME_LEN, QWP_TYPE_BINARY, QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_DATE, QWP_TYPE_DOUBLE,
+    QWP_TYPE_FLOAT, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT,
+    QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, QWP_TYPE_VARCHAR,
+    validate_name,
 };
 
 // ===========================================================================
@@ -157,6 +158,19 @@ pub(crate) enum ColumnKind {
     // overflow check (QWP's offset table is uint32 LE on the wire).
     VarcharLarge {
         offsets: *const i64,
+        /// row_count + 1
+        offsets_len: usize,
+        bytes: *const u8,
+        bytes_len: usize,
+    },
+
+    // ---- Variable-width bytes (BINARY) ----
+    //
+    // Same offsets + bytes layout as `Varchar`; differs only in the
+    // wire type byte (`QWP_TYPE_BINARY`) so the server creates a
+    // BINARY column. UTF-8 validation is not performed.
+    Binary {
+        offsets: *const i32,
         /// row_count + 1
         offsets_len: usize,
         bytes: *const u8,
@@ -292,14 +306,19 @@ impl<'a> Chunk<'a> {
         }
     }
 
+    /// Table name this chunk targets. Validated at flush time.
     pub fn table(&self) -> &str {
         &self.table
     }
 
+    /// Row count locked by the first appended column (or designated
+    /// timestamp). `0` when neither has been set.
     pub fn row_count(&self) -> usize {
         self.row_count.unwrap_or(0)
     }
 
+    /// `true` when the chunk has no appended columns and no designated
+    /// timestamp. Equivalent to "row count has not yet been locked".
     pub fn is_empty(&self) -> bool {
         self.row_count.is_none() && self.designated_ts.is_none()
     }
@@ -317,6 +336,8 @@ impl<'a> Chunk<'a> {
     // Numeric & fixed-width columns
     // -------------------------------------------------------------------
 
+    /// Append an `i8` column (QWP wire type `BYTE`). `validity` may
+    /// carry per-row null bits (Arrow shape: bit = 1 means VALID).
     pub fn column_i8(
         &mut self,
         name: &str,
@@ -335,6 +356,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append an `i16` column (QWP wire type `SHORT`).
     pub fn column_i16(
         &mut self,
         name: &str,
@@ -353,6 +375,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append an `i32` column (QWP wire type `INT`).
     pub fn column_i32(
         &mut self,
         name: &str,
@@ -371,6 +394,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append an `i64` column (QWP wire type `LONG`).
     pub fn column_i64(
         &mut self,
         name: &str,
@@ -389,6 +413,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append an `f32` column (QWP wire type `FLOAT`).
     pub fn column_f32(
         &mut self,
         name: &str,
@@ -407,6 +432,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append an `f64` column (QWP wire type `DOUBLE`).
     pub fn column_f64(
         &mut self,
         name: &str,
@@ -425,6 +451,11 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append a boolean column (QWP wire type `BOOLEAN`).
+    ///
+    /// `data` is an LSB-first bit-packed slice: bit `i` is row `i`'s
+    /// value (1 = true, 0 = false). At least `ceil(row_count / 8)`
+    /// bytes are required; the slice may be longer.
     pub fn column_bool(
         &mut self,
         name: &str,
@@ -458,6 +489,8 @@ impl<'a> Chunk<'a> {
     // Bitmap-style fixed-width columns
     // -------------------------------------------------------------------
 
+    /// Append a UUID column (QWP wire type `UUID`). Each row is 16
+    /// bytes in canonical big-endian Arrow layout.
     pub fn column_uuid(
         &mut self,
         name: &str,
@@ -476,6 +509,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append a LONG256 column (QWP wire type `LONG256`). Each row is
+    /// 32 bytes in little-endian limb order.
     pub fn column_long256(
         &mut self,
         name: &str,
@@ -494,6 +529,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append an IPv4 column (QWP wire type `IPV4`). Each row is the
+    /// 32-bit address in host byte order.
     pub fn column_ipv4(
         &mut self,
         name: &str,
@@ -512,6 +549,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append a timestamp column with nanosecond precision (QWP wire
+    /// type `TIMESTAMP_NANOS`). Values are Unix epoch nanoseconds.
     pub fn column_ts_nanos(
         &mut self,
         name: &str,
@@ -530,6 +569,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append a timestamp column with microsecond precision (QWP wire
+    /// type `TIMESTAMP`). Values are Unix epoch microseconds.
     pub fn column_ts_micros(
         &mut self,
         name: &str,
@@ -548,6 +589,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append a date column with millisecond precision (QWP wire type
+    /// `DATE`). Values are Unix epoch milliseconds.
     pub fn column_date_millis(
         &mut self,
         name: &str,
@@ -570,6 +613,10 @@ impl<'a> Chunk<'a> {
     // VARCHAR
     // -------------------------------------------------------------------
 
+    /// Append a VARCHAR column from Arrow Utf8 layout (QWP wire type
+    /// `VARCHAR`). `offsets` is `i32` with `row_count + 1` entries
+    /// (monotonic, non-negative, last ≤ `bytes.len()`); `bytes` is the
+    /// concatenated UTF-8 buffer.
     pub fn column_varchar(
         &mut self,
         name: &str,
@@ -638,10 +685,49 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Append a BINARY column. Same offsets + bytes layout as
+    /// [`column_varchar`]; the encoder writes the column with wire type
+    /// `QWP_TYPE_BINARY` instead of `QWP_TYPE_VARCHAR`. No UTF-8
+    /// validation is performed.
+    pub fn column_binary(
+        &mut self,
+        name: &str,
+        offsets: &'a [i32],
+        bytes: &'a [u8],
+        validity: Option<&Validity<'a>>,
+    ) -> Result<&mut Self> {
+        if offsets.is_empty() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "BINARY offsets must have at least one entry (row_count + 1)"
+            ));
+        }
+        let row_count = offsets.len() - 1;
+        let row_count = check_row_count(self.row_count, row_count, validity)?;
+        validate_varchar_offsets(offsets, bytes.len())?;
+        self.push_column(
+            name,
+            QWP_TYPE_BINARY,
+            ColumnKind::Binary {
+                offsets: offsets.as_ptr(),
+                offsets_len: offsets.len(),
+                bytes: bytes.as_ptr(),
+                bytes_len: bytes.len(),
+            },
+            validity,
+            row_count,
+        )
+    }
+
     // -------------------------------------------------------------------
     // Symbol
     // -------------------------------------------------------------------
 
+    /// Append a SYMBOL column whose per-row codes are `i8` indices into
+    /// a dictionary defined by (`dict_offsets`, `dict_bytes`) in Arrow
+    /// Utf8 layout. Wire type is `SYMBOL`; the encoder interns each
+    /// referenced dictionary entry against the connection-scoped
+    /// `SymbolGlobalDict` at flush time.
     pub fn symbol_dict_i8(
         &mut self,
         name: &str,
@@ -661,6 +747,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Same as [`symbol_dict_i8`](Self::symbol_dict_i8) but with `i16` codes.
     pub fn symbol_dict_i16(
         &mut self,
         name: &str,
@@ -680,6 +767,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Same as [`symbol_dict_i8`](Self::symbol_dict_i8) but with `i32` codes.
     pub fn symbol_dict_i32(
         &mut self,
         name: &str,
@@ -699,6 +787,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Same as [`symbol_dict_i8`](Self::symbol_dict_i8) but the dictionary
+    /// uses Arrow LargeUtf8 layout (`i64` offsets).
     pub fn symbol_dict_large_i8(
         &mut self,
         name: &str,
@@ -718,6 +808,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Same as [`symbol_dict_i16`](Self::symbol_dict_i16) but the dictionary
+    /// uses Arrow LargeUtf8 layout (`i64` offsets).
     pub fn symbol_dict_large_i16(
         &mut self,
         name: &str,
@@ -737,6 +829,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
+    /// Same as [`symbol_dict_i32`](Self::symbol_dict_i32) but the dictionary
+    /// uses Arrow LargeUtf8 layout (`i64` offsets).
     pub fn symbol_dict_large_i32(
         &mut self,
         name: &str,
@@ -871,10 +965,17 @@ impl<'a> Chunk<'a> {
     // Designated timestamp
     // -------------------------------------------------------------------
 
+    /// Pin the chunk's designated timestamp from a microsecond-precision
+    /// Unix epoch column (QWP wire type `TIMESTAMP`). Required before
+    /// flushing a non-empty chunk; rejects if a designated timestamp has
+    /// already been set on this chunk.
     pub fn designated_timestamp_micros(&mut self, data: &'a [i64]) -> Result<&mut Self> {
         self.set_designated_ts(QWP_TYPE_TIMESTAMP, data)
     }
 
+    /// Same as [`designated_timestamp_micros`](Self::designated_timestamp_micros)
+    /// but for a nanosecond-precision Unix epoch column (QWP wire type
+    /// `TIMESTAMP_NANOS`).
     pub fn designated_timestamp_nanos(&mut self, data: &'a [i64]) -> Result<&mut Self> {
         self.set_designated_ts(QWP_TYPE_TIMESTAMP_NANOS, data)
     }

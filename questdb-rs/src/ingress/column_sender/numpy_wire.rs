@@ -949,12 +949,16 @@ unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescript
     let full_bytes = v.bit_len / 8;
     let trailing_bits = v.bit_len % 8;
     let src = unsafe { slice::from_raw_parts(v.bits, v.byte_len()) };
-    for &byte in &src[..full_bytes] {
-        out.push(!byte);
+    let bitmap_bytes = full_bytes + usize::from(trailing_bits != 0);
+    let dst_start = out.len();
+    out.resize(dst_start + bitmap_bytes, 0);
+    let dst = &mut out[dst_start..dst_start + bitmap_bytes];
+    for (d, &s) in dst[..full_bytes].iter_mut().zip(&src[..full_bytes]) {
+        *d = !s;
     }
     if trailing_bits != 0 {
         let mask = (1u8 << trailing_bits) - 1;
-        out.push((!src[full_bytes]) & mask);
+        dst[full_bytes] = (!src[full_bytes]) & mask;
     }
 }
 
@@ -962,7 +966,7 @@ unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescript
 mod tests {
     use super::super::Validity;
     use super::super::chunk::Chunk;
-    use super::super::encoder::{SchemaRegistry, encode_chunk_into};
+    use super::super::encoder::{EncodeScratch, SchemaRegistry, encode_chunk_into};
     use super::*;
     use crate::ingress::buffer::SymbolGlobalDict;
 
@@ -970,7 +974,8 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_chunk_into(&mut out, chunk, &mut reg, &mut dict, false).unwrap();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
         out
     }
 
@@ -1291,7 +1296,9 @@ mod tests {
             let mut out = Vec::new();
             let mut reg = SchemaRegistry::new();
             let mut dict = SymbolGlobalDict::new();
-            encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap_err()
+            let mut scratch = EncodeScratch::new();
+            encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
+                .unwrap_err()
         };
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("overflows"));
@@ -1319,7 +1326,9 @@ mod tests {
             let mut out = Vec::new();
             let mut reg = SchemaRegistry::new();
             let mut dict = SymbolGlobalDict::new();
-            encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, false).unwrap_err()
+            let mut scratch = EncodeScratch::new();
+            encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
+                .unwrap_err()
         };
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("overflows"));

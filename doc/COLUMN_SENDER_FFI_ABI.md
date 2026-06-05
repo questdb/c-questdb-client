@@ -41,11 +41,11 @@ by this ABI. They are not API design choices.
 |--------------------------------|----------------------------------------|----------------------------------------------------------|
 | Max batch (frame) size         | 16 MiB protocol ceiling; effectively `min(server recv buf − 14, 16 MiB)` advertised on upgrade via `X-QWP-Max-Batch-Size` | `column_sender_flush` returns an error if the encoded frame exceeds the negotiated cap. |
 | Max tables per connection      | 10,000                                 | Server-enforced; client surfaces server rejections.       |
-| Max rows per table block       | 1,000,000                              | `column_sender_chunk_*` calls fail if `row_count` exceeds. |
+| Max rows per Arrow batch       | 16,777,216 (`MAX_ARROW_INGEST_ROWS`)   | `column_sender_flush_arrow_batch*` returns `line_sender_error_arrow_ingest` if `row_count` exceeds. The chunk path's row count is bounded only by `max_buf_size` at encode time. |
 | Max columns per table          | 2,048                                  | `column_sender_chunk_column_*` fails after the 2048th column. |
 | Max table / column name length | 127 bytes UTF-8                        | Rejected at name validation.                              |
 | Max in-flight batches          | 128                                    | Deferred flushes reserve one slot for `column_sender_sync`; flush returns back-pressure when the reserve would be exhausted. |
-| Max symbol dictionary entries  | 1,000,000 per connection               | Server returns `PARSE_ERROR`; surfaced as `line_sender_error_server_rejection`. |
+| Max symbol dictionary entries  | 8,388,608 per connection (`MAX_CONN_SYMBOL_DICT_SIZE`) | Client-side cap (mirrors Java reference client). Exceeding it returns `line_sender_error_invalid_api_call`; reconnect to reset both client and server dictionaries. |
 
 The wire pins protocol version 1; clients advertise
 `X-QWP-Max-Version: 1`.

@@ -97,7 +97,10 @@ struct DbInner {
 
 #[derive(Default)]
 struct PoolState {
-    /// Idle connections, oldest-first (FIFO push/pop from the back).
+    /// Idle connections. Borrow/return is LIFO on the back (push/pop);
+    /// the reaper drains the oldest entries from the front. Keeps hot
+    /// connections warm in the common case while the reaper still
+    /// retires entries in age order.
     free: Vec<PoolEntry>,
     /// Sum of currently-borrowed senders + in-flight grow operations.
     in_use: usize,
@@ -121,6 +124,10 @@ struct PoolEntry {
     /// argument: the server tracks ids by first-emit order over the life
     /// of the WS connection, so the dict must travel with the slot.
     symbol_dict: crate::ingress::buffer::SymbolGlobalDict,
+    /// Reusable encode scratch (signature, new-symbols, per-column
+    /// resolution). Carried across borrow/return so its allocated
+    /// capacity survives.
+    scratch: super::encoder::EncodeScratch,
     last_idle_at: Instant,
 }
 
@@ -188,6 +195,7 @@ impl QuestDb {
                 conn,
                 schema_registry: super::encoder::SchemaRegistry::new(),
                 symbol_dict: crate::ingress::buffer::SymbolGlobalDict::new(),
+                scratch: super::encoder::EncodeScratch::new(),
                 last_idle_at: now,
             });
         }
@@ -249,6 +257,7 @@ impl QuestDb {
                 entry.conn,
                 entry.schema_registry,
                 entry.symbol_dict,
+                entry.scratch,
             ));
         }
 
@@ -280,6 +289,7 @@ impl QuestDb {
             conn,
             super::encoder::SchemaRegistry::new(),
             crate::ingress::buffer::SymbolGlobalDict::new(),
+            super::encoder::EncodeScratch::new(),
         ))
     }
 
@@ -633,6 +643,7 @@ impl ReaderPoolHandle {
 
 #[cfg(feature = "_egress")]
 fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool) {
+    let must_close = must_close || reader.transport_torn_down();
     let mut state = inner
         .reader_state
         .lock()
@@ -644,8 +655,6 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
             last_idle_at: Instant::now(),
         });
     }
-    // When must_close, `reader` is dropped here under the lock — safe
-    // since Reader::drop does not re-enter the pool.
     drop(state);
 }
 
@@ -658,6 +667,7 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
             conn: sender.conn,
             schema_registry: sender.schema_registry,
             symbol_dict: sender.symbol_dict,
+            scratch: sender.scratch,
             last_idle_at: Instant::now(),
         });
     }
@@ -686,18 +696,23 @@ fn reaper_tick(idle_timeout: Duration) -> Duration {
 
 fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
     loop {
+        // Check shutdown WHILE holding the lock so a concurrent Drop's
+        // notify-under-lock is never lost: Drop sets `shutdown` then
+        // acquires the same lock to notify, so either we observe
+        // `shutdown=true` before sleeping or we are sleeping when the
+        // notify arrives.
+        let state = inner.state.lock().expect("pool mutex poisoned");
         if inner.shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let state = inner.state.lock().expect("pool mutex poisoned");
         let (state, _) = inner
             .cv
             .wait_timeout(state, tick)
             .expect("pool mutex poisoned");
-        drop(state);
         if inner.shutdown.load(Ordering::SeqCst) {
             break;
         }
+        drop(state);
         reap_idle_inner(&inner);
     }
 }

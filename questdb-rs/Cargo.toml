@@ -196,7 +196,7 @@ compression-zstd = ["_egress", "dep:zstd"]
 ## See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
 arrow = [
     "sync-reader-ws",
-    "_sender-qwp-ws",
+    "sync-sender-qwp-ws",
     "dep:arrow",
     "dep:arrow-array",
     "dep:arrow-schema",
@@ -207,7 +207,7 @@ arrow = [
 ]
 
 ## Polars sub-feature. ~30 lines of wrappers on top of `arrow`.
-polars = ["arrow", "sync-reader-ws", "dep:polars", "dep:polars-arrow"]
+polars = ["arrow", "sync-sender-qwp-ws", "sync-reader-ws", "dep:polars", "dep:polars-arrow"]
 
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at

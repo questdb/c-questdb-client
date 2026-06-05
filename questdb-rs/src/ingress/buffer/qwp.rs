@@ -3594,7 +3594,7 @@ impl QwpWsColumnarBuffer {
                     for entry in dict {
                         let bytes =
                             &data[entry.offset as usize..(entry.offset + entry.len) as usize];
-                        let (gid, _) = global_dict.intern(bytes);
+                        let (gid, _) = global_dict.intern(bytes)?;
                         highest_referenced_symbol_id = Some(
                             highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
                         );
@@ -5070,6 +5070,9 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 /// WebSocket connection. New symbols added during a flush are recorded in the
 /// per-message delta section so the server can rebuild the same global
 /// dictionary; on reconnect both sides reset.
+///
+/// Capped at [`MAX_CONN_SYMBOL_DICT_SIZE`] to mirror the server's
+/// connection-scoped dictionary ceiling and the Java reference client.
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Default)]
 pub(crate) struct SymbolGlobalDict {
@@ -5077,6 +5080,14 @@ pub(crate) struct SymbolGlobalDict {
     entries: Vec<Vec<u8>>,
     next_id: u64,
 }
+
+/// Per-connection cap on the QWP/WS global symbol dictionary. Matches
+/// `MAX_CONN_DICT_SIZE` in the egress reader (`egress/symbol_dict.rs`)
+/// and the Java reference client. When the cap is reached the encoder
+/// surfaces an `InvalidApiCall` error and the caller is expected to
+/// reconnect (which resets both sides).
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 8_388_608;
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
@@ -5128,17 +5139,26 @@ impl SymbolGlobalDict {
         self.entries.get(index).map(Vec::as_slice)
     }
 
-    /// Returns `(global_id, is_new)`.
-    pub(crate) fn intern(&mut self, bytes: &[u8]) -> (u64, bool) {
+    /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if
+    /// the dictionary has reached [`MAX_CONN_SYMBOL_DICT_SIZE`].
+    pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
         if let Some(&id) = self.map.get(bytes) {
-            return (id, false);
+            return Ok((id, false));
+        }
+        if self.entries.len() >= MAX_CONN_SYMBOL_DICT_SIZE {
+            return Err(crate::error::fmt!(
+                InvalidApiCall,
+                "QWP/WS connection-scoped symbol dictionary reached its \
+                 {MAX_CONN_SYMBOL_DICT_SIZE}-entry cap; drop and reopen \
+                 the connection to reset the dictionary"
+            ));
         }
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        self.next_id += 1;
         let owned = bytes.to_vec();
         self.entries.push(owned.clone());
         self.map.insert(owned, id);
-        (id, true)
+        Ok((id, true))
     }
 }
 
@@ -5291,7 +5311,7 @@ impl QwpBuffer {
                         let entry = &planner.symbol_dict[cursor as usize];
                         let range = entry.value.0.as_range();
                         let bytes = &self.value_bytes[range.clone()];
-                        let (gid, is_new) = global_dict.intern(bytes);
+                        let (gid, is_new) = global_dict.intern(bytes)?;
                         globals_for_col.push(gid);
                         if is_new {
                             new_symbol_ranges.push(range);
@@ -5429,7 +5449,7 @@ impl QwpBuffer {
                         let entry = &planner.symbol_dict[cursor as usize];
                         let range = entry.value.0.as_range();
                         let bytes = &self.value_bytes[range];
-                        let (gid, _) = global_dict.intern(bytes);
+                        let (gid, _) = global_dict.intern(bytes)?;
                         highest_referenced_symbol_id = Some(
                             highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
                         );

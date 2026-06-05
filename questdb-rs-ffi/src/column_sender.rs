@@ -63,7 +63,7 @@ pub struct qwpws_conn(OwnedSender);
 ///
 /// Holds raw pointers into caller buffers (no copy). Per the FFI ABI
 /// doc §2.3, the caller MUST keep every column buffer passed in via
-/// `column_sender_chunk_column_*` / `column_sender_chunk_symbol_dict_*`
+/// `column_sender_chunk_column_*` / `column_sender_chunk_append_*`
 /// alive until the next `column_sender_flush` call returns. We hide the
 /// chunk's lifetime by promoting its inner type to `'static`; the lifetime
 /// is enforced by the caller, not the borrow checker.
@@ -602,8 +602,6 @@ macro_rules! fixed_width_byte_column_fn {
                 }
                 return false;
             }
-            // SAFETY: the caller promises `data` points to `row_count *
-            // N` bytes (FFI-ABI §6) and that the buffer outlives the call.
             let data_slice: &[[u8; $n]] = if row_count == 0 {
                 &[]
             } else {
@@ -622,11 +620,7 @@ macro_rules! fixed_width_byte_column_fn {
     };
 }
 
-// `UUID` column. `data` is `row_count * 16` bytes; the FFI takes a
-// `uint8_t*` and slices it into 16-byte rows.
 fixed_width_byte_column_fn!(column_sender_chunk_column_uuid, 16, column_uuid, "uuid");
-
-// `LONG256` column. `data` is `row_count * 32` bytes.
 fixed_width_byte_column_fn!(
     column_sender_chunk_column_long256,
     32,
@@ -637,6 +631,63 @@ fixed_width_byte_column_fn!(
 // ===========================================================================
 // VARCHAR (variable-width text)
 // ===========================================================================
+
+/// `BINARY` column. Same `offsets` + `bytes` layout as
+/// `column_sender_chunk_column_varchar`; wire type byte differs so the
+/// server creates a BINARY column. No UTF-8 validation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_column_binary(
+    chunk: *mut column_sender_chunk,
+    name: *const c_char,
+    name_len: size_t,
+    offsets: *const i32,
+    bytes: *const u8,
+    bytes_len: size_t,
+    row_count: size_t,
+    validity: *const column_sender_validity,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let chunk = match unsafe { chunk.as_mut() } {
+        Some(c) => &mut c.0,
+        None => return reject_null_chunk(err_out),
+    };
+    let name = match unsafe { name_str(name, name_len, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let offsets_len = match row_count.checked_add(1) {
+        Some(n) => n,
+        None => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        "row_count overflow when computing offsets length".to_string(),
+                    ),
+                );
+            }
+            return false;
+        }
+    };
+    let offsets = match unsafe { typed_slice(offsets, offsets_len, err_out, "binary offsets") } {
+        Some(s) => s,
+        None => return false,
+    };
+    let bytes = match unsafe { typed_slice(bytes, bytes_len, err_out, "binary bytes") } {
+        Some(s) => s,
+        None => return false,
+    };
+    let validity = match unsafe { as_validity(validity, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    bubble!(
+        err_out,
+        chunk.column_binary(name, offsets, bytes, validity.as_ref())
+    );
+    true
+}
 
 /// `VARCHAR` column. Inputs are Arrow Utf8 shape: `offsets` length
 /// `row_count + 1`, monotonically non-decreasing; `bytes` is the
@@ -791,9 +842,12 @@ symbol_fn!(
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL);
 /// the chunk holds the underlying buffers via an internal Arc until
-/// `column_sender_flush` returns. On failure, `array->release` is
-/// untouched. `schema` is always borrowed; the caller retains
-/// `schema->release` in all cases.
+/// `column_sender_flush` returns. On failure, `array->release` may
+/// also have been consumed if the call reached the Arrow import step
+/// before failing — callers MUST check `array->release != NULL` before
+/// invoking it on the failure path. Early-fail paths (NULL pointer,
+/// depth-cap rejection) leave it intact. `schema` is borrowed in all
+/// cases.
 ///
 /// `array->offset` is honored (the Arrow C Data Interface logical
 /// offset); `row_offset` further sub-slices within the call.
@@ -1320,9 +1374,12 @@ pub unsafe extern "C" fn column_sender_flush(
 /// row on arrival. Use [`column_sender_flush_arrow_batch_at_column`] to
 /// source the timestamp from a `Timestamp(_)` column inside the batch.
 ///
-/// Ownership: on success, the consumer invokes `array->release` /
-/// `schema->release`; on failure, the caller retains ownership and may
-/// retry or free them.
+/// Ownership: on success, `array->release` is consumed (set to NULL)
+/// and the function has invoked it internally. On failure, `array->release`
+/// may also have been consumed if the call reached the Arrow import
+/// step before failing — callers MUST check `array->release != NULL`
+/// before invoking it on the failure path. `schema` is always
+/// borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[cfg(feature = "arrow")]

@@ -66,6 +66,7 @@ pub struct ColumnSender {
     pub(crate) conn: ColumnConn,
     pub(crate) schema_registry: SchemaRegistry,
     pub(crate) symbol_dict: SymbolGlobalDict,
+    pub(crate) scratch: encoder::EncodeScratch,
     /// The first frame is sent without `FLAG_DEFER_COMMIT` so the server
     /// commits it immediately. This lets the WAL segment roll and update
     /// `initialSymbolCount`, warming the server's `ClientSymbolCache` for
@@ -87,11 +88,13 @@ impl ColumnSender {
         conn: ColumnConn,
         schema_registry: SchemaRegistry,
         symbol_dict: SymbolGlobalDict,
+        scratch: encoder::EncodeScratch,
     ) -> Self {
         Self {
             conn,
             schema_registry,
             symbol_dict,
+            scratch,
             first_frame_sent: false,
         }
     }
@@ -221,9 +224,17 @@ impl ColumnSender {
 
         let schema = &mut self.schema_registry;
         let dict = &mut self.symbol_dict;
-        let published = self.conn.publish_qwp(|out| {
-            encoder::encode_chunk_into(out, chunk, schema, dict, defer_commit)
-        })?;
+        let scratch = &mut self.scratch;
+        let dict_mark = dict.mark();
+        let published = match self.conn.publish_qwp(|out| {
+            encoder::encode_chunk_into(out, chunk, schema, dict, scratch, defer_commit)
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                dict.rollback(dict_mark);
+                return Err(e);
+            }
+        };
 
         self.conn.push_pending(published.fsn);
         chunk.clear();

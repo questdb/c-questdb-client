@@ -306,6 +306,9 @@ private:
     friend class line_sender_buffer;
     friend class opts;
     friend class column_sender_conn;
+    friend class column_chunk;
+    friend class pool;
+    friend class borrowed_conn;
 
     template <
         typename T,

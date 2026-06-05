@@ -289,6 +289,11 @@ bool column_sender_chunk_column_f64(
 /**
  * `BOOLEAN` column. `data` is an Arrow-style LSB-first packed bitmap
  * (1 = true). `data` must point to at least `ceil(row_count / 8)` bytes.
+ *
+ * Lower-level building block for callers (typically a Python wrapper's
+ * PyObject sniff path) that already hold a packed bitmap with no Arrow
+ * schema. Arrow-backed bool columns should go through
+ * `column_sender_chunk_append_arrow_column`.
  */
 QUESTDB_CLIENT_API
 bool column_sender_chunk_column_bool(
@@ -405,6 +410,23 @@ bool column_sender_chunk_column_varchar(
     const column_sender_validity* validity,
     line_sender_error** err_out);
 
+/**
+ * `BINARY` column. Same Arrow-Binary-shape `offsets` + `bytes` layout as
+ * `column_sender_chunk_column_varchar`; differs only in the wire type
+ * byte so the server creates a BINARY column. No UTF-8 validation.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_chunk_column_binary(
+    column_sender_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    const int32_t* offsets,
+    const uint8_t* bytes,
+    size_t bytes_len,
+    size_t row_count,
+    const column_sender_validity* validity,
+    line_sender_error** err_out);
+
 /* -------------------------------------------------------------------------
  * Symbol columns (dictionary fast path)
  *
@@ -474,8 +496,12 @@ bool column_sender_chunk_symbol_dict_i32(
  *    holds the array's buffer lifetime via an internal Arc until
  *    `column_sender_flush` returns. The caller may free the
  *    `ArrowArray` struct shell immediately after this call returns.
- *  - On failure, `array->release` is left intact and the caller
- *    retains ownership.
+ *  - On failure, `array->release` may have been consumed (set to NULL)
+ *    if the function reached the Arrow import step before failing. The
+ *    underlying buffers are always released by the function in that
+ *    case. Callers MUST check `array->release != NULL` before invoking
+ *    it on the failure path. Early-fail paths (NULL pointer check,
+ *    schema/array depth-cap rejection) leave `array->release` intact.
  *  - `schema` is borrowed; the caller retains `schema->release` in
  *    all cases.
  *
@@ -573,9 +599,9 @@ bool column_sender_chunk_append_arrow_column(
  *     u32_ipv4     → IPV4
  *     u16_char     → CHAR
  *   Widen (single pass at flush):
- *     i8/i16/i32   → LONG (sign-extend)
- *     u8/u16/u32   → LONG (zero-extend)
- *     u64          → LONG (bit-reinterpret; values > i64::MAX wrap negative)
+ *     u8/u16       → INT   (zero-extend)
+ *     u32/u64      → LONG  (zero-extend / bit-reinterpret;
+ *                           u64 values > i64::MAX wrap negative)
  *     f32          → DOUBLE
  *     f16          → FLOAT
  *     datetime64[s] → TIMESTAMP (×10^6)
@@ -769,6 +795,16 @@ bool column_sender_sync(
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 
+/**
+ * Encode an Arrow C Data Interface `RecordBatch` (struct-typed
+ * `ArrowArray`) and publish it as one QWP frame.
+ *
+ * Ownership: same contract as `column_sender_chunk_append_arrow_column`
+ * — on success `array->release` is consumed (set to NULL); on failure
+ * it may also have been consumed. Callers MUST check
+ * `array->release != NULL` before invoking it on the failure path.
+ * `schema` is borrowed in all cases.
+ */
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch(
     qwpws_conn* conn,
@@ -777,6 +813,12 @@ bool column_sender_flush_arrow_batch(
     struct ArrowSchema* schema,
     line_sender_error** err_out);
 
+/**
+ * Same as `column_sender_flush_arrow_batch` but picks the designated
+ * timestamp from a named column of the batch instead of from
+ * `column_sender_chunk_designated_timestamp_*`. Same ownership
+ * contract.
+ */
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch_at_column(
     qwpws_conn* conn,

@@ -340,13 +340,14 @@ impl ColumnConn {
     }
 
     /// Dispatch a parsed QWP response: validate OK sequence, update
-    /// in-flight tracking, absorb durable watermarks, latch on error.
+    /// in-flight tracking, absorb durable watermarks (DurableAck only),
+    /// latch on error.
     fn process_response(&mut self, response: QwpResponse) -> Result<()> {
         match response {
-            QwpResponse::Ok { sequence, tables } => {
-                // The server sends cumulative OKs: sequence=N means all
-                // frames up to and including N are committed. Pop every
-                // pending entry whose fsn <= sequence.
+            QwpResponse::Ok {
+                sequence,
+                tables: _,
+            } => {
                 let mut popped = 0u32;
                 while let Some(front) = self.pending_acks.front() {
                     if front.fsn > sequence {
@@ -364,16 +365,6 @@ impl ColumnConn {
                     )));
                 }
                 self.in_flight -= popped;
-                for (t, seq_txn) in tables {
-                    self.durable_watermarks
-                        .entry(t)
-                        .and_modify(|w| {
-                            if seq_txn > *w {
-                                *w = seq_txn;
-                            }
-                        })
-                        .or_insert(seq_txn);
-                }
                 Ok(())
             }
             QwpResponse::DurableAck { tables } => {

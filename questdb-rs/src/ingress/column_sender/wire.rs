@@ -67,7 +67,6 @@ pub(crate) const QWP_TYPE_DECIMAL64: u8 = 0x13;
 pub(crate) const QWP_TYPE_DECIMAL128: u8 = 0x14;
 pub(crate) const QWP_TYPE_DECIMAL256: u8 = 0x15;
 pub(crate) const QWP_TYPE_CHAR: u8 = 0x16;
-#[cfg(feature = "arrow")]
 pub(crate) const QWP_TYPE_BINARY: u8 = 0x17;
 pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
 

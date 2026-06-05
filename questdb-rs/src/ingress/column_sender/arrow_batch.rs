@@ -63,8 +63,9 @@ use super::wire::{
 };
 
 const MAX_ARROW_INGEST_ROWS: usize = 16 * 1024 * 1024;
-const QWP_DECIMAL_MAX_SCALE: u8 = 76;
 const COLUMN_ERR_PREFIX: &str = "[column='";
+
+use crate::ingress::buffer::QWP_DECIMAL_MAX_SCALE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DictKey {
@@ -445,31 +446,39 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
     let src = nulls.inner().values();
     let full_bytes = bits / 8;
     let trailing_bits = bits % 8;
+    let dst_start = out.len();
+    out.resize(dst_start + total_bytes, 0);
+    let dst = &mut out[dst_start..dst_start + total_bytes];
     if arrow_offset.is_multiple_of(8) {
         let src_off = arrow_offset / 8;
-        for i in 0..full_bytes {
-            out.push(!src[src_off + i]);
+        for (d, &s) in dst[..full_bytes]
+            .iter_mut()
+            .zip(&src[src_off..src_off + full_bytes])
+        {
+            *d = !s;
         }
         if trailing_bits != 0 {
             let mask = (1u8 << trailing_bits) - 1;
-            out.push((!src[src_off + full_bytes]) & mask);
+            dst[full_bytes] = (!src[src_off + full_bytes]) & mask;
         }
     } else {
-        let mut packed = 0u8;
         let mut bit_idx = 0u8;
+        let mut byte_idx = 0usize;
+        let mut packed = 0u8;
         for i in 0..bits {
             if !nulls.is_valid(i) {
                 packed |= 1u8 << bit_idx;
             }
             bit_idx += 1;
             if bit_idx == 8 {
-                out.push(packed);
+                dst[byte_idx] = packed;
+                byte_idx += 1;
                 packed = 0;
                 bit_idx = 0;
             }
         }
         if bit_idx != 0 {
-            out.push(packed);
+            dst[byte_idx] = packed;
         }
     }
     Ok(())
@@ -1642,7 +1651,7 @@ fn resolve_symbol_strings<S: StrSource>(
             continue;
         }
         let bytes = source.value_bytes(row);
-        let (gid, is_new) = symbol_dict.intern(bytes);
+        let (gid, is_new) = symbol_dict.intern(bytes)?;
         if is_new {
             new_symbols.push(bytes.to_vec());
         }
@@ -1714,7 +1723,7 @@ fn resolve_symbol_dict(
                 ));
             }
             let bytes = get_value_bytes(values_typed, slot);
-            let (gid, is_new) = symbol_dict.intern(bytes);
+            let (gid, is_new) = symbol_dict.intern(bytes)?;
             if is_new {
                 new_symbols.push(bytes.to_vec());
             }
@@ -2620,7 +2629,22 @@ pub(crate) fn encode_arrow_batch_into(
         }
     }
 
-    let payload_len = (out.len() - payload_start) as u32;
+    let payload_len_usize = out.len() - payload_start;
+    let payload_len = match u32::try_from(payload_len_usize) {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(rollback_on_err(
+                out,
+                symbol_dict,
+                fmt!(
+                    ArrowIngest,
+                    "QWP frame payload size {} bytes exceeds u32::MAX; \
+                     reduce row_count or split into multiple batches",
+                    payload_len_usize
+                ),
+            ));
+        }
+    };
     let header = &mut out[frame_start..payload_start];
     header[8..12].copy_from_slice(&payload_len.to_le_bytes());
 
