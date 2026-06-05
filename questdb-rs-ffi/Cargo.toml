@@ -74,3 +74,9 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false

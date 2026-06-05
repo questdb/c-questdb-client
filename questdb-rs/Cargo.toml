@@ -330,3 +330,9 @@ required-features = ["sync-reader-ws"]
 name = "column_sender"
 harness = false
 required-features = ["sync-sender-qwp-ws"]
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
