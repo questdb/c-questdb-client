@@ -7,6 +7,10 @@ steps:
       df -h /
     condition: eq(variables['imageName'], 'ubuntu-latest')
     displayName: "Free disk space (Microsoft-hosted ubuntu)"
+  - bash: |
+      echo "##vso[task.setvariable variable=CARGO_INCREMENTAL]0"
+    condition: eq(variables['imageName'], 'ubuntu-latest')
+    displayName: "Disable cargo incremental on Linux (saves ~30-50% target/ size)"
   - script: |
       rustup update $(toolchain)
       rustup default $(toolchain)
