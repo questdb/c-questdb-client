@@ -38,11 +38,11 @@ use std::str;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use questdb::ingress::MAX_ARRAY_DIMS;
-#[cfg(feature = "arrow")]
-use questdb::ingress::column_sender::ArrowColumnOverride;
 use questdb::ingress::column_sender::{
     AckLevel, Chunk, NumpyDtype, OwnedSender, QuestDb, Validity,
 };
+#[cfg(feature = "arrow")]
+use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
 use questdb::{Error, ErrorCode};
 
 #[cfg(feature = "arrow")]
@@ -84,6 +84,13 @@ pub struct qwpws_conn(OwnedSender, AtomicU32);
 /// misbehaving caller observes `InvalidApiCall` rather than UAF.
 pub struct column_sender_chunk(Chunk<'static>, AtomicU32);
 
+/// Imported Arrow column for repeated chunk appends.
+///
+/// **Not thread-safe.** Python owns this per-plan and uses it from one thread.
+/// The latch rejects concurrent append/free on the FFI surface.
+#[cfg(feature = "arrow")]
+pub struct column_sender_arrow_import(ImportedArrowColumn, AtomicU32);
+
 const LATCH_IN_USE: u32 = 1 << 0;
 const LATCH_CLOSED: u32 = 1 << 1;
 const LATCH_DROP: u32 = 1 << 2;
@@ -93,6 +100,11 @@ trait FfiHandle {
 }
 
 impl FfiHandle for column_sender_chunk {
+    unsafe fn on_deferred_close(_handle: *mut Self, _latch_prev: u32) {}
+}
+
+#[cfg(feature = "arrow")]
+impl FfiHandle for column_sender_arrow_import {
     unsafe fn on_deferred_close(_handle: *mut Self, _latch_prev: u32) {}
 }
 
@@ -1121,6 +1133,99 @@ symbol_fn!(
 // ===========================================================================
 // Generic Arrow column appender
 // ===========================================================================
+
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_arrow_import_new(
+    array: *mut ArrowArray,
+    schema: *const ArrowSchema,
+    err_out: *mut *mut line_sender_error,
+) -> *mut column_sender_arrow_import {
+    let ffi_array = array as *mut arrow::ffi::FFI_ArrowArray;
+    let ffi_schema = schema as *const arrow::ffi::FFI_ArrowSchema;
+    let imported = match unsafe {
+        crate::arrow_ffi_import_column(
+            ffi_array,
+            ffi_schema,
+            "column_sender_arrow_import_new",
+            err_out,
+        )
+    } {
+        Some(imported) => imported,
+        None => return std::ptr::null_mut(),
+    };
+    Box::into_raw(Box::new(column_sender_arrow_import(
+        imported,
+        AtomicU32::new(0),
+    )))
+}
+
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_arrow_import_free(
+    imported: *mut column_sender_arrow_import,
+) {
+    if imported.is_null() {
+        return;
+    }
+    let state: *const AtomicU32 = unsafe { &raw const (*imported).1 };
+    unsafe { finalize_or_defer(imported, state, 0) };
+}
+
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_append_arrow_import(
+    chunk: *mut column_sender_chunk,
+    name: *const c_char,
+    name_len: size_t,
+    imported: *const column_sender_arrow_import,
+    row_offset: size_t,
+    row_count: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    if imported.is_null() {
+        return reject_null_arrow_import(err_out);
+    }
+    let imported_mut = imported as *mut column_sender_arrow_import;
+    let _import_guard = match unsafe {
+        InUseGuard::acquire(
+            imported_mut,
+            &raw const (*imported_mut).1,
+            "column_sender_chunk_append_arrow_import",
+            "column_sender_arrow_import",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let _chunk_guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_append_arrow_import",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let name = match unsafe { name_str(name, name_len, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    let imported_ref = unsafe { &(*imported).0 };
+    bubble!(
+        err_out,
+        inner.push_imported_arrow_slice(name, imported_ref, row_offset, row_count)
+    );
+    true
+}
 
 /// Append a slice of one column from an Arrow C Data Interface array.
 /// Routes through the same encoding infrastructure as
@@ -2211,6 +2316,20 @@ fn reject_null_chunk(err_out: *mut *mut line_sender_error) -> bool {
     false
 }
 
+#[cfg(feature = "arrow")]
+fn reject_null_arrow_import(err_out: *mut *mut line_sender_error) -> bool {
+    unsafe {
+        set_err_out_from_error(
+            err_out,
+            Error::new(
+                ErrorCode::InvalidApiCall,
+                "column_sender_arrow_import pointer is NULL".to_string(),
+            ),
+        );
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2221,6 +2340,15 @@ mod tests {
     // Most behaviour is already covered by the questdb-rs lib tests; this
     // module's tests focus on the FFI surface — pointer handling, NULL
     // guards, lifetime of error objects, etc.
+
+    #[cfg(feature = "arrow")]
+    unsafe extern "C" fn noop_release_array(array: *mut ArrowArray) {
+        if !array.is_null() {
+            unsafe {
+                (*array).release = None;
+            }
+        }
+    }
 
     #[test]
     fn connect_rejects_non_qwp_ws_schema() {
@@ -2408,7 +2536,7 @@ mod tests {
             buffers: dict_buffers.as_ptr(),
             children: std::ptr::null(),
             dictionary: std::ptr::null_mut(),
-            release: None,
+            release: Some(noop_release_array),
             private_data: std::ptr::null_mut(),
         };
         let mut array = ArrowArray {
@@ -2420,7 +2548,7 @@ mod tests {
             buffers: array_buffers.as_ptr(),
             children: std::ptr::null(),
             dictionary: &mut dict_array,
-            release: None,
+            release: Some(noop_release_array),
             private_data: std::ptr::null_mut(),
         };
 
@@ -2441,6 +2569,140 @@ mod tests {
         assert!(err.is_null());
         assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, codes.len());
         unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn arrow_import_append_twice_after_clear() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        let value_format = b"U\0";
+        let schema = ArrowSchema {
+            format: value_format.as_ptr() as *const c_char,
+            name: std::ptr::null(),
+            metadata: std::ptr::null(),
+            flags: 0,
+            n_children: 0,
+            children: std::ptr::null(),
+            dictionary: std::ptr::null_mut(),
+            release: None,
+            private_data: std::ptr::null_mut(),
+        };
+        let offsets = [0i64, 5, 9, 14];
+        let bytes = b"alphabetagamma";
+        let buffers = [
+            std::ptr::null(),
+            offsets.as_ptr() as *const c_void,
+            bytes.as_ptr() as *const c_void,
+        ];
+        let mut array = ArrowArray {
+            length: 3,
+            null_count: 0,
+            offset: 0,
+            n_buffers: 3,
+            n_children: 0,
+            buffers: buffers.as_ptr(),
+            children: std::ptr::null(),
+            dictionary: std::ptr::null_mut(),
+            release: Some(noop_release_array),
+            private_data: std::ptr::null_mut(),
+        };
+
+        let imported = unsafe { column_sender_arrow_import_new(&mut array, &schema, &mut err) };
+        assert!(!imported.is_null());
+        assert!(err.is_null());
+        assert!(array.release.is_none());
+
+        let name = b"sym";
+        let ok = unsafe {
+            column_sender_chunk_append_arrow_import(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                imported,
+                0,
+                2,
+                &mut err,
+            )
+        };
+        assert!(ok);
+        assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, 2);
+
+        unsafe { column_sender_chunk_clear(chunk) };
+        let ok = unsafe {
+            column_sender_chunk_append_arrow_import(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                imported,
+                1,
+                2,
+                &mut err,
+            )
+        };
+        assert!(ok);
+        assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, 2);
+
+        unsafe {
+            column_sender_arrow_import_free(imported);
+            column_sender_chunk_free(chunk);
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn arrow_import_rejects_double_import() {
+        let value_format = b"U\0";
+        let schema = ArrowSchema {
+            format: value_format.as_ptr() as *const c_char,
+            name: std::ptr::null(),
+            metadata: std::ptr::null(),
+            flags: 0,
+            n_children: 0,
+            children: std::ptr::null(),
+            dictionary: std::ptr::null_mut(),
+            release: None,
+            private_data: std::ptr::null_mut(),
+        };
+        let offsets = [0i64, 5];
+        let bytes = b"alpha";
+        let buffers = [
+            std::ptr::null(),
+            offsets.as_ptr() as *const c_void,
+            bytes.as_ptr() as *const c_void,
+        ];
+        let mut array = ArrowArray {
+            length: 1,
+            null_count: 0,
+            offset: 0,
+            n_buffers: 3,
+            n_children: 0,
+            buffers: buffers.as_ptr(),
+            children: std::ptr::null(),
+            dictionary: std::ptr::null_mut(),
+            release: Some(noop_release_array),
+            private_data: std::ptr::null_mut(),
+        };
+
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let imported = unsafe { column_sender_arrow_import_new(&mut array, &schema, &mut err) };
+        assert!(!imported.is_null());
+        assert!(err.is_null());
+        assert!(array.release.is_none());
+
+        let second = unsafe { column_sender_arrow_import_new(&mut array, &schema, &mut err) };
+        assert!(second.is_null());
+        assert!(!err.is_null());
+
+        unsafe {
+            line_sender_error_free(err);
+            column_sender_arrow_import_free(imported);
+        }
     }
 
     #[test]

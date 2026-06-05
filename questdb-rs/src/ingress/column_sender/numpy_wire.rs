@@ -340,9 +340,7 @@ pub(crate) unsafe fn emit_into_wire(
         D::U32WidenToI64 => unsafe {
             emit_widen_i64_sentinel::<u32>(out, data, row_count, validity, I64_NULL, |v| v as i64)
         },
-        D::U64WidenToI64 => unsafe {
-            emit_widen_i64_sentinel::<u64>(out, data, row_count, validity, I64_NULL, |v| v as i64)
-        },
+        D::U64WidenToI64 => unsafe { emit_u64_widen_i64_checked(out, data, row_count, validity)? },
 
         // ---- f32 sentinel FLOAT ----
         D::F32Direct => unsafe {
@@ -605,6 +603,50 @@ unsafe fn emit_widen_i64_sentinel<T>(
             }
         }
     }
+}
+
+#[inline]
+fn u64_to_i64_checked(v: u64, row: usize) -> Result<i64> {
+    if v > i64::MAX as u64 {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "u64 value {} at row {} does not fit QuestDB LONG (max i64::MAX)",
+            v,
+            row
+        ));
+    }
+    Ok(v as i64)
+}
+
+unsafe fn emit_u64_widen_i64_checked(
+    out: &mut Vec<u8>,
+    data: *const u8,
+    row_count: usize,
+    validity: Option<&ValidityDescriptor>,
+) -> Result<()> {
+    out.push(0);
+    out.reserve(8 * row_count);
+    let typed = data as *const u64;
+    let sentinel_bytes = I64_NULL.to_le_bytes();
+    match validity {
+        None => {
+            for i in 0..row_count {
+                let v = unsafe { *typed.add(i) };
+                out.extend_from_slice(&u64_to_i64_checked(v, i)?.to_le_bytes());
+            }
+        }
+        Some(v) => {
+            for i in 0..row_count {
+                if unsafe { v.is_valid(i) } {
+                    let raw = unsafe { *typed.add(i) };
+                    out.extend_from_slice(&u64_to_i64_checked(raw, i)?.to_le_bytes());
+                } else {
+                    out.extend_from_slice(&sentinel_bytes);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// f16 → f32 (sentinel FLOAT). Implements the IEEE-754 half-precision
@@ -995,6 +1037,14 @@ mod tests {
         out
     }
 
+    fn encode_err(chunk: &Chunk<'_>) -> crate::Error {
+        let mut out = Vec::new();
+        let mut reg = SchemaRegistry::new();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, chunk, &mut reg, &mut dict, &mut scratch, false).unwrap_err()
+    }
+
     #[test]
     fn i8_direct_matches_column_i8() {
         let src = [1i8, -2, 3];
@@ -1238,6 +1288,85 @@ mod tests {
             bytes_a, bytes_b,
             "I32WidenToI64 must produce byte-identical wire to column_i64 over the widened data"
         );
+    }
+
+    #[test]
+    fn u64_widen_within_i64_range_matches_column_i64() {
+        let src = [0u64, 42, i64::MAX as u64];
+        let widened: [i64; 3] = [0, 42, i64::MAX];
+        let ts = [10i64, 20, 30];
+
+        let mut a = Chunk::new("t");
+        unsafe {
+            a.push_numpy_deferred(
+                "v",
+                NumpyDtype::U64WidenToI64,
+                src.as_ptr() as *const u8,
+                src.len(),
+                None,
+            )
+            .unwrap();
+        }
+        a.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_a = encode(&a);
+
+        let mut b = Chunk::new("t");
+        b.column_i64("v", &widened, None).unwrap();
+        b.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_b = encode(&b);
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "U64WidenToI64 must produce signed LONG wire for values within i64::MAX"
+        );
+    }
+
+    #[test]
+    fn u64_widen_above_i64_max_rejects() {
+        let src = [i64::MAX as u64 + 1];
+        let ts = [10i64];
+
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "v",
+                    NumpyDtype::U64WidenToI64,
+                    src.as_ptr() as *const u8,
+                    src.len(),
+                    None,
+                )
+                .unwrap();
+        }
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+        let err = encode_err(&chunk);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
+    }
+
+    #[test]
+    fn nullable_u64_widen_above_i64_max_rejects() {
+        let src = [0u64, i64::MAX as u64 + 1];
+        let ts = [10i64, 20];
+        let validity_bits = [0b0000_0010u8];
+        let validity = Validity::from_bitmap(&validity_bits, src.len()).unwrap();
+
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "v",
+                    NumpyDtype::U64WidenToI64,
+                    src.as_ptr() as *const u8,
+                    src.len(),
+                    Some(&validity),
+                )
+                .unwrap();
+        }
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+        let err = encode_err(&chunk);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
     }
 
     #[test]

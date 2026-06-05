@@ -579,6 +579,27 @@ struct ArrowArray
 #endif /* ARROW_C_DATA_INTERFACE */
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
+typedef struct column_sender_arrow_import column_sender_arrow_import;
+
+QUESTDB_CLIENT_API
+column_sender_arrow_import* column_sender_arrow_import_new(
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool column_sender_chunk_append_arrow_import(
+    column_sender_chunk* chunk,
+    const char* name,
+    size_t name_len,
+    const column_sender_arrow_import* imported,
+    size_t row_offset,
+    size_t row_count,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+void column_sender_arrow_import_free(column_sender_arrow_import* imported);
+
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_arrow_column(
     column_sender_chunk* chunk,
@@ -616,8 +637,7 @@ bool column_sender_chunk_append_arrow_column(
  *     u16_char     → CHAR
  *   Widen (single pass at flush):
  *     u8/u16       → INT   (zero-extend)
- *     u32/u64      → LONG  (zero-extend / bit-reinterpret;
- *                           u64 values > i64::MAX wrap negative)
+ *     u32/u64      → LONG  (zero-extend; u64 values > i64::MAX are rejected)
  *     f32          → DOUBLE
  *     f16          → FLOAT
  *     datetime64[s] → TIMESTAMP (×10^6)
@@ -664,8 +684,7 @@ typedef enum column_sender_numpy_dtype
     column_sender_numpy_u8 = 4,  /* → INT   (4B/row, widen u8→i32)              */
     column_sender_numpy_u16 = 5, /* → INT   (4B/row, widen u16→i32)             */
     column_sender_numpy_u32 = 6, /* → LONG  (8B/row, widen u32→i64)             */
-    column_sender_numpy_u64 = 7, /* → LONG  (8B/row, bit-reinterpret u64→i64;
-                                    values > i64::MAX wrap to negative)         */
+    column_sender_numpy_u64 = 7, /* → LONG  (8B/row, reject values > i64::MAX)  */
 
     column_sender_numpy_f32 = 8, /* → DOUBLE (8B/row, widen f32→f64)            */
     column_sender_numpy_f64 = 9, /* → DOUBLE (8B/row, sentinel = NaN)           */

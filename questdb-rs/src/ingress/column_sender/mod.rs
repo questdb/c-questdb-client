@@ -53,6 +53,8 @@ mod wire;
 
 #[cfg(feature = "arrow")]
 pub use arrow_batch::ArrowColumnOverride;
+#[cfg(feature = "arrow")]
+pub use chunk::ImportedArrowColumn;
 pub use chunk::Chunk;
 pub use db::{BorrowedSender, QuestDb};
 pub use numpy_wire::NumpyDtype;

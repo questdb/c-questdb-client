@@ -799,6 +799,18 @@ fn try_non_null_le<const N: usize>(
     Ok(())
 }
 
+fn u64_to_i64_le_checked(v: u64, row: usize) -> Result<[u8; 8]> {
+    if v > i64::MAX as u64 {
+        return Err(fmt!(
+            ArrowIngest,
+            "UInt64 value {} at row {} does not fit QuestDB LONG (max i64::MAX)",
+            v,
+            row
+        ));
+    }
+    Ok((v as i64).to_le_bytes())
+}
+
 fn non_null_fsb(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray, size: usize) -> Result<()> {
     let non_null = non_null_count(arr, "FixedSizeBinary column")?;
     let row_count = arr.len();
@@ -2505,13 +2517,13 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
             if null_count == 0 {
                 try_reserve_bytes(out, a.values().len() * 8, "U64 widen column")?;
-                for &v in a.values() {
-                    out.extend_from_slice(&(v as i64).to_le_bytes());
+                for (row, &v) in a.values().iter().enumerate() {
+                    out.extend_from_slice(&u64_to_i64_le_checked(v, row)?);
                 }
                 Ok(())
             } else {
-                full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
-                    (a.value(row) as i64).to_le_bytes()
+                try_full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
+                    u64_to_i64_le_checked(a.value(row), row)
                 })
             }
         }
@@ -3937,31 +3949,25 @@ mod tests {
     }
 
     #[test]
-    fn uint64_above_i64_max_bit_reinterprets() {
+    fn uint64_above_i64_max_rejects() {
         let mut b = UInt64Builder::new();
         let v: u64 = i64::MAX as u64 + 1;
         b.append_value(v);
         let rb = single_col_batch(Field::new("u", DataType::UInt64, true), b.finish());
-        let bytes = encode(&rb);
-        let expected = (v as i64).to_le_bytes();
-        assert!(
-            bytes.windows(8).any(|w| w == expected),
-            "expected bit-reinterpret of u64 {v} = i64 {} on the wire",
-            v as i64
-        );
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
     }
 
     #[test]
-    fn uint64_max_value_bit_reinterprets() {
+    fn nullable_uint64_above_i64_max_rejects() {
         let mut b = UInt64Builder::new();
+        b.append_null();
         b.append_value(u64::MAX);
         let rb = single_col_batch(Field::new("u", DataType::UInt64, true), b.finish());
-        let bytes = encode(&rb);
-        let expected = (-1i64).to_le_bytes();
-        assert!(
-            bytes.windows(8).any(|w| w == expected),
-            "expected bit-reinterpret of u64::MAX = i64 -1 on the wire"
-        );
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
     }
 
     #[test]

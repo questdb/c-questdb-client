@@ -58,6 +58,75 @@ use super::wire::{
 // Descriptors
 // ===========================================================================
 
+#[cfg(feature = "arrow")]
+pub struct ImportedArrowColumn {
+    field: arrow_schema::Field,
+    array: arrow_array::ArrayRef,
+    kind: arrow_batch::ColumnKind,
+}
+
+#[cfg(feature = "arrow")]
+impl ImportedArrowColumn {
+    pub unsafe fn import_from_ffi(
+        array: &mut arrow::ffi::FFI_ArrowArray,
+        schema: &arrow::ffi::FFI_ArrowSchema,
+    ) -> Result<Self> {
+        use arrow_array::make_array;
+
+        let field = arrow_schema::Field::try_from(schema).map_err(|err| {
+            error::fmt!(ArrowIngest, "schema conversion failed: {}", err)
+        })?;
+
+        let imported_array = unsafe { std::ptr::read(array) };
+        array.release = None;
+        let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }
+            .map_err(|err| error::fmt!(ArrowIngest, "from_ffi failed: {}", err))?;
+        array_data.validate_full().map_err(|err| {
+            error::fmt!(ArrowIngest, "Arrow array validation failed: {}", err)
+        })?;
+
+        let array = make_array(array_data);
+        let kind = arrow_batch::classify(&field, array.as_ref())?;
+        Ok(Self { field, array, kind })
+    }
+
+    pub fn len(&self) -> usize {
+        self.array.len()
+    }
+
+    pub fn field(&self) -> &arrow_schema::Field {
+        &self.field
+    }
+
+    fn slice(&self, row_offset: usize, row_count: usize) -> Result<arrow_array::ArrayRef> {
+        let array_len = self.array.len();
+        let slice_end = row_offset
+            .checked_add(row_count)
+            .ok_or_else(|| {
+                error::fmt!(
+                    InvalidApiCall,
+                    "row_offset {} + row_count {} overflows",
+                    row_offset,
+                    row_count
+                )
+            })?;
+        if slice_end > array_len {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "slice [{}, {}) out of range for array length {}",
+                row_offset,
+                slice_end,
+                array_len
+            ));
+        }
+        Ok(if row_offset == 0 && row_count == array_len {
+            self.array.clone()
+        } else {
+            self.array.slice(row_offset, row_count)
+        })
+    }
+}
+
 /// Validity bitmap descriptor (raw-ptr form, matching `Validity<'a>`).
 /// `non_null_count` is pre-computed at column-append time because several
 /// encoder paths (e.g. VARCHAR's dense offset table) size their output
@@ -1047,6 +1116,18 @@ impl<'a> Chunk<'a> {
     ) -> Result<&mut Self> {
         let kind = arrow_batch::classify(field, arr.as_ref())?;
         self.push_arrow_deferred(name, kind, arr)
+    }
+
+    #[cfg(feature = "arrow")]
+    pub fn push_imported_arrow_slice(
+        &mut self,
+        name: &str,
+        imported: &ImportedArrowColumn,
+        row_offset: usize,
+        row_count: usize,
+    ) -> Result<&mut Self> {
+        let arr = imported.slice(row_offset, row_count)?;
+        self.push_arrow_deferred(name, imported.kind, arr)
     }
 
     /// Append an Arrow column to the chunk. `arr.len()` participates in

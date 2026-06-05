@@ -4076,6 +4076,14 @@ pub(crate) unsafe fn arrow_ffi_import_array_sliced(
             );
             return None;
         }
+        if (*array).release.is_none() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{fn_name}: ArrowArray has already been consumed"),
+            );
+            return None;
+        }
         if let Err(e) = validate_arrow_schema_depth(schema) {
             arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
             return None;
@@ -4133,6 +4141,51 @@ pub(crate) unsafe fn arrow_ffi_import_array_sliced(
         } else {
             full.slice(row_offset, row_count)
         })
+    }
+}
+
+#[cfg(feature = "arrow")]
+pub(crate) unsafe fn arrow_ffi_import_column(
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    fn_name: &str,
+    err_out: *mut *mut line_sender_error,
+) -> Option<questdb::ingress::column_sender::ImportedArrowColumn> {
+    unsafe {
+        if array.is_null() || schema.is_null() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{fn_name}: NULL array / schema"),
+            );
+            return None;
+        }
+        if (*array).release.is_none() {
+            arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{fn_name}: ArrowArray has already been consumed"),
+            );
+            return None;
+        }
+        if let Err(e) = validate_arrow_schema_depth(schema) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return None;
+        }
+        if let Err(e) = validate_arrow_array_depth(array, schema) {
+            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
+            return None;
+        }
+        match questdb::ingress::column_sender::ImportedArrowColumn::import_from_ffi(
+            &mut *array,
+            &*schema,
+        ) {
+            Ok(imported) => Some(imported),
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                None
+            }
+        }
     }
 }
 
