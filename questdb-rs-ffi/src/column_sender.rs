@@ -1449,6 +1449,7 @@ fn reject_null_chunk(err_out: *mut *mut line_sender_error) -> bool {
 mod tests {
     use super::*;
     use crate::line_sender_error_free;
+    #[cfg(feature = "arrow")]
     use std::ffi::c_void;
 
     // Most behaviour is already covered by the questdb-rs lib tests; this
@@ -1588,6 +1589,7 @@ mod tests {
         unsafe { column_sender_chunk_free(chunk) };
     }
 
+    #[cfg(feature = "arrow")]
     #[test]
     fn append_arrow_dictionary_accepts_large_utf8_values() {
         let table = b"trades";
