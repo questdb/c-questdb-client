@@ -220,64 +220,68 @@ pub struct line_sender_error {
 }
 
 /// Category of error.
+///
+/// APPEND-ONLY ABI: existing discriminants are pinned (the C header at
+/// `include/questdb/ingress/line_sender.h` numbers them explicitly) and
+/// new variants must be appended at the end with explicit `= N`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum line_sender_error_code {
     /// The host, port, or interface was incorrect.
-    line_sender_error_could_not_resolve_addr,
+    line_sender_error_could_not_resolve_addr = 0,
 
     /// Called methods in the wrong order. E.g. `symbol` after `column`.
-    line_sender_error_invalid_api_call,
+    line_sender_error_invalid_api_call = 1,
 
     /// A network error connecting or flushing data out.
-    line_sender_error_socket_error,
+    line_sender_error_socket_error = 2,
 
     /// The string or symbol field is not encoded in valid UTF-8.
-    line_sender_error_invalid_utf8,
+    line_sender_error_invalid_utf8 = 3,
 
     /// The table name or column name contains bad characters.
-    line_sender_error_invalid_name,
+    line_sender_error_invalid_name = 4,
 
     /// The supplied timestamp is invalid.
-    line_sender_error_invalid_timestamp,
+    line_sender_error_invalid_timestamp = 5,
 
     /// Error during the authentication process.
-    line_sender_error_auth_error,
+    line_sender_error_auth_error = 6,
 
     /// Error during TLS handshake.
-    line_sender_error_tls_error,
+    line_sender_error_tls_error = 7,
 
     /// The server does not support ILP over HTTP.
-    line_sender_error_http_not_supported,
+    line_sender_error_http_not_supported = 8,
 
     /// Error sent back from the server during flush.
-    line_sender_error_server_flush_error,
+    line_sender_error_server_flush_error = 9,
 
     /// Bad configuration.
-    line_sender_error_config_error,
+    line_sender_error_config_error = 10,
 
     /// There was an error serializing an array.
-    line_sender_error_array_error,
+    line_sender_error_array_error = 11,
 
     /// Line sender protocol version error.
-    line_sender_error_protocol_version_error,
+    line_sender_error_protocol_version_error = 12,
 
     /// The supplied decimal is invalid.
-    line_sender_error_invalid_decimal,
+    line_sender_error_invalid_decimal = 13,
 
     /// QWP/WebSocket server rejection or terminal protocol violation.
-    line_sender_error_server_rejection,
+    line_sender_error_server_rejection = 14,
 
     /// `column_sender_flush_arrow_batch` was passed a column whose
     /// Arrow / QuestDB kind cannot be persisted to a QuestDB table.
     /// Only emitted with the `arrow` feature enabled.
-    line_sender_error_arrow_unsupported_column_kind,
+    line_sender_error_arrow_unsupported_column_kind = 15,
 
     /// `column_sender_flush_arrow_batch` rejected a `RecordBatch` at
     /// client-side structural validation (column count, name encoding,
     /// FFI struct contract). Only emitted with the `arrow` feature
     /// enabled.
-    line_sender_error_arrow_ingest,
+    line_sender_error_arrow_ingest = 16,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -3640,12 +3644,13 @@ const MAX_ARROW_SCHEMA_DEPTH: usize = 64;
 const MAX_ARROW_SCHEMA_CHILDREN_PER_NODE: i64 = 65_536;
 #[cfg(feature = "arrow")]
 const MAX_ARROW_SCHEMA_TOTAL_NODES: usize = 4_096;
-// Mirrors `MAX_ARROW_INGEST_ROWS` in `questdb-rs::ingress::arrow`.
 // `arrow::ffi::from_ffi` reads `(*a).length` as i64 and casts to
 // usize before the inner crate gets to check the row cap, so a
-// negative or `i64::MAX` length must be rejected here.
+// negative or `i64::MAX` length must be rejected here. Anchored on
+// the shared `MAX_CHUNK_ROWS` constant so the two crates cannot
+// drift.
 #[cfg(feature = "arrow")]
-const MAX_ARROW_ARRAY_LENGTH: i64 = 16 * 1024 * 1024;
+const MAX_ARROW_ARRAY_LENGTH: i64 = questdb::ingress::column_sender::MAX_CHUNK_ROWS as i64;
 
 #[cfg(feature = "arrow")]
 fn arrow_ingest_err(msg: impl Into<String>) -> Error {
@@ -3702,7 +3707,7 @@ unsafe fn validate_arrow_schema_depth(
                     MAX_ARROW_SCHEMA_TOTAL_NODES
                 )));
             }
-            if depth > MAX_ARROW_SCHEMA_DEPTH {
+            if depth >= MAX_ARROW_SCHEMA_DEPTH {
                 return Err(arrow_ingest_err(format!(
                     "Arrow schema nesting depth exceeds {}",
                     MAX_ARROW_SCHEMA_DEPTH
@@ -3782,7 +3787,7 @@ unsafe fn validate_arrow_array_depth(
                     MAX_ARROW_SCHEMA_TOTAL_NODES
                 )));
             }
-            if depth > MAX_ARROW_SCHEMA_DEPTH {
+            if depth >= MAX_ARROW_SCHEMA_DEPTH {
                 return Err(arrow_ingest_err(format!(
                     "Arrow array nesting depth exceeds {}",
                     MAX_ARROW_SCHEMA_DEPTH

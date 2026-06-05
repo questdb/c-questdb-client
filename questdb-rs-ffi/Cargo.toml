@@ -44,10 +44,10 @@ confstr-ffi = ["dep:questdb-confstr-ffi"]
 sync-reader-ws = ["questdb-rs/sync-reader-ws", "questdb-rs/compression-zstd"]
 
 # Apache Arrow integration (egress + ingress over QWP/WS). Adds the
-# `line_reader_cursor_next_arrow_batch` and
-# `line_sender_buffer_append_arrow` C exports plus the Arrow
-# C Data Interface struct declarations. See
-# `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
+# `line_reader_cursor_next_arrow_batch` C export (egress) and the
+# `column_sender_chunk_append_arrow_column` / `column_sender_flush_arrow_batch[_at_column]`
+# exports (ingress), plus the Arrow C Data Interface struct
+# declarations. See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
 arrow = [
     "sync-reader-ws",
     "questdb-rs/arrow",

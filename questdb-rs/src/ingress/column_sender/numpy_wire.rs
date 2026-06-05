@@ -66,22 +66,27 @@ pub enum NumpyDtype {
     Ipv4Direct,
     CharDirect,
 
-    // ---- Direct narrow signed integers (sentinel-encoded) ----
+    // ---- Direct narrow signed integers (sentinel-encoded; BYTE/SHORT
+    // ----- use value 0 as the null sentinel) ----
     I8Direct,
     I16Direct,
     I32Direct,
 
+    // ---- Signed widen to next-up signed wire to avoid sentinel
+    // ----- collision with source value range ----
+    I8WidenToI32,
+    I16WidenToI32,
+    I32WidenToI64,
+
     // ---- Unsigned widen to smallest signed wire that holds the source
-    // ----- range WITHOUT colliding with the null sentinel.
-    // ----- (BYTE/SHORT use value 0 as the null sentinel, so u8 must
-    // ----- widen at least to INT where the sentinel is i32::MIN.)
+    // ----- range WITHOUT colliding with the null sentinel ----
     U8WidenToI32,
     U16WidenToI32,
     U32WidenToI64,
     U64WidenToI64,
 
-    // ---- Float widening ----
-    F32Widen,
+    // ---- f16 widen (no f16 wire type); f32 direct ----
+    F32Direct,
     F16Widen,
 
     // ---- Other per-row conversions ----
@@ -135,10 +140,18 @@ impl NumpyDtype {
         match self {
             D::I8Direct => QWP_TYPE_BYTE,
             D::I16Direct => QWP_TYPE_SHORT,
-            D::I32Direct | D::U8WidenToI32 | D::U16WidenToI32 => QWP_TYPE_INT,
-            D::I64Direct | D::LongDirect | D::U32WidenToI64 | D::U64WidenToI64 => QWP_TYPE_LONG,
-            D::F64Direct | D::F32Widen => QWP_TYPE_DOUBLE,
-            D::F16Widen => QWP_TYPE_FLOAT,
+            D::I32Direct
+            | D::I8WidenToI32
+            | D::I16WidenToI32
+            | D::U8WidenToI32
+            | D::U16WidenToI32 => QWP_TYPE_INT,
+            D::I64Direct
+            | D::LongDirect
+            | D::I32WidenToI64
+            | D::U32WidenToI64
+            | D::U64WidenToI64 => QWP_TYPE_LONG,
+            D::F64Direct => QWP_TYPE_DOUBLE,
+            D::F32Direct | D::F16Widen => QWP_TYPE_FLOAT,
             D::Bool => QWP_TYPE_BOOLEAN,
             D::DateI64Direct => QWP_TYPE_DATE,
             D::TimestampMicrosDirect
@@ -175,7 +188,14 @@ impl NumpyDtype {
         match self {
             D::Bool | D::I8Direct => 1,
             D::I16Direct | D::CharDirect => 2,
-            D::I32Direct | D::U8WidenToI32 | D::U16WidenToI32 | D::F16Widen | D::Ipv4Direct => 4,
+            D::I32Direct
+            | D::I8WidenToI32
+            | D::I16WidenToI32
+            | D::U8WidenToI32
+            | D::U16WidenToI32
+            | D::F32Direct
+            | D::F16Widen
+            | D::Ipv4Direct => 4,
             D::I64Direct
             | D::F64Direct
             | D::LongDirect
@@ -188,9 +208,9 @@ impl NumpyDtype {
             | D::DatetimeDayToMicros
             | D::DatetimeMonthToMicros
             | D::DatetimeYearToMicros
+            | D::I32WidenToI64
             | D::U32WidenToI64
             | D::U64WidenToI64
-            | D::F32Widen
             | D::Decimal64 { .. } => 8,
             D::UuidDirect | D::Decimal128 { .. } => 16,
             D::Long256Direct | D::Decimal256 { .. } => 32,
@@ -297,6 +317,17 @@ pub(crate) unsafe fn emit_into_wire(
             )
         },
 
+        // ---- Signed widen (sentinel-safe; mirrors unsigned widen) ----
+        D::I8WidenToI32 => unsafe {
+            emit_widen_i32_sentinel::<i8>(out, data, row_count, validity, I32_NULL, |v| v as i32)
+        },
+        D::I16WidenToI32 => unsafe {
+            emit_widen_i32_sentinel::<i16>(out, data, row_count, validity, I32_NULL, |v| v as i32)
+        },
+        D::I32WidenToI64 => unsafe {
+            emit_widen_i64_sentinel::<i32>(out, data, row_count, validity, I64_NULL, |v| v as i64)
+        },
+
         // ---- Unsigned widen to smallest signed wire that avoids the
         // ----- null-sentinel collision (BYTE/SHORT use value 0 as null).
         D::U8WidenToI32 => unsafe {
@@ -314,8 +345,17 @@ pub(crate) unsafe fn emit_into_wire(
             emit_widen_i64_sentinel::<u64>(out, data, row_count, validity, I64_NULL, |v| v as i64)
         },
 
-        // ---- f32 → f64 sentinel DOUBLE ----
-        D::F32Widen => unsafe { emit_f32_to_f64(out, data, row_count, validity) },
+        // ---- f32 sentinel FLOAT ----
+        D::F32Direct => unsafe {
+            emit_sentinel_le::<f32, 4>(
+                out,
+                data,
+                row_count,
+                validity,
+                F32_NULL.to_le_bytes(),
+                f32::to_le_bytes,
+            )
+        },
 
         // ---- f16 → f32 sentinel FLOAT ----
         D::F16Widen => unsafe { emit_f16_to_f32(out, data, row_count, validity) },
@@ -560,37 +600,6 @@ unsafe fn emit_widen_i64_sentinel<T>(
                     out.extend_from_slice(&widen(raw).to_le_bytes());
                 } else {
                     out.extend_from_slice(&sentinel_bytes);
-                }
-            }
-        }
-    }
-}
-
-/// f32 → f64 (sentinel DOUBLE).
-unsafe fn emit_f32_to_f64(
-    out: &mut Vec<u8>,
-    data: *const u8,
-    row_count: usize,
-    validity: Option<&ValidityDescriptor>,
-) {
-    out.push(0);
-    out.reserve(8 * row_count);
-    let typed = data as *const f32;
-    let sentinel = F64_NULL.to_le_bytes();
-    match validity {
-        None => {
-            for i in 0..row_count {
-                let v = unsafe { *typed.add(i) };
-                out.extend_from_slice(&(v as f64).to_le_bytes());
-            }
-        }
-        Some(v) => {
-            for i in 0..row_count {
-                if unsafe { v.is_valid(i) } {
-                    let raw = unsafe { *typed.add(i) };
-                    out.extend_from_slice(&(raw as f64).to_le_bytes());
-                } else {
-                    out.extend_from_slice(&sentinel);
                 }
             }
         }
@@ -1124,6 +1133,133 @@ mod tests {
         assert_eq!(
             bytes_a, bytes_b,
             "U16WidenToI32 must produce byte-identical wire to column_i32 over the widened data"
+        );
+    }
+
+    #[test]
+    fn i8_widen_matches_column_i32() {
+        // i8 widens to INT (not BYTE) so source value 0 does not collide
+        // with BYTE's null sentinel (which is 0).
+        let src = [-128i8, -1, 0, 1, 127];
+        let widened: [i32; 5] = [-128, -1, 0, 1, 127];
+        let ts = [10i64, 20, 30, 40, 50];
+
+        let mut a = Chunk::new("t");
+        unsafe {
+            a.push_numpy_deferred(
+                "v",
+                NumpyDtype::I8WidenToI32,
+                src.as_ptr() as *const u8,
+                src.len(),
+                None,
+            )
+            .unwrap();
+        }
+        a.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_a = encode(&a);
+
+        let mut b = Chunk::new("t");
+        b.column_i32("v", &widened, None).unwrap();
+        b.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_b = encode(&b);
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "I8WidenToI32 must produce byte-identical wire to column_i32 over the widened data"
+        );
+    }
+
+    #[test]
+    fn i16_widen_matches_column_i32() {
+        let src = [i16::MIN, -1, 0, 1, i16::MAX];
+        let widened: [i32; 5] = [i16::MIN as i32, -1, 0, 1, i16::MAX as i32];
+        let ts = [10i64, 20, 30, 40, 50];
+
+        let mut a = Chunk::new("t");
+        unsafe {
+            a.push_numpy_deferred(
+                "v",
+                NumpyDtype::I16WidenToI32,
+                src.as_ptr() as *const u8,
+                src.len(),
+                None,
+            )
+            .unwrap();
+        }
+        a.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_a = encode(&a);
+
+        let mut b = Chunk::new("t");
+        b.column_i32("v", &widened, None).unwrap();
+        b.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_b = encode(&b);
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "I16WidenToI32 must produce byte-identical wire to column_i32 over the widened data"
+        );
+    }
+
+    #[test]
+    fn i32_widen_matches_column_i64() {
+        // i32 widens to LONG so source value i32::MIN does not collide with
+        // INT's null sentinel (which is i32::MIN).
+        let src = [i32::MIN, -1, 0, 1, i32::MAX];
+        let widened: [i64; 5] = [i32::MIN as i64, -1, 0, 1, i32::MAX as i64];
+        let ts = [10i64, 20, 30, 40, 50];
+
+        let mut a = Chunk::new("t");
+        unsafe {
+            a.push_numpy_deferred(
+                "v",
+                NumpyDtype::I32WidenToI64,
+                src.as_ptr() as *const u8,
+                src.len(),
+                None,
+            )
+            .unwrap();
+        }
+        a.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_a = encode(&a);
+
+        let mut b = Chunk::new("t");
+        b.column_i64("v", &widened, None).unwrap();
+        b.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_b = encode(&b);
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "I32WidenToI64 must produce byte-identical wire to column_i64 over the widened data"
+        );
+    }
+
+    #[test]
+    fn f32_direct_matches_column_f32() {
+        let src = [1.5f32, -2.25, 3.125, f32::NAN];
+        let ts = [10i64, 20, 30, 40];
+
+        let mut a = Chunk::new("t");
+        unsafe {
+            a.push_numpy_deferred(
+                "v",
+                NumpyDtype::F32Direct,
+                src.as_ptr() as *const u8,
+                src.len(),
+                None,
+            )
+            .unwrap();
+        }
+        a.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_a = encode(&a);
+
+        let mut b = Chunk::new("t");
+        b.column_f32("v", &src, None).unwrap();
+        b.designated_timestamp_nanos(&ts).unwrap();
+        let bytes_b = encode(&b);
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "F32Direct must produce byte-identical wire to column_f32"
         );
     }
 

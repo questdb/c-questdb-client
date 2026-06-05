@@ -390,7 +390,7 @@ fn geohash_array(
     let values_buf = if bw == target_width {
         buffer_to_arrow(&buf.values)
     } else if bw < target_width {
-        widen_zero_extend(&buf.values, bw, target_width, row_count)
+        widen_zero_extend(&buf.values, bw, target_width, row_count)?
     } else {
         return Err(fmt!(
             ProtocolError,
@@ -416,15 +416,26 @@ fn geohash_array(
     })
 }
 
-fn widen_zero_extend(src: &Bytes, src_width: usize, dst_width: usize, row_count: usize) -> Buffer {
-    let mut out = ABytes::with_capacity(64, row_count * dst_width);
-    out.resize(row_count * dst_width, 0);
+fn widen_zero_extend(
+    src: &Bytes,
+    src_width: usize,
+    dst_width: usize,
+    row_count: usize,
+) -> Result<Buffer> {
+    let dst_len = row_count.checked_mul(dst_width).ok_or_else(|| {
+        fmt!(
+            ProtocolError,
+            "widen_zero_extend output size overflows usize"
+        )
+    })?;
+    let mut out = ABytes::with_capacity(64, dst_len);
+    out.resize(dst_len, 0);
     for r in 0..row_count {
         let s = r * src_width;
         let d = r * dst_width;
         out[d..d + src_width].copy_from_slice(&src[s..s + src_width]);
     }
-    Buffer::from(bytes_from_avec(out))
+    Ok(Buffer::from(bytes_from_avec(out)))
 }
 
 fn symbol_array(

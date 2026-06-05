@@ -243,7 +243,7 @@ _column_sender_sync = _setsig(
     "column_sender_sync",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
-    ctypes.c_int,
+    ctypes.c_uint32,
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 

@@ -30,11 +30,16 @@
 //! and freed through their dedicated `_close` / `_free` / `_return_conn`
 //! entry points.
 
+#![allow(non_upper_case_globals)]
+
 use libc::{c_char, size_t};
 use std::slice;
 use std::str;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use questdb::ingress::MAX_ARRAY_DIMS;
+#[cfg(feature = "arrow")]
+use questdb::ingress::column_sender::ArrowColumnOverride;
 use questdb::ingress::column_sender::{
     AckLevel, Chunk, NumpyDtype, OwnedSender, QuestDb, Validity,
 };
@@ -52,11 +57,15 @@ use crate::{line_sender_error, set_err_out_from_error};
 pub struct questdb_db(pub(crate) QuestDb);
 
 /// Borrowed QWP/WS connection. Owns a pool slot until
-/// `questdb_db_return_conn` is called. Not thread-safe. Bundles the
-/// per-connection schema registry and symbol-dict state used by all
-/// writer modes (column-sender chunks, future Arrow / NumPy appenders,
-/// future egress readers).
-pub struct qwpws_conn(OwnedSender);
+/// `questdb_db_return_conn` is called. Bundles the per-connection
+/// schema registry and symbol-dict state used by all writer modes.
+///
+/// **Not thread-safe.** A `qwpws_conn*` must not be used from more than
+/// one thread at a time. The second tuple field is a CAS-checked latch
+/// on every FFI entry that mutates the conn; concurrent calls return
+/// `line_sender_error_invalid_api_call` rather than racing on the
+/// underlying writer state.
+pub struct qwpws_conn(OwnedSender, AtomicBool);
 
 /// One DataFrame's worth of column buffers destined for one QuestDB table.
 /// Owned by the caller; not bound to a connection.
@@ -67,7 +76,54 @@ pub struct qwpws_conn(OwnedSender);
 /// alive until the next `column_sender_flush` call returns. We hide the
 /// chunk's lifetime by promoting its inner type to `'static`; the lifetime
 /// is enforced by the caller, not the borrow checker.
-pub struct column_sender_chunk(Chunk<'static>);
+///
+/// **Not thread-safe.** A `column_sender_chunk*` must not be used from
+/// more than one thread at a time. The second tuple field is a
+/// CAS-checked latch on every FFI entry that mutates the chunk;
+/// concurrent calls return `line_sender_error_invalid_api_call`.
+pub struct column_sender_chunk(Chunk<'static>, AtomicBool);
+
+/// RAII latch that flips an `AtomicBool` on construction and clears it
+/// on drop. Acquisition fails if the latch is already set; FFI entries
+/// then return `InvalidApiCall` rather than racing.
+struct InUseGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> InUseGuard<'a> {
+    fn acquire(
+        flag: &'a AtomicBool,
+        fn_name: &str,
+        what: &str,
+        err_out: *mut *mut line_sender_error,
+    ) -> Option<Self> {
+        if flag
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
+            .is_err()
+        {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "{fn_name}: {what} is already in use by a concurrent call \
+                             (each handle is single-threaded)"
+                        ),
+                    ),
+                );
+            }
+            return None;
+        }
+        Some(Self { flag })
+    }
+}
+
+impl Drop for InUseGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
 
 // ===========================================================================
 // Validity bitmap (Arrow shape: bit = 1 means valid, LSB-first).
@@ -84,10 +140,26 @@ unsafe fn as_validity<'a>(
     v: *const column_sender_validity,
     err_out: *mut *mut line_sender_error,
 ) -> Option<Option<Validity<'a>>> {
+    use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
     if v.is_null() {
         return Some(None);
     }
     let v = unsafe { &*v };
+    if v.bit_len > MAX_CHUNK_ROWS {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "column_sender_validity bit_len {} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})",
+                        v.bit_len
+                    ),
+                ),
+            );
+        }
+        return None;
+    }
     let required = v.bit_len.div_ceil(8);
     if v.bits.is_null() && v.bit_len != 0 {
         unsafe {
@@ -117,20 +189,31 @@ unsafe fn as_validity<'a>(
 
 // ===========================================================================
 // Ack level
+//
+// The C header exposes named constants (`column_sender_ack_level_ok = 0`,
+// `column_sender_ack_level_durable = 1`) but the FFI takes a `uint32_t`
+// (not a `#[repr(C)] enum`) so an out-of-range value is a recoverable
+// `InvalidApiCall` error instead of immediate Rust UB.
 // ===========================================================================
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum column_sender_ack_level {
-    column_sender_ack_level_ok = 0,
-    column_sender_ack_level_durable = 1,
-}
+pub const column_sender_ack_level_ok: u32 = 0;
+pub const column_sender_ack_level_durable: u32 = 1;
 
-impl From<column_sender_ack_level> for AckLevel {
-    fn from(value: column_sender_ack_level) -> Self {
-        match value {
-            column_sender_ack_level::column_sender_ack_level_ok => AckLevel::Ok,
-            column_sender_ack_level::column_sender_ack_level_durable => AckLevel::Durable,
+fn ack_level_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Option<AckLevel> {
+    match value {
+        0 => Some(AckLevel::Ok),
+        1 => Some(AckLevel::Durable),
+        other => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!("column_sender_sync: invalid ack_level {other} (expected 0 or 1)"),
+                    ),
+                );
+            }
+            None
         }
     }
 }
@@ -278,7 +361,7 @@ pub unsafe extern "C" fn questdb_db_borrow_conn(
     }
     let db_ref = unsafe { &*db };
     match db_ref.0.borrow_sender_owned() {
-        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned))),
+        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicBool::new(false)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             std::ptr::null_mut()
@@ -401,7 +484,10 @@ pub unsafe extern "C" fn column_sender_chunk_new(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    Box::into_raw(Box::new(column_sender_chunk(Chunk::new(table))))
+    Box::into_raw(Box::new(column_sender_chunk(
+        Chunk::new(table),
+        AtomicBool::new(false),
+    )))
 }
 
 /// Free a chunk. Accepts NULL and no-ops.
@@ -413,11 +499,27 @@ pub unsafe extern "C" fn column_sender_chunk_free(chunk: *mut column_sender_chun
 }
 
 /// Clear a chunk's content, keeping its retained capacity for reuse.
+///
+/// No-op if `chunk` is NULL or if another FFI call is currently
+/// mutating the chunk (the per-handle in-use latch protects against
+/// torn state). Concurrent use of a `column_sender_chunk*` from
+/// multiple threads is a documented contract violation; this entry
+/// returns void with no error channel, so contention is silently
+/// dropped.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_clear(chunk: *mut column_sender_chunk) {
-    if !chunk.is_null() {
-        unsafe { (*chunk).0.clear() };
+    let Some(chunk_ref) = (unsafe { chunk.as_mut() }) else {
+        return;
+    };
+    if chunk_ref
+        .1
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
+        .is_err()
+    {
+        return;
     }
+    chunk_ref.0.clear();
+    chunk_ref.1.store(false, Ordering::Release);
 }
 
 /// Current row count of the chunk; 0 if no column has been appended.
@@ -447,10 +549,20 @@ macro_rules! column_fn {
             validity: *const column_sender_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
-            let chunk = match unsafe { chunk.as_mut() } {
-                Some(c) => &mut c.0,
+            let chunk_ref = match unsafe { chunk.as_mut() } {
+                Some(c) => c,
                 None => return reject_null_chunk(err_out),
             };
+            let _guard = match InUseGuard::acquire(
+                &chunk_ref.1,
+                stringify!($fn_name),
+                "column_sender_chunk",
+                err_out,
+            ) {
+                Some(g) => g,
+                None => return false,
+            };
+            let chunk = &mut chunk_ref.0;
             let name = match unsafe { name_str(name, name_len, err_out) } {
                 Some(s) => s,
                 None => return false,
@@ -542,10 +654,20 @@ pub unsafe extern "C" fn column_sender_chunk_column_bool(
     validity: *const column_sender_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_chunk_column_bool",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -579,10 +701,20 @@ macro_rules! fixed_width_byte_column_fn {
             validity: *const column_sender_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
-            let chunk = match unsafe { chunk.as_mut() } {
-                Some(c) => &mut c.0,
+            let chunk_ref = match unsafe { chunk.as_mut() } {
+                Some(c) => c,
                 None => return reject_null_chunk(err_out),
             };
+            let _guard = match InUseGuard::acquire(
+                &chunk_ref.1,
+                stringify!($fn_name),
+                "column_sender_chunk",
+                err_out,
+            ) {
+                Some(g) => g,
+                None => return false,
+            };
+            let chunk = &mut chunk_ref.0;
             let name = match unsafe { name_str(name, name_len, err_out) } {
                 Some(s) => s,
                 None => return false,
@@ -647,10 +779,20 @@ pub unsafe extern "C" fn column_sender_chunk_column_binary(
     validity: *const column_sender_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_chunk_column_binary",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -704,10 +846,20 @@ pub unsafe extern "C" fn column_sender_chunk_column_varchar(
     validity: *const column_sender_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_chunk_column_varchar",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -766,10 +918,20 @@ macro_rules! symbol_fn {
             validity: *const column_sender_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
-            let chunk = match unsafe { chunk.as_mut() } {
-                Some(c) => &mut c.0,
+            let chunk_ref = match unsafe { chunk.as_mut() } {
+                Some(c) => c,
                 None => return reject_null_chunk(err_out),
             };
+            let _guard = match InUseGuard::acquire(
+                &chunk_ref.1,
+                stringify!($fn_name),
+                "column_sender_chunk",
+                err_out,
+            ) {
+                Some(g) => g,
+                None => return false,
+            };
+            let chunk = &mut chunk_ref.0;
             let name = match unsafe { name_str(name, name_len, err_out) } {
                 Some(s) => s,
                 None => return false,
@@ -863,10 +1025,20 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_chunk_append_arrow_column",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -1154,70 +1326,143 @@ unsafe fn validate_f64_ndarray(
 }
 
 unsafe fn resolve_numpy_dtype(
-    dtype: column_sender_numpy_dtype,
+    dtype: u32,
     extras: *const column_sender_numpy_extras,
     err_out: *mut *mut line_sender_error,
 ) -> Option<NumpyDtype> {
-    use column_sender_numpy_dtype as D;
     let extras = unsafe { extras.as_ref() };
     Some(match dtype {
-        D::column_sender_numpy_i64 => NumpyDtype::I64Direct,
-        D::column_sender_numpy_f64 => NumpyDtype::F64Direct,
-        D::column_sender_numpy_datetime64_ms => NumpyDtype::DateI64Direct,
-        D::column_sender_numpy_datetime64_us => NumpyDtype::TimestampMicrosDirect,
-        D::column_sender_numpy_datetime64_ns => NumpyDtype::TimestampNanosDirect,
-        D::column_sender_numpy_timedelta64_s
-        | D::column_sender_numpy_timedelta64_ms
-        | D::column_sender_numpy_timedelta64_us
-        | D::column_sender_numpy_timedelta64_ns => NumpyDtype::LongDirect,
-        D::column_sender_numpy_s16 => NumpyDtype::UuidDirect,
-        D::column_sender_numpy_s32 => NumpyDtype::Long256Direct,
-        D::column_sender_numpy_u32_ipv4 => NumpyDtype::Ipv4Direct,
-        D::column_sender_numpy_u16_char => NumpyDtype::CharDirect,
-
-        D::column_sender_numpy_i8 => NumpyDtype::I8Direct,
-        D::column_sender_numpy_i16 => NumpyDtype::I16Direct,
-        D::column_sender_numpy_i32 => NumpyDtype::I32Direct,
-        D::column_sender_numpy_u8 => NumpyDtype::U8WidenToI32,
-        D::column_sender_numpy_u16 => NumpyDtype::U16WidenToI32,
-        D::column_sender_numpy_u32 => NumpyDtype::U32WidenToI64,
-        D::column_sender_numpy_u64 => NumpyDtype::U64WidenToI64,
-        D::column_sender_numpy_f32 => NumpyDtype::F32Widen,
-        D::column_sender_numpy_f16 => NumpyDtype::F16Widen,
-        D::column_sender_numpy_bool => NumpyDtype::Bool,
-        D::column_sender_numpy_datetime64_s => NumpyDtype::DatetimeSecToMicros,
-        D::column_sender_numpy_datetime64_m => NumpyDtype::DatetimeMinuteToMicros,
-        D::column_sender_numpy_datetime64_h => NumpyDtype::DatetimeHourToMicros,
-        D::column_sender_numpy_datetime64_D => NumpyDtype::DatetimeDayToMicros,
-        D::column_sender_numpy_datetime64_M => NumpyDtype::DatetimeMonthToMicros,
-        D::column_sender_numpy_datetime64_Y => NumpyDtype::DatetimeYearToMicros,
-
-        D::column_sender_numpy_decimal_s8 => NumpyDtype::Decimal64 {
-            scale: unsafe { validate_decimal_scale(extras, 18, "DECIMAL64", err_out)? },
-        },
-        D::column_sender_numpy_decimal_s16 => NumpyDtype::Decimal128 {
-            scale: unsafe { validate_decimal_scale(extras, 38, "DECIMAL128", err_out)? },
-        },
-        D::column_sender_numpy_decimal_s32 => NumpyDtype::Decimal256 {
-            scale: unsafe { validate_decimal_scale(extras, 76, "DECIMAL256", err_out)? },
-        },
-
-        D::column_sender_numpy_geohash_i8 => NumpyDtype::GeohashI8 {
-            bits: unsafe { validate_geohash_bits(extras, 8, err_out)? },
-        },
-        D::column_sender_numpy_geohash_i16 => NumpyDtype::GeohashI16 {
-            bits: unsafe { validate_geohash_bits(extras, 16, err_out)? },
-        },
-        D::column_sender_numpy_geohash_i32 => NumpyDtype::GeohashI32 {
-            bits: unsafe { validate_geohash_bits(extras, 32, err_out)? },
-        },
-        D::column_sender_numpy_geohash_i64 => NumpyDtype::GeohashI64 {
-            bits: unsafe { validate_geohash_bits(extras, 60, err_out)? },
-        },
-
-        D::column_sender_numpy_f64_ndarray => {
+        d if d == column_sender_numpy_dtype::column_sender_numpy_i8 as u32 => {
+            NumpyDtype::I8WidenToI32
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_i16 as u32 => {
+            NumpyDtype::I16WidenToI32
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_i32 as u32 => {
+            NumpyDtype::I32WidenToI64
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_i64 as u32 => {
+            NumpyDtype::I64Direct
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_u8 as u32 => {
+            NumpyDtype::U8WidenToI32
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_u16 as u32 => {
+            NumpyDtype::U16WidenToI32
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_u32 as u32 => {
+            NumpyDtype::U32WidenToI64
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_u64 as u32 => {
+            NumpyDtype::U64WidenToI64
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_f32 as u32 => {
+            NumpyDtype::F32Direct
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_f64 as u32 => {
+            NumpyDtype::F64Direct
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_bool as u32 => NumpyDtype::Bool,
+        d if d == column_sender_numpy_dtype::column_sender_numpy_f16 as u32 => NumpyDtype::F16Widen,
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_s as u32 => {
+            NumpyDtype::DatetimeSecToMicros
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_ms as u32 => {
+            NumpyDtype::DateI64Direct
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_us as u32 => {
+            NumpyDtype::TimestampMicrosDirect
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_ns as u32 => {
+            NumpyDtype::TimestampNanosDirect
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_s as u32
+            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_ms as u32
+            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_us as u32
+            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_ns as u32 =>
+        {
+            NumpyDtype::LongDirect
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_s16 as u32 => {
+            NumpyDtype::UuidDirect
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_s32 as u32 => {
+            NumpyDtype::Long256Direct
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_decimal_s8 as u32 => {
+            NumpyDtype::Decimal64 {
+                scale: unsafe { validate_decimal_scale(extras, 18, "DECIMAL64", err_out)? },
+            }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_decimal_s16 as u32 => {
+            NumpyDtype::Decimal128 {
+                scale: unsafe { validate_decimal_scale(extras, 38, "DECIMAL128", err_out)? },
+            }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_decimal_s32 as u32 => {
+            NumpyDtype::Decimal256 {
+                scale: unsafe { validate_decimal_scale(extras, 76, "DECIMAL256", err_out)? },
+            }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_u32_ipv4 as u32 => {
+            NumpyDtype::Ipv4Direct
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_u16_char as u32 => {
+            NumpyDtype::CharDirect
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i8 as u32 => {
+            NumpyDtype::GeohashI8 {
+                bits: unsafe { validate_geohash_bits(extras, 8, err_out)? },
+            }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i16 as u32 => {
+            NumpyDtype::GeohashI16 {
+                bits: unsafe { validate_geohash_bits(extras, 16, err_out)? },
+            }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i32 as u32 => {
+            NumpyDtype::GeohashI32 {
+                bits: unsafe { validate_geohash_bits(extras, 32, err_out)? },
+            }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_geohash_i64 as u32 => {
+            NumpyDtype::GeohashI64 {
+                bits: unsafe { validate_geohash_bits(extras, 60, err_out)? },
+            }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_f64_ndarray as u32 => {
             let (ndim, shape) = unsafe { validate_f64_ndarray(extras, err_out)? };
             NumpyDtype::F64Ndarray { ndim, shape }
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_m as u32 => {
+            NumpyDtype::DatetimeMinuteToMicros
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_h as u32 => {
+            NumpyDtype::DatetimeHourToMicros
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_D as u32 => {
+            NumpyDtype::DatetimeDayToMicros
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_M as u32 => {
+            NumpyDtype::DatetimeMonthToMicros
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_Y as u32 => {
+            NumpyDtype::DatetimeYearToMicros
+        }
+        other => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "column_sender_chunk_append_numpy_column: invalid dtype {other} \
+                             (expected a column_sender_numpy_* constant)"
+                        ),
+                    ),
+                );
+            }
+            return None;
         }
     })
 }
@@ -1243,17 +1488,27 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
     chunk: *mut column_sender_chunk,
     name: *const c_char,
     name_len: size_t,
-    dtype: column_sender_numpy_dtype,
+    dtype: u32,
     data: *const u8,
     row_count: size_t,
     validity: *const column_sender_validity,
     extras: *const column_sender_numpy_extras,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_chunk_append_numpy_column",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -1283,10 +1538,20 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_micros(
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_chunk_designated_timestamp_micros",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let chunk = &mut chunk_ref.0;
     let data = match unsafe { typed_slice(data, row_count, err_out, "designated_ts micros") } {
         Some(s) => s,
         None => return false,
@@ -1302,10 +1567,20 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_chunk_designated_timestamp_nanos",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let chunk = &mut chunk_ref.0;
     let data = match unsafe { typed_slice(data, row_count, err_out, "designated_ts nanos") } {
         Some(s) => s,
         None => return false,
@@ -1339,8 +1614,8 @@ pub unsafe extern "C" fn column_sender_flush(
     chunk: *mut column_sender_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = match unsafe { conn.as_mut() } {
-        Some(c) => c.0.get_mut(),
+    let conn_ref = match unsafe { conn.as_mut() } {
+        Some(c) => c,
         None => {
             unsafe {
                 set_err_out_from_error(
@@ -1354,10 +1629,26 @@ pub unsafe extern "C" fn column_sender_flush(
             return false;
         }
     };
-    let chunk = match unsafe { chunk.as_mut() } {
-        Some(c) => &mut c.0,
+    let _conn_guard =
+        match InUseGuard::acquire(&conn_ref.1, "column_sender_flush", "qwpws_conn", err_out) {
+            Some(g) => g,
+            None => return false,
+        };
+    let chunk_ref = match unsafe { chunk.as_mut() } {
+        Some(c) => c,
         None => return reject_null_chunk(err_out),
     };
+    let _chunk_guard = match InUseGuard::acquire(
+        &chunk_ref.1,
+        "column_sender_flush",
+        "column_sender_chunk",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let sender = conn_ref.0.get_mut();
+    let chunk = &mut chunk_ref.0;
     bubble!(err_out, sender.flush(chunk));
     true
 }
@@ -1391,7 +1682,18 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch(
     schema: *const arrow::ffi::FFI_ArrowSchema,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { arrow_batch_impl(conn, table, array, schema, None, err_out) }
+    unsafe {
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            None,
+            std::ptr::null(),
+            0,
+            err_out,
+        )
+    }
 }
 
 /// Variant of [`column_sender_flush_arrow_batch`] that sources each
@@ -1409,20 +1711,218 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
     ts_column: line_sender_column_name,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { arrow_batch_impl(conn, table, array, schema, Some(ts_column), err_out) }
+    unsafe {
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            Some(ts_column),
+            std::ptr::null(),
+            0,
+            err_out,
+        )
+    }
+}
+
+/// Per-column wire-type hint kind passed in
+/// [`column_sender_arrow_override::kind`].
+#[cfg(feature = "arrow")]
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum column_sender_arrow_override_kind {
+    column_sender_arrow_override_symbol = 0,
+    column_sender_arrow_override_ipv4 = 1,
+    column_sender_arrow_override_char = 2,
+    column_sender_arrow_override_geohash = 3,
+}
+
+/// Per-column wire-type hint that overrides what the encoder would
+/// otherwise derive from the Arrow `Field`'s data type alone. Caller
+/// owns `column`; the bytes are borrowed for the duration of the
+/// `*_with_overrides` call and must outlive it.
+#[cfg(feature = "arrow")]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct column_sender_arrow_override {
+    /// UTF-8 column name; not necessarily NUL-terminated.
+    pub column: *const c_char,
+    pub column_len: size_t,
+    /// One of `column_sender_arrow_override_kind` as `u32`.
+    pub kind: u32,
+    /// For `_geohash`: precision bits (1..=60). Ignored for other
+    /// kinds; pass 0.
+    pub arg: u32,
+}
+
+/// Variant of [`column_sender_flush_arrow_batch`] that supplies
+/// per-column wire-type hints without requiring the caller to attach
+/// `questdb.*` Field metadata to the Arrow schema. Same ownership
+/// contract as [`column_sender_flush_arrow_batch`]. Returns `false`
+/// with `line_sender_error_invalid_api_call` if any override targets
+/// an unknown column, duplicates another override, carries invalid
+/// UTF-8 in `column`, has an unknown `kind`, or — for `_geohash` —
+/// carries `arg` outside `1..=60`.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_with_overrides(
+    conn: *mut qwpws_conn,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            None,
+            overrides,
+            overrides_len,
+            err_out,
+        )
+    }
+}
+
+/// Variant of [`column_sender_flush_arrow_batch_at_column`] that
+/// supplies per-column wire-type hints. Same ownership and validation
+/// contract as [`column_sender_flush_arrow_batch_with_overrides`].
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_with_overrides(
+    conn: *mut qwpws_conn,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: line_sender_column_name,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            Some(ts_column),
+            overrides,
+            overrides_len,
+            err_out,
+        )
+    }
 }
 
 #[cfg(feature = "arrow")]
+unsafe fn arrow_overrides_from_c<'a>(
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> Option<Vec<ArrowColumnOverride<'a>>> {
+    if overrides_len == 0 {
+        return Some(Vec::new());
+    }
+    if overrides.is_null() {
+        crate::arrow_err_to_c_box(
+            err_out,
+            ErrorCode::InvalidApiCall,
+            "column_sender_flush_arrow_batch_with_overrides: overrides pointer is NULL".to_string(),
+        );
+        return None;
+    }
+    let raw = unsafe { std::slice::from_raw_parts(overrides, overrides_len) };
+    let mut out = Vec::with_capacity(raw.len());
+    for ov in raw {
+        if ov.column.is_null() || ov.column_len == 0 {
+            crate::arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "arrow override has empty column name".to_string(),
+            );
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(ov.column as *const u8, ov.column_len) };
+        let column = match str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                crate::arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "arrow override column name is not valid UTF-8".to_string(),
+                );
+                return None;
+            }
+        };
+        let parsed = match ov.kind {
+            x if x
+                == column_sender_arrow_override_kind::column_sender_arrow_override_symbol
+                    as u32 =>
+            {
+                ArrowColumnOverride::Symbol { column }
+            }
+            x if x
+                == column_sender_arrow_override_kind::column_sender_arrow_override_ipv4 as u32 =>
+            {
+                ArrowColumnOverride::Ipv4 { column }
+            }
+            x if x
+                == column_sender_arrow_override_kind::column_sender_arrow_override_char as u32 =>
+            {
+                ArrowColumnOverride::Char { column }
+            }
+            x if x
+                == column_sender_arrow_override_kind::column_sender_arrow_override_geohash
+                    as u32 =>
+            {
+                if ov.arg == 0 || ov.arg > 60 {
+                    crate::arrow_err_to_c_box(
+                        err_out,
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "arrow override for column '{}' has invalid geohash bits {} \
+                             (must be 1..=60)",
+                            column, ov.arg
+                        ),
+                    );
+                    return None;
+                }
+                ArrowColumnOverride::Geohash {
+                    column,
+                    bits: ov.arg as u8,
+                }
+            }
+            other => {
+                crate::arrow_err_to_c_box(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!("unknown arrow override kind {}", other),
+                );
+                return None;
+            }
+        };
+        out.push(parsed);
+    }
+    Some(out)
+}
+
+#[cfg(feature = "arrow")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl(
     conn: *mut qwpws_conn,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: Option<line_sender_column_name>,
+    overrides_ptr: *const column_sender_arrow_override,
+    overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = match unsafe { conn.as_mut() } {
-        Some(c) => c.0.get_mut(),
+    let conn_ref = match unsafe { conn.as_mut() } {
+        Some(c) => c,
         None => {
             crate::arrow_err_to_c_box(
                 err_out,
@@ -1432,6 +1932,20 @@ unsafe fn arrow_batch_impl(
             return false;
         }
     };
+    let _guard = match InUseGuard::acquire(
+        &conn_ref.1,
+        "column_sender_flush_arrow_batch",
+        "qwpws_conn",
+        err_out,
+    ) {
+        Some(g) => g,
+        None => return false,
+    };
+    let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let sender = conn_ref.0.get_mut();
     let rb = match unsafe {
         crate::arrow_ffi_import_record_batch(
             array,
@@ -1445,8 +1959,13 @@ unsafe fn arrow_batch_impl(
     };
     let table_name = unsafe { table.as_name() };
     let result = match ts_column {
-        Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name()),
-        None => sender.flush_arrow_batch(table_name, &rb),
+        Some(ts) => sender.flush_arrow_batch_at_column_with_overrides(
+            table_name,
+            &rb,
+            ts.as_name(),
+            &overrides,
+        ),
+        None => sender.flush_arrow_batch_with_overrides(table_name, &rb, &overrides),
     };
     bubble!(err_out, result);
     true
@@ -1463,11 +1982,15 @@ unsafe fn arrow_batch_impl(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_sync(
     conn: *mut qwpws_conn,
-    ack_level: column_sender_ack_level,
+    ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = match unsafe { conn.as_mut() } {
-        Some(c) => c.0.get_mut(),
+    let ack_level = match ack_level_from_u32(ack_level, err_out) {
+        Some(l) => l,
+        None => return false,
+    };
+    let conn_ref = match unsafe { conn.as_mut() } {
+        Some(c) => c,
         None => {
             unsafe {
                 set_err_out_from_error(
@@ -1481,7 +2004,13 @@ pub unsafe extern "C" fn column_sender_sync(
             return false;
         }
     };
-    bubble!(err_out, sender.sync(ack_level.into()));
+    let _guard = match InUseGuard::acquire(&conn_ref.1, "column_sender_sync", "qwpws_conn", err_out)
+    {
+        Some(g) => g,
+        None => return false,
+    };
+    let sender = conn_ref.0.get_mut();
+    bubble!(err_out, sender.sync(ack_level));
     true
 }
 
@@ -1756,14 +2285,25 @@ mod tests {
     }
 
     #[test]
-    fn ack_level_enum_maps_correctly() {
+    fn ack_level_constants_map_correctly() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
         assert_eq!(
-            AckLevel::from(column_sender_ack_level::column_sender_ack_level_ok),
-            AckLevel::Ok
+            ack_level_from_u32(column_sender_ack_level_ok, &mut err),
+            Some(AckLevel::Ok)
         );
+        assert!(err.is_null());
         assert_eq!(
-            AckLevel::from(column_sender_ack_level::column_sender_ack_level_durable),
-            AckLevel::Durable
+            ack_level_from_u32(column_sender_ack_level_durable, &mut err),
+            Some(AckLevel::Durable)
         );
+        assert!(err.is_null());
+    }
+
+    #[test]
+    fn ack_level_rejects_out_of_range() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        assert_eq!(ack_level_from_u32(99, &mut err), None);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
     }
 }

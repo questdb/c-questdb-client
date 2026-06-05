@@ -64,6 +64,19 @@ bool example(const std::string& host, const std::string& port)
         return false;
     }
 
+    struct arrow_c_guard
+    {
+        ArrowArray& a;
+        ArrowSchema& s;
+        ~arrow_c_guard()
+        {
+            if (a.release)
+                a.release(&a);
+            if (s.release)
+                s.release(&s);
+        }
+    };
+
     bool ok = false;
     try
     {
@@ -77,13 +90,9 @@ bool example(const std::string& host, const std::string& port)
         }
         else
         {
-            // Designated timestamp pulled from the "ts" column. On
-            // success `c_arr` is consumed by the conn-level flush;
-            // `c_sch` is borrowed (we release it).
+            arrow_c_guard guard{c_arr, c_sch};
             qdb::column_sender_conn conn{raw_conn};
             conn.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
-            if (c_sch.release)
-                c_sch.release(&c_sch);
             if (!::column_sender_sync(raw_conn, ::column_sender_ack_level_ok, &err))
             {
                 std::fprintf(

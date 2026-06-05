@@ -1798,9 +1798,11 @@ public:
     /**
      * Construct a new line buffer with the sender's configured settings.
      *
-     * This is the preferred protocol-neutral constructor. It may produce a
-     * different buffer implementation than `line_sender_buffer{protocol_version()}`
-     * when the sender uses QWP-over-UDP or QWP-over-WebSocket.
+     * Returns an ILP buffer for the ILP/TCP and ILP/HTTP transports, and a
+     * QWP/UDP buffer for the QWP-over-UDP transport. Throws
+     * `invalid_api_call` for QWP-over-WebSocket transports — those senders
+     * publish through the column-major `column_sender` chunk API instead;
+     * see `<questdb/ingress/column_sender.hpp>`.
      */
     line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {

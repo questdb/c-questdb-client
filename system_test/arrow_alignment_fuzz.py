@@ -52,9 +52,10 @@ def _exercise_compute_kernels(rb: pa.RecordBatch, kinds: List[Tuple[str, KindSpe
         elif name in {"uuid", "long256"}:
             assert col.type.byte_width in (16, 32)
         elif name in {"timestamp", "timestamp_ns", "date"}:
-            min_v = pc.min(col).as_py()
-            max_v = pc.max(col).as_py()
+            min_v = pc.min(pc.cast(col, "int64")).as_py()
+            max_v = pc.max(pc.cast(col, "int64")).as_py()
             assert min_v is not None and max_v is not None
+            assert min_v <= max_v
 
 
 def _populate_via_ilp(sender, table: str, kinds, values_per_col, ts_base_us: int) -> None:

@@ -40,7 +40,7 @@ use crate::ingress::{ColumnName, TableName};
 use crate::{Result, error};
 
 #[cfg(feature = "arrow")]
-use super::arrow_batch;
+use super::arrow_batch::{self, ArrowColumnOverride};
 use super::chunk::Chunk;
 use super::conn::ColumnConn;
 use super::encoder::{self, SchemaRegistry};
@@ -162,8 +162,21 @@ impl ColumnSender {
     /// all accumulated rows.
     #[cfg(feature = "arrow")]
     pub fn flush_arrow_batch(&mut self, table: TableName<'_>, batch: &RecordBatch) -> Result<()> {
+        self.flush_arrow_batch_with_overrides(table, batch, &[])
+    }
+
+    /// Variant of [`Self::flush_arrow_batch`] that supplies per-column
+    /// wire-type hints without requiring the caller to patch the Arrow
+    /// `Field` metadata first.
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch_with_overrides(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<()> {
         let defer = self.first_frame_sent;
-        self.flush_arrow_batch_inner(table, batch, None, defer)?;
+        self.flush_arrow_batch_inner(table, batch, None, overrides, defer)?;
         self.first_frame_sent = true;
         Ok(())
     }
@@ -180,9 +193,23 @@ impl ColumnSender {
         batch: &RecordBatch,
         ts_column: ColumnName<'_>,
     ) -> Result<()> {
+        self.flush_arrow_batch_at_column_with_overrides(table, batch, ts_column, &[])
+    }
+
+    /// Variant of [`Self::flush_arrow_batch_at_column`] that supplies
+    /// per-column wire-type hints without requiring the caller to patch
+    /// the Arrow `Field` metadata first.
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch_at_column_with_overrides(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<()> {
         let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
         let defer = self.first_frame_sent;
-        self.flush_arrow_batch_inner(table, batch, Some(ts_col_idx), defer)?;
+        self.flush_arrow_batch_inner(table, batch, Some(ts_col_idx), overrides, defer)?;
         self.first_frame_sent = true;
         Ok(())
     }
@@ -247,6 +274,7 @@ impl ColumnSender {
         table: TableName<'_>,
         batch: &RecordBatch,
         ts_col_idx: Option<usize>,
+        overrides: &[ArrowColumnOverride<'_>],
         defer_commit: bool,
     ) -> Result<()> {
         self.conn.try_drain_acks()?;
@@ -272,6 +300,7 @@ impl ColumnSender {
                 table,
                 batch,
                 ts_col_idx,
+                overrides,
                 schema,
                 dict,
                 defer_commit,

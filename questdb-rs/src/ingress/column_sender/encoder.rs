@@ -61,19 +61,51 @@ pub(crate) struct SchemaRegistry {
     next_id: u64,
 }
 
+/// Restore point for [`SchemaRegistry`]. Captured before encoding a
+/// frame and passed to [`SchemaRegistry::rollback`] if encoding fails
+/// before the bytes hit the wire — otherwise the client and server
+/// would diverge on the schema-id allocation.
+pub(crate) struct SchemaRegistryMark {
+    next_id: u64,
+    by_signature_len: usize,
+    inserted_signature: Option<Vec<u8>>,
+}
+
 impl SchemaRegistry {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(super) fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
+    pub(super) fn mark(&self) -> SchemaRegistryMark {
+        SchemaRegistryMark {
+            next_id: self.next_id,
+            by_signature_len: self.by_signature.len(),
+            inserted_signature: None,
+        }
+    }
+
+    pub(super) fn intern(
+        &mut self,
+        signature: &[u8],
+        mark: &mut SchemaRegistryMark,
+    ) -> (u64, bool) {
         if let Some(&id) = self.by_signature.get(signature) {
             return (id, false);
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.by_signature.insert(signature.to_vec(), id);
+        let owned = signature.to_vec();
+        mark.inserted_signature = Some(owned.clone());
+        self.by_signature.insert(owned, id);
         (id, true)
+    }
+
+    pub(super) fn rollback(&mut self, mark: SchemaRegistryMark) {
+        if let Some(sig) = mark.inserted_signature {
+            self.by_signature.remove(&sig);
+        }
+        self.next_id = mark.next_id;
+        debug_assert_eq!(self.by_signature.len(), mark.by_signature_len);
     }
 
     #[cfg(test)]
@@ -135,6 +167,14 @@ pub(crate) fn encode_chunk_into(
             "Chunk row_count is 0; flush at least one row or hand back an empty chunk."
         ));
     }
+    if row_count > super::MAX_CHUNK_ROWS {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Chunk row_count {} exceeds MAX_CHUNK_ROWS ({}); split into smaller chunks",
+            row_count,
+            super::MAX_CHUNK_ROWS
+        ));
+    }
     validate_name("table", &chunk.table)?;
 
     let table_bytes = chunk.table.as_bytes();
@@ -180,7 +220,47 @@ pub(crate) fn encode_chunk_into(
     write_qwp_bytes(&mut scratch.signature, &[]); // designated_ts has empty name
     scratch.signature.push(designated.wire_type);
 
-    let (schema_id, is_new_schema) = schema_registry.intern(&scratch.signature);
+    let frame_start = out.len();
+    let mut schema_mark = schema_registry.mark();
+    let result = encode_frame_after_signature(
+        out,
+        chunk,
+        designated,
+        row_count,
+        column_count,
+        table_bytes,
+        delta_start,
+        defer_commit,
+        scratch,
+        schema_registry,
+        &mut schema_mark,
+    );
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            out.truncate(frame_start);
+            schema_registry.rollback(schema_mark);
+            symbol_dict.rollback(dict_mark);
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_frame_after_signature(
+    out: &mut Vec<u8>,
+    chunk: &Chunk<'_>,
+    designated: &DesignatedTsDescriptor,
+    row_count: usize,
+    column_count: usize,
+    table_bytes: &[u8],
+    delta_start: u64,
+    defer_commit: bool,
+    scratch: &EncodeScratch,
+    schema_registry: &mut SchemaRegistry,
+    schema_mark: &mut SchemaRegistryMark,
+) -> Result<()> {
+    let (schema_id, is_new_schema) = schema_registry.intern(&scratch.signature, schema_mark);
 
     let estimated = estimate_frame_size(
         chunk,
@@ -189,9 +269,14 @@ pub(crate) fn encode_chunk_into(
         &scratch.new_symbols,
         &scratch.per_column,
     );
-    out.reserve(estimated);
+    out.try_reserve(estimated).map_err(|_| {
+        error::fmt!(
+            InvalidApiCall,
+            "allocator could not reserve {} bytes for QWP frame",
+            estimated
+        )
+    })?;
 
-    // --- Reserve frame header placeholder ---
     let frame_start = out.len();
     write_header_placeholder(out, /* table_count = */ 1, defer_commit);
     let payload_start = out.len();
@@ -221,7 +306,6 @@ pub(crate) fn encode_chunk_into(
         }
     }
 
-    // --- Designated timestamp ---
     encode_designated_ts(out, designated, row_count);
 
     let payload_len_usize = out.len() - payload_start;
@@ -578,10 +662,15 @@ unsafe fn encode_sentinel_le<T, const N: usize>(
     out.reserve(N * row_count);
     match validity {
         None => {
-            // Hot path: contiguous typed buffer → bulk memcpy via byte
-            // reinterpret. POD numerics, any byte pattern is sound.
-            let bytes = unsafe { slice::from_raw_parts(data as *const u8, row_count * N) };
-            out.extend_from_slice(bytes);
+            if cfg!(target_endian = "little") {
+                let bytes = unsafe { slice::from_raw_parts(data as *const u8, row_count * N) };
+                out.extend_from_slice(bytes);
+            } else {
+                for i in 0..row_count {
+                    let value = unsafe { *data.add(i) };
+                    out.extend_from_slice(&to_le(value));
+                }
+            }
         }
         Some(v) => {
             for i in 0..row_count {
@@ -611,8 +700,15 @@ unsafe fn encode_bitmap_le<T, const N: usize>(
         None => {
             out.push(0);
             out.reserve(N * row_count);
-            let bytes = unsafe { slice::from_raw_parts(data as *const u8, row_count * N) };
-            out.extend_from_slice(bytes);
+            if cfg!(target_endian = "little") {
+                let bytes = unsafe { slice::from_raw_parts(data as *const u8, row_count * N) };
+                out.extend_from_slice(bytes);
+            } else {
+                for i in 0..row_count {
+                    let value = unsafe { *data.add(i) };
+                    out.extend_from_slice(&to_le(value));
+                }
+            }
         }
         Some(v) => {
             out.push(1);
@@ -704,9 +800,7 @@ unsafe fn encode_varchar(
             out.push(0); // null_flag
             out.reserve(4 * (row_count + 1) + bytes_len);
             let base = offsets_slice[0];
-            if base == 0 {
-                // Hot path: offset table is bit-identical to LE u32 for
-                // non-negative i32; memcpy both halves.
+            if base == 0 && cfg!(target_endian = "little") {
                 let offset_bytes = unsafe {
                     slice::from_raw_parts(
                         offsets as *const u8,
@@ -714,6 +808,12 @@ unsafe fn encode_varchar(
                     )
                 };
                 out.extend_from_slice(offset_bytes);
+                let used = offsets_slice[row_count] as usize;
+                out.extend_from_slice(&bytes_slice[..used]);
+            } else if base == 0 {
+                for &off in offsets_slice {
+                    out.extend_from_slice(&(off as u32).to_le_bytes());
+                }
                 let used = offsets_slice[row_count] as usize;
                 out.extend_from_slice(&bytes_slice[..used]);
             } else {
@@ -870,11 +970,19 @@ unsafe fn emit_symbol_rows<T>(
 fn encode_designated_ts(out: &mut Vec<u8>, ts: &DesignatedTsDescriptor, row_count: usize) {
     out.push(0); // designated_ts is always non-null
     out.reserve(8 * row_count);
-    // SAFETY: caller buffer lifetime is the chunk's `'a`.
-    let bytes = unsafe {
-        slice::from_raw_parts(ts.data as *const u8, row_count * std::mem::size_of::<i64>())
-    };
-    out.extend_from_slice(bytes);
+    if cfg!(target_endian = "little") {
+        // SAFETY: caller buffer lifetime is the chunk's `'a`; i64 layout
+        // matches LE wire bytes on a little-endian host.
+        let bytes = unsafe {
+            slice::from_raw_parts(ts.data as *const u8, row_count * std::mem::size_of::<i64>())
+        };
+        out.extend_from_slice(bytes);
+    } else {
+        for i in 0..row_count {
+            let v = unsafe { *ts.data.add(i) };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
 }
 
 // ===========================================================================

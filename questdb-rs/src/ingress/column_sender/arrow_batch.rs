@@ -44,7 +44,8 @@ use arrow_array::{
     types::{UInt8Type, UInt16Type, UInt32Type},
 };
 use arrow_buffer::NullBuffer;
-use arrow_schema::{DataType, Field, TimeUnit};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
+use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode};
 use crate::ingress::buffer::SymbolGlobalDict;
@@ -62,10 +63,139 @@ use super::wire::{
     validate_name, write_qwp_bytes, write_qwp_varint,
 };
 
-const MAX_ARROW_INGEST_ROWS: usize = 16 * 1024 * 1024;
+use super::MAX_CHUNK_ROWS as MAX_ARROW_INGEST_ROWS;
 const COLUMN_ERR_PREFIX: &str = "[column='";
 
 use crate::ingress::buffer::QWP_DECIMAL_MAX_SCALE;
+
+/// Per-column wire-type hint that overrides what `classify()` would
+/// otherwise derive from the Arrow `Field`'s data type alone. Useful
+/// when the Arrow source has no `questdb.*` Field metadata to carry
+/// the hint (e.g. Polars frames built without pyarrow).
+#[derive(Clone, Copy, Debug)]
+pub enum ArrowColumnOverride<'a> {
+    /// Treat a UTF-8 / LargeUtf8 / Utf8View column as `SYMBOL`.
+    Symbol { column: &'a str },
+    /// Treat a UInt32 column as `IPV4`.
+    Ipv4 { column: &'a str },
+    /// Treat a UInt16 column as `CHAR`.
+    Char { column: &'a str },
+    /// Treat an Int8/16/32/64 column as `GEOHASH(bits)`. `bits` must
+    /// be in `1..=60`.
+    Geohash { column: &'a str, bits: u8 },
+}
+
+impl<'a> ArrowColumnOverride<'a> {
+    /// Name of the column this override applies to.
+    pub fn column(&self) -> &'a str {
+        match *self {
+            Self::Symbol { column }
+            | Self::Ipv4 { column }
+            | Self::Char { column }
+            | Self::Geohash { column, .. } => column,
+        }
+    }
+}
+
+// We patch field metadata up-front rather than extending `classify`'s
+// signature: it keeps the per-column hot loop unchanged and lets the
+// override path reuse every existing metadata-driven branch.
+pub(crate) fn apply_overrides(
+    schema: &SchemaRef,
+    overrides: &[ArrowColumnOverride<'_>],
+) -> Result<SchemaRef> {
+    use std::collections::HashMap;
+
+    let mut by_name: HashMap<&str, &ArrowColumnOverride<'_>> =
+        HashMap::with_capacity(overrides.len());
+    for ov in overrides {
+        if by_name.insert(ov.column(), ov).is_some() {
+            return Err(fmt!(
+                ArrowIngest,
+                "duplicate arrow override for column '{}'",
+                ov.column()
+            ));
+        }
+    }
+
+    for ov in overrides {
+        if !schema.fields().iter().any(|f| f.name() == ov.column()) {
+            return Err(fmt!(
+                ArrowIngest,
+                "override targets unknown column '{}'",
+                ov.column()
+            ));
+        }
+        if let ArrowColumnOverride::Geohash { bits, column } = *ov
+            && (bits == 0 || bits > 60)
+        {
+            return Err(fmt!(
+                ArrowIngest,
+                "override for column '{}' has invalid geohash bits {} (must be 1..=60)",
+                column,
+                bits
+            ));
+        }
+    }
+
+    let mut patched_fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields().len());
+    let mut any_changed = false;
+    for field in schema.fields().iter() {
+        let Some(ov) = by_name.get(field.name().as_str()) else {
+            patched_fields.push(field.clone());
+            continue;
+        };
+        let mut md = field.metadata().clone();
+        match **ov {
+            ArrowColumnOverride::Symbol { .. } => {
+                md.insert(
+                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
+                    "symbol".to_string(),
+                );
+                md.insert(
+                    crate::egress::arrow::metadata::SYMBOL.to_string(),
+                    "true".to_string(),
+                );
+            }
+            ArrowColumnOverride::Ipv4 { .. } => {
+                md.insert(
+                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
+                    "ipv4".to_string(),
+                );
+            }
+            ArrowColumnOverride::Char { .. } => {
+                md.insert(
+                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
+                    "char".to_string(),
+                );
+            }
+            ArrowColumnOverride::Geohash { bits, .. } => {
+                md.insert(
+                    crate::egress::arrow::metadata::GEOHASH_BITS.to_string(),
+                    bits.to_string(),
+                );
+            }
+        }
+        if md == *field.metadata() {
+            patched_fields.push(field.clone());
+        } else {
+            any_changed = true;
+            let new_field = Field::new(
+                field.name().clone(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+            .with_metadata(md);
+            patched_fields.push(Arc::new(new_field));
+        }
+    }
+
+    if !any_changed {
+        return Ok(schema.clone());
+    }
+    let new_schema = ArrowSchema::new_with_metadata(patched_fields, schema.metadata().clone());
+    Ok(Arc::new(new_schema))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DictKey {
@@ -96,6 +226,9 @@ pub(crate) enum ColumnKind {
     F64,
     Char,
     Ipv4,
+    I8WidenToI32,
+    I16WidenToI32,
+    I32WidenToI64,
     U8WidenToI32,
     U16WidenToI32,
     U32WidenToI64,
@@ -158,6 +291,18 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         }
         Ok(bits)
     };
+    if md_geo_bits.is_some()
+        && let Some(t) = md_type
+        && !t.starts_with("geohash")
+    {
+        return Err(fmt!(
+            ArrowIngest,
+            "column '{}' carries 'questdb.geohash_bits' but column_type='{}'; \
+             drop one of the hints or set column_type='geohash'",
+            field.name(),
+            t
+        ));
+    }
     Ok(match (field.data_type(), md_type, md_ext) {
         (DataType::Boolean, _, _) => ColumnKind::Bool,
         (DataType::Int8, Some("byte"), _) => ColumnKind::I8,
@@ -175,15 +320,17 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Int8, _, _) if md_geo_bits.is_some() => {
             ColumnKind::Geohash(check_geohash_width(md_geo_bits.unwrap(), 8, "Int8")?)
         }
-        (DataType::Int8, _, _) => ColumnKind::I8,
+        (DataType::Int8, _, _) => ColumnKind::I8WidenToI32,
+        (DataType::Int16, Some("short"), _) => ColumnKind::I16,
         (DataType::Int16, _, _) if md_geo_bits.is_some() => {
             ColumnKind::Geohash(check_geohash_width(md_geo_bits.unwrap(), 16, "Int16")?)
         }
-        (DataType::Int16, _, _) => ColumnKind::I16,
+        (DataType::Int16, _, _) => ColumnKind::I16WidenToI32,
+        (DataType::Int32, Some("int"), _) => ColumnKind::I32,
         (DataType::Int32, _, _) if md_geo_bits.is_some() => {
             ColumnKind::Geohash(check_geohash_width(md_geo_bits.unwrap(), 32, "Int32")?)
         }
-        (DataType::Int32, _, _) => ColumnKind::I32,
+        (DataType::Int32, _, _) => ColumnKind::I32WidenToI64,
         (DataType::Int64, _, _) if md_geo_bits.is_some() => {
             ColumnKind::Geohash(check_geohash_width(md_geo_bits.unwrap(), 60, "Int64")?)
         }
@@ -341,8 +488,13 @@ pub(crate) fn wire_type_byte(kind: ColumnKind, _has_nulls: bool) -> u8 {
         ColumnKind::Bool => QWP_TYPE_BOOLEAN,
         ColumnKind::I8 => QWP_TYPE_BYTE,
         ColumnKind::I16 => QWP_TYPE_SHORT,
-        ColumnKind::I32 | ColumnKind::U8WidenToI32 | ColumnKind::U16WidenToI32 => QWP_TYPE_INT,
+        ColumnKind::I32
+        | ColumnKind::I8WidenToI32
+        | ColumnKind::I16WidenToI32
+        | ColumnKind::U8WidenToI32
+        | ColumnKind::U16WidenToI32 => QWP_TYPE_INT,
         ColumnKind::I64
+        | ColumnKind::I32WidenToI64
         | ColumnKind::U32WidenToI64
         | ColumnKind::U64WidenToI64Checked
         | ColumnKind::TimeAsLong(_)
@@ -1988,6 +2140,48 @@ pub(crate) fn write_arrow_column_body(
                 })
             }
         }
+        ColumnKind::I8WidenToI32 => {
+            let a = arr.as_any().downcast_ref::<Int8Array>().unwrap();
+            if null_count == 0 {
+                try_reserve_bytes(out, a.values().len() * 4, "I8 widen column")?;
+                for &v in a.values() {
+                    out.extend_from_slice(&(v as i32).to_le_bytes());
+                }
+                Ok(())
+            } else {
+                full_with_sentinel::<4>(out, arr, i32::MIN.to_le_bytes(), |row| {
+                    (a.value(row) as i32).to_le_bytes()
+                })
+            }
+        }
+        ColumnKind::I16WidenToI32 => {
+            let a = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+            if null_count == 0 {
+                try_reserve_bytes(out, a.values().len() * 4, "I16 widen column")?;
+                for &v in a.values() {
+                    out.extend_from_slice(&(v as i32).to_le_bytes());
+                }
+                Ok(())
+            } else {
+                full_with_sentinel::<4>(out, arr, i32::MIN.to_le_bytes(), |row| {
+                    (a.value(row) as i32).to_le_bytes()
+                })
+            }
+        }
+        ColumnKind::I32WidenToI64 => {
+            let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+            if null_count == 0 {
+                try_reserve_bytes(out, a.values().len() * 8, "I32 widen column")?;
+                for &v in a.values() {
+                    out.extend_from_slice(&(v as i64).to_le_bytes());
+                }
+                Ok(())
+            } else {
+                full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
+                    (a.value(row) as i64).to_le_bytes()
+                })
+            }
+        }
         ColumnKind::F16ToF32 => {
             let a = arr.as_any().downcast_ref::<Float16Array>().unwrap();
             if null_count == 0 {
@@ -2468,16 +2662,23 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
     debug_assert_eq!(out.len() - start, QWP_HEADER_LEN);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_arrow_batch_into(
     out: &mut Vec<u8>,
     table: TableName<'_>,
     batch: &RecordBatch,
     ts_col_idx: Option<usize>,
+    overrides: &[ArrowColumnOverride<'_>],
     schema_registry: &mut SchemaRegistry,
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
 ) -> Result<()> {
     let schema = batch.schema();
+    let schema = if overrides.is_empty() {
+        schema
+    } else {
+        apply_overrides(&schema, overrides)?
+    };
     let row_count = batch.num_rows();
     let total_cols = batch.num_columns();
     if schema.fields().len() != total_cols {
@@ -2564,11 +2765,13 @@ pub(crate) fn encode_arrow_batch_into(
         write_qwp_bytes(&mut signature, &[]);
         signature.push(ts_byte);
     }
-    let (schema_id, is_new_schema) = schema_registry.intern(&signature);
+    let mut schema_mark = schema_registry.mark();
+    let (schema_id, is_new_schema) = schema_registry.intern(&signature, &mut schema_mark);
 
     let frame_start = out.len();
     let estimated = estimate_frame_size(&classified, &resolution, ts_col_idx, row_count, table);
     if let Err(_e) = out.try_reserve(estimated) {
+        schema_registry.rollback(schema_mark);
         symbol_dict.rollback(dict_mark);
         return Err(fmt!(
             ArrowIngest,
@@ -2598,8 +2801,16 @@ pub(crate) fn encode_arrow_batch_into(
         write_qwp_varint(out, schema_id);
     }
 
-    let rollback_on_err = |out: &mut Vec<u8>, dict: &mut SymbolGlobalDict, e: Error| -> Error {
+    let mut schema_mark_holder = Some(schema_mark);
+    let mut rollback_on_err = |out: &mut Vec<u8>,
+                               dict: &mut SymbolGlobalDict,
+                               schema_registry: &mut SchemaRegistry,
+                               e: Error|
+     -> Error {
         out.truncate(frame_start);
+        if let Some(m) = schema_mark_holder.take() {
+            schema_registry.rollback(m);
+        }
         dict.rollback(dict_mark);
         e
     };
@@ -2611,6 +2822,7 @@ pub(crate) fn encode_arrow_batch_into(
             return Err(rollback_on_err(
                 out,
                 symbol_dict,
+                schema_registry,
                 decorate_column(e, &col_name),
             ));
         }
@@ -2624,6 +2836,7 @@ pub(crate) fn encode_arrow_batch_into(
             return Err(rollback_on_err(
                 out,
                 symbol_dict,
+                schema_registry,
                 decorate_column(e, &field_name),
             ));
         }
@@ -2636,6 +2849,7 @@ pub(crate) fn encode_arrow_batch_into(
             return Err(rollback_on_err(
                 out,
                 symbol_dict,
+                schema_registry,
                 fmt!(
                     ArrowIngest,
                     "QWP frame payload size {} bytes exceeds u32::MAX; \
@@ -2677,10 +2891,13 @@ fn estimate_frame_size(
             | ColumnKind::F32
             | ColumnKind::F16ToF32
             | ColumnKind::Ipv4
+            | ColumnKind::I8WidenToI32
+            | ColumnKind::I16WidenToI32
             | ColumnKind::U8WidenToI32
             | ColumnKind::U16WidenToI32 => 4 * row_count,
             ColumnKind::I64
             | ColumnKind::F64
+            | ColumnKind::I32WidenToI64
             | ColumnKind::U32WidenToI64
             | ColumnKind::U64WidenToI64Checked
             | ColumnKind::TimestampSecondToMicros
@@ -2765,6 +2982,7 @@ mod tests {
             tbl(table_name),
             batch,
             None,
+            &[],
             &mut reg,
             &mut dict,
             false,
@@ -2784,6 +3002,7 @@ mod tests {
             tbl("t"),
             batch,
             Some(ts_idx),
+            &[],
             &mut reg,
             &mut dict,
             false,
@@ -2796,8 +3015,17 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), batch, None, &mut reg, &mut dict, false)
-            .unwrap_err()
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            batch,
+            None,
+            &[],
+            &mut reg,
+            &mut dict,
+            false,
+        )
+        .unwrap_err()
     }
 
     fn encode_err_at_ts(batch: &RecordBatch, ts_idx: usize) -> Error {
@@ -2809,6 +3037,7 @@ mod tests {
             tbl("t"),
             batch,
             Some(ts_idx),
+            &[],
             &mut reg,
             &mut dict,
             false,
@@ -2900,7 +3129,17 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &mut reg, &mut dict, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            &[],
+            &mut reg,
+            &mut dict,
+            false,
+        )
+        .unwrap();
         assert_qwp_header(&out, 1);
         assert_eq!(dict.next_id(), 2);
     }
@@ -3274,7 +3513,17 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &mut reg, &mut dict, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            &[],
+            &mut reg,
+            &mut dict,
+            false,
+        )
+        .unwrap();
         // 4 rows, only 2 unique values → dict has 2 entries.
         assert_eq!(dict.next_id(), 2);
     }
@@ -3292,7 +3541,17 @@ mod tests {
         let mut out = Vec::new();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &mut reg, &mut dict, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            &[],
+            &mut reg,
+            &mut dict,
+            false,
+        )
+        .unwrap();
         assert_eq!(dict.next_id(), 2);
     }
 
@@ -3376,6 +3635,69 @@ mod tests {
         b.append_value(0);
         let rb = single_col_batch(Field::new("u", DataType::UInt8, true), b.finish());
         assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn int8_widens_to_int_classifier() {
+        let field = Field::new("v", DataType::Int8, true);
+        let arr = arrow_array::Int8Array::from(vec![0i8, -1, 127]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::I8WidenToI32));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
+    }
+
+    #[test]
+    fn int16_widens_to_int_classifier() {
+        let field = Field::new("v", DataType::Int16, true);
+        let arr = arrow_array::Int16Array::from(vec![0i16, -1, i16::MAX]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::I16WidenToI32));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
+    }
+
+    #[test]
+    fn int32_widens_to_long_classifier() {
+        let field = Field::new("v", DataType::Int32, true);
+        let arr = arrow_array::Int32Array::from(vec![0i32, -1, i32::MAX]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::I32WidenToI64));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_LONG);
+    }
+
+    #[test]
+    fn int8_byte_metadata_override_preserves_byte_wire() {
+        let field = Field::new("v", DataType::Int8, true).with_metadata(metadata(&[(
+            crate::egress::arrow::metadata::COLUMN_TYPE,
+            "byte",
+        )]));
+        let arr = arrow_array::Int8Array::from(vec![1i8, 2, 3]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::I8));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_BYTE);
+    }
+
+    #[test]
+    fn int16_short_metadata_override_preserves_short_wire() {
+        let field = Field::new("v", DataType::Int16, true).with_metadata(metadata(&[(
+            crate::egress::arrow::metadata::COLUMN_TYPE,
+            "short",
+        )]));
+        let arr = arrow_array::Int16Array::from(vec![1i16, 2, 3]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::I16));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_SHORT);
+    }
+
+    #[test]
+    fn int32_int_metadata_override_preserves_int_wire() {
+        let field = Field::new("v", DataType::Int32, true).with_metadata(metadata(&[(
+            crate::egress::arrow::metadata::COLUMN_TYPE,
+            "int",
+        )]));
+        let arr = arrow_array::Int32Array::from(vec![1i32, 2, 3]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::I32));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
     }
 
     #[test]
@@ -4122,9 +4444,17 @@ mod tests {
         let prior_len = out.len();
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        let err =
-            encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &mut reg, &mut dict, false)
-                .unwrap_err();
+        let err = encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            &[],
+            &mut reg,
+            &mut dict,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
         assert_eq!(
             out.len(),
@@ -4359,5 +4689,186 @@ mod tests {
             "unexpected error: {}",
             err.msg()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // arrow_overrides
+    // -----------------------------------------------------------------
+
+    fn encode_with_overrides(
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<(Vec<u8>, SymbolGlobalDict)> {
+        let mut out = Vec::new();
+        let mut reg = SchemaRegistry::new();
+        let mut dict = SymbolGlobalDict::new();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            batch,
+            None,
+            overrides,
+            &mut reg,
+            &mut dict,
+            false,
+        )?;
+        Ok((out, dict))
+    }
+
+    fn encode_with_overrides_err(
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Error {
+        encode_with_overrides(batch, overrides).unwrap_err()
+    }
+
+    #[test]
+    fn flush_arrow_batch_with_overrides_symbol_promotes_utf8() {
+        let mut sb = StringBuilder::new();
+        sb.append_value("EU");
+        sb.append_value("US");
+        sb.append_value("EU");
+        let f = Field::new("region", DataType::Utf8, false);
+        let rb = single_col_batch(f, sb.finish());
+        let (out, dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Symbol { column: "region" }])
+                .unwrap();
+        assert_qwp_header(&out, 1);
+        assert_eq!(dict.next_id(), 2);
+        assert!(
+            out.contains(&QWP_TYPE_SYMBOL),
+            "wire output missing QWP_TYPE_SYMBOL byte"
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_with_overrides_ipv4_on_uint32() {
+        let mut b = UInt32Builder::new();
+        b.append_value(0x0100_007F);
+        b.append_value(0x0101_A8C0);
+        let f = Field::new("addr", DataType::UInt32, true);
+        let rb = single_col_batch(f, b.finish());
+        let (out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Ipv4 { column: "addr" }]).unwrap();
+        assert_qwp_header(&out, 1);
+        assert!(
+            out.contains(&QWP_TYPE_IPV4),
+            "wire output missing QWP_TYPE_IPV4 byte"
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_with_overrides_unknown_column_rejected() {
+        let mut b = Int64Builder::new();
+        b.append_value(1);
+        let rb = single_col_batch(Field::new("c", DataType::Int64, false), b.finish());
+        let err =
+            encode_with_overrides_err(&rb, &[ArrowColumnOverride::Symbol { column: "missing" }]);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg()
+                .contains("override targets unknown column 'missing'"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_with_overrides_duplicate_rejected() {
+        let mut sb = StringBuilder::new();
+        sb.append_value("x");
+        let rb = single_col_batch(Field::new("s", DataType::Utf8, false), sb.finish());
+        let err = encode_with_overrides_err(
+            &rb,
+            &[
+                ArrowColumnOverride::Symbol { column: "s" },
+                ArrowColumnOverride::Symbol { column: "s" },
+            ],
+        );
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg()
+                .contains("duplicate arrow override for column 's'"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_with_overrides_geohash_bits_validated() {
+        let mut b = Int32Builder::new();
+        b.append_value(0);
+        let rb = single_col_batch(Field::new("g", DataType::Int32, true), b.finish());
+        let err_zero = encode_with_overrides_err(
+            &rb,
+            &[ArrowColumnOverride::Geohash {
+                column: "g",
+                bits: 0,
+            }],
+        );
+        assert_eq!(err_zero.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err_zero.msg().contains("invalid geohash bits 0"),
+            "unexpected error: {}",
+            err_zero.msg()
+        );
+        let err_over = encode_with_overrides_err(
+            &rb,
+            &[ArrowColumnOverride::Geohash {
+                column: "g",
+                bits: 61,
+            }],
+        );
+        assert_eq!(err_over.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err_over.msg().contains("invalid geohash bits 61"),
+            "unexpected error: {}",
+            err_over.msg()
+        );
+    }
+
+    #[test]
+    fn flush_arrow_batch_with_overrides_preserves_existing_metadata() {
+        let mut b = Int64Builder::new();
+        b.append_value(1);
+        let mut sb = StringBuilder::new();
+        sb.append_value("AAPL");
+        let id_md = metadata(&[(
+            crate::egress::arrow::metadata::ARROW_EXTENSION_NAME,
+            "arrow.uuid",
+        )]);
+        let id_field = Field::new("id", DataType::Int64, true).with_metadata(id_md);
+        let sym_field = Field::new("sym", DataType::Utf8, false);
+        let schema = Arc::new(ArrowSchema::new(vec![id_field, sym_field]));
+        let rb = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(b.finish()) as ArrayRef,
+                Arc::new(sb.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let patched =
+            apply_overrides(&schema, &[ArrowColumnOverride::Symbol { column: "sym" }]).unwrap();
+        let id_after = patched.field(0);
+        assert_eq!(
+            id_after
+                .metadata()
+                .get(crate::egress::arrow::metadata::ARROW_EXTENSION_NAME)
+                .map(String::as_str),
+            Some("arrow.uuid"),
+            "unrelated extension metadata stripped: {:?}",
+            id_after.metadata()
+        );
+        let sym_after = patched.field(1);
+        assert_eq!(
+            sym_after
+                .metadata()
+                .get(crate::egress::arrow::metadata::SYMBOL)
+                .map(String::as_str),
+            Some("true")
+        );
+        let (_out, _dict) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::Symbol { column: "sym" }]).unwrap();
     }
 }

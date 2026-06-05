@@ -33,10 +33,18 @@
  *  - Opaque handles must be non-NULL unless the function documentation
  *    states otherwise.
  *  - `err_out` is optional on every fallible call: pass NULL to discard
- *    error information.
+ *    error information. If `err_out != NULL`, `*err_out` MUST be NULL on
+ *    entry — fallible calls unconditionally store a freshly-allocated
+ *    `line_sender_error*` into `*err_out` on failure, so reusing the slot
+ *    across calls without first calling `line_sender_error_free` on the
+ *    previous value silently leaks the prior error box.
  *  - `column_sender_chunk` is owned by the caller and not bound to a
  *    particular sender; chunks can be built on any thread and flushed
- *    through any sender borrowed from the same `questdb_db`.
+ *    through any sender borrowed from the same `questdb_db`. A single
+ *    handle (chunk, conn) must not be used from more than one thread at
+ *    a time — concurrent calls on the same handle are detected via a
+ *    CAS-checked in-use latch and rejected with
+ *    `line_sender_error_invalid_api_call`.
  */
 
 #pragma once
@@ -49,7 +57,7 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
-#include "line_sender.h"
+#include <questdb/ingress/line_sender.h>
 
 /* -------------------------------------------------------------------------
  * Opaque handles
@@ -564,6 +572,7 @@ struct ArrowArray
 
 #endif /* ARROW_C_DATA_INTERFACE */
 
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_arrow_column(
     column_sender_chunk* chunk,
@@ -574,6 +583,7 @@ bool column_sender_chunk_append_arrow_column(
     size_t row_offset,
     size_t row_count,
     line_sender_error** err_out);
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 /* -------------------------------------------------------------------------
  * Generic NumPy column appender
@@ -727,12 +737,19 @@ typedef struct column_sender_numpy_extras
     const uint32_t* array_shape; /* array_ndim entries, each >= 1 */
 } column_sender_numpy_extras;
 
+/**
+ * `dtype` carries a `column_sender_numpy_*` constant from the enum
+ * above. The parameter is `uint32_t` rather than `enum
+ * column_sender_numpy_dtype` so an out-of-range value returns
+ * `line_sender_error_invalid_api_call` instead of being undefined
+ * behaviour at the language boundary.
+ */
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_numpy_column(
     column_sender_chunk* chunk,
     const char* name,
     size_t name_len,
-    column_sender_numpy_dtype dtype,
+    uint32_t dtype,
     const uint8_t* data,
     size_t row_count,
     const column_sender_validity* validity,
@@ -787,11 +804,15 @@ bool column_sender_flush(
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
+/**
+ * `ack_level` carries a `column_sender_ack_level_*` constant. The
+ * parameter is `uint32_t` rather than `enum column_sender_ack_level` so
+ * an out-of-range value returns `line_sender_error_invalid_api_call`
+ * instead of being undefined behaviour at the language boundary.
+ */
 QUESTDB_CLIENT_API
 bool column_sender_sync(
-    qwpws_conn* conn,
-    column_sender_ack_level ack_level,
-    line_sender_error** err_out);
+    qwpws_conn* conn, uint32_t ack_level, line_sender_error** err_out);
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 
@@ -810,7 +831,7 @@ bool column_sender_flush_arrow_batch(
     qwpws_conn* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
-    struct ArrowSchema* schema,
+    const struct ArrowSchema* schema,
     line_sender_error** err_out);
 
 /**
@@ -824,8 +845,77 @@ bool column_sender_flush_arrow_batch_at_column(
     qwpws_conn* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
-    struct ArrowSchema* schema,
+    const struct ArrowSchema* schema,
     line_sender_column_name ts_column,
+    line_sender_error** err_out);
+
+/**
+ * Per-column wire-type hint kind, paired with
+ * `column_sender_arrow_override::kind`.
+ */
+typedef enum column_sender_arrow_override_kind
+{
+    column_sender_arrow_override_symbol = 0,
+    column_sender_arrow_override_ipv4 = 1,
+    column_sender_arrow_override_char = 2,
+    column_sender_arrow_override_geohash = 3,
+} column_sender_arrow_override_kind;
+
+/**
+ * Per-column wire-type hint passed to the `*_with_overrides` variants
+ * to steer encoding without having to attach `questdb.*` Field
+ * metadata to the Arrow schema. Caller owns `column`; the bytes are
+ * borrowed for the duration of the call.
+ *
+ * `arg` carries the geohash precision (1..=60) when `kind ==
+ * column_sender_arrow_override_geohash`, and is ignored otherwise
+ * (pass 0).
+ */
+typedef struct column_sender_arrow_override
+{
+    const char* column;
+    size_t column_len;
+    uint32_t kind;
+    uint32_t arg;
+} column_sender_arrow_override;
+
+/**
+ * Same as `column_sender_flush_arrow_batch` but consults `overrides`
+ * to steer per-column wire-type classification. Same ownership
+ * contract as `column_sender_flush_arrow_batch`.
+ *
+ * Returns `false` with `line_sender_error_invalid_api_call` if any
+ * override targets an unknown column, duplicates another override,
+ * carries invalid UTF-8 in `column`, has an unknown `kind`, or — for
+ * `column_sender_arrow_override_geohash` — carries `arg` outside
+ * `1..=60`.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_with_overrides(
+    qwpws_conn* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_error** err_out);
+
+/**
+ * Same as `column_sender_flush_arrow_batch_at_column` but consults
+ * `overrides` to steer per-column wire-type classification. Same
+ * ownership contract as `column_sender_flush_arrow_batch_at_column`
+ * and same validation contract as
+ * `column_sender_flush_arrow_batch_with_overrides`.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_at_column_with_overrides(
+    qwpws_conn* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
     line_sender_error** err_out);
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 

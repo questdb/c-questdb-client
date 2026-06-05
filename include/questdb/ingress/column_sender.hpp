@@ -40,7 +40,7 @@ namespace questdb::ingress
 {
 
 /** Ack level for `column_sender_conn::sync`. */
-enum class column_sender_ack_level : int
+enum class column_sender_ack_level : uint32_t
 {
     ok = ::column_sender_ack_level_ok,
     durable = ::column_sender_ack_level_durable,
@@ -584,7 +584,7 @@ public:
         line_sender_error::wrapped_call(
             ::column_sender_sync,
             _raw,
-            static_cast<::column_sender_ack_level>(level));
+            static_cast<uint32_t>(level));
     }
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
@@ -601,7 +601,7 @@ public:
     void flush_arrow_batch(
         table_name_view table,
         ::ArrowArray& array,
-        ::ArrowSchema& schema)
+        const ::ArrowSchema& schema)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
@@ -620,7 +620,7 @@ public:
     void flush_arrow_batch(
         table_name_view table,
         ::ArrowArray& array,
-        ::ArrowSchema& schema,
+        const ::ArrowSchema& schema,
         column_name_view ts_column)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};

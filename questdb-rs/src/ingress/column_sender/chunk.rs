@@ -202,9 +202,6 @@ pub(crate) enum ColumnKind {
     /// [`numpy_wire::emit_into_wire`]. `data` is caller-owned: lifetime
     /// must extend through the next flush / sync call. Validity (if
     /// any) lives in the enclosing [`ColumnDescriptor`].
-    // Why: production constructor lands in the FFI-migration step;
-    // this variant currently only has unit-test callers.
-    #[allow(dead_code)]
     NumpyDeferred {
         dtype: numpy_wire::NumpyDtype,
         data: *const u8,

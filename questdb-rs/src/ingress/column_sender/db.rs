@@ -56,6 +56,79 @@ use super::sender::ColumnSender;
 /// Lower bound on the reaper's wake interval.
 const REAPER_MIN_TICK: Duration = Duration::from_secs(5);
 
+/// Poison-tolerant lock helper. The pool must survive a panic in another
+/// thread's locked region: under `panic=abort` (FFI consumers) poisoning
+/// can never be observed, but `questdb-rs` library consumers run with
+/// `panic=unwind` and a single panicking thread would otherwise turn
+/// every subsequent borrow/return into a panic via `.expect("poisoned")`.
+fn lock_state(m: &Mutex<PoolState>) -> std::sync::MutexGuard<'_, PoolState> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(feature = "_egress")]
+fn lock_reader_state(m: &Mutex<ReaderPoolState>) -> std::sync::MutexGuard<'_, ReaderPoolState> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// RAII guard that increments `state.in_use` on construction and
+/// decrements it on drop unless [`InUseSlot::commit`] is called first.
+/// Closes the leak window between `state.in_use += 1` and
+/// `ColumnConn::connect`: a panic in the connect path (allocator OOM,
+/// TLS handshake panic) would otherwise skip the matching decrement
+/// and permanently strand a pool slot.
+struct InUseSlot<'a> {
+    state: &'a Mutex<PoolState>,
+    armed: bool,
+}
+
+impl<'a> InUseSlot<'a> {
+    fn reserve(state: &'a Mutex<PoolState>) -> Self {
+        lock_state(state).in_use += 1;
+        Self { state, armed: true }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InUseSlot<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = lock_state(self.state);
+            state.in_use = state.in_use.saturating_sub(1);
+        }
+    }
+}
+
+#[cfg(feature = "_egress")]
+struct ReaderInUseSlot<'a> {
+    state: &'a Mutex<ReaderPoolState>,
+    armed: bool,
+}
+
+#[cfg(feature = "_egress")]
+impl<'a> ReaderInUseSlot<'a> {
+    fn reserve(state: &'a Mutex<ReaderPoolState>) -> Self {
+        lock_reader_state(state).in_use += 1;
+        Self { state, armed: true }
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "_egress")]
+impl Drop for ReaderInUseSlot<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = lock_reader_state(self.state);
+            state.in_use = state.in_use.saturating_sub(1);
+        }
+    }
+}
+
 /// Connection pool for the column-major sender API.
 ///
 /// Construct with [`QuestDb::connect`]. Share the pool across threads — its
@@ -249,7 +322,7 @@ impl QuestDb {
     }
 
     fn pick_sender(&self) -> Result<ColumnSender> {
-        let mut state = self.inner.state.lock().expect("pool mutex poisoned");
+        let mut state = lock_state(&self.inner.state);
         if let Some(entry) = state.free.pop() {
             state.in_use += 1;
             drop(state);
@@ -270,20 +343,11 @@ impl QuestDb {
                 self.inner.pool_max
             ));
         }
-
-        // Reserve the slot before releasing the lock so a concurrent
-        // `borrow_sender` cannot over-grow past `pool_max`.
-        state.in_use += 1;
         drop(state);
 
-        let conn = match ColumnConn::connect(&self.inner.conf) {
-            Ok(c) => c,
-            Err(err) => {
-                let mut state = self.inner.state.lock().expect("pool mutex poisoned");
-                state.in_use -= 1;
-                return Err(err);
-            }
-        };
+        let slot = InUseSlot::reserve(&self.inner.state);
+        let conn = ColumnConn::connect(&self.inner.conf)?;
+        slot.commit();
 
         Ok(ColumnSender::new(
             conn,
@@ -320,19 +384,14 @@ impl QuestDb {
     /// Snapshot the number of idle (free) connections currently in the pool.
     #[doc(hidden)]
     pub fn free_count(&self) -> usize {
-        self.inner
-            .state
-            .lock()
-            .expect("pool mutex poisoned")
-            .free
-            .len()
+        lock_state(&self.inner.state).free.len()
     }
 
     /// Snapshot the number of currently-borrowed (or in-flight-being-built)
     /// connections.
     #[doc(hidden)]
     pub fn in_use_count(&self) -> usize {
-        self.inner.state.lock().expect("pool mutex poisoned").in_use
+        lock_state(&self.inner.state).in_use
     }
 
     /// FFI escape hatch: borrow a reader from the egress pool.
@@ -367,11 +426,7 @@ impl QuestDb {
     #[cfg(feature = "_egress")]
     fn pick_reader(&self) -> crate::egress::error::Result<Reader> {
         use crate::egress::error::{Error as EgressError, ErrorCode as EgressErrorCode};
-        let mut state = self
-            .inner
-            .reader_state
-            .lock()
-            .expect("reader pool mutex poisoned");
+        let mut state = lock_reader_state(&self.inner.reader_state);
         if let Some(entry) = state.free.pop() {
             state.in_use += 1;
             drop(state);
@@ -389,47 +444,26 @@ impl QuestDb {
                 ),
             ));
         }
-
-        // Reserve the slot before releasing the lock so concurrent
-        // borrows cannot over-grow past `pool_max`.
-        state.in_use += 1;
         drop(state);
 
-        match Reader::from_conf(&self.inner.conf) {
-            Ok(r) => Ok(r),
-            Err(err) => {
-                let mut state = self
-                    .inner
-                    .reader_state
-                    .lock()
-                    .expect("reader pool mutex poisoned");
-                state.in_use -= 1;
-                Err(err)
-            }
-        }
+        let slot = ReaderInUseSlot::reserve(&self.inner.reader_state);
+        let reader = Reader::from_conf(&self.inner.conf)?;
+        slot.commit();
+        Ok(reader)
     }
 
     /// Snapshot the number of idle (free) readers currently in the pool.
     #[cfg(feature = "_egress")]
     #[doc(hidden)]
     pub fn reader_free_count(&self) -> usize {
-        self.inner
-            .reader_state
-            .lock()
-            .expect("reader pool mutex poisoned")
-            .free
-            .len()
+        lock_reader_state(&self.inner.reader_state).free.len()
     }
 
     /// Snapshot the number of currently-borrowed readers.
     #[cfg(feature = "_egress")]
     #[doc(hidden)]
     pub fn reader_in_use_count(&self) -> usize {
-        self.inner
-            .reader_state
-            .lock()
-            .expect("reader pool mutex poisoned")
-            .in_use
+        lock_reader_state(&self.inner.reader_state).in_use
     }
 }
 
@@ -456,7 +490,7 @@ impl Drop for QuestDb {
         // Notifying under the mutex avoids the lost-wakeup race where the
         // reaper has just released the lock and is about to wait.
         {
-            let _g = self.inner.state.lock().expect("pool mutex poisoned");
+            let _g = lock_state(&self.inner.state);
             self.inner.cv.notify_all();
         }
         if let Some(handle) = self.reaper.take() {
@@ -644,11 +678,8 @@ impl ReaderPoolHandle {
 #[cfg(feature = "_egress")]
 fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool) {
     let must_close = must_close || reader.transport_torn_down();
-    let mut state = inner
-        .reader_state
-        .lock()
-        .expect("reader pool mutex poisoned");
-    state.in_use -= 1;
+    let mut state = lock_reader_state(&inner.reader_state);
+    state.in_use = state.in_use.saturating_sub(1);
     if !must_close {
         state.free.push(ReaderPoolEntry {
             reader,
@@ -660,8 +691,8 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
 
 fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     let must_close = sender.must_close();
-    let mut state = inner.state.lock().expect("pool mutex poisoned");
-    state.in_use -= 1;
+    let mut state = lock_state(&inner.state);
+    state.in_use = state.in_use.saturating_sub(1);
     if !must_close {
         state.free.push(PoolEntry {
             conn: sender.conn,
@@ -671,9 +702,6 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
             last_idle_at: Instant::now(),
         });
     }
-    // When `must_close`, the contained connection is dropped here, after
-    // the count was decremented but with the mutex still held — safe
-    // since `ColumnConn::drop` does not re-enter the pool.
     drop(state);
 }
 
@@ -701,14 +729,14 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
         // acquires the same lock to notify, so either we observe
         // `shutdown=true` before sleeping or we are sleeping when the
         // notify arrives.
-        let state = inner.state.lock().expect("pool mutex poisoned");
+        let state = lock_state(&inner.state);
         if inner.shutdown.load(Ordering::SeqCst) {
             break;
         }
         let (state, _) = inner
             .cv
             .wait_timeout(state, tick)
-            .expect("pool mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         if inner.shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -732,7 +760,7 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
     // (which may take an unbounded amount of time) does not stall concurrent
     // borrows.
     let to_drop: Vec<ColumnConn> = {
-        let mut state = inner.state.lock().expect("pool mutex poisoned");
+        let mut state = lock_state(&inner.state);
         let mut to_drop = Vec::new();
         let now = Instant::now();
         // Free-list is oldest at front, newest at back (push on return /
@@ -762,10 +790,7 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
 #[cfg(feature = "_egress")]
 fn reap_idle_readers(inner: &DbInner) -> usize {
     let to_drop: Vec<Reader> = {
-        let mut state = inner
-            .reader_state
-            .lock()
-            .expect("reader pool mutex poisoned");
+        let mut state = lock_reader_state(&inner.reader_state);
         let mut to_drop = Vec::new();
         let now = Instant::now();
         // Reader pool is lazy-init so there is no warm-min floor to

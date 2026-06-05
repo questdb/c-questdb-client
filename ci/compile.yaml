@@ -23,7 +23,7 @@ steps:
     displayName: "Install numpy + pyarrow + polars on macOS"
   - script: |
       python -m pip install --upgrade pip
-      pip install numpy pyarrow polars
+      pip install numpy pyarrow polars tzdata
     condition: |
       and(
         ne(variables['imageName'], 'macos-latest'),

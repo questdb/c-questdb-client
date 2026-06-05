@@ -44,8 +44,18 @@ impl<'a> Validity<'a> {
     ///
     /// `bits.len()` must be at least `ceil(bit_len / 8)`. Bits past
     /// `bit_len` are ignored by the encoder, so callers do not need to
-    /// zero them.
+    /// zero them. `bit_len` is rejected above
+    /// [`super::MAX_CHUNK_ROWS`] so the inferred slice length cannot
+    /// approach `isize::MAX` on the FFI fabrication path.
     pub fn from_bitmap(bits: &'a [u8], bit_len: usize) -> Result<Self> {
+        if bit_len > super::MAX_CHUNK_ROWS {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "validity bit_len {} exceeds MAX_CHUNK_ROWS ({})",
+                bit_len,
+                super::MAX_CHUNK_ROWS
+            ));
+        }
         let required_bytes = bit_len.div_ceil(8);
         if bits.len() < required_bytes {
             return Err(error::fmt!(
