@@ -129,8 +129,11 @@ public:
         return ::column_sender_chunk_row_count(_raw);
     }
 
-    /** Reset the chunk; retains descriptor-vec capacity. */
-    void clear() noexcept { ::column_sender_chunk_clear(_raw); }
+    /**
+     * Reset the chunk; retains descriptor-vec capacity. Returns true on
+     * success, false if a concurrent FFI call held the in-use latch.
+     */
+    bool clear() noexcept { return ::column_sender_chunk_clear(_raw); }
 
     // -- Fixed-width column appenders ---------------------------------
 
@@ -254,7 +257,7 @@ public:
         return *this;
     }
 
-    /** UUID column: 16 contiguous bytes per row (big-endian canonical). */
+    /** UUID column: 16 bytes per row — low half LE in bytes 0..8, high half LE in bytes 8..16. */
     column_chunk& column_uuid(
         std::string_view name,
         const uint8_t* data,

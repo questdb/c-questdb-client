@@ -58,12 +58,12 @@
 //! - **Windows / other**: pass-through. `WSASend` cannot raise
 //!   `SIGPIPE`; the signal does not exist.
 
-use std::io::{self, Read, Write};
+use std::io;
+#[cfg(feature = "_egress")]
+use std::io::{Read, Write};
 use std::net::TcpStream;
 
 #[cfg(any(
-    target_os = "linux",
-    target_os = "android",
     target_os = "macos",
     target_os = "ios",
     target_os = "tvos",
@@ -72,49 +72,57 @@ use std::net::TcpStream;
     target_os = "openbsd",
     target_os = "netbsd",
     target_os = "dragonfly",
+    all(
+        feature = "_egress",
+        any(target_os = "linux", target_os = "android")
+    ),
 ))]
 use std::os::fd::AsRawFd;
 
 /// [`TcpStream`] wrapper that suppresses `SIGPIPE` on writes to a
 /// closed peer. See the module-level docs for the platform breakdown.
+/// Apply `setsockopt(SO_NOSIGPIPE)` on platforms that have a per-socket
+/// switch (macOS / iOS / *BSD). No-op elsewhere. The kernel-socket option
+/// carries across `TcpStream::try_clone`, so it is applied exactly once
+/// per native socket.
+pub(crate) fn apply_so_nosigpipe(_tcp: &TcpStream) -> io::Result<()> {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+    ))]
+    {
+        let enable: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                _tcp.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                &enable as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of_val(&enable) as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "_egress")]
 pub(crate) struct NoSigpipeTcp(TcpStream);
 
+#[cfg(feature = "_egress")]
 impl NoSigpipeTcp {
-    /// Wrap `tcp` and apply the per-platform SIGPIPE suppression.
-    ///
-    /// On macOS / iOS / *BSD this performs one `setsockopt(SO_NOSIGPIPE)`
-    /// against the underlying fd. The kernel-socket option carries
-    /// across any later `TcpStream::try_clone`, so `try_clone` on this
-    /// wrapper does not re-apply it.
+    /// Wrap `tcp` and apply the per-platform SIGPIPE suppression. See
+    /// [`apply_so_nosigpipe`] for the option semantics.
     pub(crate) fn new(tcp: TcpStream) -> io::Result<Self> {
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly",
-        ))]
-        {
-            let enable: libc::c_int = 1;
-            // SAFETY: `tcp.as_raw_fd()` is a live fd for the duration
-            // of this call; `&enable` points to a valid `c_int` and
-            // the size matches.
-            let ret = unsafe {
-                libc::setsockopt(
-                    tcp.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_NOSIGPIPE,
-                    &enable as *const libc::c_int as *const libc::c_void,
-                    std::mem::size_of_val(&enable) as libc::socklen_t,
-                )
-            };
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
+        apply_so_nosigpipe(&tcp)?;
         Ok(Self(tcp))
     }
 
@@ -131,12 +139,14 @@ impl NoSigpipeTcp {
     }
 }
 
+#[cfg(feature = "_egress")]
 impl Read for NoSigpipeTcp {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
+#[cfg(feature = "_egress")]
 impl Write for NoSigpipeTcp {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

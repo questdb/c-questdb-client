@@ -72,6 +72,12 @@ pub use validity::Validity;
 /// rows on the FFI path.
 pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "column_sender bulk-copy fast paths assume a little-endian host; \
+     QuestDB QWP wire encoding is little-endian."
+);
+
 #[doc(hidden)]
 pub use db::OwnedSender;
 

@@ -2124,6 +2124,9 @@ fn connect_tcp_to_any_addr(
                 let sock = socket2::SockRef::from(&tcp);
                 sock.set_send_buffer_size(4 * 1024 * 1024).ok();
                 sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
+                crate::ws::nosigpipe::apply_so_nosigpipe(&tcp).map_err(|err| {
+                    error::fmt!(SocketError, "Failed to set SO_NOSIGPIPE on {addr}: {err}")
+                })?;
                 return Ok(tcp);
             }
             Err(io) => failures.push(format!("{addr}: {io}")),

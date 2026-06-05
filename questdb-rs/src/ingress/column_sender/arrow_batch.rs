@@ -73,9 +73,14 @@ use crate::ingress::buffer::QWP_DECIMAL_MAX_SCALE;
 /// when the Arrow source has no `questdb.*` Field metadata to carry
 /// the hint (e.g. Polars frames built without pyarrow).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum ArrowColumnOverride<'a> {
     /// Treat a UTF-8 / LargeUtf8 / Utf8View column as `SYMBOL`.
     Symbol { column: &'a str },
+    /// Force a Dictionary(*, Utf8 / LargeUtf8) column to `VARCHAR`
+    /// wire, decoding the dictionary on emit. No-op on non-dictionary
+    /// columns (plain Utf8 is VARCHAR by default).
+    NotSymbol { column: &'a str },
     /// Treat a UInt32 column as `IPV4`.
     Ipv4 { column: &'a str },
     /// Treat a UInt16 column as `CHAR`.
@@ -90,6 +95,7 @@ impl<'a> ArrowColumnOverride<'a> {
     pub fn column(&self) -> &'a str {
         match *self {
             Self::Symbol { column }
+            | Self::NotSymbol { column }
             | Self::Ipv4 { column }
             | Self::Char { column }
             | Self::Geohash { column, .. } => column,
@@ -155,6 +161,12 @@ pub(crate) fn apply_overrides(
                 md.insert(
                     crate::egress::arrow::metadata::SYMBOL.to_string(),
                     "true".to_string(),
+                );
+            }
+            ArrowColumnOverride::NotSymbol { .. } => {
+                md.insert(
+                    crate::egress::arrow::metadata::SYMBOL.to_string(),
+                    "false".to_string(),
                 );
             }
             ArrowColumnOverride::Ipv4 { .. } => {
@@ -254,6 +266,7 @@ pub(crate) enum ColumnKind {
     Long256,
     Geohash(u8),
     SymbolDict { key: DictKey, value: DictValue },
+    DictToVarchar { key: DictKey, value: DictValue },
     Decimal32WidenToDecimal64,
     Decimal64,
     Decimal128,
@@ -279,6 +292,10 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
             .metadata()
             .get(crate::egress::arrow::metadata::SYMBOL)
             .is_some_and(|v| v == "true");
+    let wants_not_symbol = field
+        .metadata()
+        .get(crate::egress::arrow::metadata::SYMBOL)
+        .is_some_and(|v| v == "false");
     let check_geohash_width = |bits: u8, max_bits: u8, dtype_name: &str| -> Result<u8> {
         if bits == 0 || bits > max_bits {
             return Err(fmt!(
@@ -391,7 +408,11 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         {
             let k = dict_key_for(key).unwrap();
             let v = dict_value_for(value).unwrap();
-            ColumnKind::SymbolDict { key: k, value: v }
+            if wants_not_symbol {
+                ColumnKind::DictToVarchar { key: k, value: v }
+            } else {
+                ColumnKind::SymbolDict { key: k, value: v }
+            }
         }
         (DataType::Decimal32(_, _), _, _) => ColumnKind::Decimal32WidenToDecimal64,
         (DataType::Decimal64(_, _), _, _) => ColumnKind::Decimal64,
@@ -506,7 +527,10 @@ pub(crate) fn wire_type_byte(kind: ColumnKind, _has_nulls: bool) -> u8 {
         ColumnKind::TimestampSecondToMicros | ColumnKind::TimestampMicros => QWP_TYPE_TIMESTAMP,
         ColumnKind::TimestampNanos => QWP_TYPE_TIMESTAMP_NANOS,
         ColumnKind::Date | ColumnKind::Date32Days | ColumnKind::Date64Ms => QWP_TYPE_DATE,
-        ColumnKind::Utf8 | ColumnKind::LargeUtf8 | ColumnKind::Utf8View => QWP_TYPE_VARCHAR,
+        ColumnKind::Utf8
+        | ColumnKind::LargeUtf8
+        | ColumnKind::Utf8View
+        | ColumnKind::DictToVarchar { .. } => QWP_TYPE_VARCHAR,
         ColumnKind::SymbolUtf8
         | ColumnKind::SymbolLargeUtf8
         | ColumnKind::SymbolUtf8View
@@ -539,6 +563,7 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
             | ColumnKind::SymbolLargeUtf8
             | ColumnKind::SymbolUtf8View
             | ColumnKind::SymbolDict { .. }
+            | ColumnKind::DictToVarchar { .. }
             | ColumnKind::Binary
             | ColumnKind::LargeBinary
             | ColumnKind::BinaryView
@@ -652,11 +677,20 @@ fn full_with_sentinel<const N: usize>(
         )
     })?;
     try_reserve_bytes(out, bytes, "primitive column")?;
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            out.extend_from_slice(&sentinel);
-        } else {
-            out.extend_from_slice(&get(row));
+    match arr.nulls() {
+        None => {
+            for row in 0..row_count {
+                out.extend_from_slice(&get(row));
+            }
+        }
+        Some(nulls) => {
+            for row in 0..row_count {
+                if nulls.is_null(row) {
+                    out.extend_from_slice(&sentinel);
+                } else {
+                    out.extend_from_slice(&get(row));
+                }
+            }
         }
     }
     Ok(())
@@ -678,11 +712,20 @@ fn try_full_with_sentinel<const N: usize>(
         )
     })?;
     try_reserve_bytes(out, bytes, "primitive column")?;
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            out.extend_from_slice(&sentinel);
-        } else {
-            out.extend_from_slice(&get(row)?);
+    match arr.nulls() {
+        None => {
+            for row in 0..row_count {
+                out.extend_from_slice(&get(row)?);
+            }
+        }
+        Some(nulls) => {
+            for row in 0..row_count {
+                if nulls.is_null(row) {
+                    out.extend_from_slice(&sentinel);
+                } else {
+                    out.extend_from_slice(&get(row)?);
+                }
+            }
         }
     }
     Ok(())
@@ -704,11 +747,20 @@ fn non_null_le<const N: usize>(
         )
     })?;
     try_reserve_bytes(out, bytes, "primitive column")?;
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            continue;
+    match arr.nulls() {
+        None => {
+            for row in 0..row_count {
+                out.extend_from_slice(&get(row));
+            }
         }
-        out.extend_from_slice(&get(row));
+        Some(nulls) => {
+            for row in 0..row_count {
+                if nulls.is_null(row) {
+                    continue;
+                }
+                out.extend_from_slice(&get(row));
+            }
+        }
     }
     Ok(())
 }
@@ -729,11 +781,20 @@ fn try_non_null_le<const N: usize>(
         )
     })?;
     try_reserve_bytes(out, bytes, "primitive column")?;
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            continue;
+    match arr.nulls() {
+        None => {
+            for row in 0..row_count {
+                out.extend_from_slice(&get(row)?);
+            }
         }
-        out.extend_from_slice(&get(row)?);
+        Some(nulls) => {
+            for row in 0..row_count {
+                if nulls.is_null(row) {
+                    continue;
+                }
+                out.extend_from_slice(&get(row)?);
+            }
+        }
     }
     Ok(())
 }
@@ -750,11 +811,20 @@ fn non_null_fsb(out: &mut Vec<u8>, arr: &FixedSizeBinaryArray, size: usize) -> R
         )
     })?;
     try_reserve_bytes(out, bytes, "FixedSizeBinary column")?;
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            continue;
+    match arr.nulls() {
+        None => {
+            for row in 0..row_count {
+                out.extend_from_slice(arr.value(row));
+            }
         }
-        out.extend_from_slice(arr.value(row));
+        Some(nulls) => {
+            for row in 0..row_count {
+                if nulls.is_null(row) {
+                    continue;
+                }
+                out.extend_from_slice(arr.value(row));
+            }
+        }
     }
     Ok(())
 }
@@ -888,7 +958,7 @@ fn write_varlen_u32_offsets_no_null(
         )
     })?;
     try_reserve_bytes(out, offsets_bytes + used, label)?;
-    if base == 0 {
+    if base == 0 && cfg!(target_endian = "little") {
         let bytes =
             unsafe { std::slice::from_raw_parts(arr_offsets.as_ptr() as *const u8, offsets_bytes) };
         out.extend_from_slice(bytes);
@@ -1399,27 +1469,44 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
     let row_count = arr.len();
     let ndim_u8 =
         u8::try_from(ndim).map_err(|_| fmt!(ArrowIngest, "ARRAY ndim {} exceeds u8::MAX", ndim))?;
+    let mut levels: Vec<ArrayRef> = Vec::with_capacity(ndim);
+    let mut current: ArrayRef = list_values(arr)?;
+    levels.push(current.clone());
+    for _ in 1..ndim {
+        let next = list_values(&*current)?;
+        levels.push(next.clone());
+        current = next;
+    }
+    let leaf_array = levels[ndim - 1]
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::ArrowUnsupportedColumnKind,
+                format!(
+                    "ARRAY leaf must be Float64, got {:?}",
+                    levels[ndim - 1].data_type()
+                ),
+            )
+        })?;
+    let leaf_values_all = leaf_array.values();
     let mut shape: Vec<usize> = Vec::with_capacity(ndim);
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
         }
         shape.clear();
-        let extract = extract_array_row(arr, ndim, row, &mut shape)?;
-        let leaf = extract
-            .leaf
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorCode::ArrowUnsupportedColumnKind,
-                    format!(
-                        "ARRAY leaf must be Float64, got {:?}",
-                        extract.leaf.data_type()
-                    ),
-                )
-            })?;
-        let leaf_values = &leaf.values()[extract.leaf_start..extract.leaf_end];
+        let (mut start, mut end) = list_row_range(arr, row)?;
+        shape.push(end - start);
+        for level_idx in 1..ndim {
+            let level_arr: &dyn Array = &*levels[level_idx - 1];
+            let (level_start, level_end, level_dim) =
+                list_level_descend_offsets(level_arr, start, end)?;
+            shape.push(level_dim);
+            start = level_start;
+            end = level_end;
+        }
+        let leaf_values = &leaf_values_all[start..end];
         try_reserve_bytes(
             out,
             1 + 4 * ndim + 8 * leaf_values.len(),
@@ -1440,36 +1527,6 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
         }
     }
     Ok(())
-}
-
-struct ArrayRowExtract {
-    leaf: ArrayRef,
-    leaf_start: usize,
-    leaf_end: usize,
-}
-
-fn extract_array_row(
-    outer: &dyn Array,
-    ndim: usize,
-    row: usize,
-    shape: &mut Vec<usize>,
-) -> Result<ArrayRowExtract> {
-    let (mut start, mut end) = list_row_range(outer, row)?;
-    shape.push(end - start);
-    let mut current_values: ArrayRef = list_values(outer)?;
-    for _ in 1..ndim {
-        let (level_start, level_end, level_dim, next_values) =
-            list_level_descend(&*current_values, start, end)?;
-        shape.push(level_dim);
-        start = level_start;
-        end = level_end;
-        current_values = next_values;
-    }
-    Ok(ArrayRowExtract {
-        leaf: current_values,
-        leaf_start: start,
-        leaf_end: end,
-    })
 }
 
 fn checked_offset_i32(off: i32, idx: usize) -> Result<usize> {
@@ -1579,15 +1636,15 @@ fn list_values(arr: &dyn Array) -> Result<ArrayRef> {
     }
 }
 
-fn list_level_descend(
+fn list_level_descend_offsets(
     arr: &dyn Array,
     start: usize,
     end: usize,
-) -> Result<(usize, usize, usize, ArrayRef)> {
+) -> Result<(usize, usize, usize)> {
     if let Some(la) = arr.as_any().downcast_ref::<ListArray>() {
         let offsets = la.offsets();
         if end <= start {
-            return Ok((0, 0, 0, la.values().clone()));
+            return Ok((0, 0, 0));
         }
         let next_start = checked_offset_i32(offsets[start], start)?;
         let first_end = checked_offset_i32(offsets[start + 1], start + 1)?;
@@ -1602,11 +1659,11 @@ fn list_level_descend(
         if next_end.checked_sub(next_start) != dim.checked_mul(end - start) {
             return Err(ragged_inner_error_i32(&offsets[..], start, end, dim));
         }
-        Ok((next_start, next_end, dim, la.values().clone()))
+        Ok((next_start, next_end, dim))
     } else if let Some(la) = arr.as_any().downcast_ref::<LargeListArray>() {
         let offsets = la.offsets();
         if end <= start {
-            return Ok((0, 0, 0, la.values().clone()));
+            return Ok((0, 0, 0));
         }
         let next_start = checked_offset_i64(offsets[start], start)?;
         let first_end = checked_offset_i64(offsets[start + 1], start + 1)?;
@@ -1621,11 +1678,11 @@ fn list_level_descend(
         if next_end.checked_sub(next_start) != dim.checked_mul(end - start) {
             return Err(ragged_inner_error_i64(&offsets[..], start, end, dim));
         }
-        Ok((next_start, next_end, dim, la.values().clone()))
+        Ok((next_start, next_end, dim))
     } else if let Some(la) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
         let stride = la.value_length() as usize;
         if end <= start {
-            return Ok((0, 0, 0, la.values().clone()));
+            return Ok((0, 0, 0));
         }
         let next_start = start.checked_mul(stride).ok_or_else(|| {
             fmt!(
@@ -1643,7 +1700,7 @@ fn list_level_descend(
                 stride
             )
         })?;
-        Ok((next_start, next_end, stride, la.values().clone()))
+        Ok((next_start, next_end, stride))
     } else {
         Err(fmt!(
             ArrowIngest,
@@ -2078,6 +2135,174 @@ fn write_symbol_payload(out: &mut Vec<u8>, resolved: &ArrowResolvedSymbolColumn)
     Ok(())
 }
 
+fn write_dict_to_varchar_payload(
+    out: &mut Vec<u8>,
+    arr: &dyn Array,
+    key: DictKey,
+    value: DictValue,
+) -> Result<()> {
+    fn run<K, V>(
+        out: &mut Vec<u8>,
+        arr: &dyn Array,
+        get_slot: impl Fn(&DictionaryArray<K::ArrowType>, usize) -> usize,
+        get_value_bytes: impl Fn(&V, usize) -> &[u8],
+    ) -> Result<()>
+    where
+        K: DictKeyTag,
+        V: 'static,
+    {
+        let dict_arr = arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<K::ArrowType>>()
+            .unwrap();
+        let values_arr = dict_arr.values();
+        let values_typed = values_arr
+            .as_any()
+            .downcast_ref::<V>()
+            .ok_or_else(|| fmt!(ArrowIngest, "DictToVarchar: dict values downcast failed"))?;
+        let dict_len = values_arr.len();
+        write_varlen_u32_offsets_with_bitmap(out, dict_arr, "VARCHAR column", |out, row| {
+            let slot = get_slot(dict_arr, row);
+            if slot >= dict_len {
+                return Err(fmt!(
+                    ArrowIngest,
+                    "DictToVarchar: index {} out of range (dict_len={})",
+                    slot,
+                    dict_len
+                ));
+            }
+            if values_arr.is_null(slot) {
+                return Err(fmt!(
+                    ArrowIngest,
+                    "DictToVarchar: referenced dict value at slot {} is null",
+                    slot
+                ));
+            }
+            let bytes = get_value_bytes(values_typed, slot);
+            try_reserve_bytes(out, bytes.len(), "VARCHAR column")?;
+            out.extend_from_slice(bytes);
+            u32::try_from(bytes.len()).map_err(|_| {
+                fmt!(
+                    ArrowIngest,
+                    "VARCHAR column: row {} exceeds u32::MAX bytes",
+                    row
+                )
+            })
+        })
+    }
+
+    match (key, value) {
+        (DictKey::I8, DictValue::Utf8) => run::<I8KeyTag, StringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I8, DictValue::LargeUtf8) => run::<I8KeyTag, LargeStringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I8, DictValue::Utf8View) => run::<I8KeyTag, StringViewArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I16, DictValue::Utf8) => run::<I16KeyTag, StringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I16, DictValue::LargeUtf8) => run::<I16KeyTag, LargeStringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I16, DictValue::Utf8View) => run::<I16KeyTag, StringViewArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I32, DictValue::Utf8) => run::<I32KeyTag, StringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I32, DictValue::LargeUtf8) => run::<I32KeyTag, LargeStringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::I32, DictValue::Utf8View) => run::<I32KeyTag, StringViewArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U8, DictValue::Utf8) => run::<U8KeyTag, StringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U8, DictValue::LargeUtf8) => run::<U8KeyTag, LargeStringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U8, DictValue::Utf8View) => run::<U8KeyTag, StringViewArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U16, DictValue::Utf8) => run::<U16KeyTag, StringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U16, DictValue::LargeUtf8) => run::<U16KeyTag, LargeStringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U16, DictValue::Utf8View) => run::<U16KeyTag, StringViewArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U32, DictValue::Utf8) => run::<U32KeyTag, StringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U32, DictValue::LargeUtf8) => run::<U32KeyTag, LargeStringArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+        (DictKey::U32, DictValue::Utf8View) => run::<U32KeyTag, StringViewArray>(
+            out,
+            arr,
+            |d, r| d.keys().value(r) as usize,
+            |v, s| v.value(s).as_bytes(),
+        ),
+    }
+}
+
 pub(crate) fn write_arrow_column_body(
     out: &mut Vec<u8>,
     kind: ColumnKind,
@@ -2278,19 +2503,17 @@ pub(crate) fn write_arrow_column_body(
         }
         ColumnKind::U64WidenToI64Checked => {
             let a = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
-            try_full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
-                let v = a.value(row);
-                if v > i64::MAX as u64 {
-                    return Err(fmt!(
-                        ArrowIngest,
-                        "UInt64 value {} at row {} exceeds i64::MAX; \
-                         QuestDB QWP-WS encodes integers as signed i64",
-                        v,
-                        row
-                    ));
+            if null_count == 0 {
+                try_reserve_bytes(out, a.values().len() * 8, "U64 widen column")?;
+                for &v in a.values() {
+                    out.extend_from_slice(&(v as i64).to_le_bytes());
                 }
-                Ok((v as i64).to_le_bytes())
-            })
+                Ok(())
+            } else {
+                full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
+                    (a.value(row) as i64).to_le_bytes()
+                })
+            }
         }
         ColumnKind::TimestampSecondToMicros => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
@@ -2426,6 +2649,9 @@ pub(crate) fn write_arrow_column_body(
                 )
             })?;
             write_symbol_payload(out, res)
+        }
+        ColumnKind::DictToVarchar { key, value } => {
+            write_dict_to_varchar_payload(out, arr, key, value)
         }
         ColumnKind::Uuid => {
             let a = arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
@@ -2910,9 +3136,10 @@ fn estimate_frame_size(
             | ColumnKind::DurationAsLong(_) => 8 * row_count,
             ColumnKind::Uuid => 16 * row_count,
             ColumnKind::Long256 => 32 * row_count,
-            ColumnKind::Utf8 | ColumnKind::LargeUtf8 | ColumnKind::Utf8View => {
-                4 * (row_count + 1) + 16 * row_count
-            }
+            ColumnKind::Utf8
+            | ColumnKind::LargeUtf8
+            | ColumnKind::Utf8View
+            | ColumnKind::DictToVarchar { .. } => 4 * (row_count + 1) + 16 * row_count,
             ColumnKind::Binary | ColumnKind::LargeBinary | ColumnKind::BinaryView => {
                 4 * (row_count + 1) + 16 * row_count
             }
@@ -3710,21 +3937,31 @@ mod tests {
     }
 
     #[test]
-    fn uint64_above_i64_max_is_rejected() {
+    fn uint64_above_i64_max_bit_reinterprets() {
         let mut b = UInt64Builder::new();
-        b.append_value(i64::MAX as u64 + 1);
+        let v: u64 = i64::MAX as u64 + 1;
+        b.append_value(v);
         let rb = single_col_batch(Field::new("u", DataType::UInt64, true), b.finish());
-        let err = encode_err(&rb);
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        let bytes = encode(&rb);
+        let expected = (v as i64).to_le_bytes();
+        assert!(
+            bytes.windows(8).any(|w| w == expected),
+            "expected bit-reinterpret of u64 {v} = i64 {} on the wire",
+            v as i64
+        );
     }
 
     #[test]
-    fn uint64_max_value_is_rejected() {
+    fn uint64_max_value_bit_reinterprets() {
         let mut b = UInt64Builder::new();
         b.append_value(u64::MAX);
         let rb = single_col_batch(Field::new("u", DataType::UInt64, true), b.finish());
-        let err = encode_err(&rb);
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        let bytes = encode(&rb);
+        let expected = (-1i64).to_le_bytes();
+        assert!(
+            bytes.windows(8).any(|w| w == expected),
+            "expected bit-reinterpret of u64::MAX = i64 -1 on the wire"
+        );
     }
 
     #[test]
@@ -4870,5 +5107,98 @@ mod tests {
         );
         let (_out, _dict) =
             encode_with_overrides(&rb, &[ArrowColumnOverride::Symbol { column: "sym" }]).unwrap();
+    }
+
+    #[test]
+    fn not_symbol_override_decodes_dict_to_varchar_u8_utf8() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt8Type;
+        let dict = DictionaryArray::<UInt8Type>::from_iter(
+            ["foo", "bar", "foo", "baz"].into_iter().map(Some),
+        );
+        let f = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = single_col_batch(f, dict);
+        let (out, dict_global) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::NotSymbol { column: "s" }]).unwrap();
+        assert_qwp_header(&out, 1);
+        // SymbolDict route would populate the global symbol dictionary.
+        // DictToVarchar must not.
+        assert_eq!(dict_global.next_id(), 0);
+        for s in ["foo", "bar", "baz"] {
+            assert!(out.windows(s.len()).any(|w| w == s.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn not_symbol_override_decodes_dict_to_varchar_u32_large_utf8() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt32Type;
+        let keys = arrow_array::UInt32Array::from(vec![0u32, 1, 0]);
+        let values = LargeStringArray::from(vec!["alpha", "beta"]);
+        let dict = DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values)).unwrap();
+        let f = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::LargeUtf8)),
+            true,
+        );
+        let rb = single_col_batch(f, dict);
+        let (out, dict_global) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::NotSymbol { column: "s" }]).unwrap();
+        assert_eq!(dict_global.next_id(), 0);
+        for s in ["alpha", "beta"] {
+            assert!(out.windows(s.len()).any(|w| w == s.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn not_symbol_override_decodes_dict_with_nulls() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int16Type;
+        let dict = DictionaryArray::<Int16Type>::from_iter(
+            [Some("x"), None, Some("y"), Some("x")].into_iter(),
+        );
+        let f = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = single_col_batch(f, dict);
+        let (out, dict_global) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::NotSymbol { column: "s" }]).unwrap();
+        assert_eq!(dict_global.next_id(), 0);
+        for s in ["x", "y"] {
+            assert!(out.windows(s.len()).any(|w| w == s.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn not_symbol_override_on_plain_utf8_keeps_varchar() {
+        let mut sb = StringBuilder::new();
+        sb.append_value("hi");
+        sb.append_value("yo");
+        let f = Field::new("s", DataType::Utf8, false);
+        let rb = single_col_batch(f, sb.finish());
+        let (_out, dict_global) =
+            encode_with_overrides(&rb, &[ArrowColumnOverride::NotSymbol { column: "s" }]).unwrap();
+        assert_eq!(dict_global.next_id(), 0);
+    }
+
+    #[test]
+    fn dict_without_not_symbol_override_still_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::UInt8Type;
+        let dict = DictionaryArray::<UInt8Type>::from_iter(["a", "b", "a"].into_iter().map(Some));
+        let f = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = single_col_batch(f, dict);
+        let (_out, dict_global) = encode_with_overrides(&rb, &[]).unwrap();
+        assert_eq!(dict_global.next_id(), 2);
     }
 }

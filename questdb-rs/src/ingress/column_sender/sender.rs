@@ -32,7 +32,6 @@
 
 use std::fmt::{self, Debug, Formatter};
 
-#[cfg(feature = "arrow")]
 use crate::ErrorCode;
 use crate::ingress::buffer::SymbolGlobalDict;
 #[cfg(feature = "arrow")]
@@ -50,6 +49,7 @@ use arrow_array::RecordBatch;
 
 /// Acknowledgement level for [`ColumnSender::sync`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AckLevel {
     /// Wait for the server's WAL-commit ACK (spec status `0x00`). Always
     /// available.
@@ -258,7 +258,9 @@ impl ColumnSender {
         }) {
             Ok(p) => p,
             Err(e) => {
-                dict.rollback(dict_mark);
+                if e.code() != ErrorCode::SocketError {
+                    dict.rollback(dict_mark);
+                }
                 return Err(e);
             }
         };

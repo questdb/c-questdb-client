@@ -318,6 +318,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_arrow_unsupported_column_kind
             }
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
+            _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -1444,7 +1445,25 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec_str(
 ) -> bool {
     let buffer = unsafe { unwrap_buffer_mut(buffer) };
     let name = name.as_name();
-    let value = unsafe { slice::from_raw_parts(value as *const u8, value_len) };
+    if value.is_null() && value_len != 0 {
+        if !err_out.is_null() {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    questdb::Error::new(
+                        questdb::ErrorCode::InvalidDecimal,
+                        "Decimal string pointer is NULL with non-zero length".to_string(),
+                    ),
+                );
+            }
+        }
+        return false;
+    }
+    let value: &[u8] = if value_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(value as *const u8, value_len) }
+    };
     // Basic validation: ensure only numerical characters are present (accepts NaN, Inf[inity], and e-notation)
     for b in value.iter() {
         match b {
@@ -1535,7 +1554,25 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec64_str(
 ) -> bool {
     let buffer = unsafe { unwrap_buffer_mut(buffer) };
     let name = name.as_name();
-    let value = unsafe { slice::from_raw_parts(value as *const u8, value_len) };
+    if value.is_null() && value_len != 0 {
+        if !err_out.is_null() {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    questdb::Error::new(
+                        questdb::ErrorCode::InvalidDecimal,
+                        "Decimal string pointer is NULL with non-zero length".to_string(),
+                    ),
+                );
+            }
+        }
+        return false;
+    }
+    let value: &[u8] = if value_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(value as *const u8, value_len) }
+    };
     let value = match str::from_utf8(value) {
         Ok(value) => value,
         Err(err) => {
@@ -1598,7 +1635,25 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec128_str(
 ) -> bool {
     let buffer = unsafe { unwrap_buffer_mut(buffer) };
     let name = name.as_name();
-    let value = unsafe { slice::from_raw_parts(value as *const u8, value_len) };
+    if value.is_null() && value_len != 0 {
+        if !err_out.is_null() {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    questdb::Error::new(
+                        questdb::ErrorCode::InvalidDecimal,
+                        "Decimal string pointer is NULL with non-zero length".to_string(),
+                    ),
+                );
+            }
+        }
+        return false;
+    }
+    let value: &[u8] = if value_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(value as *const u8, value_len) }
+    };
     let value = match str::from_utf8(value) {
         Ok(value) => value,
         Err(err) => {

@@ -5153,11 +5153,18 @@ impl SymbolGlobalDict {
                  the connection to reset the dictionary"
             ));
         }
+        let owned_for_entries = bytes.to_vec();
+        let owned_for_map = bytes.to_vec();
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
+        self.map
+            .try_reserve(1)
+            .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
         let id = self.next_id;
+        self.entries.push(owned_for_entries);
+        self.map.insert(owned_for_map, id);
         self.next_id += 1;
-        let owned = bytes.to_vec();
-        self.entries.push(owned.clone());
-        self.map.insert(owned, id);
         Ok((id, true))
     }
 }

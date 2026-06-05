@@ -82,9 +82,19 @@ struct InUseSlot<'a> {
 }
 
 impl<'a> InUseSlot<'a> {
-    fn reserve(state: &'a Mutex<PoolState>) -> Self {
-        lock_state(state).in_use += 1;
-        Self { state, armed: true }
+    /// Reserve a slot atomically with a cap check. Returns `Err` if
+    /// `total() >= pool_max` already holds — preserving the documented
+    /// fail-fast contract under concurrent borrows.
+    fn reserve_within_cap(
+        state: &'a Mutex<PoolState>,
+        pool_max: usize,
+    ) -> std::result::Result<Self, usize> {
+        let mut guard = lock_state(state);
+        if guard.total() >= pool_max {
+            return Err(guard.in_use);
+        }
+        guard.in_use += 1;
+        Ok(Self { state, armed: true })
     }
 
     fn commit(mut self) {
@@ -109,9 +119,16 @@ struct ReaderInUseSlot<'a> {
 
 #[cfg(feature = "_egress")]
 impl<'a> ReaderInUseSlot<'a> {
-    fn reserve(state: &'a Mutex<ReaderPoolState>) -> Self {
-        lock_reader_state(state).in_use += 1;
-        Self { state, armed: true }
+    fn reserve_within_cap(
+        state: &'a Mutex<ReaderPoolState>,
+        pool_max: usize,
+    ) -> std::result::Result<Self, usize> {
+        let mut guard = lock_reader_state(state);
+        if guard.total() >= pool_max {
+            return Err(guard.in_use);
+        }
+        guard.in_use += 1;
+        Ok(Self { state, armed: true })
     }
 
     fn commit(mut self) {
@@ -286,7 +303,13 @@ impl QuestDb {
         });
 
         let reaper = match pool_cfg.pool_reap {
-            PoolReap::Auto => Some(spawn_reaper(Arc::clone(&inner))),
+            PoolReap::Auto => Some(spawn_reaper(Arc::clone(&inner)).map_err(|err| {
+                inner.shutdown.store(true, Ordering::SeqCst);
+                crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    format!("Failed to spawn pool reaper thread: {err}"),
+                )
+            })?),
             PoolReap::Manual => None,
         };
 
@@ -333,19 +356,20 @@ impl QuestDb {
                 entry.scratch,
             ));
         }
-
-        if state.total() >= self.inner.pool_max {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "Connection pool exhausted: {} connections are currently borrowed and \
-                 the pool is at its `pool_max` cap of {}. Return a sender or raise `pool_max`.",
-                state.in_use,
-                self.inner.pool_max
-            ));
-        }
         drop(state);
 
-        let slot = InUseSlot::reserve(&self.inner.state);
+        let slot = match InUseSlot::reserve_within_cap(&self.inner.state, self.inner.pool_max) {
+            Ok(slot) => slot,
+            Err(in_use) => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Connection pool exhausted: {} connections are currently borrowed and \
+                     the pool is at its `pool_max` cap of {}. Return a sender or raise `pool_max`.",
+                    in_use,
+                    self.inner.pool_max
+                ));
+            }
+        };
         let conn = ColumnConn::connect(&self.inner.conf)?;
         slot.commit();
 
@@ -432,21 +456,25 @@ impl QuestDb {
             drop(state);
             return Ok(entry.reader);
         }
-
-        if state.total() >= self.inner.pool_max {
-            return Err(EgressError::new(
-                EgressErrorCode::InvalidApiCall,
-                format!(
-                    "Reader pool exhausted: {} readers are currently borrowed and \
-                     the pool is at its `pool_max` cap of {}. \
-                     Release a reader or raise `pool_max`.",
-                    state.in_use, self.inner.pool_max
-                ),
-            ));
-        }
         drop(state);
 
-        let slot = ReaderInUseSlot::reserve(&self.inner.reader_state);
+        let slot = match ReaderInUseSlot::reserve_within_cap(
+            &self.inner.reader_state,
+            self.inner.pool_max,
+        ) {
+            Ok(slot) => slot,
+            Err(in_use) => {
+                return Err(EgressError::new(
+                    EgressErrorCode::InvalidApiCall,
+                    format!(
+                        "Reader pool exhausted: {} readers are currently borrowed and \
+                         the pool is at its `pool_max` cap of {}. \
+                         Release a reader or raise `pool_max`.",
+                        in_use, self.inner.pool_max
+                    ),
+                ));
+            }
+        };
         let reader = Reader::from_conf(&self.inner.conf)?;
         slot.commit();
         Ok(reader)
@@ -705,12 +733,11 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     drop(state);
 }
 
-fn spawn_reaper(inner: Arc<DbInner>) -> JoinHandle<()> {
+fn spawn_reaper(inner: Arc<DbInner>) -> std::io::Result<JoinHandle<()>> {
     let tick = reaper_tick(inner.pool_idle_timeout);
     thread::Builder::new()
         .name("questdb-column-sender-pool-reaper".to_string())
         .spawn(move || reaper_loop(inner, tick))
-        .expect("failed to spawn pool reaper thread")
 }
 
 fn reaper_tick(idle_timeout: Duration) -> Duration {

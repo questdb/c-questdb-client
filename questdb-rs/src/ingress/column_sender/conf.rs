@@ -43,6 +43,14 @@ pub(crate) const DEFAULT_POOL_MAX: usize = 64;
 /// connection.
 pub(crate) const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Hard cap on parsed `pool_size` / `pool_max`. Bounds the eager
+/// `Vec::with_capacity` allocation in [`super::QuestDb::connect`] so a
+/// malformed conf string cannot abort the host via allocator OOM.
+pub(crate) const MAX_POOL_SIZE: usize = 65_536;
+/// Hard cap on parsed `pool_idle_timeout_ms` (one year). Keeps `Duration`
+/// arithmetic inside `i64`-microsecond range used downstream.
+pub(crate) const MAX_POOL_IDLE_TIMEOUT_MS: u64 = 365 * 24 * 3600 * 1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PoolReap {
     Auto,
@@ -137,10 +145,18 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                 let millis: u64 = value.parse().map_err(|_| {
                     error::fmt!(
                         ConfigError,
-                        "Invalid value for \"pool_idle_timeout_ms\" (expected non-negative integer): {:?}",
+                        "Invalid value for \"pool_idle_timeout_ms\" (expected an unsigned integer): {:?}",
                         value
                     )
                 })?;
+                if millis > MAX_POOL_IDLE_TIMEOUT_MS {
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "\"pool_idle_timeout_ms\" {} exceeds maximum ({})",
+                        millis,
+                        MAX_POOL_IDLE_TIMEOUT_MS
+                    ));
+                }
                 pool.pool_idle_timeout = Duration::from_millis(millis);
             }
             "pool_reap" => {
@@ -220,14 +236,24 @@ fn refused_key_error(key: &str) -> crate::Error {
 }
 
 fn parse_pool_usize(key: &str, value: &str) -> Result<usize> {
-    value.parse::<usize>().map_err(|_| {
+    let parsed: usize = value.parse().map_err(|_| {
         error::fmt!(
             ConfigError,
-            "Invalid value for {:?} (expected non-negative integer): {:?}",
+            "Invalid value for {:?} (expected an unsigned integer): {:?}",
             key,
             value
         )
-    })
+    })?;
+    if parsed > MAX_POOL_SIZE {
+        return Err(error::fmt!(
+            ConfigError,
+            "{:?} ({}) exceeds maximum ({})",
+            key,
+            parsed,
+            MAX_POOL_SIZE
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Walk a parsed conf-string `params` section, invoking `visit(key, value)`

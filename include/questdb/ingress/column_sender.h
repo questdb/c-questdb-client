@@ -228,9 +228,15 @@ column_sender_chunk* column_sender_chunk_new(
 QUESTDB_CLIENT_API
 void column_sender_chunk_free(column_sender_chunk* chunk);
 
-/** Clear the chunk's content, keeping retained capacity for reuse. */
+/**
+ * Clear the chunk's content, keeping retained capacity for reuse.
+ *
+ * Returns true on success, false if `chunk` is NULL or another FFI
+ * call is currently mutating the chunk (concurrent use is a contract
+ * violation; the false return surfaces it instead of silently dropping).
+ */
 QUESTDB_CLIENT_API
-void column_sender_chunk_clear(column_sender_chunk* chunk);
+bool column_sender_chunk_clear(column_sender_chunk* chunk);
 
 /** Current row count of the chunk; 0 if no column has been appended. */
 QUESTDB_CLIENT_API

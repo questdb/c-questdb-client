@@ -35,7 +35,7 @@
 use libc::{c_char, size_t};
 use std::slice;
 use std::str;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use questdb::ingress::MAX_ARRAY_DIMS;
 #[cfg(feature = "arrow")]
@@ -62,10 +62,11 @@ pub struct questdb_db(pub(crate) QuestDb);
 ///
 /// **Not thread-safe.** A `qwpws_conn*` must not be used from more than
 /// one thread at a time. The second tuple field is a CAS-checked latch
-/// on every FFI entry that mutates the conn; concurrent calls return
-/// `line_sender_error_invalid_api_call` rather than racing on the
-/// underlying writer state.
-pub struct qwpws_conn(OwnedSender, AtomicBool);
+/// on every FFI entry (mutation, accessor, and free); concurrent calls
+/// return `line_sender_error_invalid_api_call`. If `questdb_db_return_conn`
+/// races with an in-flight call, the close is deferred — the in-flight
+/// call's exit path performs the deferred `Box::from_raw`, never UAF.
+pub struct qwpws_conn(OwnedSender, AtomicU32);
 
 /// One DataFrame's worth of column buffers destined for one QuestDB table.
 /// Owned by the caller; not bound to a connection.
@@ -77,51 +78,106 @@ pub struct qwpws_conn(OwnedSender, AtomicBool);
 /// chunk's lifetime by promoting its inner type to `'static`; the lifetime
 /// is enforced by the caller, not the borrow checker.
 ///
-/// **Not thread-safe.** A `column_sender_chunk*` must not be used from
-/// more than one thread at a time. The second tuple field is a
-/// CAS-checked latch on every FFI entry that mutates the chunk;
-/// concurrent calls return `line_sender_error_invalid_api_call`.
-pub struct column_sender_chunk(Chunk<'static>, AtomicBool);
+/// **Not thread-safe.** Single-threaded by contract; the latch in the
+/// second tuple field detects concurrent calls (mutation, accessor, and
+/// free) and defers a racing free until the active call exits, so a
+/// misbehaving caller observes `InvalidApiCall` rather than UAF.
+pub struct column_sender_chunk(Chunk<'static>, AtomicU32);
 
-/// RAII latch that flips an `AtomicBool` on construction and clears it
-/// on drop. Acquisition fails if the latch is already set; FFI entries
-/// then return `InvalidApiCall` rather than racing.
-struct InUseGuard<'a> {
-    flag: &'a AtomicBool,
+const LATCH_IN_USE: u32 = 1 << 0;
+const LATCH_CLOSED: u32 = 1 << 1;
+const LATCH_DROP: u32 = 1 << 2;
+
+trait FfiHandle {
+    unsafe fn on_deferred_close(handle: *mut Self, latch_prev: u32);
 }
 
-impl<'a> InUseGuard<'a> {
-    fn acquire(
-        flag: &'a AtomicBool,
+impl FfiHandle for column_sender_chunk {
+    unsafe fn on_deferred_close(_handle: *mut Self, _latch_prev: u32) {}
+}
+
+impl FfiHandle for qwpws_conn {
+    unsafe fn on_deferred_close(handle: *mut Self, latch_prev: u32) {
+        if latch_prev & LATCH_DROP != 0 {
+            unsafe { (*handle).0.get_mut().mark_must_close() };
+        }
+    }
+}
+
+struct InUseGuard<T: FfiHandle> {
+    handle: *mut T,
+    state: *const AtomicU32,
+}
+
+impl<T: FfiHandle> InUseGuard<T> {
+    unsafe fn acquire(
+        handle: *mut T,
+        state: *const AtomicU32,
         fn_name: &str,
         what: &str,
         err_out: *mut *mut line_sender_error,
     ) -> Option<Self> {
-        if flag
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
-            .is_err()
-        {
-            unsafe {
-                set_err_out_from_error(
-                    err_out,
-                    Error::new(
-                        ErrorCode::InvalidApiCall,
-                        format!(
-                            "{fn_name}: {what} is already in use by a concurrent call \
-                             (each handle is single-threaded)"
+        let atomic = unsafe { &*state };
+        loop {
+            let cur = atomic.load(Ordering::Acquire);
+            if cur & LATCH_CLOSED != 0 {
+                unsafe {
+                    set_err_out_from_error(
+                        err_out,
+                        Error::new(
+                            ErrorCode::InvalidApiCall,
+                            format!("{fn_name}: {what} has been freed or returned to the pool"),
                         ),
-                    ),
-                );
+                    );
+                }
+                return None;
             }
-            return None;
+            if cur & LATCH_IN_USE != 0 {
+                unsafe {
+                    set_err_out_from_error(
+                        err_out,
+                        Error::new(
+                            ErrorCode::InvalidApiCall,
+                            format!(
+                                "{fn_name}: {what} is already in use by a concurrent call \
+                                 (each handle is single-threaded)"
+                            ),
+                        ),
+                    );
+                }
+                return None;
+            }
+            if atomic
+                .compare_exchange_weak(cur, cur | LATCH_IN_USE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self { handle, state });
+            }
         }
-        Some(Self { flag })
     }
 }
 
-impl Drop for InUseGuard<'_> {
+impl<T: FfiHandle> Drop for InUseGuard<T> {
     fn drop(&mut self) {
-        self.flag.store(false, Ordering::Release);
+        let atomic = unsafe { &*self.state };
+        let prev = atomic.fetch_and(!LATCH_IN_USE, Ordering::AcqRel);
+        if prev & LATCH_CLOSED != 0 {
+            unsafe {
+                T::on_deferred_close(self.handle, prev);
+                drop(Box::from_raw(self.handle));
+            }
+        }
+    }
+}
+
+unsafe fn finalize_or_defer<T: FfiHandle>(handle: *mut T, state: *const AtomicU32, extra: u32) {
+    let atomic = unsafe { &*state };
+    let prev = atomic.fetch_or(LATCH_CLOSED | extra, Ordering::AcqRel);
+    if prev & (LATCH_IN_USE | LATCH_CLOSED) == 0 {
+        unsafe {
+            T::on_deferred_close(handle, LATCH_CLOSED | extra);
+            drop(Box::from_raw(handle));
+        }
     }
 }
 
@@ -267,6 +323,7 @@ unsafe fn typed_slice<'a, T>(
     err_out: *mut *mut line_sender_error,
     what: &'static str,
 ) -> Option<&'a [T]> {
+    use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
     if data.is_null() && len != 0 {
         unsafe {
             set_err_out_from_error(
@@ -274,6 +331,18 @@ unsafe fn typed_slice<'a, T>(
                 Error::new(
                     ErrorCode::InvalidApiCall,
                     format!("{what} pointer is NULL with non-zero length"),
+                ),
+            );
+        }
+        return None;
+    }
+    if len > MAX_CHUNK_ROWS {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{what} length {len} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})"),
                 ),
             );
         }
@@ -361,7 +430,7 @@ pub unsafe extern "C" fn questdb_db_borrow_conn(
     }
     let db_ref = unsafe { &*db };
     match db_ref.0.borrow_sender_owned() {
-        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicBool::new(false)))),
+        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             std::ptr::null_mut()
@@ -369,39 +438,33 @@ pub unsafe extern "C" fn questdb_db_borrow_conn(
     }
 }
 
-/// Return a borrowed conn to the pool. Invalidates `conn`. Accepts
-/// NULL `conn` and no-ops. `db` is ignored — the conn carries its own
-/// reference to the pool — but kept in the ABI for symmetry with the
-/// borrow call and to allow future runtime checks.
+/// Return a borrowed conn to the pool. Invalidates `conn`. Accepts NULL
+/// and no-ops. `db` is ignored — kept in the ABI for symmetry.
+///
+/// A racing in-flight call on the same handle defers the drop: the
+/// in-flight call's exit path performs the actual `Box::from_raw`, so
+/// the caller never sees UAF.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_return_conn(_db: *mut questdb_db, conn: *mut qwpws_conn) {
-    if !conn.is_null() {
-        unsafe { drop(Box::from_raw(conn)) };
+    if conn.is_null() {
+        return;
     }
+    let state: *const AtomicU32 = unsafe { &raw const (*conn).1 };
+    unsafe { finalize_or_defer(conn, state, 0) };
 }
 
-/// Force-drop a borrowed conn instead of recycling it. The conn is
-/// marked terminal (`qwpws_conn_must_close` becomes `true`) before
-/// the usual pool-return path runs, so the underlying connection is
-/// closed and dropped from the pool. Invalidates `conn`. Accepts
-/// NULL `conn` and no-ops.
-///
-/// Use this in error-recovery paths where the conn may hold
-/// in-flight uncommitted frames that the next borrower would otherwise
-/// commit alongside their own. Equivalent to "mark must_close, then
-/// return" but in a single atomic step from the caller's perspective.
-///
-/// `db` is ignored, kept for symmetry with the other pool entry
-/// points.
+/// Force-drop a borrowed conn instead of recycling it. Marks the conn
+/// terminal (`qwpws_conn_must_close` becomes `true`) so the underlying
+/// connection is closed and removed from the pool. Accepts NULL and
+/// no-ops. As with `questdb_db_return_conn`, a racing in-flight call
+/// defers the drop to that call's exit path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_drop_conn(_db: *mut questdb_db, conn: *mut qwpws_conn) {
-    if !conn.is_null() {
-        // SAFETY: caller guarantees `conn` is a live qwpws_conn handle
-        // (NULL handled above).
-        let owned = unsafe { &mut *conn };
-        owned.0.get_mut().mark_must_close();
-        unsafe { drop(Box::from_raw(conn)) };
+    if conn.is_null() {
+        return;
     }
+    let state: *const AtomicU32 = unsafe { &raw const (*conn).1 };
+    unsafe { finalize_or_defer(conn, state, LATCH_DROP) };
 }
 
 /// Manually reap idle connections. Returns the number of connections
@@ -419,10 +482,15 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
 // Connection state
 // ===========================================================================
 
-/// `true` if the connection is in a permanently-unusable state.
+/// `true` if the connection is in a permanently-unusable state, has been
+/// closed/dropped, or `conn` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool {
     if conn.is_null() {
+        return true;
+    }
+    let state = unsafe { &(*conn).1 };
+    if state.load(Ordering::Acquire) & LATCH_CLOSED != 0 {
         return true;
     }
     unsafe { (*conn).0.get().must_close() }
@@ -486,48 +554,62 @@ pub unsafe extern "C" fn column_sender_chunk_new(
     };
     Box::into_raw(Box::new(column_sender_chunk(
         Chunk::new(table),
-        AtomicBool::new(false),
+        AtomicU32::new(0),
     )))
 }
 
-/// Free a chunk. Accepts NULL and no-ops.
+/// Free a chunk. Accepts NULL and no-ops. A racing in-flight call defers
+/// the drop to the in-flight call's exit path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_free(chunk: *mut column_sender_chunk) {
-    if !chunk.is_null() {
-        unsafe { drop(Box::from_raw(chunk)) };
+    if chunk.is_null() {
+        return;
     }
+    let state: *const AtomicU32 = unsafe { &raw const (*chunk).1 };
+    unsafe { finalize_or_defer(chunk, state, 0) };
 }
 
 /// Clear a chunk's content, keeping its retained capacity for reuse.
 ///
-/// No-op if `chunk` is NULL or if another FFI call is currently
-/// mutating the chunk (the per-handle in-use latch protects against
-/// torn state). Concurrent use of a `column_sender_chunk*` from
-/// multiple threads is a documented contract violation; this entry
-/// returns void with no error channel, so contention is silently
-/// dropped.
+/// Returns `true` on success, `false` if `chunk` is NULL, has already
+/// been freed, or another FFI call is currently mutating the chunk.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_clear(chunk: *mut column_sender_chunk) {
-    let Some(chunk_ref) = (unsafe { chunk.as_mut() }) else {
-        return;
-    };
-    if chunk_ref
-        .1
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
-        .is_err()
-    {
-        return;
+pub unsafe extern "C" fn column_sender_chunk_clear(chunk: *mut column_sender_chunk) -> bool {
+    if chunk.is_null() {
+        return false;
     }
-    chunk_ref.0.clear();
-    chunk_ref.1.store(false, Ordering::Release);
+    let state: *const AtomicU32 = unsafe { &raw const (*chunk).1 };
+    let mut err_box: *mut line_sender_error = std::ptr::null_mut();
+    let guard = unsafe {
+        InUseGuard::acquire(
+            chunk,
+            state,
+            "column_sender_chunk_clear",
+            "column_sender_chunk",
+            &mut err_box,
+        )
+    };
+    if guard.is_none() {
+        if !err_box.is_null() {
+            unsafe { crate::line_sender_error_free(err_box) };
+        }
+        return false;
+    }
+    unsafe { (*chunk).0.clear() };
+    drop(guard);
+    true
 }
 
-/// Current row count of the chunk; 0 if no column has been appended.
+/// Current row count of the chunk; 0 if `chunk` is NULL or has been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_row_count(
     chunk: *const column_sender_chunk,
 ) -> size_t {
     if chunk.is_null() {
+        return 0;
+    }
+    let state = unsafe { &(*chunk).1 };
+    if state.load(Ordering::Acquire) & LATCH_CLOSED != 0 {
         return 0;
     }
     unsafe { (*chunk).0.row_count() }
@@ -549,20 +631,21 @@ macro_rules! column_fn {
             validity: *const column_sender_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
-            let chunk_ref = match unsafe { chunk.as_mut() } {
-                Some(c) => c,
-                None => return reject_null_chunk(err_out),
-            };
-            let _guard = match InUseGuard::acquire(
-                &chunk_ref.1,
-                stringify!($fn_name),
-                "column_sender_chunk",
-                err_out,
-            ) {
+            if chunk.is_null() {
+                return reject_null_chunk(err_out);
+            }
+            let _guard = match unsafe {
+                InUseGuard::acquire(
+                    chunk,
+                    &raw const (*chunk).1,
+                    stringify!($fn_name),
+                    "column_sender_chunk",
+                    err_out,
+                )
+            } {
                 Some(g) => g,
                 None => return false,
             };
-            let chunk = &mut chunk_ref.0;
             let name = match unsafe { name_str(name, name_len, err_out) } {
                 Some(s) => s,
                 None => return false,
@@ -575,7 +658,8 @@ macro_rules! column_fn {
                 Some(v) => v,
                 None => return false,
             };
-            bubble!(err_out, chunk.$rust_method(name, data, validity.as_ref()));
+            let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+            bubble!(err_out, inner.$rust_method(name, data, validity.as_ref()));
             true
         }
     };
@@ -654,24 +738,42 @@ pub unsafe extern "C" fn column_sender_chunk_column_bool(
     validity: *const column_sender_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_chunk_column_bool",
-        "column_sender_chunk",
-        err_out,
-    ) {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_column_bool",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
     };
+    {
+        use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
+        if row_count > MAX_CHUNK_ROWS {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "bool column row_count {row_count} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})"
+                        ),
+                    ),
+                );
+            }
+            return false;
+        }
+    }
     let bytes_required = row_count.div_ceil(8);
     let data_slice = match unsafe { typed_slice(data, bytes_required, err_out, "bool column data") }
     {
@@ -682,9 +784,10 @@ pub unsafe extern "C" fn column_sender_chunk_column_bool(
         Some(v) => v,
         None => return false,
     };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(
         err_out,
-        chunk.column_bool(name, data_slice, row_count, validity.as_ref())
+        inner.column_bool(name, data_slice, row_count, validity.as_ref())
     );
     true
 }
@@ -701,20 +804,21 @@ macro_rules! fixed_width_byte_column_fn {
             validity: *const column_sender_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
-            let chunk_ref = match unsafe { chunk.as_mut() } {
-                Some(c) => c,
-                None => return reject_null_chunk(err_out),
-            };
-            let _guard = match InUseGuard::acquire(
-                &chunk_ref.1,
-                stringify!($fn_name),
-                "column_sender_chunk",
-                err_out,
-            ) {
+            if chunk.is_null() {
+                return reject_null_chunk(err_out);
+            }
+            let _guard = match unsafe {
+                InUseGuard::acquire(
+                    chunk,
+                    &raw const (*chunk).1,
+                    stringify!($fn_name),
+                    "column_sender_chunk",
+                    err_out,
+                )
+            } {
                 Some(g) => g,
                 None => return false,
             };
-            let chunk = &mut chunk_ref.0;
             let name = match unsafe { name_str(name, name_len, err_out) } {
                 Some(s) => s,
                 None => return false,
@@ -734,6 +838,24 @@ macro_rules! fixed_width_byte_column_fn {
                 }
                 return false;
             }
+            {
+                use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
+                if row_count > MAX_CHUNK_ROWS {
+                    unsafe {
+                        set_err_out_from_error(
+                            err_out,
+                            Error::new(
+                                ErrorCode::InvalidApiCall,
+                                format!(
+                                    "{} column row_count {} exceeds MAX_CHUNK_ROWS ({})",
+                                    $what, row_count, MAX_CHUNK_ROWS
+                                ),
+                            ),
+                        );
+                    }
+                    return false;
+                }
+            }
             let data_slice: &[[u8; $n]] = if row_count == 0 {
                 &[]
             } else {
@@ -743,9 +865,10 @@ macro_rules! fixed_width_byte_column_fn {
                 Some(v) => v,
                 None => return false,
             };
+            let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
             bubble!(
                 err_out,
-                chunk.$rust_method(name, data_slice, validity.as_ref())
+                inner.$rust_method(name, data_slice, validity.as_ref())
             );
             true
         }
@@ -779,20 +902,21 @@ pub unsafe extern "C" fn column_sender_chunk_column_binary(
     validity: *const column_sender_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_chunk_column_binary",
-        "column_sender_chunk",
-        err_out,
-    ) {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_column_binary",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -824,9 +948,10 @@ pub unsafe extern "C" fn column_sender_chunk_column_binary(
         Some(v) => v,
         None => return false,
     };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(
         err_out,
-        chunk.column_binary(name, offsets, bytes, validity.as_ref())
+        inner.column_binary(name, offsets, bytes, validity.as_ref())
     );
     true
 }
@@ -846,20 +971,21 @@ pub unsafe extern "C" fn column_sender_chunk_column_varchar(
     validity: *const column_sender_validity,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_chunk_column_varchar",
-        "column_sender_chunk",
-        err_out,
-    ) {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_column_varchar",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -891,9 +1017,10 @@ pub unsafe extern "C" fn column_sender_chunk_column_varchar(
         Some(v) => v,
         None => return false,
     };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(
         err_out,
-        chunk.column_varchar(name, offsets, bytes, validity.as_ref())
+        inner.column_varchar(name, offsets, bytes, validity.as_ref())
     );
     true
 }
@@ -918,20 +1045,21 @@ macro_rules! symbol_fn {
             validity: *const column_sender_validity,
             err_out: *mut *mut line_sender_error,
         ) -> bool {
-            let chunk_ref = match unsafe { chunk.as_mut() } {
-                Some(c) => c,
-                None => return reject_null_chunk(err_out),
-            };
-            let _guard = match InUseGuard::acquire(
-                &chunk_ref.1,
-                stringify!($fn_name),
-                "column_sender_chunk",
-                err_out,
-            ) {
+            if chunk.is_null() {
+                return reject_null_chunk(err_out);
+            }
+            let _guard = match unsafe {
+                InUseGuard::acquire(
+                    chunk,
+                    &raw const (*chunk).1,
+                    stringify!($fn_name),
+                    "column_sender_chunk",
+                    err_out,
+                )
+            } {
                 Some(g) => g,
                 None => return false,
             };
-            let chunk = &mut chunk_ref.0;
             let name = match unsafe { name_str(name, name_len, err_out) } {
                 Some(s) => s,
                 None => return false,
@@ -961,9 +1089,10 @@ macro_rules! symbol_fn {
                 Some(v) => v,
                 None => return false,
             };
+            let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
             bubble!(
                 err_out,
-                chunk.$rust_method(name, codes, dict_offsets, dict_bytes, validity.as_ref())
+                inner.$rust_method(name, codes, dict_offsets, dict_bytes, validity.as_ref())
             );
             true
         }
@@ -1025,20 +1154,21 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_chunk_append_arrow_column",
-        "column_sender_chunk",
-        err_out,
-    ) {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_append_arrow_column",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -1073,7 +1203,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
             return false;
         }
     };
-    bubble!(err_out, chunk.push_arrow_column(name, &field, arr_ref));
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, inner.push_arrow_column(name, &field, arr_ref));
     true
 }
 
@@ -1495,20 +1626,21 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
     extras: *const column_sender_numpy_extras,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_chunk_append_numpy_column",
-        "column_sender_chunk",
-        err_out,
-    ) {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_append_numpy_column",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let chunk = &mut chunk_ref.0;
     let name = match unsafe { name_str(name, name_len, err_out) } {
         Some(s) => s,
         None => return false,
@@ -1521,8 +1653,9 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
         Some(d) => d,
         None => return false,
     };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(err_out, unsafe {
-        chunk.push_numpy_deferred(name, dtype, data, row_count, validity.as_ref())
+        inner.push_numpy_deferred(name, dtype, data, row_count, validity.as_ref())
     });
     true
 }
@@ -1538,25 +1671,27 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_micros(
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_chunk_designated_timestamp_micros",
-        "column_sender_chunk",
-        err_out,
-    ) {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_designated_timestamp_micros",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let chunk = &mut chunk_ref.0;
     let data = match unsafe { typed_slice(data, row_count, err_out, "designated_ts micros") } {
         Some(s) => s,
         None => return false,
     };
-    bubble!(err_out, chunk.designated_timestamp_micros(data));
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, inner.designated_timestamp_micros(data));
     true
 }
 
@@ -1567,25 +1702,27 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
     row_count: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_chunk_designated_timestamp_nanos",
-        "column_sender_chunk",
-        err_out,
-    ) {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_designated_timestamp_nanos",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let chunk = &mut chunk_ref.0;
     let data = match unsafe { typed_slice(data, row_count, err_out, "designated_ts nanos") } {
         Some(s) => s,
         None => return false,
     };
-    bubble!(err_out, chunk.designated_timestamp_nanos(data));
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, inner.designated_timestamp_nanos(data));
     true
 }
 
@@ -1614,42 +1751,48 @@ pub unsafe extern "C" fn column_sender_flush(
     chunk: *mut column_sender_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let conn_ref = match unsafe { conn.as_mut() } {
-        Some(c) => c,
-        None => {
-            unsafe {
-                set_err_out_from_error(
-                    err_out,
-                    Error::new(
-                        ErrorCode::InvalidApiCall,
-                        "column_sender_flush: conn pointer is NULL".to_string(),
-                    ),
-                );
-            }
-            return false;
+    if conn.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "column_sender_flush: conn pointer is NULL".to_string(),
+                ),
+            );
         }
-    };
-    let _conn_guard =
-        match InUseGuard::acquire(&conn_ref.1, "column_sender_flush", "qwpws_conn", err_out) {
-            Some(g) => g,
-            None => return false,
-        };
-    let chunk_ref = match unsafe { chunk.as_mut() } {
-        Some(c) => c,
-        None => return reject_null_chunk(err_out),
-    };
-    let _chunk_guard = match InUseGuard::acquire(
-        &chunk_ref.1,
-        "column_sender_flush",
-        "column_sender_chunk",
-        err_out,
-    ) {
+        return false;
+    }
+    let _conn_guard = match unsafe {
+        InUseGuard::acquire(
+            conn,
+            &raw const (*conn).1,
+            "column_sender_flush",
+            "qwpws_conn",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let sender = conn_ref.0.get_mut();
-    let chunk = &mut chunk_ref.0;
-    bubble!(err_out, sender.flush(chunk));
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _chunk_guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_flush",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let sender = unsafe { (*conn).0.get_mut() };
+    let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, sender.flush(chunk_inner));
     true
 }
 
@@ -1750,8 +1893,13 @@ pub struct column_sender_arrow_override {
     pub column_len: size_t,
     /// One of `column_sender_arrow_override_kind` as `u32`.
     pub kind: u32,
-    /// For `_geohash`: precision bits (1..=60). Ignored for other
-    /// kinds; pass 0.
+    /// Kind-specific argument:
+    /// - `_symbol`: 0 = mark column as `SYMBOL` (default), 1 = force
+    ///   the column NOT to be SYMBOL (Dictionary columns are decoded
+    ///   to VARCHAR on emit; no-op on plain Utf8 which is VARCHAR
+    ///   already).
+    /// - `_geohash`: precision bits (1..=60).
+    /// - other kinds: ignored; pass 0.
     pub arg: u32,
 }
 
@@ -1818,6 +1966,11 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_with_override
 }
 
 #[cfg(feature = "arrow")]
+const MAX_ARROW_OVERRIDES: usize = 65_536;
+#[cfg(feature = "arrow")]
+const MAX_ARROW_OVERRIDE_COLUMN_NAME_LEN: usize = 65_536;
+
+#[cfg(feature = "arrow")]
 unsafe fn arrow_overrides_from_c<'a>(
     overrides: *const column_sender_arrow_override,
     overrides_len: size_t,
@@ -1834,6 +1987,14 @@ unsafe fn arrow_overrides_from_c<'a>(
         );
         return None;
     }
+    if overrides_len > MAX_ARROW_OVERRIDES {
+        crate::arrow_err_to_c_box(
+            err_out,
+            ErrorCode::InvalidApiCall,
+            format!("arrow overrides_len {overrides_len} exceeds maximum ({MAX_ARROW_OVERRIDES})"),
+        );
+        return None;
+    }
     let raw = unsafe { std::slice::from_raw_parts(overrides, overrides_len) };
     let mut out = Vec::with_capacity(raw.len());
     for ov in raw {
@@ -1842,6 +2003,17 @@ unsafe fn arrow_overrides_from_c<'a>(
                 err_out,
                 ErrorCode::InvalidApiCall,
                 "arrow override has empty column name".to_string(),
+            );
+            return None;
+        }
+        if ov.column_len > MAX_ARROW_OVERRIDE_COLUMN_NAME_LEN {
+            crate::arrow_err_to_c_box(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!(
+                    "arrow override column_len {} exceeds maximum ({MAX_ARROW_OVERRIDE_COLUMN_NAME_LEN})",
+                    ov.column_len
+                ),
             );
             return None;
         }
@@ -1862,7 +2034,11 @@ unsafe fn arrow_overrides_from_c<'a>(
                 == column_sender_arrow_override_kind::column_sender_arrow_override_symbol
                     as u32 =>
             {
-                ArrowColumnOverride::Symbol { column }
+                if ov.arg == 0 {
+                    ArrowColumnOverride::Symbol { column }
+                } else {
+                    ArrowColumnOverride::NotSymbol { column }
+                }
             }
             x if x
                 == column_sender_arrow_override_kind::column_sender_arrow_override_ipv4 as u32 =>
@@ -1921,23 +2097,23 @@ unsafe fn arrow_batch_impl(
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let conn_ref = match unsafe { conn.as_mut() } {
-        Some(c) => c,
-        None => {
-            crate::arrow_err_to_c_box(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "column_sender_flush_arrow_batch: conn pointer is NULL".to_string(),
-            );
-            return false;
-        }
-    };
-    let _guard = match InUseGuard::acquire(
-        &conn_ref.1,
-        "column_sender_flush_arrow_batch",
-        "qwpws_conn",
-        err_out,
-    ) {
+    if conn.is_null() {
+        crate::arrow_err_to_c_box(
+            err_out,
+            ErrorCode::InvalidApiCall,
+            "column_sender_flush_arrow_batch: conn pointer is NULL".to_string(),
+        );
+        return false;
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            conn,
+            &raw const (*conn).1,
+            "column_sender_flush_arrow_batch",
+            "qwpws_conn",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
@@ -1945,7 +2121,6 @@ unsafe fn arrow_batch_impl(
         Some(v) => v,
         None => return false,
     };
-    let sender = conn_ref.0.get_mut();
     let rb = match unsafe {
         crate::arrow_ffi_import_record_batch(
             array,
@@ -1958,6 +2133,7 @@ unsafe fn arrow_batch_impl(
         None => return false,
     };
     let table_name = unsafe { table.as_name() };
+    let sender = unsafe { (*conn).0.get_mut() };
     let result = match ts_column {
         Some(ts) => sender.flush_arrow_batch_at_column_with_overrides(
             table_name,
@@ -1989,27 +2165,31 @@ pub unsafe extern "C" fn column_sender_sync(
         Some(l) => l,
         None => return false,
     };
-    let conn_ref = match unsafe { conn.as_mut() } {
-        Some(c) => c,
-        None => {
-            unsafe {
-                set_err_out_from_error(
-                    err_out,
-                    Error::new(
-                        ErrorCode::InvalidApiCall,
-                        "column_sender_sync: conn pointer is NULL".to_string(),
-                    ),
-                );
-            }
-            return false;
+    if conn.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "column_sender_sync: conn pointer is NULL".to_string(),
+                ),
+            );
         }
-    };
-    let _guard = match InUseGuard::acquire(&conn_ref.1, "column_sender_sync", "qwpws_conn", err_out)
-    {
+        return false;
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            conn,
+            &raw const (*conn).1,
+            "column_sender_sync",
+            "qwpws_conn",
+            err_out,
+        )
+    } {
         Some(g) => g,
         None => return false,
     };
-    let sender = conn_ref.0.get_mut();
+    let sender = unsafe { (*conn).0.get_mut() };
     bubble!(err_out, sender.sync(ack_level));
     true
 }

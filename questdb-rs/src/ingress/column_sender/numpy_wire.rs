@@ -53,6 +53,7 @@ use super::wire::{
 /// the caller (push_numpy_deferred / the FFI dispatcher) before being
 /// embedded — emit code trusts them and does not re-check ranges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NumpyDtype {
     // ---- Direct (zero-copy bulk emit) ----
     I64Direct,
@@ -339,8 +340,6 @@ pub(crate) unsafe fn emit_into_wire(
         D::U32WidenToI64 => unsafe {
             emit_widen_i64_sentinel::<u32>(out, data, row_count, validity, I64_NULL, |v| v as i64)
         },
-        // Why: numpy u64 → i64 bit-reinterpret matches the row-path C
-        // cast — values > i64::MAX surface as negative on the wire.
         D::U64WidenToI64 => unsafe {
             emit_widen_i64_sentinel::<u64>(out, data, row_count, validity, I64_NULL, |v| v as i64)
         },
@@ -404,15 +403,17 @@ pub(crate) unsafe fn emit_into_wire(
         },
 
         // ---- Geohash (bits byte + bitmap-encoded width-N rows) ----
-        D::GeohashI8 { bits } => unsafe { emit_geohash::<1>(out, bits, data, row_count, validity) },
+        D::GeohashI8 { bits } => unsafe {
+            emit_geohash::<1>(out, bits, data, row_count, validity)?
+        },
         D::GeohashI16 { bits } => unsafe {
-            emit_geohash::<2>(out, bits, data, row_count, validity)
+            emit_geohash::<2>(out, bits, data, row_count, validity)?
         },
         D::GeohashI32 { bits } => unsafe {
-            emit_geohash::<4>(out, bits, data, row_count, validity)
+            emit_geohash::<4>(out, bits, data, row_count, validity)?
         },
         D::GeohashI64 { bits } => unsafe {
-            emit_geohash::<8>(out, bits, data, row_count, validity)
+            emit_geohash::<8>(out, bits, data, row_count, validity)?
         },
 
         // ---- f64 ndarray (DOUBLE_ARRAY, bitmap-encoded nulls) ----
@@ -858,9 +859,14 @@ unsafe fn emit_geohash<const SRC: usize>(
     data: *const u8,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
-) {
+) -> Result<()> {
     let elem = (bits as usize).div_ceil(8);
-    debug_assert!(elem <= SRC);
+    if elem > SRC {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "numpy geohash bits ({bits}) exceeds source dtype width ({SRC} bytes)"
+        ));
+    }
     match validity {
         None => {
             out.push(0);
@@ -886,6 +892,7 @@ unsafe fn emit_geohash<const SRC: usize>(
             }
         }
     }
+    Ok(())
 }
 
 /// f64 ndarray (DOUBLE_ARRAY): `null_flag` + optional bitmap, then for

@@ -760,15 +760,33 @@ unsafe fn encode_bool(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
 ) {
-    out.push(0); // bool always sentinel-encoded
+    out.push(0);
+    if row_count == 0 {
+        return;
+    }
+    let full_bytes = row_count / 8;
+    let trailing_bits = row_count % 8;
+    let bitmap_bytes = full_bytes + usize::from(trailing_bits != 0);
+    if validity.is_none() {
+        let src = unsafe { slice::from_raw_parts(bits, bitmap_bytes) };
+        if trailing_bits == 0 {
+            out.extend_from_slice(src);
+        } else {
+            out.extend_from_slice(&src[..full_bytes]);
+            let mask = (1u8 << trailing_bits) - 1;
+            out.push(src[full_bytes] & mask);
+        }
+        return;
+    }
+    let v = validity.unwrap();
+    out.reserve(bitmap_bytes);
     let mut packed = 0u8;
     let mut bit_idx = 0u8;
     for i in 0..row_count {
         let byte_idx = i / 8;
         let bit_off = i % 8;
         let bit = (unsafe { *bits.add(byte_idx) } >> bit_off) & 1;
-        let valid = validity.is_none_or(|v| unsafe { v.is_valid(i) });
-        if bit == 1 && valid {
+        if bit == 1 && unsafe { v.is_valid(i) } {
             packed |= 1u8 << bit_idx;
         }
         bit_idx += 1;

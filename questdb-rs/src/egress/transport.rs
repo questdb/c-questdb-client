@@ -55,9 +55,9 @@ use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
 use crate::egress::ws::client::{Stream, WsClient, WsReadError};
-use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
 use crate::ws::mask::MaskKeySource;
+use crate::ws::nosigpipe::NoSigpipeTcp;
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
 /// successful handshake. Caps any single `write()` syscall — including
