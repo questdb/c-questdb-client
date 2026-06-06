@@ -4163,6 +4163,23 @@ def iter_versions(args):
         yield questdb_dir
 
 
+def _stop_and_maybe_wipe(fixture):
+    """Stop ``fixture``, reclaiming its data dir only on a clean run.
+
+    Called from the ``finally`` of each suite block. ``wipe_data_dir()``
+    deletes everything under ``data/`` (including ``data/log/log.txt``) to
+    reclaim disk between runs, but on failure we re-raise via ``sys.exit(1)``
+    and want that server log to survive for the CI "Compress QuestDB server
+    log on failure" archive step. So skip the wipe whenever an exception is
+    propagating — including the ``SystemExit`` from ``sys.exit(1)`` —
+    detected via ``sys.exc_info()`` captured before ``stop()`` runs.
+    """
+    failed = sys.exc_info()[0] is not None
+    fixture.stop()
+    if not failed:
+        fixture.wipe_data_dir()
+
+
 def run_with_fixtures(args):
     global QDB_FIXTURE
     global TLS_PROXY_FIXTURE
@@ -4217,8 +4234,7 @@ def run_with_fixtures(args):
                                 TLS_PROXY_FIXTURE.stop()
                                 TLS_PROXY_FIXTURE = None
                 finally:
-                    QDB_FIXTURE.stop()
-                    QDB_FIXTURE.wipe_data_dir()
+                    _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_smoke_suite:
             for http_auth in (False, True):
@@ -4252,8 +4268,7 @@ def run_with_fixtures(args):
                                 TLS_PROXY_FIXTURE = None
                             QWP_WS_SMOKE_TLS = False
                 finally:
-                    QDB_FIXTURE.stop()
-                    QDB_FIXTURE.wipe_data_dir()
+                    _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_protocol_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4271,8 +4286,7 @@ def run_with_fixtures(args):
                 if not _run_selected_tests(SUITE_QWP_WS_PROTOCOL):
                     sys.exit(1)
             finally:
-                QDB_FIXTURE.stop()
-                QDB_FIXTURE.wipe_data_dir()
+                _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_restart_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4290,8 +4304,7 @@ def run_with_fixtures(args):
                 if not _run_selected_tests(SUITE_QWP_WS_RESTART):
                     sys.exit(1)
             finally:
-                QDB_FIXTURE.stop()
-                QDB_FIXTURE.wipe_data_dir()
+                _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_fuzz_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4309,8 +4322,7 @@ def run_with_fixtures(args):
                 if not _run_selected_tests(SUITE_QWP_WS_FUZZ):
                     sys.exit(1)
             finally:
-                QDB_FIXTURE.stop()
-                QDB_FIXTURE.wipe_data_dir()
+                _stop_and_maybe_wipe(QDB_FIXTURE)
 
 
 def run(args, show_help=False):
