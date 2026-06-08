@@ -726,13 +726,24 @@ typedef enum column_sender_numpy_dtype
 
     /* Coarser datetime64 units → TIMESTAMP (microseconds).
        Y / M are proleptic Gregorian, anchored at the start of the
-       referenced year / month. D / h / m are constant multipliers. All
-       reject overflow with InvalidApiCall. */
+       referenced year / month. W / D / h / m are constant multipliers.
+       All reject overflow with InvalidApiCall. */
     column_sender_numpy_datetime64_m = 32, /* minute × 60_000_000          */
     column_sender_numpy_datetime64_h = 33, /* hour   × 3_600_000_000       */
     column_sender_numpy_datetime64_D = 34, /* day    × 86_400_000_000      */
     column_sender_numpy_datetime64_M = 35, /* month  → start of 1970-01+M  */
-    column_sender_numpy_datetime64_Y = 36  /* year   → start of 1970+Y     */
+    column_sender_numpy_datetime64_Y = 36, /* year   → start of 1970+Y     */
+    column_sender_numpy_datetime64_W = 37, /* week   × 604_800_000_000     */
+
+    /* Coarser timedelta64 units → LONG (raw i64, no unit normalisation).
+       Mirrors the existing s / ms / us / ns dispatch — caller picks the
+       unit, server stores the integer as-is. Calendar units (M / Y) have
+       no fixed duration and are explicitly rejected. */
+    column_sender_numpy_timedelta64_m = 38, /* minute  → raw i64 */
+    column_sender_numpy_timedelta64_h = 39, /* hour    → raw i64 */
+    column_sender_numpy_timedelta64_D = 40, /* day     → raw i64 */
+    column_sender_numpy_timedelta64_M = 41, /* REJECTED: month length is variable */
+    column_sender_numpy_timedelta64_Y = 42  /* REJECTED: year length is variable  */
 } column_sender_numpy_dtype;
 
 /* Companion struct for `column_sender_chunk_append_numpy_column` carrying

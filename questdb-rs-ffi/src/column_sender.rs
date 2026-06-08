@@ -1466,6 +1466,13 @@ pub enum column_sender_numpy_dtype {
     column_sender_numpy_datetime64_D = 34,
     column_sender_numpy_datetime64_M = 35,
     column_sender_numpy_datetime64_Y = 36,
+    column_sender_numpy_datetime64_W = 37,
+
+    column_sender_numpy_timedelta64_m = 38,
+    column_sender_numpy_timedelta64_h = 39,
+    column_sender_numpy_timedelta64_D = 40,
+    column_sender_numpy_timedelta64_M = 41,
+    column_sender_numpy_timedelta64_Y = 42,
 }
 
 /// Companion to [`column_sender_chunk_append_numpy_column`] carrying
@@ -1797,6 +1804,33 @@ unsafe fn resolve_numpy_dtype(
         }
         d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_Y as u32 => {
             NumpyDtype::DatetimeYearToMicros
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_datetime64_W as u32 => {
+            NumpyDtype::DatetimeWeekToMicros
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_m as u32
+            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_h as u32
+            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_D as u32 =>
+        {
+            NumpyDtype::LongDirect
+        }
+        d if d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_M as u32
+            || d == column_sender_numpy_dtype::column_sender_numpy_timedelta64_Y as u32 =>
+        {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        "timedelta64[M] / timedelta64[Y] are not supported as LONG: \
+                         calendar units have variable duration (28-31 days / 365-366 days) \
+                         and cannot be represented as a scalar integer offset. \
+                         Convert to a fixed unit (s / ms / us / ns / m / h / D) upstream."
+                            .to_string(),
+                    ),
+                );
+            }
+            return None;
         }
         other => {
             unsafe {

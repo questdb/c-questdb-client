@@ -96,6 +96,7 @@ pub enum NumpyDtype {
     DatetimeMinuteToMicros,
     DatetimeHourToMicros,
     DatetimeDayToMicros,
+    DatetimeWeekToMicros,
     DatetimeMonthToMicros,
     DatetimeYearToMicros,
 
@@ -160,6 +161,7 @@ impl NumpyDtype {
             | D::DatetimeMinuteToMicros
             | D::DatetimeHourToMicros
             | D::DatetimeDayToMicros
+            | D::DatetimeWeekToMicros
             | D::DatetimeMonthToMicros
             | D::DatetimeYearToMicros => QWP_TYPE_TIMESTAMP,
             D::TimestampNanosDirect => QWP_TYPE_TIMESTAMP_NANOS,
@@ -207,6 +209,7 @@ impl NumpyDtype {
             | D::DatetimeMinuteToMicros
             | D::DatetimeHourToMicros
             | D::DatetimeDayToMicros
+            | D::DatetimeWeekToMicros
             | D::DatetimeMonthToMicros
             | D::DatetimeYearToMicros
             | D::I32WidenToI64
@@ -381,12 +384,41 @@ pub(crate) unsafe fn emit_into_wire(
                 v.checked_mul(86_400_000_000)
             })?
         },
+        D::DatetimeWeekToMicros => unsafe {
+            emit_i64_to_micros(out, data, row_count, validity, "W", |v| {
+                v.checked_mul(604_800_000_000)
+            })?
+        },
         // ---- datetime64[M/Y] → calendar → TIMESTAMP (bitmap) ----
+        // `days_from_civil` is comparatively expensive (a few divisions);
+        // most numpy datetime arrays are sorted or near-sorted, so a
+        // single-slot last-value cache absorbs the bulk of repeated
+        // (year, month) inputs without affecting random-data correctness.
         D::DatetimeMonthToMicros => unsafe {
-            emit_i64_to_micros(out, data, row_count, validity, "M", month_offset_to_micros)?
+            let mut last: Option<(i64, i64)> = None;
+            emit_i64_to_micros(out, data, row_count, validity, "M", |v| {
+                if let Some((k, r)) = last
+                    && k == v
+                {
+                    return Some(r);
+                }
+                let r = month_offset_to_micros(v)?;
+                last = Some((v, r));
+                Some(r)
+            })?
         },
         D::DatetimeYearToMicros => unsafe {
-            emit_i64_to_micros(out, data, row_count, validity, "Y", year_offset_to_micros)?
+            let mut last: Option<(i64, i64)> = None;
+            emit_i64_to_micros(out, data, row_count, validity, "Y", |v| {
+                if let Some((k, r)) = last
+                    && k == v
+                {
+                    return Some(r);
+                }
+                let r = year_offset_to_micros(v)?;
+                last = Some((v, r));
+                Some(r)
+            })?
         },
 
         // ---- Decimal (scale byte + bitmap-encoded fixed-width) ----
@@ -624,9 +656,24 @@ unsafe fn emit_u64_widen_i64_checked(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
 ) -> Result<()> {
+    let typed = data as *const u64;
+    if validity.is_none() && row_count > 0 {
+        let slice = unsafe { slice::from_raw_parts(typed, row_count) };
+        let mut acc: u64 = 0;
+        for &v in slice {
+            acc |= v;
+        }
+        if acc < (1u64 << 63) {
+            unsafe {
+                emit_widen_i64_sentinel::<u64>(out, data, row_count, validity, I64_NULL, |v| {
+                    v as i64
+                })
+            };
+            return Ok(());
+        }
+    }
     out.push(0);
     out.reserve(8 * row_count);
-    let typed = data as *const u64;
     let sentinel_bytes = I64_NULL.to_le_bytes();
     match validity {
         None => {
@@ -732,14 +779,51 @@ unsafe fn emit_bool(
     validity: Option<&ValidityDescriptor>,
 ) {
     out.push(0);
-    let bytes = row_count.div_ceil(8);
-    out.reserve(bytes);
+    let bitmap_bytes = row_count.div_ceil(8);
+    out.reserve(bitmap_bytes);
+    if validity.is_none() {
+        let full_chunks = row_count / 8;
+        let tail = row_count % 8;
+        for chunk_idx in 0..full_chunks {
+            let base = chunk_idx * 8;
+            let src = unsafe { data.add(base) };
+            let b0 = unsafe { *src };
+            let b1 = unsafe { *src.add(1) };
+            let b2 = unsafe { *src.add(2) };
+            let b3 = unsafe { *src.add(3) };
+            let b4 = unsafe { *src.add(4) };
+            let b5 = unsafe { *src.add(5) };
+            let b6 = unsafe { *src.add(6) };
+            let b7 = unsafe { *src.add(7) };
+            let packed = u8::from(b0 != 0)
+                | (u8::from(b1 != 0) << 1)
+                | (u8::from(b2 != 0) << 2)
+                | (u8::from(b3 != 0) << 3)
+                | (u8::from(b4 != 0) << 4)
+                | (u8::from(b5 != 0) << 5)
+                | (u8::from(b6 != 0) << 6)
+                | (u8::from(b7 != 0) << 7);
+            out.push(packed);
+        }
+        if tail != 0 {
+            let base = full_chunks * 8;
+            let mut packed = 0u8;
+            for i in 0..tail {
+                let b = unsafe { *data.add(base + i) };
+                if b != 0 {
+                    packed |= 1u8 << i;
+                }
+            }
+            out.push(packed);
+        }
+        return;
+    }
+    let v = validity.unwrap();
     let mut packed = 0u8;
     let mut bit_idx = 0u8;
     for i in 0..row_count {
         let raw = unsafe { *data.add(i) };
-        let valid = validity.is_none_or(|v| unsafe { v.is_valid(i) });
-        if valid && raw != 0 {
+        if unsafe { v.is_valid(i) } && raw != 0 {
             packed |= 1u8 << bit_idx;
         }
         bit_idx += 1;
@@ -765,10 +849,10 @@ unsafe fn emit_i64_to_micros<F>(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
     unit_label: &str,
-    convert: F,
+    mut convert: F,
 ) -> Result<()>
 where
-    F: Fn(i64) -> Option<i64>,
+    F: FnMut(i64) -> Option<i64>,
 {
     let typed = data as *const i64;
     let make_err = |i: usize, value: i64| {
@@ -914,10 +998,15 @@ unsafe fn emit_geohash<const SRC: usize>(
             out.push(0);
             out.reserve(1 + elem * row_count);
             out.push(bits);
-            for i in 0..row_count {
-                let row_start = unsafe { data.add(i * SRC) };
-                let row = unsafe { slice::from_raw_parts(row_start, elem) };
-                out.extend_from_slice(row);
+            if elem == SRC && row_count > 0 {
+                let bytes = unsafe { slice::from_raw_parts(data, SRC * row_count) };
+                out.extend_from_slice(bytes);
+            } else {
+                for i in 0..row_count {
+                    let row_start = unsafe { data.add(i * SRC) };
+                    let row = unsafe { slice::from_raw_parts(row_start, elem) };
+                    out.extend_from_slice(row);
+                }
             }
         }
         Some(v) => {
@@ -974,16 +1063,22 @@ unsafe fn emit_f64_ndarray(
     };
     out.reserve(non_null_rows * row_payload);
 
+    let header_len = 1 + 4 * nd;
+    let mut header: [u8; 1 + 4 * MAX_ARRAY_DIMS] = [0u8; 1 + 4 * MAX_ARRAY_DIMS];
+    header[0] = ndim;
+    for (i, &d) in shape[..nd].iter().enumerate() {
+        let off = 1 + 4 * i;
+        header[off..off + 4].copy_from_slice(&d.to_le_bytes());
+    }
+    let header = &header[..header_len];
+
     for row in 0..row_count {
         if let Some(v) = validity
             && !unsafe { v.is_valid(row) }
         {
             continue;
         }
-        out.push(ndim);
-        for &d in &shape[..nd] {
-            out.extend_from_slice(&d.to_le_bytes());
-        }
+        out.extend_from_slice(header);
         let src = unsafe { data.add(row * row_bytes) };
         if cfg!(target_endian = "little") {
             if row_bytes > 0 {

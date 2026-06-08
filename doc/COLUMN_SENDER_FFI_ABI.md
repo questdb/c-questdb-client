@@ -820,8 +820,11 @@ wider wire type; `pack` = byte-per-row to LSB-first bitmap.
 | `datetime64_m`                  | TIMESTAMP        | widen (×60·10⁶) |
 | `datetime64_h`                  | TIMESTAMP        | widen (×3600·10⁶) |
 | `datetime64_D`                  | TIMESTAMP        | widen (×86400·10⁶) |
+| `datetime64_W`                  | TIMESTAMP        | widen (×604800·10⁶) |
 | `datetime64_M`                  | TIMESTAMP        | calendar (start of 1970-01 + N months, proleptic Gregorian) |
 | `datetime64_Y`                  | TIMESTAMP        | calendar (start of 1970 + N years, proleptic Gregorian) |
+| `timedelta64_m` / `h` / `D`     | LONG             | direct (raw i64 in source unit; caller responsibility) |
+| `timedelta64_M` / `Y`           | —                | rejected with `InvalidApiCall` (calendar units have no fixed duration) |
 | `bool`                          | BOOLEAN          | pack (byte-per-row → bitmap) |
 | `decimal_s8` + scale            | DECIMAL64        | direct (i64 mantissa) |
 | `decimal_s16` + scale           | DECIMAL128       | direct (i128 mantissa) |
