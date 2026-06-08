@@ -67,23 +67,32 @@ pub struct ImportedArrowColumn {
 
 #[cfg(feature = "arrow")]
 impl ImportedArrowColumn {
+    /// Import an Arrow column from the Arrow C Data Interface.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `array` and `schema` are valid
+    /// `FFI_ArrowArray` / `FFI_ArrowSchema` structures as produced by
+    /// the Arrow C Data Interface. On success, ownership of `array` is
+    /// transferred into the returned column (the caller's `array` has
+    /// its `release` callback cleared and must not be released again).
+    /// `schema` is borrowed and remains owned by the caller.
     pub unsafe fn import_from_ffi(
         array: &mut arrow::ffi::FFI_ArrowArray,
         schema: &arrow::ffi::FFI_ArrowSchema,
     ) -> Result<Self> {
         use arrow_array::make_array;
 
-        let field = arrow_schema::Field::try_from(schema).map_err(|err| {
-            error::fmt!(ArrowIngest, "schema conversion failed: {}", err)
-        })?;
+        let field = arrow_schema::Field::try_from(schema)
+            .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
 
         let imported_array = unsafe { std::ptr::read(array) };
         array.release = None;
         let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }
             .map_err(|err| error::fmt!(ArrowIngest, "from_ffi failed: {}", err))?;
-        array_data.validate_full().map_err(|err| {
-            error::fmt!(ArrowIngest, "Arrow array validation failed: {}", err)
-        })?;
+        array_data
+            .validate_full()
+            .map_err(|err| error::fmt!(ArrowIngest, "Arrow array validation failed: {}", err))?;
 
         let array = make_array(array_data);
         let kind = arrow_batch::classify(&field, array.as_ref())?;
@@ -94,22 +103,24 @@ impl ImportedArrowColumn {
         self.array.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.array.is_empty()
+    }
+
     pub fn field(&self) -> &arrow_schema::Field {
         &self.field
     }
 
     fn slice(&self, row_offset: usize, row_count: usize) -> Result<arrow_array::ArrayRef> {
         let array_len = self.array.len();
-        let slice_end = row_offset
-            .checked_add(row_count)
-            .ok_or_else(|| {
-                error::fmt!(
-                    InvalidApiCall,
-                    "row_offset {} + row_count {} overflows",
-                    row_offset,
-                    row_count
-                )
-            })?;
+        let slice_end = row_offset.checked_add(row_count).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "row_offset {} + row_count {} overflows",
+                row_offset,
+                row_count
+            )
+        })?;
         if slice_end > array_len {
             return Err(error::fmt!(
                 InvalidApiCall,

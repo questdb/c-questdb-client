@@ -222,30 +222,6 @@ void expect_flush_ok(
     }
 }
 
-void expect_flush_throws_with_code(
-    MockConn& mc,
-    const char* table,
-    ArrowArray& arr,
-    ArrowSchema& sch,
-    qdb::line_sender_error_code expected)
-{
-    qdb::column_sender_conn conn{mc.conn};
-    try
-    {
-        conn.flush_arrow_batch(
-            qdb::table_name_view{table, std::strlen(table)}, arr, sch);
-        FAIL("expected flush_arrow_batch to throw");
-    }
-    catch (const qdb::line_sender_error& e)
-    {
-        CHECK(e.code() == expected);
-    }
-    if (arr.release)
-        arr.release(&arr);
-    if (sch.release)
-        sch.release(&sch);
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -474,16 +450,14 @@ TEST_CASE("flush_arrow_batch: FixedSizeBinary(16) + arrow.uuid extension → col
     expect_flush_ok(mc, "t_uuid", arr, sch);
 }
 
-TEST_CASE("flush_arrow_batch: FixedSizeBinary(16) without UUID metadata → ArrowUnsupportedColumnKind")
+TEST_CASE("flush_arrow_batch: FixedSizeBinary(16) without metadata defaults to column_uuid")
 {
     MockConn mc;
     auto data = std::make_shared<std::vector<uint8_t>>(
         std::vector<uint8_t>(16, 0));
     auto arr = make_array(1, 0, {nullptr, data});
     auto sch = make_schema("w:16", "id");
-    expect_flush_throws_with_code(
-        mc, "t_unsup", arr, sch,
-        qdb::line_sender_error_code::arrow_unsupported_column_kind);
+    expect_flush_ok(mc, "t_uuid_default", arr, sch);
 }
 
 TEST_CASE("flush_arrow_batch: FixedSizeBinary(32) → column_long256")

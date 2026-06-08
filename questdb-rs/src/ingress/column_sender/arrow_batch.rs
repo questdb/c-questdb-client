@@ -3962,7 +3962,11 @@ mod tests {
         let rb = single_col_batch(Field::new("u", DataType::UInt64, true), b.finish());
         let err = encode_err(&rb);
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
-        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
+        assert!(
+            err.msg().contains("does not fit QuestDB LONG"),
+            "{}",
+            err.msg()
+        );
     }
 
     #[test]
@@ -3973,7 +3977,11 @@ mod tests {
         let rb = single_col_batch(Field::new("u", DataType::UInt64, true), b.finish());
         let err = encode_err(&rb);
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
-        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
+        assert!(
+            err.msg().contains("does not fit QuestDB LONG"),
+            "{}",
+            err.msg()
+        );
     }
 
     #[test]

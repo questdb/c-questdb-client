@@ -1341,7 +1341,11 @@ mod tests {
         chunk.designated_timestamp_nanos(&ts).unwrap();
         let err = encode_err(&chunk);
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
-        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
+        assert!(
+            err.msg().contains("does not fit QuestDB LONG"),
+            "{}",
+            err.msg()
+        );
     }
 
     #[test]
@@ -1366,7 +1370,11 @@ mod tests {
         chunk.designated_timestamp_nanos(&ts).unwrap();
         let err = encode_err(&chunk);
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
-        assert!(err.msg().contains("does not fit QuestDB LONG"), "{}", err.msg());
+        assert!(
+            err.msg().contains("does not fit QuestDB LONG"),
+            "{}",
+            err.msg()
+        );
     }
 
     #[test]

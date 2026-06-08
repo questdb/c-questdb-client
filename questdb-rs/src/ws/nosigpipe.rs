@@ -72,10 +72,7 @@ use std::net::TcpStream;
     target_os = "openbsd",
     target_os = "netbsd",
     target_os = "dragonfly",
-    all(
-        feature = "_egress",
-        any(target_os = "linux", target_os = "android")
-    ),
+    all(feature = "_egress", any(target_os = "linux", target_os = "android")),
 ))]
 use std::os::fd::AsRawFd;
 
