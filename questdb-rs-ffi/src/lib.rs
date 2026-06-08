@@ -3757,6 +3757,25 @@ unsafe fn validate_format_str(s: *const arrow::ffi::FFI_ArrowSchema) -> questdb:
     }
 }
 
+// `FFI_ArrowSchema::name()` in arrow-schema-58.x calls `.expect("non-utf8
+// as name")` on every import, and `TryFrom<&FFI_ArrowSchema> for Field`
+// invokes it unconditionally. Under `panic = "abort"` an invalid byte in
+// `name` from an Arrow producer aborts the host. NULL is allowed (treated
+// as empty string by arrow-rs); only reject non-UTF-8.
+#[cfg(feature = "arrow")]
+unsafe fn validate_name_str(s: *const arrow::ffi::FFI_ArrowSchema) -> questdb::Result<()> {
+    unsafe {
+        let p = (*s).name;
+        if p.is_null() {
+            return Ok(());
+        }
+        let cstr = std::ffi::CStr::from_ptr(p);
+        cstr.to_str()
+            .map_err(|_| arrow_ingest_err("Arrow schema name is not UTF-8"))?;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "arrow")]
 unsafe fn try_reserve_one<T>(v: &mut Vec<T>) -> questdb::Result<()> {
     v.try_reserve(1)
@@ -3791,6 +3810,7 @@ unsafe fn validate_arrow_schema_depth(
                 )));
             }
             validate_format_str(s)?;
+            validate_name_str(s)?;
             let n = (*s).n_children;
             if n < 0 {
                 return Err(arrow_ingest_err(format!(

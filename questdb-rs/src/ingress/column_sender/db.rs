@@ -838,20 +838,15 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
 
 #[cfg(feature = "_egress")]
 fn reap_idle_readers(inner: &DbInner) -> usize {
+    // Reader pool is lazy-init (no pre-population at connect), so there
+    // is no warm-min floor to preserve — reap any reader that has been
+    // parked longer than the idle timeout.
     let to_drop: Vec<Reader> = {
         let mut state = lock_reader_state(&inner.reader_state);
         let mut to_drop = Vec::new();
         let now = Instant::now();
-        // Reader pool is lazy-init so there is no warm-min floor to
-        // preserve. We reap any idle reader that's been parked longer
-        // than the timeout.
         let mut i = 0;
         while i < state.free.len() {
-            // Apply the same floor as the sender pool — keep at most
-            // `pool_size` warm readers around.
-            if state.total() <= inner.pool_size {
-                break;
-            }
             let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
             if idle_for > inner.pool_idle_timeout {
                 let entry = state.free.remove(i);
@@ -866,3 +861,23 @@ fn reap_idle_readers(inner: &DbInner) -> usize {
     drop(to_drop);
     dropped
 }
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>() {}
+    assert_send_sync::<QuestDb>();
+    assert_send::<OwnedSender>();
+};
+
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn _disambiguate() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    fn assert_not_send<T: ?Sized>() {
+        let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
+    }
+    assert_not_send::<BorrowedSender<'_>>();
+    assert_not_send::<crate::ingress::column_sender::Chunk<'_>>();
+};

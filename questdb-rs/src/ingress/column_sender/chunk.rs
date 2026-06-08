@@ -1028,6 +1028,7 @@ impl<'a> Chunk<'a> {
                 row_count
             ));
         }
+        dtype.validate()?;
         let row_count = check_row_count(self.row_count, row_count, validity)?;
         let wire_type = dtype.wire_type();
         self.push_column(
@@ -1130,6 +1131,15 @@ impl<'a> Chunk<'a> {
         field: &arrow_schema::Field,
         arr: arrow_array::ArrayRef,
     ) -> Result<&mut Self> {
+        if field.data_type() != arr.data_type() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "column {:?}: field data type {:?} does not match array data type {:?}",
+                name,
+                field.data_type(),
+                arr.data_type()
+            ));
+        }
         let kind = arrow_batch::classify(field, arr.as_ref())?;
         self.push_arrow_deferred(name, kind, arr)
     }

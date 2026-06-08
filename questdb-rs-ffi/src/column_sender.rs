@@ -37,12 +37,12 @@ use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use questdb::ingress::MAX_ARRAY_DIMS;
 use questdb::ingress::column_sender::{
     AckLevel, Chunk, NumpyDtype, OwnedSender, QuestDb, Validity,
 };
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
+use questdb::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use questdb::{Error, ErrorCode};
 
 #[cfg(feature = "arrow")]
@@ -896,8 +896,20 @@ pub unsafe extern "C" fn column_sender_chunk_column_bool(
         }
     }
     let bytes_required = row_count.div_ceil(8);
-    let data_slice = match unsafe { typed_slice(data, bytes_required, err_out, "bool column data") }
-    {
+    let bool_bytes_cap = {
+        use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
+        MAX_CHUNK_ROWS.div_ceil(8)
+    };
+    let data_slice = match unsafe {
+        typed_slice_bounded(
+            data,
+            bytes_required,
+            bool_bytes_cap,
+            "ceil(MAX_CHUNK_ROWS / 8)",
+            err_out,
+            "bool column data",
+        )
+    } {
         Some(s) => s,
         None => return false,
     };
@@ -1245,6 +1257,17 @@ symbol_fn!(
 // Generic Arrow column appender
 // ===========================================================================
 
+/// Import an Arrow C Data Interface (`ArrowArray` + `ArrowSchema`) pair
+/// into an opaque handle that subsequent calls can slice / append from.
+///
+/// Ownership: on success, `array->release` is consumed (set to NULL);
+/// the returned handle owns the underlying buffers and releases them on
+/// `column_sender_arrow_import_free`. On failure, `array->release` may
+/// also have been consumed if the call reached the Arrow import step
+/// before failing — callers MUST check `array->release != NULL` before
+/// invoking it on the failure path. Early-fail paths (NULL pointer,
+/// depth-cap rejection) leave it intact. `schema` is borrowed in all
+/// cases.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_arrow_import_new(
@@ -1697,12 +1720,6 @@ unsafe fn validate_f64_ndarray(
     Some((ndim, shape))
 }
 
-/// Maximum element count of a single ndarray row payload. Bounds
-/// `prod(shape)` so the per-row reservation (`leaf_count * 8 bytes`)
-/// stays well under `isize::MAX`. Matches the egress-side cap on
-/// `MAX_ARRAY_ELEMENTS_PER_ROW`.
-pub(crate) const MAX_NDARRAY_LEAF_ELEMS: usize = 1 << 24;
-
 unsafe fn resolve_numpy_dtype(
     dtype: u32,
     extras: *const column_sender_numpy_extras,
@@ -1919,6 +1936,35 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
         Some(s) => s,
         None => return false,
     };
+    {
+        use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
+        if row_count > MAX_CHUNK_ROWS {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "numpy column row_count {row_count} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})"
+                        ),
+                    ),
+                );
+            }
+            return false;
+        }
+    }
+    if data.is_null() && row_count != 0 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("numpy column data pointer is NULL with row_count = {row_count}"),
+                ),
+            );
+        }
+        return false;
+    }
     let validity = match unsafe { as_validity(validity, err_out) } {
         Some(v) => v,
         None => return false,

@@ -81,6 +81,13 @@ pub const MAX_ARRAY_DIMS: usize = 32;
 pub const MAX_ARRAY_BUFFER_SIZE: usize = 512 * 1024 * 1024; // 512MiB
 pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
+/// Maximum element count of a single ndarray row payload (`prod(shape)`).
+/// Bounds the per-row reservation (`leaf_count * 8` bytes) well below
+/// `isize::MAX` so allocator-OOM cannot abort the host under
+/// `panic = "abort"`. Enforced on both the FFI and pure-Rust entry
+/// points to keep the contract uniform across API surfaces.
+pub const MAX_NDARRAY_LEAF_ELEMS: usize = 1 << 24;
+
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
 pub const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;

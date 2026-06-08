@@ -4057,6 +4057,16 @@ pub enum line_reader_arrow_batch_result {
     line_reader_arrow_batch_error = 2,
 }
 
+/// Pull the next Arrow `RecordBatch` from `cursor` and export it via
+/// the Arrow C Data Interface into `out_array` + `out_schema`.
+///
+/// Ownership: `out_array` and `out_schema` are written-into unconditionally
+/// on success — any prior contents at those addresses are overwritten
+/// without being released. Callers must pass zeroed structs or structs
+/// whose `release` callbacks have already been invoked and cleared.
+/// On success, the caller owns `out_array->release` and `out_schema->release`
+/// and must invoke them when done. On failure the output structs are left
+/// untouched (their `release` slots remain whatever the caller passed in).
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(

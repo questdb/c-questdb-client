@@ -34,7 +34,7 @@
 
 use std::slice;
 
-use crate::ingress::MAX_ARRAY_DIMS;
+use crate::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use crate::{Result, error};
 
 use super::chunk::ValidityDescriptor;
@@ -234,6 +234,51 @@ impl NumpyDtype {
                     .saturating_add(8usize.saturating_mul(leaf))
             }
         }
+    }
+
+    /// Reject dtype configurations that the encoder cannot safely
+    /// allocate for. Currently bounds `F64Ndarray`'s shape to
+    /// `1..=MAX_ARRAY_DIMS` dimensions, non-zero per-dimension extents,
+    /// and `prod(shape) <= MAX_NDARRAY_LEAF_ELEMS` to keep the per-row
+    /// reservation well under `isize::MAX`. All other variants are
+    /// inherently bounded by their wire-type encoding.
+    pub fn validate(&self) -> Result<()> {
+        if let NumpyDtype::F64Ndarray { ndim, shape } = self {
+            let nd = *ndim as usize;
+            if nd == 0 {
+                return Err(error::fmt!(InvalidApiCall, "F64Ndarray ndim must be >= 1"));
+            }
+            if nd > MAX_ARRAY_DIMS {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "F64Ndarray ndim must be <= {} (MAX_ARRAY_DIMS), got {}",
+                    MAX_ARRAY_DIMS,
+                    nd
+                ));
+            }
+            let mut leaf_count: usize = 1;
+            for (i, &dim) in shape[..nd].iter().enumerate() {
+                if dim == 0 {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "F64Ndarray shape[{}] must be >= 1, got 0",
+                        i
+                    ));
+                }
+                leaf_count = leaf_count.checked_mul(dim as usize).ok_or_else(|| {
+                    error::fmt!(InvalidApiCall, "F64Ndarray shape product overflows usize")
+                })?;
+                if leaf_count > MAX_NDARRAY_LEAF_ELEMS {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "F64Ndarray shape product exceeds MAX_NDARRAY_LEAF_ELEMS ({}) at dim {}",
+                        MAX_NDARRAY_LEAF_ELEMS,
+                        i
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1047,8 +1092,21 @@ unsafe fn emit_f64_ndarray(
         .map(|d| d as usize)
         .try_fold(1usize, usize::checked_mul)
         .ok_or_else(|| error::fmt!(InvalidApiCall, "F64Ndarray shape overflows usize"))?;
-    let row_payload = 1 + 4 * nd + 8 * leaf_count;
-    let row_bytes = leaf_count * 8;
+    if leaf_count > MAX_NDARRAY_LEAF_ELEMS {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "F64Ndarray shape product {} exceeds MAX_NDARRAY_LEAF_ELEMS ({})",
+            leaf_count,
+            MAX_NDARRAY_LEAF_ELEMS
+        ));
+    }
+    let row_payload = 1usize
+        .checked_add(4usize.saturating_mul(nd))
+        .and_then(|v| v.checked_add(8usize.saturating_mul(leaf_count)))
+        .ok_or_else(|| error::fmt!(InvalidApiCall, "F64Ndarray row payload overflows usize"))?;
+    let row_bytes = leaf_count
+        .checked_mul(8)
+        .ok_or_else(|| error::fmt!(InvalidApiCall, "F64Ndarray row size overflows usize"))?;
 
     let non_null_rows = match validity {
         None => {
@@ -1061,7 +1119,21 @@ unsafe fn emit_f64_ndarray(
             v.non_null_count
         }
     };
-    out.reserve(non_null_rows * row_payload);
+    let reserve_bytes = non_null_rows.checked_mul(row_payload).ok_or_else(|| {
+        error::fmt!(
+            InvalidApiCall,
+            "F64Ndarray reservation overflows usize ({} rows * {} bytes/row)",
+            non_null_rows,
+            row_payload
+        )
+    })?;
+    out.try_reserve(reserve_bytes).map_err(|_| {
+        error::fmt!(
+            InvalidApiCall,
+            "F64Ndarray reservation of {} bytes failed",
+            reserve_bytes
+        )
+    })?;
 
     let header_len = 1 + 4 * nd;
     let mut header: [u8; 1 + 4 * MAX_ARRAY_DIMS] = [0u8; 1 + 4 * MAX_ARRAY_DIMS];

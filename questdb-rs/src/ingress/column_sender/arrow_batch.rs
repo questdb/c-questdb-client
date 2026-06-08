@@ -379,8 +379,30 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Timestamp(TimeUnit::Millisecond, _), _, _) => ColumnKind::Date,
         (DataType::Date32, _, _) => ColumnKind::Date32Days,
         (DataType::Date64, _, _) => ColumnKind::Date64Ms,
-        (DataType::Time32(unit), _, _) => ColumnKind::TimeAsLong(*unit),
-        (DataType::Time64(unit), _, _) => ColumnKind::TimeAsLong(*unit),
+        (DataType::Time32(unit @ (TimeUnit::Second | TimeUnit::Millisecond)), _, _) => {
+            ColumnKind::TimeAsLong(*unit)
+        }
+        (DataType::Time32(unit), _, _) => {
+            return Err(fmt!(
+                ArrowIngest,
+                "column '{}': Time32({:?}) is not a valid Arrow type; \
+                 Time32 only permits Second or Millisecond",
+                field.name(),
+                unit
+            ));
+        }
+        (DataType::Time64(unit @ (TimeUnit::Microsecond | TimeUnit::Nanosecond)), _, _) => {
+            ColumnKind::TimeAsLong(*unit)
+        }
+        (DataType::Time64(unit), _, _) => {
+            return Err(fmt!(
+                ArrowIngest,
+                "column '{}': Time64({:?}) is not a valid Arrow type; \
+                 Time64 only permits Microsecond or Nanosecond",
+                field.name(),
+                unit
+            ));
+        }
         (DataType::Duration(unit), _, _) => ColumnKind::DurationAsLong(*unit),
         (DataType::Utf8, _, _) if wants_symbol => ColumnKind::SymbolUtf8,
         (DataType::Utf8, _, _) => ColumnKind::Utf8,
@@ -410,6 +432,17 @@ pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> 
         (DataType::Decimal256(_, _), _, _) => ColumnKind::Decimal256,
         (DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _), _, _) => {
             let (leaf, ndim) = walk_list_leaf(field.data_type());
+            if ndim > crate::ingress::MAX_ARRAY_DIMS {
+                return Err(Error::new(
+                    ErrorCode::ArrowUnsupportedColumnKind,
+                    format!(
+                        "Arrow nested-list column '{}' nesting depth {} exceeds MAX_ARRAY_DIMS ({})",
+                        field.name(),
+                        ndim,
+                        crate::ingress::MAX_ARRAY_DIMS
+                    ),
+                ));
+            }
             match leaf {
                 DataType::Float64 => ColumnKind::ArrayDouble(ndim),
                 other => {
@@ -618,10 +651,16 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
     let dst = &mut out[dst_start..dst_start + total_bytes];
     if arrow_offset.is_multiple_of(8) {
         let src_off = arrow_offset / 8;
-        for (d, &s) in dst[..full_bytes]
-            .iter_mut()
-            .zip(&src[src_off..src_off + full_bytes])
-        {
+        let src_slice = &src[src_off..src_off + full_bytes];
+        let dst_slice = &mut dst[..full_bytes];
+        let word_bytes = (full_bytes / 8) * 8;
+        let (src_words, src_rem) = src_slice.split_at(word_bytes);
+        let (dst_words, dst_rem) = dst_slice.split_at_mut(word_bytes);
+        for (dchunk, schunk) in dst_words.chunks_exact_mut(8).zip(src_words.chunks_exact(8)) {
+            let w = u64::from_ne_bytes(schunk.try_into().unwrap());
+            dchunk.copy_from_slice(&(!w).to_ne_bytes());
+        }
+        for (d, &s) in dst_rem.iter_mut().zip(src_rem) {
             *d = !s;
         }
         if trailing_bits != 0 {
@@ -686,6 +725,66 @@ fn full_with_sentinel<const N: usize>(
                     out.extend_from_slice(&get(row));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Nullable LE same-width fast path: memcpy the typed value slab as-is,
+/// then walk the null bitmap and overwrite null slots with the sentinel.
+/// Only valid for LE targets where `T`'s in-memory layout matches the
+/// QWP wire encoding. The Arrow buffer's null-slot values are
+/// undefined-but-readable (Arrow guarantees the value buffer is fully
+/// allocated even where the null mask says "missing"), so the memcpy of
+/// garbage is safe; we overwrite each null slot before any downstream
+/// consumer sees it.
+fn nullable_le_memcpy_patch<const N: usize>(
+    out: &mut Vec<u8>,
+    values_le: &[u8],
+    nulls: &NullBuffer,
+    sentinel: [u8; N],
+) -> Result<()> {
+    debug_assert_eq!(values_le.len(), nulls.len() * N);
+    let dst_start = out.len();
+    try_reserve_bytes(out, values_le.len(), "primitive column memcpy+patch")?;
+    out.extend_from_slice(values_le);
+    let row_count = nulls.len();
+    let inner = nulls.inner();
+    let offset = inner.offset();
+    let bits = inner.values();
+    let mut row = 0usize;
+    while row < row_count {
+        let abs_bit = offset + row;
+        let byte_idx = abs_bit / 8;
+        let bit_off = abs_bit % 8;
+        if bit_off == 0 && row + 8 <= row_count {
+            let v = bits[byte_idx];
+            if v == 0xFF {
+                row += 8;
+                continue;
+            }
+            if v == 0 {
+                let slab_start = dst_start + row * N;
+                for slot in 0..8 {
+                    let off = slab_start + slot * N;
+                    out[off..off + N].copy_from_slice(&sentinel);
+                }
+                row += 8;
+                continue;
+            }
+            for slot in 0..8 {
+                if (v >> slot) & 1 == 0 {
+                    let off = dst_start + (row + slot) * N;
+                    out[off..off + N].copy_from_slice(&sentinel);
+                }
+            }
+            row += 8;
+        } else {
+            if (bits[byte_idx] >> bit_off) & 1 == 0 {
+                let off = dst_start + row * N;
+                out[off..off + N].copy_from_slice(&sentinel);
+            }
+            row += 1;
         }
     }
     Ok(())
@@ -2366,7 +2465,8 @@ pub(crate) fn write_arrow_column_body(
         })?;
         write_qwp_bitmap_from_arrow(out, nulls)?;
     }
-    let le_no_nulls = cfg!(target_endian = "little") && null_count == 0;
+    let le_target = cfg!(target_endian = "little");
+    let le_no_nulls = le_target && null_count == 0;
     match kind {
         ColumnKind::Bool => {
             let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -2374,8 +2474,15 @@ pub(crate) fn write_arrow_column_body(
         }
         ColumnKind::I8 => {
             let a = arr.as_any().downcast_ref::<Int8Array>().unwrap();
-            if le_no_nulls {
+            if null_count == 0 {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
+            } else if let Some(nulls) = arr.nulls() {
+                nullable_le_memcpy_patch::<1>(
+                    out,
+                    unsafe { typed_slice_as_le_bytes(a.values()) },
+                    nulls,
+                    [0u8; 1],
+                )
             } else {
                 full_with_sentinel::<1>(out, arr, [0u8; 1], |row| [a.value(row) as u8])
             }
@@ -2384,6 +2491,13 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<Int16Array>().unwrap();
             if le_no_nulls {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
+            } else if le_target && let Some(nulls) = arr.nulls() {
+                nullable_le_memcpy_patch::<2>(
+                    out,
+                    unsafe { typed_slice_as_le_bytes(a.values()) },
+                    nulls,
+                    0i16.to_le_bytes(),
+                )
             } else {
                 full_with_sentinel::<2>(out, arr, 0i16.to_le_bytes(), |row| {
                     a.value(row).to_le_bytes()
@@ -2394,6 +2508,13 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
             if le_no_nulls {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
+            } else if le_target && let Some(nulls) = arr.nulls() {
+                nullable_le_memcpy_patch::<4>(
+                    out,
+                    unsafe { typed_slice_as_le_bytes(a.values()) },
+                    nulls,
+                    i32::MIN.to_le_bytes(),
+                )
             } else {
                 full_with_sentinel::<4>(out, arr, i32::MIN.to_le_bytes(), |row| {
                     a.value(row).to_le_bytes()
@@ -2404,6 +2525,13 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
             if le_no_nulls {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
+            } else if le_target && let Some(nulls) = arr.nulls() {
+                nullable_le_memcpy_patch::<8>(
+                    out,
+                    unsafe { typed_slice_as_le_bytes(a.values()) },
+                    nulls,
+                    i64::MIN.to_le_bytes(),
+                )
             } else {
                 full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
                     a.value(row).to_le_bytes()
@@ -2470,6 +2598,13 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
             if le_no_nulls {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
+            } else if le_target && let Some(nulls) = arr.nulls() {
+                nullable_le_memcpy_patch::<4>(
+                    out,
+                    unsafe { typed_slice_as_le_bytes(a.values()) },
+                    nulls,
+                    f32::NAN.to_le_bytes(),
+                )
             } else {
                 full_with_sentinel::<4>(out, arr, f32::NAN.to_le_bytes(), |row| {
                     a.value(row).to_le_bytes()
@@ -2480,6 +2615,13 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<Float64Array>().unwrap();
             if le_no_nulls {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
+            } else if le_target && let Some(nulls) = arr.nulls() {
+                nullable_le_memcpy_patch::<8>(
+                    out,
+                    unsafe { typed_slice_as_le_bytes(a.values()) },
+                    nulls,
+                    f64::NAN.to_le_bytes(),
+                )
             } else {
                 full_with_sentinel::<8>(out, arr, f64::NAN.to_le_bytes(), |row| {
                     a.value(row).to_le_bytes()
@@ -2490,6 +2632,13 @@ pub(crate) fn write_arrow_column_body(
             let a = arr.as_any().downcast_ref::<UInt16Array>().unwrap();
             if le_no_nulls {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
+            } else if le_target && let Some(nulls) = arr.nulls() {
+                nullable_le_memcpy_patch::<2>(
+                    out,
+                    unsafe { typed_slice_as_le_bytes(a.values()) },
+                    nulls,
+                    0u16.to_le_bytes(),
+                )
             } else {
                 full_with_sentinel::<2>(out, arr, 0u16.to_le_bytes(), |row| {
                     a.value(row).to_le_bytes()
