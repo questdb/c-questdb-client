@@ -533,6 +533,11 @@ impl<'a> Chunk<'a> {
     /// `data` is an LSB-first bit-packed slice: bit `i` is row `i`'s
     /// value (1 = true, 0 = false). At least `ceil(row_count / 8)`
     /// bytes are required; the slice may be longer.
+    ///
+    /// QWP `BOOLEAN` has no NULL representation on the wire: when
+    /// `validity` is supplied, null rows are coerced to `false`. Pass
+    /// `None` if your data has no nulls, or use a wider numeric column
+    /// if you need to distinguish null from `false` downstream.
     pub fn column_bool(
         &mut self,
         name: &str,

@@ -1170,6 +1170,14 @@ fn write_varlen_large_offsets_no_null(
         ));
     }
     let end = arr_offsets[row_count];
+    if end < base {
+        return Err(fmt!(
+            ArrowIngest,
+            "VARCHAR column: end offset {} below base {}",
+            end,
+            base
+        ));
+    }
     let used = (end - base) as usize;
     let offsets_bytes = 4usize.checked_mul(row_count + 1).ok_or_else(|| {
         fmt!(
@@ -1854,19 +1862,31 @@ fn resolve_symbol_strings<S: StrSource>(
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
+    use std::collections::HashMap;
     let row_count = arr.len();
     let non_null = non_null_count(arr, "SYMBOL column")?;
+    let mut local: HashMap<Vec<u8>, u64> = HashMap::new();
+    for row in 0..row_count {
+        if arr.is_null(row) {
+            continue;
+        }
+        let bytes = source.value_bytes(row);
+        if local.contains_key(bytes) {
+            continue;
+        }
+        let (gid, is_new) = symbol_dict.intern(bytes)?;
+        if is_new {
+            new_symbols.push(bytes.to_vec());
+        }
+        local.insert(bytes.to_vec(), gid);
+    }
     let mut gids = Vec::with_capacity(non_null);
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
         }
         let bytes = source.value_bytes(row);
-        let (gid, is_new) = symbol_dict.intern(bytes)?;
-        if is_new {
-            new_symbols.push(bytes.to_vec());
-        }
-        gids.push(gid);
+        gids.push(*local.get(bytes).expect("interned in pass 1"));
     }
     Ok(ArrowResolvedSymbolColumn { gids })
 }

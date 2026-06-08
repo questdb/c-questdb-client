@@ -62,10 +62,18 @@ pub struct questdb_db(pub(crate) QuestDb);
 ///
 /// **Not thread-safe.** A `qwpws_conn*` must not be used from more than
 /// one thread at a time. The second tuple field is a CAS-checked latch
-/// on every FFI entry (mutation, accessor, and free); concurrent calls
-/// return `line_sender_error_invalid_api_call`. If `questdb_db_return_conn`
-/// races with an in-flight call, the close is deferred — the in-flight
-/// call's exit path performs the deferred `Box::from_raw`, never UAF.
+/// on every FFI entry (mutation, accessor, and free); a non-blocking
+/// contending caller observes `line_sender_error_invalid_api_call`
+/// instead of a data race. When `questdb_db_return_conn` is observed
+/// to interleave with an in-flight call (the latch sees `IN_USE` when
+/// the free arrives), the box's drop is deferred to the in-flight
+/// call's exit path, preventing UAF for that ordering.
+///
+/// Callers must still ensure happens-before ordering between the last
+/// FFI call on `conn` and `questdb_db_return_conn(conn)` — e.g. by
+/// confining `conn` to a single thread, or by an external barrier — so
+/// the latch's CAS sees the close intent. A true concurrent free
+/// without such ordering is undefined behavior.
 pub struct qwpws_conn(OwnedSender, AtomicU32);
 
 /// One DataFrame's worth of column buffers destined for one QuestDB table.
@@ -79,9 +87,11 @@ pub struct qwpws_conn(OwnedSender, AtomicU32);
 /// is enforced by the caller, not the borrow checker.
 ///
 /// **Not thread-safe.** Single-threaded by contract; the latch in the
-/// second tuple field detects concurrent calls (mutation, accessor, and
-/// free) and defers a racing free until the active call exits, so a
-/// misbehaving caller observes `InvalidApiCall` rather than UAF.
+/// second tuple field detects in-thread reentrance and out-of-order
+/// free/use sequences, deferring a free observed mid-call until the
+/// active call exits. The same caveat as [`qwpws_conn`] applies: the
+/// caller must establish happens-before between the last column call
+/// on `chunk` and `column_sender_chunk_free(chunk)`.
 pub struct column_sender_chunk(Chunk<'static>, AtomicU32);
 
 /// Imported Arrow column for repeated chunk appends.
@@ -329,13 +339,18 @@ unsafe fn name_str<'a>(
     }
 }
 
-unsafe fn typed_slice<'a, T>(
+/// Per-column varlen payload cap (~2 GiB). Bounded by `i32::MAX` to
+/// match the i32 offset encoding used by varchar/binary/dict-bytes.
+pub(crate) const MAX_VARLEN_PAYLOAD_BYTES: usize = i32::MAX as usize;
+
+unsafe fn typed_slice_bounded<'a, T>(
     data: *const T,
     len: size_t,
+    max_len: usize,
+    max_label: &'static str,
     err_out: *mut *mut line_sender_error,
     what: &'static str,
 ) -> Option<&'a [T]> {
-    use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
     if data.is_null() && len != 0 {
         unsafe {
             set_err_out_from_error(
@@ -348,13 +363,13 @@ unsafe fn typed_slice<'a, T>(
         }
         return None;
     }
-    if len > MAX_CHUNK_ROWS {
+    if len > max_len {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    format!("{what} length {len} exceeds MAX_CHUNK_ROWS ({MAX_CHUNK_ROWS})"),
+                    format!("{what} length {len} exceeds {max_label} ({max_len})"),
                 ),
             );
         }
@@ -364,6 +379,45 @@ unsafe fn typed_slice<'a, T>(
         return Some(&[]);
     }
     Some(unsafe { slice::from_raw_parts(data, len) })
+}
+
+unsafe fn typed_slice<'a, T>(
+    data: *const T,
+    len: size_t,
+    err_out: *mut *mut line_sender_error,
+    what: &'static str,
+) -> Option<&'a [T]> {
+    use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
+    unsafe { typed_slice_bounded(data, len, MAX_CHUNK_ROWS, "MAX_CHUNK_ROWS", err_out, what) }
+}
+
+unsafe fn typed_offsets_slice<'a, T>(
+    data: *const T,
+    len: size_t,
+    err_out: *mut *mut line_sender_error,
+    what: &'static str,
+) -> Option<&'a [T]> {
+    use questdb::ingress::column_sender::MAX_CHUNK_ROWS;
+    let max = MAX_CHUNK_ROWS + 1;
+    unsafe { typed_slice_bounded(data, len, max, "MAX_CHUNK_ROWS+1", err_out, what) }
+}
+
+unsafe fn typed_bytes_slice<'a>(
+    data: *const u8,
+    len: size_t,
+    err_out: *mut *mut line_sender_error,
+    what: &'static str,
+) -> Option<&'a [u8]> {
+    unsafe {
+        typed_slice_bounded(
+            data,
+            len,
+            MAX_VARLEN_PAYLOAD_BYTES,
+            "MAX_VARLEN_PAYLOAD_BYTES",
+            err_out,
+            what,
+        )
+    }
 }
 
 macro_rules! bubble {
@@ -495,17 +549,34 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
 // ===========================================================================
 
 /// `true` if the connection is in a permanently-unusable state, has been
-/// closed/dropped, or `conn` is NULL.
+/// closed/dropped, `conn` is NULL, or another FFI call on the same handle
+/// is currently in flight (treated as "must close" to avoid the caller
+/// trying to share `conn` across threads).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool {
     if conn.is_null() {
         return true;
     }
-    let state = unsafe { &(*conn).1 };
-    if state.load(Ordering::Acquire) & LATCH_CLOSED != 0 {
+    let state: *const AtomicU32 = unsafe { &raw const (*conn).1 };
+    let mut err_box: *mut line_sender_error = std::ptr::null_mut();
+    let guard = unsafe {
+        InUseGuard::acquire(
+            conn as *mut qwpws_conn,
+            state,
+            "qwpws_conn_must_close",
+            "qwpws_conn",
+            &mut err_box,
+        )
+    };
+    if guard.is_none() {
+        if !err_box.is_null() {
+            unsafe { crate::line_sender_error_free(err_box) };
+        }
         return true;
     }
-    unsafe { (*conn).0.get().must_close() }
+    let result = unsafe { (*conn).0.get().must_close() };
+    drop(guard);
+    result
 }
 
 // ===========================================================================
@@ -612,7 +683,8 @@ pub unsafe extern "C" fn column_sender_chunk_clear(chunk: *mut column_sender_chu
     true
 }
 
-/// Current row count of the chunk; 0 if `chunk` is NULL or has been freed.
+/// Current row count of the chunk; 0 if `chunk` is NULL, has been freed,
+/// or another FFI call on the same handle is currently in flight.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_row_count(
     chunk: *const column_sender_chunk,
@@ -620,11 +692,26 @@ pub unsafe extern "C" fn column_sender_chunk_row_count(
     if chunk.is_null() {
         return 0;
     }
-    let state = unsafe { &(*chunk).1 };
-    if state.load(Ordering::Acquire) & LATCH_CLOSED != 0 {
+    let state: *const AtomicU32 = unsafe { &raw const (*chunk).1 };
+    let mut err_box: *mut line_sender_error = std::ptr::null_mut();
+    let guard = unsafe {
+        InUseGuard::acquire(
+            chunk as *mut column_sender_chunk,
+            state,
+            "column_sender_chunk_row_count",
+            "column_sender_chunk",
+            &mut err_box,
+        )
+    };
+    if guard.is_none() {
+        if !err_box.is_null() {
+            unsafe { crate::line_sender_error_free(err_box) };
+        }
         return 0;
     }
-    unsafe { (*chunk).0.row_count() }
+    let result = unsafe { (*chunk).0.row_count() };
+    drop(guard);
+    result
 }
 
 // ===========================================================================
@@ -948,11 +1035,12 @@ pub unsafe extern "C" fn column_sender_chunk_column_binary(
             return false;
         }
     };
-    let offsets = match unsafe { typed_slice(offsets, offsets_len, err_out, "binary offsets") } {
-        Some(s) => s,
-        None => return false,
-    };
-    let bytes = match unsafe { typed_slice(bytes, bytes_len, err_out, "binary bytes") } {
+    let offsets =
+        match unsafe { typed_offsets_slice(offsets, offsets_len, err_out, "binary offsets") } {
+            Some(s) => s,
+            None => return false,
+        };
+    let bytes = match unsafe { typed_bytes_slice(bytes, bytes_len, err_out, "binary bytes") } {
         Some(s) => s,
         None => return false,
     };
@@ -1017,11 +1105,12 @@ pub unsafe extern "C" fn column_sender_chunk_column_varchar(
             return false;
         }
     };
-    let offsets = match unsafe { typed_slice(offsets, offsets_len, err_out, "varchar offsets") } {
-        Some(s) => s,
-        None => return false,
-    };
-    let bytes = match unsafe { typed_slice(bytes, bytes_len, err_out, "varchar bytes") } {
+    let offsets =
+        match unsafe { typed_offsets_slice(offsets, offsets_len, err_out, "varchar offsets") } {
+            Some(s) => s,
+            None => return false,
+        };
+    let bytes = match unsafe { typed_bytes_slice(bytes, bytes_len, err_out, "varchar bytes") } {
         Some(s) => s,
         None => return false,
     };
@@ -1081,7 +1170,7 @@ macro_rules! symbol_fn {
                 None => return false,
             };
             let dict_offsets = match unsafe {
-                typed_slice(
+                typed_offsets_slice(
                     dict_offsets,
                     dict_offsets_len,
                     err_out,
@@ -1092,7 +1181,7 @@ macro_rules! symbol_fn {
                 None => return false,
             };
             let dict_bytes = match unsafe {
-                typed_slice(dict_bytes, dict_bytes_len, err_out, "symbol dict bytes")
+                typed_bytes_slice(dict_bytes, dict_bytes_len, err_out, "symbol dict bytes")
             } {
                 Some(s) => s,
                 None => return false,
@@ -1542,6 +1631,7 @@ unsafe fn validate_f64_ndarray(
         return None;
     }
     let mut shape = [0u32; MAX_ARRAY_DIMS];
+    let mut leaf_count: usize = 1;
     for (i, slot) in shape.iter_mut().take(ndim as usize).enumerate() {
         let dim = unsafe { *extras.array_shape.add(i) };
         if dim == 0 {
@@ -1556,10 +1646,33 @@ unsafe fn validate_f64_ndarray(
             }
             return None;
         }
+        leaf_count = match leaf_count.checked_mul(dim as usize) {
+            Some(v) if v <= MAX_NDARRAY_LEAF_ELEMS => v,
+            _ => {
+                unsafe {
+                    set_err_out_from_error(
+                        err_out,
+                        Error::new(
+                            ErrorCode::InvalidApiCall,
+                            format!(
+                                "array_shape product exceeds MAX_NDARRAY_LEAF_ELEMS ({MAX_NDARRAY_LEAF_ELEMS}) at dim {i}"
+                            ),
+                        ),
+                    );
+                }
+                return None;
+            }
+        };
         *slot = dim;
     }
     Some((ndim, shape))
 }
+
+/// Maximum element count of a single ndarray row payload. Bounds
+/// `prod(shape)` so the per-row reservation (`leaf_count * 8 bytes`)
+/// stays well under `isize::MAX`. Matches the egress-side cap on
+/// `MAX_ARRAY_ELEMENTS_PER_ROW`.
+pub(crate) const MAX_NDARRAY_LEAF_ELEMS: usize = 1 << 24;
 
 unsafe fn resolve_numpy_dtype(
     dtype: u32,

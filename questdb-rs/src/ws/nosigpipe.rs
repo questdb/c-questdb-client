@@ -59,7 +59,7 @@
 //!   `SIGPIPE`; the signal does not exist.
 
 use std::io;
-#[cfg(feature = "_egress")]
+#[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -72,7 +72,10 @@ use std::net::TcpStream;
     target_os = "openbsd",
     target_os = "netbsd",
     target_os = "dragonfly",
-    all(feature = "_egress", any(target_os = "linux", target_os = "android")),
+    all(
+        any(feature = "_egress", feature = "_sender-qwp-ws"),
+        any(target_os = "linux", target_os = "android"),
+    ),
 ))]
 use std::os::fd::AsRawFd;
 
@@ -111,10 +114,10 @@ pub(crate) fn apply_so_nosigpipe(_tcp: &TcpStream) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "_egress")]
+#[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
 pub(crate) struct NoSigpipeTcp(TcpStream);
 
-#[cfg(feature = "_egress")]
+#[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
 impl NoSigpipeTcp {
     /// Wrap `tcp` and apply the per-platform SIGPIPE suppression. See
     /// [`apply_so_nosigpipe`] for the option semantics.
@@ -127,23 +130,25 @@ impl NoSigpipeTcp {
         &self.0
     }
 
+    #[cfg(feature = "_egress")]
     pub(crate) fn tcp_mut(&mut self) -> &mut TcpStream {
         &mut self.0
     }
 
+    #[cfg(feature = "_egress")]
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         Ok(Self(self.0.try_clone()?))
     }
 }
 
-#[cfg(feature = "_egress")]
+#[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
 impl Read for NoSigpipeTcp {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-#[cfg(feature = "_egress")]
+#[cfg(any(feature = "_egress", feature = "_sender-qwp-ws"))]
 impl Write for NoSigpipeTcp {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

@@ -44,7 +44,7 @@ use std::time::Duration;
 
 use crate::ingress::SenderBuilder;
 use crate::ingress::sender::qwp_ws::WsStream;
-use crate::ws::frame::{self, FrameError, FrameHeader, Opcode};
+use crate::ws::frame::{self, FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::{MaskKeySource, apply_mask};
 use crate::{Result, error};
 
@@ -73,6 +73,13 @@ const MAX_INBOUND_FRAME_BYTES: u64 = 256 * 1024 * 1024;
 
 /// QWP spec §Protocol limits: max in-flight batches per connection.
 const MAX_IN_FLIGHT: u32 = 128;
+
+/// Best-effort write budget for the Close frame on Drop. Short enough
+/// that a wedged peer cannot block deallocation of the connection.
+const CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// RFC 6455 §7.4.1 normal closure status, big-endian.
+const WS_CLOSE_STATUS_NORMAL: [u8; 2] = 1000u16.to_be_bytes();
 
 /// Metadata for one published-but-unacked frame. Pushed on publish,
 /// popped (front) when the matching OK arrives.
@@ -107,6 +114,13 @@ pub(crate) struct ColumnConn {
     /// For ack_level=Durable: per-table seq_txn watermark the server has
     /// reported reaching durable storage.
     durable_watermarks: HashMap<String, i64>,
+    /// Per-table seq_txn high-water mark observed in OK acks but not yet
+    /// confirmed durable. Populated by every Ok ack regardless of the
+    /// caller's `ack_level`, so a later `sync(Durable)` can still wait
+    /// for earlier frames that were drained by `sync(Ok)` or
+    /// `try_drain_acks`. Satisfied entries are removed once
+    /// `durable_watermarks` reaches them.
+    pending_durable_targets: HashMap<String, i64>,
     /// Sticky: once `true`, the connection cannot be used for further
     /// publishes; the pool drops the slot on return.
     must_close: bool,
@@ -135,6 +149,7 @@ impl ColumnConn {
             pending_acks: VecDeque::new(),
             in_flight: 0,
             durable_watermarks: HashMap::new(),
+            pending_durable_targets: HashMap::new(),
             must_close: false,
             max_buf_size: raw.max_buf_size,
             request_timeout: raw.request_timeout,
@@ -309,34 +324,32 @@ impl ColumnConn {
         }
         self.validate_ack_level(ack_level)?;
 
-        // Phase 1: drain all OK acks.
-        let mut durable_targets: HashMap<String, i64> = HashMap::new();
         while self.in_flight > 0 {
             let response = self.recv_qwp_response()?;
-            if let QwpResponse::Ok { tables, .. } = &response
-                && ack_level == AckLevel::Durable
-            {
-                for (t, seq_txn) in tables {
-                    let entry = durable_targets.entry(t.clone()).or_insert(i64::MIN);
-                    if *seq_txn > *entry {
-                        *entry = *seq_txn;
-                    }
-                }
-            }
             self.process_response(response)?;
         }
 
-        // Phase 2 (Durable only): wait for watermarks.
         if ack_level == AckLevel::Durable {
-            while durable_targets.iter().any(|(t, target)| {
-                self.durable_watermarks.get(t).copied().unwrap_or(i64::MIN) < *target
-            }) {
+            while !self.durability_satisfied() {
                 let response = self.recv_qwp_response()?;
                 self.process_response(response)?;
             }
+            self.drop_satisfied_durable_targets();
         }
 
         Ok(())
+    }
+
+    fn durability_satisfied(&self) -> bool {
+        self.pending_durable_targets.iter().all(|(t, target)| {
+            self.durable_watermarks.get(t).copied().unwrap_or(i64::MIN) >= *target
+        })
+    }
+
+    fn drop_satisfied_durable_targets(&mut self) {
+        let watermarks = &self.durable_watermarks;
+        self.pending_durable_targets
+            .retain(|t, target| watermarks.get(t).copied().unwrap_or(i64::MIN) < *target);
     }
 
     /// Dispatch a parsed QWP response: validate OK sequence, update
@@ -344,10 +357,7 @@ impl ColumnConn {
     /// latch on error.
     fn process_response(&mut self, response: QwpResponse) -> Result<()> {
         match response {
-            QwpResponse::Ok {
-                sequence,
-                tables: _,
-            } => {
+            QwpResponse::Ok { sequence, tables } => {
                 let mut popped = 0u32;
                 while let Some(front) = self.pending_acks.front() {
                     if front.fsn > sequence {
@@ -365,6 +375,16 @@ impl ColumnConn {
                     )));
                 }
                 self.in_flight -= popped;
+                for (t, seq_txn) in tables {
+                    self.pending_durable_targets
+                        .entry(t)
+                        .and_modify(|w| {
+                            if seq_txn > *w {
+                                *w = seq_txn;
+                            }
+                        })
+                        .or_insert(seq_txn);
+                }
                 Ok(())
             }
             QwpResponse::DurableAck { tables } => {
@@ -673,6 +693,26 @@ impl ColumnConn {
             ))
         })?;
         Ok(())
+    }
+}
+
+impl Drop for ColumnConn {
+    fn drop(&mut self) {
+        let _ = self
+            .stream
+            .set_timeouts(Some(CLOSE_TIMEOUT), Some(CLOSE_TIMEOUT));
+        let Ok(mask_key) = self.mask_keys.next_key() else {
+            return;
+        };
+        self.write_buf.clear();
+        encode_client_frame(
+            &mut self.write_buf,
+            Opcode::Close,
+            mask_key,
+            &WS_CLOSE_STATUS_NORMAL,
+        );
+        let _ = self.stream.write_all(&self.write_buf);
+        let _ = self.stream.flush();
     }
 }
 
