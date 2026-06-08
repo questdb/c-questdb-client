@@ -842,39 +842,6 @@ bool column_sender_sync(
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 
 /**
- * Encode an Arrow C Data Interface `RecordBatch` (struct-typed
- * `ArrowArray`) and publish it as one QWP frame.
- *
- * Ownership: same contract as `column_sender_chunk_append_arrow_column`
- * — on success `array->release` is consumed (set to NULL); on failure
- * it may also have been consumed. Callers MUST check
- * `array->release != NULL` before invoking it on the failure path.
- * `schema` is borrowed in all cases.
- */
-QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch(
-    qwpws_conn* conn,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    line_sender_error** err_out);
-
-/**
- * Same as `column_sender_flush_arrow_batch` but picks the designated
- * timestamp from a named column of the batch instead of from
- * `column_sender_chunk_designated_timestamp_*`. Same ownership
- * contract.
- */
-QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch_at_column(
-    qwpws_conn* conn,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    line_sender_column_name ts_column,
-    line_sender_error** err_out);
-
-/**
  * Per-column wire-type hint kind, paired with
  * `column_sender_arrow_override::kind`.
  */
@@ -887,10 +854,10 @@ typedef enum column_sender_arrow_override_kind
 } column_sender_arrow_override_kind;
 
 /**
- * Per-column wire-type hint passed to the `*_with_overrides` variants
- * to steer encoding without having to attach `questdb.*` Field
- * metadata to the Arrow schema. Caller owns `column`; the bytes are
- * borrowed for the duration of the call.
+ * Per-column wire-type hint passed to `column_sender_flush_arrow_batch`
+ * (and `_at_column`) to steer encoding without having to attach
+ * `questdb.*` Field metadata to the Arrow schema. Caller owns `column`;
+ * the bytes are borrowed for the duration of the call.
  *
  * `arg` carries the geohash precision (1..=60) when `kind ==
  * column_sender_arrow_override_geohash`, and is ignored otherwise
@@ -905,18 +872,25 @@ typedef struct column_sender_arrow_override
 } column_sender_arrow_override;
 
 /**
- * Same as `column_sender_flush_arrow_batch` but consults `overrides`
- * to steer per-column wire-type classification. Same ownership
- * contract as `column_sender_flush_arrow_batch`.
+ * Encode an Arrow C Data Interface `RecordBatch` (struct-typed
+ * `ArrowArray`) and publish it as one QWP frame.
  *
- * Returns `false` with `line_sender_error_invalid_api_call` if any
- * override targets an unknown column, duplicates another override,
- * carries invalid UTF-8 in `column`, has an unknown `kind`, or — for
+ * Ownership: same contract as `column_sender_chunk_append_arrow_column`
+ * — on success `array->release` is consumed (set to NULL); on failure
+ * it may also have been consumed. Callers MUST check
+ * `array->release != NULL` before invoking it on the failure path.
+ * `schema` is borrowed in all cases.
+ *
+ * `overrides` (length `overrides_len`) optionally supplies per-column
+ * wire-type hints. Pass `NULL, 0` for no overrides. Returns `false`
+ * with `line_sender_error_invalid_api_call` if any override targets
+ * an unknown column, duplicates another override, carries invalid
+ * UTF-8 in `column`, has an unknown `kind`, or — for
  * `column_sender_arrow_override_geohash` — carries `arg` outside
  * `1..=60`.
  */
 QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch_with_overrides(
+bool column_sender_flush_arrow_batch(
     qwpws_conn* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -926,14 +900,13 @@ bool column_sender_flush_arrow_batch_with_overrides(
     line_sender_error** err_out);
 
 /**
- * Same as `column_sender_flush_arrow_batch_at_column` but consults
- * `overrides` to steer per-column wire-type classification. Same
- * ownership contract as `column_sender_flush_arrow_batch_at_column`
- * and same validation contract as
- * `column_sender_flush_arrow_batch_with_overrides`.
+ * Same as `column_sender_flush_arrow_batch` but picks the designated
+ * timestamp from a named column of the batch instead of from
+ * `column_sender_chunk_designated_timestamp_*`. Same ownership and
+ * `overrides` contract.
  */
 QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch_at_column_with_overrides(
+bool column_sender_flush_arrow_batch_at_column(
     qwpws_conn* conn,
     line_sender_table_name table,
     struct ArrowArray* array,

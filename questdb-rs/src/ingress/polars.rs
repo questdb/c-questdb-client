@@ -44,7 +44,7 @@
 //!
 //! ```ignore
 //! for rb in questdb::ingress::polars::dataframe_to_batches(&df, None) {
-//!     sender.flush_arrow_batch(table, &rb?)?;
+//!     sender.flush_arrow_batch(table, &rb?, &[])?;
 //! }
 //! ```
 //!
@@ -310,7 +310,7 @@ impl crate::ingress::column_sender::ColumnSender {
         max_rows: Option<NonZeroUsize>,
     ) -> Result<()> {
         for rb in dataframe_to_batches(df, max_rows) {
-            self.flush_arrow_batch(table, &rb?)?;
+            self.flush_arrow_batch(table, &rb?, &[])?;
         }
         Ok(())
     }

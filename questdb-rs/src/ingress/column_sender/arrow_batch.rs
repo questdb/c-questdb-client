@@ -4970,7 +4970,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_arrow_batch_with_overrides_symbol_promotes_utf8() {
+    fn flush_arrow_batch_overrides_symbol_promotes_utf8() {
         let mut sb = StringBuilder::new();
         sb.append_value("EU");
         sb.append_value("US");
@@ -4989,7 +4989,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_arrow_batch_with_overrides_ipv4_on_uint32() {
+    fn flush_arrow_batch_overrides_ipv4_on_uint32() {
         let mut b = UInt32Builder::new();
         b.append_value(0x0100_007F);
         b.append_value(0x0101_A8C0);
@@ -5005,7 +5005,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_arrow_batch_with_overrides_unknown_column_rejected() {
+    fn flush_arrow_batch_overrides_unknown_column_rejected() {
         let mut b = Int64Builder::new();
         b.append_value(1);
         let rb = single_col_batch(Field::new("c", DataType::Int64, false), b.finish());
@@ -5021,7 +5021,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_arrow_batch_with_overrides_duplicate_rejected() {
+    fn flush_arrow_batch_overrides_duplicate_rejected() {
         let mut sb = StringBuilder::new();
         sb.append_value("x");
         let rb = single_col_batch(Field::new("s", DataType::Utf8, false), sb.finish());
@@ -5042,7 +5042,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_arrow_batch_with_overrides_geohash_bits_validated() {
+    fn flush_arrow_batch_overrides_geohash_bits_validated() {
         let mut b = Int32Builder::new();
         b.append_value(0);
         let rb = single_col_batch(Field::new("g", DataType::Int32, true), b.finish());
@@ -5075,7 +5075,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_arrow_batch_with_overrides_preserves_existing_metadata() {
+    fn flush_arrow_batch_overrides_preserves_existing_metadata() {
         let mut b = Int64Builder::new();
         b.append_value(1);
         let mut sb = StringBuilder::new();

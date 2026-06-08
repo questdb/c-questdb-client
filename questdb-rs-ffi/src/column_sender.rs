@@ -1921,6 +1921,14 @@ pub unsafe extern "C" fn column_sender_flush(
 /// borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
+///
+/// `overrides` (length `overrides_len`) optionally supplies per-column
+/// wire-type hints without requiring the caller to attach `questdb.*`
+/// Field metadata to the Arrow schema. Pass `NULL, 0` for no overrides.
+/// Returns `false` with `line_sender_error_invalid_api_call` if any
+/// override targets an unknown column, duplicates another override,
+/// carries invalid UTF-8 in `column`, has an unknown `kind`, or — for
+/// `_geohash` — carries `arg` outside `1..=60`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush_arrow_batch(
@@ -1928,6 +1936,8 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch(
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
@@ -1937,8 +1947,8 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch(
             array,
             schema,
             None,
-            std::ptr::null(),
-            0,
+            overrides,
+            overrides_len,
             err_out,
         )
     }
@@ -1948,7 +1958,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch(
 /// row's designated timestamp from a named `Timestamp(_)` column inside
 /// the batch. The column must be `Timestamp(Microsecond | Nanosecond |
 /// Millisecond, _)` with no null rows and no values before the Unix
-/// epoch. Same ownership contract.
+/// epoch. Same ownership and `overrides` contract.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
@@ -1957,6 +1967,8 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
     ts_column: line_sender_column_name,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
@@ -1966,8 +1978,8 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
             array,
             schema,
             Some(ts_column),
-            std::ptr::null(),
-            0,
+            overrides,
+            overrides_len,
             err_out,
         )
     }
@@ -1988,7 +2000,8 @@ pub enum column_sender_arrow_override_kind {
 /// Per-column wire-type hint that overrides what the encoder would
 /// otherwise derive from the Arrow `Field`'s data type alone. Caller
 /// owns `column`; the bytes are borrowed for the duration of the
-/// `*_with_overrides` call and must outlive it.
+/// `column_sender_flush_arrow_batch[_at_column]` call and must outlive
+/// it.
 #[cfg(feature = "arrow")]
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -2006,68 +2019,6 @@ pub struct column_sender_arrow_override {
     /// - `_geohash`: precision bits (1..=60).
     /// - other kinds: ignored; pass 0.
     pub arg: u32,
-}
-
-/// Variant of [`column_sender_flush_arrow_batch`] that supplies
-/// per-column wire-type hints without requiring the caller to attach
-/// `questdb.*` Field metadata to the Arrow schema. Same ownership
-/// contract as [`column_sender_flush_arrow_batch`]. Returns `false`
-/// with `line_sender_error_invalid_api_call` if any override targets
-/// an unknown column, duplicates another override, carries invalid
-/// UTF-8 in `column`, has an unknown `kind`, or — for `_geohash` —
-/// carries `arg` outside `1..=60`.
-#[cfg(feature = "arrow")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_flush_arrow_batch_with_overrides(
-    conn: *mut qwpws_conn,
-    table: line_sender_table_name,
-    array: *mut arrow::ffi::FFI_ArrowArray,
-    schema: *const arrow::ffi::FFI_ArrowSchema,
-    overrides: *const column_sender_arrow_override,
-    overrides_len: size_t,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    unsafe {
-        arrow_batch_impl(
-            conn,
-            table,
-            array,
-            schema,
-            None,
-            overrides,
-            overrides_len,
-            err_out,
-        )
-    }
-}
-
-/// Variant of [`column_sender_flush_arrow_batch_at_column`] that
-/// supplies per-column wire-type hints. Same ownership and validation
-/// contract as [`column_sender_flush_arrow_batch_with_overrides`].
-#[cfg(feature = "arrow")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_with_overrides(
-    conn: *mut qwpws_conn,
-    table: line_sender_table_name,
-    array: *mut arrow::ffi::FFI_ArrowArray,
-    schema: *const arrow::ffi::FFI_ArrowSchema,
-    ts_column: line_sender_column_name,
-    overrides: *const column_sender_arrow_override,
-    overrides_len: size_t,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    unsafe {
-        arrow_batch_impl(
-            conn,
-            table,
-            array,
-            schema,
-            Some(ts_column),
-            overrides,
-            overrides_len,
-            err_out,
-        )
-    }
 }
 
 #[cfg(feature = "arrow")]
@@ -2088,7 +2039,7 @@ unsafe fn arrow_overrides_from_c<'a>(
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch_with_overrides: overrides pointer is NULL".to_string(),
+            "column_sender_flush_arrow_batch: overrides pointer is NULL".to_string(),
         );
         return None;
     }
@@ -2240,13 +2191,8 @@ unsafe fn arrow_batch_impl(
     let table_name = unsafe { table.as_name() };
     let sender = unsafe { (*conn).0.get_mut() };
     let result = match ts_column {
-        Some(ts) => sender.flush_arrow_batch_at_column_with_overrides(
-            table_name,
-            &rb,
-            ts.as_name(),
-            &overrides,
-        ),
-        None => sender.flush_arrow_batch_with_overrides(table_name, &rb, &overrides),
+        Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name(), &overrides),
+        None => sender.flush_arrow_batch(table_name, &rb, &overrides),
     };
     bubble!(err_out, result);
     true

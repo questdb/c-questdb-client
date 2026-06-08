@@ -240,7 +240,7 @@ TEST_CASE("flush_arrow_batch: NULL array → invalid_api_call")
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
     bool ok = column_sender_flush_arrow_batch(
-        mc.conn, tbl, nullptr, &sch, &err);
+        mc.conn, tbl, nullptr, &sch, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
     CHECK(line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
@@ -255,7 +255,7 @@ TEST_CASE("flush_arrow_batch: NULL schema → invalid_api_call")
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
     bool ok = column_sender_flush_arrow_batch(
-        mc.conn, tbl, &arr, nullptr, &err);
+        mc.conn, tbl, &arr, nullptr, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
     CHECK(line_sender_error_get_code(err) == line_sender_error_invalid_api_call);

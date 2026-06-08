@@ -126,7 +126,8 @@ TEST(test_ingress_null_conn_returns_false)
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table("t");
-    bool ok = column_sender_flush_arrow_batch(NULL, tbl, &arr, &sch, &err);
+    bool ok = column_sender_flush_arrow_batch(
+        NULL, tbl, &arr, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL conn → false");
     CHECK(err != NULL, "err_out populated");
     if (err)
@@ -151,7 +152,7 @@ TEST(test_ingress_null_array_returns_false)
      * need a real conn, which requires a live mock server. Coverage moved
      * to Rust unit tests. */
     bool ok = column_sender_flush_arrow_batch(
-        NULL, make_table("t"), NULL, &sch, &err);
+        NULL, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array path through NULL-conn short-circuit");
     if (err)
         line_sender_error_free(err);
@@ -165,7 +166,8 @@ TEST(test_ingress_at_column_null_conn_returns_false)
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
     bool ok = column_sender_flush_arrow_batch_at_column(
-        NULL, make_table("t"), &arr, &sch, make_col("ts"), &err);
+        NULL, make_table("t"), &arr, &sch, make_col("ts"),
+        NULL, 0, &err);
     CHECK(!ok, "NULL conn → false");
     CHECK(err != NULL, "err_out populated");
     if (err)
@@ -890,7 +892,8 @@ static void run_arrow_flush(
     }
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table(table);
-    bool ok = column_sender_flush_arrow_batch(conn, tbl, arr, sch, &err);
+    bool ok = column_sender_flush_arrow_batch(
+        conn, tbl, arr, sch, NULL, 0, &err);
     if (!ok)
     {
         CHECK(err != NULL, "err_out populated on failure");
@@ -927,7 +930,7 @@ TEST(test_mock_ingress_null_array_via_real_conn)
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
     bool ok = column_sender_flush_arrow_batch(
-        conn, make_table("t"), NULL, &sch, &err);
+        conn, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array → false");
     CHECK(err != NULL, "err_out populated");
     if (err)
@@ -1074,7 +1077,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
         line_sender_table_name tbl = make_table("dts_t_col");
         line_sender_column_name ts_col = make_col("missing_ts");
         bool ok = column_sender_flush_arrow_batch_at_column(
-            conn, tbl, &arr, &sch, ts_col, &err);
+            conn, tbl, &arr, &sch, ts_col, NULL, 0, &err);
         CHECK(!ok, "missing ts column → false");
         if (err)
         {

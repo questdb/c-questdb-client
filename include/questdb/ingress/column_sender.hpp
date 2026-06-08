@@ -604,7 +604,9 @@ public:
     void flush_arrow_batch(
         table_name_view table,
         ::ArrowArray& array,
-        const ::ArrowSchema& schema)
+        const ::ArrowSchema& schema,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
@@ -612,7 +614,9 @@ public:
             _raw,
             table_c,
             &array,
-            &schema);
+            &schema,
+            overrides,
+            overrides_len);
     }
 
     /**
@@ -624,7 +628,9 @@ public:
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        column_name_view ts_column)
+        column_name_view ts_column,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
@@ -634,7 +640,9 @@ public:
             table_c,
             &array,
             &schema,
-            ts_c);
+            ts_c,
+            overrides,
+            overrides_len);
     }
 #endif
 

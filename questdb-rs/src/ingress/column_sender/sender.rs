@@ -160,16 +160,12 @@ impl ColumnSender {
     /// warm its symbol cache; later frames are sent with
     /// `FLAG_DEFER_COMMIT`. Call [`Self::sync`] to trigger commit for
     /// all accumulated rows.
+    ///
+    /// `overrides` (use `&[]` for none) supplies per-column wire-type
+    /// hints without requiring the caller to patch the Arrow `Field`
+    /// metadata first.
     #[cfg(feature = "arrow")]
-    pub fn flush_arrow_batch(&mut self, table: TableName<'_>, batch: &RecordBatch) -> Result<()> {
-        self.flush_arrow_batch_with_overrides(table, batch, &[])
-    }
-
-    /// Variant of [`Self::flush_arrow_batch`] that supplies per-column
-    /// wire-type hints without requiring the caller to patch the Arrow
-    /// `Field` metadata first.
-    #[cfg(feature = "arrow")]
-    pub fn flush_arrow_batch_with_overrides(
+    pub fn flush_arrow_batch(
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
@@ -185,22 +181,10 @@ impl ColumnSender {
     /// designated timestamp from `ts_column`. The column must be a
     /// `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with no
     /// null rows and no values before the Unix epoch; `Millisecond` is
-    /// widened to µs on the wire.
+    /// widened to µs on the wire. `overrides` (use `&[]` for none) has
+    /// the same meaning as in [`Self::flush_arrow_batch`].
     #[cfg(feature = "arrow")]
     pub fn flush_arrow_batch_at_column(
-        &mut self,
-        table: TableName<'_>,
-        batch: &RecordBatch,
-        ts_column: ColumnName<'_>,
-    ) -> Result<()> {
-        self.flush_arrow_batch_at_column_with_overrides(table, batch, ts_column, &[])
-    }
-
-    /// Variant of [`Self::flush_arrow_batch_at_column`] that supplies
-    /// per-column wire-type hints without requiring the caller to patch
-    /// the Arrow `Field` metadata first.
-    #[cfg(feature = "arrow")]
-    pub fn flush_arrow_batch_at_column_with_overrides(
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
