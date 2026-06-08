@@ -668,14 +668,14 @@ bool column_sender_chunk_append_arrow_column(
 
 typedef enum column_sender_numpy_dtype
 {
-    /* Signed integers — emit at source width (identity, 1 memcpy/no-null).
-       NOTE: BYTE / SHORT use value 0 as the wire null sentinel, so source
-       values of 0 round-trip as NULL on the server side. Callers wanting
-       0 to round-trip as 0 must widen to INT (i32) themselves. */
-    column_sender_numpy_i8 = 0,  /* → BYTE  (1B/row, sentinel = 0)              */
-    column_sender_numpy_i16 = 1, /* → SHORT (2B/row, sentinel = 0)              */
-    column_sender_numpy_i32 = 2, /* → INT   (4B/row, sentinel = i32::MIN)       */
-    column_sender_numpy_i64 = 3, /* → LONG  (8B/row, sentinel = i64::MIN)       */
+    /* Signed integers — widened one step up to a sentinel-safe wire so the
+       source's full range (including value 0) round-trips faithfully. The
+       widened wire's sentinel (i32::MIN / i64::MIN) lies outside the
+       source's representable range, so no source value collides with it. */
+    column_sender_numpy_i8 = 0,  /* → INT  (4B/row, widen i8→i32, sentinel-safe)  */
+    column_sender_numpy_i16 = 1, /* → INT  (4B/row, widen i16→i32, sentinel-safe) */
+    column_sender_numpy_i32 = 2, /* → LONG (8B/row, widen i32→i64, sentinel-safe) */
+    column_sender_numpy_i64 = 3, /* → LONG (8B/row, sentinel = i64::MIN)          */
 
     /* Unsigned integers — widen to the smallest signed wire that holds the
        source range WITHOUT colliding with the null sentinel. BYTE/SHORT
