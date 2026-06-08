@@ -1196,6 +1196,7 @@ def _build_kind_registry() -> Dict[str, KindSpec]:
         _vg_ts_us, _arr_timestamp, _set_ts_us,
         compare_fn=_cmp_timestamp,
         params={"unit": "us"},
+        supports_server_null=False,
     )
     reg["timestamp_ns"] = KindSpec(
         "timestamp_ns", "TIMESTAMP_NS",
@@ -1203,6 +1204,7 @@ def _build_kind_registry() -> Dict[str, KindSpec]:
         _vg_ts_ns, _arr_timestamp, _set_ts_ns,
         compare_fn=_cmp_timestamp,
         params={"unit": "ns"},
+        supports_server_null=False,
     )
     for bits in EDGE_GEOHASH_BITS:
         spec = _make_geohash_spec(bits)

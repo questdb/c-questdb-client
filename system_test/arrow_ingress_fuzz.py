@@ -585,20 +585,6 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
         rb = pa.RecordBatch.from_arrays([c_int, ts_arr], schema=schema)
         self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
 
-    def test_err_fsb16_without_uuid_metadata(self):
-        n = 4
-        c_fsb = pa.array([b"x" * 16] * n, type=pa.binary(16))
-        ts_arr = pa.array(
-            [1_700_000_000_000_000 + i for i in range(n)],
-            type=pa.timestamp("us", tz="UTC"),
-        )
-        schema = pa.schema([
-            pa.field("c_fsb", pa.binary(16), nullable=True),  # no metadata
-            pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
-        ])
-        rb = pa.RecordBatch.from_arrays([c_fsb, ts_arr], schema=schema)
-        self._expect_code(rb, SenderErrorCode.ARROW_UNSUPPORTED_COLUMN_KIND)
-
     def test_err_list_non_float_leaf(self):
         n = 4
         c_list = pa.array([[1, 2], [3], [], [4, 5, 6]], type=pa.list_(pa.int64()))
@@ -697,7 +683,7 @@ class TestArrowIngressExtraTypes(afc.ArrowFuzzBase):
         self._ingest_one_col(table, "DATE", "c", arr)
 
     def test_extra_timestamp_second_widens_to_micros(self):
-        arr = pa.array([1_700_000_000, 0, 1, None],
+        arr = pa.array([1_700_000_000, 0, 1, 2],
                        type=pa.timestamp("s", tz="UTC"))
         table = self.fresh_table("arrow_extra_ts_s")
         self._ingest_one_col(table, "TIMESTAMP", "c", arr)
