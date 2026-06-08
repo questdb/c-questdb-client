@@ -624,9 +624,11 @@ pub struct ArrowSchema {
 // Chunk lifecycle
 // ===========================================================================
 
-/// Create an empty chunk for `table_name` (validated UTF-8, ≤ 127 bytes,
-/// no control characters or reserved punctuation). Invalid names are
-/// rejected eagerly with `InvalidName` rather than at first flush.
+/// Create an empty chunk for `table_name` (validated UTF-8).
+///
+/// Table name grammar and length validation is deferred to first flush —
+/// matches the deferred-validation contract of `Chunk::new` in the Rust
+/// API.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_new(
     table_name: *const c_char,
@@ -637,22 +639,6 @@ pub unsafe extern "C" fn column_sender_chunk_new(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
-    if let Err(e) = questdb::ingress::TableName::new(table) {
-        unsafe { set_err_out_from_error(err_out, e) };
-        return std::ptr::null_mut();
-    }
-    if table.len() > 127 {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidName,
-                    format!("table name is too long: {} bytes (max 127)", table.len()),
-                ),
-            );
-        }
-        return std::ptr::null_mut();
-    }
     Box::into_raw(Box::new(column_sender_chunk(
         Chunk::new(table),
         AtomicU32::new(0),
@@ -2491,36 +2477,18 @@ mod tests {
     }
 
     #[test]
-    fn chunk_new_validates_table_name_length() {
+    fn chunk_new_defers_table_name_validation() {
+        // The 128-byte name exceeds the QWP 127-byte cap and contains
+        // grammatically valid characters; both checks are deferred to
+        // flush per the documented contract on `Chunk::new`.
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let table = "x".repeat(128);
         let chunk = unsafe {
             column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
         };
-        assert!(chunk.is_null());
-        assert!(!err.is_null());
-        unsafe { line_sender_error_free(err) };
-    }
-
-    #[test]
-    fn chunk_new_validates_table_name_grammar() {
-        let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let table = "bad?name";
-        let chunk = unsafe {
-            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
-        };
-        assert!(chunk.is_null());
-        assert!(!err.is_null());
-        unsafe { line_sender_error_free(err) };
-    }
-
-    #[test]
-    fn chunk_new_validates_empty_table_name() {
-        let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let chunk = unsafe { column_sender_chunk_new(std::ptr::null(), 0, &mut err) };
-        assert!(chunk.is_null());
-        assert!(!err.is_null());
-        unsafe { line_sender_error_free(err) };
+        assert!(!chunk.is_null());
+        assert!(err.is_null());
+        unsafe { column_sender_chunk_free(chunk) };
     }
 
     #[test]
