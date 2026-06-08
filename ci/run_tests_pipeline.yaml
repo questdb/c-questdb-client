@@ -314,16 +314,7 @@ stages:
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
           - script: |
-              python3 system_test/test.py run --repo ./questdb \
-                TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty \
-                TestArrowIngressFuzz TestArrowIngressPerKind \
-                TestArrowIngressDesignatedTs TestArrowIngressErrors \
-                TestArrowIngressMultiBatch \
-                TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes \
-                TestArrowRoundTripFuzz TestArrowRoundTripPerKind \
-                TestArrowAlignment \
-                TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind \
-                TestArrowPolarsPerDtype -v
+              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
             displayName: "TestArrowWsFuzz"
           # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
           # publish the QuestDB server log so PR reviewers don't have to
@@ -428,16 +419,7 @@ stages:
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
           - script: |
-              python3 system_test/test.py run --repo ./questdb \
-                TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty \
-                TestArrowIngressFuzz TestArrowIngressPerKind \
-                TestArrowIngressDesignatedTs TestArrowIngressErrors \
-                TestArrowIngressMultiBatch \
-                TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes \
-                TestArrowRoundTripFuzz TestArrowRoundTripPerKind \
-                TestArrowAlignment \
-                TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind \
-                TestArrowPolarsPerDtype -v
+              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
             displayName: "TestArrowWsFuzz"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"
