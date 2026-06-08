@@ -203,10 +203,15 @@ stages:
             displayName: "TestQwpWsFuzz"
           - script: |
               python3 system_test/test.py run --repo ./questdb \
-                TestArrowEgressFuzz TestArrowIngressFuzz \
+                TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty \
+                TestArrowIngressFuzz TestArrowIngressPerKind \
+                TestArrowIngressDesignatedTs TestArrowIngressErrors \
+                TestArrowIngressMultiBatch \
                 TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes \
-                TestArrowRoundTripFuzz TestArrowAlignment \
-                TestArrowPolarsFuzz TestArrowPolarsPerDtype -v
+                TestArrowRoundTripFuzz TestArrowRoundTripPerKind \
+                TestArrowAlignment \
+                TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind \
+                TestArrowPolarsPerDtype -v
             displayName: "TestArrowFuzz"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"

@@ -62,13 +62,12 @@ pub(crate) struct SchemaRegistry {
 }
 
 /// Restore point for [`SchemaRegistry`]. Captured before encoding a
-/// frame and passed to [`SchemaRegistry::rollback`] if encoding fails
-/// before the bytes hit the wire — otherwise the client and server
-/// would diverge on the schema-id allocation.
+/// frame; on [`SchemaRegistry::rollback`] every signature interned
+/// after the snapshot is removed and `next_id` is reset — so a frame
+/// that fails before its bytes reach the wire never gets to claim a
+/// schema id the server hasn't seen.
 pub(crate) struct SchemaRegistryMark {
-    next_id: u64,
-    by_signature_len: usize,
-    inserted_signature: Option<Vec<u8>>,
+    next_id_at_mark: u64,
 }
 
 impl SchemaRegistry {
@@ -76,36 +75,28 @@ impl SchemaRegistry {
         Self::default()
     }
 
-    pub(super) fn mark(&self) -> SchemaRegistryMark {
+    pub(crate) fn mark(&self) -> SchemaRegistryMark {
         SchemaRegistryMark {
-            next_id: self.next_id,
-            by_signature_len: self.by_signature.len(),
-            inserted_signature: None,
+            next_id_at_mark: self.next_id,
         }
     }
 
-    pub(super) fn intern(
-        &mut self,
-        signature: &[u8],
-        mark: &mut SchemaRegistryMark,
-    ) -> (u64, bool) {
+    pub(super) fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
         if let Some(&id) = self.by_signature.get(signature) {
             return (id, false);
         }
         let id = self.next_id;
         self.next_id += 1;
-        let owned = signature.to_vec();
-        mark.inserted_signature = Some(owned.clone());
-        self.by_signature.insert(owned, id);
+        self.by_signature.insert(signature.to_vec(), id);
         (id, true)
     }
 
-    pub(super) fn rollback(&mut self, mark: SchemaRegistryMark) {
-        if let Some(sig) = mark.inserted_signature {
-            self.by_signature.remove(&sig);
+    pub(crate) fn rollback(&mut self, mark: SchemaRegistryMark) {
+        if self.next_id == mark.next_id_at_mark {
+            return;
         }
-        self.next_id = mark.next_id;
-        debug_assert_eq!(self.by_signature.len(), mark.by_signature_len);
+        self.by_signature.retain(|_, id| *id < mark.next_id_at_mark);
+        self.next_id = mark.next_id_at_mark;
     }
 
     #[cfg(test)]
@@ -221,7 +212,7 @@ pub(crate) fn encode_chunk_into(
     scratch.signature.push(designated.wire_type);
 
     let frame_start = out.len();
-    let mut schema_mark = schema_registry.mark();
+    let schema_mark = schema_registry.mark();
     let result = encode_frame_after_signature(
         out,
         chunk,
@@ -233,7 +224,6 @@ pub(crate) fn encode_chunk_into(
         defer_commit,
         scratch,
         schema_registry,
-        &mut schema_mark,
     );
     match result {
         Ok(()) => Ok(()),
@@ -258,9 +248,8 @@ fn encode_frame_after_signature(
     defer_commit: bool,
     scratch: &EncodeScratch,
     schema_registry: &mut SchemaRegistry,
-    schema_mark: &mut SchemaRegistryMark,
 ) -> Result<()> {
-    let (schema_id, is_new_schema) = schema_registry.intern(&scratch.signature, schema_mark);
+    let (schema_id, is_new_schema) = schema_registry.intern(&scratch.signature);
 
     let estimated = estimate_frame_size(
         chunk,
@@ -306,7 +295,7 @@ fn encode_frame_after_signature(
         }
     }
 
-    encode_designated_ts(out, designated, row_count);
+    encode_designated_ts(out, designated, row_count)?;
 
     let payload_len_usize = out.len() - payload_start;
     let payload_len = u32::try_from(payload_len_usize).map_err(|_| {
@@ -334,52 +323,63 @@ fn estimate_frame_size(
     new_symbols: &[Vec<u8>],
     _per_column: &[Option<ResolvedColumn>],
 ) -> usize {
-    let mut total = QWP_HEADER_LEN;
-    total += 10 + 10; // delta_start + new_symbols_count varints
+    // Saturating arithmetic throughout: the encoder's job is to size a
+    // reservation, never to compute a wire offset. An overflow that
+    // wraps to a small `total` would cause `try_reserve(small)` to
+    // succeed and the subsequent per-column writes to abort the process
+    // on the infallible `Vec::reserve` call.
+    let mut total: usize = QWP_HEADER_LEN;
+    total = total.saturating_add(20);
     for s in new_symbols {
-        total += 10 + s.len();
+        total = total.saturating_add(10).saturating_add(s.len());
     }
-    // table block header + schema section
-    total += 10 + chunk.table.len() + 10 + 10; // table name + row + col count varints
-    total += 1 + 10 + signature.len(); // schema mode + id varint + signature (full case)
+    total = total
+        .saturating_add(10)
+        .saturating_add(chunk.table.len())
+        .saturating_add(20);
+    total = total.saturating_add(11).saturating_add(signature.len());
 
     let bitmap_bytes = row_count.div_ceil(8);
     for col in &chunk.columns {
-        let null_overhead = 1 + if col.validity.is_some() {
+        let null_overhead = 1usize.saturating_add(if col.validity.is_some() {
             bitmap_bytes
         } else {
             0
-        };
+        });
         let payload_size = match col.kind {
             ColumnKind::Byte { .. } => row_count,
-            ColumnKind::Short { .. } => 2 * row_count,
+            ColumnKind::Short { .. } => row_count.saturating_mul(2),
             ColumnKind::Int { .. } | ColumnKind::Float { .. } | ColumnKind::Ipv4 { .. } => {
-                4 * row_count
+                row_count.saturating_mul(4)
             }
             ColumnKind::Long { .. }
             | ColumnKind::Double { .. }
             | ColumnKind::TsNanos { .. }
             | ColumnKind::TsMicros { .. }
-            | ColumnKind::DateMillis { .. } => 8 * row_count,
+            | ColumnKind::DateMillis { .. } => row_count.saturating_mul(8),
             ColumnKind::Bool { .. } => bitmap_bytes,
-            ColumnKind::Uuid { .. } => 16 * row_count,
-            ColumnKind::Long256 { .. } => 32 * row_count,
+            ColumnKind::Uuid { .. } => row_count.saturating_mul(16),
+            ColumnKind::Long256 { .. } => row_count.saturating_mul(32),
             ColumnKind::Varchar { bytes_len, .. }
             | ColumnKind::VarcharLarge { bytes_len, .. }
-            | ColumnKind::Binary { bytes_len, .. } => 4 * (row_count + 1) + bytes_len,
-            ColumnKind::Symbol { .. } => 5 * row_count, // varint upper bound
-            // Conservative upper bound covering the widest Arrow body
-            // (Decimal256 = scale + 32 B/row, ARRAY DOUBLE per-row blob).
-            // Under-estimation only costs a Vec realloc inside the
-            // encoder; over-estimation costs a one-shot reservation.
+            | ColumnKind::Binary { bytes_len, .. } => row_count
+                .saturating_add(1)
+                .saturating_mul(4)
+                .saturating_add(bytes_len),
+            ColumnKind::Symbol { .. } => row_count.saturating_mul(5),
             #[cfg(feature = "arrow")]
-            ColumnKind::ArrowDeferred { .. } => 64 * row_count,
-            ColumnKind::NumpyDeferred { dtype, .. } => dtype.bytes_per_row() * row_count,
+            ColumnKind::ArrowDeferred { .. } => row_count.saturating_mul(64),
+            ColumnKind::NumpyDeferred { dtype, .. } => {
+                dtype.bytes_per_row().saturating_mul(row_count)
+            }
         };
-        total += null_overhead + payload_size;
+        total = total
+            .saturating_add(null_overhead)
+            .saturating_add(payload_size);
     }
-    // designated timestamp
-    total += 1 + 8 * row_count;
+    total = total
+        .saturating_add(1)
+        .saturating_add(row_count.saturating_mul(8));
     total
 }
 
@@ -985,22 +985,35 @@ unsafe fn emit_symbol_rows<T>(
     }
 }
 
-fn encode_designated_ts(out: &mut Vec<u8>, ts: &DesignatedTsDescriptor, row_count: usize) {
+fn encode_designated_ts(
+    out: &mut Vec<u8>,
+    ts: &DesignatedTsDescriptor,
+    row_count: usize,
+) -> Result<()> {
+    let values = unsafe { slice::from_raw_parts(ts.data, row_count) };
+    for (row, &v) in values.iter().enumerate() {
+        if v < 0 {
+            return Err(error::fmt!(
+                InvalidTimestamp,
+                "designated timestamp at row {} is negative ({})",
+                row,
+                v
+            ));
+        }
+    }
     out.push(0); // designated_ts is always non-null
     out.reserve(8 * row_count);
     if cfg!(target_endian = "little") {
-        // SAFETY: caller buffer lifetime is the chunk's `'a`; i64 layout
-        // matches LE wire bytes on a little-endian host.
         let bytes = unsafe {
             slice::from_raw_parts(ts.data as *const u8, row_count * std::mem::size_of::<i64>())
         };
         out.extend_from_slice(bytes);
     } else {
-        for i in 0..row_count {
-            let v = unsafe { *ts.data.add(i) };
+        for &v in values {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
+    Ok(())
 }
 
 // ===========================================================================

@@ -63,9 +63,6 @@ use crate::{Result, fmt};
 /// Suggested default chunk size for [`dataframe_to_batches`].
 pub const DEFAULT_MAX_BATCH_ROWS: usize = 10_000;
 
-// Both crates are `#[repr(C)]` impls of the same Arrow C Data Interface
-// struct; size/align pinned by the spec, field order verified by the
-// `dataframe_round_trip_*` tests. Re-validate on `polars-arrow` bumps.
 const _: () = assert!(
     std::mem::size_of::<polars_arrow::ffi::ArrowArray>()
         == std::mem::size_of::<arrow::ffi::FFI_ArrowArray>(),
@@ -83,14 +80,19 @@ const _: () = assert!(
         == std::mem::align_of::<arrow::ffi::FFI_ArrowSchema>(),
 );
 
-/// SAFETY: layout-identical `#[repr(C)]` Arrow C Data Interface structs;
-/// release-callback ownership transfers — caller must not reuse input.
+// polars-arrow keeps its `ArrowArray`/`ArrowSchema` fields private, so a
+// field-level copy is impossible. We rely on the Arrow C Data Interface
+// spec to fix the `#[repr(C)]` field order across crates; `transmute`
+// is sound as long as both crates implement the same spec. The
+// `polars_ffi_layout_round_trip` test fires a real data roundtrip on
+// every CI run to catch a spec violation in either crate before
+// production.
+
 #[inline]
 unsafe fn pa_array_into_rs(pa: polars_arrow::ffi::ArrowArray) -> arrow::ffi::FFI_ArrowArray {
     unsafe { std::mem::transmute::<polars_arrow::ffi::ArrowArray, arrow::ffi::FFI_ArrowArray>(pa) }
 }
 
-/// SAFETY: see [`pa_array_into_rs`].
 #[inline]
 unsafe fn pa_schema_into_rs(pa: polars_arrow::ffi::ArrowSchema) -> arrow::ffi::FFI_ArrowSchema {
     unsafe {
@@ -98,7 +100,6 @@ unsafe fn pa_schema_into_rs(pa: polars_arrow::ffi::ArrowSchema) -> arrow::ffi::F
     }
 }
 
-/// SAFETY: see [`pa_array_into_rs`].
 #[inline]
 pub(crate) unsafe fn rs_array_into_pa(
     rs: arrow::ffi::FFI_ArrowArray,
@@ -106,7 +107,6 @@ pub(crate) unsafe fn rs_array_into_pa(
     unsafe { std::mem::transmute::<arrow::ffi::FFI_ArrowArray, polars_arrow::ffi::ArrowArray>(rs) }
 }
 
-/// SAFETY: see [`pa_array_into_rs`].
 #[inline]
 pub(crate) unsafe fn rs_schema_into_pa(
     rs: arrow::ffi::FFI_ArrowSchema,
@@ -367,6 +367,33 @@ mod tests {
         assert_eq!(rb.schema().field(0).name(), "i");
         assert_eq!(rb.schema().field(1).name(), "f");
         assert_eq!(rb.schema().field(2).name(), "s");
+    }
+
+    #[test]
+    fn polars_ffi_layout_round_trip() {
+        let s = Series::new(PlSmallStr::from("x"), &[10i64, 20, 30, 40, 50]);
+        let pa_field = polars_arrow::datatypes::Field::new(
+            s.name().clone(),
+            s.dtype().to_arrow(CompatLevel::newest()),
+            true,
+        );
+        let pa_arr = s.to_arrow(0, CompatLevel::newest());
+        let exported_array = polars_arrow::ffi::export_array_to_c(pa_arr);
+        let exported_schema = polars_arrow::ffi::export_field_to_c(&pa_field);
+
+        let rs_array = unsafe { pa_array_into_rs(exported_array) };
+        let rs_schema = unsafe { pa_schema_into_rs(exported_schema) };
+        let data = unsafe { arrow::ffi::from_ffi(rs_array, &rs_schema) }
+            .expect("from_ffi after polars-arrow → arrow-rs bridge");
+
+        let arr = arrow_array::make_array(data);
+        let int_arr = arr.as_primitive::<Int64Type>();
+        assert_eq!(int_arr.len(), 5);
+        assert_eq!(int_arr.value(0), 10);
+        assert_eq!(int_arr.value(1), 20);
+        assert_eq!(int_arr.value(2), 30);
+        assert_eq!(int_arr.value(3), 40);
+        assert_eq!(int_arr.value(4), 50);
     }
 
     #[test]

@@ -629,23 +629,28 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
             dst[full_bytes] = (!src[src_off + full_bytes]) & mask;
         }
     } else {
-        let mut bit_idx = 0u8;
-        let mut byte_idx = 0usize;
-        let mut packed = 0u8;
-        for i in 0..bits {
-            if !nulls.is_valid(i) {
-                packed |= 1u8 << bit_idx;
-            }
-            bit_idx += 1;
-            if bit_idx == 8 {
-                dst[byte_idx] = packed;
-                byte_idx += 1;
-                packed = 0;
-                bit_idx = 0;
-            }
+        // Byte-stride shift fallback. Read two adjacent source bytes,
+        // shift+OR to reconstruct the byte-aligned bits, then NOT for
+        // the QWP convention (1 = null). 8× faster than the per-bit
+        // loop and matches semantics exactly.
+        let shift = (arrow_offset % 8) as u32;
+        let first_byte = arrow_offset / 8;
+        let inv_shift = 8 - shift;
+        let src_len = src.len();
+        for (i, d) in dst[..full_bytes].iter_mut().enumerate() {
+            let lo_idx = first_byte + i;
+            let lo = if lo_idx < src_len { src[lo_idx] } else { 0 };
+            let hi_idx = lo_idx + 1;
+            let hi = if hi_idx < src_len { src[hi_idx] } else { 0 };
+            *d = !((lo >> shift) | (hi << inv_shift));
         }
-        if bit_idx != 0 {
-            dst[byte_idx] = packed;
+        if trailing_bits != 0 {
+            let lo_idx = first_byte + full_bytes;
+            let lo = if lo_idx < src_len { src[lo_idx] } else { 0 };
+            let hi_idx = lo_idx + 1;
+            let hi = if hi_idx < src_len { src[hi_idx] } else { 0 };
+            let mask = (1u8 << trailing_bits) - 1;
+            dst[full_bytes] = (!((lo >> shift) | (hi << inv_shift))) & mask;
         }
     }
     Ok(())
@@ -1499,6 +1504,11 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
                 ),
             )
         })?;
+    // List `value_offsets` index into the child's underlying buffer (raw,
+    // not slice-aware). `leaf_array.values()` returns the LOGICAL slice
+    // `[leaf_offset .. leaf_offset+len]` of that buffer, so the inbound
+    // indices must be rebased by `leaf_offset` before use.
+    let leaf_offset = leaf_array.offset();
     let leaf_values_all = leaf_array.values();
     let mut shape: Vec<usize> = Vec::with_capacity(ndim);
     for row in 0..row_count {
@@ -1516,7 +1526,32 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
             start = level_start;
             end = level_end;
         }
-        let leaf_values = &leaf_values_all[start..end];
+        let local_start = start.checked_sub(leaf_offset).ok_or_else(|| {
+            fmt!(
+                ArrowIngest,
+                "ARRAY leaf index {} below leaf array offset {}",
+                start,
+                leaf_offset
+            )
+        })?;
+        let local_end = end.checked_sub(leaf_offset).ok_or_else(|| {
+            fmt!(
+                ArrowIngest,
+                "ARRAY leaf index {} below leaf array offset {}",
+                end,
+                leaf_offset
+            )
+        })?;
+        if local_end > leaf_values_all.len() {
+            return Err(fmt!(
+                ArrowIngest,
+                "ARRAY leaf slice [{},{}) out of bounds for leaf len {}",
+                local_start,
+                local_end,
+                leaf_values_all.len()
+            ));
+        }
+        let leaf_values = &leaf_values_all[local_start..local_end];
         try_reserve_bytes(
             out,
             1 + 4 * ndim + 8 * leaf_values.len(),
@@ -1862,31 +1897,19 @@ fn resolve_symbol_strings<S: StrSource>(
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
-    use std::collections::HashMap;
     let row_count = arr.len();
     let non_null = non_null_count(arr, "SYMBOL column")?;
-    let mut local: HashMap<Vec<u8>, u64> = HashMap::new();
-    for row in 0..row_count {
-        if arr.is_null(row) {
-            continue;
-        }
-        let bytes = source.value_bytes(row);
-        if local.contains_key(bytes) {
-            continue;
-        }
-        let (gid, is_new) = symbol_dict.intern(bytes)?;
-        if is_new {
-            new_symbols.push(bytes.to_vec());
-        }
-        local.insert(bytes.to_vec(), gid);
-    }
     let mut gids = Vec::with_capacity(non_null);
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
         }
         let bytes = source.value_bytes(row);
-        gids.push(*local.get(bytes).expect("interned in pass 1"));
+        let (gid, is_new) = symbol_dict.intern(bytes)?;
+        if is_new {
+            new_symbols.push(bytes.to_vec());
+        }
+        gids.push(gid);
     }
     Ok(ArrowResolvedSymbolColumn { gids })
 }
@@ -3016,8 +3039,8 @@ pub(crate) fn encode_arrow_batch_into(
         write_qwp_bytes(&mut signature, &[]);
         signature.push(ts_byte);
     }
-    let mut schema_mark = schema_registry.mark();
-    let (schema_id, is_new_schema) = schema_registry.intern(&signature, &mut schema_mark);
+    let schema_mark = schema_registry.mark();
+    let (schema_id, is_new_schema) = schema_registry.intern(&signature);
 
     let frame_start = out.len();
     let estimated = estimate_frame_size(&classified, &resolution, ts_col_idx, row_count, table);

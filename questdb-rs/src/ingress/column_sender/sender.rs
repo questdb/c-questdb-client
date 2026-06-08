@@ -237,12 +237,14 @@ impl ColumnSender {
         let dict = &mut self.symbol_dict;
         let scratch = &mut self.scratch;
         let dict_mark = dict.mark();
+        let schema_mark = schema.mark();
         let published = match self.conn.publish_qwp(|out| {
             encoder::encode_chunk_into(out, chunk, schema, dict, scratch, defer_commit)
         }) {
             Ok(p) => p,
             Err(e) => {
                 if e.code() != ErrorCode::SocketError {
+                    schema.rollback(schema_mark);
                     dict.rollback(dict_mark);
                 }
                 return Err(e);
@@ -278,6 +280,7 @@ impl ColumnSender {
         }
 
         let dict_mark = self.symbol_dict.mark();
+        let schema_mark = self.schema_registry.mark();
         let schema = &mut self.schema_registry;
         let dict = &mut self.symbol_dict;
         let result = self.conn.publish_qwp(|out| {
@@ -296,6 +299,7 @@ impl ColumnSender {
             Ok(p) => p,
             Err(err) => {
                 if err.code() != ErrorCode::SocketError {
+                    self.schema_registry.rollback(schema_mark);
                     self.symbol_dict.rollback(dict_mark);
                 }
                 return Err(err);

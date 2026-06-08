@@ -49,64 +49,70 @@ class line_sender;
 class line_sender_buffer;
 class opts;
 
-/** Category of error. */
+/** Category of error.
+ *
+ *  Discriminants are pinned to match the C ABI (see
+ *  `include/questdb/ingress/line_sender.h` and the Rust enum
+ *  `line_sender_error_code` in `questdb-rs-ffi`). Append-only: new
+ *  variants go at the tail.
+ */
 enum class line_sender_error_code
 {
     /** The host, port, or interface was incorrect. */
-    could_not_resolve_addr,
+    could_not_resolve_addr = 0,
 
     /** Called methods in the wrong order. E.g. `symbol` after `column`. */
-    invalid_api_call,
+    invalid_api_call = 1,
 
     /** A network error connecting or flushing data out. */
-    socket_error,
+    socket_error = 2,
 
     /** The string or symbol field is not encoded in valid UTF-8. */
-    invalid_utf8,
+    invalid_utf8 = 3,
 
     /** The table name or column name contains bad characters. */
-    invalid_name,
+    invalid_name = 4,
 
     /** The supplied timestamp is invalid. */
-    invalid_timestamp,
+    invalid_timestamp = 5,
 
     /** Error during the authentication process. */
-    auth_error,
+    auth_error = 6,
 
     /** Error during TLS handshake. */
-    tls_error,
+    tls_error = 7,
 
     /** The server does not support ILP over HTTP. */
-    http_not_supported,
+    http_not_supported = 8,
 
     /** Error sent back from the server during flush. */
-    server_flush_error,
+    server_flush_error = 9,
 
     /** Bad configuration. */
-    config_error,
+    config_error = 10,
 
     /** There was an error serializing an array. */
-    array_error,
+    array_error = 11,
 
     /**  Line sender protocol version error. */
-    protocol_version_error,
+    protocol_version_error = 12,
 
     /** The supplied decimal is invalid. */
-    invalid_decimal,
+    invalid_decimal = 13,
 
     /** QWP/WebSocket server rejection or terminal protocol violation. */
-    server_rejection,
+    server_rejection = 14,
 
     /** `column_sender_conn::flush_arrow_batch` was passed a column whose
      *  Arrow type / metadata combination has no QuestDB ingress mapping.
      *  Only raised with the `arrow` feature enabled. */
-    arrow_unsupported_column_kind,
+    arrow_unsupported_column_kind = 15,
 
     /** `column_sender_conn::flush_arrow_batch` rejected a `RecordBatch` at
      *  the contract layer (invalid format, structural error against the
      *  Arrow C Data Interface). Only raised with the `arrow` feature
      *  enabled. */
-    arrow_ingest,
+    arrow_ingest = 16,
 };
 
 /** The protocol used to connect with. */

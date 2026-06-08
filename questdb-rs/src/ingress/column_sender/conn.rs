@@ -374,7 +374,18 @@ impl ColumnConn {
                         self.pending_acks.front().map(|p| p.fsn)
                     )));
                 }
-                self.in_flight -= popped;
+                // Invariant: `pending_acks.len() + popped == in_flight_before`.
+                // A future refactor that desynchronises the two would
+                // otherwise silently wrap in release builds.
+                self.in_flight = self.in_flight.checked_sub(popped).ok_or_else(|| {
+                    self.must_close = true;
+                    error::fmt!(
+                        SocketError,
+                        "QWP in-flight accounting underflow: {} acked, {} tracked",
+                        popped,
+                        self.in_flight
+                    )
+                })?;
                 for (t, seq_txn) in tables {
                     self.pending_durable_targets
                         .entry(t)
@@ -474,6 +485,13 @@ impl ColumnConn {
                     // Consume header + payload from leftover.
                     self.leftover.drain(..header_len);
                     self.read_buf.clear();
+                    if self.read_buf.try_reserve(payload_len).is_err() {
+                        return Err(self.latch(error::fmt!(
+                            SocketError,
+                            "could not allocate {} bytes for inbound QWP frame",
+                            payload_len
+                        )));
+                    }
                     self.read_buf
                         .extend_from_slice(&self.leftover[..payload_len]);
                     self.leftover.drain(..payload_len);
@@ -537,6 +555,13 @@ impl ColumnConn {
                 )));
             }
             self.read_buf.clear();
+            if self.read_buf.try_reserve(payload_len).is_err() {
+                return Err(self.latch(error::fmt!(
+                    SocketError,
+                    "could not allocate {} bytes for inbound QWP frame",
+                    payload_len
+                )));
+            }
             self.read_buf.resize(payload_len, 0);
             self.read_exact_into_buf(payload_len)?;
             match header.opcode {

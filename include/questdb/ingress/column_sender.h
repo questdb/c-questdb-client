@@ -231,16 +231,26 @@ void column_sender_chunk_free(column_sender_chunk* chunk);
 /**
  * Clear the chunk's content, keeping retained capacity for reuse.
  *
- * Returns true on success, false if `chunk` is NULL or another FFI
- * call is currently mutating the chunk (concurrent use is a contract
- * violation; the false return surfaces it instead of silently dropping).
+ * Returns true on success. Returns false and sets `*err_out` if `chunk`
+ * is NULL, has already been freed, or another FFI call is currently
+ * mutating the chunk. A NULL `err_out` is silently ignored.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_clear(column_sender_chunk* chunk);
+bool column_sender_chunk_clear(
+    column_sender_chunk* chunk,
+    line_sender_error** err_out);
 
-/** Current row count of the chunk; 0 if no column has been appended. */
+/**
+ * Current row count of the chunk; 0 if no column has been appended.
+ *
+ * Returns `(size_t)-1` and sets `*err_out` if `chunk` is NULL, has been
+ * freed, or another FFI call is in flight. A NULL `err_out` is silently
+ * ignored.
+ */
 QUESTDB_CLIENT_API
-size_t column_sender_chunk_row_count(const column_sender_chunk* chunk);
+size_t column_sender_chunk_row_count(
+    const column_sender_chunk* chunk,
+    line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
  * Numeric / fixed-width column appends

@@ -123,17 +123,29 @@ public:
     ::column_sender_chunk* c_ptr() noexcept { return _raw; }
     const ::column_sender_chunk* c_ptr() const noexcept { return _raw; }
 
-    /** Row count locked by the first appended column / designated ts. */
-    size_t row_count() const noexcept
+    /**
+     * Row count locked by the first appended column / designated ts.
+     * Throws `line_sender_error` if the underlying handle is NULL,
+     * freed, or held by a concurrent FFI call.
+     */
+    size_t row_count() const
     {
-        return ::column_sender_chunk_row_count(_raw);
+        ::line_sender_error* c_err{nullptr};
+        size_t r = ::column_sender_chunk_row_count(_raw, &c_err);
+        if (r == static_cast<size_t>(-1))
+            throw line_sender_error::from_c(c_err);
+        return r;
     }
 
     /**
-     * Reset the chunk; retains descriptor-vec capacity. Returns true on
-     * success, false if a concurrent FFI call held the in-use latch.
+     * Reset the chunk; retains descriptor-vec capacity. Throws
+     * `line_sender_error` if the underlying handle is NULL, freed, or
+     * held by a concurrent FFI call.
      */
-    bool clear() noexcept { return ::column_sender_chunk_clear(_raw); }
+    void clear()
+    {
+        line_sender_error::wrapped_call(::column_sender_chunk_clear, _raw);
+    }
 
     // -- Fixed-width column appenders ---------------------------------
 

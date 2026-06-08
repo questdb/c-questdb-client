@@ -582,9 +582,16 @@ impl DerefMut for BorrowedSender<'_> {
 
 impl Drop for BorrowedSender<'_> {
     fn drop(&mut self) {
-        let Some(sender) = self.sender.take() else {
+        let Some(mut sender) = self.sender.take() else {
             return;
         };
+        // A drop with un-sync'd deferred frames would let the next
+        // borrower's first flush commit the previous borrower's data
+        // attributed to whatever table the new borrower targets.
+        // Latch must_close so the connection is discarded instead.
+        if sender.conn.in_flight() > 0 {
+            sender.mark_must_close();
+        }
         return_to_pool(&self.db.inner, sender);
     }
 }
@@ -620,7 +627,10 @@ impl OwnedSender {
 
 impl Drop for OwnedSender {
     fn drop(&mut self) {
-        if let Some(sender) = self.sender.take() {
+        if let Some(mut sender) = self.sender.take() {
+            if sender.conn.in_flight() > 0 {
+                sender.mark_must_close();
+            }
             return_to_pool(&self.inner, sender);
         }
     }
@@ -700,6 +710,18 @@ impl ReaderPoolHandle {
     /// the [`OwnedReader::mark_must_close`] semantics.
     pub fn return_reader(&self, reader: Reader, must_close: bool) {
         return_reader_to_pool(&self.inner, reader, must_close);
+    }
+
+    /// Release the `in_use` slot that was reserved when this reader
+    /// was borrowed, without returning the `Reader` itself. Used by
+    /// the FFI leak-on-active path: when a `line_reader_close` arrives
+    /// with a cursor still live, the underlying `Reader` cannot be
+    /// extracted (UnsafeCell aliasing with the in-flight `&mut Reader`),
+    /// so it leaks — but the pool's borrow accounting must still drop
+    /// the slot or `pool_max` is permanently burned.
+    pub fn release_leaked_slot(&self) {
+        let mut state = lock_reader_state(&self.inner.reader_state);
+        state.in_use = state.in_use.saturating_sub(1);
     }
 }
 

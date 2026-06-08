@@ -707,23 +707,24 @@ pub unsafe extern "C" fn line_reader_close(reader: *mut line_reader) {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            // A query or cursor is still live (or a concurrent _query_new
-            // raced us); freeing the reader would leave a dangling
-            // `&mut Reader` inside it. Leak the reader (and its socket)
-            // rather than risk use-after-free.
-            // Project to the stats Arc via `addr_of!` so we don't form
-            // a `&line_reader` reborrow that would alias the in-flight
-            // `&mut Reader` held by the live query/cursor (same pattern
-            // as the stat getters below).
             let stats_ptr = std::ptr::addr_of!((*reader).stats);
             let bytes_in_flight = (&*stats_ptr).bytes_received.load(Ordering::Relaxed);
+            // Release the pool slot before leaking the box so the pool's
+            // `pool_max` budget isn't permanently burned by misuse.
+            // The Reader stays inside the leaked box (cursor still holds
+            // a `&mut Reader`); only the bookkeeping slot is freed.
+            let ownership_ptr = std::ptr::addr_of!((*reader).ownership);
+            if let ReaderOwnership::Pooled { handle, .. } = &*ownership_ptr {
+                handle.release_leaked_slot();
+            }
             eprintln!(
                 "line_reader_close: a query or cursor is still live on this \
                  reader. The reader has been LEAKED (TCP socket + TLS session + \
                  ~{bytes_in_flight} bytes of in-flight buffers + up to the \
-                 symbol-dict heap cap) to avoid use-after-free. Close the \
-                 cursor / free the query before closing the reader. This is \
-                 a contract violation — see the line_reader_close docstring."
+                 symbol-dict heap cap) to avoid use-after-free. The pool slot \
+                 has been released. Close the cursor / free the query before \
+                 closing the reader. This is a contract violation — see the \
+                 line_reader_close docstring."
             );
             return;
         }

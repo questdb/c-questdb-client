@@ -624,7 +624,9 @@ pub struct ArrowSchema {
 // Chunk lifecycle
 // ===========================================================================
 
-/// Create an empty chunk for `table_name` (validated UTF-8, ≤ 127 bytes).
+/// Create an empty chunk for `table_name` (validated UTF-8, ≤ 127 bytes,
+/// no control characters or reserved punctuation). Invalid names are
+/// rejected eagerly with `InvalidName` rather than at first flush.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_new(
     table_name: *const c_char,
@@ -635,6 +637,22 @@ pub unsafe extern "C" fn column_sender_chunk_new(
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
+    if let Err(e) = questdb::ingress::TableName::new(table) {
+        unsafe { set_err_out_from_error(err_out, e) };
+        return std::ptr::null_mut();
+    }
+    if table.len() > 127 {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidName,
+                    format!("table name is too long: {} bytes (max 127)", table.len()),
+                ),
+            );
+        }
+        return std::ptr::null_mut();
+    }
     Box::into_raw(Box::new(column_sender_chunk(
         Chunk::new(table),
         AtomicU32::new(0),
@@ -656,26 +674,36 @@ pub unsafe extern "C" fn column_sender_chunk_free(chunk: *mut column_sender_chun
 ///
 /// Returns `true` on success, `false` if `chunk` is NULL, has already
 /// been freed, or another FFI call is currently mutating the chunk.
+/// On `false`, `*err_out` carries the reason (NULL `err_out` is silently
+/// ignored).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_clear(chunk: *mut column_sender_chunk) -> bool {
+pub unsafe extern "C" fn column_sender_chunk_clear(
+    chunk: *mut column_sender_chunk,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     if chunk.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "column_sender_chunk_clear: chunk is NULL".to_string(),
+                ),
+            );
+        }
         return false;
     }
     let state: *const AtomicU32 = unsafe { &raw const (*chunk).1 };
-    let mut err_box: *mut line_sender_error = std::ptr::null_mut();
     let guard = unsafe {
         InUseGuard::acquire(
             chunk,
             state,
             "column_sender_chunk_clear",
             "column_sender_chunk",
-            &mut err_box,
+            err_out,
         )
     };
     if guard.is_none() {
-        if !err_box.is_null() {
-            unsafe { crate::line_sender_error_free(err_box) };
-        }
         return false;
     }
     unsafe { (*chunk).0.clear() };
@@ -683,31 +711,39 @@ pub unsafe extern "C" fn column_sender_chunk_clear(chunk: *mut column_sender_chu
     true
 }
 
-/// Current row count of the chunk; 0 if `chunk` is NULL, has been freed,
-/// or another FFI call on the same handle is currently in flight.
+/// Current row count of the chunk. Returns `(size_t)-1` (a.k.a.
+/// `SIZE_MAX`) on failure (`chunk` is NULL, has been freed, or another
+/// FFI call on the same handle is currently in flight) and sets
+/// `*err_out`. A NULL `err_out` is silently ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_row_count(
     chunk: *const column_sender_chunk,
+    err_out: *mut *mut line_sender_error,
 ) -> size_t {
     if chunk.is_null() {
-        return 0;
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "column_sender_chunk_row_count: chunk is NULL".to_string(),
+                ),
+            );
+        }
+        return usize::MAX;
     }
     let state: *const AtomicU32 = unsafe { &raw const (*chunk).1 };
-    let mut err_box: *mut line_sender_error = std::ptr::null_mut();
     let guard = unsafe {
         InUseGuard::acquire(
             chunk as *mut column_sender_chunk,
             state,
             "column_sender_chunk_row_count",
             "column_sender_chunk",
-            &mut err_box,
+            err_out,
         )
     };
     if guard.is_none() {
-        if !err_box.is_null() {
-            unsafe { crate::line_sender_error_free(err_box) };
-        }
-        return 0;
+        return usize::MAX;
     }
     let result = unsafe { (*chunk).0.row_count() };
     drop(guard);
@@ -2455,18 +2491,36 @@ mod tests {
     }
 
     #[test]
-    fn chunk_new_validates_table_name() {
+    fn chunk_new_validates_table_name_length() {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        // 128-byte name: exceeds the 127-byte QWP cap, but the public
-        // `Chunk::new` does not validate eagerly — validation happens at
-        // flush time. So this constructor succeeds.
         let table = "x".repeat(128);
         let chunk = unsafe {
             column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
         };
-        assert!(!chunk.is_null());
-        assert!(err.is_null());
-        unsafe { column_sender_chunk_free(chunk) };
+        assert!(chunk.is_null());
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn chunk_new_validates_table_name_grammar() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let table = "bad?name";
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(chunk.is_null());
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn chunk_new_validates_empty_table_name() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe { column_sender_chunk_new(std::ptr::null(), 0, &mut err) };
+        assert!(chunk.is_null());
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
     }
 
     #[test]
@@ -2503,7 +2557,10 @@ mod tests {
             )
         };
         assert!(ok, "column_i64 should succeed");
-        assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, 3);
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            3
+        );
         unsafe { column_sender_chunk_free(chunk) };
     }
 
@@ -2660,7 +2717,10 @@ mod tests {
         };
         assert!(ok, "LargeUtf8 dictionary values should be accepted");
         assert!(err.is_null());
-        assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, codes.len());
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            codes.len()
+        );
         unsafe { column_sender_chunk_free(chunk) };
     }
 
@@ -2724,9 +2784,12 @@ mod tests {
             )
         };
         assert!(ok);
-        assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, 2);
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            2
+        );
 
-        unsafe { column_sender_chunk_clear(chunk) };
+        unsafe { column_sender_chunk_clear(chunk, std::ptr::null_mut()) };
         let ok = unsafe {
             column_sender_chunk_append_arrow_import(
                 chunk,
@@ -2739,7 +2802,10 @@ mod tests {
             )
         };
         assert!(ok);
-        assert_eq!(unsafe { column_sender_chunk_row_count(chunk) }, 2);
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            2
+        );
 
         unsafe {
             column_sender_arrow_import_free(imported);

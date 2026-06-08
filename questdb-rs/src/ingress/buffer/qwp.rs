@@ -2250,7 +2250,7 @@ struct QwpWsMarker {
 
 #[cfg(feature = "_sender-qwp-ws")]
 type QwpWsSymbolHashMap<V> =
-    std::collections::HashMap<Vec<u8>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
+    std::collections::HashMap<std::sync::Arc<[u8]>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
 
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_WS_SYMBOL_HASH_OFFSET: u64 = 0xcbf29ce484222325;
@@ -5077,7 +5077,7 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 #[derive(Debug, Default)]
 pub(crate) struct SymbolGlobalDict {
     map: QwpWsSymbolHashMap<u64>,
-    entries: Vec<Vec<u8>>,
+    entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
 }
 
@@ -5128,7 +5128,7 @@ impl SymbolGlobalDict {
     pub(crate) fn rollback(&mut self, mark: SymbolGlobalDictMark) {
         while self.entries.len() > mark.entries_len {
             if let Some(entry) = self.entries.pop() {
-                self.map.remove(entry.as_slice());
+                self.map.remove(entry.as_ref());
             }
         }
         self.next_id = mark.next_id;
@@ -5136,7 +5136,7 @@ impl SymbolGlobalDict {
 
     pub(crate) fn entry(&self, id: u64) -> Option<&[u8]> {
         let index = usize::try_from(id).ok()?;
-        self.entries.get(index).map(Vec::as_slice)
+        self.entries.get(index).map(|a| a.as_ref())
     }
 
     /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if
@@ -5153,17 +5153,16 @@ impl SymbolGlobalDict {
                  the connection to reset the dictionary"
             ));
         }
-        let owned_for_entries = bytes.to_vec();
-        let owned_for_map = bytes.to_vec();
         self.entries
             .try_reserve(1)
             .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
         self.map
             .try_reserve(1)
             .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
+        let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
         let id = self.next_id;
-        self.entries.push(owned_for_entries);
-        self.map.insert(owned_for_map, id);
+        self.entries.push(std::sync::Arc::clone(&owned));
+        self.map.insert(owned, id);
         self.next_id += 1;
         Ok((id, true))
     }

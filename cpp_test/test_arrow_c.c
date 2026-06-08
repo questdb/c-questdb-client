@@ -281,7 +281,7 @@ TEST(test_chunk_append_arrow_column_valid_i64_smoke)
     CHECK(err == NULL, "no err on success");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk) == 1, "row_count == 1");
+    CHECK(column_sender_chunk_row_count(chunk, NULL) == 1, "row_count == 1");
     column_sender_chunk_free(chunk);
 }
 
@@ -366,7 +366,7 @@ TEST(test_chunk_append_numpy_column_i64_smoke)
         line_sender_error_free(err);
         err = NULL;
     }
-    CHECK(column_sender_chunk_row_count(chunk) == 3, "row_count == 3");
+    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
     column_sender_chunk_free(chunk);
 }
 
@@ -391,7 +391,7 @@ TEST(test_chunk_append_numpy_column_f64_smoke)
     CHECK(ok, "f64 append → true");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk) == 3, "row_count == 3");
+    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
     column_sender_chunk_free(chunk);
 }
 
@@ -408,7 +408,7 @@ TEST(test_chunk_append_numpy_column_bool_smoke)
     CHECK(ok, "bool append → true");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk) == 3, "row_count == 3");
+    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
     column_sender_chunk_free(chunk);
 }
 
@@ -738,7 +738,7 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_smoke)
     CHECK(ok, "ndarray 1-D shape {3} × 2 rows → true");
     if (err)
         line_sender_error_free(err);
-    CHECK(column_sender_chunk_row_count(chunk) == 2, "row_count == 2");
+    CHECK(column_sender_chunk_row_count(chunk, NULL) == 2, "row_count == 2");
     column_sender_chunk_free(chunk);
 }
 

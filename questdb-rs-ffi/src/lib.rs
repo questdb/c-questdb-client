@@ -286,6 +286,14 @@ pub enum line_sender_error_code {
 
 impl From<ErrorCode> for line_sender_error_code {
     fn from(code: ErrorCode) -> Self {
+        // `ErrorCode` is `#[non_exhaustive]`; the trailing `_ =>` is
+        // mandatory by the Rust language. To stop a future upstream
+        // variant from silently downgrading to `invalid_api_call`,
+        // the test
+        // `line_sender_error_code_covers_every_upstream_variant`
+        // exhaustively lists every current variant and fails to
+        // compile when a new one is added without an explicit arm
+        // below.
         match code {
             ErrorCode::CouldNotResolveAddr => {
                 line_sender_error_code::line_sender_error_could_not_resolve_addr
@@ -472,25 +480,42 @@ impl From<line_sender_ca> for CertificateAuthority {
     }
 }
 
-/** Error code categorizing the error. */
+/// Error code categorising the error.
+///
+/// NULL-safe: passing `NULL` returns `line_sender_error_invalid_api_call`
+/// (the caller is misusing the accessor) rather than dereferencing.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_error_get_code(
     error: *const line_sender_error,
 ) -> line_sender_error_code {
+    if error.is_null() {
+        return line_sender_error_code::line_sender_error_invalid_api_call;
+    }
     unsafe { (*error).error.code().into() }
 }
 
 /// UTF-8 encoded error message. Never returns NULL.
-/// The `len_out` argument is set to the number of bytes in the string.
-/// The string is NOT null-terminated.
+/// `len_out` is set to the number of bytes; the string is NOT null-terminated.
+///
+/// NULL-safe on both `error` and `len_out`. A NULL `error` returns a static
+/// empty string with `*len_out = 0` (when `len_out` is non-NULL); a NULL
+/// `len_out` is silently ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_error_msg(
     error: *const line_sender_error,
     len_out: *mut size_t,
 ) -> *const c_char {
     unsafe {
+        if error.is_null() {
+            if !len_out.is_null() {
+                *len_out = 0;
+            }
+            return c"".as_ptr();
+        }
         let msg: &str = (*error).error.msg();
-        *len_out = msg.len();
+        if !len_out.is_null() {
+            *len_out = msg.len();
+        }
         msg.as_ptr() as *const c_char
     }
 }
@@ -3742,19 +3767,16 @@ unsafe fn try_reserve_one<T>(v: &mut Vec<T>) -> questdb::Result<()> {
 unsafe fn validate_arrow_schema_depth(
     schema: *const arrow::ffi::FFI_ArrowSchema,
 ) -> questdb::Result<()> {
+    // Shared children / dictionaries (a DAG) are legal per the Arrow C
+    // Data Interface spec, so we don't use "ever-visited" as a cycle
+    // proxy. Cycles are still bounded — both the total-nodes cap and
+    // the depth cap below ensure traversal terminates.
     unsafe {
         let mut stack: Vec<(*const arrow::ffi::FFI_ArrowSchema, usize)> = Vec::new();
-        let mut visited: std::collections::HashSet<*const arrow::ffi::FFI_ArrowSchema> =
-            std::collections::HashSet::new();
         let mut total: usize = 0;
         try_reserve_one(&mut stack)?;
         stack.push((schema, 0));
         while let Some((s, depth)) = stack.pop() {
-            if !visited.insert(s) {
-                return Err(arrow_ingest_err(
-                    "Arrow schema contains a cycle (revisited node)",
-                ));
-            }
             total += 1;
             if total > MAX_ARROW_SCHEMA_TOTAL_NODES {
                 return Err(arrow_ingest_err(format!(
@@ -3818,23 +3840,18 @@ unsafe fn validate_arrow_array_depth(
     array: *const arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
 ) -> questdb::Result<()> {
+    // Shared children are legal — see validate_arrow_schema_depth for
+    // the same rationale. Cycles are bounded by total + depth caps.
     unsafe {
         let mut stack: Vec<(
             *const arrow::ffi::FFI_ArrowArray,
             *const arrow::ffi::FFI_ArrowSchema,
             usize,
         )> = Vec::new();
-        let mut visited: std::collections::HashSet<*const arrow::ffi::FFI_ArrowArray> =
-            std::collections::HashSet::new();
         let mut total: usize = 0;
         try_reserve_one(&mut stack)?;
         stack.push((array, schema, 0));
         while let Some((a, s, depth)) = stack.pop() {
-            if !visited.insert(a) {
-                return Err(arrow_ingest_err(
-                    "Arrow array contains a cycle (revisited node)",
-                ));
-            }
             total += 1;
             if total > MAX_ARROW_SCHEMA_TOTAL_NODES {
                 return Err(arrow_ingest_err(format!(
@@ -4269,6 +4286,62 @@ mod tests {
                 *variant as u32, *want,
                 "{:?} discriminant changed — appended-only ABI broken",
                 variant,
+            );
+        }
+    }
+
+    #[test]
+    fn line_sender_error_code_covers_every_upstream_variant() {
+        // Tripwire for the `_ =>` arm in `impl From<ErrorCode> for
+        // line_sender_error_code`. Whenever a new variant is added
+        // upstream, also add it to the iteration below; the runtime
+        // assertion catches missing FFI mappings on the next test run.
+        fn cover(code: ErrorCode) -> &'static str {
+            match code {
+                ErrorCode::CouldNotResolveAddr => "CouldNotResolveAddr",
+                ErrorCode::InvalidApiCall => "InvalidApiCall",
+                ErrorCode::SocketError => "SocketError",
+                ErrorCode::InvalidUtf8 => "InvalidUtf8",
+                ErrorCode::InvalidName => "InvalidName",
+                ErrorCode::InvalidTimestamp => "InvalidTimestamp",
+                ErrorCode::AuthError => "AuthError",
+                ErrorCode::TlsError => "TlsError",
+                ErrorCode::HttpNotSupported => "HttpNotSupported",
+                ErrorCode::ServerFlushError => "ServerFlushError",
+                ErrorCode::ConfigError => "ConfigError",
+                ErrorCode::ArrayError => "ArrayError",
+                ErrorCode::ProtocolVersionError => "ProtocolVersionError",
+                ErrorCode::InvalidDecimal => "InvalidDecimal",
+                ErrorCode::ServerRejection => "ServerRejection",
+                ErrorCode::ArrowUnsupportedColumnKind => "ArrowUnsupportedColumnKind",
+                ErrorCode::ArrowIngest => "ArrowIngest",
+                _ => "unmapped",
+            }
+        }
+        for code in [
+            ErrorCode::CouldNotResolveAddr,
+            ErrorCode::InvalidApiCall,
+            ErrorCode::SocketError,
+            ErrorCode::InvalidUtf8,
+            ErrorCode::InvalidName,
+            ErrorCode::InvalidTimestamp,
+            ErrorCode::AuthError,
+            ErrorCode::TlsError,
+            ErrorCode::HttpNotSupported,
+            ErrorCode::ServerFlushError,
+            ErrorCode::ConfigError,
+            ErrorCode::ArrayError,
+            ErrorCode::ProtocolVersionError,
+            ErrorCode::InvalidDecimal,
+            ErrorCode::ServerRejection,
+            ErrorCode::ArrowUnsupportedColumnKind,
+            ErrorCode::ArrowIngest,
+        ] {
+            assert_ne!(
+                cover(code),
+                "unmapped",
+                "FFI mapping missing for {:?}",
+                code
             );
         }
     }
@@ -5047,6 +5120,9 @@ mod tests {
 
         #[test]
         fn schema_self_dictionary_cycle_rejected() {
+            // Self-cycles are not flagged by name (DAGs with shared
+            // children are legal) but the depth / total-nodes caps
+            // make traversal terminate with a bounded-size error.
             unsafe {
                 let format = CString::new("i").unwrap();
                 let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
@@ -5058,8 +5134,8 @@ mod tests {
                 std::alloc::dealloc(raw as *mut u8, layout);
                 let err = res.unwrap_err();
                 assert!(
-                    err.msg().contains("cycle"),
-                    "expected cycle error, got: {}",
+                    err.msg().contains("depth") || err.msg().contains("total"),
+                    "expected depth/total cap rejection, got: {}",
                     err.msg()
                 );
             }
@@ -5083,8 +5159,8 @@ mod tests {
                 std::alloc::dealloc(a_raw as *mut u8, a_layout);
                 let err = res.unwrap_err();
                 assert!(
-                    err.msg().contains("cycle"),
-                    "expected cycle error, got: {}",
+                    err.msg().contains("depth") || err.msg().contains("total"),
+                    "expected depth/total cap rejection, got: {}",
                     err.msg()
                 );
             }

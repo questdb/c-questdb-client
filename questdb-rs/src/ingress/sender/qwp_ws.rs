@@ -2122,10 +2122,13 @@ fn connect_tcp_to_any_addr(
                 let sock = socket2::SockRef::from(&tcp);
                 sock.set_send_buffer_size(4 * 1024 * 1024).ok();
                 sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
-                let wrapped = NoSigpipeTcp::new(tcp).map_err(|err| {
-                    error::fmt!(SocketError, "Failed to set SO_NOSIGPIPE on {addr}: {err}")
-                })?;
-                return Ok(wrapped);
+                match NoSigpipeTcp::new(tcp) {
+                    Ok(wrapped) => return Ok(wrapped),
+                    Err(err) => {
+                        failures.push(format!("{addr}: SO_NOSIGPIPE setup failed: {err}"));
+                        continue;
+                    }
+                }
             }
             Err(io) => failures.push(format!("{addr}: {io}")),
         }

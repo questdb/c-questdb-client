@@ -40,6 +40,7 @@ def main():
         'test_arrow_c',
         'test_arrow_egress',
         'test_arrow_ingress',
+        'test_column_sender',
     ]
     test_paths = [
         (d, find_binary(d, name, exe_suffix))
