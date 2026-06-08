@@ -1492,7 +1492,8 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Cap on the per-attempt reconnect delay. Default 5s.
+    /// Cap on the reconnect backoff the retry loop doubles toward; the actual
+    /// per-attempt delay is this value jittered to ~[half, 1.5x]. Default 5s.
     pub fn reconnect_max_backoff(mut self, value: Duration) -> Result<Self> {
         if value.is_zero() {
             return Err(error::fmt!(

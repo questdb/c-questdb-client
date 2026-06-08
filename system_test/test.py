@@ -2577,6 +2577,14 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # wait through the bounce up to reconnect_max_duration_millis.
             initial_connect_retry='sync',
             reconnect_max_duration_millis=120000,
+            # The bounce tests restart the server faster than the reconnect
+            # backoff cap can track, so the client keeps backing off and
+            # misses the brief windows the server is up between restarts —
+            # close_drain then can't drain and times out. A tighter cap keeps
+            # reconnect attempts landing inside those windows. (Harmless for
+            # the non-bounce tests, which never reconnect, so the backoff
+            # never engages.)
+            reconnect_max_backoff_millis=250,
             # 2 min on close_drain — bounce-test variants need a long
             # enough budget for SFA to replay queued frames into a
             # freshly-restarted server.
