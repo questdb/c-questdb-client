@@ -41,7 +41,7 @@ use crate::ingress::{
     QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
 };
 
-const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+pub(crate) const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const FIRST_WIRE_SEQUENCE: u64 = 0;
 const QWP_STATUS_OK: u8 = 0x00;
 const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
@@ -94,7 +94,7 @@ struct MockResult {
     received_frames: Vec<Vec<u8>>,
 }
 
-fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 256];
     loop {
@@ -110,7 +110,7 @@ fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>>
     Ok(buf)
 }
 
-fn parse_header(req: &str, name: &str) -> Option<String> {
+pub(crate) fn parse_header(req: &str, name: &str) -> Option<String> {
     for line in req.split("\r\n").skip(1) {
         if let Some((k, v)) = line.split_once(':')
             && k.trim().eq_ignore_ascii_case(name)
@@ -121,7 +121,7 @@ fn parse_header(req: &str, name: &str) -> Option<String> {
     None
 }
 
-fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
+pub(crate) fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr)?;
     let fin = (hdr[0] & 0x80) != 0;
@@ -155,7 +155,10 @@ fn read_frame(stream: &mut TcpStream) -> std::io::Result<(bool, u8, Vec<u8>)> {
     Ok((fin, opcode, payload))
 }
 
-fn write_server_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_server_binary_frame(
+    stream: &mut TcpStream,
+    payload: &[u8],
+) -> std::io::Result<()> {
     // FIN | binary, no mask (server→client).
     let mut frame = vec![0x82];
     let plen = payload.len();
@@ -172,7 +175,7 @@ fn write_server_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io:
     stream.write_all(&frame)
 }
 
-fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<Vec<String>> {
+pub(crate) fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<Vec<String>> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
@@ -272,7 +275,7 @@ fn write_raw_ws_frame(stream: &mut TcpStream, byte0: u8, payload: &[u8]) -> std:
     stream.write_all(&frame)
 }
 
-fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Result<()> {
+pub(crate) fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Result<()> {
     let mut ok = Vec::new();
     ok.push(QWP_STATUS_OK);
     ok.extend_from_slice(&wire_seq.to_le_bytes());
@@ -325,7 +328,7 @@ fn write_qwp_error_response(
     write_server_binary_frame(stream, &err)
 }
 
-fn compute_accept(key_b64: &str) -> String {
+pub(crate) fn compute_accept(key_b64: &str) -> String {
     use base64ct::{Base64, Encoding};
     let combined = format!("{key_b64}{WS_GUID}");
     let digest = sha1(combined.as_bytes());
@@ -407,7 +410,7 @@ fn upgrade_mock_stream_without_upgrade_header(stream: &mut TcpStream) {
 // Mirror of the production SHA-1 used by the sender, reproduced here to
 // validate the upgrade handshake from the server side without poking at
 // internals. ~50 lines is cheaper than another dependency.
-fn sha1(input: &[u8]) -> [u8; 20] {
+pub(crate) fn sha1(input: &[u8]) -> [u8; 20] {
     let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
         0x67452301u32,
         0xEFCDAB89,
@@ -4127,8 +4130,11 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     let zone_ignored = "qwpws::addr=localhost:9000;zone=dc-amsterdam;";
     SenderBuilder::from_conf(zone_ignored).unwrap();
 
-    let tcp_zone = "tcp::addr=localhost:9009;zone=dc-amsterdam;";
-    SenderBuilder::from_conf(tcp_zone).unwrap();
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        let tcp_zone = "tcp::addr=localhost:9009;zone=dc-amsterdam;";
+        SenderBuilder::from_conf(tcp_zone).unwrap();
+    }
 
     // Java Sender ignores unknown keys; this is parser compatibility, not
     // target-selection support.
@@ -4163,13 +4169,16 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     let err = SenderBuilder::from_conf(zero_port).unwrap_err();
     assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
 
-    let repeated_tcp_addr = "tcp::addr=localhost:9009;addr=localhost:9010;";
-    let err = SenderBuilder::from_conf(repeated_tcp_addr).unwrap_err();
-    assert!(
-        err.msg().contains("DuplicateKey") || err.msg().contains("duplicate"),
-        "got: {}",
-        err.msg()
-    );
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        let repeated_tcp_addr = "tcp::addr=localhost:9009;addr=localhost:9010;";
+        let err = SenderBuilder::from_conf(repeated_tcp_addr).unwrap_err();
+        assert!(
+            err.msg().contains("DuplicateKey") || err.msg().contains("duplicate"),
+            "got: {}",
+            err.msg()
+        );
+    }
 
     let conf_async = "qwpws::addr=localhost:9000;initial_connect_retry=async;";
     SenderBuilder::from_conf(conf_async).unwrap();

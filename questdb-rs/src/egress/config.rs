@@ -549,6 +549,15 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "drain_orphans",
     "max_background_drainers",
     "error_inbox_capacity",
+    // Connection-pool knobs owned by `questdb_db` (the column-sender
+    // pool). The reader doesn't pool itself — `questdb_db` pools
+    // readers on the reader's behalf — but a Client that holds both
+    // a sender and a reader pool is configured by one conf-string,
+    // so the reader's parser accepts and ignores these.
+    "pool_size",
+    "pool_max",
+    "pool_idle_timeout_ms",
+    "pool_reap",
 ];
 
 impl ReaderConfig {
@@ -577,12 +586,13 @@ impl ReaderConfig {
             .map_err(|e| fmt!(ConfigError, "Config parse error: {}", e))?;
         let scheme = conf.service();
         let tls = match scheme {
-            "ws" => false,
-            "wss" => true,
+            "ws" | "qwpws" => false,
+            "wss" | "qwpwss" => true,
             other => {
                 return Err(fmt!(
                     ConfigError,
-                    "Unknown scheme \"{}\" — expected \"ws\" or \"wss\"",
+                    "Unknown scheme \"{}\" — expected \"ws\", \"wss\", \
+                     \"qwpws\", or \"qwpwss\"",
                     other
                 ));
             }

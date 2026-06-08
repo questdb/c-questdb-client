@@ -118,6 +118,19 @@ pub enum line_reader_error_code {
     /// `line_reader_query_on_failover_reset` to opt in to replays, or
     /// re-execute the query from scratch.
     line_reader_error_failover_would_duplicate = 21,
+    /// Streaming Arrow adapter saw a mid-stream schema change. The cursor
+    /// is still usable; re-wrap with `line_reader_cursor_next_arrow_batch`
+    /// after dropping any partial state to snapshot the new schema. Only
+    /// emitted with the `arrow` feature enabled.
+    line_reader_error_schema_drift = 22,
+    /// `line_reader_cursor_next_arrow_batch` was called on a stream that
+    /// terminated before any batch was produced — no schema to snapshot.
+    /// Only emitted with the `arrow` feature enabled.
+    line_reader_error_no_schema = 23,
+    /// Arrow C Data Interface export failed (arrow-rs rejected the
+    /// produced `ArrayData`'s invariants). Indicates a client bug — not
+    /// user-recoverable. Only emitted with the `arrow` feature enabled.
+    line_reader_error_arrow_export = 24,
 }
 
 impl From<ErrorCode> for line_reader_error_code {
@@ -144,6 +157,9 @@ impl From<ErrorCode> for line_reader_error_code {
             ErrorCode::ServerLimitExceeded => line_reader_error_server_limit_exceeded,
             ErrorCode::Cancelled => line_reader_error_cancelled,
             ErrorCode::FailoverWouldDuplicate => line_reader_error_failover_would_duplicate,
+            ErrorCode::SchemaDrift => line_reader_error_schema_drift,
+            ErrorCode::NoSchema => line_reader_error_no_schema,
+            ErrorCode::ArrowExport => line_reader_error_arrow_export,
             // ErrorCode is `#[non_exhaustive]`. Any future variant added
             // upstream that the C ABI hasn't been taught about falls
             // back to ProtocolError so callers see *something* rather
@@ -215,6 +231,50 @@ unsafe fn write_err_box(err_out: *mut *mut line_reader_error, err: Error) {
     }
     unsafe {
         *err_out = Box::into_raw(Box::new(line_reader_error(err)));
+    }
+}
+
+/// Wrap a pool-borrowed `Reader` + `ReaderPoolHandle` in a
+/// `line_reader` opaque so the rest of the egress FFI can treat
+/// it identically to a standalone reader.
+#[cfg(feature = "sync-reader-ws")]
+fn wrap_pooled_reader(
+    reader: Reader,
+    pool: questdb::ingress::column_sender::ReaderPoolHandle,
+) -> *mut line_reader {
+    let stats = Arc::clone(reader.stats());
+    Box::into_raw(Box::new(line_reader {
+        reader_cell: UnsafeCell::new(reader),
+        cursor_active: AtomicBool::new(false),
+        stats,
+        ownership: ReaderOwnership::Pooled {
+            handle: pool,
+            must_close: AtomicBool::new(false),
+        },
+    }))
+}
+
+/// Mark a pool-borrowed reader for must-close: the next
+/// `line_reader_close` will drop the reader instead of returning it
+/// to the pool. No-op on standalone readers (they're dropped on
+/// close regardless) and on NULL handles.
+///
+/// Useful when the cursor lifecycle detected a state that makes the
+/// reader unsafe to recycle (e.g. a cursor abandoned mid-stream,
+/// which causes the Rust `Cursor::Drop` to tear down the transport).
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_mark_must_close(reader: *mut line_reader) {
+    if reader.is_null() {
+        return;
+    }
+    // Project to the `ownership` field via `addr_of!` so we never
+    // form a `&line_reader` reborrow that could alias an in-flight
+    // `&mut Reader` held by a cursor. Same pattern as the stat
+    // getters above.
+    let ownership_ptr: *const ReaderOwnership = unsafe { std::ptr::addr_of!((*reader).ownership) };
+    if let ReaderOwnership::Pooled { must_close, .. } = unsafe { &*ownership_ptr } {
+        must_close.store(true, Ordering::Release);
     }
 }
 
@@ -489,7 +549,32 @@ impl From<ColumnKind> for line_reader_column_kind {
 /// getters read from here and never touch `.0`, so a monitoring
 /// thread firing a stat getter while another thread is driving a
 /// cursor cannot disturb the cursor's laundered `&mut Reader`.
-pub struct line_reader(UnsafeCell<Reader>, AtomicBool, Arc<ReaderStats>);
+pub struct line_reader {
+    reader_cell: UnsafeCell<Reader>,
+    cursor_active: AtomicBool,
+    stats: Arc<ReaderStats>,
+    ownership: ReaderOwnership,
+}
+
+/// How a [`line_reader`] is owned, and what to do with it on close.
+///
+/// `must_close` lives inside the `Pooled` arm because it is only
+/// meaningful when there is a pool to be returned to — `Standalone`
+/// readers are dropped on close regardless. Encoding the invariant
+/// in the type makes the close path a straight match instead of a
+/// nullable-flag dance.
+enum ReaderOwnership {
+    /// Constructed via `line_reader_from_conf` / `line_reader_from_env`.
+    /// Closed via `line_reader_close` — the inner `Reader` is dropped.
+    Standalone,
+    /// Borrowed from a `questdb_db` pool via `questdb_db_borrow_reader`.
+    /// On close, returned to the pool unless `must_close` is set, in
+    /// which case it is dropped.
+    Pooled {
+        handle: questdb::ingress::column_sender::ReaderPoolHandle,
+        must_close: AtomicBool,
+    },
+}
 
 /// Construct a reader from a QuestDB config string.
 ///
@@ -521,11 +606,12 @@ pub unsafe extern "C" fn line_reader_from_conf(
         let reader_result = Reader::from_conf(conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(line_reader(
-            UnsafeCell::new(reader),
-            AtomicBool::new(false),
+        Box::into_raw(Box::new(line_reader {
+            reader_cell: UnsafeCell::new(reader),
+            cursor_active: AtomicBool::new(false),
             stats,
-        )))
+            ownership: ReaderOwnership::Standalone,
+        }))
     }));
     match result {
         Ok(p) => p,
@@ -571,11 +657,12 @@ pub unsafe extern "C" fn line_reader_from_env(
         let reader_result = Reader::from_conf(&conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         let stats = Arc::clone(reader.stats());
-        Box::into_raw(Box::new(line_reader(
-            UnsafeCell::new(reader),
-            AtomicBool::new(false),
+        Box::into_raw(Box::new(line_reader {
+            reader_cell: UnsafeCell::new(reader),
+            cursor_active: AtomicBool::new(false),
             stats,
-        )))
+            ownership: ReaderOwnership::Standalone,
+        }))
     }));
     match result {
         Ok(p) => p,
@@ -616,27 +703,28 @@ pub unsafe extern "C" fn line_reader_close(reader: *mut line_reader) {
         // racing) we leak — matching the existing leak-on-active policy
         // documented above.
         if (*reader)
-            .1
+            .cursor_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            // A query or cursor is still live (or a concurrent _query_new
-            // raced us); freeing the reader would leave a dangling
-            // `&mut Reader` inside it. Leak the reader (and its socket)
-            // rather than risk use-after-free.
-            // Project to the stats Arc via `addr_of!` so we don't form
-            // a `&line_reader` reborrow that would alias the in-flight
-            // `&mut Reader` held by the live query/cursor (same pattern
-            // as the stat getters below).
-            let stats_ptr = std::ptr::addr_of!((*reader).2);
+            let stats_ptr = std::ptr::addr_of!((*reader).stats);
             let bytes_in_flight = (&*stats_ptr).bytes_received.load(Ordering::Relaxed);
+            // Release the pool slot before leaking the box so the pool's
+            // `pool_max` budget isn't permanently burned by misuse.
+            // The Reader stays inside the leaked box (cursor still holds
+            // a `&mut Reader`); only the bookkeeping slot is freed.
+            let ownership_ptr = std::ptr::addr_of!((*reader).ownership);
+            if let ReaderOwnership::Pooled { handle, .. } = &*ownership_ptr {
+                handle.release_leaked_slot();
+            }
             eprintln!(
                 "line_reader_close: a query or cursor is still live on this \
                  reader. The reader has been LEAKED (TCP socket + TLS session + \
                  ~{bytes_in_flight} bytes of in-flight buffers + up to the \
-                 symbol-dict heap cap) to avoid use-after-free. Close the \
-                 cursor / free the query before closing the reader. This is \
-                 a contract violation — see the line_reader_close docstring."
+                 symbol-dict heap cap) to avoid use-after-free. The pool slot \
+                 has been released. Close the cursor / free the query before \
+                 closing the reader. This is a contract violation — see the \
+                 line_reader_close docstring."
             );
             return;
         }
@@ -645,7 +733,24 @@ pub unsafe extern "C" fn line_reader_close(reader: *mut line_reader) {
         // transport `Drop` is localized in test builds (and would
         // localize if the crate ever moved off `panic = abort`).
         // No-op in shipped builds; see `panic_guard` docstring.
-        drop(Box::from_raw(reader));
+        //
+        // If this reader was borrowed from a `questdb_db` pool, hand
+        // ownership of the inner `Reader` back to the pool (or drop
+        // it if `must_close` is set). Otherwise, dropping the box is
+        // equivalent to closing the connection.
+        let boxed = Box::from_raw(reader);
+        let line_reader {
+            reader_cell,
+            ownership,
+            ..
+        } = *boxed;
+        let inner = reader_cell.into_inner();
+        match ownership {
+            ReaderOwnership::Standalone => drop(inner),
+            ReaderOwnership::Pooled { handle, must_close } => {
+                handle.return_reader(inner, must_close.load(Ordering::Acquire));
+            }
+        }
     })
 }
 
@@ -673,7 +778,7 @@ pub unsafe extern "C" fn line_reader_has_active_query(reader: *const line_reader
         // would cover the `UnsafeCell<Reader>` field and disturb the
         // laundered `&mut Reader` held by an in-flight query/cursor under
         // Stacked Borrows. Same pattern as the stat getters below.
-        let active: &AtomicBool = &*std::ptr::addr_of!((*reader).1);
+        let active: &AtomicBool = &*std::ptr::addr_of!((*reader).cursor_active);
         // `Acquire` pairs with the `AcqRel` flip in `_query_new` / the
         // `Release` clear in `_query_free` / `_cursor_free`, so observers
         // see a consistent state under the C contract's
@@ -698,7 +803,7 @@ pub unsafe extern "C" fn line_reader_bytes_received(reader: *const line_reader) 
         // `ReaderQuery` / `Cursor` under Stacked Borrows. The explicit
         // `&Arc<ReaderStats>` borrow below covers only the Arc field,
         // which lives at a distinct offset and is unrelated to the cell.
-        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).stats);
         stats.bytes_received.load(Ordering::Relaxed)
     }
 }
@@ -711,7 +816,7 @@ pub unsafe extern "C" fn line_reader_credit_granted_total(reader: *const line_re
         if reader.is_null() {
             return 0;
         }
-        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).stats);
         stats.credit_granted_total.load(Ordering::Relaxed)
     }
 }
@@ -724,7 +829,7 @@ pub unsafe extern "C" fn line_reader_read_ns(reader: *const line_reader) -> u64 
         if reader.is_null() {
             return 0;
         }
-        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).stats);
         stats.read_ns.load(Ordering::Relaxed)
     }
 }
@@ -737,7 +842,7 @@ pub unsafe extern "C" fn line_reader_decode_ns(reader: *const line_reader) -> u6
         if reader.is_null() {
             return 0;
         }
-        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).stats);
         stats.decode_ns.load(Ordering::Relaxed)
     }
 }
@@ -750,7 +855,7 @@ pub unsafe extern "C" fn line_reader_reset_timing(reader: *mut line_reader) {
         if reader.is_null() {
             return;
         }
-        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).stats);
         stats.read_ns.store(0, Ordering::Relaxed);
         stats.decode_ns.store(0, Ordering::Relaxed);
     }
@@ -765,7 +870,7 @@ pub unsafe extern "C" fn line_reader_reset_timing(reader: *mut line_reader) {
 unsafe fn reader_active(reader: *const line_reader) -> bool {
     // `addr_of!` avoids a `&line_reader` reborrow over the cell — see
     // `line_reader_has_active_query`.
-    let active: &AtomicBool = unsafe { &*std::ptr::addr_of!((*reader).1) };
+    let active: &AtomicBool = unsafe { &*std::ptr::addr_of!((*reader).cursor_active) };
     active.load(Ordering::Acquire)
 }
 
@@ -818,7 +923,7 @@ pub unsafe extern "C" fn line_reader_server_version(
             }
             return false;
         }
-        match (*(*reader).0.get()).server_version() {
+        match (*(*reader).reader_cell.get()).server_version() {
             Ok(v) => {
                 *out_version = v;
                 true
@@ -852,7 +957,7 @@ pub unsafe extern "C" fn line_reader_current_server_info(
         if reader_active(reader) {
             return ptr::null();
         }
-        match (*(*reader).0.get()).server_info() {
+        match (*(*reader).reader_cell.get()).server_info() {
             Some(si) => si as *const ServerInfo as *const line_reader_server_info,
             None => ptr::null(),
         }
@@ -888,7 +993,7 @@ pub unsafe extern "C" fn line_reader_current_addr_host(
             *out_len = 0;
             return;
         }
-        let ep = (*(*reader).0.get()).current_addr();
+        let ep = (*(*reader).reader_cell.get()).current_addr();
         *out_buf = ep.host.as_ptr() as *const c_char;
         *out_len = ep.host.len();
     }
@@ -909,7 +1014,7 @@ pub unsafe extern "C" fn line_reader_current_addr_port(reader: *const line_reade
         if reader_active(reader) {
             return 0;
         }
-        (*(*reader).0.get()).current_addr().port
+        (*(*reader).reader_cell.get()).current_addr().port
     }
 }
 
@@ -1757,7 +1862,7 @@ pub unsafe extern "C" fn line_reader_prepare(
         // thread next observes `active=false`. `Acquire`-only on the
         // success arm would skip the `Release` half of that handover.
         if (*reader)
-            .1
+            .cursor_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -1781,18 +1886,18 @@ pub unsafe extern "C" fn line_reader_prepare(
             Err(e) => {
                 // Release the active flag we just claimed: no query was
                 // produced, so the reader must be available again.
-                (*reader).1.store(false, Ordering::Release);
+                (*reader).cursor_active.store(false, Ordering::Release);
                 write_err_box(err_out, e);
                 return ptr::null_mut();
             }
         };
         // Derive `&mut Reader` through the `UnsafeCell::get()` raw pointer
-        // (rather than `&mut (*reader).0`, which would give the borrow a
+        // (rather than `&mut (*reader).reader_cell`, which would give the borrow a
         // `Unique` tag under Stacked/Tree Borrows and conflict with the
         // shared reborrows synthesised by the read-only stat getters).
         // Going through the cell's raw pointer tags this borrow as
         // `SharedReadWrite`, compatible with those temporary `&Reader`s.
-        let r: &mut Reader = &mut *(*reader).0.get();
+        let r: &mut Reader = &mut *(*reader).reader_cell.get();
         // Catch any unwind out of `r.prepare(sql_str)` AND the
         // wrapper allocation that publishes the result, then abort.
         // No-op under this crate's `panic = abort` policy (see
@@ -1850,7 +1955,9 @@ pub unsafe extern "C" fn line_reader_query_free(query: *mut line_reader_query) {
         // Release the reader's active flag so a new query/cursor can be
         // started.
         if !boxed.reader.is_null() {
-            (*boxed.reader).1.store(false, Ordering::Release);
+            (*boxed.reader)
+                .cursor_active
+                .store(false, Ordering::Release);
         }
         drop(boxed);
     })
@@ -1910,7 +2017,7 @@ pub unsafe extern "C" fn line_reader_query_execute(
         if let Some(e) = boxed.deferred_err.take() {
             drop(q);
             if !reader.is_null() {
-                (*reader).1.store(false, Ordering::Release);
+                (*reader).cursor_active.store(false, Ordering::Release);
             }
             write_err_box(err_out, e);
             return ptr::null_mut();
@@ -1941,13 +2048,15 @@ pub unsafe extern "C" fn line_reader_query_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
+                        #[cfg(feature = "arrow")]
+                        arrow_schema_pin: None,
                         reader,
                     }))
                 }
                 Err(e) => {
                     // Query gone, no cursor produced — release the active flag.
                     if !reader.is_null() {
-                        (*reader).1.store(false, Ordering::Release);
+                        (*reader).cursor_active.store(false, Ordering::Release);
                     }
                     write_err_box(err_out, e);
                     ptr::null_mut()
@@ -1983,7 +2092,7 @@ pub unsafe extern "C" fn line_reader_execute(
             return ptr::null_mut();
         }
         if (*reader)
-            .1
+            .cursor_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -1998,12 +2107,12 @@ pub unsafe extern "C" fn line_reader_execute(
         let sql_str = match validated_utf8(&sql) {
             Ok(s) => s,
             Err(e) => {
-                (*reader).1.store(false, Ordering::Release);
+                (*reader).cursor_active.store(false, Ordering::Release);
                 write_err_box(err_out, e);
                 return ptr::null_mut();
             }
         };
-        let r: &mut Reader = &mut *(*reader).0.get();
+        let r: &mut Reader = &mut *(*reader).reader_cell.get();
         // Single guarded closure covers `r.execute(...)`, the lifetime
         // launder, and both success/error Box allocations — same
         // pattern as `_prepare` and `_query_execute`. No-op under this
@@ -2018,11 +2127,13 @@ pub unsafe extern "C" fn line_reader_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
+                        #[cfg(feature = "arrow")]
+                        arrow_schema_pin: None,
                         reader,
                     }))
                 }
                 Err(e) => {
-                    (*reader).1.store(false, Ordering::Release);
+                    (*reader).cursor_active.store(false, Ordering::Release);
                     write_err_box(err_out, e);
                     ptr::null_mut()
                 }
@@ -2433,6 +2544,9 @@ pub struct line_reader_cursor {
     /// for the same reason as `cursor`. See the struct-level safety note —
     /// this field MUST be `None` whenever `&mut self.cursor` is exposed.
     current_batch: Option<BatchView<'static>>,
+    /// Pins the first Arrow batch's schema for mid-stream drift detection.
+    #[cfg(feature = "arrow")]
+    arrow_schema_pin: Option<arrow::datatypes::SchemaRef>,
     /// Backpointer to the originating reader, used to clear its `active`
     /// flag on `_cursor_free`. Always non-NULL for a valid cursor.
     reader: *mut line_reader,
@@ -2444,7 +2558,25 @@ impl line_reader_cursor {
     /// "no-`current_batch`-while-`&mut cursor`" invariant documented on
     /// `line_reader_cursor`. Mutating cursor ops MUST go through here
     /// instead of taking `&mut self.cursor` directly.
+    ///
+    /// Also clears any Arrow schema pin — switching back from the raw
+    /// `BatchView` path to `_next_arrow_batch` should re-snapshot the
+    /// schema, not compare against a stale one from before the detour.
     fn cursor_for_mut(&mut self) -> &mut Cursor<'static> {
+        self.current_batch = None;
+        debug_assert!(self.current_batch.is_none());
+        #[cfg(feature = "arrow")]
+        {
+            self.arrow_schema_pin = None;
+        }
+        &mut self.cursor
+    }
+
+    /// Like `cursor_for_mut` but preserves any Arrow schema pin. For
+    /// auxiliary cursor ops (`cancel`, `add_credit`) that do not advance
+    /// the stream and therefore must not lose the drift-detection
+    /// snapshot established by a prior `_next_arrow_batch`.
+    fn cursor_for_aux(&mut self) -> &mut Cursor<'static> {
         self.current_batch = None;
         debug_assert!(self.current_batch.is_none());
         &mut self.cursor
@@ -2486,7 +2618,9 @@ pub unsafe extern "C" fn line_reader_cursor_free(cursor: *mut line_reader_cursor
         // Release the reader's active flag so a new query/cursor can be
         // started.
         if !boxed.reader.is_null() {
-            (*boxed.reader).1.store(false, Ordering::Release);
+            (*boxed.reader)
+                .cursor_active
+                .store(false, Ordering::Release);
         }
         drop(boxed);
     })
@@ -2868,13 +3002,10 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
             );
             return false;
         }
-        // Routes through `cursor_for_mut` to maintain the BatchView /
-        // &mut Cursor exclusion invariant — see line_reader_cursor docs.
-        // `cancel()` runs the drain loop which can panic (decoder paths).
-        // The `catch_unwind` + abort below is a no-op in shipped builds
-        // under `panic = abort` and active in test builds; see
-        // `panic_guard` docstring.
-        let inner = (*cursor).cursor_for_mut();
+        // `cursor_for_aux` keeps the Arrow schema pin intact — `cancel`
+        // is a terminal op so the pin is about to be irrelevant, but
+        // sharing the helper with `add_credit` keeps the contract uniform.
+        let inner = (*cursor).cursor_for_aux();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.cancel()));
         let res = match result {
             Ok(r) => r,
@@ -2907,11 +3038,10 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
             );
             return false;
         }
-        // Routes through `cursor_for_mut` — see line_reader_cursor docs.
-        // The `catch_unwind` + abort below is a no-op in shipped builds
-        // under `panic = abort` and active in test builds; see
-        // `panic_guard` docstring.
-        let inner = (*cursor).cursor_for_mut();
+        // `cursor_for_aux` keeps the Arrow schema pin intact across this
+        // flow-control call; otherwise a subsequent `_next_arrow_batch`
+        // would lose its drift snapshot.
+        let inner = (*cursor).cursor_for_aux();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             inner.add_credit(additional_bytes)
         }));
@@ -3674,6 +3804,9 @@ mod tests {
             ErrorCode::ServerLimitExceeded,
             ErrorCode::Cancelled,
             ErrorCode::FailoverWouldDuplicate,
+            ErrorCode::SchemaDrift,
+            ErrorCode::NoSchema,
+            ErrorCode::ArrowExport,
         ];
         for code in codes {
             let c: line_reader_error_code = code.into();
@@ -3685,6 +3818,24 @@ mod tests {
                 line_reader_error_free(err);
             }
         }
+    }
+
+    #[test]
+    fn line_reader_error_code_arrow_discriminants_are_abi_stable() {
+        // Pin numeric values for the Arrow-related variants exposed to C/FFI
+        // consumers. Append-only past the existing tail at 21.
+        assert_eq!(
+            line_reader_error_code::line_reader_error_schema_drift as u32,
+            22
+        );
+        assert_eq!(
+            line_reader_error_code::line_reader_error_no_schema as u32,
+            23
+        );
+        assert_eq!(
+            line_reader_error_code::line_reader_error_arrow_export as u32,
+            24
+        );
     }
 
     #[test]
@@ -3895,4 +4046,209 @@ mod tests {
         // No assertion on side-effects: the goal is to confirm dispatch
         // is a no-op when the C callback slot is empty.
     }
+}
+
+#[cfg(feature = "arrow")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_reader_arrow_batch_result {
+    line_reader_arrow_batch_ok = 0,
+    line_reader_arrow_batch_end = 1,
+    line_reader_arrow_batch_error = 2,
+}
+
+/// Pull the next Arrow `RecordBatch` from `cursor` and export it via
+/// the Arrow C Data Interface into `out_array` + `out_schema`.
+///
+/// Ownership: `out_array` and `out_schema` are written-into unconditionally
+/// on success — any prior contents at those addresses are overwritten
+/// without being released. Callers must pass zeroed structs or structs
+/// whose `release` callbacks have already been invoked and cleared.
+/// On success, the caller owns `out_array->release` and `out_schema->release`
+/// and must invoke them when done. On failure the output structs are left
+/// untouched (their `release` slots remain whatever the caller passed in).
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
+    cursor: *mut line_reader_cursor,
+    out_array: *mut arrow::ffi::FFI_ArrowArray,
+    out_schema: *mut arrow::ffi::FFI_ArrowSchema,
+    err_out: *mut *mut line_reader_error,
+) -> line_reader_arrow_batch_result {
+    use arrow_array::{Array, StructArray};
+    unsafe {
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_next_arrow_batch: cursor is NULL",
+            );
+            return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
+        }
+        if out_array.is_null() || out_schema.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_next_arrow_batch: out_array or out_schema is NULL",
+            );
+            return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
+        }
+        enum NextArrow {
+            Ok(
+                arrow::ffi::FFI_ArrowArray,
+                arrow::ffi::FFI_ArrowSchema,
+                arrow::datatypes::SchemaRef,
+            ),
+            End,
+            Err(Error, Option<arrow::datatypes::SchemaRef>),
+        }
+        let c = &mut *cursor;
+        let pinned = c.arrow_schema_pin.clone();
+        let inner: &mut Cursor<'static> = c.cursor_for_mut();
+        let outcome = panic_guard(|| -> NextArrow {
+            let rb = match inner.next_arrow_batch_inner(pinned.as_ref()) {
+                Ok(Some(rb)) => rb,
+                Ok(None) => return NextArrow::End,
+                Err(e) => return NextArrow::Err(e, None),
+            };
+            let schema_ref = rb.schema();
+            let struct_array: StructArray = rb.into();
+            let array_data = struct_array.into_data();
+            match arrow::ffi::to_ffi(&array_data) {
+                Ok((ffi_array, ffi_schema)) => NextArrow::Ok(ffi_array, ffi_schema, schema_ref),
+                Err(e) => NextArrow::Err(
+                    Error::new(ErrorCode::ArrowExport, e.to_string()),
+                    Some(schema_ref),
+                ),
+            }
+        });
+        match outcome {
+            NextArrow::Ok(ffi_array, ffi_schema, schema_ref) => {
+                c.arrow_schema_pin = Some(schema_ref);
+                std::ptr::write(out_array, ffi_array);
+                std::ptr::write(out_schema, ffi_schema);
+                line_reader_arrow_batch_result::line_reader_arrow_batch_ok
+            }
+            NextArrow::End => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
+            NextArrow::Err(e, pin_to_restore) => {
+                match pin_to_restore {
+                    Some(pin) => {
+                        c.arrow_schema_pin = Some(pin);
+                    }
+                    None => {
+                        if e.code() != ErrorCode::SchemaDrift {
+                            c.arrow_schema_pin = pinned;
+                        }
+                    }
+                }
+                write_err_box(err_out, e);
+                line_reader_arrow_batch_result::line_reader_arrow_batch_error
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Reader pool FFI
+//
+// These thin wrappers route between the `questdb_db` pool (in the
+// column-sender crate / FFI module) and the `line_reader` opaque
+// owned here. Living next to the `line_reader` type keeps the
+// wrap/unwrap discipline local: a borrow constructs a pooled
+// `line_reader` via `wrap_pooled_reader`; a return is just
+// `line_reader_close`, which the ownership tag dispatches.
+// ===========================================================================
+
+#[cfg(feature = "sync-reader-ws")]
+use crate::column_sender::questdb_db;
+
+/// Borrow a reader from the egress pool. Returns NULL and sets
+/// `*err_out` on failure (pool exhausted, transport failure, etc.).
+///
+/// Reader connections are pooled separately from writer connections
+/// but share the same `pool_size` / `pool_max` /
+/// `pool_idle_timeout_ms` budget. The reader pool is lazy: a
+/// connection is opened on first borrow, not at `questdb_db_connect`
+/// time, so callers that never use egress don't pay any handshake
+/// cost.
+///
+/// The returned `line_reader*` is equivalent to one constructed via
+/// `line_reader_from_conf`: cursor lifecycle, stat getters, and
+/// failover all work the same. On `line_reader_close` the reader is
+/// returned to the pool (or dropped if it was marked must-close via
+/// `line_reader_mark_must_close`).
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_borrow_reader(
+    db: *mut questdb_db,
+    err_out: *mut *mut line_reader_error,
+) -> *mut line_reader {
+    if db.is_null() {
+        unsafe {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "questdb_db_borrow_reader: db pointer is NULL",
+            );
+        }
+        return ptr::null_mut();
+    }
+    let db_ref = unsafe { &*db };
+    match db_ref.0.borrow_reader_owned() {
+        Ok(owned) => {
+            let handle = db_ref.0.reader_pool_handle();
+            // Take the reader out of the OwnedReader so its Drop
+            // doesn't ALSO return it to the pool. The line_reader
+            // wrapper now owns the reader-return semantics via its
+            // `ReaderOwnership::Pooled` variant.
+            let reader = owned
+                .take()
+                .expect("borrow_reader_owned returned an empty OwnedReader");
+            wrap_pooled_reader(reader, handle)
+        }
+        Err(err) => {
+            unsafe { write_err_box(err_out, err) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Return a borrowed reader to the pool. Invalidates `reader`.
+/// Accepts NULL `reader` and no-ops. `db` is ignored — the reader
+/// carries its own pool back-reference via its `ReaderOwnership::Pooled`
+/// variant — but kept in the ABI for symmetry with the borrow call.
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_return_reader(_db: *mut questdb_db, reader: *mut line_reader) {
+    if reader.is_null() {
+        return;
+    }
+    // Return path == close path for pooled readers. `line_reader_close`
+    // matches on the ownership tag and dispatches to
+    // `ReaderPoolHandle::return_reader`.
+    unsafe { line_reader_close(reader) };
+}
+
+/// Snapshot the number of currently-idle (cached) readers in the
+/// reader pool. Returns 0 for a NULL `db`. Internal / test-only.
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_reader_free_count(db: *mut questdb_db) -> usize {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    db_ref.0.reader_free_count()
+}
+
+/// Snapshot the number of currently-borrowed (in-use) readers.
+/// Returns 0 for a NULL `db`. Internal / test-only.
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_reader_in_use_count(db: *mut questdb_db) -> usize {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    db_ref.0.reader_in_use_count()
 }

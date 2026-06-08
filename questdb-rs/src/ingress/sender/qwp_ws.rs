@@ -41,6 +41,7 @@ use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::QwpWsColumnarBuffer;
 use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
+use crate::ws::nosigpipe::NoSigpipeTcp;
 
 use super::qwp_ws_codec::{
     self as codec, MAX_INBOUND_FRAME_BYTES, Opcode, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
@@ -67,21 +68,22 @@ use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
 // ---------- transport ----------
 
-type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>;
 
 const QWP_WS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) enum WsStream {
-    Plain(TcpStream),
+    Plain(NoSigpipeTcp),
     Tls(Box<TlsStream>),
 }
 
 impl WsStream {
-    fn set_timeouts(&self, read: Option<Duration>, write: Option<Duration>) -> std::io::Result<()> {
-        let sock = match self {
-            WsStream::Plain(s) => s,
-            WsStream::Tls(s) => s.get_ref(),
-        };
+    pub(crate) fn set_timeouts(
+        &self,
+        read: Option<Duration>,
+        write: Option<Duration>,
+    ) -> std::io::Result<()> {
+        let sock = self.tcp_stream();
         sock.set_read_timeout(read)?;
         sock.set_write_timeout(write)?;
         Ok(())
@@ -99,8 +101,8 @@ impl WsStream {
 
     fn tcp_stream(&self) -> &TcpStream {
         match self {
-            WsStream::Plain(sock) => sock,
-            WsStream::Tls(stream) => stream.get_ref(),
+            WsStream::Plain(sock) => sock.tcp(),
+            WsStream::Tls(stream) => stream.get_ref().tcp(),
         }
     }
 }
@@ -2022,7 +2024,7 @@ fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::
 /// connect paths use below, but in a single call so the probes don't need
 /// to thread the extras-builder + validate-headers + error-mapper boilerplate
 /// through every test harness.
-#[cfg(test)]
+#[cfg(all(test, feature = "_sender-http"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_upgrade<S: Read + Write>(
     stream: &mut S,
@@ -2047,7 +2049,7 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
 
 fn complete_qwp_ws_tls_handshake(
     conn: &mut rustls::ClientConnection,
-    tcp: &mut TcpStream,
+    tcp: &mut NoSigpipeTcp,
     tls_timeout: Duration,
 ) -> crate::Result<()> {
     while conn.wants_write() || conn.is_handshaking() {
@@ -2099,7 +2101,7 @@ fn connect_qwp_ws_tcp(
     host: &str,
     port: &str,
     request_timeout: Duration,
-) -> crate::Result<TcpStream> {
+) -> crate::Result<NoSigpipeTcp> {
     let addrs = resolve_qwp_ws_addrs(host, port)?;
     connect_tcp_to_any_addr(host, port, &addrs, request_timeout)
 }
@@ -2109,7 +2111,7 @@ fn connect_tcp_to_any_addr(
     port: &str,
     addrs: &[SocketAddr],
     request_timeout: Duration,
-) -> crate::Result<TcpStream> {
+) -> crate::Result<NoSigpipeTcp> {
     let mut failures = Vec::new();
     for addr in addrs {
         match TcpStream::connect(addr) {
@@ -2117,7 +2119,16 @@ fn connect_tcp_to_any_addr(
                 tcp.set_nodelay(true).ok();
                 tcp.set_read_timeout(Some(request_timeout)).ok();
                 tcp.set_write_timeout(Some(request_timeout)).ok();
-                return Ok(tcp);
+                let sock = socket2::SockRef::from(&tcp);
+                sock.set_send_buffer_size(4 * 1024 * 1024).ok();
+                sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
+                match NoSigpipeTcp::new(tcp) {
+                    Ok(wrapped) => return Ok(wrapped),
+                    Err(err) => {
+                        failures.push(format!("{addr}: SO_NOSIGPIPE setup failed: {err}"));
+                        continue;
+                    }
+                }
             }
             Err(io) => failures.push(format!("{addr}: {io}")),
         }
@@ -2351,18 +2362,22 @@ pub(crate) fn establish_connection(
             .map_err(|e| error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e))?;
         let mut conn = rustls::ClientConnection::new(cfg, server_name)
             .map_err(|e| error::fmt!(TlsError, "TLS handshake setup failed: {}", e))?;
-        tcp.set_read_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
+        tcp.tcp()
+            .set_read_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
             .ok();
-        tcp.set_write_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
+        tcp.tcp()
+            .set_write_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
             .ok();
         complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, QWP_WS_TLS_HANDSHAKE_TIMEOUT)?;
         let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
         tls_stream
             .get_ref()
+            .tcp()
             .set_read_timeout(Some(request_timeout))
             .ok();
         tls_stream
             .get_ref()
+            .tcp()
             .set_write_timeout(Some(request_timeout))
             .ok();
         // The shared `upgrade()` does both the request write and the
@@ -2371,6 +2386,7 @@ pub(crate) fn establish_connection(
         // read_timeout), and the response read is what auth_timeout bounds.
         tls_stream
             .get_ref()
+            .tcp()
             .set_read_timeout(Some(auth_timeout))
             .ok();
         let extras =
@@ -2391,7 +2407,7 @@ pub(crate) fn establish_connection(
         )
     } else {
         let mut plain_stream = tcp;
-        plain_stream.set_read_timeout(Some(auth_timeout)).ok();
+        plain_stream.tcp().set_read_timeout(Some(auth_timeout)).ok();
         let extras =
             codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
         let handshake =
@@ -3313,8 +3329,8 @@ mod tests {
 
         let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout).unwrap();
 
-        assert_eq!(tcp.read_timeout().unwrap(), Some(io_timeout));
-        assert_eq!(tcp.write_timeout().unwrap(), Some(io_timeout));
+        assert_eq!(tcp.tcp().read_timeout().unwrap(), Some(io_timeout));
+        assert_eq!(tcp.tcp().write_timeout().unwrap(), Some(io_timeout));
         drop(tcp);
         let _ = accepted.join().unwrap();
     }

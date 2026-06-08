@@ -11,6 +11,8 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 libc = "0.2"
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
+arrow = { version = "58", optional = true, default-features = false, features = ["ffi"] }
+arrow-array = { version = "58", optional = true, default-features = false }
 
 [dependencies.questdb-rs]
 path = "../questdb-rs"
@@ -40,6 +42,19 @@ confstr-ffi = ["dep:questdb-confstr-ffi"]
 # dependency. The in-tree CMake build enables it via
 # `corrosion_import_crate(FEATURES sync-reader-ws ...)`.
 sync-reader-ws = ["questdb-rs/sync-reader-ws", "questdb-rs/compression-zstd"]
+
+# Apache Arrow integration (egress + ingress over QWP/WS). Adds the
+# `line_reader_cursor_next_arrow_batch` C export (egress) and the
+# `column_sender_chunk_append_arrow_column` / `column_sender_flush_arrow_batch[_at_column]`
+# exports (ingress), plus the Arrow C Data Interface struct
+# declarations. See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
+arrow = [
+    "sync-reader-ws",
+    "questdb-rs/arrow",
+    "questdb-rs/sync-sender-qwp-ws",
+    "dep:arrow",
+    "dep:arrow-array",
+]
 # Compile in support for the `tls_verify=unsafe_off` connect-string knob.
 # Off by default: a shipped C ABI binary should not silently allow
 # downstream callers to disable certificate verification. Distributions
@@ -59,3 +74,9 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false

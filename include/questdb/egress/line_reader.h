@@ -35,7 +35,7 @@ extern "C" {
 
 /* Reuse `line_sender_utf8` for validated UTF-8 strings, and the
    `QUESTDB_CLIENT_API` / `QUESTDB_CLIENT_DYN_LIB` linkage macros. */
-#include "../ingress/line_sender.h"
+#include <questdb/ingress/line_sender.h>
 
 /////////// Thread safety.
 //
@@ -193,6 +193,23 @@ typedef enum line_reader_error_code
      *  connect failover (before any batch is yielded) is unaffected
      *  and remains transparent. */
     line_reader_error_failover_would_duplicate = 21,
+    /** Streaming Arrow adapter saw a mid-stream schema change. The
+     *  cursor remains usable; its pinned schema snapshot is cleared
+     *  by this error, so the next
+     *  `line_reader_cursor_next_arrow_batch` call snapshots the new
+     *  schema and resumes streaming. The batch that triggered the
+     *  drift is discarded — re-issue the query if you need it. Only
+     *  emitted when the `arrow` feature is enabled. */
+    line_reader_error_schema_drift = 22,
+    /** `line_reader_cursor_next_arrow_batch` was called on a stream
+     *  that terminated before any batch was produced — no schema to
+     *  snapshot. Only emitted when the `arrow` feature is enabled. */
+    line_reader_error_no_schema = 23,
+    /** Arrow C Data Interface export failed (arrow-rs rejected the
+     *  produced `ArrayData`'s invariants). Indicates a client bug —
+     *  not user-recoverable. Only emitted when the `arrow` feature
+     *  is enabled. */
+    line_reader_error_arrow_export = 24,
 } line_reader_error_code;
 
 /**
@@ -330,6 +347,58 @@ line_reader* line_reader_from_env(
  */
 QUESTDB_CLIENT_API
 void line_reader_close(line_reader* reader);
+
+/**
+ * Mark a pool-borrowed reader for must-close: the next
+ * `line_reader_close` will drop the reader instead of returning it
+ * to the pool. No-op on standalone readers (they're dropped on
+ * close regardless) and on NULL handles.
+ *
+ * Use this when the cursor lifecycle detected a state that makes
+ * the reader unsafe to recycle — e.g. a cursor abandoned mid-stream,
+ * which causes the Rust `Cursor::Drop` to tear down the transport.
+ */
+QUESTDB_CLIENT_API
+void line_reader_mark_must_close(line_reader* reader);
+
+/* Reader pool (provided by `questdb/ingress/column_sender.h`'s
+ * `questdb_db` opaque). Same FFI surface as the writer-side
+ * `questdb_db_borrow_conn` / `_return_conn`, but for `line_reader`
+ * handles. Lives here because it wraps the `line_reader` type. */
+struct questdb_db;
+
+/**
+ * Borrow a reader from the egress pool. Returns NULL and sets
+ * `*err_out` on failure (pool exhausted, transport failure, etc.).
+ *
+ * The returned `line_reader*` is equivalent to one constructed via
+ * `line_reader_from_conf`. On `line_reader_close` the reader is
+ * returned to the pool (or dropped if `line_reader_mark_must_close`
+ * was called first).
+ */
+QUESTDB_CLIENT_API
+line_reader* questdb_db_borrow_reader(
+    struct questdb_db* db,
+    line_reader_error** err_out);
+
+/**
+ * Return a borrowed reader to the pool. Invalidates `reader`.
+ * Accepts NULL `reader` and no-ops. `db` is ignored — the reader
+ * carries its own pool back-reference — but kept in the ABI for
+ * symmetry with the borrow call.
+ */
+QUESTDB_CLIENT_API
+void questdb_db_return_reader(
+    struct questdb_db* db,
+    line_reader* reader);
+
+/** Snapshot of idle reader count. Internal / test-only. */
+QUESTDB_CLIENT_API
+size_t questdb_db_reader_free_count(struct questdb_db* db);
+
+/** Snapshot of in-use reader count. Internal / test-only. */
+QUESTDB_CLIENT_API
+size_t questdb_db_reader_in_use_count(struct questdb_db* db);
 
 /**
  * Peek at the reader's active-query flag.
@@ -1747,6 +1816,87 @@ static inline bool line_reader_column_data_get_symbol(
     *out_len = (size_t)e.length;
     return true;
 }
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+/* Canonical Apache Arrow C Data Interface boilerplate. Guarded by
+ * `ARROW_C_DATA_INTERFACE` so it composes safely with the identical
+ * block in `column_sender.h`, with arrow.h, nanoarrow, polars-arrow,
+ * and any other header that ships the same definitions.
+ * https://arrow.apache.org/docs/format/CDataInterface.html */
+#ifndef ARROW_C_DATA_INTERFACE
+#    define ARROW_C_DATA_INTERFACE
+
+#    define ARROW_FLAG_DICTIONARY_ORDERED 1
+#    define ARROW_FLAG_NULLABLE 2
+#    define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema
+{
+    const char* format;
+    const char* name;
+    const char* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
+    void (*release)(struct ArrowSchema*);
+    void* private_data;
+};
+
+struct ArrowArray
+{
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
+
+
+/**
+ * Tri-state return for `line_reader_cursor_next_arrow_batch`.
+ */
+typedef enum line_reader_arrow_batch_result
+{
+    /** A batch was decoded and `out_array` / `out_schema` are populated. */
+    line_reader_arrow_batch_ok = 0,
+    /** End of stream; `out_*` are unchanged and no error was produced. */
+    line_reader_arrow_batch_end = 1,
+    /** Decode failed; `out_*` are unchanged and `out_err` is populated. */
+    line_reader_arrow_batch_error = 2,
+} line_reader_arrow_batch_result;
+
+/**
+ * Advance the cursor by one RESULT_BATCH and export it as an Arrow
+ * C Data Interface array + schema. `out_array` / `out_schema` must be
+ * caller-allocated AND uninitialised on each call: either zero-initialised
+ * memory or storage whose previous `release` callback has already been
+ * invoked. The implementation overwrites the slots without inspecting
+ * their prior contents, so a non-released previous result would leak its
+ * buffers. On `_ok` the slots are filled in place and the caller owns
+ * the new release callback contract. On `_end` / `_error` they are left
+ * untouched.
+ *
+ * Mid-stream schema drift (the underlying QuestDB table altered between
+ * batches) surfaces as `line_reader_error_schema_drift` (= 22) on the
+ * call that detects it; the cursor's pinned schema snapshot is then
+ * cleared so the next call snapshots the new schema and resumes. The
+ * batch that triggered the drift is discarded.
+ */
+QUESTDB_CLIENT_API
+line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(
+    line_reader_cursor* cursor,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema,
+    line_reader_error** err_out);
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
 }

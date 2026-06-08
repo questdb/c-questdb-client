@@ -37,6 +37,10 @@ def main():
         'test_line_reader_mock',
         'line_reader_c_smoke',
         'test_line_reader',  # live-broker; skips per-test when no broker reachable
+        'test_arrow_c',
+        'test_arrow_egress',
+        'test_arrow_ingress',
+        'test_column_sender',
     ]
     test_paths = [
         (d, find_binary(d, name, exe_suffix))
@@ -45,7 +49,7 @@ def main():
     ]
 
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    qdb_v = '9.2.0'  # The version of QuestDB we'll test against.
+    qdb_v = '9.4.1'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
@@ -64,7 +68,14 @@ def main():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test',
+            '--features=almost-all-features,arrow,polars',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-ws,arrow',
+            '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
+    run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
     for _, path in test_paths:
         run_cmd(str(path))
     run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')

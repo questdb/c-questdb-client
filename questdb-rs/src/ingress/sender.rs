@@ -85,7 +85,7 @@ pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
 pub use qwp_ws_ownership::*;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-mod qwp_ws;
+pub(crate) mod qwp_ws;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws::*;

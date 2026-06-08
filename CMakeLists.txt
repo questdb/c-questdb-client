@@ -71,6 +71,11 @@ option(
     "Build the C/C++ tests with -fsanitize=address,undefined."
     OFF)
 
+option(
+    QUESTDB_ENABLE_ARROW
+    "Build with Apache Arrow C Data Interface exports. Opt-in: pulls arrow-rs."
+    OFF)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
@@ -80,6 +85,13 @@ if(QUESTDB_ENABLE_READER)
 endif()
 if(QUESTDB_ENABLE_INSECURE_SKIP_VERIFY)
     list(APPEND QUESTDB_CARGO_FEATURES insecure-skip-verify)
+endif()
+if(QUESTDB_TESTS_AND_EXAMPLES AND NOT QUESTDB_ENABLE_ARROW)
+    message(STATUS "QUESTDB_TESTS_AND_EXAMPLES=ON: enabling QUESTDB_ENABLE_ARROW")
+    set(QUESTDB_ENABLE_ARROW ON)
+endif()
+if(QUESTDB_ENABLE_ARROW)
+    list(APPEND QUESTDB_CARGO_FEATURES arrow)
 endif()
 if(QUESTDB_CARGO_FEATURES)
     corrosion_import_crate(
@@ -94,6 +106,9 @@ endif()
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(QUESTDB_ENABLE_ARROW)
+    target_compile_definitions(questdb_client INTERFACE QUESTDB_CLIENT_ENABLE_ARROW)
+endif()
 if(WIN32)
     set_target_properties(
         questdb_client-shared
@@ -280,6 +295,26 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_reader_c_example_columns
         examples/line_reader_c_example_columns.c)
+    compile_example(
+        line_reader_c_example_arrow
+        examples/line_reader_c_example_arrow.c)
+
+    find_package(Arrow QUIET)
+    if(Arrow_FOUND)
+        compile_example(
+            line_sender_cpp_example_arrow
+            examples/line_sender_cpp_example_arrow.cpp)
+        target_link_libraries(
+            line_sender_cpp_example_arrow Arrow::arrow_shared)
+        compile_example(
+            line_reader_cpp_example_arrow
+            examples/line_reader_cpp_example_arrow.cpp)
+        target_link_libraries(
+            line_reader_cpp_example_arrow Arrow::arrow_shared)
+    else()
+        message(STATUS
+            "arrow-cpp not found; skipping line_{sender,reader}_cpp_example_arrow.")
+    endif()
 
     # Include Rust tests as part of the tests run
     add_test(
@@ -357,6 +392,28 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_line_reader_mock
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_line_reader_mock.cpp)
+
+    # Apache Arrow C Data Interface tests. The fatal_error gate above
+    # forces QUESTDB_ENABLE_ARROW=ON when tests are enabled, so these
+    # always build alongside the rest of the suite.
+    compile_test(
+        test_arrow_c
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/qwp_mock_c.cpp
+        cpp_test/test_arrow_c.c)
+    compile_test(
+        test_arrow_egress
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/test_arrow_egress.cpp)
+    compile_test(
+        test_arrow_ingress
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/test_arrow_ingress.cpp)
+
+    compile_test(
+        test_column_sender
+        cpp_test/qwp_mock_server.cpp
+        cpp_test/test_column_sender.cpp)
 
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,

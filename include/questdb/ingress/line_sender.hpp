@@ -98,7 +98,7 @@ public:
             protocol_version::v1,
             init_buf_size,
             max_name_len,
-            true};
+            _backend_kind::qwp_udp};
     }
 
     line_sender_buffer(const line_sender_buffer& other)
@@ -110,7 +110,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
     }
@@ -120,7 +120,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
         other._impl = nullptr;
@@ -142,7 +142,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
         }
         return *this;
     }
@@ -156,7 +156,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
             other._impl = nullptr;
         }
         return *this;
@@ -1137,17 +1137,23 @@ public:
     }
 
 private:
+    enum class _backend_kind
+    {
+        ilp,
+        qwp_udp
+    };
+
     line_sender_buffer(
         ::line_sender_buffer* impl,
         protocol_version version,
         size_t init_buf_size,
         size_t max_name_len,
-        bool is_qwp = false) noexcept
+        _backend_kind backend = _backend_kind::ilp) noexcept
         : _impl{impl}
         , _protocol_version{version}
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
-        , _is_qwp{is_qwp}
+        , _backend{backend}
     {
     }
 
@@ -1156,17 +1162,18 @@ private:
         if (!_impl)
         {
             ::line_sender_buffer* tmp = nullptr;
-            if (_is_qwp)
+            switch (_backend)
             {
+            case _backend_kind::qwp_udp:
                 tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
                     _max_name_len);
-            }
-            else
-            {
+                break;
+            case _backend_kind::ilp:
                 tmp = ::line_sender_buffer_with_max_name_len(
                     static_cast<::line_sender_protocol_version>(
                         static_cast<int>(_protocol_version)),
                     _max_name_len);
+                break;
             }
             try
             {
@@ -1186,7 +1193,7 @@ private:
     protocol_version _protocol_version;
     size_t _init_buf_size;
     size_t _max_name_len;
-    bool _is_qwp{false};
+    _backend_kind _backend{_backend_kind::ilp};
 
     friend class line_sender;
 };
@@ -1791,9 +1798,11 @@ public:
     /**
      * Construct a new line buffer with the sender's configured settings.
      *
-     * This is the preferred protocol-neutral constructor. It may produce a
-     * different buffer implementation than `line_sender_buffer{protocol_version()}`
-     * when the sender uses QWP-over-UDP or QWP-over-WebSocket.
+     * Returns an ILP buffer for the ILP/TCP and ILP/HTTP transports, and a
+     * QWP/UDP buffer for the QWP-over-UDP transport. Throws
+     * `invalid_api_call` for QWP-over-WebSocket transports — those senders
+     * publish through the column-major `column_sender` chunk API instead;
+     * see `<questdb/ingress/column_sender.hpp>`.
      */
     line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {
@@ -1801,9 +1810,17 @@ public:
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto sender_protocol = this->protocol();
-        bool is_qwp = sender_protocol == protocol::qwpudp ||
-            sender_protocol == protocol::qwpws ||
-            sender_protocol == protocol::qwpwss;
+        if (sender_protocol == protocol::qwpws ||
+            sender_protocol == protocol::qwpwss)
+        {
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket senders do not produce row-by-row buffers; "
+                "use the column_sender chunk API instead."};
+        }
+        auto backend = line_sender_buffer::_backend_kind::ilp;
+        if (sender_protocol == protocol::qwpudp)
+            backend = line_sender_buffer::_backend_kind::qwp_udp;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         try
         {
@@ -1816,11 +1833,7 @@ public:
             throw;
         }
         return line_sender_buffer{
-            raw_buffer,
-            version,
-            init_buf_size,
-            max_name_len,
-            is_qwp};
+            raw_buffer, version, init_buf_size, max_name_len, backend};
     }
 
     /**

@@ -46,9 +46,9 @@ use std::net::{Shutdown, TcpStream};
 
 use bytes::{Bytes, BytesMut};
 
-use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::frame::{FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::MaskKeySource;
+use crate::ws::nosigpipe::NoSigpipeTcp;
 
 /// Initial recv buffer capacity. Sized to fit a typical multi-MB QWP
 /// `RESULT_BATCH` in a single `read()` syscall: the batch wire cap is

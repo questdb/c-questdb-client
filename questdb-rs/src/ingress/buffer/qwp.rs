@@ -109,7 +109,7 @@ pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
 const QWP_LONG256_BYTES: usize = 32;
 pub(crate) const QWP_VERSION_1: u8 = 1;
 const QWP_INLINE_SCHEMA_ID: u64 = 0;
-const QWP_DECIMAL_MAX_SCALE: u8 = 76;
+pub(crate) const QWP_DECIMAL_MAX_SCALE: u8 = 76;
 const QWP_DECIMAL_SCALE_UNSET: u8 = u8::MAX;
 const QWP_DECIMAL_MAG_LIMBS: usize = 4;
 const QWP_DECIMAL_MAG_BYTES: usize = QWP_DECIMAL_MAG_LIMBS * 8;
@@ -565,7 +565,7 @@ impl DecimalValue {
 // --- Column kind ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColumnKind {
+pub(crate) enum ColumnKind {
     Bool,
     Symbol,
     I8,
@@ -2250,7 +2250,7 @@ struct QwpWsMarker {
 
 #[cfg(feature = "_sender-qwp-ws")]
 type QwpWsSymbolHashMap<V> =
-    std::collections::HashMap<Vec<u8>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
+    std::collections::HashMap<std::sync::Arc<[u8]>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
 
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_WS_SYMBOL_HASH_OFFSET: u64 = 0xcbf29ce484222325;
@@ -2423,7 +2423,7 @@ struct QwpWsTableBuffer {
     in_progress_column_count: usize,
     column_access_cursor: usize,
     columns: Vec<QwpWsColumnBuffer>,
-    column_lookup: std::collections::HashMap<String, usize>,
+    column_lookup: std::collections::HashMap<Box<[u8]>, usize>,
     row_mark: Option<QwpWsRowRollbackMark>,
 }
 
@@ -2431,8 +2431,9 @@ struct QwpWsTableBuffer {
 #[derive(Clone, Debug)]
 struct QwpWsColumnBuffer {
     name: Vec<u8>,
-    lower_ascii_name: Vec<u8>,
+    lower_name: Vec<u8>,
     packed_lower_ascii_name: u64,
+    name_is_ascii: bool,
     kind: ColumnKind,
     last_written_row: Option<u32>,
     non_null_count: u32,
@@ -2721,8 +2722,7 @@ impl QwpWsColumnarBuffer {
             cap += table.table_name.capacity();
             cap += table.columns.capacity() * std::mem::size_of::<QwpWsColumnBuffer>();
             for column in &table.columns {
-                cap +=
-                    column.name.capacity() + column.lower_ascii_name.capacity() + column.capacity();
+                cap += column.name.capacity() + column.lower_name.capacity() + column.capacity();
             }
         }
         cap
@@ -3559,6 +3559,16 @@ impl QwpWsColumnarBuffer {
         global_dict: &mut SymbolGlobalDict,
         version: u8,
     ) -> crate::Result<()> {
+        self.encode_ws_replay_message_with_defer(scratch, global_dict, version, false)
+    }
+
+    pub(crate) fn encode_ws_replay_message_with_defer(
+        &self,
+        scratch: &mut QwpWsEncodeScratch,
+        global_dict: &mut SymbolGlobalDict,
+        version: u8,
+        defer_commit: bool,
+    ) -> crate::Result<()> {
         self.check_can_flush()?;
         let out = &mut scratch.message;
         out.clear();
@@ -3584,7 +3594,7 @@ impl QwpWsColumnarBuffer {
                     for entry in dict {
                         let bytes =
                             &data[entry.offset as usize..(entry.offset + entry.len) as usize];
-                        let (gid, _) = global_dict.intern(bytes);
+                        let (gid, _) = global_dict.intern(bytes)?;
                         highest_referenced_symbol_id = Some(
                             highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
                         );
@@ -3650,7 +3660,11 @@ impl QwpWsColumnarBuffer {
         let header = QwpMessageHeader {
             magic: *b"QWP1",
             version,
-            flags: QWP_FLAG_DELTA_SYMBOL_DICT,
+            flags: if defer_commit {
+                QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_DEFER_COMMIT
+            } else {
+                QWP_FLAG_DELTA_SYMBOL_DICT
+            },
             table_count,
             payload_len: checked_qwp_u32(
                 out.len() - payload_start,
@@ -3714,9 +3728,12 @@ impl QwpWsTableBuffer {
 
     #[inline(always)]
     fn lookup_column(&mut self, name: &[u8]) -> crate::Result<Option<usize>> {
-        if self.column_access_cursor < self.columns.len()
+        let name_is_ascii = name.is_ascii();
+        if name_is_ascii
+            && self.column_access_cursor < self.columns.len()
+            && self.columns[self.column_access_cursor].name_is_ascii
             && names_equal_lower_ascii(
-                &self.columns[self.column_access_cursor].lower_ascii_name,
+                &self.columns[self.column_access_cursor].lower_name,
                 self.columns[self.column_access_cursor].packed_lower_ascii_name,
                 name,
             )
@@ -3724,11 +3741,22 @@ impl QwpWsTableBuffer {
             return Ok(Some(self.column_access_cursor));
         }
 
+        if name_is_ascii {
+            let mut stack: [u8; 128] = [0; 128];
+            if name.len() <= stack.len() {
+                for (dst, src) in stack[..name.len()].iter_mut().zip(name.iter()) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                if let Some(&idx) = self.column_lookup.get(&stack[..name.len()]) {
+                    return Ok(Some(idx));
+                }
+                return Ok(None);
+            }
+        }
         let lookup_key = column_lookup_key(name)?;
-        if let Some(&idx) = self.column_lookup.get(&lookup_key) {
+        if let Some(&idx) = self.column_lookup.get(&lookup_key[..]) {
             return Ok(Some(idx));
         }
-
         Ok(None)
     }
 
@@ -3754,10 +3782,16 @@ impl QwpWsTableBuffer {
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsColumnBuffer {
     fn new(name: &[u8], kind: ColumnKind) -> Self {
+        let name_is_ascii = name.is_ascii();
         Self {
             name: name.to_vec(),
-            lower_ascii_name: lowercase_ascii_bytes(name),
-            packed_lower_ascii_name: packed_lower_ascii_name(name),
+            lower_name: lowercase_name_bytes(name, name_is_ascii),
+            packed_lower_ascii_name: if name_is_ascii {
+                packed_lower_ascii_name(name)
+            } else {
+                0
+            },
+            name_is_ascii,
             kind,
             last_written_row: None,
             non_null_count: 0,
@@ -4934,8 +4968,14 @@ impl QwpWsColumnValues {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn lowercase_ascii_bytes(name: &[u8]) -> Vec<u8> {
-    name.iter().map(|byte| byte.to_ascii_lowercase()).collect()
+fn lowercase_name_bytes(name: &[u8], is_ascii: bool) -> Vec<u8> {
+    if is_ascii {
+        return name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    }
+    match std::str::from_utf8(name) {
+        Ok(s) => s.to_lowercase().into_bytes(),
+        Err(_) => name.iter().map(|b| b.to_ascii_lowercase()).collect(),
+    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -4992,15 +5032,8 @@ fn names_equal_lower_ascii(left_lower: &[u8], packed_left_lower: u64, right: &[u
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn column_lookup_key(name: &[u8]) -> crate::Result<String> {
-    let name = std::str::from_utf8(name).map_err(|err| {
-        error::fmt!(
-            InvalidApiCall,
-            "internal QWP/WS column name is not UTF-8: {}",
-            err
-        )
-    })?;
-    Ok(name.to_lowercase())
+fn column_lookup_key(name: &[u8]) -> crate::Result<Box<[u8]>> {
+    Ok(lowercase_name_bytes(name, name.is_ascii()).into_boxed_slice())
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5019,7 +5052,6 @@ fn batched_type_change_error_ws(entry_name: &[u8]) -> crate::Error {
     }
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
 fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
     batched_type_change_error_ws(entry_name)
 }
@@ -5028,6 +5060,8 @@ fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
 
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 
 /// Connection-scoped global symbol dictionary used by the QWP/WebSocket
 /// transport's delta-symbol-dict mode.
@@ -5036,13 +5070,24 @@ const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 /// WebSocket connection. New symbols added during a flush are recorded in the
 /// per-message delta section so the server can rebuild the same global
 /// dictionary; on reconnect both sides reset.
+///
+/// Capped at [`MAX_CONN_SYMBOL_DICT_SIZE`] to mirror the server's
+/// connection-scoped dictionary ceiling and the Java reference client.
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Default)]
 pub(crate) struct SymbolGlobalDict {
     map: QwpWsSymbolHashMap<u64>,
-    entries: Vec<Vec<u8>>,
+    entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
 }
+
+/// Per-connection cap on the QWP/WS global symbol dictionary. Matches
+/// `MAX_CONN_DICT_SIZE` in the egress reader (`egress/symbol_dict.rs`)
+/// and the Java reference client. When the cap is reached the encoder
+/// surfaces an `InvalidApiCall` error and the caller is expected to
+/// reconnect (which resets both sides).
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 8_388_608;
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
@@ -5066,6 +5111,13 @@ impl SymbolGlobalDict {
         self.next_id
     }
 
+    /// Number of global ids assigned so far. The column-sender encoder
+    /// uses this as the `delta_start` field of the delta-symbol-dict
+    /// prefix.
+    pub(crate) fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     pub(crate) fn mark(&self) -> SymbolGlobalDictMark {
         SymbolGlobalDictMark {
             entries_len: self.entries.len(),
@@ -5076,28 +5128,43 @@ impl SymbolGlobalDict {
     pub(crate) fn rollback(&mut self, mark: SymbolGlobalDictMark) {
         while self.entries.len() > mark.entries_len {
             if let Some(entry) = self.entries.pop() {
-                self.map.remove(entry.as_slice());
+                self.map.remove(entry.as_ref());
             }
         }
         self.next_id = mark.next_id;
     }
 
-    fn entry(&self, id: u64) -> Option<&[u8]> {
+    pub(crate) fn entry(&self, id: u64) -> Option<&[u8]> {
         let index = usize::try_from(id).ok()?;
-        self.entries.get(index).map(Vec::as_slice)
+        self.entries.get(index).map(|a| a.as_ref())
     }
 
-    /// Returns `(global_id, is_new)`.
-    fn intern(&mut self, bytes: &[u8]) -> (u64, bool) {
+    /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if
+    /// the dictionary has reached [`MAX_CONN_SYMBOL_DICT_SIZE`].
+    pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
         if let Some(&id) = self.map.get(bytes) {
-            return (id, false);
+            return Ok((id, false));
         }
+        if self.entries.len() >= MAX_CONN_SYMBOL_DICT_SIZE {
+            return Err(crate::error::fmt!(
+                InvalidApiCall,
+                "QWP/WS connection-scoped symbol dictionary reached its \
+                 {MAX_CONN_SYMBOL_DICT_SIZE}-entry cap; drop and reopen \
+                 the connection to reset the dictionary"
+            ));
+        }
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
+        self.map
+            .try_reserve(1)
+            .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
+        let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        let owned = bytes.to_vec();
-        self.entries.push(owned.clone());
+        self.entries.push(std::sync::Arc::clone(&owned));
         self.map.insert(owned, id);
-        (id, true)
+        self.next_id += 1;
+        Ok((id, true))
     }
 }
 
@@ -5250,7 +5317,7 @@ impl QwpBuffer {
                         let entry = &planner.symbol_dict[cursor as usize];
                         let range = entry.value.0.as_range();
                         let bytes = &self.value_bytes[range.clone()];
-                        let (gid, is_new) = global_dict.intern(bytes);
+                        let (gid, is_new) = global_dict.intern(bytes)?;
                         globals_for_col.push(gid);
                         if is_new {
                             new_symbol_ranges.push(range);
@@ -5388,7 +5455,7 @@ impl QwpBuffer {
                         let entry = &planner.symbol_dict[cursor as usize];
                         let range = entry.value.0.as_range();
                         let bytes = &self.value_bytes[range];
-                        let (gid, _) = global_dict.intern(bytes);
+                        let (gid, _) = global_dict.intern(bytes)?;
                         highest_referenced_symbol_id = Some(
                             highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
                         );
