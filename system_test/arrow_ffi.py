@@ -212,6 +212,15 @@ _conn_must_close = _setsig(
     ctypes.POINTER(_QwpwsConn),
 )
 
+class _ColumnSenderArrowOverride(ctypes.Structure):
+    _fields_ = [
+        ("column", ctypes.c_char_p),
+        ("column_len", ctypes.c_size_t),
+        ("kind", ctypes.c_uint32),
+        ("arg", ctypes.c_uint32),
+    ]
+
+
 # Conn-level Arrow batch flush.
 _flush_arrow_batch = _setsig(
     "column_sender_flush_arrow_batch",
@@ -220,6 +229,8 @@ _flush_arrow_batch = _setsig(
     _LineSenderTableName,
     ctypes.POINTER(ArrowArray),
     ctypes.POINTER(ArrowSchema),
+    ctypes.POINTER(_ColumnSenderArrowOverride),
+    ctypes.c_size_t,
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
@@ -231,6 +242,8 @@ _flush_arrow_batch_at_column = _setsig(
     ctypes.POINTER(ArrowArray),
     ctypes.POINTER(ArrowSchema),
     c_line_sender_column_name,
+    ctypes.POINTER(_ColumnSenderArrowOverride),
+    ctypes.c_size_t,
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
@@ -278,6 +291,7 @@ def conn_flush_arrow_batch(
     variant when `ts_column_name` is set). Consumes `array_ptr`'s
     ownership; `schema_ptr` remains the caller's."""
     err_ref = ctypes.POINTER(_LineSenderError)()
+    overrides_ptr = ctypes.POINTER(_ColumnSenderArrowOverride)()
     if ts_column_name:
         ts_col = c_line_sender_column_name(
             len(ts_column_name),
@@ -289,6 +303,8 @@ def conn_flush_arrow_batch(
             array_ptr,
             schema_ptr,
             ts_col,
+            overrides_ptr,
+            0,
             ctypes.byref(err_ref),
         )
     else:
@@ -297,6 +313,8 @@ def conn_flush_arrow_batch(
             table_name,
             array_ptr,
             schema_ptr,
+            overrides_ptr,
+            0,
             ctypes.byref(err_ref),
         )
     if not ok:
