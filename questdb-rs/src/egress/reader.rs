@@ -190,6 +190,25 @@ const _: fn() = || {
     assert_send_sync::<HostHealthTracker>();
 };
 
+// Two blanket impls of the same trait force method-resolution ambiguity
+// iff the target type IS `Send`; the call thus compiles only when the
+// type is `!Send`.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn _disambiguate() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    fn assert_not_send<T: ?Sized>() {
+        let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
+    }
+    assert_not_send::<crate::egress::Cursor<'_>>();
+    #[cfg(feature = "arrow")]
+    assert_not_send::<crate::egress::arrow::CursorRecordBatchReader<'_, '_>>();
+    #[cfg(feature = "polars")]
+    assert_not_send::<crate::egress::arrow::polars::CursorPolarsIter<'_, '_>>();
+};
+
 impl Reader {
     /// Open a new connection from a connect string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
@@ -1442,6 +1461,156 @@ impl<'r> Cursor<'r> {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Wrap this cursor as an Arrow [`RecordBatchReader`]. Blocks until
+    /// the first `RESULT_BATCH` is decoded, then snapshots its schema.
+    /// Mid-stream schema drift poisons the adapter; re-wrap to resume.
+    /// Returns [`ErrorCode::NoSchema`] if the stream terminates before
+    /// any batch is produced.
+    ///
+    /// [`RecordBatchReader`]: arrow_array::RecordBatchReader
+    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
+    #[cfg(feature = "arrow")]
+    pub fn as_arrow_reader<'c>(
+        &'c mut self,
+    ) -> Result<crate::egress::arrow::CursorRecordBatchReader<'r, 'c>> {
+        crate::egress::arrow::CursorRecordBatchReader::new(self)
+    }
+
+    /// Eagerly drain every batch and return them together with the
+    /// pinned Arrow schema. Symmetric with
+    /// [`Cursor::fetch_all_polars`](crate::egress::Cursor::fetch_all_polars).
+    /// Errors as [`ErrorCode::NoSchema`] if the stream ends without
+    /// producing a batch; surfaces drift as
+    /// [`ErrorCode::SchemaDrift`].
+    ///
+    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
+    /// [`ErrorCode::SchemaDrift`]: crate::egress::ErrorCode::SchemaDrift
+    #[cfg(feature = "arrow")]
+    pub fn fetch_all_arrow(
+        &mut self,
+    ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>)> {
+        let mut reader = self.as_arrow_reader()?;
+        let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        for item in reader.by_ref() {
+            batches.push(item.map_err(|e| {
+                crate::egress::arrow::try_downcast_questdb(&e)
+                    .cloned()
+                    .unwrap_or_else(|| fmt!(ArrowExport, "{}", e))
+            })?);
+        }
+        Ok((reader.schema(), batches))
+    }
+
+    /// Drift-checked iterator over Polars [`DataFrame`](polars::frame::DataFrame)s,
+    /// one per QWP batch. Snapshots the first batch's Arrow schema
+    /// and yields `Err(SchemaDrift)` then terminates if a
+    /// later batch diverges. Returns `Err(NoSchema)` if the stream
+    /// ends before any batch is produced.
+    ///
+    /// Use this in preference to a `while let Some(df) = cursor.next_polars()?`
+    /// loop when you care about schema consistency mid-stream.
+    #[cfg(feature = "polars")]
+    pub fn iter_polars<'c>(&'c mut self) -> Result<crate::egress::arrow::CursorPolarsIter<'r, 'c>> {
+        crate::egress::arrow::CursorPolarsIter::new(self)
+    }
+
+    /// Next batch as an Arrow [`RecordBatch`](arrow_array::RecordBatch).
+    /// `Ok(None)` on stream end; replays terminal errors like
+    /// [`Cursor::next_batch`]. No drift check — use
+    /// [`Cursor::as_arrow_reader`] for that.
+    #[cfg(feature = "arrow")]
+    pub fn next_arrow_batch(&mut self) -> Result<Option<arrow_array::RecordBatch>> {
+        self.next_arrow_batch_inner(None)
+    }
+
+    #[cfg(feature = "arrow")]
+    #[doc(hidden)]
+    pub fn next_arrow_batch_inner(
+        &mut self,
+        expected_schema: Option<&arrow_schema::SchemaRef>,
+    ) -> Result<Option<arrow_array::RecordBatch>> {
+        use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch, schemas_equal};
+        use std::sync::Arc;
+
+        if self.done {
+            return match self.terminal_error.as_ref() {
+                Some(e) => Err(e.clone()),
+                None => Ok(None),
+            };
+        }
+        let outcome = match self.next_batch_inner() {
+            Ok(o) => o,
+            Err(e) => {
+                if self.done && self.terminal_error.is_none() {
+                    self.terminal_error = Some(e.clone());
+                }
+                return Err(e);
+            }
+        };
+        match outcome {
+            NextOutcome::Done => Ok(None),
+            NextOutcome::HaveBatch => {
+                let decoded = self
+                    .last_batch
+                    .take()
+                    .expect("HaveBatch implies last_batch");
+                let egress_schema = match self.reader.registry.get(decoded.schema_id) {
+                    Some(s) => s.clone(),
+                    None => {
+                        let e = fmt!(
+                            ProtocolError,
+                            "schema id {} missing from registry",
+                            decoded.schema_id
+                        );
+                        self.stash_arrow_terminal_error(&e);
+                        return Err(e);
+                    }
+                };
+                let arrow_schema = match batch_arrow_schema(&egress_schema, &decoded) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        self.stash_arrow_terminal_error(&e);
+                        return Err(e);
+                    }
+                };
+                if let Some(expected) = expected_schema
+                    && !schemas_equal(expected.as_ref(), arrow_schema.as_ref())
+                {
+                    let e = fmt!(
+                        SchemaDrift,
+                        "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
+                        decoded.batch_seq
+                    );
+                    // Discard the drift batch but keep the cursor live —
+                    // the caller may re-pin and resume from the next batch.
+                    return Err(e);
+                }
+                match batch_to_record_batch(
+                    arrow_schema,
+                    &egress_schema,
+                    decoded,
+                    &self.reader.dict,
+                ) {
+                    Ok(rb) => Ok(Some(rb)),
+                    Err(e) => {
+                        self.stash_arrow_terminal_error(&e);
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    // Replay-contract stash for errors that bypass `next_batch_inner`
+    // (schema drift, batch_to_record_batch). Cursor stays live.
+    #[cfg(feature = "arrow")]
+    fn stash_arrow_terminal_error(&mut self, err: &Error) {
+        self.done = true;
+        if self.terminal_error.is_none() {
+            self.terminal_error = Some(err.clone());
         }
     }
 

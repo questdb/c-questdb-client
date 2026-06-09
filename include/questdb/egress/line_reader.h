@@ -35,7 +35,7 @@ extern "C" {
 
 /* Reuse `line_sender_utf8` for validated UTF-8 strings, and the
    `QUESTDB_CLIENT_API` / `QUESTDB_CLIENT_DYN_LIB` linkage macros. */
-#include "../ingress/line_sender.h"
+#include <questdb/ingress/line_sender.h>
 
 /////////// Thread safety.
 //
@@ -193,6 +193,23 @@ typedef enum line_reader_error_code
      *  connect failover (before any batch is yielded) is unaffected
      *  and remains transparent. */
     line_reader_error_failover_would_duplicate = 21,
+    /** Streaming Arrow adapter saw a mid-stream schema change. The
+     *  cursor remains usable; its pinned schema snapshot is cleared
+     *  by this error, so the next
+     *  `line_reader_cursor_next_arrow_batch` call snapshots the new
+     *  schema and resumes streaming. The batch that triggered the
+     *  drift is discarded — re-issue the query if you need it. Only
+     *  emitted when the `arrow` feature is enabled. */
+    line_reader_error_schema_drift = 22,
+    /** `line_reader_cursor_next_arrow_batch` was called on a stream
+     *  that terminated before any batch was produced — no schema to
+     *  snapshot. Only emitted when the `arrow` feature is enabled. */
+    line_reader_error_no_schema = 23,
+    /** Arrow C Data Interface export failed (arrow-rs rejected the
+     *  produced `ArrayData`'s invariants). Indicates a client bug —
+     *  not user-recoverable. Only emitted when the `arrow` feature
+     *  is enabled. */
+    line_reader_error_arrow_export = 24,
 } line_reader_error_code;
 
 /**
@@ -1747,6 +1764,46 @@ static inline bool line_reader_column_data_get_symbol(
     *out_len = (size_t)e.length;
     return true;
 }
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+
+/**
+ * Tri-state return for `line_reader_cursor_next_arrow_batch`.
+ */
+typedef enum line_reader_arrow_batch_result
+{
+    /** A batch was decoded and `out_array` / `out_schema` are populated. */
+    line_reader_arrow_batch_ok = 0,
+    /** End of stream; `out_*` are unchanged and no error was produced. */
+    line_reader_arrow_batch_end = 1,
+    /** Decode failed; `out_*` are unchanged and `out_err` is populated. */
+    line_reader_arrow_batch_error = 2,
+} line_reader_arrow_batch_result;
+
+/**
+ * Advance the cursor by one RESULT_BATCH and export it as an Arrow
+ * C Data Interface array + schema. `out_array` / `out_schema` must be
+ * caller-allocated AND uninitialised on each call: either zero-initialised
+ * memory or storage whose previous `release` callback has already been
+ * invoked. The implementation overwrites the slots without inspecting
+ * their prior contents, so a non-released previous result would leak its
+ * buffers. On `_ok` the slots are filled in place and the caller owns
+ * the new release callback contract. On `_end` / `_error` they are left
+ * untouched.
+ *
+ * Mid-stream schema drift (the underlying QuestDB table altered between
+ * batches) surfaces as `line_reader_error_schema_drift` (= 22) on the
+ * call that detects it; the cursor's pinned schema snapshot is then
+ * cleared so the next call snapshots the new schema and resumes. The
+ * batch that triggered the drift is discarded.
+ */
+QUESTDB_CLIENT_API
+line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(
+    line_reader_cursor* cursor,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema,
+    line_reader_error** err_out);
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
 }

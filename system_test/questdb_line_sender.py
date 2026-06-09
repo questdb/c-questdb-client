@@ -257,13 +257,12 @@ def _setup_cdll():
 
     set_sig(
         dll.line_sender_error_get_code,
-        c_line_sender_error_p,
         c_int,
-        c_void_p)
+        c_line_sender_error_p)
     set_sig(
         dll.line_sender_error_msg,
-        c_line_sender_error_p,
         c_void_p,
+        c_line_sender_error_p,
         c_size_t_p)
     set_sig(
         dll.line_sender_error_free,

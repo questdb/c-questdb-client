@@ -11,7 +11,7 @@ categories = ["database"]
 authors = ["Adam Cimarosti <adam@questdb.io>"]
 
 [package.metadata.docs.rs]
-features = ["almost-all-features"]
+features = ["almost-all-features", "arrow", "polars"]
 
 [lib]
 name = "questdb"
@@ -64,6 +64,22 @@ p12-keystore = { version = "0.2", optional = true }
 
 zstd = { version = "0.13", optional = true }
 
+# Apache Arrow integration. `ffi` feature enables Arrow C Data Interface
+# export. Pinned to a single major to match DataFusion's current major;
+# bump deliberately per release notes.
+arrow = { version = "58", optional = true, default-features = false, features = ["ffi"] }
+arrow-array = { version = "58", optional = true, default-features = false }
+arrow-schema = { version = "58", optional = true, default-features = false }
+arrow-buffer = { version = "58", optional = true, default-features = false }
+arrow-data = { version = "58", optional = true, default-features = false }
+# 64-byte aligned allocations for build-pass Arrow buffers (validity,
+# BOOLEAN bit-pack, ARRAY offsets, SYMBOL union dict).
+aligned-vec = { version = "0.6", optional = true }
+# Polars bridge via the Arrow C Data Interface. Tighter pin than arrow
+# because polars 0.x churns the ffi surface across minors.
+polars = { version = "0.53", optional = true, default-features = false, features = ["dtype-categorical"] }
+polars-arrow = { version = "0.53", optional = true, default-features = false, features = ["compute"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
@@ -79,6 +95,9 @@ slugify = "0.1.0"
 indoc = "2"
 
 [dev-dependencies]
+# Pulled in transitively by `arrow-array`; named explicitly here so unit
+# tests under `ingress::arrow::tests` can build `Float16Array` payloads.
+half = "2"
 socket2 = "0.6.1"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
@@ -172,6 +191,24 @@ sync-reader-ws = ["_egress", "_keystore-roots"]
 ## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
 compression-zstd = ["_egress", "dep:zstd"]
 
+## Arrow integration: streaming Cursor → RecordBatchReader (egress) and
+## RecordBatch → Buffer (ingress). Both directions ride QWP/WS.
+## See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
+arrow = [
+    "sync-reader-ws",
+    "_sender-qwp-ws",
+    "dep:arrow",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:arrow-buffer",
+    "dep:arrow-data",
+    "dep:aligned-vec",
+    "dep:bytes",
+]
+
+## Polars sub-feature. ~30 lines of wrappers on top of `arrow`.
+polars = ["arrow", "sync-reader-ws", "dep:polars", "dep:polars-arrow"]
+
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
 ## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
@@ -196,6 +233,9 @@ _keystore-roots = ["dep:jks", "dep:p12-keystore"]
 ## thus compiling with `--all-features` will not work.
 ## Instead use `--features almost-all-features`.
 ## This is useful for quickly running `cargo test` or `cargo clippy`.
+##
+## Excludes `arrow` / `polars`: those are opt-in. CI runs them separately
+## via `cargo test --features almost-all-features,arrow,polars`.
 almost-all-features = [
     "sync-sender",
     "sync-reader-ws",
@@ -254,6 +294,10 @@ required-features = ["sync-reader-ws"]
 [[example]]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "polars"
+required-features = ["polars", "sync-sender-qwp-ws"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR

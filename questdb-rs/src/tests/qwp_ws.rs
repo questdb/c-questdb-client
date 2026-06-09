@@ -4127,8 +4127,11 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     let zone_ignored = "qwpws::addr=localhost:9000;zone=dc-amsterdam;";
     SenderBuilder::from_conf(zone_ignored).unwrap();
 
-    let tcp_zone = "tcp::addr=localhost:9009;zone=dc-amsterdam;";
-    SenderBuilder::from_conf(tcp_zone).unwrap();
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        let tcp_zone = "tcp::addr=localhost:9009;zone=dc-amsterdam;";
+        SenderBuilder::from_conf(tcp_zone).unwrap();
+    }
 
     // Java Sender ignores unknown keys; this is parser compatibility, not
     // target-selection support.
@@ -4163,13 +4166,16 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
     let err = SenderBuilder::from_conf(zero_port).unwrap_err();
     assert!(err.msg().contains("invalid port"), "got: {}", err.msg());
 
-    let repeated_tcp_addr = "tcp::addr=localhost:9009;addr=localhost:9010;";
-    let err = SenderBuilder::from_conf(repeated_tcp_addr).unwrap_err();
-    assert!(
-        err.msg().contains("DuplicateKey") || err.msg().contains("duplicate"),
-        "got: {}",
-        err.msg()
-    );
+    #[cfg(feature = "sync-sender-tcp")]
+    {
+        let repeated_tcp_addr = "tcp::addr=localhost:9009;addr=localhost:9010;";
+        let err = SenderBuilder::from_conf(repeated_tcp_addr).unwrap_err();
+        assert!(
+            err.msg().contains("DuplicateKey") || err.msg().contains("duplicate"),
+            "got: {}",
+            err.msg()
+        );
+    }
 
     let conf_async = "qwpws::addr=localhost:9000;initial_connect_retry=async;";
     SenderBuilder::from_conf(conf_async).unwrap();

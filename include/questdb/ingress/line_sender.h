@@ -79,53 +79,66 @@ extern "C" {
 /** An error that occurred when using the line sender. */
 typedef struct line_sender_error line_sender_error;
 
-/** Category of error. */
+/** Category of error.
+ *
+ * Append-only: reordering or inserting in the middle breaks ABI. */
 typedef enum line_sender_error_code
 {
     /** The host, port, or interface was incorrect. */
-    line_sender_error_could_not_resolve_addr,
+    line_sender_error_could_not_resolve_addr = 0,
 
     /** Called methods in the wrong order. E.g. `symbol` after `column`. */
-    line_sender_error_invalid_api_call,
+    line_sender_error_invalid_api_call = 1,
 
     /** A network error connecting or flushing data out. */
-    line_sender_error_socket_error,
+    line_sender_error_socket_error = 2,
 
     /** The string or symbol field is not encoded in valid UTF-8. */
-    line_sender_error_invalid_utf8,
+    line_sender_error_invalid_utf8 = 3,
 
     /** The table name or column name contains bad characters. */
-    line_sender_error_invalid_name,
+    line_sender_error_invalid_name = 4,
 
     /** The supplied timestamp is invalid. */
-    line_sender_error_invalid_timestamp,
+    line_sender_error_invalid_timestamp = 5,
 
     /** Error during the authentication process. */
-    line_sender_error_auth_error,
+    line_sender_error_auth_error = 6,
 
     /** Error during TLS handshake. */
-    line_sender_error_tls_error,
+    line_sender_error_tls_error = 7,
 
     /** The server does not support ILP over HTTP. */
-    line_sender_error_http_not_supported,
+    line_sender_error_http_not_supported = 8,
 
     /** Error sent back from the server during flush. */
-    line_sender_error_server_flush_error,
+    line_sender_error_server_flush_error = 9,
 
     /** Bad configuration. */
-    line_sender_error_config_error,
+    line_sender_error_config_error = 10,
 
     /** There was an error serializing an array. */
-    line_sender_error_array_error,
+    line_sender_error_array_error = 11,
 
     /**  Line sender protocol version error. */
-    line_sender_error_protocol_version_error,
+    line_sender_error_protocol_version_error = 12,
 
     /** The supplied decimal is invalid. */
-    line_sender_error_invalid_decimal,
+    line_sender_error_invalid_decimal = 13,
 
     /** QWP/WebSocket server rejection or terminal protocol violation. */
-    line_sender_error_server_rejection,
+    line_sender_error_server_rejection = 14,
+
+    /** Arrow column whose kind cannot be persisted (e.g.
+     *  `FixedSizeBinary(16)` without `arrow.uuid` extension metadata;
+     *  `ARRAY(LONG, N-D)` is egress-only; nested-list leaf must be
+     *  `Float64`). `arrow` feature only. */
+    line_sender_error_arrow_unsupported_column_kind = 15,
+
+    /** RecordBatch failed client-side structural validation
+     *  (column count, name encoding, C Data Interface contract).
+     *  `arrow` feature only. */
+    line_sender_error_arrow_ingest = 16,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -427,6 +440,14 @@ line_sender_buffer* line_sender_buffer_new_qwp(void);
 QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
     size_t max_name_len);
+
+/**
+ * Construct a QWP/WebSocket columnar `line_sender_buffer` with a 127-byte
+ * name length limit. This is the buffer kind required by
+ * `line_sender_buffer_append_arrow`.
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws(void);
 
 /** Release the `line_sender_buffer` object. */
 QUESTDB_CLIENT_API
@@ -1974,6 +1995,91 @@ int64_t line_sender_now_nanos(void);
 /** Get the current time in microseconds since the Unix epoch (UTC). */
 QUESTDB_CLIENT_API
 int64_t line_sender_now_micros(void);
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+/* Apache Arrow C Data Interface (feature: arrow).
+ * https://arrow.apache.org/docs/format/CDataInterface.html */
+
+#ifndef ARROW_C_DATA_INTERFACE
+#    define ARROW_C_DATA_INTERFACE
+
+#    define ARROW_FLAG_DICTIONARY_ORDERED 1
+#    define ARROW_FLAG_NULLABLE 2
+#    define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema
+{
+    const char* format;
+    const char* name;
+    const char* metadata;
+    int64_t flags;
+    int64_t n_children;
+    struct ArrowSchema** children;
+    struct ArrowSchema* dictionary;
+    void (*release)(struct ArrowSchema*);
+    void* private_data;
+};
+
+struct ArrowArray
+{
+    int64_t length;
+    int64_t null_count;
+    int64_t offset;
+    int64_t n_buffers;
+    int64_t n_children;
+    const void** buffers;
+    struct ArrowArray** children;
+    struct ArrowArray* dictionary;
+    void (*release)(struct ArrowArray*);
+    void* private_data;
+};
+
+#endif /* ARROW_C_DATA_INTERFACE */
+
+/**
+ * Append every row of a `RecordBatch` (Arrow C Data Interface) to `buffer`.
+ * The per-row designated timestamp is not sent — the server stamps each row
+ * on arrival (same semantics as `line_sender_buffer_at_now`).
+ *
+ * `array` may be either:
+ *   - A Struct array (one child per column, the standard RecordBatch shape), or
+ *   - A non-Struct (single-column) array whose `schema->name` becomes the
+ *     column name.
+ *
+ * Ownership: `array` is consumed once input validation passes
+ * (non-NULL pointers, schema depth within bounds) — `array->release`
+ * is cleared and the imported buffers are dropped on every subsequent
+ * return path. If validation fails first (NULL or over-deep schema),
+ * `array->release` is left untouched. `schema` is always borrowed.
+ *
+ * Server-side type-mismatch surfaces from the next `line_sender_flush`.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_buffer_append_arrow(
+    line_sender_buffer* buffer,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_error** err_out);
+
+/**
+ * Append every row of a `RecordBatch`, sourcing the per-row designated
+ * timestamp from a named `Timestamp(_)` column inside the batch.
+ *
+ * Same ownership and shape contract as `line_sender_buffer_append_arrow`.
+ * `ts_column` must be initialised via `line_sender_column_name_init` and
+ * name a `Timestamp(Microsecond | Nanosecond | Millisecond, _)` column
+ * with no null rows.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_buffer_append_arrow_at_column(
+    line_sender_buffer* buffer,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    line_sender_error** err_out);
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
 }

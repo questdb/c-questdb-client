@@ -118,6 +118,19 @@ pub enum line_reader_error_code {
     /// `line_reader_query_on_failover_reset` to opt in to replays, or
     /// re-execute the query from scratch.
     line_reader_error_failover_would_duplicate = 21,
+    /// Streaming Arrow adapter saw a mid-stream schema change. The cursor
+    /// is still usable; re-wrap with `line_reader_cursor_next_arrow_batch`
+    /// after dropping any partial state to snapshot the new schema. Only
+    /// emitted with the `arrow` feature enabled.
+    line_reader_error_schema_drift = 22,
+    /// `line_reader_cursor_next_arrow_batch` was called on a stream that
+    /// terminated before any batch was produced — no schema to snapshot.
+    /// Only emitted with the `arrow` feature enabled.
+    line_reader_error_no_schema = 23,
+    /// Arrow C Data Interface export failed (arrow-rs rejected the
+    /// produced `ArrayData`'s invariants). Indicates a client bug — not
+    /// user-recoverable. Only emitted with the `arrow` feature enabled.
+    line_reader_error_arrow_export = 24,
 }
 
 impl From<ErrorCode> for line_reader_error_code {
@@ -144,6 +157,9 @@ impl From<ErrorCode> for line_reader_error_code {
             ErrorCode::ServerLimitExceeded => line_reader_error_server_limit_exceeded,
             ErrorCode::Cancelled => line_reader_error_cancelled,
             ErrorCode::FailoverWouldDuplicate => line_reader_error_failover_would_duplicate,
+            ErrorCode::SchemaDrift => line_reader_error_schema_drift,
+            ErrorCode::NoSchema => line_reader_error_no_schema,
+            ErrorCode::ArrowExport => line_reader_error_arrow_export,
             // ErrorCode is `#[non_exhaustive]`. Any future variant added
             // upstream that the C ABI hasn't been taught about falls
             // back to ProtocolError so callers see *something* rather
@@ -1941,6 +1957,8 @@ pub unsafe extern "C" fn line_reader_query_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
+                        #[cfg(feature = "arrow")]
+                        arrow_schema_pin: None,
                         reader,
                     }))
                 }
@@ -2018,6 +2036,8 @@ pub unsafe extern "C" fn line_reader_execute(
                     Box::into_raw(Box::new(line_reader_cursor {
                         cursor: ManuallyDrop::new(cursor_static),
                         current_batch: None,
+                        #[cfg(feature = "arrow")]
+                        arrow_schema_pin: None,
                         reader,
                     }))
                 }
@@ -2433,6 +2453,9 @@ pub struct line_reader_cursor {
     /// for the same reason as `cursor`. See the struct-level safety note —
     /// this field MUST be `None` whenever `&mut self.cursor` is exposed.
     current_batch: Option<BatchView<'static>>,
+    /// Pins the first Arrow batch's schema for mid-stream drift detection.
+    #[cfg(feature = "arrow")]
+    arrow_schema_pin: Option<arrow::datatypes::SchemaRef>,
     /// Backpointer to the originating reader, used to clear its `active`
     /// flag on `_cursor_free`. Always non-NULL for a valid cursor.
     reader: *mut line_reader,
@@ -2444,7 +2467,25 @@ impl line_reader_cursor {
     /// "no-`current_batch`-while-`&mut cursor`" invariant documented on
     /// `line_reader_cursor`. Mutating cursor ops MUST go through here
     /// instead of taking `&mut self.cursor` directly.
+    ///
+    /// Also clears any Arrow schema pin — switching back from the raw
+    /// `BatchView` path to `_next_arrow_batch` should re-snapshot the
+    /// schema, not compare against a stale one from before the detour.
     fn cursor_for_mut(&mut self) -> &mut Cursor<'static> {
+        self.current_batch = None;
+        debug_assert!(self.current_batch.is_none());
+        #[cfg(feature = "arrow")]
+        {
+            self.arrow_schema_pin = None;
+        }
+        &mut self.cursor
+    }
+
+    /// Like `cursor_for_mut` but preserves any Arrow schema pin. For
+    /// auxiliary cursor ops (`cancel`, `add_credit`) that do not advance
+    /// the stream and therefore must not lose the drift-detection
+    /// snapshot established by a prior `_next_arrow_batch`.
+    fn cursor_for_aux(&mut self) -> &mut Cursor<'static> {
         self.current_batch = None;
         debug_assert!(self.current_batch.is_none());
         &mut self.cursor
@@ -2868,13 +2909,10 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
             );
             return false;
         }
-        // Routes through `cursor_for_mut` to maintain the BatchView /
-        // &mut Cursor exclusion invariant — see line_reader_cursor docs.
-        // `cancel()` runs the drain loop which can panic (decoder paths).
-        // The `catch_unwind` + abort below is a no-op in shipped builds
-        // under `panic = abort` and active in test builds; see
-        // `panic_guard` docstring.
-        let inner = (*cursor).cursor_for_mut();
+        // `cursor_for_aux` keeps the Arrow schema pin intact — `cancel`
+        // is a terminal op so the pin is about to be irrelevant, but
+        // sharing the helper with `add_credit` keeps the contract uniform.
+        let inner = (*cursor).cursor_for_aux();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.cancel()));
         let res = match result {
             Ok(r) => r,
@@ -2907,11 +2945,10 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
             );
             return false;
         }
-        // Routes through `cursor_for_mut` — see line_reader_cursor docs.
-        // The `catch_unwind` + abort below is a no-op in shipped builds
-        // under `panic = abort` and active in test builds; see
-        // `panic_guard` docstring.
-        let inner = (*cursor).cursor_for_mut();
+        // `cursor_for_aux` keeps the Arrow schema pin intact across this
+        // flow-control call; otherwise a subsequent `_next_arrow_batch`
+        // would lose its drift snapshot.
+        let inner = (*cursor).cursor_for_aux();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             inner.add_credit(additional_bytes)
         }));
@@ -3674,6 +3711,9 @@ mod tests {
             ErrorCode::ServerLimitExceeded,
             ErrorCode::Cancelled,
             ErrorCode::FailoverWouldDuplicate,
+            ErrorCode::SchemaDrift,
+            ErrorCode::NoSchema,
+            ErrorCode::ArrowExport,
         ];
         for code in codes {
             let c: line_reader_error_code = code.into();
@@ -3685,6 +3725,24 @@ mod tests {
                 line_reader_error_free(err);
             }
         }
+    }
+
+    #[test]
+    fn line_reader_error_code_arrow_discriminants_are_abi_stable() {
+        // Pin numeric values for the Arrow-related variants exposed to C/FFI
+        // consumers. Append-only past the existing tail at 21.
+        assert_eq!(
+            line_reader_error_code::line_reader_error_schema_drift as u32,
+            22
+        );
+        assert_eq!(
+            line_reader_error_code::line_reader_error_no_schema as u32,
+            23
+        );
+        assert_eq!(
+            line_reader_error_code::line_reader_error_arrow_export as u32,
+            24
+        );
     }
 
     #[test]
@@ -3894,5 +3952,95 @@ mod tests {
         dispatch_via_trampoline(cb, user_data, ev);
         // No assertion on side-effects: the goal is to confirm dispatch
         // is a no-op when the C callback slot is empty.
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_reader_arrow_batch_result {
+    line_reader_arrow_batch_ok = 0,
+    line_reader_arrow_batch_end = 1,
+    line_reader_arrow_batch_error = 2,
+}
+
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_reader_cursor_next_arrow_batch(
+    cursor: *mut line_reader_cursor,
+    out_array: *mut arrow::ffi::FFI_ArrowArray,
+    out_schema: *mut arrow::ffi::FFI_ArrowSchema,
+    err_out: *mut *mut line_reader_error,
+) -> line_reader_arrow_batch_result {
+    use arrow_array::{Array, StructArray};
+    unsafe {
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_next_arrow_batch: cursor is NULL",
+            );
+            return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
+        }
+        if out_array.is_null() || out_schema.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_cursor_next_arrow_batch: out_array or out_schema is NULL",
+            );
+            return line_reader_arrow_batch_result::line_reader_arrow_batch_error;
+        }
+        enum NextArrow {
+            Ok(
+                arrow::ffi::FFI_ArrowArray,
+                arrow::ffi::FFI_ArrowSchema,
+                arrow::datatypes::SchemaRef,
+            ),
+            End,
+            Err(Error, Option<arrow::datatypes::SchemaRef>),
+        }
+        let c = &mut *cursor;
+        let pinned = c.arrow_schema_pin.clone();
+        let inner: &mut Cursor<'static> = c.cursor_for_mut();
+        let outcome = panic_guard(|| -> NextArrow {
+            let rb = match inner.next_arrow_batch_inner(pinned.as_ref()) {
+                Ok(Some(rb)) => rb,
+                Ok(None) => return NextArrow::End,
+                Err(e) => return NextArrow::Err(e, None),
+            };
+            let schema_ref = rb.schema();
+            let struct_array: StructArray = rb.into();
+            let array_data = struct_array.into_data();
+            match arrow::ffi::to_ffi(&array_data) {
+                Ok((ffi_array, ffi_schema)) => NextArrow::Ok(ffi_array, ffi_schema, schema_ref),
+                Err(e) => NextArrow::Err(
+                    Error::new(ErrorCode::ArrowExport, e.to_string()),
+                    Some(schema_ref),
+                ),
+            }
+        });
+        match outcome {
+            NextArrow::Ok(ffi_array, ffi_schema, schema_ref) => {
+                c.arrow_schema_pin = Some(schema_ref);
+                std::ptr::write(out_array, ffi_array);
+                std::ptr::write(out_schema, ffi_schema);
+                line_reader_arrow_batch_result::line_reader_arrow_batch_ok
+            }
+            NextArrow::End => line_reader_arrow_batch_result::line_reader_arrow_batch_end,
+            NextArrow::Err(e, pin_to_restore) => {
+                match pin_to_restore {
+                    Some(pin) => {
+                        c.arrow_schema_pin = Some(pin);
+                    }
+                    None => {
+                        if e.code() != ErrorCode::SchemaDrift {
+                            c.arrow_schema_pin = pinned;
+                        }
+                    }
+                }
+                write_err_box(err_out, e);
+                line_reader_arrow_batch_result::line_reader_arrow_batch_error
+            }
+        }
     }
 }

@@ -121,6 +121,31 @@ pub enum ErrorCode {
     /// Surfaced only mid-query — initial connect failover (before any
     /// batch is yielded) does not raise this and behaves transparently.
     FailoverWouldDuplicate,
+
+    /// Streaming Arrow adapter saw a mid-stream schema change: a later
+    /// `RESULT_BATCH` decoded into an Arrow schema that differs from
+    /// the snapshot captured at adapter construction. The adapter is
+    /// poisoned; the underlying [`crate::egress::Cursor`] remains
+    /// usable and the caller may re-wrap it with a fresh
+    /// `as_arrow_reader()` call to snapshot the new schema.
+    ///
+    /// Only emitted on the `arrow` feature.
+    SchemaDrift,
+
+    /// `Cursor::as_arrow_reader()` was called on a stream that
+    /// terminated before any `RESULT_BATCH` was decoded — there is no
+    /// schema to snapshot. Recoverable: the caller can either treat
+    /// this as a "no rows" result, or re-execute the query.
+    ///
+    /// Only emitted on the `arrow` feature.
+    NoSchema,
+
+    /// Arrow C Data Interface export failed (e.g. arrow-rs rejected an
+    /// internal invariant on the produced `ArrayData`). Indicates a
+    /// crate bug; not user-recoverable.
+    ///
+    /// Only emitted on the `arrow` feature.
+    ArrowExport,
 }
 
 /// Upgrade-time topology rejection carried alongside an `Error`.

@@ -98,7 +98,41 @@ public:
             protocol_version::v1,
             init_buf_size,
             max_name_len,
-            true};
+            _backend_kind::qwp_udp};
+    }
+
+    /**
+     * Construct a standalone QWP/WebSocket columnar buffer. Required
+     * by `append_arrow`; also accepts the row-by-row `table` /
+     * `symbol` / `column` / `at` API.
+     *
+     * For protocol-neutral construction tied to a sender instance,
+     * prefer `line_sender::new_buffer()`.
+     *
+     * @param init_buf_size Hint passed to `line_sender_buffer_reserve`
+     *                      for the initial capacity of the underlying
+     *                      column storage.
+     * @throws line_sender_error if the initial reserve fails.
+     */
+    static line_sender_buffer qwp_ws(size_t init_buf_size = 64 * 1024)
+    {
+        auto* raw_buffer = ::line_sender_buffer_new_qwp_ws();
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
+        return line_sender_buffer{
+            raw_buffer,
+            protocol_version::v1,
+            init_buf_size,
+            127,
+            _backend_kind::qwp_ws};
     }
 
     line_sender_buffer(const line_sender_buffer& other)
@@ -110,7 +144,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
     }
@@ -120,7 +154,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
         other._impl = nullptr;
@@ -142,7 +176,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
         }
         return *this;
     }
@@ -156,7 +190,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
             other._impl = nullptr;
         }
         return *this;
@@ -1117,6 +1151,58 @@ public:
         line_sender_error::wrapped_call(::line_sender_buffer_at_now, _impl);
     }
 
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+    /**
+     * Append every row of an Apache Arrow `RecordBatch` to the buffer.
+     * Per-row timestamp is not sent; the server stamps each row on
+     * arrival (same semantics as `at_now()`).
+     *
+     * Requires a QWP/WebSocket buffer. `schema` is borrowed.
+     * `array` is consumed once control reaches the underlying C call;
+     * if `may_init()` throws first (e.g. lazy buffer reserve fails),
+     * `array` is left untouched and the caller retains ownership.
+     * `array` may be a Struct top-level array or a non-Struct
+     * single-column array.
+     *
+     * @throws line_sender_error on validation or classification failure.
+     */
+    void append_arrow(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_append_arrow,
+            _impl,
+            table._impl,
+            &array,
+            &schema);
+    }
+
+    /**
+     * Append an Arrow `RecordBatch`, sourcing the per-row designated
+     * timestamp from a named column inside the batch. The column must
+     * be `Timestamp(Microsecond | Nanosecond | Millisecond, _)` with
+     * no null rows.
+     */
+    void append_arrow(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_append_arrow_at_column,
+            _impl,
+            table._impl,
+            &array,
+            &schema,
+            ts_column._impl);
+    }
+#endif /* QUESTDB_CLIENT_ENABLE_ARROW */
+
     void check_can_flush() const
     {
         if (!_impl)
@@ -1137,17 +1223,24 @@ public:
     }
 
 private:
+    enum class _backend_kind
+    {
+        ilp,
+        qwp_udp,
+        qwp_ws
+    };
+
     line_sender_buffer(
         ::line_sender_buffer* impl,
         protocol_version version,
         size_t init_buf_size,
         size_t max_name_len,
-        bool is_qwp = false) noexcept
+        _backend_kind backend = _backend_kind::ilp) noexcept
         : _impl{impl}
         , _protocol_version{version}
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
-        , _is_qwp{is_qwp}
+        , _backend{backend}
     {
     }
 
@@ -1156,17 +1249,21 @@ private:
         if (!_impl)
         {
             ::line_sender_buffer* tmp = nullptr;
-            if (_is_qwp)
+            switch (_backend)
             {
+            case _backend_kind::qwp_ws:
+                tmp = ::line_sender_buffer_new_qwp_ws();
+                break;
+            case _backend_kind::qwp_udp:
                 tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
                     _max_name_len);
-            }
-            else
-            {
+                break;
+            case _backend_kind::ilp:
                 tmp = ::line_sender_buffer_with_max_name_len(
                     static_cast<::line_sender_protocol_version>(
                         static_cast<int>(_protocol_version)),
                     _max_name_len);
+                break;
             }
             try
             {
@@ -1186,7 +1283,7 @@ private:
     protocol_version _protocol_version;
     size_t _init_buf_size;
     size_t _max_name_len;
-    bool _is_qwp{false};
+    _backend_kind _backend{_backend_kind::ilp};
 
     friend class line_sender;
 };
@@ -1801,9 +1898,13 @@ public:
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto sender_protocol = this->protocol();
-        bool is_qwp = sender_protocol == protocol::qwpudp ||
+        auto backend = line_sender_buffer::_backend_kind::ilp;
+        if (sender_protocol == protocol::qwpudp)
+            backend = line_sender_buffer::_backend_kind::qwp_udp;
+        else if (
             sender_protocol == protocol::qwpws ||
-            sender_protocol == protocol::qwpwss;
+            sender_protocol == protocol::qwpwss)
+            backend = line_sender_buffer::_backend_kind::qwp_ws;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         try
         {
@@ -1816,11 +1917,7 @@ public:
             throw;
         }
         return line_sender_buffer{
-            raw_buffer,
-            version,
-            init_buf_size,
-            max_name_len,
-            is_qwp};
+            raw_buffer, version, init_buf_size, max_name_len, backend};
     }
 
     /**
