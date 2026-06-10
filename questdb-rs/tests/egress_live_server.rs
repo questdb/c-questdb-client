@@ -1100,15 +1100,21 @@ fn symbol_dict_persists_across_queries() {
 }
 
 // ---------------------------------------------------------------------------
-// Schema reuse
+// Per-query inline schema
 // ---------------------------------------------------------------------------
 
+/// The column schema rides the first `RESULT_BATCH` (`batch_seq == 0`) of
+/// every query and is cleared at each `execute()`; continuation batches
+/// reuse it. Two sequential queries on the *same* connection with different
+/// column shapes must therefore each re-read their own inline schema — the
+/// second query must not decode its rows against the schema left behind by
+/// the first. (There is no longer a connection-scoped schema registry.)
 #[test]
-fn schema_reference_after_full() {
+fn inline_schema_reread_per_query_on_shared_connection() {
     let srv = server();
-    let table = unique_table("schema_ref");
+    let table = unique_table("schema_inline");
     srv.http_exec(&format!(
-        "create table \"{}\" (v long, ts timestamp) timestamp(ts) partition by day wal",
+        "create table \"{}\" (v long, w double, ts timestamp) timestamp(ts) partition by day wal",
         table
     ));
     let mut sender = make_sender(srv, ProtocolVersion::V2);
@@ -1117,6 +1123,8 @@ fn schema_reference_after_full() {
         buf.table(table.as_str())
             .unwrap()
             .column_i64("v", i)
+            .unwrap()
+            .column_f64("w", 1.5 * i as f64)
             .unwrap()
             .at(TimestampNanos::new(
                 1_700_000_000_000_000_000 + i * 1_000_000,
@@ -1127,27 +1135,53 @@ fn schema_reference_after_full() {
     wait_for_rows(srv, &table, 3);
 
     let mut reader = make_reader(srv);
-    // First query populates schema registry.
-    {
-        let mut cur = reader
-            .prepare(&format!("select v from \"{}\"", table))
-            .execute()
-            .expect("execute");
-        while cur.next_batch().expect("drain").is_some() {}
-    }
-    let registered_after_first = reader.schema_registry().len();
-    assert!(registered_after_first >= 1);
 
-    // Second query with the same column shape should reuse a schema_id;
-    // registry size should not grow.
+    // Query 1: a single Long column. Drain every batch and collect `v`.
+    let mut v_values = Vec::new();
     {
         let mut cur = reader
-            .prepare(&format!("select v from \"{}\"", table))
+            .prepare(&format!("select v from \"{}\" order by ts", table))
             .execute()
-            .expect("execute");
-        while cur.next_batch().expect("drain").is_some() {}
+            .expect("execute query 1");
+        while let Some(view) = cur.next_batch().expect("drain query 1") {
+            let ColumnView::Long(v) = view.column(0).unwrap() else {
+                panic!("query 1 col 0 should be Long")
+            };
+            for row in 0..view.row_count() {
+                v_values.push(v.value(row));
+            }
+        }
     }
-    assert_eq!(reader.schema_registry().len(), registered_after_first);
+    assert_eq!(v_values, vec![0, 1, 2], "query 1 (v long) values");
+
+    // Query 2 on the SAME reader: a wider, differently-typed shape
+    // (Double, Long) in a different column order. The reader must re-read
+    // this schema from query 2's `batch_seq == 0`; if the per-query reset
+    // were missing it would decode these rows with query 1's one-Long
+    // schema and either error or mis-decode.
+    let mut wv_values = Vec::new();
+    {
+        let mut cur = reader
+            .prepare(&format!("select w, v from \"{}\" order by ts", table))
+            .execute()
+            .expect("execute query 2");
+        while let Some(view) = cur.next_batch().expect("drain query 2") {
+            let ColumnView::Double(w) = view.column(0).unwrap() else {
+                panic!("query 2 col 0 should be Double")
+            };
+            let ColumnView::Long(v) = view.column(1).unwrap() else {
+                panic!("query 2 col 1 should be Long")
+            };
+            for row in 0..view.row_count() {
+                wv_values.push((w.value(row), v.value(row)));
+            }
+        }
+    }
+    assert_eq!(
+        wv_values,
+        vec![(0.0, 0), (1.5, 1), (3.0, 2)],
+        "query 2 (w double, v long) values"
+    );
 }
 
 // ---------------------------------------------------------------------------
