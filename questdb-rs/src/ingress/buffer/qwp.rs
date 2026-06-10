@@ -5066,6 +5066,13 @@ impl SymbolGlobalDict {
         self.next_id
     }
 
+    /// Number of global ids assigned so far. The column-sender encoder
+    /// uses this as the `delta_start` field of the delta-symbol-dict
+    /// prefix.
+    pub(crate) fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     pub(crate) fn mark(&self) -> SymbolGlobalDictMark {
         SymbolGlobalDictMark {
             entries_len: self.entries.len(),
@@ -5082,13 +5089,13 @@ impl SymbolGlobalDict {
         self.next_id = mark.next_id;
     }
 
-    fn entry(&self, id: u64) -> Option<&[u8]> {
+    pub(crate) fn entry(&self, id: u64) -> Option<&[u8]> {
         let index = usize::try_from(id).ok()?;
         self.entries.get(index).map(Vec::as_slice)
     }
 
     /// Returns `(global_id, is_new)`.
-    fn intern(&mut self, bytes: &[u8]) -> (u64, bool) {
+    pub(crate) fn intern(&mut self, bytes: &[u8]) -> (u64, bool) {
         if let Some(&id) = self.map.get(bytes) {
             return (id, false);
         }

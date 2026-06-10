@@ -2117,6 +2117,9 @@ fn connect_tcp_to_any_addr(
                 tcp.set_nodelay(true).ok();
                 tcp.set_read_timeout(Some(request_timeout)).ok();
                 tcp.set_write_timeout(Some(request_timeout)).ok();
+                let sock = socket2::SockRef::from(&tcp);
+                sock.set_send_buffer_size(4 * 1024 * 1024).ok();
+                sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
                 return Ok(tcp);
             }
             Err(io) => failures.push(format!("{addr}: {io}")),

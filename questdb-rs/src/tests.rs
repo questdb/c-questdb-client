@@ -54,6 +54,9 @@ mod qwp_ws_publication_probe;
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws_java_golden;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod column_sender_pool;
+
 mod sender;
 
 mod decimal;

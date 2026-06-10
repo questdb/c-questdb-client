@@ -60,13 +60,16 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
-mod sender;
+pub(crate) mod sender;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use sender::QwpWsRoleReject;
 pub use sender::*;
 
 mod decimal;
 pub use decimal::DecimalView;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub mod column_sender;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -387,6 +390,24 @@ impl Protocol {
 pub(crate) struct QwpWsAddrScan {
     pub(crate) addr_values: Vec<String>,
     pub(crate) sanitized_conf: String,
+}
+
+/// Raw QWP/WebSocket connection produced by
+/// [`SenderBuilder::build_qwp_ws_raw_stream`]. The column-major sender uses
+/// this as its sole entry point into the network — it does its own
+/// synchronous frame I/O on the contained `WsStream` and never touches the
+/// row-API publisher / driver / queue stack.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) struct RawQwpWsStream {
+    pub(crate) stream: sender::qwp_ws::WsStream,
+    /// Bytes already read past the HTTP upgrade response. The shared
+    /// handshake helper may consume more bytes than the response body
+    /// itself; those bytes are the start of the first server WS frame
+    /// and must be drained before reading more from the socket.
+    pub(crate) leftover: Vec<u8>,
+    pub(crate) max_buf_size: usize,
+    pub(crate) request_timeout: Duration,
+    pub(crate) durable_ack_opt_in: bool,
 }
 
 /// Pre-scan a raw connect string for repeated `addr=...` params. Returns the
@@ -2383,6 +2404,92 @@ impl SenderBuilder {
         );
 
         Ok(sender)
+    }
+
+    /// Open a raw QWP/WebSocket connection (TCP + optional TLS + HTTP
+    /// upgrade) **without** assembling the row-API publisher, queue, or
+    /// background-thread machinery.
+    ///
+    /// Returned by reference, the [`crate::ingress::sender::qwp_ws::WsStream`]
+    /// is the only thing the column-major sender needs from this crate's
+    /// builder: it does its own synchronous frame writing and ack reading
+    /// from there. See `doc/COLUMN_SENDER_PLAN.md`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn build_qwp_ws_raw_stream(&self) -> Result<RawQwpWsStream> {
+        if self.init_buf_size.is_specified() && *self.init_buf_size > *self.max_buf_size {
+            return Err(error::fmt!(
+                ConfigError,
+                "init_buf_size ({}) cannot exceed max_buf_size ({})",
+                *self.init_buf_size,
+                *self.max_buf_size
+            ));
+        }
+
+        if !matches!(self.protocol, Protocol::QwpWs | Protocol::QwpWss) {
+            return Err(error::fmt!(
+                ConfigError,
+                "Column-sender requires a QWP/WebSocket connect string \
+                 (got protocol {:?})",
+                self.protocol
+            ));
+        }
+        if self.net_interface.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "net_interface is not supported for QWP over WebSocket."
+            ));
+        }
+        let Some(qwp_ws) = self.qwp_ws.as_ref() else {
+            return Err(error::fmt!(
+                ConfigError,
+                "QWP/WebSocket configuration is missing."
+            ));
+        };
+
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+        let tls_roots_password = self.tls_roots_password.deref().as_deref();
+
+        if tls_roots_password.is_some() && self.tls_roots.deref().is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"tls_roots_password\" requires \"tls_roots\" \
+                 (the password unlocks the keystore at that path)"
+            ));
+        }
+
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+            tls_roots_password,
+        )?;
+
+        let auth = self.build_auth()?;
+        let basic_auth = qwp_ws_auth_header(&auth)?;
+        let mut qwp_ws = qwp_ws.clone();
+        qwp_ws.apply_reconnect_implies_initial_retry();
+        reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
+
+        let use_tls = matches!(self.protocol, Protocol::QwpWss);
+        let (stream, _negotiated_version, leftover) = sender::qwp_ws::establish_connection(
+            self.host.as_str(),
+            self.port.as_str(),
+            use_tls,
+            tls_settings,
+            &qwp_ws,
+            basic_auth.as_deref(),
+        )?;
+
+        Ok(RawQwpWsStream {
+            stream,
+            leftover,
+            max_buf_size: *self.max_buf_size,
+            request_timeout: *qwp_ws.request_timeout,
+            durable_ack_opt_in: *qwp_ws.request_durable_ack,
+        })
     }
 
     #[cfg(any(feature = "_sender-tcp", feature = "_sender-qwp-udp"))]
