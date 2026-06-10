@@ -72,6 +72,14 @@ QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
 DECIMAL_RELEASE = (9, 2, 0)
+# First QuestDB version with the single-version, inline-schema QWP wire
+# format (questdb #7200). The client now speaks only that format, so the
+# QWP/WebSocket tests can't talk to an older server. It is on master --
+# which `query_version` reports as 9.4.3 (from 9.4.3-SNAPSHOT) -- but no
+# release carries it yet, so the QWP/WS tests run against `--repo`/master
+# and skip released versions until one does. Bump this if #7200 first
+# ships in a later release.
+QWP_INLINE_SCHEMA_RELEASE = (9, 4, 3)
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
     "57896044618658097711785492504343953926634992332820282019728792003956564819968")
 QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
@@ -1451,6 +1459,17 @@ class QwpWsTestSupport:
         if not hasattr(qls.Protocol, 'QWPWS'):
             raise unittest.SkipTest(
                 'QWP/WebSocket protocol is not exposed by the system-test shim')
+        # This client speaks only the inline-schema QWP wire format
+        # (questdb #7200), which is on master but not in any release yet.
+        # Talking to an older server fails the handshake/decode, so skip
+        # QWP/WS tests against pre-#7200 servers. They still run against
+        # `--repo`/master (reported as 9.4.3) and auto-resume once a
+        # release carries the protocol. See QWP_INLINE_SCHEMA_RELEASE.
+        if QDB_FIXTURE.version < QWP_INLINE_SCHEMA_RELEASE:
+            raise unittest.SkipTest(
+                'QWP/WebSocket inline-schema protocol (questdb #7200) requires '
+                f'QuestDB >= {".".join(map(str, QWP_INLINE_SCHEMA_RELEASE))}; '
+                f'server is {".".join(map(str, QDB_FIXTURE.version))}')
 
     @staticmethod
     def _create_qwp_ws_table(table_name):
