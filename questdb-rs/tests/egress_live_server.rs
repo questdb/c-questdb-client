@@ -2013,14 +2013,15 @@ fn all_null_long_column() {
             assert_eq!(c.len(), 3);
             for r in 0..3 {
                 assert!(c.is_null(r), "row {} should be null", r);
-                // Pin the densification contract from commit a89e0fc:
-                // null slots must read as zero, not garbage from a
-                // cleared-but-still-stale buffer or out-of-bounds
-                // densification math.
+                // A null LONG reads back as QuestDB's i64::MIN null
+                // sentinel (per the spec's null sentinel table), not a
+                // densified zero. Pinning the exact sentinel still guards
+                // against garbage from a stale/uninitialized buffer or an
+                // out-of-bounds read.
                 assert_eq!(
                     c.value(r),
-                    0,
-                    "null slot at row {} must be densified to zero",
+                    i64::MIN,
+                    "null LONG slot at row {} must read back as the i64::MIN sentinel",
                     r
                 );
             }
