@@ -104,9 +104,18 @@ impl FrameHeader {
     }
 
     /// Serialize this header into the first [`HEADER_LEN`] bytes of `out`.
+    ///
+    /// The `version` byte is always written as [`PROTOCOL_VERSION`] — the only
+    /// value [`FrameHeader::parse`] accepts — and `self.version` is
+    /// debug-asserted to match, so a header built with a stale version can't
+    /// serialize bytes this module would then refuse to parse.
     pub fn write(self, out: &mut [u8; HEADER_LEN]) {
+        debug_assert_eq!(
+            self.version, PROTOCOL_VERSION,
+            "FrameHeader::write must only serialize the pinned protocol version"
+        );
         out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        out[4] = self.version;
+        out[4] = PROTOCOL_VERSION;
         out[5] = self.flags;
         out[6..8].copy_from_slice(&self.table_count.to_le_bytes());
         out[8..12].copy_from_slice(&self.payload_length.to_le_bytes());
