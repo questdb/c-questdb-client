@@ -302,6 +302,16 @@ class QuestDbFixtureBase:
         vers = re.compile(r'.*QuestDB ([0-9.]+).*').search(vers).group(1)
         return _parse_version(vers)
 
+    def _try_query_version(self):
+        """`query_version()`, returning None on transient network errors
+        so it can be driven by `retry()`."""
+        try:
+            return self.query_version()
+        except (OSError, json.JSONDecodeError):
+            # Connection refused/reset, response timeout, or a torn
+            # response: the server is still warming up.
+            return None
+
     def retry_check_table(
             self,
             table_name,
@@ -406,7 +416,9 @@ class QuestDbFixture(QuestDbFixtureBase):
         self._conf_dir.mkdir(exist_ok=True)
         self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
+        self._log_start_offset = 0
         self._proc = None
+        self._version_queried = False
         self.host = '127.0.0.1'
         self.http_server_port = None
         self.line_tcp_port = None
@@ -428,15 +440,72 @@ class QuestDbFixture(QuestDbFixtureBase):
         self.qwp_udp = qwp_udp
 
     def print_log(self):
-        with open(self._log_path, 'r', encoding='utf-8') as log_file:
-            log = log_file.read()
-            sys.stderr.write(textwrap.indent(log, '    '))
-            sys.stderr.write('\n\n')
+        # The server log accumulates across restarts within a fixture
+        # (it is opened in append mode), so dump only the slice written
+        # by the current instance. Read as bytes: after a SIGKILL the
+        # file can end mid-character.
+        offset = self._log_start_offset
+        with open(self._log_path, 'rb') as log_file:
+            log_file.seek(offset)
+            log = log_file.read().decode('utf-8', errors='replace')
+        if offset:
+            sys.stderr.write(
+                f'    [cumulative server log: showing from byte offset '
+                f'{offset}, where the current instance started]\n')
+        sys.stderr.write(textwrap.indent(log, '    '))
+        sys.stderr.write('\n\n')
+
+    def _await_ports_free(self, timeout_sec=5.0):
+        """Wait until our previously assigned TCP ports stop accepting
+        connections.
+
+        A port still serving here means a previous QuestDB instance is
+        alive: the health check polls by port and would mistake it for
+        the process we are about to launch, while the new process would
+        die on the port (or ``tables.d.lock``) conflict.
+        """
+        deadline = time.monotonic() + timeout_sec
+        ports = [
+            port
+            for port in (
+                self.http_server_port, self.line_tcp_port, self.pg_port)
+            if port]
+        while True:
+            occupied = None
+            for port in ports:
+                try:
+                    with socket.create_connection(
+                            (self.host, port), timeout=0.25):
+                        occupied = port
+                        break
+                except ConnectionRefusedError:
+                    continue  # definitive: nothing listens on the port
+                except OSError:
+                    # Timeout or reset on loopback: something holds the
+                    # port but isn't completing handshakes (e.g. a full
+                    # accept backlog). Count it as occupied.
+                    occupied = port
+                    break
+            if occupied is None:
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f'port {occupied} is still serving connections; a '
+                    'previous QuestDB instance appears to be running. '
+                    'Refusing to start a second one.')
+            time.sleep(0.05)
 
     def start(self):
+        if self._proc is not None and self._proc.poll() is None:
+            raise RuntimeError(
+                f'start() called while QuestDB (pid {self._proc.pid}) is '
+                'still running; call stop() first.')
         if self.http_server_port is None:
             ports = discover_avail_ports(3)
             self.http_server_port, self.line_tcp_port, self.pg_port = ports
+        else:
+            # Restarting on previously assigned ports.
+            self._await_ports_free()
         if self.qwp_udp and self.qwp_udp_port is None:
             self.qwp_udp_port = discover_avail_udp_port()
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
@@ -492,6 +561,10 @@ class QuestDbFixture(QuestDbFixtureBase):
             f'(auth: {self.auth}, http_auth: {self.http_auth}, '
             f'http: {self.http}, qwp_udp: {self.qwp_udp})\n')
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Opened in append mode: remember where this instance's output
+        # begins so print_log() can show just its slice.
+        self._log_start_offset = (
+            self._log_path.stat().st_size if self._log_path.exists() else 0)
         self._log = open(self._log_path, 'ab')
         # On Windows, Popen.terminate() maps to TerminateProcess(), which kills
         # the JVM without running shutdown hooks. That leaves QuestDB's writers
@@ -545,7 +618,21 @@ class QuestDbFixture(QuestDbFixtureBase):
         # Read the actual version from the running process.
         # This is to support a version like `7.3.2-SNAPSHOT`
         # from an externally started QuestDB instance.
-        self.version = self.query_version()
+        # Queried once per fixture: the binary doesn't change across
+        # restarts, and right after a restart that recovered from an
+        # unclean shutdown the first SQL query can be slow enough to
+        # blow a fixed timeout (the engine may still be replaying WAL).
+        if not self._version_queried:
+            try:
+                self.version = retry(
+                    self._try_query_version,
+                    timeout_sec=60,
+                    msg='Timed out querying the server version.')
+            except:
+                sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
+                self.print_log()
+                raise
+            self._version_queried = True
 
         if self.wrap_tls:
             self._tls_proxy = TlsProxyFixture(self.line_tcp_port)
@@ -555,7 +642,7 @@ class QuestDbFixture(QuestDbFixtureBase):
     def __enter__(self):
         self.start()
 
-    def stop(self):
+    def stop(self, wait_timeout_sec=30):
         if self._tls_proxy:
             self._tls_proxy.stop()
         if self._proc:
@@ -567,8 +654,27 @@ class QuestDbFixture(QuestDbFixtureBase):
             else:
                 self._proc.terminate()
             try:
-                self._proc.wait(timeout=30)
+                self._proc.wait(timeout=wait_timeout_sec)
             except subprocess.TimeoutExpired:
+                sys.stderr.write(
+                    f'QuestDB (pid {self._proc.pid}) did not exit within '
+                    f'{wait_timeout_sec}s of being asked to shut down; '
+                    'escalating to SIGKILL.\n')
+                if hasattr(signal, 'SIGQUIT'):
+                    # Make the JVM print a thread dump into the server log
+                    # first, so a hung shutdown identifies the blocked
+                    # thread instead of vanishing without a trace.
+                    sys.stderr.write(
+                        'Requested a JVM thread dump (SIGQUIT); it goes '
+                        f'to `{self._log_path}`.\n')
+                    try:
+                        self._proc.send_signal(signal.SIGQUIT)
+                        # The JVM keeps running after a SIGQUIT dump; this
+                        # wait is just a grace period for it to finish
+                        # writing the dump.
+                        self._proc.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
                 self._proc.kill()
                 self._proc.wait()
             self._proc = None

@@ -1411,8 +1411,9 @@ class BounceThread(threading.Thread):
     * the producers signal completion via ``writers_done.set()``;
     * ``stop_event`` is set; or
     * a previous bounce raised, in which case ``failure_counter`` gets
-      bumped and the thread tries one defensive ``start()`` before
-      exiting so the rest of the test still has a server to talk to.
+      bumped and the thread tries one defensive ``stop()`` + ``start()``
+      before exiting so the rest of the test still has a server to talk
+      to (and no half-started instance is left behind).
 
     Each bounce is atomic from the caller's perspective: once the loop
     enters a bounce cycle it completes ``stop()`` + ``start()`` before
@@ -1475,7 +1476,15 @@ class BounceThread(threading.Thread):
                     f'{type(e).__name__}: {e}')
                 # One defensive recovery attempt so the rest of the test
                 # has a chance to surface the underlying assertion
-                # failure rather than a query timeout.
+                # failure rather than a query timeout. stop() first: if
+                # start() failed partway, the process it launched may
+                # still be alive, and starting another instance next to
+                # it leaves behind a zombie server that the port-based
+                # health checks cannot tell apart from the new one.
+                try:
+                    self._fixture.stop()
+                except Exception:
+                    pass
                 try:
                     self._fixture.start()
                 except Exception:
