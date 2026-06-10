@@ -101,20 +101,18 @@ fn wait_for_rows(srv: &QuestDbServer, table: &str, expected: usize) {
     let sql = format!("select count(*) from \"{}\"", table);
     while std::time::Instant::now() < deadline {
         let conf = srv.qwp_conf();
-        if let Ok(mut r) = Reader::from_conf(&conf) {
-            if let Ok(mut cur) = r.prepare(&sql).execute() {
-                if let Ok(Some(view)) = cur.next_batch() {
-                    if let Ok(c) = view.column(0) {
-                        let n = match c {
-                            ColumnView::Long(c) => c.value(0),
-                            ColumnView::Int(c) => c.value(0) as i64,
-                            _ => -1,
-                        };
-                        if n as usize >= expected {
-                            return;
-                        }
-                    }
-                }
+        if let Ok(mut r) = Reader::from_conf(&conf)
+            && let Ok(mut cur) = r.prepare(&sql).execute()
+            && let Ok(Some(view)) = cur.next_batch()
+            && let Ok(c) = view.column(0)
+        {
+            let n = match c {
+                ColumnView::Long(c) => c.value(0),
+                ColumnView::Int(c) => c.value(0) as i64,
+                _ => -1,
+            };
+            if n as usize >= expected {
+                return;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(80));
@@ -1060,7 +1058,7 @@ fn symbol_dict_persists_across_queries() {
     // First query: dict gets populated.
     {
         let mut cur = reader
-            .prepare(&format!("select s from \"{}\" order by ts", table))
+            .prepare(format!("select s from \"{}\" order by ts", table))
             .execute()
             .expect("execute");
         let view = cur.next_batch().expect("next").expect("Some");
@@ -1083,7 +1081,7 @@ fn symbol_dict_persists_across_queries() {
     // shouldn't retransmit "alpha"/"beta"/"gamma").
     {
         let mut cur = reader
-            .prepare(&format!("select s from \"{}\" order by ts", table))
+            .prepare(format!("select s from \"{}\" order by ts", table))
             .execute()
             .expect("execute");
         let view = cur.next_batch().expect("next").expect("Some");
@@ -1140,7 +1138,7 @@ fn inline_schema_reread_per_query_on_shared_connection() {
     let mut v_values = Vec::new();
     {
         let mut cur = reader
-            .prepare(&format!("select v from \"{}\" order by ts", table))
+            .prepare(format!("select v from \"{}\" order by ts", table))
             .execute()
             .expect("execute query 1");
         while let Some(view) = cur.next_batch().expect("drain query 1") {
@@ -1162,7 +1160,7 @@ fn inline_schema_reread_per_query_on_shared_connection() {
     let mut wv_values = Vec::new();
     {
         let mut cur = reader
-            .prepare(&format!("select w, v from \"{}\" order by ts", table))
+            .prepare(format!("select w, v from \"{}\" order by ts", table))
             .execute()
             .expect("execute query 2");
         while let Some(view) = cur.next_batch().expect("drain query 2") {
@@ -1257,14 +1255,14 @@ fn bind_double_literal_passthrough() {
     let mut reader = make_reader(srv);
     let mut cur = reader
         .prepare("select $1::double as v")
-        .bind_f64(2.718281828)
+        .bind_f64(std::f64::consts::E)
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Double(c) = view.column(0).unwrap() else {
         panic!("col 0")
     };
-    assert_eq!(c.value(0), 2.718281828);
+    assert_eq!(c.value(0), std::f64::consts::E);
 }
 
 #[test]
@@ -1318,7 +1316,7 @@ fn bind_symbol_via_varchar_cast() {
 
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .prepare(&format!(
+        .prepare(format!(
             "select s, v from \"{}\" where s = cast($1 as symbol) order by ts",
             table
         ))
@@ -1432,7 +1430,7 @@ fn bind_in_where_clause_filters_rows() {
 
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .prepare(&format!(
+        .prepare(format!(
             "select id from \"{}\" where id >= $1 and id < $2 order by id",
             table
         ))
@@ -2416,7 +2414,7 @@ fn credit_flow_control_keeps_server_streaming() {
     let conf = format!("{};max_batch_rows=500", srv.qwp_conf());
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .prepare(&format!("select i, d from \"{}\" order by ts", table))
+        .prepare(format!("select i, d from \"{}\" order by ts", table))
         .initial_credit(4 * 1024) // 4 KiB; smaller than a single batch
         .execute()
         .expect("execute");
@@ -2461,7 +2459,7 @@ fn exec_done_for_ddl_and_insert() {
     // 1) CREATE TABLE -> EXEC_DONE (DDL: rows_affected = 0).
     {
         let mut cur = reader
-            .prepare(&format!(
+            .prepare(format!(
                 "create table \"{}\" (v long, ts timestamp) timestamp(ts) partition by day wal",
                 table
             ))
@@ -2493,7 +2491,7 @@ fn exec_done_for_ddl_and_insert() {
     // 2) INSERT INTO ... VALUES -> EXEC_DONE with rows_affected = N.
     {
         let mut cur = reader
-            .prepare(&format!(
+            .prepare(format!(
                 "insert into \"{}\" values \
                  (10, '2026-01-01T00:00:00.000Z'), \
                  (20, '2026-01-01T00:00:01.000Z'), \
@@ -2527,7 +2525,7 @@ fn exec_done_for_ddl_and_insert() {
     wait_for_rows(srv, &table, 3);
     {
         let mut cur = reader
-            .prepare(&format!("select v from \"{}\" order by ts", table))
+            .prepare(format!("select v from \"{}\" order by ts", table))
             .execute()
             .expect("execute select");
         let view = cur.next_batch().expect("next select").expect("Some batch");
@@ -2544,7 +2542,7 @@ fn exec_done_for_ddl_and_insert() {
     // 4) DROP TABLE -> EXEC_DONE.
     {
         let mut cur = reader
-            .prepare(&format!("drop table \"{}\"", table))
+            .prepare(format!("drop table \"{}\"", table))
             .execute()
             .expect("execute drop");
         assert!(cur.next_batch().expect("next drop").is_none());
@@ -2590,7 +2588,7 @@ fn exec_done_for_bound_multi_row_insert() {
     // INSERT INTO ... VALUES ($1, ...) -> EXEC_DONE with rows_affected = N.
     {
         let mut cur = reader
-            .prepare(&format!(
+            .prepare(format!(
                 "insert into \"{}\" values ($1, $2, $3), ($4, $5, $6), ($7, $8, $9)",
                 table
             ))
@@ -2635,10 +2633,7 @@ fn exec_done_for_bound_multi_row_insert() {
     wait_for_rows(srv, &table, 3);
     {
         let mut cur = reader
-            .prepare(&format!(
-                "select name, v, ts from \"{}\" order by ts",
-                table
-            ))
+            .prepare(format!("select name, v, ts from \"{}\" order by ts", table))
             .execute()
             .expect("execute select");
         let view = cur.next_batch().expect("next select").expect("Some batch");
@@ -2687,7 +2682,7 @@ fn cursor_terminal_after_select() {
 
     let mut reader = make_reader(srv);
     let mut cur = reader
-        .prepare(&format!("select v from \"{}\"", table))
+        .prepare(format!("select v from \"{}\"", table))
         .execute()
         .expect("execute");
     while cur.next_batch().expect("next").is_some() {}
@@ -2731,7 +2726,7 @@ fn multi_batch_streaming() {
     let conf = format!("{};max_batch_rows={}", srv.qwp_conf(), PER_BATCH);
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .prepare(&format!("select i, d from \"{}\" order by ts", table))
+        .prepare(format!("select i, d from \"{}\" order by ts", table))
         .execute()
         .expect("execute");
 
@@ -2848,7 +2843,7 @@ fn multi_batch_with_mixed_nulls_and_symbols() {
     let conf = format!("{};max_batch_rows={}", srv.qwp_conf(), PER_BATCH);
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .prepare(&format!("select s, v from \"{}\" order by ts", table))
+        .prepare(format!("select s, v from \"{}\" order by ts", table))
         .execute()
         .expect("execute");
 
@@ -2883,8 +2878,8 @@ fn multi_batch_with_mixed_nulls_and_symbols() {
         // only on the first batch.
         for r in 0..rows {
             let global_row = total_rows - rows + r;
-            let null_sym_expected = global_row % 11 == 0;
-            let null_v_expected = global_row % 7 == 0;
+            let null_sym_expected = global_row.is_multiple_of(11);
+            let null_v_expected = global_row.is_multiple_of(7);
 
             // Symbol null bitmap.
             assert_eq!(
@@ -2997,7 +2992,7 @@ fn zstd_compressed_multi_batch() {
     );
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .prepare(&format!("select i, d from \"{}\" order by ts", table))
+        .prepare(format!("select i, d from \"{}\" order by ts", table))
         .execute()
         .expect("execute");
 
@@ -3188,7 +3183,7 @@ fn cancel_does_not_replenish_credit_window() {
     let conf = format!("{};max_batch_rows=500", srv.qwp_conf());
     let mut reader = Reader::from_conf(&conf).expect("reader");
     let mut cursor = reader
-        .prepare(&format!("select i from \"{}\" order by ts", table))
+        .prepare(format!("select i from \"{}\" order by ts", table))
         .initial_credit(CREDIT)
         .execute()
         .expect("execute");
@@ -3200,7 +3195,7 @@ fn cancel_does_not_replenish_credit_window() {
     // the drain would otherwise top the budget back up.
     const PRE_BATCHES: usize = 3;
     for _ in 0..PRE_BATCHES {
-        cursor
+        let _ = cursor
             .next_batch()
             .expect("pre-cancel next_batch")
             .expect("pre-cancel batch present");
@@ -3318,19 +3313,20 @@ where
     })
 }
 
-/// Regression: every terminal path — `RESULT_END`, `EXEC_DONE`, AND
-/// `QUERY_ERROR` (including the `STATUS_CANCELLED` reply that
-/// `cancel()` ends on) — must mark the cursor finished, so a follow-up
-/// `next_batch()` short-circuits to `Ok(None)` instead of trying to
-/// read another frame.
+/// Regression: every terminal — `RESULT_END`, `EXEC_DONE`, `QUERY_ERROR`,
+/// and the `STATUS_CANCELLED` reply that `cancel()` ends on — must mark the
+/// cursor `done` so a follow-up `next_batch()` returns *promptly* instead of
+/// blocking on `transport.read_frame()` for bytes the server will never send.
 ///
-/// Pre-fix, the `ServerEvent::Error` arm returned `Err(...)` and
-/// cleared `cursor_active` but never assigned `self.terminal`. A
-/// follow-up `next_batch()` then fell through to `transport.read_frame()`
-/// and blocked indefinitely on a healthy connection — most visibly
-/// after `cancel()`, which converts the `STATUS_CANCELLED` error into
-/// `Ok(())` and leaves the cursor in a "finished from cancel's POV but
-/// unfinished from next_batch's POV" state.
+/// The terminal kind decides the return value (see the replay-on-terminal
+/// guard in `Cursor::next_batch`): a clean terminal yields `Ok(None)`, while
+/// an error terminal stashes the error in `terminal_error` and replays that
+/// same `Err` on every later call — so a retry-on-transient-error caller can't
+/// mistake an aborted query for a complete, empty result.
+///
+/// Pre-fix, the error arm cleared `cursor_active` but never marked the cursor
+/// done, so the follow-up `next_batch()` blocked indefinitely on a healthy
+/// connection — most visibly after `cancel()`.
 #[test]
 fn cursor_short_circuits_after_query_error() {
     let srv = server();
@@ -3351,24 +3347,32 @@ fn cursor_short_circuits_after_query_error() {
             err.code()
         );
 
-        // Pre-fix: blocks reading the transport. Post-fix: returns
-        // Ok(None) immediately because `done` was set in the Error
-        // arm.
+        // After a QUERY_ERROR terminal the cursor is `done` with the error
+        // stashed in `terminal_error`, so every later next_batch replays that
+        // same Err (the replay-on-terminal guard in `Cursor::next_batch`)
+        // rather than collapsing to Ok(None). The regression is that the call
+        // returns *promptly* — never blocks on transport.read_frame — which
+        // `assert_returns_within` enforces.
         let again = assert_returns_within(
             Duration::from_secs(3),
             "next_batch after QUERY_ERROR",
-            || cur.next_batch().expect("second next_batch returns Ok"),
+            || cur.next_batch().map(|o| o.is_none()).map_err(|e| e.code()),
         );
-        assert!(
-            again.is_none(),
-            "next_batch after a QUERY_ERROR terminal must return Ok(None)"
+        assert_eq!(
+            again,
+            Err(err.code()),
+            "next_batch after a QUERY_ERROR terminal must replay the cached Err"
         );
 
-        // And one more for good measure — idempotent.
+        // Idempotent: the replay keeps surfacing the same error.
         let third = assert_returns_within(Duration::from_secs(3), "third next_batch", || {
-            cur.next_batch().expect("third next_batch returns Ok")
+            cur.next_batch().map(|o| o.is_none()).map_err(|e| e.code())
         });
-        assert!(third.is_none());
+        assert_eq!(
+            third,
+            Err(err.code()),
+            "the replayed Err must be idempotent"
+        );
     }
 
     // Path B: STATUS_CANCELLED from cancel(). cancel() returns Ok(())
@@ -3379,14 +3383,17 @@ fn cursor_short_circuits_after_query_error() {
         let mut cur = reader.prepare("select 1 as v").execute().expect("execute");
         cur.cancel().expect("cancel returns Ok");
 
+        // `select 1` completes before the CANCEL lands, so cancel() drains a
+        // clean terminal: `done` is set with no stashed error, and the
+        // follow-up next_batch returns Ok(None) (true = is_none), not Err.
         let post_cancel =
             assert_returns_within(Duration::from_secs(3), "next_batch after cancel", || {
-                cur.next_batch()
-                    .expect("next_batch after cancel returns Ok")
+                cur.next_batch().map(|o| o.is_none()).map_err(|e| e.code())
             });
-        assert!(
-            post_cancel.is_none(),
-            "next_batch after a successful cancel must return Ok(None)"
+        assert_eq!(
+            post_cancel,
+            Ok(true),
+            "next_batch after a cancel on a completed query must return Ok(None)"
         );
 
         // cancel() called twice is a no-op (also exercises the early
