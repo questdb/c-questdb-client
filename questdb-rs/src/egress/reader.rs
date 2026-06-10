@@ -131,9 +131,11 @@ pub struct Reader {
     query_schema: Option<Schema>,
     next_request_id: i64,
     cursor_active: bool,
-    /// Server's `SERVER_INFO` (`0x18`) — `None` when negotiated v1.
-    /// Captured eagerly during connect so multi-addr role filtering
-    /// can dismiss endpoints whose role doesn't match `target`.
+    /// Server's `SERVER_INFO` (`0x18`), captured eagerly during connect.
+    /// The single QWP version always sends it as the first frame, so this
+    /// is `Some` outside the brief reconnect window; multi-addr role
+    /// filtering uses it to dismiss endpoints whose role doesn't match
+    /// `target`.
     server_info: Option<ServerInfo>,
     /// Diagnostic counters (`bytes_received`, `credit_granted_total`,
     /// `read_ns`, `decode_ns`) shared with the FFI handle via `Arc` so
@@ -329,7 +331,7 @@ impl Reader {
             }
             annotated
         })?;
-        let server_info = if transport.server_version() >= 2 {
+        let server_info = if transport.server_version() >= 1 {
             Some(read_server_info_frame(
                 &mut transport,
                 Duration::from_millis(cfg.server_info_timeout_ms),
@@ -340,21 +342,21 @@ impl Reader {
         if !matches!(cfg.target, Target::Any) {
             match server_info.as_ref() {
                 None => {
-                    // v1 negotiated; per failover.md §5 every host's zone
-                    // tier stays `Unknown` and `target=primary|replica`
-                    // produces `TopologyReject`. Surface a plain
+                    // No SERVER_INFO was supplied, so there's no wire role
+                    // to match against `target`. Surface a plain
                     // `RoleMismatch` without `UpgradeReject` — there's no
-                    // wire role to attach, and the tracker treats the
-                    // absence as v1-pinned-topological.
+                    // role or zone to attach. With the single QWP version
+                    // (which always sends SERVER_INFO) this is unreachable
+                    // for a conformant server; it remains as a guard.
                     return Err(fmt!(
                         RoleMismatch,
-                        "endpoint {} negotiated v1 and cannot supply a role for target={:?}",
+                        "endpoint {} supplied no SERVER_INFO and cannot match target={:?}",
                         idx,
                         cfg.target
                     ));
                 }
                 Some(info) if !target_matches(cfg.target, info.role) => {
-                    // v2 advertised a role that doesn't match `target=`.
+                    // The endpoint advertised a role that doesn't match `target=`.
                     // Attach `UpgradeReject` carrying the advertised role
                     // and zone so the host-health tracker classifies
                     // identically to a `421+role` response — same
@@ -665,8 +667,8 @@ impl Reader {
         &self.stats
     }
 
-    /// `SERVER_INFO` (`0x18`) captured at connect time, when negotiated
-    /// version >= 2. `None` for v1 servers.
+    /// `SERVER_INFO` (`0x18`) captured at connect time. `None` only while
+    /// a reconnect is in flight; the single QWP version always supplies it.
     pub fn server_info(&self) -> Option<&ServerInfo> {
         self.server_info.as_ref()
     }
@@ -2614,7 +2616,7 @@ fn read_server_info_frame(transport: &mut WsTransport, timeout: Duration) -> Res
         ServerEvent::ServerInfo(info) => Ok(info),
         other => Err(fmt!(
             ProtocolError,
-            "expected SERVER_INFO as first v2 frame, got {:?}",
+            "expected SERVER_INFO as the first frame, got {:?}",
             std::mem::discriminant(&other)
         )),
     }

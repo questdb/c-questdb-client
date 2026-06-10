@@ -71,7 +71,6 @@ const MSG_KIND_QUERY_REQUEST: u8 = 0x10;
 const MSG_KIND_RESULT_BATCH: u8 = 0x11;
 const MSG_KIND_RESULT_END: u8 = 0x12;
 const MSG_KIND_SERVER_INFO: u8 = 0x18;
-const SCHEMA_MODE_FULL: u8 = 0x00;
 const NULL_FLAG_NONE: u8 = 0x00;
 const COL_KIND_LONG: u8 = 0x05;
 
@@ -107,7 +106,7 @@ fn server_info_frame(node_id: &str) -> Vec<u8> {
     let node_bytes = node_id.as_bytes();
     payload.extend_from_slice(&(node_bytes.len() as u16).to_le_bytes());
     payload.extend_from_slice(node_bytes);
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 fn result_end_frame(request_id: i64) -> Vec<u8> {
@@ -116,7 +115,7 @@ fn result_end_frame(request_id: i64) -> Vec<u8> {
     payload.extend_from_slice(&request_id.to_le_bytes());
     encode_varint_u64(0, &mut payload); // final_seq
     encode_varint_u64(0, &mut payload); // total_rows_affected
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 /// Build a `RESULT_BATCH` payload carrying a single 1-column LONG result
@@ -134,9 +133,8 @@ fn result_batch_frame_seq(request_id: i64, batch_seq: u64, row_count: usize) -> 
     encode_varint_u64(row_count as u64, &mut payload);
     encode_varint_u64(1, &mut payload);
 
-    // Schema section: Full, schema_id=1, one column "id" of type LONG.
-    payload.push(SCHEMA_MODE_FULL);
-    encode_varint_u64(1, &mut payload);
+    // Schema section: one column "id" of type LONG, inline right after
+    // col_count (no schema-mode byte, no schema id).
     encode_varint_u64(2, &mut payload); // name_len
     payload.extend_from_slice(b"id");
     payload.push(COL_KIND_LONG);
@@ -148,7 +146,7 @@ fn result_batch_frame_seq(request_id: i64, batch_seq: u64, row_count: usize) -> 
         payload.extend_from_slice(&v.to_le_bytes());
     }
 
-    framed(2, 0, 1, &payload)
+    framed(1, 0, 1, &payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +275,7 @@ impl Drop for FragMock {
 }
 
 /// Handle one accepted connection: HTTP/WS upgrade (replying with
-/// x-qwp-version=2 to match the SERVER_INFO frame), send SERVER_INFO,
+/// x-qwp-version=1 to match the SERVER_INFO frame), send SERVER_INFO,
 /// read the client's QUERY_REQUEST, then emit RESULT_BATCH (rows) +
 /// RESULT_END. Errors close the connection cleanly.
 ///
@@ -291,7 +289,7 @@ fn run_session(stream: ChunkingStream, rows: usize) {
     let mut ws: WebSocket<ChunkingStream> =
         match accept_hdr(stream, |_req: &Request, mut resp: Response| {
             resp.headers_mut()
-                .insert("x-qwp-version", HeaderValue::from_static("2"));
+                .insert("x-qwp-version", HeaderValue::from_static("1"));
             Ok(resp)
         }) {
             Ok(w) => w,

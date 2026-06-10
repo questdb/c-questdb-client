@@ -94,7 +94,7 @@ fn server_info_frame(role: ServerRole, node_id: &str, cluster_id: &str) -> Vec<u
     payload.extend_from_slice(cluster_id.as_bytes());
     payload.extend_from_slice(&(node_id.len() as u16).to_le_bytes());
     payload.extend_from_slice(node_id.as_bytes());
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 fn result_end_frame(request_id: i64) -> Vec<u8> {
@@ -103,7 +103,7 @@ fn result_end_frame(request_id: i64) -> Vec<u8> {
     payload.extend_from_slice(&request_id.to_le_bytes());
     encode_varint_u64(0, &mut payload); // final_seq
     encode_varint_u64(0, &mut payload); // total_rows
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 /// `QUERY_ERROR` frame: `[0x13, request_id i64 LE, status u8, msg_len u16 LE, msg_bytes...]`.
@@ -116,14 +116,14 @@ fn query_error_frame(request_id: i64, status: u8, message: &str) -> Vec<u8> {
     payload.push(status);
     payload.extend_from_slice(&(msg_bytes.len() as u16).to_le_bytes());
     payload.extend_from_slice(msg_bytes);
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 /// `CACHE_RESET` frame. `mask = 0x01` clears the per-connection symbol
 /// dict, `0x02` clears the schema registry, `0x03` clears both. The
 /// payload is just `[msg_kind, mask]`.
 fn cache_reset_frame(mask: u8) -> Vec<u8> {
-    framed(2, 0, 0, &[MSG_CACHE_RESET, mask])
+    framed(1, 0, 0, &[MSG_CACHE_RESET, mask])
 }
 
 // ---------------------------------------------------------------------------
@@ -390,17 +390,17 @@ fn run_script(
         return;
     }
 
-    // Pick the `x-qwp-version` to advertise. Default is "2" (matches
-    // SERVER_INFO frames the helpers build); a `HandshakeVersion(v)`
-    // action anywhere in the script overrides it so tests can drive
-    // the version-mismatch path in `WsTransport::connect_to`.
+    // Pick the `x-qwp-version` to advertise. Default is "1" (the single
+    // QWP version; matches the SERVER_INFO frames the helpers build); a
+    // `HandshakeVersion(v)` action anywhere in the script overrides it so
+    // tests can drive the version-mismatch path in `WsTransport::connect_to`.
     let handshake_version: String = script
         .iter()
         .find_map(|a| match a {
             Action::HandshakeVersion(v) => Some(v.to_string()),
             _ => None,
         })
-        .unwrap_or_else(|| "2".to_string());
+        .unwrap_or_else(|| "1".to_string());
     let handshake_version_for_closure = handshake_version.clone();
 
     let captured_auth_for_closure = Arc::clone(&captured_auth);
@@ -413,7 +413,7 @@ fn run_script(
             .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
         captured_auth_for_closure.lock().unwrap().push(auth);
         // Inject the X-QWP-Version response header. By default we
-        // negotiate v2 to match the SERVER_INFO frames the helpers
+        // negotiate v1 to match the SERVER_INFO frames the helpers
         // build; a `HandshakeVersion(v)` script entry overrides it.
         let header = HeaderValue::from_str(&handshake_version_for_closure).unwrap();
         resp.headers_mut().insert("x-qwp-version", header);
@@ -877,12 +877,12 @@ fn mid_query_close_triggers_failover() {
 
         // m9 regression guard: `new_server_info` must reflect the
         // actually-bound new endpoint (B), not be silently `None`.
-        // The mock advertises QWP v2 for every accept, so v1-only
-        // SERVER_INFO absence is not in play here.
+        // The mock advertises the single QWP version for every accept,
+        // which always carries SERVER_INFO.
         let info = events[0]
             .new_server_info
             .as_ref()
-            .expect("v2 mock must surface SERVER_INFO of the new endpoint");
+            .expect("mock must surface SERVER_INFO of the new endpoint");
         assert_eq!(info.role, ServerRole::Standalone);
         assert_eq!(info.node_id, "b");
     }
@@ -1929,7 +1929,7 @@ fn decode_error_does_not_trigger_failover_and_closes_transport() {
     // same Reader fails at the transport layer (the WS was torn down)
     // rather than with a stale-request_id ProtocolError.
     let bogus_payload = vec![0xEEu8, 0, 0, 0, 0, 0, 0, 0, 0]; // unknown msg_kind.
-    let bogus_frame = framed(2, 0, 0, &bogus_payload);
+    let bogus_frame = framed(1, 0, 0, &bogus_payload);
     let srv_a = MockServer::start(vec![vec![
         Action::SendServerInfo {
             role: ServerRole::Standalone,
@@ -3478,7 +3478,7 @@ fn auth_timeout_does_not_fire_within_budget() {
 ///
 /// The mock's script holds the connection open for 800ms WITHOUT
 /// emitting `SendServerInfo`, so the upgrade completes (advertised
-/// `x-qwp-version: 2`) but the post-upgrade read on the client side
+/// `x-qwp-version: 1`) but the post-upgrade read on the client side
 /// has no SERVER_INFO frame to consume. With
 /// `server_info_timeout_ms=100`, the client should give up within
 /// ~150ms and surface a failover-eligible transport error.
@@ -3486,7 +3486,7 @@ fn auth_timeout_does_not_fire_within_budget() {
 fn server_info_timeout_bounds_post_upgrade_stall() {
     use questdb::egress::ReaderConfig;
 
-    // The implicit `handshake_version = "2"` advertises v2, which
+    // The implicit `handshake_version = "1"` advertises v1, which
     // triggers `read_server_info_frame` on the client side. The
     // script has no `SendServerInfo` action, so the server just
     // sleeps after the upgrade and never writes the frame.

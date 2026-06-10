@@ -93,7 +93,7 @@ TEST_CASE("mock: handshake + immediate ResultEnd drives cursor terminus")
     qm::MockServer srv({s});
 
     auto reader = connect_to(srv);
-    CHECK(reader.server_version() == 2);
+    CHECK(reader.server_version() == 1);
     CHECK_FALSE(reader.current_host().empty());
 
     // Server identity from SERVER_INFO is exposed via the wrapper.
@@ -2694,7 +2694,7 @@ TEST_CASE("mock: protocol_error — over-long varint in batch_seq")
             for (int i = 0; i < 12; ++i)
                 p.push_back(0xFF);
             p.push_back(0x00);
-            return qm::framed(2, 0, 1, p);
+            return qm::framed(1, 0, 1, p);
         }},
         qm::ActionSendResultEnd{},
     };
@@ -2806,7 +2806,7 @@ TEST_CASE("mock: reader move-assign succeeds once cursor is dropped")
 
     // No throw; reader_a now talks to srv_b's handshake.
     reader_a = std::move(reader_b);
-    CHECK(reader_a.server_version() == 2);
+    CHECK(reader_a.server_version() == 1);
 }
 
 // A live cursor holds a laundered `&mut Reader`; the reader-side metadata
@@ -2826,7 +2826,7 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
     const uint8_t version = reader.server_version();
     const std::string host{reader.current_host()};
     const uint16_t port = reader.current_port();
-    CHECK(version == 2);
+    CHECK(version == 1);
     CHECK_FALSE(host.empty());
     CHECK(port != 0);
     CHECK(static_cast<bool>(reader.server_info()));
@@ -4282,8 +4282,9 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 // breadcrumbs for the next contributor:
 //
 //  - `tls_error`: needs a real TLS terminator in front of the mock.
-//  - `unsupported_server`: the mock pins QWP version 2; triggering the
-//    upstream version-rejection path needs a higher-version SERVER_INFO.
+//  - `unsupported_server`: the mock pins QWP version 1 (the only version
+//    this client speaks); triggering the upstream version-rejection path
+//    needs the handshake to advertise a higher X-QWP-Version.
 //  - `invalid_timestamp` / `invalid_decimal`: per upstream, these
 //    error variants are reachable from sender code paths but not
 //    produced by the reader as of this revision; assertion would need

@@ -655,8 +655,8 @@ qwp_test_decoded_scalar_datagram decode_single_scalar_qwp_datagram(
     decoded.row_count = decoder.read_varint();
     const size_t row_count = static_cast<size_t>(decoded.row_count);
     const size_t column_count = static_cast<size_t>(decoder.read_varint());
-    REQUIRE(decoder.read_u8() == 0);
-    REQUIRE(decoder.read_varint() == 0);
+    // Columns travel inline right after col_count: no schema-mode byte,
+    // no schema id.
 
     decoded.columns.reserve(column_count);
     for (size_t i = 0; i < column_count; ++i)
@@ -829,8 +829,8 @@ qwp_test_decoded_array_datagram decode_single_array_qwp_datagram(
     decoded.row_count = decoder.read_varint();
     REQUIRE(decoded.row_count == 1);
     REQUIRE(decoder.read_varint() == 1);
-    REQUIRE(decoder.read_u8() == 0);
-    (void)decoder.read_varint(); // schema id
+    // Columns travel inline right after col_count: no schema-mode byte,
+    // no schema id.
 
     decoded.column.name = decoder.read_string();
     decoded.column.type_code = decoder.read_u8();
@@ -934,8 +934,8 @@ qwp_test_decoded_decimal_datagram decode_single_decimal_qwp_datagram(
     decoded.table_name = decoder.read_string();
     decoded.row_count = decoder.read_varint();
     REQUIRE(decoder.read_varint() == 1);
-    REQUIRE(decoder.read_u8() == 0);
-    (void)decoder.read_varint(); // schema id
+    // Columns travel inline right after col_count: no schema-mode byte,
+    // no schema id.
 
     decoded.column.name = decoder.read_string();
     decoded.column.type_code = decoder.read_u8();
