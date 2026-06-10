@@ -390,8 +390,9 @@ fn generate_valid_message(seed: u64) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Decode helpers. Each call gets a fresh `SymbolDict` / `SchemaRegistry`
-// so a corrupted SYMBOL dict in one iteration can't poison the next.
+// Decode helpers. Each call gets a fresh `SymbolDict` and an empty
+// per-query schema (`Option<Schema>`) so a corrupted SYMBOL dict in one
+// iteration can't poison the next.
 // ---------------------------------------------------------------------------
 
 fn sanity_check_decode(message: &[u8]) {

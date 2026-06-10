@@ -37,7 +37,7 @@
 //! |--------------------|----------------------------------------------------------|
 //! | `addr`             | required; `host:port` or `host`                          |
 //! | `path`             | endpoint path (`/read/v1`)                               |
-//! | `max_version`      | QWP version to advertise (`2`)                           |
+//! | `max_version`      | QWP version to advertise (`1`)                           |
 //! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
 //! | `compression_level`| `zstd` level advertised in `X-QWP-Accept-Encoding` as `zstd;level=N`; `[1,22]`, default `1` (server clamps to `[1,9]`); ignored when `compression=raw` |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
