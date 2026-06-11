@@ -95,7 +95,7 @@ impl Schema {
     /// first `RESULT_BATCH` (`batch_seq == 0`) of a query inline, right after
     /// the table block's `col_count`. Returns the decoded schema and the
     /// number of bytes consumed (the column data follows immediately after).
-    pub fn decode_inline(bytes: &[u8], col_count: usize) -> Result<(Schema, usize)> {
+    pub(crate) fn decode_inline(bytes: &[u8], col_count: usize) -> Result<(Schema, usize)> {
         let mut cursor = 0usize;
         // Clamp initial capacity by available bytes so a hostile `col_count`
         // can't trigger an oversized allocation before the loop discovers the
