@@ -444,13 +444,13 @@ fn generate_valid_query(seed: u64) -> (Vec<u8>, Vec<u8>) {
 
 fn sanity_check_decode(message: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg: Option<Schema> = None;
+    let mut schema: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     decode_result_batch(
         &Bytes::copy_from_slice(message),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     )
     .unwrap_or_else(|e| {
@@ -467,13 +467,13 @@ fn sanity_check_decode(message: &[u8]) {
 /// shrinkable failure.
 fn attempt_decode_no_panic(bytes: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg: Option<Schema> = None;
+    let mut schema: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     let _ = decode_result_batch(
         &Bytes::copy_from_slice(bytes),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     );
 }
@@ -482,13 +482,13 @@ fn attempt_decode_no_panic(bytes: &[u8]) {
 /// populated per-query schema slot, ready for continuation decodes.
 fn decode_batch0_schema(batch0: &[u8]) -> Option<Schema> {
     let mut dict = SymbolDict::new();
-    let mut reg: Option<Schema> = None;
+    let mut schema: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     if let Err(e) = decode_result_batch(
         &Bytes::copy_from_slice(batch0),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     ) {
         panic!(
@@ -498,10 +498,10 @@ fn decode_batch0_schema(batch0: &[u8]) -> Option<Schema> {
         );
     }
     assert!(
-        reg.is_some(),
+        schema.is_some(),
         "batch 0 decode must populate the schema slot"
     );
-    reg
+    schema
 }
 
 /// Continuation analogue of [`attempt_decode_no_panic`]: decode `bytes`
@@ -509,13 +509,13 @@ fn decode_batch0_schema(batch0: &[u8]) -> Option<Schema> {
 /// call for the same isolation reasons as the batch-0 helpers.
 fn attempt_continuation_decode_no_panic(schema: &Option<Schema>, bytes: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg = schema.clone();
+    let mut schema = schema.clone();
     let mut scratch = ZstdScratch::new();
     let _ = decode_result_batch(
         &Bytes::copy_from_slice(bytes),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     );
 }
@@ -524,13 +524,13 @@ fn attempt_continuation_decode_no_panic(schema: &Option<Schema>, bytes: &[u8]) {
 /// against the schema retained from batch 0.
 fn sanity_check_continuation_decode(schema: &Option<Schema>, cont: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg = schema.clone();
+    let mut schema = schema.clone();
     let mut scratch = ZstdScratch::new();
     if let Err(e) = decode_result_batch(
         &Bytes::copy_from_slice(cont),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     ) {
         panic!(
@@ -637,13 +637,13 @@ proptest! {
 fn continuation_with_empty_schema_slot_rejected() {
     let (_batch0, cont) = generate_valid_query(0xC0FF_EE12_3456_789A);
     let mut dict = SymbolDict::new();
-    let mut reg: Option<Schema> = None;
+    let mut schema: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     let err = decode_result_batch(
         &Bytes::copy_from_slice(&cont),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     )
     .expect_err("continuation without a prior batch 0 must be rejected");

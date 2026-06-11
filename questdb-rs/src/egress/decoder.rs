@@ -43,8 +43,9 @@
 //!   name_len:  varint   0 for query results
 //!   name:      bytes    (skipped)
 //!   row_count: varint
-//!   col_count: varint
-//!   schema section (see egress::schema)
+//!   [if batch_seq == 0]:           # schema rides the first batch only
+//!     col_count: varint
+//!     schema section (see egress::schema)
 //!
 //! per-column data:
 //!   null_flag: u8       0x00 = no bitmap; 0x01 = bitmap of ceil(row/8) bytes
@@ -1775,12 +1776,12 @@ mod tests {
         let payload = Bytes::from(payload);
 
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .expect_err("decoder must reject FLAG_ZSTD when built without compression-zstd");
@@ -1929,12 +1930,12 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -1965,12 +1966,12 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -1999,12 +2000,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2077,12 +2078,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2114,12 +2115,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2143,12 +2144,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2227,12 +2228,12 @@ mod tests {
                 .add_column("v", *kind, col_with_bitmap(&bitmap, value_bytes))
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let batch = decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .unwrap_or_else(|e| panic!("{:?}: {}", kind, e.msg()));
@@ -2265,12 +2266,12 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, geo_payload)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2298,12 +2299,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2331,12 +2332,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2360,12 +2361,12 @@ mod tests {
             .add_column("b", ColumnKind::Boolean, col_no_nulls(&[0x0D]))
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2426,12 +2427,12 @@ mod tests {
     fn assert_non_nullable_rejects_bitmap(kind: ColumnKind, kind_name: &str, body: Vec<u8>) {
         let (flags_byte, payload) = BatchBuilder::new(5).add_column("c", kind, body).build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -2485,12 +2486,12 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2515,12 +2516,12 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2548,12 +2549,12 @@ mod tests {
             .add_column("b", ColumnKind::Symbol, col_b)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2578,12 +2579,12 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -2600,12 +2601,12 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -2622,12 +2623,12 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -2650,12 +2651,12 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2682,12 +2683,12 @@ mod tests {
             .build();
 
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2721,12 +2722,12 @@ mod tests {
             let (flags_byte, payload) = BatchBuilder::new(1).add_column("p", kind, data).build();
 
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .unwrap_err();
@@ -2748,12 +2749,12 @@ mod tests {
             .add_column("p", ColumnKind::Decimal64, data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -2763,14 +2764,14 @@ mod tests {
     #[test]
     fn schema_reused_across_continuation_batches() {
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
 
         // First batch (batch_seq == 0) carries the full inline schema.
         let (f1, p1) = BatchBuilder::new(2)
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[1, 2])))
             .build();
-        decode_result_batch(&p1, f1, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
-        assert!(reg.is_some());
+        decode_result_batch(&p1, f1, &mut dict, &mut schema, &mut ZstdScratch::new()).unwrap();
+        assert!(schema.is_some());
 
         // Continuation batch (batch_seq == 1) carries rows only and reuses the
         // schema parsed from batch 0.
@@ -2779,7 +2780,7 @@ mod tests {
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[42])))
             .build();
         let b2 =
-            decode_result_batch(&p2, f2, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
+            decode_result_batch(&p2, f2, &mut dict, &mut schema, &mut ZstdScratch::new()).unwrap();
         assert_eq!(b2.batch_seq, 1);
         let view = b2.column_view(0, &dict).unwrap();
         let ColumnView::Long(c) = view else { panic!() };
@@ -2789,15 +2790,15 @@ mod tests {
     #[test]
     fn continuation_before_schema_rejected() {
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         // A batch_seq > 0 arriving before any batch_seq == 0 has no schema to
         // bind rows to and must be rejected.
         let (f, p) = BatchBuilder::new(1)
             .with_batch_seq(1)
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[42])))
             .build();
-        let err =
-            decode_result_batch(&p, f, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
+        let err = decode_result_batch(&p, f, &mut dict, &mut schema, &mut ZstdScratch::new())
+            .unwrap_err();
         assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
     }
 
@@ -2831,12 +2832,12 @@ mod tests {
         let zstd_payload = Bytes::from(zstd_payload);
 
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &zstd_payload,
             flags::ZSTD,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -2986,12 +2987,12 @@ mod tests {
         payload.extend_from_slice(&[0u8, 0, 0, 0]); // not a zstd frame
         let payload = Bytes::from(payload);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3059,12 +3060,12 @@ mod tests {
 
         let payload = zstd_payload_with_body(&body);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3093,12 +3094,12 @@ mod tests {
 
         let payload = zstd_payload_with_body(&frame);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3145,12 +3146,12 @@ mod tests {
 
         let payload = zstd_payload_with_body(&body);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::ZSTD,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3168,12 +3169,12 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags::GORILLA,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3198,12 +3199,12 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3228,12 +3229,12 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3257,12 +3258,12 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3286,12 +3287,12 @@ mod tests {
             .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3394,12 +3395,12 @@ mod tests {
             .add_column("ts", kind, body)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags::GORILLA,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_or_else(|e| panic!("decode failed for {:?}: {}", kind, e));
@@ -3495,12 +3496,12 @@ mod tests {
             .add_column("a", ColumnKind::DoubleArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3528,12 +3529,12 @@ mod tests {
             .add_column("a", ColumnKind::LongArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3560,12 +3561,12 @@ mod tests {
             .add_column("a", ColumnKind::DoubleArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3582,12 +3583,12 @@ mod tests {
             .add_column("a", ColumnKind::LongArray, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3633,12 +3634,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3664,12 +3665,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3697,12 +3698,12 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3725,12 +3726,12 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3749,12 +3750,12 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3778,12 +3779,12 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3806,12 +3807,12 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3836,12 +3837,12 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3870,12 +3871,12 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3900,12 +3901,12 @@ mod tests {
             .add_column("g", ColumnKind::Geohash, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -3920,12 +3921,12 @@ mod tests {
             .add_column("p", ColumnKind::Decimal128, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3949,12 +3950,12 @@ mod tests {
             .add_column("p", ColumnKind::Decimal256, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -3977,12 +3978,12 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4006,12 +4007,12 @@ mod tests {
         bytes_vec.push(0xAA); // trailing byte
         let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -4026,12 +4027,12 @@ mod tests {
             .build();
         payload.truncate(payload.len() - 4); // chop value bytes
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -4055,12 +4056,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4100,12 +4101,12 @@ mod tests {
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[])))
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4128,12 +4129,12 @@ mod tests {
             .add_column("s", ColumnKind::Varchar, varchar_col_no_nulls(&[]))
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4168,12 +4169,12 @@ mod tests {
             })
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4212,12 +4213,12 @@ mod tests {
             )
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4254,12 +4255,12 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4298,12 +4299,12 @@ mod tests {
             .add_column("b", ColumnKind::Binary, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4354,12 +4355,12 @@ mod tests {
             .add_column("s", ColumnKind::Symbol, col)
             .build();
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let batch = decode_result_batch(
             &payload,
             flags_byte,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -4448,12 +4449,12 @@ mod tests {
                 .add_column("a", ColumnKind::DoubleArray, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .expect("ARRAY row with dim==0 must decode as a valid empty array");
@@ -4469,12 +4470,12 @@ mod tests {
                 .add_column("a", ColumnKind::DoubleArray, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .expect("2D array with all non-zero dims must decode cleanly");
@@ -4495,12 +4496,12 @@ mod tests {
                 .add_column("g", ColumnKind::Geohash, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .expect_err("decoder must reject GEOHASH precision_bits=0");
@@ -4521,12 +4522,12 @@ mod tests {
                 .add_column("g", ColumnKind::Geohash, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .expect_err("decoder must reject GEOHASH precision_bits > 60");
@@ -4560,9 +4561,9 @@ mod tests {
 
             let payload = Bytes::from(out);
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let err =
-                decode_result_batch(&payload, 0, &mut dict, &mut reg, &mut ZstdScratch::new())
+                decode_result_batch(&payload, 0, &mut dict, &mut schema, &mut ZstdScratch::new())
                     .expect_err("decoder must reject huge table name length");
             assert!(
                 err.msg().contains("table name length"),
@@ -4589,12 +4590,12 @@ mod tests {
                 .add_column("s", ColumnKind::Symbol, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .expect_err("decoder must reject SYMBOL dict_size > row_count");
@@ -4627,12 +4628,12 @@ mod tests {
                 .add_column("v", ColumnKind::Varchar, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .expect_err("decoder must reject non-monotonic varlen offsets");
@@ -4659,12 +4660,12 @@ mod tests {
                 .add_column("v", ColumnKind::Varchar, body)
                 .build();
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let err = decode_result_batch(
                 &payload,
                 flags_byte,
                 &mut dict,
-                &mut reg,
+                &mut schema,
                 &mut ZstdScratch::new(),
             )
             .expect_err("decoder must reject non-zero first offset");

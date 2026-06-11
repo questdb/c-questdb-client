@@ -42,7 +42,7 @@ use bytes::Bytes;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// QuestDB cluster role advertised by `SERVER_INFO` (v2+).
+/// QuestDB cluster role advertised by `SERVER_INFO`.
 ///
 /// `#[non_exhaustive]` because new role bytes may be added in future
 /// protocol revisions; a future revision might also promote a known
@@ -109,15 +109,15 @@ pub struct ServerInfo {
     /// `capabilities`. Free-form, opaque, case-insensitively compared to
     /// the client's `zone=` connect-string knob (failover.md §2). `None`
     /// on every server that does not advertise `CAP_ZONE` — including
-    /// v2.0 servers whose `capabilities` is hard-zero.
+    /// servers whose `capabilities` is hard-zero.
     pub zone_id: Option<String>,
 }
 
 /// Single decoded server message.
 ///
 /// One frame in, one event out. The dispatcher applies state mutations
-/// (symbol dict deltas, schema-registry inserts, cache resets) before
-/// returning so callers can treat each event idempotently.
+/// (symbol dict deltas, batch-0 inline-schema capture, cache resets)
+/// before returning so callers can treat each event idempotently.
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
     /// `RESULT_BATCH` (`0x11`).
@@ -140,7 +140,7 @@ pub enum ServerEvent {
         op_type: u8,
         rows_affected: u64,
     },
-    /// `CACHE_RESET` (`0x17`). Mask bits already applied to dict/registry.
+    /// `CACHE_RESET` (`0x17`). Mask bits already applied to the symbol dict.
     CacheReset {
         // `mask` is matched literally by tests (pattern `mask: 0x01`)
         // but never read by the consumers — `decode_frame` performs
@@ -291,11 +291,11 @@ fn decode_server_info(payload: &[u8]) -> Result<ServerEvent> {
     let cluster_id = read_u16_string(&mut r, "cluster_id")?;
     let node_id = read_u16_string(&mut r, "node_id")?;
     // `zone_id` is the only currently-defined trailing field, gated on
-    // CAP_ZONE (wire-egress.md §11.8). A v2.0 server with capabilities=0
-    // never enters this branch and the byte layout matches the original
-    // v2.0 spec. Future trailing fields will key off their own capability
-    // bits the same way; unknown bits are silently ignored so a v2.0
-    // client reading a v2.1+ server tolerates new fields it doesn't know
+    // CAP_ZONE (wire-egress.md §11.8). A server with capabilities=0
+    // never enters this branch and the byte layout matches the base
+    // spec. Future trailing fields will key off their own capability
+    // bits the same way; unknown bits are silently ignored so an older
+    // client reading a newer server tolerates new fields it doesn't know
     // how to parse — those bytes get caught by `expect_eof` below until
     // this client learns to consume them.
     let zone_id = if has_zone(capabilities) {
@@ -360,12 +360,12 @@ fn read_u16_string(r: &mut ByteReader<'_>, field: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::egress::error::ErrorCode;
-    use crate::egress::wire::header::HEADER_LEN;
+    use crate::egress::wire::header::{HEADER_LEN, PROTOCOL_VERSION};
     use crate::egress::wire::varint::encode_u64;
 
     fn header(payload_len: usize) -> FrameHeader {
         FrameHeader {
-            version: 2,
+            version: PROTOCOL_VERSION,
             flags: 0,
             table_count: 0,
             payload_length: payload_len as u32,
@@ -386,12 +386,12 @@ mod tests {
     fn decode_result_end_ok() {
         let payload = build_result_end(42, 7, 1_000);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -424,12 +424,12 @@ mod tests {
     fn decode_query_error_ok() {
         let payload = build_query_error(9, StatusCode::ParseError, "bad SQL");
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -452,12 +452,12 @@ mod tests {
         let payload = build_query_error(1, StatusCode::InternalError, "details");
         let truncated = payload.slice(..payload.len() - 3);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_frame(
             header(truncated.len()),
             &truncated,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -473,12 +473,12 @@ mod tests {
         p.extend_from_slice(&[0xFF, 0xFE]);
         let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_frame(
             header(p.len()),
             &p,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -495,12 +495,12 @@ mod tests {
         encode_u64(0, &mut p); // rows_affected for DDL
         let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let event = decode_frame(
             header(p.len()),
             &p,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -607,12 +607,12 @@ mod tests {
     fn decode_server_info_primary() {
         let payload = build_server_info(0x01, "cluster-A", "node-1");
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -632,12 +632,12 @@ mod tests {
     fn unknown_role_byte_is_other_variant() {
         let payload = build_server_info(0x55, "c", "n");
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -658,12 +658,12 @@ mod tests {
             Some("eu-west-1a"),
         );
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let event = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap();
@@ -691,12 +691,12 @@ mod tests {
             None, // no trailing zone_id despite CAP_ZONE
         );
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn unknown_capabilities_bit_with_trailing_bytes_is_protocol_error() {
-        // A future capability bit gates further trailing fields. A v2.0
+        // A future capability bit gates further trailing fields. A
         // client that doesn't understand the bit MUST still reject
         // unknown trailing bytes (caught by `expect_eof`) rather than
         // silently ignoring them — the server is supposed to omit
@@ -716,12 +716,12 @@ mod tests {
         payload.extend_from_slice(&[0xDE, 0xAD]);
         let payload = Bytes::from(payload);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -733,13 +733,13 @@ mod tests {
     #[test]
     fn empty_payload_rejected() {
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let empty = Bytes::new();
         let err = decode_frame(
             header(0),
             &empty,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
@@ -749,10 +749,16 @@ mod tests {
     #[test]
     fn unknown_msg_kind_rejected() {
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let p = Bytes::from(vec![0xAA]);
-        let err =
-            decode_frame(header(1), &p, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
+        let err = decode_frame(
+            header(1),
+            &p,
+            &mut dict,
+            &mut schema,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -764,10 +770,16 @@ mod tests {
             MsgKind::Credit.as_u8(),
         ] {
             let mut dict = SymbolDict::new();
-            let mut reg: Option<Schema> = None;
+            let mut schema: Option<Schema> = None;
             let p = Bytes::from(vec![k]);
-            let err = decode_frame(header(1), &p, &mut dict, &mut reg, &mut ZstdScratch::new())
-                .unwrap_err();
+            let err = decode_frame(
+                header(1),
+                &p,
+                &mut dict,
+                &mut schema,
+                &mut ZstdScratch::new(),
+            )
+            .unwrap_err();
             assert_eq!(err.code(), ErrorCode::ProtocolError);
             assert!(err.msg().contains("client-only"));
         }
@@ -780,12 +792,12 @@ mod tests {
         bytes_vec.push(0xFF);
         let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
-        let mut reg: Option<Schema> = None;
+        let mut schema: Option<Schema> = None;
         let err = decode_frame(
             header(payload.len()),
             &payload,
             &mut dict,
-            &mut reg,
+            &mut schema,
             &mut ZstdScratch::new(),
         )
         .unwrap_err();
