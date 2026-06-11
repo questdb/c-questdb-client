@@ -2507,6 +2507,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     max_bounces=fuzz.max_bounces,
                     min_interval_s=fuzz.min_bounce_interval_s,
                     max_interval_s=fuzz.max_bounce_interval_s,
+                    stop_timeout_s=fuzz.bounce_stop_timeout_s,
                     writers_done=producers_done,
                     stop_event=stop_event,
                     record_failure=record_failure,

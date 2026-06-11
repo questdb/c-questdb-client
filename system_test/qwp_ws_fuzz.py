@@ -755,6 +755,7 @@ class FuzzParams:
         'max_bounces',
         'min_bounce_interval_s',
         'max_bounce_interval_s',
+        'bounce_stop_timeout_s',
         'extreme_string_factor',
         'extreme_numeric_factor',
         'extreme_timestamp_factor',
@@ -775,6 +776,7 @@ class FuzzParams:
             max_bounces=0,
             min_bounce_interval_s=0.5,
             max_bounce_interval_s=3.0,
+            bounce_stop_timeout_s=120.0,
             extreme_string_factor=-1,
             extreme_numeric_factor=-1,
             extreme_timestamp_factor=-1,
@@ -792,6 +794,13 @@ class FuzzParams:
         self.min_bounce_interval_s = min_bounce_interval_s
         self.max_bounce_interval_s = max(
             min_bounce_interval_s, max_bounce_interval_s)
+        # Graceful-shutdown budget for a bounce's stop(). Generous on
+        # purpose: SIGTERM has to drain the in-flight WAL structural-change
+        # backlog (QuestDB's QWP ingest path keeps committing queued
+        # ADD COLUMNs through shutdown instead of honouring the worker halt
+        # signal), and on a slow CI box that bounded drain can run well past
+        # the fixture's strict 30s default. See BounceThread.run().
+        self.bounce_stop_timeout_s = bounce_stop_timeout_s
         self.extreme_string_factor = extreme_string_factor
         self.extreme_numeric_factor = extreme_numeric_factor
         self.extreme_timestamp_factor = extreme_timestamp_factor
@@ -1429,6 +1438,7 @@ class BounceThread(threading.Thread):
             max_bounces: int,
             min_interval_s: float,
             max_interval_s: float,
+            stop_timeout_s: float,
             writers_done: threading.Event,
             stop_event: threading.Event,
             record_failure,
@@ -1441,6 +1451,7 @@ class BounceThread(threading.Thread):
         self._max_bounces = max_bounces
         self._min_interval_s = min_interval_s
         self._max_interval_s = max(max_interval_s, min_interval_s)
+        self._stop_timeout_s = stop_timeout_s
         self._writers_done = writers_done
         self._stop_event = stop_event
         self._record_failure = record_failure
@@ -1461,7 +1472,16 @@ class BounceThread(threading.Thread):
             try:
                 idx = self.bounces_performed + 1
                 self._log(f'fuzz bounce #{idx}: stopping QDB')
-                self._fixture.stop()
+                # Generous shutdown budget (not the fixture's strict 30s
+                # default): a bounce SIGTERMs the server while producers are
+                # mid-load, so graceful shutdown must first drain the
+                # in-flight WAL structural-change backlog. QuestDB's QWP
+                # ingest path keeps committing the queued ADD COLUMNs through
+                # shutdown (unlike the WAL-apply job, it doesn't honour the
+                # worker halt signal), so that bounded drain legitimately runs
+                # past 30s on a slow CI box. A genuinely stuck server still
+                # trips the larger budget and fails the run.
+                self._fixture.stop(wait_timeout_sec=self._stop_timeout_s)
                 # Tiny gap so the OS settles the listening sockets
                 # before start() rebinds them.
                 time.sleep(0.02 + self._rnd.next_int(200) / 1000.0)
@@ -1484,7 +1504,7 @@ class BounceThread(threading.Thread):
                 # failed partway it may have left a process behind, and we
                 # must not launch a second one next to it.
                 try:
-                    self._fixture.stop()
+                    self._fixture.stop(wait_timeout_sec=self._stop_timeout_s)
                 except Exception:
                     pass
                 try:
