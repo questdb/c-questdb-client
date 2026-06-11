@@ -32,8 +32,8 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ingress::{
-    Buffer, QwpWsEncodeScratch, SchemaRegistry, SymbolGlobalDict, TimestampNanos, perform_upgrade,
-    read_message, write_binary_frame,
+    Buffer, QwpWsEncodeScratch, SymbolGlobalDict, TimestampNanos, perform_upgrade, read_message,
+    write_binary_frame,
 };
 
 use super::{TestError, TestResult};
@@ -106,7 +106,6 @@ fn qwp_ws_real_server_error_taxonomy_probe() -> TestResult {
     eprintln!("QuestDB build: {}", query_build(&config)?);
 
     probe_malformed_frame_taxonomy(&config)?;
-    probe_schema_mismatch_taxonomy(&config)?;
     probe_type_coercion_taxonomy(&config)?;
 
     Ok(())
@@ -188,39 +187,6 @@ fn probe_malformed_frame_taxonomy(config: &ProbeConfig) -> ProbeResult<()> {
     eprintln!("malformed-frame post-error observation for {table}: {post_error:?}");
 
     assert_eq!(error.status, QWP_STATUS_PARSE_ERROR);
-    assert_eq!(error.sequence, 1);
-    assert_eq!(
-        post_error,
-        PostErrorObservation::Response(ObservedResponse::Ok { sequence: 2 }),
-        "server should continue far enough to resolve the later valid frame"
-    );
-
-    let count = wait_for_count(config, &table, 2, Duration::from_secs(10))?;
-    assert_eq!(count, 2);
-    assert!(has_qty(config, &table, 10)?);
-    assert!(has_qty(config, &table, 30)?);
-
-    Ok(())
-}
-
-fn probe_schema_mismatch_taxonomy(config: &ProbeConfig) -> ProbeResult<()> {
-    let table = unique_table_name("qwp_error_probe_schema");
-    let _cleanup = TableCleanup::new(config.clone(), table.clone());
-    let payloads = build_schema_reference_mismatch_payloads(&table)?;
-
-    let mut stream = open_ws_connection(config, "rust-qwp-error-schema-probe")?;
-    send_payloads_without_reading(&mut stream, &payloads)?;
-
-    let (responses, error) = read_until_error(&mut stream)?;
-    let post_error = observe_post_error(&mut stream);
-    eprintln!("schema-mismatch responses before error for {table}: {responses:?}");
-    eprintln!(
-        "schema-mismatch error for {table}: status=0x{:02x}, sequence={}, message={:?}",
-        error.status, error.sequence, error.message
-    );
-    eprintln!("schema-mismatch post-error observation for {table}: {post_error:?}");
-
-    assert_eq!(error.status, QWP_STATUS_SCHEMA_MISMATCH);
     assert_eq!(error.sequence, 1);
     assert_eq!(
         post_error,
@@ -352,7 +318,6 @@ impl<'a> ProbeRow<'a> {
 fn build_normal_payloads(table: &str, rows: &[ProbeRow<'_>]) -> ProbeResult<Vec<Vec<u8>>> {
     let mut scratch = QwpWsEncodeScratch::new();
     let mut global_dict = SymbolGlobalDict::new();
-    let mut schema_registry = SchemaRegistry::new();
     let mut payloads = Vec::with_capacity(rows.len());
 
     for row in rows {
@@ -367,34 +332,8 @@ fn build_normal_payloads(table: &str, rows: &[ProbeRow<'_>]) -> ProbeResult<Vec<
             &mut buffer,
             &mut scratch,
             &mut global_dict,
-            &mut schema_registry,
         )?);
     }
-
-    Ok(payloads)
-}
-
-fn build_schema_reference_mismatch_payloads(table: &str) -> ProbeResult<Vec<Vec<u8>>> {
-    let mut payloads = build_normal_payloads(
-        table,
-        &[
-            ProbeRow::new("SYM_SCHEMA_0", 10, 100.0, 0),
-            ProbeRow::new("SYM_SCHEMA_1", 20, 200.0, 1),
-            ProbeRow::new("SYM_SCHEMA_2", 30, 300.0, 2),
-        ],
-    )?;
-
-    let offset = table_column_count_offset(&payloads[1])?;
-    if payloads[1][offset] & 0x80 != 0 || payloads[1][offset] == u8::MAX {
-        return Err(Box::new(IoError::new(
-            ErrorKind::InvalidData,
-            format!(
-                "expected mutable one-byte column count in schema-reference payload, got {}",
-                payloads[1][offset]
-            ),
-        )));
-    }
-    payloads[1][offset] += 1;
 
     Ok(payloads)
 }
@@ -402,7 +341,6 @@ fn build_schema_reference_mismatch_payloads(table: &str) -> ProbeResult<Vec<Vec<
 fn build_type_coercion_payloads(table: &str) -> ProbeResult<Vec<Vec<u8>>> {
     let mut scratch = QwpWsEncodeScratch::new();
     let mut global_dict = SymbolGlobalDict::new();
-    let mut schema_registry = SchemaRegistry::new();
     let mut payloads = Vec::with_capacity(3);
 
     let mut first = Buffer::new_qwp();
@@ -416,7 +354,6 @@ fn build_type_coercion_payloads(table: &str) -> ProbeResult<Vec<Vec<u8>>> {
         &mut first,
         &mut scratch,
         &mut global_dict,
-        &mut schema_registry,
     )?);
 
     let mut bad = Buffer::new_qwp();
@@ -429,7 +366,6 @@ fn build_type_coercion_payloads(table: &str) -> ProbeResult<Vec<Vec<u8>>> {
         &mut bad,
         &mut scratch,
         &mut global_dict,
-        &mut schema_registry,
     )?);
 
     let mut third = Buffer::new_qwp();
@@ -443,92 +379,20 @@ fn build_type_coercion_payloads(table: &str) -> ProbeResult<Vec<Vec<u8>>> {
         &mut third,
         &mut scratch,
         &mut global_dict,
-        &mut schema_registry,
     )?);
 
     Ok(payloads)
-}
-
-fn table_column_count_offset(frame: &[u8]) -> ProbeResult<usize> {
-    let mut pos = 12;
-    let _delta_start = read_probe_varint(frame, &mut pos)?;
-    let delta_count = read_probe_varint(frame, &mut pos)?;
-    for _ in 0..delta_count {
-        let name_len = read_probe_varint(frame, &mut pos)? as usize;
-        pos = pos.checked_add(name_len).ok_or_else(|| {
-            Box::new(IoError::new(
-                ErrorKind::InvalidData,
-                "QWP symbol dictionary offset overflow",
-            )) as TestError
-        })?;
-        if pos > frame.len() {
-            return Err(Box::new(IoError::new(
-                ErrorKind::UnexpectedEof,
-                "QWP symbol dictionary entry exceeds frame length",
-            )));
-        }
-    }
-
-    let table_len = read_probe_varint(frame, &mut pos)? as usize;
-    pos = pos.checked_add(table_len).ok_or_else(|| {
-        Box::new(IoError::new(
-            ErrorKind::InvalidData,
-            "QWP table name offset overflow",
-        )) as TestError
-    })?;
-    if pos > frame.len() {
-        return Err(Box::new(IoError::new(
-            ErrorKind::UnexpectedEof,
-            "QWP table name exceeds frame length",
-        )));
-    }
-
-    let _row_count = read_probe_varint(frame, &mut pos)?;
-    if pos >= frame.len() {
-        return Err(Box::new(IoError::new(
-            ErrorKind::UnexpectedEof,
-            "QWP frame missing column count",
-        )));
-    }
-    Ok(pos)
-}
-
-fn read_probe_varint(frame: &[u8], pos: &mut usize) -> ProbeResult<u64> {
-    let mut result = 0u64;
-    let mut shift = 0;
-    loop {
-        if *pos >= frame.len() {
-            return Err(Box::new(IoError::new(
-                ErrorKind::UnexpectedEof,
-                "QWP varint exceeds frame length",
-            )));
-        }
-        let byte = frame[*pos];
-        *pos += 1;
-        result |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(Box::new(IoError::new(
-                ErrorKind::InvalidData,
-                "QWP varint overflows u64",
-            )));
-        }
-    }
 }
 
 fn encode_probe_buffer(
     buffer: &mut Buffer,
     scratch: &mut QwpWsEncodeScratch,
     global_dict: &mut SymbolGlobalDict,
-    schema_registry: &mut SchemaRegistry,
 ) -> ProbeResult<Vec<u8>> {
     buffer
         .as_qwp()
         .unwrap()
-        .encode_ws_message(scratch, global_dict, schema_registry, 1)?;
+        .encode_ws_message(scratch, global_dict, 1)?;
     Ok(scratch.message.clone())
 }
 

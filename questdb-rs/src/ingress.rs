@@ -658,8 +658,7 @@ impl SenderBuilder {
     /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
     /// `auth_timeout_ms`, `close_flush_timeout_millis`, `request_durable_ack`,
     /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
-    /// `max_background_drainers`, `error_inbox_capacity`, and
-    /// `max_schemas_per_connection`.
+    /// `max_background_drainers`, and `error_inbox_capacity`.
     ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].
@@ -685,6 +684,8 @@ impl SenderBuilder {
         let params = conf.params();
 
         let protocol = Protocol::from_schema(service)?;
+        #[cfg(feature = "_sender-qwp-ws")]
+        let conf_is_qwp_ws = protocol.is_qwp_ws();
 
         let Some(addr) = params.get("addr") else {
             return Err(error::fmt!(
@@ -734,6 +735,43 @@ impl SenderBuilder {
         }
 
         validate_auto_flush_params(params)?;
+
+        // Connect-string keys valid on a `ws::` / `wss::` string that are not
+        // matched by an arm below: `addr` (consumed before this loop), the
+        // auto-flush keys (validated by `validate_auto_flush_params`), and the
+        // egress query-client keys (a single connect string drives both the
+        // sender and the `QwpQueryClient`). Any other key on a QWP/WebSocket
+        // connect string is rejected as unknown. Keys added to either direction
+        // MUST be reflected here or a shared connect string breaks.
+        #[cfg(feature = "_sender-qwp-ws")]
+        const QWP_WS_PORTABLE_CONFIG_KEYS: &[&str] = &[
+            "addr",
+            "auth",
+            "auto_flush",
+            "auto_flush_bytes",
+            "auto_flush_interval",
+            "auto_flush_rows",
+            "buffer_pool_size",
+            "client_id",
+            "compression",
+            "compression_level",
+            "failover",
+            "failover_backoff_initial_ms",
+            "failover_backoff_max_ms",
+            "failover_max_attempts",
+            "failover_max_duration_ms",
+            "max_batch_rows",
+            "max_version",
+            "on_internal_error",
+            "on_parse_error",
+            "on_schema_error",
+            "on_security_error",
+            "on_server_error",
+            "on_write_error",
+            "path",
+            "target",
+            "zone",
+        ];
 
         for (key, val) in params.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
             builder = match key {
@@ -793,11 +831,6 @@ impl SenderBuilder {
                 "close_flush_timeout_millis" => builder.close_flush_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "request_durable_ack" => builder.request_durable_ack(val)?,
-                #[cfg(feature = "_sender-qwp-ws")]
-                "max_schemas_per_connection" => builder.reject_unsupported_qwp_ws_setting(
-                    "max_schemas_per_connection",
-                    "configurable schema limits are not implemented",
-                )?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "durable_ack_keepalive_interval_millis" => {
                     builder.durable_ack_keepalive_interval_millis(val)?
@@ -955,10 +988,15 @@ impl SenderBuilder {
                     builder.retry_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
 
-                // Ignore other parameters.
-                // We don't want to fail on unknown keys as this would require releasing different
-                // library implementations in lock step as soon as a new parameter is added to any of them,
-                // even if it's not used.
+                // QWP/WebSocket follows the connect-string spec: a key that is
+                // neither matched above nor portable (QWP_WS_PORTABLE_CONFIG_KEYS)
+                // is a typo or unsupported option and is rejected. Legacy ILP
+                // transports keep ignoring unknown keys -- a parameter added to
+                // one ILP client must not force a lock-step release of the others.
+                #[cfg(feature = "_sender-qwp-ws")]
+                other if conf_is_qwp_ws && !QWP_WS_PORTABLE_CONFIG_KEYS.contains(&other) => {
+                    return Err(error::fmt!(ConfigError, "Unknown config key \"{}\"", other));
+                }
                 _ => builder,
             };
         }
@@ -1712,25 +1750,6 @@ impl SenderBuilder {
             .error_inbox_capacity
             .set_specified("error_inbox_capacity", value)?;
         Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    fn reject_unsupported_qwp_ws_setting(
-        self,
-        setting_name: &'static str,
-        reason: &'static str,
-    ) -> Result<Self> {
-        if self.qwp_ws.is_none() {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"{setting_name}\" setting is only supported for QWP/WebSocket."
-            ));
-        }
-
-        Err(error::fmt!(
-            ConfigError,
-            "\"{setting_name}\" is not supported by the Rust QWP/WebSocket sync sender yet; {reason}."
-        ))
     }
 
     /// Configure how long to wait for messages from the QuestDB server during

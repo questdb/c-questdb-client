@@ -303,7 +303,7 @@ fn ingress_accepts_full_egress_connect_string_unchanged() {
     // into a non-TLS connect string.
     let conf = "http::addr=127.0.0.1:9000\
         ;username=u;password=p\
-        ;path=/exec;max_version=2;compression=zstd;compression_level=3\
+        ;path=/exec;max_version=1;compression=zstd;compression_level=3\
         ;max_batch_rows=10000;client_id=svc-a;target=primary\
         ;failover=on;failover_max_attempts=3\
         ;on_schema_error=drop;on_parse_error=halt\
@@ -322,8 +322,10 @@ fn qwpws_config_silently_accepts_reserved_on_error_policy_keys() {
     // Java parity (design/qwp-cursor-error-api.md): the per-category
     // server-error policy keys are reserved so the same connect string
     // can be shared across language clients regardless of which side
-    // has wired the resolver. Today the sender catches them via the
-    // generic unknown-key fallthrough — this guard locks that in.
+    // has wired the resolver. The QWP-WS parser rejects unknown keys, so
+    // these are accepted only because they're listed in
+    // `QWP_WS_PORTABLE_CONFIG_KEYS` (the `_ => builder` arm then ignores
+    // them) — this guard locks that allow-list in.
     for key in [
         "on_server_error",
         "on_schema_error",
@@ -450,17 +452,29 @@ fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
         "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
     )
     .unwrap();
-    assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_schemas_per_connection=1024;"),
-        "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
-    );
-
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=64;").unwrap();
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=16;").unwrap();
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;error_inbox_capacity=15;"),
         "error_inbox_capacity must be >= 16: 15",
     );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_rejects_unknown_config_key_but_tolerates_egress_keys() {
+    // Per the connect-string spec, a genuinely unknown key on a QWP/WebSocket
+    // connect string is rejected (typo / unsupported-option safety net).
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;totally_bogus_key=1;"),
+        "Unknown config key \"totally_bogus_key\"",
+    );
+    // Egress query-client keys are tolerated so a single ws:: connect string can
+    // drive both the ingress sender and the QwpQueryClient.
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;target=primary;compression=zstd;failover=on;zone=eu-1;max_batch_rows=1000;",
+    )
+    .unwrap();
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]

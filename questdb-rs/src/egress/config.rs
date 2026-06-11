@@ -37,7 +37,7 @@
 //! |--------------------|----------------------------------------------------------|
 //! | `addr`             | required; `host:port` or `host`                          |
 //! | `path`             | endpoint path (`/read/v1`)                               |
-//! | `max_version`      | QWP version to advertise (`2`)                           |
+//! | `max_version`      | QWP version to advertise (`1`)                           |
 //! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
 //! | `compression_level`| `zstd` level advertised in `X-QWP-Accept-Encoding` as `zstd;level=N`; `[1,22]`, default `1` (server clamps to `[1,9]`); ignored when `compression=raw` |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
@@ -75,7 +75,17 @@ use crate::ingress::CertificateAuthority;
 pub const DEFAULT_PATH: &str = "/read/v1";
 
 /// Highest QWP version this client can speak.
-pub const HIGHEST_KNOWN_VERSION: u8 = 2;
+///
+/// QWP runs at a single version, so this is exactly the wire-frame
+/// [`PROTOCOL_VERSION`]: the value advertised in the `X-QWP-Max-Version`
+/// handshake header must equal the version byte
+/// [`FrameHeader::parse`](crate::egress::wire::FrameHeader::parse) accepts,
+/// or the handshake would settle on a version that every subsequent frame
+/// then fails to parse. Defined in terms of the wire constant so bumping
+/// the protocol version moves both together.
+///
+/// [`PROTOCOL_VERSION`]: crate::egress::wire::PROTOCOL_VERSION
+pub const HIGHEST_KNOWN_VERSION: u8 = crate::egress::wire::PROTOCOL_VERSION;
 
 /// Default WS port (matches QuestDB HTTP / ILP-HTTP convention).
 const DEFAULT_PLAIN_PORT: &str = "9000";
@@ -393,8 +403,8 @@ pub enum TlsVerify {
 #[non_exhaustive]
 pub struct ReaderConfig {
     /// Endpoints to walk on connect, in order. The Reader tries each
-    /// until one accepts the WS handshake and (when v2) advertises a
-    /// role matching `target`.
+    /// until one accepts the WS handshake and advertises a role matching
+    /// `target`.
     ///
     /// Crate-private to keep external code from mutating the address
     /// list after a `Reader` has been built around an `Arc<ReaderConfig>`
@@ -544,7 +554,6 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // QWP-WS lifecycle / observability
     "close_flush_timeout_millis",
     "request_durable_ack",
-    "max_schemas_per_connection",
     "durable_ack_keepalive_interval_millis",
     "drain_orphans",
     "max_background_drainers",
@@ -1494,7 +1503,7 @@ mod tests {
         let h = c.upgrade_headers();
         // Always emit max_version + accept-encoding; nothing else by default.
         assert_eq!(h.len(), 2);
-        assert_eq!(h[0], ("X-QWP-Max-Version", "2".to_string()));
+        assert_eq!(h[0], ("X-QWP-Max-Version", "1".to_string()));
         assert_eq!(h[1], ("X-QWP-Accept-Encoding", "raw".to_string()));
     }
 
