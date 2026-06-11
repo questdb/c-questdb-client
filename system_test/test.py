@@ -336,7 +336,7 @@ class TestSender(unittest.TestCase):
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
             **kwargs)
-    
+
     def _ns_to_qdb_date(self, at_ts_ns, exp_nanos: bool):
         # We first need to match QuestDB's internal microsecond resolution.
         at_ts_us = at_ts_ns // 1000
@@ -350,7 +350,7 @@ class TestSender(unittest.TestCase):
         if exp_nanos:
             extra_precision = f'{trimmed_ns:03}'
         return at_td.isoformat() + extra_precision + 'Z'
-    
+
     @property
     def client_driven_nanos_supported(self) -> bool:
         # """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
@@ -618,7 +618,7 @@ class TestSender(unittest.TestCase):
                      .table(table_name)
                      .symbol('a', 'A')
                      .at(at_ts_ns))
-                    
+
     def test_micros_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
             self.skipTest('No support for user-provided timestamps.')
@@ -834,7 +834,7 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['12.990'], ['-12.340'], ['0.001'], ['10000000.000'], [None], [None], ['0.000'], ['0.000'], ['1000.000']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
-    
+
     def test_decimal_invalid_characters(self):
         if QDB_FIXTURE.version < DECIMAL_RELEASE:
             self.skipTest('No decimal support in this version of QuestDB.')
@@ -849,7 +849,7 @@ class TestSender(unittest.TestCase):
                     .table(table_name)
                     .column_dec_str('dec', "12.34abc")
                     .at_now())
-    
+
     def test_decimal_not_available(self):
         if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
             self.skipTest('Decimal support is available in this version of QuestDB.')
@@ -1077,7 +1077,7 @@ class TestSender(unittest.TestCase):
             self.skipTest('BuildMode.API-only test')
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')
-        
+
         exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
         # Decimal columns must be created manually beforehand.
         sql_query(f'''CREATE TABLE "{table_name}" (price DECIMAL(18,3), timestamp {exp_ts_type}) TIMESTAMP(timestamp) PARTITION BY DAY;''')
