@@ -2795,7 +2795,7 @@ fn multi_batch_streaming() {
 #[test]
 fn multi_batch_with_mixed_nulls_and_symbols() {
     // Stresses the most-interesting decoder paths together:
-    //  - delta-dict on first batch, schema-reference after
+    //  - delta-dict and inline schema on batch 0, reused by later batches
     //  - dense decoding of long with nulls (bitmap + values per row)
     //  - dense decoding of symbol codes with nulls (codes only over
     //    non-null rows on the wire, densified to per-row u32)
@@ -3384,17 +3384,22 @@ fn cursor_short_circuits_after_query_error() {
         let mut cur = reader.prepare("select 1 as v").execute().expect("execute");
         cur.cancel().expect("cancel returns Ok");
 
-        // `select 1` completes before the CANCEL lands, so cancel() drains a
-        // clean terminal: `done` is set with no stashed error, and the
-        // follow-up next_batch returns Ok(None) (true = is_none), not Err.
+        // Whether the follow-up `next_batch` sees `Ok(None)` or replays
+        // `Err(Cancelled)` is a race: if `select 1` completes before the
+        // CANCEL lands, cancel() drains a clean terminal (`done` set, no
+        // stashed error) and the follow-up returns Ok(None); if the CANCEL
+        // wins, the drain stashes `Err(Cancelled)` which the follow-up
+        // replays. Both are correct terminal outcomes — accept either.
         let post_cancel =
             assert_returns_within(Duration::from_secs(3), "next_batch after cancel", || {
                 cur.next_batch().map(|o| o.is_none()).map_err(|e| e.code())
             });
-        assert_eq!(
-            post_cancel,
-            Ok(true),
-            "next_batch after a cancel on a completed query must return Ok(None)"
+        assert!(
+            matches!(
+                post_cancel,
+                Ok(true) | Err(questdb::egress::ErrorCode::Cancelled)
+            ),
+            "next_batch after cancel must return Ok(None) or replay Err(Cancelled), got {post_cancel:?}"
         );
 
         // cancel() called twice is a no-op (also exercises the early

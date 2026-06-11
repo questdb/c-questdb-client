@@ -1084,7 +1084,11 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
                 .unwrap();
         }
         let encoded_len = qwp_ws_replay_encoded_len(&buf);
-        assert!(encoded_len >= 1024, "encoded_len={encoded_len}");
+        // Strictly greater than 1024 so `encoded_len - 1` is still >= 1024,
+        // the `max_buf_size` floor (see `ingress.rs`). At exactly 1024 the
+        // builder would reject `max_buf_size(1023)` and the `.unwrap()` below
+        // would panic before the flush ever measures the oversized frame.
+        assert!(encoded_len > 1024, "encoded_len={encoded_len}");
         // Cap one byte below the actual replay-encoded size so the flush is
         // rejected once the encoder measures the full frame.
         let max = encoded_len - 1;
