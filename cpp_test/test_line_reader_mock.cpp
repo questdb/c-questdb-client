@@ -2701,6 +2701,79 @@ TEST_CASE("mock: protocol_error — over-long varint in batch_seq")
     run_malformed_batch(s);
 }
 
+TEST_CASE("mock: continuation batch decodes against the batch-0 schema")
+{
+    // The schema (col_count + inline descriptors) rides only the first
+    // batch of a query (batch_seq == 0); the continuation carries rows
+    // only and must decode against the schema retained from batch 0 —
+    // asserted here by row *values* through the C API, not just by the
+    // drain not throwing.
+    qm::ColumnSpec c0{
+        "v", qm::COL_LONG, qm::fixed_column_bytes(2, pack_le<int64_t>({10, 20}))};
+    qm::ColumnSpec c1{
+        "v", qm::COL_LONG,
+        qm::fixed_column_bytes(3, pack_le<int64_t>({30, 40, 50}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c0](int64_t rid)
+                            { return qm::result_batch_frame(rid, 0, 1, 2, {c0}); }},
+        qm::ActionSendBuilt{[c1](int64_t rid)
+                            { return qm::result_batch_frame(rid, 1, 1, 3, {c1}); }},
+        qm::ActionSendResultEnd{},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto cur = reader.execute("select v from t"_utf8);
+
+    // Batch 0: schema-bearing, two rows. (Scoped — the batch handle is
+    // invalidated by the next next_batch call.)
+    {
+        auto batch_opt = cur.next_batch();
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
+        CHECK(batch.seq() == 0);
+        REQUIRE(batch.row_count() == 2);
+        REQUIRE(batch.column_count() == 1);
+        CHECK(batch.column(0).get<int64_t>(0).value_or(0) == 10);
+        CHECK(batch.column(0).get<int64_t>(1).value_or(0) == 20);
+    }
+
+    // Continuation: rows only on the wire; col_count and the Long kind
+    // come from the retained schema.
+    {
+        auto batch_opt = cur.next_batch();
+        REQUIRE(batch_opt);
+        auto& batch = *batch_opt;
+        CHECK(batch.seq() == 1);
+        REQUIRE(batch.row_count() == 3);
+        REQUIRE(batch.column_count() == 1);
+        CHECK(batch.column(0).get<int64_t>(0).value_or(0) == 30);
+        CHECK(batch.column(0).get<int64_t>(1).value_or(0) == 40);
+        CHECK(batch.column(0).get<int64_t>(2).value_or(0) == 50);
+    }
+
+    CHECK_FALSE(cur.next_batch());
+}
+
+TEST_CASE("mock: protocol_error — continuation batch before schema-bearing batch 0")
+{
+    // A query whose *first* frame is a continuation (batch_seq > 0) has
+    // no schema to bind rows to and must surface a protocol error
+    // through the C API rather than mis-decode.
+    qm::ColumnSpec c{
+        "v", qm::COL_LONG, qm::fixed_column_bytes(1, pack_le<int64_t>({42}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid)
+                            { return qm::result_batch_frame(
+                                  rid, /*batch_seq=*/1, 1, 1, {c}); }},
+        qm::ActionSendResultEnd{},
+    };
+    run_malformed_batch(s);
+}
+
 // Wire `ActionSendRaw` into a regression test so the action variant
 // stops being dead code: a future refactor that drops it would
 // silently lose a piece of public test infrastructure. Frames that

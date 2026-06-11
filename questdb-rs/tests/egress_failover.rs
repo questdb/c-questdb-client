@@ -39,7 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use questdb::egress::{
-    ErrorCode, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ServerRole,
+    ColumnView, ErrorCode, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ServerRole,
 };
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::http::HeaderValue;
@@ -51,6 +51,7 @@ use tungstenite::{Message, WebSocket, accept_hdr};
 
 const MAGIC: [u8; 4] = *b"QWP1";
 const MSG_QUERY_REQUEST: u8 = 0x10;
+const MSG_RESULT_BATCH: u8 = 0x11;
 const MSG_RESULT_END: u8 = 0x12;
 const MSG_QUERY_ERROR: u8 = 0x13;
 const MSG_CANCEL: u8 = 0x14;
@@ -106,6 +107,56 @@ fn result_end_frame(request_id: i64) -> Vec<u8> {
     framed(1, 0, 0, &payload)
 }
 
+/// Column payload for [`Action::SendBatch`]: one named, non-null column.
+#[derive(Debug, Clone)]
+enum BatchColumn {
+    /// LONG column named `v`.
+    Long(Vec<i64>),
+    /// DOUBLE column named `d`.
+    Double(Vec<f64>),
+}
+
+/// Single-table `RESULT_BATCH` frame carrying one non-null column. The
+/// schema (col_count + the inline column descriptor) rides only
+/// `batch_seq == 0`; continuation frames (`batch_seq > 0`) carry rows
+/// only.
+fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> Vec<u8> {
+    // Egress wire type codes (`ColumnKind::as_u8`).
+    const KIND_LONG: u8 = 0x05;
+    const KIND_DOUBLE: u8 = 0x07;
+    const NULL_FLAG_NONE: u8 = 0x00;
+    let (name, kind, row_count) = match column {
+        BatchColumn::Long(v) => ("v", KIND_LONG, v.len()),
+        BatchColumn::Double(v) => ("d", KIND_DOUBLE, v.len()),
+    };
+    let mut payload = Vec::new();
+    payload.push(MSG_RESULT_BATCH);
+    payload.extend_from_slice(&request_id.to_le_bytes());
+    encode_varint_u64(batch_seq, &mut payload);
+    encode_varint_u64(0, &mut payload); // empty table name
+    encode_varint_u64(row_count as u64, &mut payload);
+    if batch_seq == 0 {
+        encode_varint_u64(1, &mut payload); // col_count
+        encode_varint_u64(name.len() as u64, &mut payload);
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(kind);
+    }
+    payload.push(NULL_FLAG_NONE);
+    match column {
+        BatchColumn::Long(values) => {
+            for v in values {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        BatchColumn::Double(values) => {
+            for v in values {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    framed(1, 0, 1, &payload)
+}
+
 /// `QUERY_ERROR` frame: `[0x13, request_id i64 LE, status u8, msg_len u16 LE, msg_bytes...]`.
 /// `status` is a raw `StatusCode` discriminant (e.g. `0x06` InternalError).
 fn query_error_frame(request_id: i64, status: u8, message: &str) -> Vec<u8> {
@@ -120,8 +171,8 @@ fn query_error_frame(request_id: i64, status: u8, message: &str) -> Vec<u8> {
 }
 
 /// `CACHE_RESET` frame. `mask = 0x01` clears the per-connection symbol
-/// dict, `0x02` clears the schema registry, `0x03` clears both. The
-/// payload is just `[msg_kind, mask]`.
+/// dict; `0x02` is reserved and ignored by recipients. The payload is
+/// just `[msg_kind, mask]`.
 fn cache_reset_frame(mask: u8) -> Vec<u8> {
     framed(1, 0, 0, &[MSG_CACHE_RESET, mask])
 }
@@ -150,6 +201,11 @@ enum Action {
     /// Reply with RESULT_END (using the request_id from the most-recent
     /// AwaitQueryRequest).
     SendResultEnd,
+    /// Reply with a single-table, single-column RESULT_BATCH (using the
+    /// request_id from the most-recent AwaitQueryRequest). The schema
+    /// rides only `batch_seq == 0`; a `batch_seq > 0` frame carries rows
+    /// only and relies on the client's retained per-query schema.
+    SendBatch { batch_seq: u64, column: BatchColumn },
     /// Reply with QUERY_ERROR (using the request_id from the most-recent
     /// AwaitQueryRequest). `status` is a raw `StatusCode` discriminant,
     /// e.g. `0x06` (InternalError) for a generic server-side failure.
@@ -194,9 +250,9 @@ enum Action {
     /// Override the `x-qwp-version` value injected into the WS upgrade
     /// response. Detected before `accept_hdr` runs (like `Reject401`),
     /// so it parameterises the handshake itself rather than running as
-    /// a script step. Default is `2`. Used to drive the
-    /// `UnsupportedServer` path in `transport.rs` by negotiating a
-    /// version higher than `config.max_version`.
+    /// a script step. Default is `1` (the single QWP version). Used to
+    /// drive the version-rejection path in `transport.rs` by negotiating
+    /// a version higher than `config.max_version`.
     HandshakeVersion(u8),
 }
 
@@ -457,6 +513,13 @@ fn run_script(
             Action::SendQueryError { status, message } => {
                 let rid = last_request_id.expect("AwaitQueryRequest before SendQueryError");
                 let frame = query_error_frame(rid, status, &message);
+                if ws.send(Message::Binary(frame.into())).is_err() {
+                    return;
+                }
+            }
+            Action::SendBatch { batch_seq, column } => {
+                let rid = last_request_id.expect("AwaitQueryRequest before SendBatch");
+                let frame = result_batch_frame(rid, batch_seq, &column);
                 if ws.send(Message::Binary(frame.into())).is_err() {
                     return;
                 }
@@ -928,10 +991,10 @@ fn mid_query_close_triggers_failover() {
 /// cleanly via the replayed RESULT_END from server B.
 ///
 /// (The data-delivered-with-no-callback branch — where the guard
-/// fires — is unit-tested via `would_silently_duplicate_truth_table`
-/// in `src/egress/reader.rs`. Exercising it as an integration test
-/// would require the Rust mock to emit a synthetic RESULT_BATCH; the
-/// Rust mock has no helper for that yet — only the C++ mock does.)
+/// fires — is pinned end-to-end by
+/// `post_batch_failover_without_callback_refuses_replay` below, via
+/// `Action::SendBatch`; the boolean matrix itself is unit-tested by
+/// `would_silently_duplicate_truth_table` in `src/egress/reader.rs`.)
 #[test]
 fn pre_batch_failover_without_callback_still_replays() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
@@ -970,6 +1033,218 @@ fn pre_batch_failover_without_callback_still_replays() {
     );
 }
 
+/// Mid-query failover *after* a batch was already delivered: with a
+/// reset callback installed (the replay opt-in), the replayed query
+/// must re-read its schema from the new node's `batch_seq == 0` frame
+/// and surface the new node's data through the same cursor. Server B
+/// deliberately answers with a different column shape (DOUBLE `d` vs
+/// LONG `v`) — the post-failover batch must decode against B's inline
+/// schema, not against anything retained from A.
+#[test]
+fn failover_after_batch_replays_and_rereads_schema() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Double(vec![1.5, 2.5, 3.5]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let observed: Arc<Mutex<Vec<FailoverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = Arc::clone(&observed);
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(move |ev: &FailoverEvent| {
+            observed_clone.lock().unwrap().push(ev.clone());
+        })
+        .execute()
+        .expect("execute");
+
+    // Batch 1: served by A before the drop, decoded against A's schema.
+    {
+        let view = cursor
+            .next_batch()
+            .expect("first next_batch")
+            .expect("first batch present");
+        assert_eq!(view.row_count(), 2);
+        let ColumnView::Long(c) = view.column(0).expect("col 0") else {
+            panic!("pre-failover column should decode against A's Long schema");
+        };
+        assert_eq!((c.value(0), c.value(1)), (1, 2));
+    }
+
+    // Batch 2: A is gone — this call observes the close, fails over,
+    // replays, and must yield B's batch decoded against B's schema.
+    {
+        let view = cursor
+            .next_batch()
+            .expect("post-failover next_batch")
+            .expect("post-failover batch present");
+        assert_eq!(view.row_count(), 3);
+        let ColumnView::Double(c) = view.column(0).expect("col 0") else {
+            panic!("post-failover column must decode against B's Double schema");
+        };
+        assert_eq!((c.value(0), c.value(1), c.value(2)), (1.5, 2.5, 3.5));
+    }
+    assert_eq!(cursor.failover_resets(), 1);
+    assert!(
+        cursor.next_batch().expect("terminal").is_none(),
+        "B's RESULT_END must terminate the cursor cleanly"
+    );
+
+    let events = observed.lock().unwrap();
+    assert_eq!(events.len(), 1, "reset callback fired exactly once");
+    assert_eq!(events[0].new_addr.port, srv_b.addr.port());
+}
+
+/// Regression pin for the reconnect-path schema clear
+/// (`query_schema = None` in `Reader::reconnect_with_failover`): when
+/// the replayed query's *first* frame from the new node is a
+/// continuation (`batch_seq > 0`), the cursor must reject it as a
+/// protocol error. Without the clear, the dead connection's retained
+/// LONG schema would decode B's rows-only frame "successfully" and
+/// resurface data bound to a schema the new connection never sent.
+#[test]
+fn failover_replay_continuation_before_schema_rejected() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        // Misbehaving replay: the first frame is a continuation — the
+        // schema-bearing batch 0 never arrives on this connection.
+        Action::SendBatch {
+            batch_seq: 1,
+            column: BatchColumn::Long(vec![42]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(|_ev: &FailoverEvent| {})
+        .execute()
+        .expect("execute");
+
+    // Batch 1 from A delivers fine.
+    {
+        let view = cursor
+            .next_batch()
+            .expect("first next_batch")
+            .expect("first batch present");
+        assert_eq!(view.row_count(), 2);
+    }
+
+    // A drops; the reconnect-and-replay itself succeeds, but the new
+    // node's first frame is `batch_seq=1` with no schema on this
+    // connection — a decode-level ProtocolError (deliberately not
+    // failover-eligible), not a silent decode against A's schema.
+    let err = match cursor.next_batch() {
+        Ok(_) => panic!("continuation before the schema-bearing batch 0 must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), ErrorCode::ProtocolError);
+    assert!(
+        err.msg().contains("arrived before the schema-bearing"),
+        "unexpected message: {}",
+        err.msg()
+    );
+    assert_eq!(
+        cursor.failover_resets(),
+        1,
+        "the replay itself succeeded; only the post-replay decode failed"
+    );
+}
+
+/// The silent-duplicate guard, end-to-end: once a batch has been
+/// yielded to the caller and NO replay-aware callback is installed,
+/// a mid-query failover must refuse to replay (the replay would
+/// re-deliver row 1..2 with no signal) and surface
+/// `FailoverWouldDuplicate` instead.
+#[test]
+fn post_batch_failover_without_callback_refuses_replay() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // NO on_failover_reset / on_failover_progress callback installed.
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    {
+        let view = cursor
+            .next_batch()
+            .expect("first next_batch")
+            .expect("first batch present");
+        assert_eq!(view.row_count(), 2);
+    }
+
+    let err = match cursor.next_batch() {
+        Ok(_) => panic!("data-delivered failover without a callback must refuse to replay"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), ErrorCode::FailoverWouldDuplicate);
+    assert_eq!(
+        cursor.failover_resets(),
+        0,
+        "the guard must fire before any reconnect is attempted"
+    );
+}
+
 /// Regression coverage for the silent-duplicate guard wired into
 /// `Cursor::add_credit` (C1 in the PR review).
 ///
@@ -983,11 +1258,11 @@ fn pre_batch_failover_without_callback_still_replays() {
 /// by TCP semantics: a write to a freshly-RST'd peer does not always
 /// fail synchronously (the kernel may buffer the frame before the
 /// RST lands), so we cannot deterministically force the failover
-/// branch from a scripted close. The data-delivered branch is even
-/// less reachable from the Rust mock — it has no helper to emit a
-/// synthetic RESULT_BATCH (only the C++ mock does), so the
-/// guard-fires-after-batch-delivered combination is out of integration
-/// scope on the Rust side.
+/// branch from a scripted close — which keeps the
+/// guard-fires-after-batch-delivered combination out of integration
+/// scope for `add_credit` even though `Action::SendBatch` can put
+/// data on the wire (the `next_batch` flavour of that combination is
+/// pinned by `post_batch_failover_without_callback_refuses_replay`).
 ///
 /// What this test does pin down: if `add_credit` DOES drive a
 /// failover (the race resolves with a synchronous write failure), the
@@ -2867,6 +3142,34 @@ fn unsupported_server_version_surfaces_handshake_error() {
     );
 }
 
+/// Boundary value for the handshake version gate: `max_version + 1`
+/// (`x-qwp-version: 2` with the version pinned at 1) must be rejected
+/// exactly like any farther-out version — a crisp `HandshakeError`, not
+/// a mid-stream frame-decode failure. The sibling test above drives the
+/// same gate with a far-out value (99); this one pins the off-by-one
+/// edge of the `server_version > max_version` comparison.
+#[test]
+fn version_just_above_max_rejected_at_handshake() {
+    let srv = MockServer::start(vec![vec![Action::HandshakeVersion(2)]]);
+    let conf = format!("ws::addr={};failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("connect must reject a version above max_version"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::HandshakeError,
+        "a version above max must surface HandshakeError; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    assert!(
+        err.msg().contains("version 2"),
+        "error message should mention the negotiated version: {}",
+        err.msg()
+    );
+}
+
 /// Connect-string addr with an unresolvable hostname must surface
 /// `CouldNotResolveAddr`. Uses the reserved `.invalid` TLD (RFC 6761)
 /// so the test is deterministic on every host without depending on
@@ -4140,10 +4443,13 @@ fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
 
 // NOTE: the "progress callback alone unlocks replay after data
 // delivered" branch is covered by the C++ mock-driven test in
-// `cpp_test/test_line_reader_mock.cpp` (the Rust mock has no helper to
-// emit a synthetic RESULT_BATCH yet — see the comment on
-// `pre_batch_failover_without_callback_still_replays`). The boolean
-// branch of `would_silently_duplicate` itself is exercised in the unit
+// `cpp_test/test_line_reader_mock.cpp`. The reset-callback flavour of
+// replay-after-data — including the schema re-read from the new node's
+// batch 0 — is covered here via `Action::SendBatch` in
+// `failover_after_batch_replays_and_rereads_schema`, and the
+// guard-fires branch in
+// `post_batch_failover_without_callback_refuses_replay`. The boolean
+// matrix of `would_silently_duplicate` itself is exercised in the unit
 // tests in `src/egress/reader.rs`.
 
 #[test]

@@ -172,6 +172,31 @@ mod tests {
     }
 
     #[test]
+    fn wrong_version_rejected() {
+        // Any version byte other than the pinned one — below it (0) or
+        // above it (2, 0xFF) — must be rejected per-frame, independently
+        // of the handshake-level check.
+        let valid = FrameHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            table_count: 0,
+            payload_length: 0,
+        }
+        .to_bytes();
+        for wrong in [0u8, 2, 0xFF] {
+            let mut bytes = valid;
+            bytes[4] = wrong;
+            let err = FrameHeader::parse(&bytes).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ProtocolError);
+            assert!(
+                err.msg().contains(&format!("version {wrong}")),
+                "message should name the rejected version {wrong}: {}",
+                err.msg()
+            );
+        }
+    }
+
+    #[test]
     fn extra_bytes_ignored() {
         let h = FrameHeader {
             version: 1,
