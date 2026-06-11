@@ -102,6 +102,33 @@ pub(crate) fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// Append `src[..bit_len bits]` to `out`, inverted (Arrow `1=valid` →
+/// QWP `1=null`), masking the high bits past `bit_len` in the trailing
+/// byte. Word-stride on the bulk; byte-stride only on the tail. Caller
+/// owns the source slice's lifetime.
+#[inline]
+pub(crate) fn write_qwp_bitmap_invert(out: &mut Vec<u8>, src: &[u8], bit_len: usize) {
+    let full_bytes = bit_len / 8;
+    let trailing_bits = bit_len % 8;
+    let bitmap_bytes = full_bytes + usize::from(trailing_bits != 0);
+    let dst_start = out.len();
+    out.resize(dst_start + bitmap_bytes, 0);
+    let dst = &mut out[dst_start..dst_start + bitmap_bytes];
+    let mut i = 0;
+    while i + 8 <= full_bytes {
+        let w = u64::from_ne_bytes(src[i..i + 8].try_into().unwrap());
+        dst[i..i + 8].copy_from_slice(&(!w).to_ne_bytes());
+        i += 8;
+    }
+    for j in i..full_bytes {
+        dst[j] = !src[j];
+    }
+    if trailing_bits != 0 {
+        let mask = (1u8 << trailing_bits) - 1;
+        dst[full_bytes] = (!src[full_bytes]) & mask;
+    }
+}
+
 /// Validate a UTF-8 name against the QWP/Java client length cap.
 pub(crate) fn validate_name(kind: &'static str, name: &str) -> crate::Result<()> {
     if name.is_empty() {

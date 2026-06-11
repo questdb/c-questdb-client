@@ -313,6 +313,7 @@ private:
     friend class opts;
     friend class column_sender_conn;
     friend class column_chunk;
+    friend class arrow_import;
     friend class pool;
     friend class borrowed_conn;
 

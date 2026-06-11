@@ -548,10 +548,19 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
 // Connection state
 // ===========================================================================
 
-/// `true` if the connection is in a permanently-unusable state, has been
-/// closed/dropped, `conn` is NULL, or another FFI call on the same handle
-/// is currently in flight (treated as "must close" to avoid the caller
-/// trying to share `conn` across threads).
+/// `true` if any of the following hold; `false` only when the conn is
+/// safely reusable:
+///   * `conn` is NULL,
+///   * the conn was already closed / dropped,
+///   * the conn is in a permanently-unusable state (e.g. a flush left
+///     it with uncommitted in-flight frames),
+///   * another FFI call on the same handle is currently in flight on
+///     another thread (single-handle contract violation).
+///
+/// The latch-contention case folds into the same return value because
+/// the caller cannot safely act on a contended handle anyway; if you
+/// need to distinguish "contended" from "terminal", confine `conn` to
+/// one thread so the latch can never be contended at this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool {
     if conn.is_null() {
@@ -1304,6 +1313,20 @@ pub unsafe extern "C" fn column_sender_arrow_import_free(
     }
     let state: *const AtomicU32 = unsafe { &raw const (*imported).1 };
     unsafe { finalize_or_defer(imported, state, 0) };
+}
+
+/// Number of rows in an imported Arrow column. Returns 0 for a NULL
+/// `imported` and for a logically-empty column. Cheap accessor; the
+/// length is stored alongside the buffers.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_arrow_import_len(
+    imported: *const column_sender_arrow_import,
+) -> size_t {
+    if imported.is_null() {
+        return 0;
+    }
+    unsafe { (*imported).0.len() }
 }
 
 #[cfg(feature = "arrow")]

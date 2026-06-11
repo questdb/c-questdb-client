@@ -1166,25 +1166,10 @@ unsafe fn emit_f64_ndarray(
     Ok(())
 }
 
-/// Append `validity` as a QWP-shape bitmap (bit = 1 → NULL). Local
-/// copy of [`super::encoder::write_qwp_bitmap_from_validity`]; kept
-/// here to preserve the §4 dependency-wall invariant (numpy_wire does
-/// not call back into encoder.rs).
+/// Append `validity` as a QWP-shape bitmap (bit = 1 → NULL).
 unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescriptor) {
-    let full_bytes = v.bit_len / 8;
-    let trailing_bits = v.bit_len % 8;
     let src = unsafe { slice::from_raw_parts(v.bits, v.byte_len()) };
-    let bitmap_bytes = full_bytes + usize::from(trailing_bits != 0);
-    let dst_start = out.len();
-    out.resize(dst_start + bitmap_bytes, 0);
-    let dst = &mut out[dst_start..dst_start + bitmap_bytes];
-    for (d, &s) in dst[..full_bytes].iter_mut().zip(&src[..full_bytes]) {
-        *d = !s;
-    }
-    if trailing_bits != 0 {
-        let mask = (1u8 << trailing_bits) - 1;
-        dst[full_bytes] = (!src[full_bytes]) & mask;
-    }
+    super::wire::write_qwp_bitmap_invert(out, src, v.bit_len);
 }
 
 #[cfg(test)]

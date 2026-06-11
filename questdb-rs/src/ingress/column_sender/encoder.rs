@@ -113,6 +113,10 @@ pub(crate) struct EncodeScratch {
     pub(crate) signature: Vec<u8>,
     pub(crate) new_symbols: Vec<Vec<u8>>,
     pub(crate) per_column: Vec<Option<ResolvedColumn>>,
+    /// `referenced[slot] = 1` if any non-null row touches that dict slot.
+    /// Reused across symbol columns within one flush; bytes (not bools)
+    /// so `resize(n, 0)` is a single `memset`.
+    pub(crate) referenced: Vec<u8>,
 }
 
 impl EncodeScratch {
@@ -193,6 +197,7 @@ pub(crate) fn encode_chunk_into(
         symbol_dict,
         &mut scratch.new_symbols,
         &mut scratch.per_column,
+        &mut scratch.referenced,
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -438,6 +443,7 @@ fn resolve_symbols(
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
     per_column: &mut Vec<Option<ResolvedColumn>>,
+    referenced_scratch: &mut Vec<u8>,
 ) -> Result<u64> {
     let delta_start = symbol_dict.next_id();
     per_column.reserve(chunk.columns.len());
@@ -454,19 +460,20 @@ fn resolve_symbols(
             } => {
                 let dict_len = dict_offsets_len - 1;
                 let dict_bytes_slice = unsafe { slice::from_raw_parts(dict_bytes, dict_bytes_len) };
-                let mut referenced = vec![false; dict_len];
+                referenced_scratch.clear();
+                referenced_scratch.resize(dict_len, 0);
                 let mut non_null_count = 0usize;
                 for i in 0..row_count {
                     if !is_valid_row(col.validity.as_ref(), i) {
                         continue;
                     }
                     let slot = unsafe { codes.read_i64(i) } as usize;
-                    referenced[slot] = true;
+                    referenced_scratch[slot] = 1;
                     non_null_count += 1;
                 }
                 let mut local_to_global = vec![u64::MAX; dict_len];
-                for (slot, mark) in referenced.iter().enumerate() {
-                    if !*mark {
+                for (slot, mark) in referenced_scratch.iter().enumerate() {
+                    if *mark == 0 {
                         continue;
                     }
                     let start = unsafe { dict_offsets.read_i64(slot) } as usize;
@@ -1023,20 +1030,8 @@ fn encode_designated_ts(
 /// Write `validity` as a QWP-shape (bit = 1 NULL) bitmap appended to
 /// `out`. The high bits past `bit_len` in the last byte are masked.
 unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescriptor) {
-    let full_bytes = v.bit_len / 8;
-    let trailing_bits = v.bit_len % 8;
     let src = unsafe { slice::from_raw_parts(v.bits, v.byte_len()) };
-    let bitmap_bytes = full_bytes + usize::from(trailing_bits != 0);
-    let dst_start = out.len();
-    out.resize(dst_start + bitmap_bytes, 0);
-    let dst = &mut out[dst_start..dst_start + bitmap_bytes];
-    for (d, &s) in dst[..full_bytes].iter_mut().zip(&src[..full_bytes]) {
-        *d = !s;
-    }
-    if trailing_bits != 0 {
-        let mask = (1u8 << trailing_bits) - 1;
-        dst[full_bytes] = (!src[full_bytes]) & mask;
-    }
+    super::wire::write_qwp_bitmap_invert(out, src, v.bit_len);
 }
 
 #[inline]

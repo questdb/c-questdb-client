@@ -4230,10 +4230,11 @@ pub unsafe extern "C" fn questdb_db_return_reader(_db: *mut questdb_db, reader: 
 }
 
 /// Snapshot the number of currently-idle (cached) readers in the
-/// reader pool. Returns 0 for a NULL `db`. Internal / test-only.
+/// reader pool. Returns 0 for a NULL `db`. Diagnostics / test-only;
+/// not part of the supported API surface.
 #[cfg(feature = "sync-reader-ws")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_reader_free_count(db: *mut questdb_db) -> usize {
+pub unsafe extern "C" fn questdb_db_dbg_reader_free_count(db: *mut questdb_db) -> usize {
     if db.is_null() {
         return 0;
     }
@@ -4242,10 +4243,11 @@ pub unsafe extern "C" fn questdb_db_reader_free_count(db: *mut questdb_db) -> us
 }
 
 /// Snapshot the number of currently-borrowed (in-use) readers.
-/// Returns 0 for a NULL `db`. Internal / test-only.
+/// Returns 0 for a NULL `db`. Diagnostics / test-only; not part of
+/// the supported API surface.
 #[cfg(feature = "sync-reader-ws")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_reader_in_use_count(db: *mut questdb_db) -> usize {
+pub unsafe extern "C" fn questdb_db_dbg_reader_in_use_count(db: *mut questdb_db) -> usize {
     if db.is_null() {
         return 0;
     }

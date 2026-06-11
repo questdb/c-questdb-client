@@ -1078,10 +1078,17 @@ fn write_varlen_u32_offsets_no_null(
     Ok(())
 }
 
+/// `bytes_upper_bound`, when `Some`, is the exact (or worst-case) byte
+/// total the `emit_row` closure will append across all non-null rows.
+/// It is reserved up front so the closure can do raw `extend_from_slice`
+/// without paying a per-row checked allocation. Pass `None` when no
+/// tight upper bound is known; the closure is then responsible for its
+/// own `try_reserve_bytes` calls.
 fn write_varlen_u32_offsets_with_bitmap<F>(
     out: &mut Vec<u8>,
     arr: &dyn Array,
     label: &str,
+    bytes_upper_bound: Option<usize>,
     mut emit_row: F,
 ) -> Result<()>
 where
@@ -1098,7 +1105,13 @@ where
         )
     })?;
     let offsets_start = out.len();
-    try_reserve_bytes(out, offsets_bytes, label)?;
+    let reserve = match bytes_upper_bound {
+        Some(b) => offsets_bytes
+            .checked_add(b)
+            .ok_or_else(|| fmt!(ArrowIngest, "{}: offsets+bytes reservation overflow", label))?,
+        None => offsets_bytes,
+    };
+    try_reserve_bytes(out, reserve, label)?;
     out.resize(offsets_start + offsets_bytes, 0);
     out[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
     let mut cumulative: u32 = 0;
@@ -1127,10 +1140,32 @@ where
     Ok(())
 }
 
+/// Per-row emit closure with a per-row `try_reserve_bytes` probe. Use
+/// when the outer caller did NOT reserve up front (i.e. passed
+/// `bytes_upper_bound = None` to `write_varlen_u32_offsets_with_bitmap`).
 fn emit_str_row<S: StrSource>(arr: &S) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + '_ {
     move |out, row| {
         let bytes = arr.value_bytes(row);
         try_reserve_bytes(out, bytes.len(), "VARCHAR column")?;
+        out.extend_from_slice(bytes);
+        u32::try_from(bytes.len()).map_err(|_| {
+            fmt!(
+                ArrowIngest,
+                "VARCHAR column: row {} exceeds u32::MAX bytes",
+                row
+            )
+        })
+    }
+}
+
+/// Per-row emit closure without the per-row reserve probe. Caller MUST
+/// have reserved enough capacity up front (via `bytes_upper_bound`) so
+/// every `extend_from_slice` fits without reallocation.
+fn emit_str_row_no_reserve<S: StrSource>(
+    arr: &S,
+) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + '_ {
+    move |out, row| {
+        let bytes = arr.value_bytes(row);
         out.extend_from_slice(bytes);
         u32::try_from(bytes.len()).map_err(|_| {
             fmt!(
@@ -1160,9 +1195,33 @@ where
     }
 }
 
+fn emit_bytes_row_no_reserve<'a, F>(get: F) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + 'a
+where
+    F: Fn(usize) -> &'a [u8] + 'a,
+{
+    move |out, row| {
+        let bytes = get(row);
+        out.extend_from_slice(bytes);
+        u32::try_from(bytes.len()).map_err(|_| {
+            fmt!(
+                ArrowIngest,
+                "BINARY column: row {} exceeds u32::MAX bytes",
+                row
+            )
+        })
+    }
+}
+
 fn write_string_payload(out: &mut Vec<u8>, arr: &StringArray, use_bitmap: bool) -> Result<()> {
     if use_bitmap {
-        write_varlen_u32_offsets_with_bitmap(out, arr, "VARCHAR column", emit_str_row(arr))
+        let bound = Some(arr.value_data().len());
+        write_varlen_u32_offsets_with_bitmap(
+            out,
+            arr,
+            "VARCHAR column",
+            bound,
+            emit_str_row_no_reserve(arr),
+        )
     } else {
         write_varlen_u32_offsets_no_null(
             out,
@@ -1180,7 +1239,14 @@ fn write_large_string_payload(
     use_bitmap: bool,
 ) -> Result<()> {
     if use_bitmap {
-        write_varlen_u32_offsets_with_bitmap(out, arr, "VARCHAR column", emit_str_row(arr))
+        let bound = Some(arr.value_data().len());
+        write_varlen_u32_offsets_with_bitmap(
+            out,
+            arr,
+            "VARCHAR column",
+            bound,
+            emit_str_row_no_reserve(arr),
+        )
     } else {
         write_varlen_large_offsets_no_null(out, arr.value_offsets(), arr.value_data(), arr.len())
     }
@@ -1192,7 +1258,7 @@ fn write_string_view_payload(
     use_bitmap: bool,
 ) -> Result<()> {
     if use_bitmap {
-        write_varlen_u32_offsets_with_bitmap(out, arr, "VARCHAR column", emit_str_row(arr))
+        write_varlen_u32_offsets_with_bitmap(out, arr, "VARCHAR column", None, emit_str_row(arr))
     } else {
         write_varlen_view_no_null(out, arr.len(), emit_str_row(arr))
     }
@@ -1200,11 +1266,13 @@ fn write_string_view_payload(
 
 fn write_binary_payload(out: &mut Vec<u8>, arr: &BinaryArray, use_bitmap: bool) -> Result<()> {
     if use_bitmap {
+        let bound = Some(arr.value_data().len());
         write_varlen_u32_offsets_with_bitmap(
             out,
             arr,
             "BINARY column",
-            emit_bytes_row(|row| arr.value(row)),
+            bound,
+            emit_bytes_row_no_reserve(|row| arr.value(row)),
         )
     } else {
         write_varlen_u32_offsets_no_null(
@@ -1223,11 +1291,13 @@ fn write_large_binary_payload(
     use_bitmap: bool,
 ) -> Result<()> {
     if use_bitmap {
+        let bound = Some(arr.value_data().len());
         write_varlen_u32_offsets_with_bitmap(
             out,
             arr,
             "BINARY column",
-            emit_bytes_row(|row| arr.value(row)),
+            bound,
+            emit_bytes_row_no_reserve(|row| arr.value(row)),
         )
     } else {
         write_varlen_large_offsets_no_null(out, arr.value_offsets(), arr.value_data(), arr.len())
@@ -1244,6 +1314,7 @@ fn write_binary_view_payload(
             out,
             arr,
             "BINARY column",
+            None,
             emit_bytes_row(|row| arr.value(row)),
         )
     } else {
@@ -2305,7 +2376,7 @@ fn write_dict_to_varchar_payload(
             .downcast_ref::<V>()
             .ok_or_else(|| fmt!(ArrowIngest, "DictToVarchar: dict values downcast failed"))?;
         let dict_len = values_arr.len();
-        write_varlen_u32_offsets_with_bitmap(out, dict_arr, "VARCHAR column", |out, row| {
+        write_varlen_u32_offsets_with_bitmap(out, dict_arr, "VARCHAR column", None, |out, row| {
             let slot = get_slot(dict_arr, row);
             if slot >= dict_len {
                 return Err(fmt!(

@@ -392,13 +392,15 @@ void questdb_db_return_reader(
     struct questdb_db* db,
     line_reader* reader);
 
-/** Snapshot of idle reader count. Internal / test-only. */
+/** Snapshot of idle reader count. Diagnostics / test-only; not part of
+ *  the supported API surface. */
 QUESTDB_CLIENT_API
-size_t questdb_db_reader_free_count(struct questdb_db* db);
+size_t questdb_db_dbg_reader_free_count(struct questdb_db* db);
 
-/** Snapshot of in-use reader count. Internal / test-only. */
+/** Snapshot of in-use reader count. Diagnostics / test-only; not part
+ *  of the supported API surface. */
 QUESTDB_CLIENT_API
-size_t questdb_db_reader_in_use_count(struct questdb_db* db);
+size_t questdb_db_dbg_reader_in_use_count(struct questdb_db* db);
 
 /**
  * Peek at the reader's active-query flag.

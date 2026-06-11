@@ -549,11 +549,105 @@ public:
             row_count);
         return *this;
     }
+
+    /**
+     * Append a slice of a previously-imported Arrow column. The
+     * `arrow_import` wrapper must outlive the next
+     * `column_sender_conn::flush`.
+     */
+    column_chunk& append_arrow_import(
+        std::string_view name,
+        const class arrow_import& imported,
+        size_t row_offset,
+        size_t row_count);
 #endif
 
 private:
     ::column_sender_chunk* _raw{nullptr};
 };
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+/**
+ * RAII wrapper around `::column_sender_arrow_import*`. Move-only.
+ *
+ * Lets a caller import an `ArrowArray` + `ArrowSchema` pair once and
+ * then slice/append it across many chunks (e.g. paginating a large
+ * DataFrame) without re-paying the import cost per chunk. On
+ * construction the array's buffers transfer into this wrapper —
+ * `array.release` is cleared on success, and may also be cleared on
+ * failure (check before invoking it on the error path). `schema` is
+ * borrowed only for the duration of the constructor.
+ *
+ * Not thread-safe. Bound to the importing thread until destroyed. MUST
+ * outlive every `column_sender_conn::flush` that referenced it through
+ * `column_chunk::append_arrow_import`.
+ */
+class arrow_import
+{
+public:
+    arrow_import(::ArrowArray& array, const ::ArrowSchema& schema)
+    {
+        _raw = line_sender_error::wrapped_call(
+            ::column_sender_arrow_import_new, &array, &schema);
+    }
+
+    arrow_import(const arrow_import&) = delete;
+    arrow_import& operator=(const arrow_import&) = delete;
+
+    arrow_import(arrow_import&& other) noexcept
+        : _raw{other._raw}
+    {
+        other._raw = nullptr;
+    }
+
+    arrow_import& operator=(arrow_import&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (_raw)
+                ::column_sender_arrow_import_free(_raw);
+            _raw = other._raw;
+            other._raw = nullptr;
+        }
+        return *this;
+    }
+
+    ~arrow_import() noexcept
+    {
+        if (_raw)
+            ::column_sender_arrow_import_free(_raw);
+    }
+
+    /** Number of rows in the imported column. */
+    size_t len() const noexcept
+    {
+        return ::column_sender_arrow_import_len(_raw);
+    }
+
+    ::column_sender_arrow_import* c_ptr() noexcept { return _raw; }
+    const ::column_sender_arrow_import* c_ptr() const noexcept { return _raw; }
+
+private:
+    ::column_sender_arrow_import* _raw{nullptr};
+};
+
+inline column_chunk& column_chunk::append_arrow_import(
+    std::string_view name,
+    const arrow_import& imported,
+    size_t row_offset,
+    size_t row_count)
+{
+    line_sender_error::wrapped_call(
+        ::column_sender_chunk_append_arrow_import,
+        _raw,
+        name.data(),
+        name.size(),
+        imported.c_ptr(),
+        row_offset,
+        row_count);
+    return *this;
+}
+#endif
 
 /**
  * Borrowed `::qwpws_conn*` wrapper exposing flush / sync / Arrow-batch

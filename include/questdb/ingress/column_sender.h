@@ -163,6 +163,9 @@ qwpws_conn* questdb_db_borrow_conn(
  *
  * `db` is currently ignored — the conn carries its own reference to
  * the pool — but accepted for symmetry with the borrow call.
+ *
+ * Mutually exclusive with `questdb_db_drop_conn` on the same `conn`:
+ * call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
 void questdb_db_return_conn(
@@ -178,6 +181,9 @@ void questdb_db_return_conn(
  * Use this in error-recovery paths where the conn may hold in-flight
  * uncommitted frames that the next borrower would otherwise commit
  * alongside their own (the round-3 dirty-sender concern).
+ *
+ * Mutually exclusive with `questdb_db_return_conn` on the same `conn`:
+ * call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
 void questdb_db_drop_conn(
@@ -185,7 +191,7 @@ void questdb_db_drop_conn(
     qwpws_conn* conn);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
- * `questdb_db_return_reader`, `questdb_db_reader_*_count`) live in
+ * `questdb_db_return_reader`, `questdb_db_dbg_reader_*_count`) live in
  * `questdb/egress/line_reader.h` alongside the `line_reader` type
  * they wrap. */
 
@@ -589,14 +595,52 @@ struct ArrowArray
 #endif /* ARROW_C_DATA_INTERFACE */
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
+/**
+ * Opaque handle wrapping an `ArrowArray` + `ArrowSchema` pair imported
+ * from the Arrow C Data Interface. Lets a caller import a Polars /
+ * Pandas / Arrow column once and then slice/append it across many
+ * chunks (e.g. paginating a large DataFrame) without re-paying the
+ * import cost per chunk.
+ *
+ * Not thread-safe. Bound to the importing thread until freed.
+ */
 typedef struct column_sender_arrow_import column_sender_arrow_import;
 
+/**
+ * Import an `ArrowArray` + `ArrowSchema` pair into an opaque handle.
+ *
+ * Ownership of the array's buffers transfers into the returned handle.
+ * On success, `array->release` is cleared to NULL — the caller MUST
+ * NOT invoke it. On error, `array->release` may also have been
+ * cleared if validation reached the Arrow import step; the caller
+ * MUST check `array->release != NULL` before calling it on the
+ * failure path. Depth-cap and NULL-pointer rejections leave it
+ * intact. `schema` is borrowed only for the duration of this call.
+ *
+ * Returns NULL on error and writes a `line_sender_error*` to
+ * `*err_out`. The returned handle (when non-NULL) MUST be freed with
+ * `column_sender_arrow_import_free`.
+ */
 QUESTDB_CLIENT_API
 column_sender_arrow_import* column_sender_arrow_import_new(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
     line_sender_error** err_out);
 
+/**
+ * Append a slice of a previously-imported Arrow column to `chunk`.
+ *
+ * `name` / `name_len` is the destination QuestDB column name (UTF-8,
+ * not NUL-terminated). `row_offset` and `row_count` select a slice
+ * within `imported`'s logical length; pass `row_offset = 0` and
+ * `row_count = column_sender_arrow_import_len(imported)` for the
+ * whole column. `imported` is borrowed; the chunk holds an internal
+ * reference to its buffers until `column_sender_flush` returns.
+ *
+ * Returns `true` on success; on failure returns `false`, writes a
+ * `line_sender_error*` to `*err_out`, and leaves the chunk
+ * unchanged.
+ */
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_arrow_import(
     column_sender_chunk* chunk,
@@ -607,9 +651,45 @@ bool column_sender_chunk_append_arrow_import(
     size_t row_count,
     line_sender_error** err_out);
 
+/**
+ * Free a `column_sender_arrow_import` handle and its underlying
+ * Arrow buffers. Accepts NULL `imported` and no-ops. Invalidates
+ * `imported`; do not use it after this call.
+ *
+ * Safe to call after every chunk that referenced this import has
+ * been successfully flushed. Calling it while a chunk still
+ * references the import is UB — the chunk's internal reference
+ * extends the buffers' lifetime through the next `column_sender_flush`,
+ * not beyond.
+ */
 QUESTDB_CLIENT_API
 void column_sender_arrow_import_free(column_sender_arrow_import* imported);
 
+/**
+ * Number of rows in an imported Arrow column. Returns 0 for a NULL
+ * `imported` and for a logically-empty column.
+ */
+QUESTDB_CLIENT_API
+size_t column_sender_arrow_import_len(const column_sender_arrow_import* imported);
+
+/**
+ * Append a slice of one column from an `ArrowArray` + `ArrowSchema`
+ * pair directly to `chunk`, without going through
+ * `column_sender_arrow_import_new`. Convenience for callers that
+ * only need to ingest the column once.
+ *
+ * Ownership: on success, `array->release` is consumed (cleared to
+ * NULL); the chunk holds the underlying buffers via an internal
+ * reference until `column_sender_flush` returns. On failure,
+ * `array->release` may also have been consumed if the call reached
+ * the Arrow import step before failing — callers MUST check
+ * `array->release != NULL` before invoking it on the failure path.
+ * Early-fail paths (NULL pointer, depth-cap rejection) leave it
+ * intact. `schema` is borrowed in all cases.
+ *
+ * `array->offset` is honored (the Arrow C Data Interface logical
+ * offset); `row_offset` further sub-slices within the call.
+ */
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_arrow_column(
     column_sender_chunk* chunk,

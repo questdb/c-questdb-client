@@ -497,16 +497,12 @@ impl QuestDb {
 
 impl Debug for QuestDb {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let state = self.inner.state.lock();
-        let (free, in_use) = match state {
-            Ok(s) => (s.free.len(), s.in_use),
-            Err(_) => (0, 0),
-        };
+        let state = lock_state(&self.inner.state);
         f.debug_struct("QuestDb")
             .field("pool_size", &self.inner.pool_size)
             .field("pool_max", &self.inner.pool_max)
-            .field("free", &free)
-            .field("in_use", &in_use)
+            .field("free", &state.free.len())
+            .field("in_use", &state.in_use)
             .finish()
     }
 }
@@ -679,6 +675,13 @@ impl OwnedReader {
     /// Take the inner reader, leaving the wrapper inert. Used by the
     /// FFI to expose the raw `Reader` to other call sites that don't
     /// know about the pool (e.g. monitoring stat getters).
+    ///
+    /// After this call, `Drop` no longer decrements the pool's
+    /// `in_use` counter — the caller has assumed responsibility for
+    /// either dropping the returned `Reader` into oblivion (e.g.
+    /// `line_reader_close`'s leak-on-active branch) or routing it
+    /// back to the pool via [`ReaderPoolHandle::return_reader`].
+    /// Forgetting both permanently burns one pool slot.
     pub fn take(mut self) -> Option<Reader> {
         self.reader.take()
     }

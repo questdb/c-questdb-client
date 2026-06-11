@@ -3724,6 +3724,11 @@ const MAX_ARROW_SCHEMA_DEPTH: usize = 64;
 const MAX_ARROW_SCHEMA_CHILDREN_PER_NODE: i64 = 65_536;
 #[cfg(feature = "arrow")]
 const MAX_ARROW_SCHEMA_TOTAL_NODES: usize = 4_096;
+// Widest Arrow physical layout is dense Union at 3 buffers. Cap above
+// that so the validator can't be DoS'd by an inflated `n_buffers`
+// independently of whatever arrow-rs's `from_ffi` happens to trust.
+#[cfg(feature = "arrow")]
+const MAX_ARROW_ARRAY_N_BUFFERS_PER_NODE: i64 = 16;
 // `arrow::ffi::from_ffi` reads `(*a).length` as i64 and casts to
 // usize before the inner crate gets to check the row cap, so a
 // negative or `i64::MAX` length must be rejected here. Anchored on
@@ -3935,6 +3940,13 @@ unsafe fn validate_arrow_array_depth(
                 return Err(arrow_ingest_err(format!(
                     "Arrow array n_buffers {} is negative",
                     (*a).n_buffers
+                )));
+            }
+            if (*a).n_buffers > MAX_ARROW_ARRAY_N_BUFFERS_PER_NODE {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow array n_buffers {} exceeds per-node cap {}",
+                    (*a).n_buffers,
+                    MAX_ARROW_ARRAY_N_BUFFERS_PER_NODE
                 )));
             }
             let dict_a = (*a).dictionary;
@@ -5110,6 +5122,28 @@ mod tests {
                 assert!(
                     err.msg().contains("n_buffers"),
                     "expected n_buffers-negative error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_n_buffers_above_cap_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).n_buffers = MAX_ARROW_ARRAY_N_BUFFERS_PER_NODE + 1;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("n_buffers"),
+                    "expected n_buffers-cap error, got: {}",
                     err.msg()
                 );
             }

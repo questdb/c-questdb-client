@@ -69,9 +69,8 @@ pub use validity::Validity;
 ///   * validity bitmap byte-length (`ceil(bit_len / 8)`) to a value
 ///     well below `isize::MAX` on every supported target.
 ///
-/// Mirrored as the FFI-side `MAX_ARROW_ARRAY_LENGTH` cap; a value
-/// raised here without raising the FFI-side cap will silently reject
-/// rows on the FFI path.
+/// The FFI-side `MAX_ARROW_ARRAY_LENGTH` cap is derived from this
+/// constant, so raising it here raises both in lockstep.
 pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 
 const _: () = assert!(

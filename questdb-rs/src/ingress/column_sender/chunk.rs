@@ -73,21 +73,22 @@ impl ImportedArrowColumn {
     ///
     /// The caller must ensure that `array` and `schema` are valid
     /// `FFI_ArrowArray` / `FFI_ArrowSchema` structures as produced by
-    /// the Arrow C Data Interface. On success, ownership of `array` is
-    /// transferred into the returned column (the caller's `array` has
-    /// its `release` callback cleared and must not be released again).
-    /// `schema` is borrowed and remains owned by the caller.
+    /// the Arrow C Data Interface. The caller's `array.release` is
+    /// consumed unconditionally: cleared to `None` on every return,
+    /// success or error. The caller MUST NOT invoke the original
+    /// release after this call. `schema` is borrowed and remains owned
+    /// by the caller.
     pub unsafe fn import_from_ffi(
         array: &mut arrow::ffi::FFI_ArrowArray,
         schema: &arrow::ffi::FFI_ArrowSchema,
     ) -> Result<Self> {
         use arrow_array::make_array;
 
-        let field = arrow_schema::Field::try_from(schema)
-            .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
-
         let imported_array = unsafe { std::ptr::read(array) };
         array.release = None;
+
+        let field = arrow_schema::Field::try_from(schema)
+            .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
         let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }
             .map_err(|err| error::fmt!(ArrowIngest, "from_ffi failed: {}", err))?;
         array_data

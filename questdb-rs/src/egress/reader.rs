@@ -1592,12 +1592,6 @@ impl<'r> Cursor<'r> {
                         "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
                         decoded.batch_seq
                     );
-                    // Restore the decoded batch so the caller can re-pin
-                    // against the new schema (calling with `None` or with
-                    // the drift schema returns it without re-reading the
-                    // wire). Without this restore the drift batch's rows
-                    // are silently lost.
-                    self.last_batch = Some(decoded);
                     return Err(e);
                 }
                 match batch_to_record_batch(

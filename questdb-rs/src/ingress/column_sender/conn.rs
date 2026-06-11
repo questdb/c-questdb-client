@@ -738,6 +738,7 @@ impl Drop for ColumnConn {
         );
         let _ = self.stream.write_all(&self.write_buf);
         let _ = self.stream.flush();
+        self.stream.shutdown_tls();
     }
 }
 

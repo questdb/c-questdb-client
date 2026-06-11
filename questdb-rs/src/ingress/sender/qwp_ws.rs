@@ -105,6 +105,18 @@ impl WsStream {
             WsStream::Tls(stream) => stream.get_ref().tcp(),
         }
     }
+
+    /// Emit a TLS `close_notify` and try to flush it. No-op for plain
+    /// sockets. `rustls::ClientConnection` does NOT auto-send
+    /// `close_notify` on `Drop`, so callers issuing a clean shutdown
+    /// (after writing the WS Close frame) must invoke this explicitly to
+    /// satisfy RFC 8446 §6.1 and avoid server-side truncation warnings.
+    pub(crate) fn shutdown_tls(&mut self) {
+        if let WsStream::Tls(stream) = self {
+            stream.conn.send_close_notify();
+            let _ = stream.conn.complete_io(&mut stream.sock);
+        }
+    }
 }
 
 struct NonblockingModeGuard {
