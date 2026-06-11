@@ -223,7 +223,7 @@ impl Reader {
 
     /// Walk `cfg.addrs` via the per-client host-health tracker, opening
     /// the highest-priority unattempted endpoint and eagerly consuming
-    /// the v2 `SERVER_INFO` frame. Accepts the first endpoint whose role
+    /// the `SERVER_INFO` frame. Accepts the first endpoint whose role
     /// matches `cfg.target`. Returns:
     ///
     /// - `RoleMismatch` if every endpoint connected but none advertised
@@ -307,7 +307,7 @@ impl Reader {
 
     /// Open a single endpoint by index. Used by [`walk_via_tracker`] on
     /// both initial connect and mid-query failover. On success, returns
-    /// a [`TransportSession`] holding the bound socket plus the v2
+    /// a [`TransportSession`] holding the bound socket plus the
     /// `SERVER_INFO` (when applicable); the caller decides whether to
     /// wrap it in a fresh `Reader` (initial connect) or splice into an
     /// existing one (reconnect). On role mismatch, a `RoleMismatch`
@@ -401,8 +401,9 @@ impl Reader {
     /// → Unknown → TransientReject → TransportError → TopologyReject;
     /// same-zone preferred when zone is configured). On success, the
     /// old transport has been closed, the new transport + `SERVER_INFO`
-    /// are bound, dict / registry are reset to empty, and `addr_idx`
-    /// reflects the new endpoint. The caller must re-issue the
+    /// are bound, the symbol dict and per-query schema are reset to
+    /// empty, and `addr_idx` reflects the new endpoint. The caller must
+    /// re-issue the
     /// `QUERY_REQUEST` with a freshly-allocated `request_id`.
     ///
     /// The `failed_idx` argument is the address index that just failed
@@ -1387,7 +1388,7 @@ impl<'r> Cursor<'r> {
     /// happens before the first batch is yielded — including initial
     /// connect failover — is unaffected and remains transparent.
     ///
-    /// Decode errors (malformed payload, schema-ref miss, zstd
+    /// Decode errors (malformed payload, missing batch-0 schema, zstd
     /// corruption) are NOT routed through failover — they bubble up
     /// immediately and terminate the cursor, since reconnecting
     /// won't fix a wire-state bug.
@@ -1429,19 +1430,29 @@ impl<'r> Cursor<'r> {
         // can't overwrite the originating error.
         match self.next_batch_inner() {
             Ok(NextOutcome::HaveBatch) => {
-                let last = self
-                    .last_batch
-                    .as_ref()
-                    .expect("HaveBatch implies last_batch populated");
-                let schema = self
-                    .reader
-                    .query_schema
-                    .as_ref()
-                    .expect("schema populated by inner decode");
+                // `next_batch_inner` populates `last_batch` (via `.insert`)
+                // and verifies `query_schema` is `Some` before returning
+                // `HaveBatch`, so both are present here. Re-check with the
+                // inner's *soft* pattern rather than `.expect()`: a panic
+                // would abort the whole process across the FFI boundary
+                // (`panic=abort`), so a future refactor that breaks the
+                // invariant must surface a terminal `ProtocolError`, not
+                // kill the host.
+                if self.last_batch.is_none() || self.reader.query_schema.is_none() {
+                    let err = fmt!(
+                        ProtocolError,
+                        "internal invariant: next_batch produced a batch without a decoded view or schema"
+                    );
+                    self.terminate_with_close();
+                    if self.done && self.terminal_error.is_none() {
+                        self.terminal_error = Some(err.clone());
+                    }
+                    return Err(err);
+                }
                 Ok(Some(BatchView {
-                    decoded: last,
+                    decoded: self.last_batch.as_ref().unwrap(),
                     dict: &self.reader.dict,
-                    schema,
+                    schema: self.reader.query_schema.as_ref().unwrap(),
                 }))
             }
             Ok(NextOutcome::Done) => Ok(None),
@@ -1509,7 +1520,7 @@ impl<'r> Cursor<'r> {
             let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
             // Decode is **not** failover-eligible. Anything that comes
             // out as an error here (bad varint, unknown discriminant,
-            // schema-ref miss, symbol-dict miss, zstd corruption) is
+            // missing batch-0 schema, symbol-dict miss, zstd corruption) is
             // a wire/state bug that won't be fixed by reconnecting —
             // and silently retrying would mask it from the user. Bubble
             // it up as a hard failure with the cursor terminated.
@@ -1825,7 +1836,7 @@ impl<'r> Cursor<'r> {
             }
         };
         // Reset connection-scoped state. The new connection has its
-        // own (empty) dict + registry already (set up by
+        // own (empty) dict and per-query schema already (set up by
         // `connect_endpoint`). Drop any in-flight batch buffer so we
         // don't accidentally surface a stale view.
         self.last_batch = None;
@@ -2548,8 +2559,9 @@ fn walk_via_tracker(
                         // Pull the role/zone bytes out of `UpgradeReject`
                         // (set by both the SERVER_INFO target-mismatch path
                         // and the `421 + X-QuestDB-Role` upgrade-reject path
-                        // in transport.rs). v1-pinned mismatches have no
-                        // `UpgradeReject`; default to topological.
+                        // in transport.rs). A mismatch with no
+                        // `UpgradeReject` (the no-SERVER_INFO guard)
+                        // defaults to topological.
                         let reject = e.upgrade_reject();
                         let transient = reject.is_some_and(|r| r.is_transient());
                         if let Some(r) = reject {
@@ -2578,8 +2590,8 @@ fn walk_via_tracker(
 }
 
 /// Read one frame off a fresh transport and expect `SERVER_INFO`.
-/// Called once per successful upgrade on a v2+ connection. Uses
-/// throwaway dict / registry / zstd scratch since `SERVER_INFO` itself
+/// Called once per successful upgrade. Uses throwaway dict / schema /
+/// zstd scratch since `SERVER_INFO` itself
 /// never carries symbols, schemas, or compressed payload — those state
 /// machines only kick in once the Reader is assembled and starts
 /// pulling `RESULT_BATCH` frames.
