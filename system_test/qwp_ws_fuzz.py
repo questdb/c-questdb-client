@@ -1469,18 +1469,20 @@ class BounceThread(threading.Thread):
                 self._fixture.start()
                 self.bounces_performed += 1
                 self._log(f'fuzz bounce #{idx}: server back up')
-            except Exception as e:  # noqa: BLE001 — fixture lifecycle is fragile
+            except Exception as e:  # noqa: BLE001 — any lifecycle failure fails the run
+                # A raise here is a real failure, not noise: stop() raises
+                # when the server won't shut down within its timeout, and
+                # start() raises when it won't come back up. Either way we
+                # record it so the end-of-run assertion fails.
                 self._record_failure(
                     f'fuzz bounce: unexpected failure at attempt '
                     f'{self.bounces_performed + 1}: '
                     f'{type(e).__name__}: {e}')
                 # One defensive recovery attempt so the rest of the test
-                # has a chance to surface the underlying assertion
-                # failure rather than a query timeout. stop() first: if
-                # start() failed partway, the process it launched may
-                # still be alive, and starting another instance next to
-                # it leaves behind a zombie server that the port-based
-                # health checks cannot tell apart from the new one.
+                # has a chance to surface the underlying assertion failure
+                # rather than a query timeout. stop() first: if start()
+                # failed partway it may have left a process behind, and we
+                # must not launch a second one next to it.
                 try:
                     self._fixture.stop()
                 except Exception:

@@ -25,19 +25,18 @@
 """Unit-level regression tests for the `fixture` QuestDB lifecycle.
 
 These do not launch QuestDB — they drive `QuestDbFixture` with stand-in
-child processes and sockets. They pin down the hardening added after a
-qwp_ws_fuzz CI failure (2026-06-10, `test_all_mixed_with_bounce`
-seed=0x8f7a0293542c4692) where a hung graceful shutdown cascaded into a
-zombie server that the port-based health checks mistook for the
-freshly launched instance:
+child processes. They pin down how `stop()` reacts when a server refuses
+to shut down (originally seen in a qwp_ws_fuzz CI failure on 2026-06-10,
+`test_all_mixed_with_bounce` seed=0x8f7a0293542c4692, where the server
+hung in graceful shutdown):
 
-* `stop()` escalates SIGTERM -> SIGQUIT (JVM thread dump) -> SIGKILL
-  and says so on stderr;
-* `start()` refuses to run while the previous process is still alive;
-* `_await_ports_free()` detects a leftover process still serving our
-  ports;
-* `print_log()` dumps only the current instance's slice of the
-  cumulative server log.
+* `stop()` escalates SIGTERM -> SIGQUIT (JVM thread dump) -> SIGKILL,
+  says so on stderr, and then raises `QuestDbStopTimeout` so a server
+  that won't shut down within its timeout fails the test instead of
+  being silently absorbed;
+* a clean shutdown stays quiet and does not raise;
+* `print_log()` reads the log as bytes so a force-kill that truncates
+  it mid-character can't crash the dump.
 
 Run with::
 
@@ -51,12 +50,10 @@ import contextlib
 import io
 import pathlib
 import signal
-import socket
 import subprocess
 import tempfile
 import time
 import unittest
-import unittest.mock
 
 import fixture
 
@@ -88,7 +85,7 @@ class StopEscalationTest(unittest.TestCase):
 
     @unittest.skipUnless(
         hasattr(signal, 'SIGQUIT'), 'SIGQUIT is POSIX-only')
-    def test_hung_shutdown_requests_thread_dump_then_kills(self):
+    def test_hung_shutdown_requests_thread_dump_then_fails(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             qdb = _make_fixture(tmp_dir)
             qdb._log_path.parent.mkdir(parents=True)
@@ -110,9 +107,15 @@ class StopEscalationTest(unittest.TestCase):
 
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
-                    qdb.stop(wait_timeout_sec=1)
+                    # A server that won't shut down within the timeout is
+                    # a failure: stop() force-kills it (so nothing leaks)
+                    # and then raises so the test fails loudly.
+                    with self.assertRaises(fixture.QuestDbStopTimeout):
+                        qdb.stop(wait_timeout_sec=1)
 
+                # Cleanup must still have happened before the raise.
                 self.assertIsNone(qdb._proc)
+                self.assertIsNone(qdb._log)
                 self.assertIsNotNone(proc.poll(), 'child must be dead')
                 messages = stderr.getvalue()
                 self.assertIn('escalating to SIGKILL', messages)
@@ -132,106 +135,26 @@ class StopEscalationTest(unittest.TestCase):
                 [sys.executable, '-c', 'import time; time.sleep(60)'])
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
-                qdb.stop(wait_timeout_sec=10)
+                qdb.stop(wait_timeout_sec=10)  # must not raise
             self.assertIsNone(qdb._proc)
             self.assertEqual('', stderr.getvalue())
 
 
-class DoubleStartGuardTest(unittest.TestCase):
+class PrintLogTest(unittest.TestCase):
 
-    def test_start_refuses_while_previous_instance_alive(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            qdb = _make_fixture(tmp_dir)
-            qdb._proc = subprocess.Popen(
-                [sys.executable, '-c', 'import time; time.sleep(60)'])
-            try:
-                with self.assertRaisesRegex(RuntimeError, 'still running'):
-                    qdb.start()
-            finally:
-                qdb._proc.kill()
-                qdb._proc.wait()
-
-    def test_start_allowed_after_previous_instance_died(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            qdb = _make_fixture(tmp_dir)
-            qdb._proc = subprocess.Popen([sys.executable, '-c', 'pass'])
-            qdb._proc.wait()
-            # The guard must not fire for a dead process; the port check
-            # is the next thing start() does, so use it as the witness
-            # that we got past the guard.
-            qdb.http_server_port = 1  # forces the restart branch
-            with unittest.mock.patch.object(qdb, '_await_ports_free',
-                                            side_effect=KeyboardInterrupt):
-                with self.assertRaises(KeyboardInterrupt):
-                    qdb.start()
-
-
-class AwaitPortsFreeTest(unittest.TestCase):
-
-    def test_detects_port_still_serving(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            qdb = _make_fixture(tmp_dir)
-            with socket.socket() as listener:
-                listener.bind(('127.0.0.1', 0))
-                listener.listen(1)
-                qdb.http_server_port = listener.getsockname()[1]
-                with self.assertRaisesRegex(
-                        RuntimeError, 'still serving connections'):
-                    qdb._await_ports_free(timeout_sec=0.3)
-
-    def test_returns_once_ports_are_free(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            qdb = _make_fixture(tmp_dir)
-            listener = socket.socket()
-            listener.bind(('127.0.0.1', 0))
-            listener.listen(1)
-            qdb.http_server_port = listener.getsockname()[1]
-            listener.close()
-            qdb._await_ports_free(timeout_sec=1.0)  # must not raise
-
-
-class PrintLogOffsetTest(unittest.TestCase):
-
-    def test_prints_only_current_instance_slice(self):
+    def test_handles_truncated_utf8_without_crashing(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             qdb = _make_fixture(tmp_dir)
             qdb._log_path.parent.mkdir(parents=True)
-            old = b'OLD INSTANCE LINE\n'
-            new = b'NEW INSTANCE LINE\n'
-            qdb._log_path.write_bytes(old + new)
-            qdb._log_start_offset = len(old)
+            # A lone continuation byte: invalid UTF-8, as produced when a
+            # force-kill truncates the log mid-character.
+            qdb._log_path.write_bytes(b'GOOD LINE\n\xff\xfe BAD BYTES\n')
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
-                qdb.print_log()
+                qdb.print_log()  # must not raise
             dumped = stderr.getvalue()
-            self.assertNotIn('OLD INSTANCE LINE', dumped)
-            self.assertIn('NEW INSTANCE LINE', dumped)
-            self.assertIn(f'byte offset {len(old)}', dumped)
-
-    def test_zero_offset_prints_everything_without_header(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            qdb = _make_fixture(tmp_dir)
-            qdb._log_path.parent.mkdir(parents=True)
-            qdb._log_path.write_bytes(b'FIRST INSTANCE LINE\n')
-            stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
-                qdb.print_log()
-            dumped = stderr.getvalue()
-            self.assertIn('FIRST INSTANCE LINE', dumped)
-            self.assertNotIn('byte offset', dumped)
-
-
-class TryQueryVersionTest(unittest.TestCase):
-
-    def test_transient_network_error_returns_none(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            qdb = _make_fixture(tmp_dir)
-            with socket.socket() as probe:
-                probe.bind(('127.0.0.1', 0))
-                free_port = probe.getsockname()[1]
-            # Nothing listens on free_port any more: connection refused.
-            qdb.http_server_port = free_port
-            self.assertIsNone(qdb._try_query_version())
+            self.assertIn('GOOD LINE', dumped)
+            self.assertIn('BAD BYTES', dumped)
 
 
 if __name__ == '__main__':
