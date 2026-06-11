@@ -97,7 +97,7 @@ fn server_info_frame(role: ServerRole, node_id: &str, cluster_id: &str) -> Vec<u
     payload.extend_from_slice(cluster_id.as_bytes());
     payload.extend_from_slice(&(node_id.len() as u16).to_le_bytes());
     payload.extend_from_slice(node_id.as_bytes());
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 fn result_end_frame(request_id: i64) -> Vec<u8> {
@@ -106,7 +106,7 @@ fn result_end_frame(request_id: i64) -> Vec<u8> {
     payload.extend_from_slice(&request_id.to_le_bytes());
     encode_varint_u64(0, &mut payload);
     encode_varint_u64(0, &mut payload);
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ fn serve_one(tcp: TcpStream, cfg: Arc<ServerConfig>) {
     let stream = rustls::StreamOwned::new(conn, tcp);
 
     let mut ws = match accept_hdr(stream, |_req: &Request, mut resp: Response| {
-        let header = HeaderValue::from_static("2");
+        let header = HeaderValue::from_static("1");
         resp.headers_mut().insert("x-qwp-version", header);
         Ok(resp)
     }) {

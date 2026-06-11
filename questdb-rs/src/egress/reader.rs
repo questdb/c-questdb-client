@@ -53,7 +53,7 @@ use crate::egress::decoder::DecodedBatch;
 use crate::egress::decoder::ZstdScratch;
 use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET};
-use crate::egress::schema::{Schema, SchemaRegistry};
+use crate::egress::schema::Schema;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::tracker::HostHealthTracker;
@@ -95,7 +95,7 @@ pub struct ReaderStats {
 }
 
 /// Per-connection reader. Owns the WebSocket transport and the
-/// connection-scoped symbol dictionary + schema registry.
+/// connection-scoped symbol dictionary.
 pub struct Reader {
     /// Snapshot of the config used to open this connection. Owned (not
     /// borrowed) because the cursor's failover machinery needs to outlive
@@ -121,12 +121,21 @@ pub struct Reader {
     /// [`Reader::transport_mut`] to access — they assert this invariant.
     transport: Option<WsTransport>,
     dict: SymbolDict,
-    registry: SchemaRegistry,
+    /// Schema for the in-flight query. Populated from the first
+    /// `RESULT_BATCH` (`batch_seq == 0`) and reused by continuation
+    /// batches; `ReaderQuery::execute` clears it at query start and the
+    /// reconnect path clears it on failover so a replayed query re-reads
+    /// it from the new node's batch 0. A single slot suffices because a
+    /// `Reader` runs one cursor at a time; pipelined `request_id`s would
+    /// need a map keyed by request id.
+    query_schema: Option<Schema>,
     next_request_id: i64,
     cursor_active: bool,
-    /// Server's `SERVER_INFO` (`0x18`) — `None` when negotiated v1.
-    /// Captured eagerly during connect so multi-addr role filtering
-    /// can dismiss endpoints whose role doesn't match `target`.
+    /// Server's `SERVER_INFO` (`0x18`), captured eagerly during connect.
+    /// The single QWP version always sends it as the first frame, so this
+    /// is `Some` outside the brief reconnect window; multi-addr role
+    /// filtering uses it to dismiss endpoints whose role doesn't match
+    /// `target`.
     server_info: Option<ServerInfo>,
     /// Diagnostic counters (`bytes_received`, `credit_granted_total`,
     /// `read_ns`, `decode_ns`) shared with the FFI handle via `Arc` so
@@ -214,7 +223,7 @@ impl Reader {
 
     /// Walk `cfg.addrs` via the per-client host-health tracker, opening
     /// the highest-priority unattempted endpoint and eagerly consuming
-    /// the v2 `SERVER_INFO` frame. Accepts the first endpoint whose role
+    /// the `SERVER_INFO` frame. Accepts the first endpoint whose role
     /// matches `cfg.target`. Returns:
     ///
     /// - `RoleMismatch` if every endpoint connected but none advertised
@@ -285,7 +294,7 @@ impl Reader {
             addr_idx: walk.session.idx,
             transport: Some(walk.session.transport),
             dict: SymbolDict::new(),
-            registry: SchemaRegistry::new(),
+            query_schema: None,
             next_request_id: 1,
             cursor_active: false,
             server_info: walk.session.server_info,
@@ -298,7 +307,7 @@ impl Reader {
 
     /// Open a single endpoint by index. Used by [`walk_via_tracker`] on
     /// both initial connect and mid-query failover. On success, returns
-    /// a [`TransportSession`] holding the bound socket plus the v2
+    /// a [`TransportSession`] holding the bound socket plus the
     /// `SERVER_INFO` (when applicable); the caller decides whether to
     /// wrap it in a fresh `Reader` (initial connect) or splice into an
     /// existing one (reconnect). On role mismatch, a `RoleMismatch`
@@ -322,7 +331,7 @@ impl Reader {
             }
             annotated
         })?;
-        let server_info = if transport.server_version() >= 2 {
+        let server_info = if transport.server_version() >= 1 {
             Some(read_server_info_frame(
                 &mut transport,
                 Duration::from_millis(cfg.server_info_timeout_ms),
@@ -333,21 +342,21 @@ impl Reader {
         if !matches!(cfg.target, Target::Any) {
             match server_info.as_ref() {
                 None => {
-                    // v1 negotiated; per failover.md §5 every host's zone
-                    // tier stays `Unknown` and `target=primary|replica`
-                    // produces `TopologyReject`. Surface a plain
+                    // No SERVER_INFO was supplied, so there's no wire role
+                    // to match against `target`. Surface a plain
                     // `RoleMismatch` without `UpgradeReject` — there's no
-                    // wire role to attach, and the tracker treats the
-                    // absence as v1-pinned-topological.
+                    // role or zone to attach. With the single QWP version
+                    // (which always sends SERVER_INFO) this is unreachable
+                    // for a conformant server; it remains as a guard.
                     return Err(fmt!(
                         RoleMismatch,
-                        "endpoint {} negotiated v1 and cannot supply a role for target={:?}",
+                        "endpoint {} supplied no SERVER_INFO and cannot match target={:?}",
                         idx,
                         cfg.target
                     ));
                 }
                 Some(info) if !target_matches(cfg.target, info.role) => {
-                    // v2 advertised a role that doesn't match `target=`.
+                    // The endpoint advertised a role that doesn't match `target=`.
                     // Attach `UpgradeReject` carrying the advertised role
                     // and zone so the host-health tracker classifies
                     // identically to a `421+role` response — same
@@ -392,8 +401,9 @@ impl Reader {
     /// → Unknown → TransientReject → TransportError → TopologyReject;
     /// same-zone preferred when zone is configured). On success, the
     /// old transport has been closed, the new transport + `SERVER_INFO`
-    /// are bound, dict / registry are reset to empty, and `addr_idx`
-    /// reflects the new endpoint. The caller must re-issue the
+    /// are bound, the symbol dict and per-query schema are reset to
+    /// empty, and `addr_idx` reflects the new endpoint. The caller must
+    /// re-issue the
     /// `QUERY_REQUEST` with a freshly-allocated `request_id`.
     ///
     /// The `failed_idx` argument is the address index that just failed
@@ -524,7 +534,7 @@ impl Reader {
                     self.transport = Some(walk.session.transport);
                     self.server_info = walk.session.server_info;
                     self.dict = SymbolDict::new();
-                    self.registry = SchemaRegistry::new();
+                    self.query_schema = None;
                     self.addr_idx = walk.session.idx;
                     return Ok(total_dials);
                 }
@@ -658,8 +668,8 @@ impl Reader {
         &self.stats
     }
 
-    /// `SERVER_INFO` (`0x18`) captured at connect time, when negotiated
-    /// version >= 2. `None` for v1 servers.
+    /// `SERVER_INFO` (`0x18`) captured at connect time. `None` only while
+    /// a reconnect is in flight; the single QWP version always supplies it.
     pub fn server_info(&self) -> Option<&ServerInfo> {
         self.server_info.as_ref()
     }
@@ -674,11 +684,6 @@ impl Reader {
     /// Connection-scoped symbol dictionary.
     pub fn symbol_dict(&self) -> &SymbolDict {
         &self.dict
-    }
-
-    /// Connection-scoped schema registry.
-    pub fn schema_registry(&self) -> &SchemaRegistry {
-        &self.registry
     }
 
     /// Begin building a parametrised query. The returned `ReaderQuery`
@@ -727,7 +732,8 @@ pub struct FailoverEvent {
     pub failed_addr: Endpoint,
     /// Endpoint of the new connection.
     pub new_addr: Endpoint,
-    /// `SERVER_INFO` of the new endpoint (`None` for v1 servers).
+    /// `SERVER_INFO` of the new endpoint (`None` only if the server
+    /// omitted it).
     pub new_server_info: Option<ServerInfo>,
     /// Newly-allocated `request_id` the cursor will receive frames for
     /// from now on. Different from `Cursor::request_id` *before* the
@@ -817,7 +823,7 @@ pub struct FailoverProgressEvent {
     /// [`FailoverPhase::Reset`].
     pub new_addr: Option<Endpoint>,
     /// `SERVER_INFO` of the new endpoint. `Some` only on
-    /// [`FailoverPhase::Reset`] and only on QWP v2+ servers.
+    /// [`FailoverPhase::Reset`].
     pub new_server_info: Option<ServerInfo>,
     /// Newly-allocated `request_id`. `Some` only on
     /// [`FailoverPhase::Reset`].
@@ -1100,6 +1106,10 @@ impl<'r> ReaderQuery<'r> {
             ));
         }
         let request_id = self.reader.alloc_request_id();
+        // The schema rides the first RESULT_BATCH (batch_seq == 0) of each
+        // query; clear any schema left from the prior query so a stray
+        // continuation batch can't bind rows to a stale schema.
+        self.reader.query_schema = None;
         let req = self.builder.request_id(request_id).build()?;
         let credit_enabled = req.initial_credit() > 0;
         // Encode the QUERY_REQUEST once and stash the bytes on the
@@ -1378,7 +1388,7 @@ impl<'r> Cursor<'r> {
     /// happens before the first batch is yielded — including initial
     /// connect failover — is unaffected and remains transparent.
     ///
-    /// Decode errors (malformed payload, schema-ref miss, zstd
+    /// Decode errors (malformed payload, missing batch-0 schema, zstd
     /// corruption) are NOT routed through failover — they bubble up
     /// immediately and terminate the cursor, since reconnecting
     /// won't fix a wire-state bug.
@@ -1420,19 +1430,29 @@ impl<'r> Cursor<'r> {
         // can't overwrite the originating error.
         match self.next_batch_inner() {
             Ok(NextOutcome::HaveBatch) => {
-                let last = self
-                    .last_batch
-                    .as_ref()
-                    .expect("HaveBatch implies last_batch populated");
-                let schema = self
-                    .reader
-                    .registry
-                    .get(last.schema_id)
-                    .expect("schema validated by inner");
+                // `next_batch_inner` populates `last_batch` (via `.insert`)
+                // and verifies `query_schema` is `Some` before returning
+                // `HaveBatch`, so both are present here. Re-check with the
+                // inner's *soft* pattern rather than `.expect()`: a panic
+                // would abort the whole process across the FFI boundary
+                // (`panic=abort`), so a future refactor that breaks the
+                // invariant must surface a terminal `ProtocolError`, not
+                // kill the host.
+                if self.last_batch.is_none() || self.reader.query_schema.is_none() {
+                    let err = fmt!(
+                        ProtocolError,
+                        "internal invariant: next_batch produced a batch without a decoded view or schema"
+                    );
+                    self.terminate_with_close();
+                    if self.done && self.terminal_error.is_none() {
+                        self.terminal_error = Some(err.clone());
+                    }
+                    return Err(err);
+                }
                 Ok(Some(BatchView {
-                    decoded: last,
+                    decoded: self.last_batch.as_ref().unwrap(),
                     dict: &self.reader.dict,
-                    schema,
+                    schema: self.reader.query_schema.as_ref().unwrap(),
                 }))
             }
             Ok(NextOutcome::Done) => Ok(None),
@@ -1500,7 +1520,7 @@ impl<'r> Cursor<'r> {
             let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
             // Decode is **not** failover-eligible. Anything that comes
             // out as an error here (bad varint, unknown discriminant,
-            // schema-ref miss, symbol-dict miss, zstd corruption) is
+            // missing batch-0 schema, symbol-dict miss, zstd corruption) is
             // a wire/state bug that won't be fixed by reconnecting —
             // and silently retrying would mask it from the user. Bubble
             // it up as a hard failure with the cursor terminated.
@@ -1509,7 +1529,7 @@ impl<'r> Cursor<'r> {
                 header,
                 &payload,
                 &mut self.reader.dict,
-                &mut self.reader.registry,
+                &mut self.reader.query_schema,
                 &mut self.reader.zstd_scratch,
             );
             // Account for decode time on both arms — the error path is
@@ -1568,13 +1588,13 @@ impl<'r> Cursor<'r> {
                         self.terminate_with_close();
                         return Err(e);
                     }
-                    let schema_id = b.schema_id;
-                    if self.reader.registry.get(schema_id).is_none() {
-                        let err = fmt!(
-                            ProtocolError,
-                            "RESULT_BATCH references schema {} not in registry",
-                            schema_id
-                        );
+                    // decode_result_batch guarantees `query_schema` is
+                    // populated on Ok (batch_seq == 0 sets it; > 0 errors
+                    // when it's absent). Defensive check rather than an
+                    // `.expect()` so an internal-invariant violation can't
+                    // abort the process across the FFI boundary.
+                    if self.reader.query_schema.is_none() {
+                        let err = fmt!(ProtocolError, "RESULT_BATCH decoded without a schema");
                         self.terminate_with_close();
                         return Err(err);
                     }
@@ -1588,11 +1608,10 @@ impl<'r> Cursor<'r> {
                     // BatchView construction is hoisted to `next_batch`
                     // (the wrapper) so the inner returns a borrow-free
                     // discriminant; the wrapper re-acquires the borrows
-                    // on `last_batch`, `dict`, and `registry` itself.
-                    // `last`/`schema_id` are still in scope here only
-                    // for the side effects (insert + data_delivered).
+                    // on `last_batch`, `dict`, and `query_schema` itself.
+                    // `last` is still in scope here only for the side
+                    // effects (insert + data_delivered).
                     let _ = last;
-                    let _ = schema_id;
                     return Ok(NextOutcome::HaveBatch);
                 }
                 ServerEvent::End {
@@ -1677,8 +1696,9 @@ impl<'r> Cursor<'r> {
         self.reader.server_version()
     }
 
-    /// `SERVER_INFO` of the cursor's currently connected endpoint, or
-    /// `None` on v1 servers. The in-cursor accessor for
+    /// `SERVER_INFO` of the cursor's currently connected endpoint;
+    /// `None` only while a reconnect is in flight (the single QWP
+    /// version always supplies it). The in-cursor accessor for
     /// [`Reader::server_info`], unreachable from user code while the
     /// cursor holds the `Reader`'s mutable borrow. Reflects the new
     /// endpoint after mid-query failover.
@@ -1816,7 +1836,7 @@ impl<'r> Cursor<'r> {
             }
         };
         // Reset connection-scoped state. The new connection has its
-        // own (empty) dict + registry already (set up by
+        // own (empty) dict and per-query schema already (set up by
         // `connect_endpoint`). Drop any in-flight batch buffer so we
         // don't accidentally surface a stale view.
         self.last_batch = None;
@@ -2517,7 +2537,8 @@ fn walk_via_tracker(
                 // Update zone tier from `SERVER_INFO.zone_id` when the
                 // server advertised one (gated by `CAP_ZONE`). `record_zone`
                 // with `None`/empty is a no-op, so passing the field
-                // unconditionally is safe even on v1 or CAP_ZONE=0.
+                // unconditionally is safe even when the server advertised
+                // no zone (CAP_ZONE=0).
                 if let Some(info) = session.server_info.as_ref() {
                     tracker.record_zone(idx, info.zone_id.as_deref());
                 }
@@ -2538,8 +2559,9 @@ fn walk_via_tracker(
                         // Pull the role/zone bytes out of `UpgradeReject`
                         // (set by both the SERVER_INFO target-mismatch path
                         // and the `421 + X-QuestDB-Role` upgrade-reject path
-                        // in transport.rs). v1-pinned mismatches have no
-                        // `UpgradeReject`; default to topological.
+                        // in transport.rs). A mismatch with no
+                        // `UpgradeReject` (the no-SERVER_INFO guard)
+                        // defaults to topological.
                         let reject = e.upgrade_reject();
                         let transient = reject.is_some_and(|r| r.is_transient());
                         if let Some(r) = reject {
@@ -2568,8 +2590,8 @@ fn walk_via_tracker(
 }
 
 /// Read one frame off a fresh transport and expect `SERVER_INFO`.
-/// Called once per successful upgrade on a v2+ connection. Uses
-/// throwaway dict / registry / zstd scratch since `SERVER_INFO` itself
+/// Called once per successful upgrade. Uses throwaway dict / schema /
+/// zstd scratch since `SERVER_INFO` itself
 /// never carries symbols, schemas, or compressed payload — those state
 /// machines only kick in once the Reader is assembled and starts
 /// pulling `RESULT_BATCH` frames.
@@ -2596,20 +2618,20 @@ fn read_server_info_frame(transport: &mut WsTransport, timeout: Duration) -> Res
     transport.set_read_timeout(None);
     let (header, payload) = result?;
     let mut dict = SymbolDict::new();
-    let mut registry = SchemaRegistry::new();
+    let mut query_schema: Option<Schema> = None;
     let mut zstd_scratch = ZstdScratch::new();
     let event = decode_frame(
         header,
         &payload,
         &mut dict,
-        &mut registry,
+        &mut query_schema,
         &mut zstd_scratch,
     )?;
     match event {
         ServerEvent::ServerInfo(info) => Ok(info),
         other => Err(fmt!(
             ProtocolError,
-            "expected SERVER_INFO as first v2 frame, got {:?}",
+            "expected SERVER_INFO as the first frame, got {:?}",
             std::mem::discriminant(&other)
         )),
     }

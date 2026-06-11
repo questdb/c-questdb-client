@@ -71,7 +71,6 @@ const MSG_KIND_QUERY_REQUEST: u8 = 0x10;
 const MSG_KIND_RESULT_BATCH: u8 = 0x11;
 const MSG_KIND_RESULT_END: u8 = 0x12;
 const MSG_KIND_SERVER_INFO: u8 = 0x18;
-const SCHEMA_MODE_FULL: u8 = 0x00;
 const NULL_FLAG_NONE: u8 = 0x00;
 const COL_KIND_LONG: u8 = 0x05;
 
@@ -107,7 +106,7 @@ fn server_info_frame(node_id: &str) -> Vec<u8> {
     let node_bytes = node_id.as_bytes();
     payload.extend_from_slice(&(node_bytes.len() as u16).to_le_bytes());
     payload.extend_from_slice(node_bytes);
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 fn result_end_frame(request_id: i64) -> Vec<u8> {
@@ -116,39 +115,48 @@ fn result_end_frame(request_id: i64) -> Vec<u8> {
     payload.extend_from_slice(&request_id.to_le_bytes());
     encode_varint_u64(0, &mut payload); // final_seq
     encode_varint_u64(0, &mut payload); // total_rows_affected
-    framed(2, 0, 0, &payload)
+    framed(1, 0, 0, &payload)
 }
 
 /// Build a `RESULT_BATCH` payload carrying a single 1-column LONG result
-/// with `row_count` rows, where row `i` contains the value `i + 1` (so the
-/// expected id sum is `n*(n+1)/2`, mirroring the Java reference's
-/// `idSum` assertion).
-fn result_batch_frame_seq(request_id: i64, batch_seq: u64, row_count: usize) -> Vec<u8> {
+/// with `row_count` rows, where row `i` contains the value `start + i`.
+/// The schema (col_count + the inline "id" LONG descriptor) rides only
+/// `batch_seq == 0`; continuation frames carry rows only. A query split
+/// into batches with continuing `start` values therefore still sums to
+/// `n*(n+1)/2`, mirroring the Java reference's `idSum` assertion.
+fn result_batch_frame_seq(
+    request_id: i64,
+    batch_seq: u64,
+    start: i64,
+    row_count: usize,
+) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(MSG_KIND_RESULT_BATCH);
     payload.extend_from_slice(&request_id.to_le_bytes());
     encode_varint_u64(batch_seq, &mut payload);
 
-    // Table block: empty name, row_count, col_count=1.
+    // Table block: empty name, row_count.
     encode_varint_u64(0, &mut payload);
     encode_varint_u64(row_count as u64, &mut payload);
-    encode_varint_u64(1, &mut payload);
 
-    // Schema section: Full, schema_id=1, one column "id" of type LONG.
-    payload.push(SCHEMA_MODE_FULL);
-    encode_varint_u64(1, &mut payload);
-    encode_varint_u64(2, &mut payload); // name_len
-    payload.extend_from_slice(b"id");
-    payload.push(COL_KIND_LONG);
+    // Schema section rides only the first batch of the query: col_count=1,
+    // then one column "id" of type LONG inline right after it.
+    // Continuations carry rows only.
+    if batch_seq == 0 {
+        encode_varint_u64(1, &mut payload); // col_count
+        encode_varint_u64(2, &mut payload); // name_len
+        payload.extend_from_slice(b"id");
+        payload.push(COL_KIND_LONG);
+    }
 
     // Column body: no nulls, then row_count × i64_le with monotonic ids.
     payload.push(NULL_FLAG_NONE);
     for i in 0..row_count {
-        let v = (i as i64) + 1;
+        let v = start + i as i64;
         payload.extend_from_slice(&v.to_le_bytes());
     }
 
-    framed(2, 0, 1, &payload)
+    framed(1, 0, 1, &payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,8 +219,16 @@ struct FragMock {
 impl FragMock {
     /// Start a mock that, on each accepted connection, sends a result of
     /// `rows` rows (looking up by accept-index modulo length) through a
-    /// `ChunkingStream` capped at `chunk_size`.
+    /// `ChunkingStream` capped at `chunk_size`, as a single batch.
     fn start(rows_per_conn: Vec<usize>, chunk_size: usize) -> Self {
+        Self::start_with_batches(rows_per_conn, chunk_size, 1)
+    }
+
+    /// Like [`FragMock::start`], but each result is split into `batches`
+    /// RESULT_BATCH frames: the schema-bearing `batch_seq == 0` plus
+    /// rows-only continuations, with the `id` values continuing across the
+    /// split so the caller's sum assertion stays `n*(n+1)/2`.
+    fn start_with_batches(rows_per_conn: Vec<usize>, chunk_size: usize, batches: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
         let addr = listener.local_addr().expect("local_addr");
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -243,7 +259,7 @@ impl FragMock {
                 // One worker per connection. Failures inside the worker
                 // are swallowed — the test asserts against the client
                 // side, not the mock's IO results.
-                thread::spawn(move || run_session(cs, rows));
+                thread::spawn(move || run_session(cs, rows, batches));
             }
         });
 
@@ -277,9 +293,11 @@ impl Drop for FragMock {
 }
 
 /// Handle one accepted connection: HTTP/WS upgrade (replying with
-/// x-qwp-version=2 to match the SERVER_INFO frame), send SERVER_INFO,
-/// read the client's QUERY_REQUEST, then emit RESULT_BATCH (rows) +
-/// RESULT_END. Errors close the connection cleanly.
+/// x-qwp-version=1 to match the SERVER_INFO frame), send SERVER_INFO,
+/// read the client's QUERY_REQUEST, then emit the result split into
+/// `batches` RESULT_BATCH frames (schema on batch 0 only, `id` values
+/// continuing across the split) + RESULT_END. Errors close the
+/// connection cleanly.
 ///
 /// `tungstenite::accept_hdr`'s callback returns `Result<Response, Response>`
 /// where the `Err` variant is the full `Response<Option<String>>` (~136 B).
@@ -287,11 +305,11 @@ impl Drop for FragMock {
 /// test-only and we don't own the tungstenite signature, so we silence the
 /// lint locally rather than wrap the response in `Box`.
 #[allow(clippy::result_large_err)]
-fn run_session(stream: ChunkingStream, rows: usize) {
+fn run_session(stream: ChunkingStream, rows: usize, batches: usize) {
     let mut ws: WebSocket<ChunkingStream> =
         match accept_hdr(stream, |_req: &Request, mut resp: Response| {
             resp.headers_mut()
-                .insert("x-qwp-version", HeaderValue::from_static("2"));
+                .insert("x-qwp-version", HeaderValue::from_static("1"));
             Ok(resp)
         }) {
             Ok(w) => w,
@@ -315,19 +333,32 @@ fn run_session(stream: ChunkingStream, rows: usize) {
         None => return,
     };
 
-    // Single batch + terminator. Larger results would split across
-    // multiple RESULT_BATCH frames; one is enough to exercise the
-    // partial-read path (the batch's bytes still trickle out chunk by
-    // chunk through the ChunkingStream).
-    if ws
-        .send(Message::Binary(
-            result_batch_frame_seq(request_id, 0, rows).into(),
-        ))
-        .is_err()
-    {
-        return;
+    // Emit the result split into `batches` frames: the schema rides only
+    // `batch_seq == 0`; continuations carry rows only and decode against
+    // the client's retained per-query schema. Each frame's bytes still
+    // trickle out chunk by chunk through the ChunkingStream, so the
+    // multi-batch split also fragments the batch-0/continuation boundary.
+    let batches = batches.max(1);
+    let per = rows / batches;
+    let mut start: i64 = 1;
+    for seq in 0..batches {
+        // Remainder rides the last batch so the totals always add up.
+        let n = if seq + 1 == batches {
+            rows - per * (batches - 1)
+        } else {
+            per
+        };
+        if ws
+            .send(Message::Binary(
+                result_batch_frame_seq(request_id, seq as u64, start, n).into(),
+            ))
+            .is_err()
+        {
+            return;
+        }
+        let _ = ws.flush();
+        start += n as i64;
     }
-    let _ = ws.flush();
 
     let _ = ws.send(Message::Binary(result_end_frame(request_id).into()));
     let _ = ws.flush();
@@ -454,6 +485,23 @@ fn fragmented_streaming_big_result() {
     let chunk = pick_chunk(0xDEAD_BEEF_CAFE_BABE);
     let rows = 2000;
     let mock = FragMock::start(vec![rows], chunk);
+    let (n, sum) = run_and_sum(&mock.url());
+    assert_eq!(n, rows, "chunk={} row_count drift", chunk);
+    assert_eq!(sum, expected_sum(rows), "chunk={} id_sum drift", chunk);
+}
+
+/// Multi-batch streaming under fragmentation: the schema rides only
+/// `batch_seq == 0`; the continuations carry rows only and must decode
+/// against the retained per-query schema even when every frame —
+/// including the batch-0/continuation boundary — trickles in through
+/// chunked reads. The `id` values continue across the split, so a
+/// mis-bound continuation (rows decoded against the wrong schema, or a
+/// dropped/duplicated batch) breaks the `n*(n+1)/2` sum.
+#[test]
+fn fragmented_multi_batch_continuations() {
+    let chunk = pick_chunk(0x0F1E_2D3C_4B5A_6978);
+    let rows = 600;
+    let mock = FragMock::start_with_batches(vec![rows], chunk, 3);
     let (n, sum) = run_and_sum(&mock.url());
     assert_eq!(n, rows, "chunk={} row_count drift", chunk);
     assert_eq!(sum, expected_sum(rows), "chunk={} id_sum drift", chunk);

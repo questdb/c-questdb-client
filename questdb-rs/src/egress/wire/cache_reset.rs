@@ -29,19 +29,9 @@
 /// `delta_start = 0`.
 pub const RESET_MASK_DICT: u8 = 0x01;
 
-/// Clear the connection-scoped schema registry. All previously assigned
-/// `schema_id` values are discarded; post-reset ids may collide with
-/// pre-reset ids.
-pub const RESET_MASK_SCHEMAS: u8 = 0x02;
-
 /// Convenience: returns true if the dict bit is set.
 pub fn resets_dict(mask: u8) -> bool {
     mask & RESET_MASK_DICT != 0
-}
-
-/// Convenience: returns true if the schemas bit is set.
-pub fn resets_schemas(mask: u8) -> bool {
-    mask & RESET_MASK_SCHEMAS != 0
 }
 
 #[cfg(test)]
@@ -52,9 +42,6 @@ mod tests {
     fn predicates() {
         assert!(resets_dict(0x01));
         assert!(!resets_dict(0x02));
-        assert!(resets_schemas(0x02));
-        assert!(!resets_schemas(0x01));
         assert!(resets_dict(0x03));
-        assert!(resets_schemas(0x03));
     }
 }

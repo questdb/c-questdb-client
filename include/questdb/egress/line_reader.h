@@ -153,7 +153,7 @@ typedef enum line_reader_error_code
      *  single-node OSS server emitting `STANDALONE`). */
     line_reader_error_role_mismatch = 8,
     /** Wire-format violation: bad magic, truncated frame, unknown
-     *  discriminant, invalid varint, schema/symbol-dict reference miss, etc. */
+     *  discriminant, invalid varint, symbol-dict reference miss, etc. */
     line_reader_error_protocol_error = 9,
     /** String or symbol field was not valid UTF-8. */
     line_reader_error_invalid_utf8 = 10,
@@ -427,8 +427,9 @@ typedef enum line_reader_server_role
 } line_reader_server_role;
 
 /**
- * Get the reader's last-seen `SERVER_INFO`, or NULL on v1 servers. The
- * pointer is invalidated by any reader operation that may reconnect.
+ * Get the reader's last-seen `SERVER_INFO`. The server always sends one,
+ * so this is NULL only while a reconnect is in flight. The pointer is
+ * invalidated by any reader operation that may reconnect.
  *
  * Also returns NULL while a `line_reader_query` / `line_reader_cursor`
  * produced by this reader is still live (release it first to read
@@ -555,7 +556,8 @@ line_reader_failover_event_trigger_code(const line_reader_failover_event*);
 /** Trigger error message (UTF-8). Borrowed for the duration of the call. */
 QUESTDB_CLIENT_API void line_reader_failover_event_trigger_msg(
     const line_reader_failover_event*, const char** out_buf, size_t* out_len);
-/** `SERVER_INFO` for the new endpoint, or NULL on v1 servers. */
+/** `SERVER_INFO` for the new endpoint; NULL only if the server omitted
+ *  it. */
 QUESTDB_CLIENT_API const line_reader_server_info*
 line_reader_failover_event_server_info(const line_reader_failover_event*);
 
@@ -712,7 +714,7 @@ QUESTDB_CLIENT_API uint64_t line_reader_failover_progress_event_elapsed_ns(
     const line_reader_failover_progress_event*);
 
 /** `SERVER_INFO` for the new endpoint, or NULL outside the Reset
- *  phase / on v1 servers. */
+ *  phase (or if the server omitted it). */
 QUESTDB_CLIENT_API const line_reader_server_info*
 line_reader_failover_progress_event_server_info(
     const line_reader_failover_progress_event*);
@@ -1106,11 +1108,12 @@ void line_reader_cursor_free(line_reader_cursor* cursor);
 //
 // Lifetime: the handle and every pointer reachable through its descriptors
 // borrow from the batch. They are invalidated by the next
-// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`, or
-// `line_reader_cursor_free` on the owning cursor, and by mid-query failover
-// (transparently triggered by `line_reader_cursor_next_batch`). Do not
-// cache them across batches; re-derive after every `next_batch`. The handle
-// is never freed by the caller.
+// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
+// `line_reader_cursor_add_credit`, or `line_reader_cursor_free` on the
+// owning cursor, and by mid-query failover (transparently triggered by
+// `line_reader_cursor_next_batch` or `line_reader_cursor_add_credit`). Do
+// not cache them across batches; re-derive after every `next_batch`. The
+// handle is never freed by the caller.
 
 /** Opaque handle for the batch currently loaded in a cursor. */
 typedef struct line_reader_batch line_reader_batch;
@@ -1120,8 +1123,8 @@ typedef struct line_reader_batch line_reader_batch;
  *
  * @return Non-NULL borrowed batch handle on a new batch. The pointer is
  *         invalidated by the next `line_reader_cursor_next_batch`,
- *         `line_reader_cursor_cancel`, `line_reader_cursor_free`, or
- *         mid-query failover.
+ *         `line_reader_cursor_cancel`, `line_reader_cursor_add_credit`,
+ *         `line_reader_cursor_free`, or mid-query failover.
  * @return NULL with `*err_out` left untouched when the stream has
  *         terminated normally — no batch is available.
  * @return NULL with `*err_out` set on error; the cursor must be freed.
@@ -1379,9 +1382,10 @@ QUESTDB_CLIENT_API bool line_reader_cursor_server_version(
     line_reader_error** err_out);
 
 /**
- * Last-seen `SERVER_INFO` of the cursor's currently connected endpoint, or
- * NULL on v1 servers. The pointer is invalidated by any cursor operation
- * that may reconnect. The in-cursor counterpart to
+ * Last-seen `SERVER_INFO` of the cursor's currently connected endpoint.
+ * The server always sends one, so this is NULL only while a reconnect is
+ * in flight. The pointer is invalidated by any cursor operation that may
+ * reconnect. The in-cursor counterpart to
  * `line_reader_current_server_info` (which rejects while a cursor is live).
  */
 QUESTDB_CLIENT_API const line_reader_server_info*
@@ -1426,7 +1430,9 @@ QUESTDB_CLIENT_API bool line_reader_cursor_cancel(
 
 /**
  * Grant additional CREDIT to the server. Only valid when the cursor was
- * started with `initial_credit > 0`.
+ * started with `initial_credit > 0`. Invalidates the current batch handle
+ * and every pointer borrowed from it, and may transparently trigger
+ * mid-query failover when the CREDIT write hits a transport failure.
  */
 QUESTDB_CLIENT_API bool line_reader_cursor_add_credit(
     line_reader_cursor* cursor,

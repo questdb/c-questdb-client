@@ -72,6 +72,7 @@ QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
 DECIMAL_RELEASE = (9, 2, 0)
+QWP_MIN_RELEASE = (9, 4, 3)
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
     "57896044618658097711785492504343953926634992332820282019728792003956564819968")
 QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
@@ -328,7 +329,7 @@ class TestSender(unittest.TestCase):
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
             **kwargs)
-    
+
     def _ns_to_qdb_date(self, at_ts_ns, exp_nanos: bool):
         # We first need to match QuestDB's internal microsecond resolution.
         at_ts_us = at_ts_ns // 1000
@@ -342,7 +343,7 @@ class TestSender(unittest.TestCase):
         if exp_nanos:
             extra_precision = f'{trimmed_ns:03}'
         return at_td.isoformat() + extra_precision + 'Z'
-    
+
     @property
     def client_driven_nanos_supported(self) -> bool:
         # """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
@@ -610,7 +611,7 @@ class TestSender(unittest.TestCase):
                      .table(table_name)
                      .symbol('a', 'A')
                      .at(at_ts_ns))
-                    
+
     def test_micros_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
             self.skipTest('No support for user-provided timestamps.')
@@ -826,7 +827,7 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['12.990'], ['-12.340'], ['0.001'], ['10000000.000'], [None], [None], ['0.000'], ['0.000'], ['1000.000']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
-    
+
     def test_decimal_invalid_characters(self):
         if QDB_FIXTURE.version < DECIMAL_RELEASE:
             self.skipTest('No decimal support in this version of QuestDB.')
@@ -841,7 +842,7 @@ class TestSender(unittest.TestCase):
                     .table(table_name)
                     .column_dec_str('dec', "12.34abc")
                     .at_now())
-    
+
     def test_decimal_not_available(self):
         if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
             self.skipTest('Decimal support is available in this version of QuestDB.')
@@ -1069,7 +1070,7 @@ class TestSender(unittest.TestCase):
             self.skipTest('BuildMode.API-only test')
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')
-        
+
         exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
         # Decimal columns must be created manually beforehand.
         sql_query(f'''CREATE TABLE "{table_name}" (price DECIMAL(18,3), timestamp {exp_ts_type}) TIMESTAMP(timestamp) PARTITION BY DAY;''')
@@ -1448,9 +1449,11 @@ class QwpWsTestSupport:
 
     @staticmethod
     def _require_qwp_ws_protocol():
-        if not hasattr(qls.Protocol, 'QWPWS'):
+        if QDB_FIXTURE.version < QWP_MIN_RELEASE:
             raise unittest.SkipTest(
-                'QWP/WebSocket protocol is not exposed by the system-test shim')
+                f'Server version {".".join(map(str, QDB_FIXTURE.version))} does not '
+                'support the QWP protocol version we can test. Minimum version we need: '
+                f'(QuestDB >= {".".join(map(str, QWP_MIN_RELEASE))})')
 
     @staticmethod
     def _create_qwp_ws_table(table_name):

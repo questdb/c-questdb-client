@@ -38,6 +38,10 @@ use crate::egress::error::{Result, fmt};
 /// `"QWP1"` interpreted as a little-endian `u32`.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"QWP1");
 
+/// The single QWP protocol version. Every frame's `version` byte is written
+/// as this value and validated to equal it on parse.
+pub const PROTOCOL_VERSION: u8 = 1;
+
 /// Length of the wire frame header in bytes.
 pub const HEADER_LEN: usize = 12;
 
@@ -80,8 +84,19 @@ impl FrameHeader {
                 MAGIC
             ));
         }
+        // QWP runs at a single version. Each frame fails fast on its own here,
+        // independently of the negotiated version checked in `transport.rs`.
+        let version = bytes[4];
+        if version != PROTOCOL_VERSION {
+            return Err(fmt!(
+                ProtocolError,
+                "unsupported QWP frame version {} (expected {})",
+                version,
+                PROTOCOL_VERSION
+            ));
+        }
         Ok(FrameHeader {
-            version: bytes[4],
+            version,
             flags: bytes[5],
             table_count: u16::from_le_bytes([bytes[6], bytes[7]]),
             payload_length: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
@@ -89,9 +104,18 @@ impl FrameHeader {
     }
 
     /// Serialize this header into the first [`HEADER_LEN`] bytes of `out`.
+    ///
+    /// The `version` byte is always written as [`PROTOCOL_VERSION`] — the only
+    /// value [`FrameHeader::parse`] accepts — and `self.version` is
+    /// debug-asserted to match, so a header built with a stale version can't
+    /// serialize bytes this module would then refuse to parse.
     pub fn write(self, out: &mut [u8; HEADER_LEN]) {
+        debug_assert_eq!(
+            self.version, PROTOCOL_VERSION,
+            "FrameHeader::write must only serialize the pinned protocol version"
+        );
         out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        out[4] = self.version;
+        out[4] = PROTOCOL_VERSION;
         out[5] = self.flags;
         out[6..8].copy_from_slice(&self.table_count.to_le_bytes());
         out[8..12].copy_from_slice(&self.payload_length.to_le_bytes());
@@ -118,7 +142,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let h = FrameHeader {
-            version: 2,
+            version: 1,
             flags: flags::GORILLA | flags::DELTA_SYMBOL_DICT,
             table_count: 1,
             payload_length: 0xDEAD_BEEF,
@@ -145,6 +169,31 @@ mod tests {
             FrameHeader::parse(&bytes).unwrap_err().code(),
             ErrorCode::ProtocolError
         );
+    }
+
+    #[test]
+    fn wrong_version_rejected() {
+        // Any version byte other than the pinned one — below it (0) or
+        // above it (2, 0xFF) — must be rejected per-frame, independently
+        // of the handshake-level check.
+        let valid = FrameHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            table_count: 0,
+            payload_length: 0,
+        }
+        .to_bytes();
+        for wrong in [0u8, 2, 0xFF] {
+            let mut bytes = valid;
+            bytes[4] = wrong;
+            let err = FrameHeader::parse(&bytes).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ProtocolError);
+            assert!(
+                err.msg().contains(&format!("version {wrong}")),
+                "message should name the rejected version {wrong}: {}",
+                err.msg()
+            );
+        }
     }
 
     #[test]

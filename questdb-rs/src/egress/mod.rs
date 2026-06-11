@@ -28,8 +28,8 @@
 //! columnar, WebSocket-based read protocol for streaming query results
 //! from QuestDB. The module bundles the wire codec foundation (frame
 //! header, varint, message kinds, column type codes, errors), the
-//! `RESULT_BATCH` decoder and column views, the symbol/schema
-//! registries, and — when `sync-reader-ws` is enabled — the WebSocket
+//! `RESULT_BATCH` decoder and column views, the symbol dict and
+//! per-query schema, and — when `sync-reader-ws` is enabled — the WebSocket
 //! transport and `Reader`/`Cursor`/`BatchView` streaming API.
 
 // Sub-modules.
@@ -106,7 +106,7 @@ pub use symbol_dict::{SymbolDict, SymbolEntry};
 #[cfg(feature = "sync-reader-ws")]
 pub mod _bench_internals {
     pub use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
-    pub use crate::egress::schema::SchemaRegistry;
+    pub use crate::egress::schema::Schema;
     pub use crate::egress::symbol_dict::SymbolDict;
     pub use bytes::Bytes;
 }

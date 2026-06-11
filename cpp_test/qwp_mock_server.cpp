@@ -305,7 +305,7 @@ std::vector<uint8_t> server_info_frame(
     p.push_back(uint8_t(nl));
     p.push_back(uint8_t(nl >> 8));
     p.insert(p.end(), node_id.begin(), node_id.end());
-    return framed(2, 0, 0, p);
+    return framed(1, 0, 0, p);
 }
 
 std::vector<uint8_t> result_end_frame(int64_t request_id)
@@ -316,7 +316,7 @@ std::vector<uint8_t> result_end_frame(int64_t request_id)
         p.push_back(uint8_t(request_id >> (i * 8)));
     encode_varint_u64(0, p); // final_seq
     encode_varint_u64(0, p); // total_rows (not asserted by client beyond plumbing)
-    return framed(2, 0, 0, p);
+    return framed(1, 0, 0, p);
 }
 
 std::vector<uint8_t> exec_done_frame(
@@ -328,7 +328,7 @@ std::vector<uint8_t> exec_done_frame(
         p.push_back(uint8_t(request_id >> (i * 8)));
     p.push_back(op_type);
     encode_varint_u64(rows_affected, p);
-    return framed(2, 0, 0, p);
+    return framed(1, 0, 0, p);
 }
 
 std::vector<uint8_t> query_error_frame(
@@ -344,17 +344,17 @@ std::vector<uint8_t> query_error_frame(
     p.push_back(uint8_t(mlen));
     p.push_back(uint8_t(mlen >> 8));
     p.insert(p.end(), message.begin(), message.end());
-    return framed(2, 0, 0, p);
+    return framed(1, 0, 0, p);
 }
 
 std::vector<uint8_t> cache_reset_frame(uint8_t mask)
 {
     std::vector<uint8_t> p = {MSG_CACHE_RESET, mask};
-    return framed(2, 0, 0, p);
+    return framed(1, 0, 0, p);
 }
 
 std::vector<uint8_t> result_batch_frame(
-    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    int64_t request_id, uint64_t batch_seq,
     size_t row_count, const std::vector<ColumnSpec>& columns)
 {
     std::vector<uint8_t> p;
@@ -366,16 +366,20 @@ std::vector<uint8_t> result_batch_frame(
     // Table block.
     encode_varint_u64(0, p); // empty table name
     encode_varint_u64(uint64_t(row_count), p);
-    encode_varint_u64(uint64_t(columns.size()), p);
 
-    // Schema section: Full mode (0x00).
-    p.push_back(0x00);
-    encode_varint_u64(schema_id, p);
-    for (const auto& c : columns)
+    // The schema rides only the first batch of a query (batch_seq == 0):
+    // col_count followed by the inline column descriptors (name_len, name,
+    // type_code). Continuation batches (batch_seq > 0) carry rows only and
+    // reuse the schema from batch 0 — no col_count, no schema section.
+    if (batch_seq == 0)
     {
-        encode_varint_u64(uint64_t(c.name.size()), p);
-        p.insert(p.end(), c.name.begin(), c.name.end());
-        p.push_back(c.kind);
+        encode_varint_u64(uint64_t(columns.size()), p);
+        for (const auto& c : columns)
+        {
+            encode_varint_u64(uint64_t(c.name.size()), p);
+            p.insert(p.end(), c.name.begin(), c.name.end());
+            p.push_back(c.kind);
+        }
     }
 
     // Per-column data.
@@ -383,11 +387,11 @@ std::vector<uint8_t> result_batch_frame(
         p.insert(p.end(), c.data.begin(), c.data.end());
 
     // RESULT_BATCH frames have table_count = 1.
-    return framed(2, 0, 1, p);
+    return framed(1, 0, 1, p);
 }
 
 std::vector<uint8_t> result_batch_frame_with_dict(
-    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    int64_t request_id, uint64_t batch_seq,
     size_t row_count, const std::vector<ColumnSpec>& columns,
     uint64_t dict_delta_start,
     const std::vector<std::string>& dict_entries)
@@ -409,21 +413,24 @@ std::vector<uint8_t> result_batch_frame_with_dict(
 
     encode_varint_u64(0, p); // empty table name
     encode_varint_u64(uint64_t(row_count), p);
-    encode_varint_u64(uint64_t(columns.size()), p);
 
-    p.push_back(0x00); // Schema: full mode
-    encode_varint_u64(schema_id, p);
-    for (const auto& c : columns)
+    // Schema (col_count + inline column descriptors) rides only batch_seq
+    // == 0; continuation batches carry rows only.
+    if (batch_seq == 0)
     {
-        encode_varint_u64(uint64_t(c.name.size()), p);
-        p.insert(p.end(), c.name.begin(), c.name.end());
-        p.push_back(c.kind);
+        encode_varint_u64(uint64_t(columns.size()), p);
+        for (const auto& c : columns)
+        {
+            encode_varint_u64(uint64_t(c.name.size()), p);
+            p.insert(p.end(), c.name.begin(), c.name.end());
+            p.push_back(c.kind);
+        }
     }
     for (const auto& c : columns)
         p.insert(p.end(), c.data.begin(), c.data.end());
 
     // flags = FLAG_DELTA_SYMBOL_DICT (0x08); table_count = 1.
-    return framed(2, 0x08, 1, p);
+    return framed(1, 0x08, 1, p);
 }
 
 std::vector<uint8_t> symbol_column_bytes(const std::vector<uint32_t>& codes)
@@ -647,7 +654,7 @@ bool recv_all(socket_t fd, uint8_t* data, size_t len)
 }
 
 // Read the HTTP request, find Sec-WebSocket-Key, write the upgrade
-// response with X-QWP-Version: 2. Returns true on success.
+// response with X-QWP-Version: 1. Returns true on success.
 bool ws_handshake(socket_t fd, bool reject_401)
 {
     std::string buf;
@@ -715,7 +722,7 @@ bool ws_handshake(socket_t fd, bool reject_401)
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        "X-QWP-Version: 2\r\n"
+        "X-QWP-Version: 1\r\n"
         "Sec-WebSocket-Accept: " +
         accept + "\r\n\r\n";
     return send_all(fd, reinterpret_cast<const uint8_t*>(resp.data()),

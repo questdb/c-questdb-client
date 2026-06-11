@@ -52,7 +52,7 @@ pub enum MsgKind {
     ExecDone = 0x16,
     /// Server → Client: clear connection caches.
     CacheReset = 0x17,
-    /// Server → Client: role + cluster identity (v2+).
+    /// Server → Client: role + cluster identity.
     ServerInfo = 0x18,
 }
 
