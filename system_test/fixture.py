@@ -331,6 +331,13 @@ class QuestDbFixtureBase:
                 return resp
             except QueryError:
                 return None
+            except TimeoutError:
+                # A single poll stalling its 5s socket timeout (server
+                # busy catching up after a bounce) must not abort the
+                # whole wait: the enclosing retry() budget decides when
+                # to give up. Without this, the handler below would also
+                # mislabel one stalled poll as the full timeout_sec.
+                return None
 
         try:
             return retry(check_table, timeout_sec=timeout_sec)
@@ -407,6 +414,8 @@ class QuestDbFixture(QuestDbFixtureBase):
             http_auth=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
+        # Set once start() has refined `version` from the live server.
+        self._version_queried = False
         self._data_dir = self._root_dir / 'data'
         self._log_path = self._data_dir / 'log' / 'log.txt'
         self._conf_dir = self._data_dir / 'conf'
@@ -552,10 +561,17 @@ class QuestDbFixture(QuestDbFixtureBase):
         atexit.register(self.stop)
         sys.stderr.write('QuestDB fixture instance is ready.\n')
 
-        # Read the actual version from the running process.
-        # This is to support a version like `7.3.2-SNAPSHOT`
-        # from an externally started QuestDB instance.
-        self.version = self.query_version()
+        # Read the actual version from the running process; it can be more
+        # precise than the path-parsed one (e.g. `7.3.2-SNAPSHOT`). Only on
+        # the first start, which always precedes client load: the binary
+        # doesn't change across restarts, and a bounce restart must stay
+        # clear of SQL — right after it the reconnecting fuzz producers
+        # can keep the network workers busy past the 5s query timeout,
+        # failing the bounce even though /ping already vouched for
+        # liveness.
+        if not self._version_queried:
+            self.version = self.query_version()
+            self._version_queried = True
 
         if self.wrap_tls:
             self._tls_proxy = TlsProxyFixture(self.line_tcp_port)
