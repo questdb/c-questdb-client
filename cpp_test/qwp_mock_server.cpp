@@ -354,7 +354,7 @@ std::vector<uint8_t> cache_reset_frame(uint8_t mask)
 }
 
 std::vector<uint8_t> result_batch_frame(
-    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    int64_t request_id, uint64_t batch_seq,
     size_t row_count, const std::vector<ColumnSpec>& columns)
 {
     std::vector<uint8_t> p;
@@ -371,9 +371,6 @@ std::vector<uint8_t> result_batch_frame(
     // col_count followed by the inline column descriptors (name_len, name,
     // type_code). Continuation batches (batch_seq > 0) carry rows only and
     // reuse the schema from batch 0 — no col_count, no schema section.
-    // `schema_id` is accepted for call-site compatibility but no longer
-    // appears on the wire.
-    (void)schema_id;
     if (batch_seq == 0)
     {
         encode_varint_u64(uint64_t(columns.size()), p);
@@ -394,7 +391,7 @@ std::vector<uint8_t> result_batch_frame(
 }
 
 std::vector<uint8_t> result_batch_frame_with_dict(
-    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    int64_t request_id, uint64_t batch_seq,
     size_t row_count, const std::vector<ColumnSpec>& columns,
     uint64_t dict_delta_start,
     const std::vector<std::string>& dict_entries)
@@ -418,9 +415,7 @@ std::vector<uint8_t> result_batch_frame_with_dict(
     encode_varint_u64(uint64_t(row_count), p);
 
     // Schema (col_count + inline column descriptors) rides only batch_seq
-    // == 0; continuation batches carry rows only. `schema_id` is accepted
-    // but no longer on the wire.
-    (void)schema_id;
+    // == 0; continuation batches carry rows only.
     if (batch_seq == 0)
     {
         encode_varint_u64(uint64_t(columns.size()), p);

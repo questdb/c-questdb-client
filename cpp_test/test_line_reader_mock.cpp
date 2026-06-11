@@ -127,7 +127,7 @@ TEST_CASE("mock: column getter — i32 (Int) round-trip")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 3, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 3, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -182,7 +182,7 @@ TEST_CASE("mock: column getter — i64 / f64 / bool / i8 / i16 / f32")
         qm::ActionSendBuilt{[=](int64_t rid)
                             {
                                 return qm::result_batch_frame(
-                                    rid, 0, 1, 2,
+                                    rid, 0, 2,
                                     {c_i64, c_f64, c_bool, c_i8, c_i16, c_f32});
                             }},
         qm::ActionSendResultEnd{},
@@ -218,7 +218,7 @@ TEST_CASE("mock: column getter — varchar")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -248,7 +248,7 @@ TEST_CASE("mock: column getter — uuid (16 raw bytes, big-endian on wire)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -272,7 +272,7 @@ TEST_CASE("mock: column getter — decimal64 with non-zero scale")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -303,7 +303,7 @@ TEST_CASE("mock: column getter — decimal128 with negative i128 mantissa")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -337,7 +337,7 @@ TEST_CASE("mock: column validity bitmap matches null pattern from server")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 5, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 5, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -568,7 +568,7 @@ TEST_CASE("mock: bytes_received increases after a batch is consumed")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -707,7 +707,7 @@ TEST_CASE("mock: dropping cursor without draining writes MSG_CANCEL on the wire"
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {c});
+            return qm::result_batch_frame(rid, 0, 1, {c});
         }},
         qm::ActionAwaitClientFrame{qm::MSG_CANCEL},
     };
@@ -764,7 +764,7 @@ TEST_CASE("mock: cursor::add_credit writes MSG_CREDIT")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionAwaitClientFrame{qm::MSG_CREDIT},
         qm::ActionSendResultEnd{},
     };
@@ -847,7 +847,7 @@ TEST_CASE("mock: add_credit failover on write failure replays credit on B")
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[col](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {col});
+            return qm::result_batch_frame(rid, 0, 1, {col});
         }},
         qm::ActionHardDrop{},
     };
@@ -1045,7 +1045,7 @@ TEST_CASE("mock: column::shape + elements<double> round-trip")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1093,7 +1093,7 @@ TEST_CASE("mock: LONG_ARRAY column rejected (not supported in this revision)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1120,7 +1120,7 @@ TEST_CASE("mock: non-null empty-data array row exposes data_offsets symmetry")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1153,7 +1153,7 @@ TEST_CASE("mock: NULL array row surfaces via is_null")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1185,7 +1185,7 @@ TEST_CASE("mock: get_char round-trip (u16 codepoint)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1212,7 +1212,7 @@ TEST_CASE("mock: get_long256 round-trip (32 raw bytes)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1236,7 +1236,7 @@ TEST_CASE("mock: get_binary round-trip (zero-copy bytes)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1268,7 +1268,7 @@ TEST_CASE("mock: get_decimal256 round-trip (32-byte mantissa + scale)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1295,7 +1295,7 @@ TEST_CASE("mock: get_geohash round-trip (precision_bits + bits)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1329,7 +1329,7 @@ TEST_CASE("mock: stats and cursor introspection getters return live values")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, /*batch_seq=*/0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, /*batch_seq=*/0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1748,7 +1748,7 @@ TEST_CASE("mock: column_name returns the schema's column name")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c0, c1](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c0, c1}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c0, c1}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1775,7 +1775,7 @@ TEST_CASE("mock: column_name fails cleanly on out-of-range index")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1820,7 +1820,7 @@ TEST_CASE("mock: get_ipv4 round-trips high-bit IPs without sign-flipping")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 3, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 3, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1855,7 +1855,7 @@ TEST_CASE("mock: get_i32 rejects an IPV4 column with a type-mismatch error")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1893,7 +1893,7 @@ TEST_CASE("mock: get_ipv4 rejects an INT column with a type-mismatch error")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -1942,7 +1942,7 @@ TEST_CASE("mock: typed getters reject mismatched column kind")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[int_col](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {int_col}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {int_col}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2002,7 +2002,7 @@ TEST_CASE("mock: column accessors reject out-of-range indices")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[int_col](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {int_col}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {int_col}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2076,7 +2076,7 @@ TEST_CASE("mock: get_i64 round-trips TIMESTAMP / DATE / TIMESTAMP_NANOS")
         qm::ActionSendBuilt{[c_ts, c_date, c_tn](int64_t rid)
                             {
                                 return qm::result_batch_frame(
-                                    rid, 0, 1, 1, {c_ts, c_date, c_tn});
+                                    rid, 0, 1, {c_ts, c_date, c_tn});
                             }},
         qm::ActionSendResultEnd{},
     };
@@ -2125,7 +2125,7 @@ TEST_CASE(
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2169,7 +2169,7 @@ TEST_CASE("mock: C++ wrapper move semantics — reader / cursor")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2395,7 +2395,7 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
             qm::ActionAwaitQueryRequest{},
             qm::ActionSendBuilt{
                 [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv1({s1});
@@ -2425,7 +2425,7 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
             qm::ActionAwaitQueryRequest{},
             qm::ActionSendBuilt{
                 [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv1({s1});
@@ -2458,7 +2458,7 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
             qm::ActionAwaitQueryRequest{},
             qm::ActionSendBuilt{
                 [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv({s});
@@ -2490,7 +2490,7 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
             qm::ActionAwaitQueryRequest{},
             qm::ActionSendBuilt{
                 [c](int64_t rid)
-                { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                { return qm::result_batch_frame(rid, 0, 1, {c}); }},
             qm::ActionSendResultEnd{},
         };
         qm::MockServer srv1({s1});
@@ -2620,7 +2620,7 @@ TEST_CASE("mock: protocol_error — header.payload_length lies (claims more byte
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid) {
-            auto f = qm::result_batch_frame(rid, 0, 1, 1, {c});
+            auto f = qm::result_batch_frame(rid, 0, 1, {c});
             // Bump declared payload_length by 1024 — the actual bytes
             // are unchanged, so the frame parser sees a mismatch.
             uint32_t plen = uint32_t(f[8]) | (uint32_t(f[9]) << 8) |
@@ -2649,7 +2649,7 @@ TEST_CASE("mock: protocol_error — RESULT_BATCH carries an unknown column kind"
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {c});
+            return qm::result_batch_frame(rid, 0, 1, {c});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -2669,7 +2669,7 @@ TEST_CASE("mock: invalid_utf8 — RESULT_BATCH column name is not valid UTF-8")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {c});
+            return qm::result_batch_frame(rid, 0, 1, {c});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -2717,9 +2717,9 @@ TEST_CASE("mock: continuation batch decodes against the batch-0 schema")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c0](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 2, {c0}); }},
+                            { return qm::result_batch_frame(rid, 0, 2, {c0}); }},
         qm::ActionSendBuilt{[c1](int64_t rid)
-                            { return qm::result_batch_frame(rid, 1, 1, 3, {c1}); }},
+                            { return qm::result_batch_frame(rid, 1, 3, {c1}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -2768,7 +2768,7 @@ TEST_CASE("mock: protocol_error — continuation batch before schema-bearing bat
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
                             { return qm::result_batch_frame(
-                                  rid, /*batch_seq=*/1, 1, 1, {c}); }},
+                                  rid, /*batch_seq=*/1, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     run_malformed_batch(s);
@@ -3209,7 +3209,7 @@ TEST_CASE(
         s.emplace_back(qm::ActionSendBuilt{
             [col, i](int64_t rid)
             { return qm::result_batch_frame(
-                  rid, static_cast<uint64_t>(i), 1, 4, {col}); }});
+                  rid, static_cast<uint64_t>(i), 4, {col}); }});
     }
     s.emplace_back(qm::ActionSendResultEnd{});
 
@@ -3467,7 +3467,7 @@ TEST_CASE("mock: progress callback alone unlocks replay-after-data-delivered")
         qm::ActionSendServerInfo{qm::ROLE_STANDALONE, "c", "a"},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[col](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {col}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {col}); }},
         qm::ActionHardDrop{},
     };
     qm::Script s_b = {
@@ -3625,7 +3625,7 @@ TEST_CASE("mock: batch::column<int32_t> dense values match get_i32 per cell")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 4, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 4, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -3679,7 +3679,7 @@ TEST_CASE("mock: batch::column<varchar> offsets/data match get_varchar per cell"
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{
             [col_spec](int64_t rid)
-            { return qm::result_batch_frame(rid, 0, 1, 3, {col_spec}); }},
+            { return qm::result_batch_frame(rid, 0, 3, {col_spec}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -3723,7 +3723,7 @@ TEST_CASE("mock: batch::column INT validity bitmap matches is_null per cell")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 4, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 4, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -3810,7 +3810,7 @@ TEST_CASE("mock: batch::column — every fixed-width scalar kind round-trip")
         qm::ActionSendBuilt{[cols](int64_t rid)
                             {
                                 return qm::result_batch_frame(
-                                    rid, 0, 1, 2, cols);
+                                    rid, 0, 2, cols);
                             }},
         qm::ActionSendResultEnd{},
     };
@@ -3970,7 +3970,7 @@ TEST_CASE("mock: batch::column — binary + decimal64/128/256 + geohash bulk vs 
             [c_bin, c_dec64, c_dec128, c_dec256, c_geo](int64_t rid)
             {
                 return qm::result_batch_frame(
-                    rid, 0, 1, 2,
+                    rid, 0, 2,
                     {c_bin, c_dec64, c_dec128, c_dec256, c_geo});
             }},
         qm::ActionSendResultEnd{},
@@ -4055,7 +4055,7 @@ TEST_CASE("mock: batch::column — DOUBLE_ARRAY round-trip")
         qm::ActionSendBuilt{
             [c_da](int64_t rid)
             {
-                return qm::result_batch_frame(rid, 0, 1, 3, {c_da});
+                return qm::result_batch_frame(rid, 0, 3, {c_da});
             }},
         qm::ActionSendResultEnd{},
     };
@@ -4112,7 +4112,7 @@ TEST_CASE("mock: batch::symbol — column codes + dictionary bulk round-trip")
             [c_sym](int64_t rid)
             {
                 return qm::result_batch_frame_with_dict(
-                    rid, 0, 1, 4, {c_sym},
+                    rid, 0, 4, {c_sym},
                     /*delta_start=*/0,
                     {"alpha", "beta", "gamma"});
             }},
@@ -4174,7 +4174,7 @@ TEST_CASE("mock: array accessors on a scalar column raise")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c](int64_t rid)
-                            { return qm::result_batch_frame(rid, 0, 1, 1, {c}); }},
+                            { return qm::result_batch_frame(rid, 0, 1, {c}); }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
@@ -4233,7 +4233,7 @@ TEST_CASE(
         qm::ActionSendBuilt{
             [=](int64_t rid) {
                 return qm::result_batch_frame_with_dict(
-                    rid, 0, 1, 1,
+                    rid, 0, 1,
                     {c_bool, c_int, c_long, c_double, c_dec64, c_uuid, c_geo,
                      c_varchar, c_sym},
                     /*delta_start=*/0,
@@ -4320,7 +4320,7 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[c_da](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {c_da});
+            return qm::result_batch_frame(rid, 0, 1, {c_da});
         }},
         qm::ActionSendResultEnd{},
     };
