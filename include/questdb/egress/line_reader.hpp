@@ -2552,7 +2552,9 @@ public:
         line_reader_error::wrapped_call(::line_reader_cursor_cancel, _impl);
     }
 
-    /** Grant additional CREDIT to the server.
+    /** Grant additional CREDIT to the server. Invalidates the current
+     *  `batch` and everything borrowed from it, and may transparently
+     *  trigger mid-query failover on a transport failure.
      *  @throws line_reader_error on transport failure or if this cursor
      *          has been moved from. */
     void add_credit(uint64_t additional_bytes)

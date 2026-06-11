@@ -2497,7 +2497,8 @@ pub unsafe extern "C" fn line_reader_cursor_free(cursor: *mut line_reader_cursor
 /// Returns:
 ///   * Non-NULL borrowed batch handle on success. Invalidated by the next
 ///     `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
-///     `line_reader_cursor_free`, or mid-query failover.
+///     `line_reader_cursor_add_credit`, `line_reader_cursor_free`, or
+///     mid-query failover.
 ///   * NULL with `*err_out` left untouched when the stream has terminated
 ///     normally (no batch available).
 ///   * NULL with `*err_out` set on error; the cursor must be freed.
@@ -2891,7 +2892,10 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
 }
 
 /// Grant the server an additional CREDIT budget. Only valid for cursors
-/// started with `initial_credit > 0`.
+/// started with `initial_credit > 0`. Invalidates the current batch handle
+/// and every pointer borrowed from it (routes through `cursor_for_mut`),
+/// and may transparently trigger mid-query failover when the CREDIT write
+/// hits a transport failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_add_credit(
     cursor: *mut line_reader_cursor,
@@ -2958,8 +2962,8 @@ unsafe fn null_out_param_err(err_out: *mut *mut line_reader_error, fn_name: &str
 /// Borrowed handle for the batch currently loaded in a cursor. Backed by
 /// the cursor's `current_batch`; invalidated by the next
 /// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
-/// `line_reader_cursor_free`, or mid-query failover. Never freed by the
-/// caller.
+/// `line_reader_cursor_add_credit`, `line_reader_cursor_free`, or
+/// mid-query failover. Never freed by the caller.
 #[repr(transparent)]
 pub struct line_reader_batch(BatchView<'static>);
 

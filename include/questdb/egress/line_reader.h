@@ -1106,11 +1106,12 @@ void line_reader_cursor_free(line_reader_cursor* cursor);
 //
 // Lifetime: the handle and every pointer reachable through its descriptors
 // borrow from the batch. They are invalidated by the next
-// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`, or
-// `line_reader_cursor_free` on the owning cursor, and by mid-query failover
-// (transparently triggered by `line_reader_cursor_next_batch`). Do not
-// cache them across batches; re-derive after every `next_batch`. The handle
-// is never freed by the caller.
+// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
+// `line_reader_cursor_add_credit`, or `line_reader_cursor_free` on the
+// owning cursor, and by mid-query failover (transparently triggered by
+// `line_reader_cursor_next_batch` or `line_reader_cursor_add_credit`). Do
+// not cache them across batches; re-derive after every `next_batch`. The
+// handle is never freed by the caller.
 
 /** Opaque handle for the batch currently loaded in a cursor. */
 typedef struct line_reader_batch line_reader_batch;
@@ -1120,8 +1121,8 @@ typedef struct line_reader_batch line_reader_batch;
  *
  * @return Non-NULL borrowed batch handle on a new batch. The pointer is
  *         invalidated by the next `line_reader_cursor_next_batch`,
- *         `line_reader_cursor_cancel`, `line_reader_cursor_free`, or
- *         mid-query failover.
+ *         `line_reader_cursor_cancel`, `line_reader_cursor_add_credit`,
+ *         `line_reader_cursor_free`, or mid-query failover.
  * @return NULL with `*err_out` left untouched when the stream has
  *         terminated normally — no batch is available.
  * @return NULL with `*err_out` set on error; the cursor must be freed.
@@ -1426,7 +1427,9 @@ QUESTDB_CLIENT_API bool line_reader_cursor_cancel(
 
 /**
  * Grant additional CREDIT to the server. Only valid when the cursor was
- * started with `initial_credit > 0`.
+ * started with `initial_credit > 0`. Invalidates the current batch handle
+ * and every pointer borrowed from it, and may transparently trigger
+ * mid-query failover when the CREDIT write hits a transport failure.
  */
 QUESTDB_CLIENT_API bool line_reader_cursor_add_credit(
     line_reader_cursor* cursor,
