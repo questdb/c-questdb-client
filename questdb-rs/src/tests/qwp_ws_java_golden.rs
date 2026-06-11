@@ -25,10 +25,10 @@
 //! Java/Rust golden payload parity for QWP/WebSocket replay-mode bytes.
 //!
 //! These constants are unmasked QWP application payloads in the inline-schema
-//! wire format (no schema-mode byte, no schema id). They are the Java client
-//! golden bytes from the `vi_sf` branch at commit
-//! `05c3829cd5e46986e2bc97c05caa1395df930cb2`, with the dropped schema-mode and
-//! schema_id bytes removed and each frame's payload_len adjusted to match.
+//! wire format (no schema-mode byte, no schema id), captured from the Java
+//! client's inline-schema replay encoder. The Rust replay encoder must
+//! reproduce them byte-for-byte, so the assertions below prove cross-client
+//! wire parity rather than asserting a hand-derived expectation.
 
 use crate::ingress::{Buffer, QwpWsEncodeScratch, SymbolGlobalDict, TimestampNanos};
 
