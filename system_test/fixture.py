@@ -63,6 +63,54 @@ HTTP_AUTH = dict(
 CA_PATH = (pathlib.Path(__file__).parent.parent /
            'tls_certs' / 'server_rootCA.pem')
 
+# Posts a console control event to the QuestDB JVM on Windows. Run as
+# `python -c <this> <pid> <ctrl_c|ctrl_break>` in a separate process: a
+# control event can only be sent from inside the target's console —
+# GenerateConsoleCtrlEvent() reaches just the processes attached to the
+# caller's own console — and the test runner cannot abandon its console
+# to go borrow the JVM's, but a throwaway helper process can.
+_WIN_CONSOLE_CTRL_HELPER = r'''
+import ctypes
+import ctypes.wintypes
+import sys
+
+CTRL_C_EVENT = 0
+CTRL_BREAK_EVENT = 1
+
+pid = int(sys.argv[1])
+event = {'ctrl_c': CTRL_C_EVENT, 'ctrl_break': CTRL_BREAK_EVENT}[sys.argv[2]]
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+
+def bail(code, what):
+    sys.stderr.write(
+        f'console-ctrl helper: {what} failed, '
+        f'winerror={ctypes.get_last_error()}\n')
+    sys.exit(code)
+
+
+# The posted event reaches every process on the console, this helper
+# included. A handler that claims each event keeps the default handler
+# (ExitProcess) from killing the helper before it can report success.
+# Merely ignoring would not do: SetConsoleCtrlHandler(NULL, TRUE)
+# covers Ctrl+C only, not Ctrl+Break.
+handler_t = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+claim_all = handler_t(lambda _event: True)
+if not kernel32.SetConsoleCtrlHandler(claim_all, True):
+    bail(2, 'SetConsoleCtrlHandler')
+kernel32.FreeConsole()  # Failure is fine: it means we had no console.
+if not kernel32.AttachConsole(pid):
+    bail(3, 'AttachConsole')
+# Process group 0 == everyone on this console, which is exactly the JVM
+# (and this helper): the JVM was launched with CREATE_NO_WINDOW, so its
+# console hosts nothing else. Group 0 rather than the JVM's pid because
+# Ctrl+C cannot be addressed to a process group: with a non-zero group
+# id, GenerateConsoleCtrlEvent(CTRL_C_EVENT, ...) reports success
+# without delivering anything.
+if not kernel32.GenerateConsoleCtrlEvent(event, 0):
+    bail(4, 'GenerateConsoleCtrlEvent')
+'''
+
 
 def retry(
         predicate_task,
@@ -515,12 +563,18 @@ class QuestDbFixture(QuestDbFixtureBase):
         # On Windows, Popen.terminate() maps to TerminateProcess(), which kills
         # the JVM without running shutdown hooks. That leaves QuestDB's writers
         # mid-update and can corrupt the sequencer's _meta/_txnlog ordering.
-        # CREATE_NEW_PROCESS_GROUP lets stop() send CTRL_BREAK_EVENT to the JVM
-        # only (not to pytest), which triggers a graceful shutdown.
+        # The graceful equivalent of SIGTERM for a JVM is a Ctrl+C console
+        # event, which it maps to SIGINT. (Ctrl+Break is NOT that: HotSpot
+        # answers it with a thread dump and keeps running.) Ctrl+C cannot be
+        # addressed to a single process, though — it goes to every process on
+        # the target console — so CREATE_NO_WINDOW gives the JVM a fresh,
+        # windowless console of its own, where stop() can post Ctrl+C (via
+        # _win_send_console_ctrl) and hit nothing else. CREATE_NEW_PROCESS_GROUP
+        # is deliberately absent: it would start the child with the
+        # ignore-Ctrl+C flag set, which the JVM never clears, making it deaf
+        # to the shutdown request.
         creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP
-            if sys.platform == 'win32'
-            else 0)
+            subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
         try:
             self._proc = subprocess.Popen(
                 launch_args,
@@ -581,6 +635,37 @@ class QuestDbFixture(QuestDbFixtureBase):
     def __enter__(self):
         self.start()
 
+    def _win_send_console_ctrl(self, event):
+        """Post a console control event to the QuestDB JVM on Windows.
+
+        `event` is 'ctrl_c' (graceful shutdown: the JVM maps it to
+        SIGINT and runs shutdown hooks) or 'ctrl_break' (HotSpot prints
+        a thread dump to the server log and keeps running). Runs
+        _WIN_CONSOLE_CTRL_HELPER in a separate process; see its comment
+        for why one is needed. Returns True when the event was posted.
+        Never raises: stop() must always reach its force-kill cleanup,
+        however delivery fails.
+        """
+        try:
+            res = subprocess.run(
+                [sys.executable, '-c', _WIN_CONSOLE_CTRL_HELPER,
+                 str(self._proc.pid), event],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            sys.stderr.write(
+                f'Failed to post {event} to QuestDB '
+                f'(pid {self._proc.pid}): {e!r}\n')
+            return False
+        if res.returncode != 0:
+            # The helper wrote a winerror diagnostic to stderr already.
+            sys.stderr.write(
+                f'Failed to post {event} to QuestDB '
+                f'(pid {self._proc.pid}); helper exited with '
+                f'{res.returncode}.\n')
+            return False
+        return True
+
     def stop(self, wait_timeout_sec=30):
         if self._tls_proxy:
             self._tls_proxy.stop()
@@ -593,10 +678,13 @@ class QuestDbFixture(QuestDbFixtureBase):
         kill_pid = None
         if self._proc:
             if sys.platform == 'win32':
-                # CTRL_BREAK_EVENT is the closest Windows analogue of SIGTERM
-                # for a JVM child: it runs shutdown hooks. Requires the child
-                # to have been started with CREATE_NEW_PROCESS_GROUP.
-                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
+                # Post Ctrl+C to the JVM's private console: the JVM maps it
+                # to SIGINT and runs shutdown hooks, making it the closest
+                # Windows analogue of SIGTERM. (Ctrl+Break would not do:
+                # HotSpot answers it with a thread dump to the server log
+                # and keeps running.) Delivery failure is not fatal here:
+                # the wait below times out, force-kills and raises.
+                self._win_send_console_ctrl('ctrl_c')
             else:
                 self._proc.terminate()
             try:
@@ -608,20 +696,29 @@ class QuestDbFixture(QuestDbFixtureBase):
                     f'QuestDB (pid {self._proc.pid}) did not exit within '
                     f'{wait_timeout_sec}s of being asked to shut down; '
                     'escalating to SIGKILL.\n')
-                if hasattr(signal, 'SIGQUIT'):
-                    # Make the JVM print a thread dump into the server log
-                    # first, so a hung shutdown identifies the blocked
-                    # thread instead of vanishing without a trace.
-                    sys.stderr.write(
-                        'Requested a JVM thread dump (SIGQUIT); it goes '
-                        f'to `{self._log_path}`.\n')
+                # Make the JVM print a thread dump into the server log
+                # first, so a hung shutdown identifies the blocked thread
+                # instead of vanishing without a trace: SIGQUIT on POSIX,
+                # Ctrl+Break on Windows.
+                dump_requested = False
+                if sys.platform == 'win32':
+                    dump_requested = self._win_send_console_ctrl(
+                        'ctrl_break')
+                elif hasattr(signal, 'SIGQUIT'):
                     try:
                         self._proc.send_signal(signal.SIGQUIT)
-                        # The JVM keeps running after a SIGQUIT dump; this
-                        # wait is just a grace period for it to finish
-                        # writing the dump.
+                        dump_requested = True
+                    except OSError:
+                        pass
+                if dump_requested:
+                    sys.stderr.write(
+                        'Requested a JVM thread dump; it goes to '
+                        f'`{self._log_path}`.\n')
+                    try:
+                        # The JVM keeps running after the dump; this wait
+                        # is just a grace period for it to finish writing.
                         self._proc.wait(timeout=2)
-                    except (subprocess.TimeoutExpired, OSError):
+                    except subprocess.TimeoutExpired:
                         pass
                 self._proc.kill()
                 self._proc.wait()
