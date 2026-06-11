@@ -75,7 +75,17 @@ use crate::ingress::CertificateAuthority;
 pub const DEFAULT_PATH: &str = "/read/v1";
 
 /// Highest QWP version this client can speak.
-pub const HIGHEST_KNOWN_VERSION: u8 = 1;
+///
+/// QWP runs at a single version, so this is exactly the wire-frame
+/// [`PROTOCOL_VERSION`]: the value advertised in the `X-QWP-Max-Version`
+/// handshake header must equal the version byte
+/// [`FrameHeader::parse`](crate::egress::wire::FrameHeader::parse) accepts,
+/// or the handshake would settle on a version that every subsequent frame
+/// then fails to parse. Defined in terms of the wire constant so bumping
+/// the protocol version moves both together.
+///
+/// [`PROTOCOL_VERSION`]: crate::egress::wire::PROTOCOL_VERSION
+pub const HIGHEST_KNOWN_VERSION: u8 = crate::egress::wire::PROTOCOL_VERSION;
 
 /// Default WS port (matches QuestDB HTTP / ILP-HTTP convention).
 const DEFAULT_PLAIN_PORT: &str = "9000";
@@ -393,8 +403,8 @@ pub enum TlsVerify {
 #[non_exhaustive]
 pub struct ReaderConfig {
     /// Endpoints to walk on connect, in order. The Reader tries each
-    /// until one accepts the WS handshake and (when v2) advertises a
-    /// role matching `target`.
+    /// until one accepts the WS handshake and advertises a role matching
+    /// `target`.
     ///
     /// Crate-private to keep external code from mutating the address
     /// list after a `Reader` has been built around an `Arc<ReaderConfig>`

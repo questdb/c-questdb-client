@@ -37,6 +37,6 @@ pub(crate) use byte_reader::ByteReader;
 
 pub use cache_reset::RESET_MASK_DICT;
 pub use capabilities::CAP_ZONE;
-pub use header::{FrameHeader, HEADER_LEN, MAGIC, flags};
+pub use header::{FrameHeader, HEADER_LEN, MAGIC, PROTOCOL_VERSION, flags};
 pub use msg_kind::{MsgKind, StatusCode};
 pub use varint::{MAX_VARINT_LEN_U64, decode_u64, decode_usize, encode_u64};
