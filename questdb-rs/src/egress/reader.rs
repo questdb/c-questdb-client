@@ -731,7 +731,8 @@ pub struct FailoverEvent {
     pub failed_addr: Endpoint,
     /// Endpoint of the new connection.
     pub new_addr: Endpoint,
-    /// `SERVER_INFO` of the new endpoint (`None` for v1 servers).
+    /// `SERVER_INFO` of the new endpoint (`None` only if the server
+    /// omitted it).
     pub new_server_info: Option<ServerInfo>,
     /// Newly-allocated `request_id` the cursor will receive frames for
     /// from now on. Different from `Cursor::request_id` *before* the
@@ -821,7 +822,7 @@ pub struct FailoverProgressEvent {
     /// [`FailoverPhase::Reset`].
     pub new_addr: Option<Endpoint>,
     /// `SERVER_INFO` of the new endpoint. `Some` only on
-    /// [`FailoverPhase::Reset`] and only on QWP v2+ servers.
+    /// [`FailoverPhase::Reset`].
     pub new_server_info: Option<ServerInfo>,
     /// Newly-allocated `request_id`. `Some` only on
     /// [`FailoverPhase::Reset`].
@@ -1684,8 +1685,9 @@ impl<'r> Cursor<'r> {
         self.reader.server_version()
     }
 
-    /// `SERVER_INFO` of the cursor's currently connected endpoint, or
-    /// `None` on v1 servers. The in-cursor accessor for
+    /// `SERVER_INFO` of the cursor's currently connected endpoint;
+    /// `None` only while a reconnect is in flight (the single QWP
+    /// version always supplies it). The in-cursor accessor for
     /// [`Reader::server_info`], unreachable from user code while the
     /// cursor holds the `Reader`'s mutable borrow. Reflects the new
     /// endpoint after mid-query failover.
@@ -2524,7 +2526,8 @@ fn walk_via_tracker(
                 // Update zone tier from `SERVER_INFO.zone_id` when the
                 // server advertised one (gated by `CAP_ZONE`). `record_zone`
                 // with `None`/empty is a no-op, so passing the field
-                // unconditionally is safe even on v1 or CAP_ZONE=0.
+                // unconditionally is safe even when the server advertised
+                // no zone (CAP_ZONE=0).
                 if let Some(info) = session.server_info.as_ref() {
                     tracker.record_zone(idx, info.zone_id.as_deref());
                 }

@@ -427,8 +427,9 @@ typedef enum line_reader_server_role
 } line_reader_server_role;
 
 /**
- * Get the reader's last-seen `SERVER_INFO`, or NULL on v1 servers. The
- * pointer is invalidated by any reader operation that may reconnect.
+ * Get the reader's last-seen `SERVER_INFO`. The server always sends one,
+ * so this is NULL only while a reconnect is in flight. The pointer is
+ * invalidated by any reader operation that may reconnect.
  *
  * Also returns NULL while a `line_reader_query` / `line_reader_cursor`
  * produced by this reader is still live (release it first to read
@@ -555,7 +556,8 @@ line_reader_failover_event_trigger_code(const line_reader_failover_event*);
 /** Trigger error message (UTF-8). Borrowed for the duration of the call. */
 QUESTDB_CLIENT_API void line_reader_failover_event_trigger_msg(
     const line_reader_failover_event*, const char** out_buf, size_t* out_len);
-/** `SERVER_INFO` for the new endpoint, or NULL on v1 servers. */
+/** `SERVER_INFO` for the new endpoint; NULL only if the server omitted
+ *  it. */
 QUESTDB_CLIENT_API const line_reader_server_info*
 line_reader_failover_event_server_info(const line_reader_failover_event*);
 
@@ -712,7 +714,7 @@ QUESTDB_CLIENT_API uint64_t line_reader_failover_progress_event_elapsed_ns(
     const line_reader_failover_progress_event*);
 
 /** `SERVER_INFO` for the new endpoint, or NULL outside the Reset
- *  phase / on v1 servers. */
+ *  phase (or if the server omitted it). */
 QUESTDB_CLIENT_API const line_reader_server_info*
 line_reader_failover_progress_event_server_info(
     const line_reader_failover_progress_event*);
@@ -1380,9 +1382,10 @@ QUESTDB_CLIENT_API bool line_reader_cursor_server_version(
     line_reader_error** err_out);
 
 /**
- * Last-seen `SERVER_INFO` of the cursor's currently connected endpoint, or
- * NULL on v1 servers. The pointer is invalidated by any cursor operation
- * that may reconnect. The in-cursor counterpart to
+ * Last-seen `SERVER_INFO` of the cursor's currently connected endpoint.
+ * The server always sends one, so this is NULL only while a reconnect is
+ * in flight. The pointer is invalidated by any cursor operation that may
+ * reconnect. The in-cursor counterpart to
  * `line_reader_current_server_info` (which rejects while a cursor is live).
  */
 QUESTDB_CLIENT_API const line_reader_server_info*

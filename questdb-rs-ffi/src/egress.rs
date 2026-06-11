@@ -831,11 +831,12 @@ pub unsafe extern "C" fn line_reader_server_version(
     }
 }
 
-/// Borrowed `SERVER_INFO` of the currently connected endpoint, or NULL when
-/// the server hasn't sent one (v1 protocol). The returned pointer is
-/// invalidated by any subsequent reader operation that may reconnect or
-/// receive a new `SERVER_INFO` (`line_reader_query_execute`,
-/// `line_reader_cursor_next_batch`, `line_reader_close`).
+/// Borrowed `SERVER_INFO` of the currently connected endpoint. The server
+/// always sends one, so this is NULL only while a reconnect is in flight.
+/// The returned pointer is invalidated by any subsequent reader operation
+/// that may reconnect or receive a new `SERVER_INFO`
+/// (`line_reader_query_execute`, `line_reader_cursor_next_batch`,
+/// `line_reader_close`).
 ///
 /// Returns NULL for a NULL handle, and also NULL while a `line_reader_query`
 /// / `line_reader_cursor` produced by this reader is still live — reading
@@ -1259,9 +1260,9 @@ pub unsafe extern "C" fn line_reader_failover_event_trigger_msg(
     }
 }
 
-/// `SERVER_INFO` for the new endpoint, or NULL for v1 servers. Borrowed
-/// for the duration of the call. NULL-safe: returns NULL when `ev` is
-/// NULL.
+/// `SERVER_INFO` for the new endpoint; NULL only if the server omitted
+/// it. Borrowed for the duration of the call. NULL-safe: returns NULL
+/// when `ev` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_failover_event_server_info(
     ev: *const line_reader_failover_event,
@@ -1575,7 +1576,7 @@ pub unsafe extern "C" fn line_reader_failover_progress_event_elapsed_ns(
 }
 
 /// `SERVER_INFO` for the new endpoint, or NULL outside the Reset phase
-/// / on QWP v1 servers. Borrowed for the duration of the call.
+/// (or if the server omitted it). Borrowed for the duration of the call.
 /// NULL-safe: returns NULL when `ev` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_failover_progress_event_server_info(
@@ -2713,11 +2714,11 @@ pub unsafe extern "C" fn line_reader_cursor_server_version(
     }
 }
 
-/// Borrowed `SERVER_INFO` of the cursor's currently connected endpoint, or
-/// NULL when the server hasn't sent one (v1 protocol). The returned
-/// pointer is invalidated by any subsequent cursor operation that may
-/// reconnect (`line_reader_cursor_next_batch`, `line_reader_cursor_free`).
-/// Returns NULL for a NULL handle.
+/// Borrowed `SERVER_INFO` of the cursor's currently connected endpoint.
+/// The server always sends one, so this is NULL only while a reconnect is
+/// in flight. The returned pointer is invalidated by any subsequent cursor
+/// operation that may reconnect (`line_reader_cursor_next_batch`,
+/// `line_reader_cursor_free`). Returns NULL for a NULL handle.
 ///
 /// The in-cursor counterpart to `line_reader_current_server_info`, which
 /// rejects while a cursor is live.
