@@ -835,16 +835,16 @@ fn happy_path_no_failover() {
 #[test]
 fn cache_reset_mid_stream_does_not_break_cursor() {
     // The server emits CACHE_RESET to invalidate the per-connection
-    // symbol dict and/or schema registry. The decoder applies the
-    // resets in `decode_frame` before returning `ServerEvent::CacheReset`,
-    // and `next_batch` is supposed to swallow that event and continue
-    // reading. Live coverage is hard (the real server emits
-    // CACHE_RESET only under specific dict/schema-aging conditions)
-    // so the contract is pinned here against a scripted mock.
+    // symbol dict (mask bit 0x01). The decoder applies the resets in
+    // `decode_frame` before returning `ServerEvent::CacheReset`, and
+    // `next_batch` is supposed to swallow that event and continue
+    // reading. Live coverage is hard (the real server emits CACHE_RESET
+    // only under specific dict-aging conditions) so the contract is
+    // pinned here against a scripted mock.
     //
-    // Sends both reset masks in sequence (dict, then schemas, then
-    // both at once) to exercise every bit of the mask without making
-    // assumptions about which kind of reset is "common."
+    // Sends 0x01 (clear dict), then 0x02 (a reserved bit, ignored by
+    // recipients), then 0x03 (both) so the cursor is exercised against
+    // the defined bit, a reserved bit, and their combination.
     let srv = MockServer::start(vec![vec![
         Action::SendServerInfo {
             role: ServerRole::Standalone,
@@ -852,8 +852,8 @@ fn cache_reset_mid_stream_does_not_break_cursor() {
         },
         Action::AwaitQueryRequest,
         Action::SendRaw(cache_reset_frame(0x01)), // clear dict
-        Action::SendRaw(cache_reset_frame(0x02)), // clear schemas
-        Action::SendRaw(cache_reset_frame(0x03)), // clear both
+        Action::SendRaw(cache_reset_frame(0x02)), // reserved bit, ignored
+        Action::SendRaw(cache_reset_frame(0x03)), // dict + reserved bit
         Action::SendResultEnd,
     ]]);
     let conf = format!("ws::addr={}", srv.url());

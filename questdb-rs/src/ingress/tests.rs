@@ -303,7 +303,7 @@ fn ingress_accepts_full_egress_connect_string_unchanged() {
     // into a non-TLS connect string.
     let conf = "http::addr=127.0.0.1:9000\
         ;username=u;password=p\
-        ;path=/exec;max_version=2;compression=zstd;compression_level=3\
+        ;path=/exec;max_version=1;compression=zstd;compression_level=3\
         ;max_batch_rows=10000;client_id=svc-a;target=primary\
         ;failover=on;failover_max_attempts=3\
         ;on_schema_error=drop;on_parse_error=halt\
@@ -322,8 +322,10 @@ fn qwpws_config_silently_accepts_reserved_on_error_policy_keys() {
     // Java parity (design/qwp-cursor-error-api.md): the per-category
     // server-error policy keys are reserved so the same connect string
     // can be shared across language clients regardless of which side
-    // has wired the resolver. Today the sender catches them via the
-    // generic unknown-key fallthrough — this guard locks that in.
+    // has wired the resolver. The QWP-WS parser rejects unknown keys, so
+    // these are accepted only because they're listed in
+    // `QWP_WS_PORTABLE_CONFIG_KEYS` (the `_ => builder` arm then ignores
+    // them) — this guard locks that allow-list in.
     for key in [
         "on_server_error",
         "on_schema_error",

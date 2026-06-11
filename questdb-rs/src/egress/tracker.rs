@@ -69,7 +69,7 @@ pub enum ZoneTier {
     /// `zone=` is unset, OR `target=primary`.
     Same,
     /// Server did not advertise a zone (no `CAP_ZONE`, no
-    /// `X-QuestDB-Zone` header, or v1-pinned client).
+    /// `X-QuestDB-Zone` header).
     Unknown,
     /// Server advertised a different zone.
     Other,

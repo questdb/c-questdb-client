@@ -153,7 +153,7 @@ typedef enum line_reader_error_code
      *  single-node OSS server emitting `STANDALONE`). */
     line_reader_error_role_mismatch = 8,
     /** Wire-format violation: bad magic, truncated frame, unknown
-     *  discriminant, invalid varint, schema/symbol-dict reference miss, etc. */
+     *  discriminant, invalid varint, symbol-dict reference miss, etc. */
     line_reader_error_protocol_error = 9,
     /** String or symbol field was not valid UTF-8. */
     line_reader_error_invalid_utf8 = 10,
