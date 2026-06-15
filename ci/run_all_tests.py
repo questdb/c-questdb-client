@@ -49,7 +49,6 @@ def main():
     ]
 
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    qdb_v = '9.4.1'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
@@ -78,8 +77,11 @@ def main():
     run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
     for _, path in test_paths:
         run_cmd(str(path))
-    run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
-    # run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
+    # Test against QuestDB master (QWP/Arrow not yet in a release). Switch back
+    # to the `--versions` lines below once a release ships it.
+    run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
+    # qdb_v = '9.4.1'
+    # run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
 
 
 if __name__ == '__main__':

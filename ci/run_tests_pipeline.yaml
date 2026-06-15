@@ -54,17 +54,16 @@ stages:
               cd questdb-rs
               cargo build --examples --features almost-all-features
             displayName: "Build Rust examples"
-          ############################# temp for test begin #####################
-          #- script: |
-          #    git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
-          #  displayName: git clone questdb
-          #- task: Maven@3
-          #  displayName: "Compile QuestDB"
-          #  inputs:
-          #    mavenPOMFile: "questdb/pom.xml"
-          #    jdkVersionOption: "1.17"
-          #    options: "-DskipTests -Pbuild-web-console"
-          ############################# temp for test end #####################
+          # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
+          # Drop once QWP/Arrow ships in a release (revert to `--versions`).
+          - template: templates/clone_questdb.yaml
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME_25_X64)"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_25_X64)
