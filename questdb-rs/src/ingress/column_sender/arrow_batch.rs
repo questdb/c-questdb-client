@@ -3102,9 +3102,11 @@ pub(crate) fn resolve_ts_column(batch: &RecordBatch, name: ColumnName<'_>) -> Re
 }
 
 fn check_array_data_bounds(arr: &dyn Array) -> Result<()> {
-    // arrow_array enforces this at array construction except via
-    // `from_ffi(_unchecked)`. The FFI boundary already calls
-    // `check_offset`, so we limit the structural sanity to null_count.
+    // Value- and offset-buffer bounds are validated by the FFI entry
+    // point (`arrow_ffi_import_*` runs `ArrayData::validate_full`) and by
+    // arrow-rs's safe builders on the native path. `from_ffi` itself does
+    // NOT validate, so this is a cheap structural cross-check only — do
+    // not rely on it for buffer-length safety.
     let null_count = arr.null_count();
     let row_count = arr.len();
     if null_count > row_count {
@@ -3851,21 +3853,120 @@ mod tests {
     }
 
     #[test]
-    fn decimal64_appends_via_be_mantissa() {
+    fn decimal64_payload_is_le_twos_complement() {
         let mut b = Decimal64Builder::new();
         b.append_value(12345);
+        b.append_value(-2);
         let arr = b.finish().with_precision_and_scale(18, 2).unwrap();
-        let rb = single_col_batch(Field::new("d", DataType::Decimal64(18, 2), true), arr);
-        assert_ok_with_table_count(&rb, 1);
+        let mut out = Vec::new();
+        write_decimal64_payload(&mut out, &arr, false).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&12345_i64.to_le_bytes());
+        expected.extend_from_slice(&(-2_i64).to_le_bytes());
+        assert_eq!(out, expected);
     }
 
     #[test]
-    fn decimal128_appends_via_be_mantissa() {
+    fn decimal128_payload_is_le_twos_complement() {
         let mut b = Decimal128Builder::new();
         b.append_value(67890_i128);
+        b.append_value(-1_i128);
         let arr = b.finish().with_precision_and_scale(38, 3).unwrap();
-        let rb = single_col_batch(Field::new("d", DataType::Decimal128(38, 3), true), arr);
-        assert_ok_with_table_count(&rb, 1);
+        let mut out = Vec::new();
+        write_decimal128_payload(&mut out, &arr, false).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&67890_i128.to_le_bytes());
+        expected.extend_from_slice(&(-1_i128).to_le_bytes());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn decimal256_payload_is_le_twos_complement() {
+        use arrow_array::builder::Decimal256Builder;
+        use arrow_buffer::i256;
+        let mut b = Decimal256Builder::new();
+        b.append_value(i256::from_i128(67890));
+        b.append_value(i256::from_i128(-3));
+        let arr = b.finish().with_precision_and_scale(40, 3).unwrap();
+        let mut out = Vec::new();
+        write_decimal256_payload(&mut out, &arr, false).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&i256::from_i128(67890).to_le_bytes());
+        expected.extend_from_slice(&i256::from_i128(-3).to_le_bytes());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn decimal32_widens_to_le_i64_payload() {
+        use arrow_array::builder::Decimal32Builder;
+        let mut b = Decimal32Builder::new();
+        b.append_value(-5_i32);
+        let arr = b.finish().with_precision_and_scale(9, 2).unwrap();
+        let mut out = Vec::new();
+        write_decimal32_widen_to_64_payload(&mut out, &arr, false).unwrap();
+        assert_eq!(out, (-5_i64).to_le_bytes());
+    }
+
+    // QWP convention: a set bit == null.
+    fn decode_qwp_nulls(bytes: &[u8], rows: usize) -> Vec<bool> {
+        (0..rows)
+            .map(|i| (bytes[i / 8] >> (i % 8)) & 1 == 1)
+            .collect()
+    }
+
+    #[test]
+    fn qwp_bitmap_aligned_trailing_bits() {
+        use arrow_buffer::BooleanBuffer;
+        // 13 rows, byte-aligned offset → word/byte NOT path plus the
+        // trailing-bit mask (13 % 8 == 5).
+        let valid: Vec<bool> = vec![
+            true, false, true, true, false, true, false, true, // byte 0
+            true, false, true, false, true, // 5 trailing rows
+        ];
+        let nulls = NullBuffer::new(BooleanBuffer::from(valid.clone()));
+        let mut out = Vec::new();
+        write_qwp_bitmap_from_arrow(&mut out, &nulls).unwrap();
+        let expected: Vec<bool> = valid.iter().map(|v| !v).collect();
+        assert_eq!(decode_qwp_nulls(&out, valid.len()), expected);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1] >> 5, 0, "trailing bits beyond row count must be 0");
+    }
+
+    #[test]
+    fn qwp_bitmap_unaligned_sliced_fallback() {
+        use arrow_buffer::BooleanBuffer;
+        // Slice at a non-byte-aligned offset with a non-multiple-of-8
+        // length to drive the shift+OR fallback and its trailing mask.
+        let valid: Vec<bool> = vec![
+            true, false, true, true, // bits 0..3, dropped by the slice
+            false, true, false, true, true, false, true, // window rows 0..6
+            false, true, // padding past the window
+        ];
+        let nulls = NullBuffer::new(BooleanBuffer::from(valid.clone()).slice(4, 7));
+        assert_eq!(nulls.offset() % 8, 4, "must exercise the unaligned path");
+        let mut out = Vec::new();
+        write_qwp_bitmap_from_arrow(&mut out, &nulls).unwrap();
+        let expected: Vec<bool> = valid[4..11].iter().map(|v| !v).collect();
+        assert_eq!(decode_qwp_nulls(&out, 7), expected);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0] >> 7, 0, "trailing bit beyond row count must be 0");
+    }
+
+    #[test]
+    fn qwp_bitmap_unaligned_all_null_and_all_valid() {
+        use arrow_buffer::BooleanBuffer;
+        let all_valid = vec![true; 12];
+        let nulls = NullBuffer::new(BooleanBuffer::from(all_valid).slice(3, 6));
+        let mut out = Vec::new();
+        write_qwp_bitmap_from_arrow(&mut out, &nulls).unwrap();
+        assert_eq!(decode_qwp_nulls(&out, 6), vec![false; 6]);
+
+        let all_null = vec![false; 12];
+        let nulls = NullBuffer::new(BooleanBuffer::from(all_null).slice(3, 6));
+        let mut out = Vec::new();
+        write_qwp_bitmap_from_arrow(&mut out, &nulls).unwrap();
+        assert_eq!(decode_qwp_nulls(&out, 6), vec![true; 6]);
+        assert_eq!(out[0] >> 6, 0, "trailing bits beyond row count must be 0");
     }
 
     #[test]

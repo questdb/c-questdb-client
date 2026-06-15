@@ -473,7 +473,13 @@ fn symbol_array(
             .get(code)
             .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
         union_bytes.extend_from_slice(s.as_bytes());
-        let next_off = union_bytes.len() as i32;
+        let next_off = i32::try_from(union_bytes.len()).map_err(|_| {
+            fmt!(
+                ProtocolError,
+                "symbol union dictionary exceeds {} bytes",
+                i32::MAX
+            )
+        })?;
         union_offsets.push(next_off);
         let assigned = (union_offsets.len() - 2) as u32;
         remap.insert(code, assigned);

@@ -314,7 +314,7 @@ fn append_table_seq_txns(payload: &mut Vec<u8>, entries: &[(&str, i64)]) {
     }
 }
 
-fn write_qwp_error_response(
+pub(crate) fn write_qwp_error_response(
     stream: &mut TcpStream,
     status: u8,
     wire_seq: u64,

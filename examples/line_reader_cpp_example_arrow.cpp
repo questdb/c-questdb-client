@@ -55,6 +55,11 @@ bool example()
         std::fprintf(stderr, "Error: %s\n", e.what());
         return false;
     }
+    catch (const ingress::line_sender_error& e)
+    {
+        std::fprintf(stderr, "Error: %s\n", e.what());
+        return false;
+    }
 }
 
 } // namespace

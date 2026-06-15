@@ -3856,6 +3856,33 @@ unsafe fn validate_arrow_schema_depth(
     }
 }
 
+// Minimum `n_buffers` arrow-rs's `from_ffi` requires for `dt` before it
+// would read an out-of-range / NULL buffer. Mirrors `arrow_data::layout`
+// (validity + data buffers; view types add a variadic lengths buffer)
+// without calling it — `layout` panics on a negative `FixedSizeBinary`
+// width. The catch-all is the validity + single-data-buffer family
+// (primitives, decimals, list, map, fixed-size-binary, temporal).
+#[cfg(feature = "arrow")]
+fn arrow_min_n_buffers(dt: &arrow::datatypes::DataType) -> i64 {
+    use arrow::datatypes::{DataType as D, UnionMode};
+    match dt {
+        D::Null | D::RunEndEncoded(..) => 0,
+        D::Struct(_) | D::FixedSizeList(..) => 1,
+        D::Union(_, UnionMode::Sparse) => 1,
+        D::Union(_, UnionMode::Dense) => 2,
+        D::Utf8
+        | D::LargeUtf8
+        | D::Binary
+        | D::LargeBinary
+        | D::Utf8View
+        | D::BinaryView
+        | D::ListView(_)
+        | D::LargeListView(_) => 3,
+        D::Dictionary(key, _) => arrow_min_n_buffers(key),
+        _ => 2,
+    }
+}
+
 // Cross-walk schema + array in lockstep. arrow-rs's `from_ffi` asserts on
 // mismatches between the two trees (`n_children` agreement for Struct /
 // Union, `n_buffers` consistency, etc.); under `panic = "abort"` that
@@ -3948,6 +3975,37 @@ unsafe fn validate_arrow_array_depth(
                     (*a).n_buffers,
                     MAX_ARROW_ARRAY_N_BUFFERS_PER_NODE
                 )));
+            }
+            // arrow-rs's `from_ffi` dereferences the buffer array and reads
+            // every buffer slot the data type's layout requires *before*
+            // `validate_full` runs. A NULL buffer pointer, fewer buffers
+            // than the layout demands (a view type with `< 3` buffers
+            // underflows `num_buffers - (2 + null_mask)`), or a negative
+            // `FixedSizeBinary` width (panics in `layout`) each abort the
+            // host under `panic = "abort"`. Reject them here.
+            if (*a).n_buffers > 0 && (*a).buffers.is_null() {
+                return Err(arrow_ingest_err(
+                    "Arrow array declares buffers but the buffer pointer is NULL",
+                ));
+            }
+            if let Ok(dt) = arrow::datatypes::DataType::try_from(&*s) {
+                if let arrow::datatypes::DataType::FixedSizeBinary(width) = &dt {
+                    if *width < 0 {
+                        return Err(arrow_ingest_err(format!(
+                            "Arrow FixedSizeBinary width {} is negative",
+                            width
+                        )));
+                    }
+                }
+                let min_buffers = arrow_min_n_buffers(&dt);
+                if (*a).n_buffers < min_buffers {
+                    return Err(arrow_ingest_err(format!(
+                        "Arrow array declares {} buffers but {:?} requires at least {}",
+                        (*a).n_buffers,
+                        dt,
+                        min_buffers
+                    )));
+                }
             }
             let dict_a = (*a).dictionary;
             let dict_s = (*s).dictionary;
@@ -5144,6 +5202,72 @@ mod tests {
                 assert!(
                     err.msg().contains("n_buffers"),
                     "expected n_buffers-cap error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_null_buffers_pointer_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).n_buffers = 2;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("buffer pointer is NULL"),
+                    "expected NULL-buffers error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_too_few_buffers_for_view_rejected() {
+            unsafe {
+                let format = CString::new("vu").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).n_buffers = 0;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("requires at least"),
+                    "expected too-few-buffers error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_negative_fixed_size_binary_width_rejected() {
+            unsafe {
+                let format = CString::new("w:-4").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).n_buffers = 0;
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("negative"),
+                    "expected negative-width error, got: {}",
                     err.msg()
                 );
             }

@@ -139,6 +139,13 @@ impl ColumnSender {
     /// On failure, the error is returned and `chunk` is left untouched.
     /// Transport and server failures latch the connection as terminal;
     /// validation and capacity failures leave it usable.
+    ///
+    /// `flush` does not wait for the server's per-frame ack, so a
+    /// server-side rejection of an already-written frame surfaces only on
+    /// a later `flush`/[`sync`](Self::sync) — not on this call. Call
+    /// [`sync`](Self::sync) before dropping the sender to observe those
+    /// acks; a sender dropped with frames still in flight discards the
+    /// connection (and their acks) rather than reusing it.
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
         let defer = self.first_frame_sent;
         self.flush_inner(chunk, defer)?;

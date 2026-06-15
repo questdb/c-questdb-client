@@ -774,8 +774,10 @@ public:
     borrowed_conn(borrowed_conn&& other) noexcept
         : _db{other._db}
         , _conn{std::move(other._conn)}
+        , _force_drop{other._force_drop}
     {
         other._db = nullptr;
+        other._force_drop = false;
     }
 
     borrowed_conn& operator=(borrowed_conn&& other) noexcept
@@ -785,7 +787,9 @@ public:
             release();
             _db = other._db;
             _conn = std::move(other._conn);
+            _force_drop = other._force_drop;
             other._db = nullptr;
+            other._force_drop = false;
         }
         return *this;
     }

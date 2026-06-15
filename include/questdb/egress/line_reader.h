@@ -201,9 +201,12 @@ typedef enum line_reader_error_code
      *  drift is discarded — re-issue the query if you need it. Only
      *  emitted when the `arrow` feature is enabled. */
     line_reader_error_schema_drift = 22,
-    /** `line_reader_cursor_next_arrow_batch` was called on a stream
-     *  that terminated before any batch was produced — no schema to
-     *  snapshot. Only emitted when the `arrow` feature is enabled. */
+    /** A higher-level streaming Arrow adapter (Rust `as_arrow_reader` /
+     *  `iter_polars`) was asked for a schema on a stream that terminated
+     *  before any batch was produced. `line_reader_cursor_next_arrow_batch`
+     *  itself reports an empty stream as `line_reader_arrow_batch_end`, so
+     *  pure-C callers do not observe this code. Only present when the
+     *  `arrow` feature is enabled. */
     line_reader_error_no_schema = 23,
     /** Arrow C Data Interface export failed (arrow-rs rejected the
      *  produced `ArrayData`'s invariants). Indicates a client bug —

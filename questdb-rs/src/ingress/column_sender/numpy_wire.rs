@@ -909,13 +909,21 @@ where
             value
         )
     };
+    // numpy NaT is `i64::MIN`, which is also QuestDB's i64 null sentinel
+    // (`I64_NULL`). Map it straight through to null so an in-band NaT is
+    // treated consistently with the direct (already-µs) paths instead of
+    // failing the whole batch on conversion overflow.
     match validity {
         None => {
             out.push(0);
             out.reserve(8 * row_count);
             for i in 0..row_count {
                 let value = unsafe { *typed.add(i) };
-                let micros = convert(value).ok_or_else(|| make_err(i, value))?;
+                let micros = if value == I64_NULL {
+                    I64_NULL
+                } else {
+                    convert(value).ok_or_else(|| make_err(i, value))?
+                };
                 out.extend_from_slice(&micros.to_le_bytes());
             }
         }
@@ -928,7 +936,11 @@ where
                     continue;
                 }
                 let value = unsafe { *typed.add(i) };
-                let micros = convert(value).ok_or_else(|| make_err(i, value))?;
+                let micros = if value == I64_NULL {
+                    I64_NULL
+                } else {
+                    convert(value).ok_or_else(|| make_err(i, value))?
+                };
                 out.extend_from_slice(&micros.to_le_bytes());
             }
         }
@@ -1648,6 +1660,20 @@ mod tests {
     fn datetime_day_matches_column_ts_micros() {
         let src = [0i64, 1, 18262]; // epoch, +1d, 2020-01-01
         let expected = [0i64, 86_400_000_000, 18262 * 86_400_000_000];
+        let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            encode_datetime_col(NumpyDtype::DatetimeDayToMicros, &raw, src.len()),
+            encode_micros_col(&expected),
+        );
+    }
+
+    #[test]
+    fn datetime_nat_maps_to_null_not_error() {
+        // numpy NaT is `i64::MIN`, which is also QuestDB's i64 null
+        // sentinel (`I64_NULL`). The converting path must pass it through
+        // as null rather than failing the whole batch on overflow.
+        let src = [0i64, i64::MIN, 1];
+        let expected = [0i64, i64::MIN, 86_400_000_000];
         let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
         assert_eq!(
             encode_datetime_col(NumpyDtype::DatetimeDayToMicros, &raw, src.len()),

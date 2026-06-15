@@ -157,6 +157,35 @@ impl ColumnConn {
         })
     }
 
+    /// Build a connection around an already-open `stream` without the
+    /// handshake. The socket is never touched by the ack-bookkeeping
+    /// logic, so tests can drive `process_response` / `push_pending`
+    /// against a dummy connected pair.
+    #[cfg(test)]
+    pub(crate) fn for_test(stream: WsStream, durable_ack_opt_in: bool) -> Self {
+        Self {
+            stream,
+            leftover: Vec::new(),
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            mask_keys: MaskKeySource::new().expect("test mask key source"),
+            next_fsn: 0,
+            pending_acks: VecDeque::new(),
+            in_flight: 0,
+            durable_watermarks: HashMap::new(),
+            pending_durable_targets: HashMap::new(),
+            must_close: false,
+            max_buf_size: 1 << 20,
+            request_timeout: Duration::from_secs(30),
+            durable_ack_opt_in,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_durable_target_count(&self) -> usize {
+        self.pending_durable_targets.len()
+    }
+
     pub(crate) fn must_close(&self) -> bool {
         self.must_close
     }
@@ -386,15 +415,22 @@ impl ColumnConn {
                         self.in_flight
                     )
                 })?;
-                for (t, seq_txn) in tables {
-                    self.pending_durable_targets
-                        .entry(t)
-                        .and_modify(|w| {
-                            if seq_txn > *w {
-                                *w = seq_txn;
-                            }
-                        })
-                        .or_insert(seq_txn);
+                // Only meaningful when durable acks are enabled: a later
+                // `sync(Durable)` waits on these targets. Without the
+                // opt-in, `Durable` is rejected up front and the map is
+                // never pruned, so accumulating here would leak one entry
+                // per distinct table for the life of a pooled connection.
+                if self.durable_ack_opt_in {
+                    for (t, seq_txn) in tables {
+                        self.pending_durable_targets
+                            .entry(t)
+                            .and_modify(|w| {
+                                if seq_txn > *w {
+                                    *w = seq_txn;
+                                }
+                            })
+                            .or_insert(seq_txn);
+                    }
                 }
                 Ok(())
             }
@@ -1037,5 +1073,102 @@ mod tests {
         // status=PARSE_ERROR but only the status byte present
         let err = parse_qwp_response(&[QWP_STATUS_PARSE_ERROR]).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::SocketError);
+    }
+
+    fn dummy_ws_stream() -> WsStream {
+        use crate::ws::nosigpipe::NoSigpipeTcp;
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        // Keep the accepted peer alive only long enough to complete the
+        // connect; the ack-bookkeeping path never touches the socket.
+        let _server = listener.accept().expect("accept");
+        WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe"))
+    }
+
+    #[test]
+    fn process_ok_pops_pending_and_tracks_durable_when_opted_in() {
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), true);
+        conn.push_pending(0);
+        conn.process_response(QwpResponse::Ok {
+            sequence: 0,
+            tables: vec![("trades".to_string(), 7)],
+        })
+        .expect("matching ok");
+        assert_eq!(conn.in_flight(), 0);
+        assert_eq!(conn.pending_durable_target_count(), 1);
+        assert!(!conn.must_close());
+    }
+
+    #[test]
+    fn process_ok_skips_durable_targets_without_opt_in() {
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        conn.push_pending(0);
+        conn.process_response(QwpResponse::Ok {
+            sequence: 0,
+            tables: vec![("trades".to_string(), 7), ("quotes".to_string(), 3)],
+        })
+        .expect("matching ok");
+        assert_eq!(conn.in_flight(), 0);
+        assert_eq!(
+            conn.pending_durable_target_count(),
+            0,
+            "durable targets must not accumulate without request_durable_ack"
+        );
+    }
+
+    #[test]
+    fn process_unmatched_ok_latches_connection() {
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        // No pending frame: an OK that matches nothing is a protocol error.
+        let err = conn
+            .process_response(QwpResponse::Ok {
+                sequence: 0,
+                tables: vec![],
+            })
+            .expect_err("unmatched ok must error");
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(conn.must_close());
+    }
+
+    #[test]
+    fn process_stale_ok_below_pending_fsn_latches() {
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+        conn.push_pending(5);
+        // An OK whose sequence precedes the oldest pending frame matches
+        // nothing and must latch rather than silently drop.
+        let err = conn
+            .process_response(QwpResponse::Ok {
+                sequence: 3,
+                tables: vec![],
+            })
+            .expect_err("stale ok must error");
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(conn.must_close());
+    }
+
+    #[test]
+    fn process_error_frame_maps_status_and_latches() {
+        for (status, expected) in [
+            (QWP_STATUS_SCHEMA_MISMATCH, crate::ErrorCode::InvalidApiCall),
+            (
+                QWP_STATUS_INTERNAL_ERROR,
+                crate::ErrorCode::ServerFlushError,
+            ),
+            (QWP_STATUS_SECURITY_ERROR, crate::ErrorCode::AuthError),
+            (QWP_STATUS_WRITE_ERROR, crate::ErrorCode::ServerFlushError),
+        ] {
+            let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
+            let err = conn
+                .process_response(QwpResponse::Error {
+                    sequence: 0,
+                    status,
+                    message: "boom".to_string(),
+                })
+                .expect_err("server error must surface");
+            assert_eq!(err.code(), expected, "status 0x{status:02x}");
+            assert!(conn.must_close(), "error must latch the connection");
+        }
     }
 }

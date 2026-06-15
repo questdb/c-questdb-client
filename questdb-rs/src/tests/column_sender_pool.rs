@@ -46,7 +46,9 @@ use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::column_sender::{AckLevel, Chunk, QuestDb};
-use crate::tests::qwp_ws::{perform_server_upgrade, read_frame, write_qwp_ok_response};
+use crate::tests::qwp_ws::{
+    perform_server_upgrade, read_frame, write_qwp_error_response, write_qwp_ok_response,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum MockMode {
@@ -54,6 +56,8 @@ enum MockMode {
     Park,
     /// Read every QWP frame the client sends and reply with an OK ack.
     AckEachFrame,
+    /// Reply to every QWP frame with an error ack carrying `status`.
+    ErrorEachFrame(u8),
 }
 
 /// Spawn a mock server that performs the WS upgrade for up to `max_accepts`
@@ -73,6 +77,10 @@ impl MockServer {
 
     fn spawn_acking(max_accepts: usize) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::AckEachFrame)
+    }
+
+    fn spawn_erroring(max_accepts: usize, status: u8) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::ErrorEachFrame(status))
     }
 
     fn spawn_with_mode(max_accepts: usize, mode: MockMode) -> Self {
@@ -109,6 +117,9 @@ impl MockServer {
                                         MockMode::Park => park_connection(&mut stream, &stop),
                                         MockMode::AckEachFrame => {
                                             ack_each_frame(&mut stream, &stop)
+                                        }
+                                        MockMode::ErrorEachFrame(status) => {
+                                            error_each_frame(&mut stream, &stop, status)
                                         }
                                     }
                                 }
@@ -188,6 +199,37 @@ fn ack_each_frame(stream: &mut std::net::TcpStream, stop: &AtomicBool) {
                     continue;
                 }
                 if write_qwp_ok_response(stream, next_wire_seq).is_err() {
+                    break;
+                }
+                next_wire_seq += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Like [`ack_each_frame`] but replies to each binary frame with a QWP
+/// error ack carrying `status`, so tests can exercise the server-error
+/// latch + pool-drop path.
+fn error_each_frame(stream: &mut std::net::TcpStream, stop: &AtomicBool, status: u8) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut next_wire_seq: u64 = 0;
+    while !stop.load(Ordering::SeqCst) {
+        match read_frame(stream) {
+            Ok((_fin, opcode, _payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                if write_qwp_error_response(stream, status, next_wire_seq, b"injected").is_err() {
                     break;
                 }
                 next_wire_seq += 1;
@@ -618,6 +660,39 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
     chunk.designated_timestamp_nanos(&[5, 6, 7, 8]).unwrap();
     sender.flush(&mut chunk).unwrap();
     sender.sync(AckLevel::Ok).expect("symbol flush 2");
+}
+
+#[test]
+fn server_error_latches_conn_and_pool_drops_it() {
+    // Status 0x09 = QWP write error → ServerFlushError.
+    let server = MockServer::spawn_erroring(4, 0x09);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+    ))
+    .unwrap();
+    {
+        let mut sender = db.borrow_sender().expect("borrow");
+        let err = sender
+            .sync(AckLevel::Ok)
+            .expect_err("server error must surface");
+        assert_eq!(err.code(), ErrorCode::ServerFlushError);
+        // The server's status byte and message must survive the round-trip.
+        assert!(err.msg().contains("0x09"), "msg: {}", err.msg());
+        assert!(err.msg().contains("injected"), "msg: {}", err.msg());
+        assert!(sender.must_close(), "errored conn must be latched");
+        assert_eq!(db.in_use_count(), 1);
+    }
+    // The latched connection must be dropped, not returned to the free pool.
+    assert_eq!(db.free_count(), 0, "latched conn must not be recycled");
+    assert_eq!(db.in_use_count(), 0);
+    // The next borrow must therefore open a brand-new physical connection.
+    let _fresh = db.borrow_sender().expect("re-borrow after drop");
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 2),
+        "re-borrow must open a new connection; accepted={}",
+        server.accepted()
+    );
 }
 
 #[test]

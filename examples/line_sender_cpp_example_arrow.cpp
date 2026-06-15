@@ -47,18 +47,22 @@ bool example(const std::string& host, const std::string& port)
         ::questdb_db_connect(conf_str.data(), conf_str.size(), &err);
     if (!db)
     {
+        size_t err_len = 0;
+        const char* err_msg = ::line_sender_error_msg(err, &err_len);
         std::fprintf(
-            stderr, "questdb_db_connect: %s\n",
-            ::line_sender_error_msg(err, nullptr));
+            stderr, "questdb_db_connect: %.*s\n",
+            static_cast<int>(err_len), err_msg);
         ::line_sender_error_free(err);
         return false;
     }
     ::qwpws_conn* raw_conn = ::questdb_db_borrow_conn(db, &err);
     if (!raw_conn)
     {
+        size_t err_len = 0;
+        const char* err_msg = ::line_sender_error_msg(err, &err_len);
         std::fprintf(
-            stderr, "questdb_db_borrow_conn: %s\n",
-            ::line_sender_error_msg(err, nullptr));
+            stderr, "questdb_db_borrow_conn: %.*s\n",
+            static_cast<int>(err_len), err_msg);
         ::line_sender_error_free(err);
         ::questdb_db_close(db);
         return false;
@@ -95,9 +99,11 @@ bool example(const std::string& host, const std::string& port)
             conn.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
             if (!::column_sender_sync(raw_conn, ::column_sender_ack_level_ok, &err))
             {
+                size_t err_len = 0;
+                const char* err_msg = ::line_sender_error_msg(err, &err_len);
                 std::fprintf(
-                    stderr, "column_sender_sync: %s\n",
-                    ::line_sender_error_msg(err, nullptr));
+                    stderr, "column_sender_sync: %.*s\n",
+                    static_cast<int>(err_len), err_msg);
                 ::line_sender_error_free(err);
             }
             else
