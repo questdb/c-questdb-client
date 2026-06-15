@@ -549,6 +549,17 @@ bool column_sender_chunk_symbol_dict_i32(
  * `line_sender_error_arrow_unsupported_column_kind`. Structural
  * failures (validity-count mismatch, ms→µs overflow, decimal scale
  * out of range, etc.) return `line_sender_error_arrow_ingest`.
+ *
+ * Buffer-size trust boundary: the struct is validated for structural
+ * sanity (non-NULL mandatory pointers, non-negative length/offset/child
+ * counts, bounded nesting depth and `row_count`) so that a malformed
+ * struct returns an error rather than aborting. It is NOT possible to
+ * validate the *sizes* of the producer's buffers — the Arrow C Data
+ * Interface carries no buffer byte-length. A producer that declares a
+ * `length`/offsets inconsistent with its actual buffer allocations
+ * causes out-of-bounds reads (undefined behavior). The caller is
+ * responsible for passing arrays whose buffers match their declared
+ * length. First-party producers (pyarrow, polars) always satisfy this.
  * ------------------------------------------------------------------------- */
 
 /* Apache Arrow C Data Interface boilerplate. Guarded by

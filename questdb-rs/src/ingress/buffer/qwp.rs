@@ -9310,6 +9310,37 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_columnar_column_identity_is_case_insensitive_unicode() {
+        // Uppercase É (U+00C9) and lowercase é (U+00E9) are non-ASCII, so the
+        // lookup must Unicode-case-fold rather than byte-level ASCII-fold to
+        // resolve both spellings to the same column.
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_i64("CAFÉ", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("café", 8)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        assert_eq!(
+            decode_single_i64_column_ws_replay(&scratch.message),
+            vec![("trades".to_owned(), "CAFÉ".to_owned(), vec![7, 8])]
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_columnar_type_mismatch_rolls_back_partial_row() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         let mut scratch = QwpWsEncodeScratch::new();

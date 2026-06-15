@@ -3025,9 +3025,10 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
 
 /// Grant the server an additional CREDIT budget. Only valid for cursors
 /// started with `initial_credit > 0`. Invalidates the current batch handle
-/// and every pointer borrowed from it (routes through `cursor_for_mut`),
-/// and may transparently trigger mid-query failover when the CREDIT write
-/// hits a transport failure.
+/// and every pointer borrowed from it (routes through `cursor_for_aux`,
+/// which clears the batch but preserves any Arrow schema pin), and may
+/// transparently trigger mid-query failover when the CREDIT write hits a
+/// transport failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_add_credit(
     cursor: *mut line_reader_cursor,

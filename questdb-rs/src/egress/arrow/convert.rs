@@ -348,6 +348,7 @@ fn boolean_array(buf: ColumnBuffer, row_count: usize) -> Result<BooleanArray> {
         .len(row_count)
         .add_buffer(buf)
         .nulls(nulls)
+        .align_buffers(true)
         .build()
         .map_err(|e| to_arrow_export(e.to_string()))?;
     Ok(BooleanArray::from(data))

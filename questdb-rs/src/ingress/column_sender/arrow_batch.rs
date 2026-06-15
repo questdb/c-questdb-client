@@ -1680,6 +1680,12 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
     // indices must be rebased by `leaf_offset` before use.
     let leaf_offset = leaf_array.offset();
     let leaf_values_all = leaf_array.values();
+    // The QWP ARRAY(DOUBLE) wire format is dense with no per-element null
+    // channel: a NULL leaf element would ship the undefined value-buffer slot
+    // as a real double (silent corruption). Reject it. Checked per emitted
+    // range below so null *rows* (handled by the column validity bitmap) are
+    // not mistaken for null elements.
+    let leaf_has_nulls = leaf_array.null_count() > 0;
     let mut shape: Vec<usize> = Vec::with_capacity(ndim);
     for row in 0..row_count {
         if arr.is_null(row) {
@@ -1720,6 +1726,17 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
                 local_end,
                 leaf_values_all.len()
             ));
+        }
+        if leaf_has_nulls {
+            for k in local_start..local_end {
+                if leaf_array.is_null(k) {
+                    return Err(fmt!(
+                        ArrowUnsupportedColumnKind,
+                        "ARRAY column has a NULL element; QuestDB ARRAY(DOUBLE) \
+                         ingress does not support NULL array elements"
+                    ));
+                }
+            }
         }
         let leaf_values = &leaf_values_all[local_start..local_end];
         try_reserve_bytes(
@@ -5203,6 +5220,29 @@ mod tests {
         );
         let rb = single_col_batch(field, arr);
         assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn nested_double_list_with_null_leaf_rejected() {
+        let mut single = ListBuilder::new(Float64Builder::new());
+        single.values().append_value(1.0);
+        single.values().append_null();
+        single.values().append_value(3.0);
+        single.append(true);
+        let arr = single.finish();
+        let field = Field::new(
+            "a",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        );
+        let rb = single_col_batch(field, arr);
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
+        assert!(
+            err.msg().contains("does not support NULL array element"),
+            "got: {}",
+            err.msg()
+        );
     }
 
     #[test]

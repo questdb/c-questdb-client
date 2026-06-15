@@ -327,6 +327,7 @@ impl ColumnConn {
     /// Block until at least one OK ack arrives. Used when
     /// `in_flight == MAX_IN_FLIGHT` to free a slot.
     pub(crate) fn drain_one_ack_blocking(&mut self) -> Result<()> {
+        self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
         loop {
             let response = self.recv_qwp_response()?;
             match &response {
@@ -352,6 +353,11 @@ impl ColumnConn {
             ));
         }
         self.validate_ack_level(ack_level)?;
+
+        // Arm the blocking-read timeout explicitly rather than relying on a
+        // prior `publish_qwp` having set it on this socket; a sync with no
+        // preceding publish must not block forever on a dead peer.
+        self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
 
         while self.in_flight > 0 {
             let response = self.recv_qwp_response()?;

@@ -288,10 +288,12 @@ impl NumpyDtype {
 ///
 /// `data` must be either NULL with `row_count == 0`, or point to at
 /// least `row_count * size_of(<source dtype>)` valid contiguous bytes
-/// (one byte per row for `Bool`). `validity`, if present, must reference
-/// a bitmap of at least `ceil(row_count / 8)` bytes; the caller is
-/// responsible for keeping all referenced memory alive for the duration
-/// of the call.
+/// (one byte per row for `Bool`; for the n-dimensional `F64Ndarray`
+/// variant each row is a full tensor, so the requirement is
+/// `row_count * prod(shape) * 8` bytes). `validity`, if present, must
+/// reference a bitmap of at least `ceil(row_count / 8)` bytes; the caller
+/// is responsible for keeping all referenced memory alive for the
+/// duration of the call.
 pub(crate) unsafe fn emit_into_wire(
     out: &mut Vec<u8>,
     dtype: NumpyDtype,

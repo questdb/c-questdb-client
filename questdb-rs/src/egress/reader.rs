@@ -1629,8 +1629,12 @@ impl<'r> Cursor<'r> {
         }
     }
 
-    // Replay-contract stash for errors that bypass `next_batch_inner`
-    // (schema drift, batch_to_record_batch). Cursor stays live.
+    // Replay-contract stash for fatal errors that bypass `next_batch_inner`
+    // (missing/invalid Arrow schema, `batch_to_record_batch`): marks the
+    // cursor terminal so the error replays on every later call instead of
+    // silently advancing. Schema drift is deliberately NOT stashed — it
+    // leaves the cursor live so the caller can re-snapshot and resume on the
+    // next batch (see `next_arrow_batch_inner`).
     #[cfg(feature = "arrow")]
     fn stash_arrow_terminal_error(&mut self, err: &Error) {
         self.done = true;

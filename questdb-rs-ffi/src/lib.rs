@@ -4006,6 +4006,33 @@ unsafe fn validate_arrow_array_depth(
                         min_buffers
                     )));
                 }
+                // arrow-rs `from_ffi` dereferences the offset buffer of a
+                // variable-width array (and the variadic-lengths buffer of a
+                // view array) to size the data buffer, *before* `validate_full`
+                // runs. A NULL pointer in those slots aborts the host under
+                // `panic = "abort"`. Other NULL slots (e.g. an empty data
+                // buffer, a NULL validity mask) import safely, so only reject
+                // the eagerly-dereferenced ones here.
+                use arrow::datatypes::DataType;
+                let buffers = (*a).buffers;
+                let var_width = matches!(
+                    dt,
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+                );
+                if var_width && (*a).length > 0 && (*buffers.add(1)).is_null() {
+                    return Err(arrow_ingest_err(
+                        "Arrow variable-width array offset buffer (slot 1) is NULL",
+                    ));
+                }
+                let view = matches!(dt, DataType::Utf8View | DataType::BinaryView);
+                if view
+                    && (*a).n_buffers > 3
+                    && (*buffers.add(((*a).n_buffers - 1) as usize)).is_null()
+                {
+                    return Err(arrow_ingest_err(
+                        "Arrow view array variadic-lengths buffer is NULL",
+                    ));
+                }
             }
             let dict_a = (*a).dictionary;
             let dict_s = (*s).dictionary;
@@ -5224,6 +5251,41 @@ mod tests {
                 assert!(
                     err.msg().contains("buffer pointer is NULL"),
                     "expected NULL-buffers error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_null_offset_buffer_slot_rejected() {
+            // Utf8 with a non-NULL buffers array but a NULL offsets slot
+            // (index 1) — the slot arrow-rs `from_ffi` dereferences before
+            // `validate_full`, which would abort under `panic = "abort"`.
+            unsafe {
+                let format = CString::new("u").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                let validity: u8 = 0;
+                let data: u8 = 0;
+                let mut slots: [*const std::ffi::c_void; 3] = [
+                    &validity as *const u8 as *const std::ffi::c_void,
+                    std::ptr::null(),
+                    &data as *const u8 as *const std::ffi::c_void,
+                ];
+                (*a_raw).length = 1;
+                (*a_raw).n_buffers = 3;
+                (*a_raw).buffers = slots.as_mut_ptr();
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                (*a_raw).buffers = std::ptr::null_mut();
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("offset buffer"),
+                    "expected NULL offset-buffer rejection, got: {}",
                     err.msg()
                 );
             }
