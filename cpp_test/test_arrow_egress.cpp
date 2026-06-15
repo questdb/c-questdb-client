@@ -129,7 +129,7 @@ TEST_CASE("arrow egress: single Long batch — struct layout + release order")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[col_v](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 3, {col_v});
+            return qm::result_batch_frame(rid, 0, 3, {col_v});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -197,7 +197,7 @@ TEST_CASE("arrow egress: mixed kinds — Bool / Byte / Short / Int / Long / Floa
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[cols](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, cols);
+            return qm::result_batch_frame(rid, 0, 2, cols);
         }},
         qm::ActionSendResultEnd{},
     };
@@ -240,7 +240,7 @@ TEST_CASE("arrow egress: TIMESTAMP / TIMESTAMP_NS / DATE — timezone-carrying f
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, {c_ts, c_ts_ns, c_date});
+            return qm::result_batch_frame(rid, 0, 2, {c_ts, c_ts_ns, c_date});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -277,7 +277,7 @@ TEST_CASE("arrow egress: VARCHAR + BINARY — variable-length format codes")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 3, {c_v, c_b});
+            return qm::result_batch_frame(rid, 0, 3, {c_v, c_b});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -311,7 +311,7 @@ TEST_CASE("arrow egress: UUID — FixedSizeBinary(16) with arrow.uuid extension 
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, {c_uuid});
+            return qm::result_batch_frame(rid, 0, 2, {c_uuid});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -344,7 +344,7 @@ TEST_CASE("arrow egress: LONG256 — FixedSizeBinary(32)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, {c_l256});
+            return qm::result_batch_frame(rid, 0, 2, {c_l256});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -371,7 +371,7 @@ TEST_CASE("arrow egress: SYMBOL — Dictionary(UInt32, Utf8) with questdb.symbol
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
             return qm::result_batch_frame_with_dict(
-                rid, 0, 1, 3, {c_sym},
+                rid, 0, 3, {c_sym},
                 /*dict_delta_start=*/0,
                 {"alpha", "beta"});
         }},
@@ -412,7 +412,7 @@ TEST_CASE("arrow egress: DECIMAL64 / DECIMAL128 / DECIMAL256 — decimal format 
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, {c_d64, c_d128, c_d256});
+            return qm::result_batch_frame(rid, 0, 2, {c_d64, c_d128, c_d256});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -448,7 +448,7 @@ TEST_CASE("arrow egress: DOUBLE_ARRAY — nested List(Float64)")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, {c_arr});
+            return qm::result_batch_frame(rid, 0, 2, {c_arr});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -483,7 +483,7 @@ TEST_CASE("arrow egress: stream exhaustion — second call returns nullopt")
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[=](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {c});
+            return qm::result_batch_frame(rid, 0, 1, {c});
         }},
         qm::ActionSendResultEnd{},
     };
@@ -497,38 +497,45 @@ TEST_CASE("arrow egress: stream exhaustion — second call returns nullopt")
     CHECK(!h.cursor.next_arrow_batch().has_value());
 }
 
-TEST_CASE("arrow egress: schema drift — dtype change between batches throws schema_drift")
+// Since #156 the schema rides batch 0 only; continuation batches reuse it,
+// so a continuation batch can no longer declare a different column dtype,
+// name, or count. The one schema dimension that is still inferred per-batch
+// is array ndim (derived from each batch's row shapes, not the query
+// schema), so that is the only mid-stream drift the streaming Arrow adapter
+// can observe end-to-end.
+TEST_CASE("arrow egress: schema drift — array ndim change between batches throws schema_drift")
 {
+    std::vector<std::optional<qm::ArrayRow>> b1_rows = {
+        qm::ArrayRow{{3}, pack_le<double>({1.0, 2.0, 3.0})}};
+    std::vector<std::optional<qm::ArrayRow>> b2_rows = {
+        qm::ArrayRow{{2, 2}, pack_le<double>({1.0, 2.0, 3.0, 4.0})}};
     qm::ColumnSpec b1_col{
-        "v", qm::COL_LONG,
-        qm::fixed_column_bytes(2, pack_le<int64_t>({10, 20}))};
+        "a", qm::COL_DOUBLE_ARRAY, qm::array_column_bytes(b1_rows)};
     qm::ColumnSpec b2_col{
-        "v", qm::COL_INT,
-        qm::fixed_column_bytes(2, pack_le<int32_t>({30, 40}))};
+        "a", qm::COL_DOUBLE_ARRAY, qm::array_column_bytes(b2_rows)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[b1_col](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, {b1_col});
+            return qm::result_batch_frame(rid, 0, 1, {b1_col});
         }},
         qm::ActionSendBuilt{[b2_col](int64_t rid) {
-            return qm::result_batch_frame(rid, 1, 2, 2, {b2_col});
+            return qm::result_batch_frame(rid, 1, 1, {b2_col});
         }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
-    auto h = open_cursor(srv, "select v from t");
+    auto h = open_cursor(srv, "select a from t");
 
     auto first = h.cursor.next_arrow_batch();
     REQUIRE(first.has_value());
-    CHECK(first->array.length == 2);
-    CHECK(std::string(first->schema.children[0]->format) == "l");
+    CHECK(std::string(first->schema.children[0]->format) == "+l"); // 1-D List
     release_pair(&first->array, &first->schema);
 
     try
     {
         (void)h.cursor.next_arrow_batch();
-        FAIL("expected schema_drift on second batch with changed dtype");
+        FAIL("expected schema_drift on second batch with changed array ndim");
     }
     catch (const egress::line_reader_error& e)
     {
@@ -536,81 +543,43 @@ TEST_CASE("arrow egress: schema drift — dtype change between batches throws sc
     }
 }
 
-TEST_CASE("arrow egress: schema drift — column rename between batches throws schema_drift")
+// Batch 0's only array row is null, so ndim can't be inferred and the field
+// is marked tentative. A later firm batch refines ndim; the streaming
+// adapter accepts this as an upgrade (`schemas_equal` ignores ndim while
+// either side is tentative) rather than rejecting it as drift.
+TEST_CASE("arrow egress: schema drift — tentative→firm array ndim upgrade does NOT drift")
 {
+    std::vector<std::optional<qm::ArrayRow>> b1_rows = {std::nullopt};
+    std::vector<std::optional<qm::ArrayRow>> b2_rows = {
+        qm::ArrayRow{{3}, pack_le<double>({1.0, 2.0, 3.0})}};
     qm::ColumnSpec b1_col{
-        "v", qm::COL_LONG,
-        qm::fixed_column_bytes(1, pack_le<int64_t>({1}))};
+        "a", qm::COL_DOUBLE_ARRAY, qm::array_column_bytes(b1_rows)};
     qm::ColumnSpec b2_col{
-        "w", qm::COL_LONG,
-        qm::fixed_column_bytes(1, pack_le<int64_t>({2}))};
+        "a", qm::COL_DOUBLE_ARRAY, qm::array_column_bytes(b2_rows)};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[b1_col](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {b1_col});
+            return qm::result_batch_frame(rid, 0, 1, {b1_col});
         }},
         qm::ActionSendBuilt{[b2_col](int64_t rid) {
-            return qm::result_batch_frame(rid, 1, 2, 1, {b2_col});
+            return qm::result_batch_frame(rid, 1, 1, {b2_col});
         }},
         qm::ActionSendResultEnd{},
     };
     qm::MockServer srv({s});
-    auto h = open_cursor(srv, "select v from t");
+    auto h = open_cursor(srv, "select a from t");
 
     auto first = h.cursor.next_arrow_batch();
     REQUIRE(first.has_value());
     release_pair(&first->array, &first->schema);
 
-    try
-    {
-        (void)h.cursor.next_arrow_batch();
-        FAIL("expected schema_drift on column rename");
-    }
-    catch (const egress::line_reader_error& e)
-    {
-        CHECK(e.code() == egress::error_code::schema_drift);
-    }
-}
+    auto second = h.cursor.next_arrow_batch();
+    REQUIRE(second.has_value());
+    CHECK(std::string(second->schema.children[0]->format) == "+l"); // 1-D List
+    release_pair(&second->array, &second->schema);
 
-TEST_CASE("arrow egress: schema drift — column count change throws schema_drift")
-{
-    qm::ColumnSpec b1_v{
-        "v", qm::COL_LONG,
-        qm::fixed_column_bytes(1, pack_le<int64_t>({1}))};
-    qm::ColumnSpec b2_v{
-        "v", qm::COL_LONG,
-        qm::fixed_column_bytes(1, pack_le<int64_t>({2}))};
-    qm::ColumnSpec b2_extra{
-        "extra", qm::COL_INT,
-        qm::fixed_column_bytes(1, pack_le<int32_t>({3}))};
-    qm::Script s = {
-        qm::ActionSendServerInfo{},
-        qm::ActionAwaitQueryRequest{},
-        qm::ActionSendBuilt{[b1_v](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 1, {b1_v});
-        }},
-        qm::ActionSendBuilt{[b2_v, b2_extra](int64_t rid) {
-            return qm::result_batch_frame(rid, 1, 2, 1, {b2_v, b2_extra});
-        }},
-        qm::ActionSendResultEnd{},
-    };
-    qm::MockServer srv({s});
-    auto h = open_cursor(srv, "select * from t");
-
-    auto first = h.cursor.next_arrow_batch();
-    REQUIRE(first.has_value());
-    release_pair(&first->array, &first->schema);
-
-    try
-    {
-        (void)h.cursor.next_arrow_batch();
-        FAIL("expected schema_drift on column count change");
-    }
-    catch (const egress::line_reader_error& e)
-    {
-        CHECK(e.code() == egress::error_code::schema_drift);
-    }
+    CHECK(!h.cursor.next_arrow_batch().has_value());
 }
 
 TEST_CASE("arrow egress: schema drift — same schema across batches does NOT drift")
@@ -622,10 +591,10 @@ TEST_CASE("arrow egress: schema drift — same schema across batches does NOT dr
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
         qm::ActionSendBuilt{[b_col](int64_t rid) {
-            return qm::result_batch_frame(rid, 0, 1, 2, {b_col});
+            return qm::result_batch_frame(rid, 0, 2, {b_col});
         }},
         qm::ActionSendBuilt{[b_col](int64_t rid) {
-            return qm::result_batch_frame(rid, 1, 2, 2, {b_col});
+            return qm::result_batch_frame(rid, 1, 2, {b_col});
         }},
         qm::ActionSendResultEnd{},
     };
