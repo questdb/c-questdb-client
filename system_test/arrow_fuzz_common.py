@@ -1321,6 +1321,11 @@ class ArrowFuzzBase(unittest.TestCase):
         except ImportError:
             self.skipTest("pyarrow is required for the Arrow system tests")
         self._fixture = get_live_fixture(self)
+        # Arrow ingest/egress ride QWP/WebSocket, exposed only by repo (master)
+        # builds for now — same repo-only gate as the QWP/WS tests in test.py.
+        root_dir = getattr(self._fixture, '_root_dir', None)
+        if root_dir is not None and root_dir.name != 'repo':
+            self.skipTest('Arrow system tests require a QuestDB repo (master) fixture')
         seed = derive_master_seed()
         self._master_rng = Rng(seed)
         self._seed_label = format_seed(seed)
