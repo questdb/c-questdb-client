@@ -3895,6 +3895,13 @@ unsafe fn validate_arrow_array_depth(
     // Shared children are legal — see validate_arrow_schema_depth for
     // the same rationale. Cycles are bounded by total + depth caps.
     unsafe {
+        // `DataType::try_from` (called per node below) recursively follows
+        // the schema's children and `dictionary` pointers, so a cyclic or
+        // over-deep schema would overflow the stack before the iterative
+        // depth cap here can fire. Bound the schema first with the
+        // cycle-safe walker (which never calls `try_from`); afterwards every
+        // `try_from` recurses at most `MAX_ARROW_SCHEMA_DEPTH` levels.
+        validate_arrow_schema_depth(schema)?;
         let mut stack: Vec<(
             *const arrow::ffi::FFI_ArrowArray,
             *const arrow::ffi::FFI_ArrowSchema,
@@ -3989,13 +3996,13 @@ unsafe fn validate_arrow_array_depth(
                 ));
             }
             if let Ok(dt) = arrow::datatypes::DataType::try_from(&*s) {
-                if let arrow::datatypes::DataType::FixedSizeBinary(width) = &dt {
-                    if *width < 0 {
-                        return Err(arrow_ingest_err(format!(
-                            "Arrow FixedSizeBinary width {} is negative",
-                            width
-                        )));
-                    }
+                if let arrow::datatypes::DataType::FixedSizeBinary(width) = &dt
+                    && *width < 0
+                {
+                    return Err(arrow_ingest_err(format!(
+                        "Arrow FixedSizeBinary width {} is negative",
+                        width
+                    )));
                 }
                 let min_buffers = arrow_min_n_buffers(&dt);
                 if (*a).n_buffers < min_buffers {
