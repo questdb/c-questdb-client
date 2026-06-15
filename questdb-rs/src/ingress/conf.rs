@@ -209,7 +209,8 @@ pub(crate) struct QwpWsConfig {
     /// Initial reconnect backoff; the reconnect loop doubles the delay up to
     /// `reconnect_max_backoff`.
     pub(crate) reconnect_initial_backoff: ConfigSetting<std::time::Duration>,
-    /// Cap on the per-attempt reconnect delay.
+    /// Cap on the reconnect backoff the retry loop doubles toward; the actual
+    /// per-attempt delay is this value jittered to ~[half, 1.5x].
     pub(crate) reconnect_max_backoff: ConfigSetting<std::time::Duration>,
     /// Initial-connect retry mode. Default is fail-fast after one endpoint
     /// round, matching Java's startup behavior.

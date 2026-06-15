@@ -367,7 +367,7 @@ public:
     explicit server_info_view(const ::line_reader_server_info* impl) noexcept
         : _impl{impl} {}
 
-    /** True if a `SERVER_INFO` is available (false for v1 servers). */
+    /** True if a `SERVER_INFO` is available. */
     explicit operator bool() const noexcept { return _impl != nullptr; }
 
     server_role role() const noexcept
@@ -592,7 +592,7 @@ public:
         return ::line_reader_failover_progress_event_elapsed_ns(_impl);
     }
 
-    /** `SERVER_INFO` for the new endpoint (Reset phase only, v2+ servers). */
+    /** `SERVER_INFO` for the new endpoint (Reset phase only). */
     server_info_view server_info() const noexcept
     {
         return server_info_view{
@@ -780,8 +780,9 @@ public:
         return v;
     }
 
-    /** Last-seen `SERVER_INFO`, or empty for v1 servers. The view is
-     *  invalidated by any reader operation that may reconnect.
+    /** Last-seen `SERVER_INFO`. The server always sends one, so the view
+     *  is empty only while a reconnect is in flight; it is invalidated by
+     *  any reader operation that may reconnect.
      *  @throws line_reader_error if this reader has been moved from. */
     server_info_view server_info() const
     {
@@ -2616,8 +2617,10 @@ public:
             ::line_reader_cursor_server_version, _impl, &v);
         return v;
     }
-    /** Last-seen `SERVER_INFO`, or empty for v1 servers. The view is
-     *  invalidated by any cursor operation that may reconnect.
+    /** Last-seen `SERVER_INFO` of the cursor's connected endpoint. The
+     *  server always sends one, so the view is empty only while a
+     *  reconnect is in flight; it is invalidated by any cursor operation
+     *  that may reconnect.
      *  @throws line_reader_error if this cursor has been moved from. */
     server_info_view server_info() const
     {
@@ -2668,7 +2671,9 @@ public:
         line_reader_error::wrapped_call(::line_reader_cursor_cancel, _impl);
     }
 
-    /** Grant additional CREDIT to the server.
+    /** Grant additional CREDIT to the server. Invalidates the current
+     *  `batch` and everything borrowed from it, and may transparently
+     *  trigger mid-query failover on a transport failure.
      *  @throws line_reader_error on transport failure or if this cursor
      *          has been moved from. */
     void add_credit(uint64_t additional_bytes)

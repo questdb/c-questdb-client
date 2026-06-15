@@ -47,7 +47,7 @@
 use proptest::prelude::*;
 
 use questdb::egress::_bench_internals::{
-    Bytes, SchemaRegistry, SymbolDict, ZstdScratch, decode_result_batch,
+    Bytes, Schema, SymbolDict, ZstdScratch, decode_result_batch,
 };
 use questdb::egress::ColumnKind;
 
@@ -56,7 +56,6 @@ use questdb::egress::ColumnKind;
 // ---------------------------------------------------------------------------
 
 const MSG_KIND_RESULT_BATCH: u8 = 0x11;
-const SCHEMA_MODE_FULL: u8 = 0x00;
 const NULL_FLAG_NONE: u8 = 0x00;
 const NULL_FLAG_PRESENT: u8 = 0x01;
 
@@ -378,9 +377,7 @@ fn generate_valid_message(seed: u64) -> Vec<u8> {
     varint_u64(row_count as u64, &mut out);
     varint_u64(col_count as u64, &mut out);
 
-    // Schema section: Full mode, fresh id.
-    out.push(SCHEMA_MODE_FULL);
-    varint_u64(1, &mut out);
+    // Columns inline: per-column (name, kind). No schema-mode byte, no schema id.
     for i in 0..col_count {
         varint_u64(names[i].len() as u64, &mut out);
         out.extend_from_slice(names[i].as_bytes());
@@ -395,20 +392,68 @@ fn generate_valid_message(seed: u64) -> Vec<u8> {
     out
 }
 
+/// Synthesise a valid two-batch query: the schema-bearing `batch_seq == 0`
+/// message plus a rows-only continuation (`batch_seq == 1`) over the same
+/// column set. The continuation carries no col_count and no inline schema —
+/// decoding it exercises the retained-schema path that single-message
+/// generation can't reach.
+fn generate_valid_query(seed: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut rng = SplitMix64::new(seed);
+    let row_count0 = rng.gen_range(20); // 0..20
+    let col_count = 1 + rng.gen_range(6); // 1..=6
+
+    let kinds: Vec<ColumnKind> = (0..col_count)
+        .map(|_| FUZZABLE_KINDS[rng.gen_range(FUZZABLE_KINDS.len())])
+        .collect();
+    let names: Vec<String> = (0..col_count).map(|i| format!("c{}", i)).collect();
+
+    let mut batch0 = Vec::new();
+    batch0.push(MSG_KIND_RESULT_BATCH);
+    batch0.extend_from_slice(&1i64.to_le_bytes());
+    varint_u64(0, &mut batch0); // batch_seq = 0
+    varint_u64(0, &mut batch0); // empty table name
+    varint_u64(row_count0 as u64, &mut batch0);
+    varint_u64(col_count as u64, &mut batch0);
+    for i in 0..col_count {
+        varint_u64(names[i].len() as u64, &mut batch0);
+        batch0.extend_from_slice(names[i].as_bytes());
+        batch0.push(kinds[i].as_u8());
+    }
+    for &kind in &kinds {
+        write_column_data(&mut batch0, &mut rng, kind, row_count0);
+    }
+
+    // Continuation: rows only — no col_count, no schema section. Row count
+    // may differ from batch 0; the schema constrains columns, not rows.
+    let row_count1 = rng.gen_range(20); // 0..20
+    let mut cont = Vec::new();
+    cont.push(MSG_KIND_RESULT_BATCH);
+    cont.extend_from_slice(&1i64.to_le_bytes());
+    varint_u64(1, &mut cont); // batch_seq = 1
+    varint_u64(0, &mut cont); // empty table name
+    varint_u64(row_count1 as u64, &mut cont);
+    for &kind in &kinds {
+        write_column_data(&mut cont, &mut rng, kind, row_count1);
+    }
+
+    (batch0, cont)
+}
+
 // ---------------------------------------------------------------------------
-// Decode helpers. Each call gets a fresh `SymbolDict` / `SchemaRegistry`
-// so a corrupted SYMBOL dict in one iteration can't poison the next.
+// Decode helpers. Each call gets a fresh `SymbolDict` and an empty
+// per-query schema (`Option<Schema>`) so a corrupted SYMBOL dict in one
+// iteration can't poison the next.
 // ---------------------------------------------------------------------------
 
 fn sanity_check_decode(message: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg = SchemaRegistry::new();
+    let mut schema: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     decode_result_batch(
         &Bytes::copy_from_slice(message),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     )
     .unwrap_or_else(|e| {
@@ -425,15 +470,78 @@ fn sanity_check_decode(message: &[u8]) {
 /// shrinkable failure.
 fn attempt_decode_no_panic(bytes: &[u8]) {
     let mut dict = SymbolDict::new();
-    let mut reg = SchemaRegistry::new();
+    let mut schema: Option<Schema> = None;
     let mut scratch = ZstdScratch::new();
     let _ = decode_result_batch(
         &Bytes::copy_from_slice(bytes),
         0,
         &mut dict,
-        &mut reg,
+        &mut schema,
         &mut scratch,
     );
+}
+
+/// Decode the schema-bearing batch 0 of a generated query and return the
+/// populated per-query schema slot, ready for continuation decodes.
+fn decode_batch0_schema(batch0: &[u8]) -> Option<Schema> {
+    let mut dict = SymbolDict::new();
+    let mut schema: Option<Schema> = None;
+    let mut scratch = ZstdScratch::new();
+    if let Err(e) = decode_result_batch(
+        &Bytes::copy_from_slice(batch0),
+        0,
+        &mut dict,
+        &mut schema,
+        &mut scratch,
+    ) {
+        panic!(
+            "generated batch 0 must decode cleanly (len={}): {:?}",
+            batch0.len(),
+            e
+        );
+    }
+    assert!(
+        schema.is_some(),
+        "batch 0 decode must populate the schema slot"
+    );
+    schema
+}
+
+/// Continuation analogue of [`attempt_decode_no_panic`]: decode `bytes`
+/// against a clone of the retained batch-0 schema. Fresh dict/scratch per
+/// call for the same isolation reasons as the batch-0 helpers.
+fn attempt_continuation_decode_no_panic(schema: &Option<Schema>, bytes: &[u8]) {
+    let mut dict = SymbolDict::new();
+    let mut schema = schema.clone();
+    let mut scratch = ZstdScratch::new();
+    let _ = decode_result_batch(
+        &Bytes::copy_from_slice(bytes),
+        0,
+        &mut dict,
+        &mut schema,
+        &mut scratch,
+    );
+}
+
+/// Sanity: the untruncated, uncorrupted continuation must decode cleanly
+/// against the schema retained from batch 0.
+fn sanity_check_continuation_decode(schema: &Option<Schema>, cont: &[u8]) {
+    let mut dict = SymbolDict::new();
+    let mut schema = schema.clone();
+    let mut scratch = ZstdScratch::new();
+    if let Err(e) = decode_result_batch(
+        &Bytes::copy_from_slice(cont),
+        0,
+        &mut dict,
+        &mut schema,
+        &mut scratch,
+    ) {
+        panic!(
+            "generated continuation must decode cleanly (len={}): {:?}",
+            cont.len(),
+            e
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,4 +593,66 @@ proptest! {
             attempt_decode_no_panic(&corrupted);
         }
     }
+
+    /// Continuation truncation sweep: decode batch 0 to populate the
+    /// per-query schema, then decode every prefix of the rows-only
+    /// continuation against that retained schema. This is the decode
+    /// state the single-message sweeps above can never reach — the
+    /// continuation parser takes col_count from the schema instead of
+    /// the wire.
+    #[test]
+    fn continuation_truncation_at_every_offset(seed in any::<u64>()) {
+        let (batch0, cont) = generate_valid_query(seed);
+        let schema = decode_batch0_schema(&batch0);
+        sanity_check_continuation_decode(&schema, &cont);
+        for trunc_len in 0..cont.len() {
+            attempt_continuation_decode_no_panic(&schema, &cont[..trunc_len]);
+        }
+    }
+
+    /// Continuation corruption sweep: 30 corruption attempts (1..=3 flipped
+    /// bytes each) against the rows-only continuation, decoded with the
+    /// schema retained from batch 0. Corruption that flips the batch_seq
+    /// byte back to 0 makes the decoder re-read an inline schema from row
+    /// bytes — also a path worth hammering.
+    #[test]
+    fn continuation_byte_corruption(seed in any::<u64>()) {
+        let (batch0, cont) = generate_valid_query(seed);
+        let schema = decode_batch0_schema(&batch0);
+        sanity_check_continuation_decode(&schema, &cont);
+
+        let mut rng = SplitMix64::new(seed ^ 0xC0FF_EE00_C0FF_EE00);
+        for _ in 0..30 {
+            let mut corrupted = cont.clone();
+            let n_corrupt = 1 + rng.gen_range(3); // 1..=3
+            for _ in 0..n_corrupt {
+                let pos = rng.gen_range(corrupted.len());
+                corrupted[pos] = rng.next_u8();
+            }
+            attempt_continuation_decode_no_panic(&schema, &corrupted);
+        }
+    }
+}
+
+/// A continuation arriving with an empty schema slot (no prior batch 0)
+/// must surface a protocol error — never a panic and never an Ok.
+#[test]
+fn continuation_with_empty_schema_slot_rejected() {
+    let (_batch0, cont) = generate_valid_query(0xC0FF_EE12_3456_789A);
+    let mut dict = SymbolDict::new();
+    let mut schema: Option<Schema> = None;
+    let mut scratch = ZstdScratch::new();
+    let err = decode_result_batch(
+        &Bytes::copy_from_slice(&cont),
+        0,
+        &mut dict,
+        &mut schema,
+        &mut scratch,
+    )
+    .expect_err("continuation without a prior batch 0 must be rejected");
+    assert!(
+        err.msg().contains("arrived before the schema-bearing"),
+        "unexpected message: {}",
+        err.msg()
+    );
 }

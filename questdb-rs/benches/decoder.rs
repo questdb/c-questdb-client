@@ -68,7 +68,7 @@ use std::time::Duration;
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use questdb::egress::_bench_internals::{
-    Bytes, SchemaRegistry, SymbolDict, ZstdScratch, decode_result_batch,
+    Bytes, Schema, SymbolDict, ZstdScratch, decode_result_batch,
 };
 use questdb::egress::ColumnKind;
 
@@ -79,8 +79,6 @@ use questdb::egress::ColumnKind;
 
 /// Wire byte for the `RESULT_BATCH` message kind.
 const MSG_KIND_RESULT_BATCH: u8 = 0x11;
-/// `SchemaMode::Full` discriminator.
-const SCHEMA_MODE_FULL: u8 = 0x00;
 /// `decode_validity`'s convention for the null_flag prefix when the
 /// column body carries no bitmap.
 const NULL_FLAG_NONE: u8 = 0x00;
@@ -331,9 +329,7 @@ fn build_workload(row_count: usize) -> Bytes {
     varint_u64(row_count as u64, &mut out);
     varint_u64(cols.len() as u64, &mut out);
 
-    // Schema section: Full mode, fresh id, per-column (name, kind).
-    out.push(SCHEMA_MODE_FULL);
-    varint_u64(1, &mut out); // schema_id
+    // Columns inline: per-column (name, kind). No schema-mode byte, no schema id.
     for c in &cols {
         varint_u64(c.name.len() as u64, &mut out);
         out.extend_from_slice(c.name.as_bytes());
@@ -366,7 +362,7 @@ fn bench_decoder(c: &mut Criterion) {
     // payload.
     {
         let mut dict = SymbolDict::new();
-        let mut reg = SchemaRegistry::new();
+        let mut reg: Option<Schema> = None;
         let mut scratch = ZstdScratch::new();
         let batch = decode_result_batch(&payload, 0, &mut dict, &mut reg, &mut scratch)
             .expect("synthesised workload must decode cleanly");
@@ -387,7 +383,7 @@ fn bench_decoder(c: &mut Criterion) {
         |b| {
             b.iter(|| {
                 let mut dict = SymbolDict::new();
-                let mut reg = SchemaRegistry::new();
+                let mut reg: Option<Schema> = None;
                 let mut scratch = ZstdScratch::new();
                 let batch =
                     decode_result_batch(black_box(&payload), 0, &mut dict, &mut reg, &mut scratch)

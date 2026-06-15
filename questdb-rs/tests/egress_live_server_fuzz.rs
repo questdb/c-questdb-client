@@ -1202,8 +1202,8 @@ fn random_schema_roundtrip() {
 }
 
 /// Ports `testBackToBackQueriesSameConnection`. 12 cases on a single
-/// shared `Reader`, exercising per-connection schema-registry / symbol-
-/// dict state across queries. Column count picked from `1..=4`.
+/// shared `Reader`, exercising per-query schema and per-connection
+/// symbol-dict state across queries. Column count picked from `1..=4`.
 #[test]
 fn back_to_back_queries_same_connection() {
     let mut rng = SplitMix64::new(fuzz_seed_for("back_to_back_queries_same_connection"));

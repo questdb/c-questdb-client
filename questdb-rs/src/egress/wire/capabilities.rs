@@ -24,11 +24,11 @@
 
 //! `SERVER_INFO` (0x18) capability bits. See wire-egress.md §11.8.
 //!
-//! v2.0 servers and clients set `capabilities` to zero. Each defined bit
-//! gates an optional trailing field or a protocol extension. A v2.0 client
-//! reading a v2.1+ server MUST ignore any unknown bits — newer fields are
-//! always appended after the existing layout, so a known-bit-only reader
-//! sees the same prefix it always did.
+//! A server or client with no extensions sets `capabilities` to zero. Each
+//! defined bit gates an optional trailing field or a protocol extension. A
+//! client MUST ignore any capability bit it doesn't recognise — newer fields
+//! are always appended after the existing layout, so a reader that knows only
+//! the older bits sees the same prefix it always did.
 
 /// Server appends `zone_id_len: uint16` + `zone_id: bytes` after `node_id`.
 /// Identifies the server's geographic / logical zone (e.g. `eu-west-1a`,

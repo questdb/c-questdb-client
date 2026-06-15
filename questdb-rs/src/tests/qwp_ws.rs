@@ -1075,8 +1075,7 @@ fn qwp_ws_max_buf_size_allows_frame_when_encoded_replay_len_fits_in_all_progress
 }
 
 #[test]
-fn qwp_ws_max_buf_size_rejects_frame_when_replay_schema_ids_make_encoded_len_exceed_limit_in_all_progress_modes()
- {
+fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let mut buf = Buffer::qwp_ws_with_max_name_len(127);
         for idx in 0..131 {
@@ -1087,17 +1086,19 @@ fn qwp_ws_max_buf_size_rejects_frame_when_replay_schema_ids_make_encoded_len_exc
                 .at_now()
                 .unwrap();
         }
-        let local_hint = buf.len();
         let encoded_len = qwp_ws_replay_encoded_len(&buf);
-        assert!(local_hint >= 1024, "local_hint={local_hint}");
-        assert!(
-            encoded_len > local_hint,
-            "encoded_len={encoded_len}, local_hint={local_hint}"
-        );
+        // Strictly greater than 1024 so `encoded_len - 1` is still >= 1024,
+        // the `max_buf_size` floor (see `ingress.rs`). At exactly 1024 the
+        // builder would reject `max_buf_size(1023)` and the `.unwrap()` below
+        // would panic before the flush ever measures the oversized frame.
+        assert!(encoded_len > 1024, "encoded_len={encoded_len}");
+        // Cap one byte below the actual replay-encoded size so the flush is
+        // rejected once the encoder measures the full frame.
+        let max = encoded_len - 1;
 
         let port = spawn_upgrade_only_server();
         let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-            .max_buf_size(local_hint)
+            .max_buf_size(max)
             .unwrap();
         let mut sender = match progress {
             ProgressCase::Background => builder.build().unwrap(),
@@ -1117,7 +1118,7 @@ fn qwp_ws_max_buf_size_rejects_frame_when_replay_schema_ids_make_encoded_len_exc
         assert_eq!(
             err.msg(),
             format!(
-                "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} exceeds maximum configured allowed size of {local_hint} bytes."
+                "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} exceeds maximum configured allowed size of {max} bytes."
             ),
             "mode={}",
             progress.name()
@@ -2207,9 +2208,10 @@ fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
     assert_eq!(payload[2], 0x07);
     assert_eq!(&payload[3..10], b"BTC-USD");
 
-    // Replay-safe public QWP/WS frames always carry full schema.
-    assert_eq!(read_schema_mode(&first), 0x00);
-    assert_eq!(read_schema_mode(&second), 0x00);
+    // Replay-safe public QWP/WS frames always carry the full inline schema
+    // (sym, qty) on every frame (at_now() carries no timestamp column).
+    assert_eq!(first_table_column_count(&first), 2);
+    assert_eq!(first_table_column_count(&second), 2);
 }
 
 #[test]
@@ -2273,16 +2275,23 @@ fn qwp_ws_replay_full_schema_used_when_columns_match() {
     let m2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let m3 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-    assert_eq!(read_schema_mode(&m1), 0x00, "first message: full schema");
-    assert_eq!(read_schema_mode(&m2), 0x00, "second message: full schema");
-    assert_eq!(read_schema_mode(&m3), 0x00, "third message: full schema");
-
-    let (_, m1_id) = read_schema_mode_and_id(&m1);
-    let (_, m2_id) = read_schema_mode_and_id(&m2);
-    let (_, m3_id) = read_schema_mode_and_id(&m3);
-    assert_eq!(m1_id, 0);
-    assert_eq!(m2_id, 0);
-    assert_eq!(m3_id, 0);
+    // Every frame carries its full inline schema (qty, price) so it can be
+    // delivered independently.
+    assert_eq!(
+        first_table_column_count(&m1),
+        2,
+        "first message: full schema"
+    );
+    assert_eq!(
+        first_table_column_count(&m2),
+        2,
+        "second message: full schema"
+    );
+    assert_eq!(
+        first_table_column_count(&m3),
+        2,
+        "third message: full schema"
+    );
 }
 
 #[test]
@@ -2351,15 +2360,14 @@ fn qwp_ws_full_schema_re_emitted_when_columns_change() {
     let m1 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let m2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-    let (mode1, id1) = read_schema_mode_and_id(&m1);
-    let (mode2, id2) = read_schema_mode_and_id(&m2);
-    assert_eq!(mode1, 0x00);
+    // First message: qty only. Second message adds price, so its inline schema
+    // re-emits with the new, wider column set.
+    assert_eq!(first_table_column_count(&m1), 1);
     assert_eq!(
-        mode2, 0x00,
-        "different column set must re-register full schema"
+        first_table_column_count(&m2),
+        2,
+        "different column set must re-emit the full inline schema"
     );
-    assert_eq!(id1, 0, "replay schema registry is per frame");
-    assert_eq!(id2, 0, "replay schema registry is per frame");
 }
 
 // ---------- wire helpers ----------
@@ -2379,8 +2387,10 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
 }
 
 /// Skip past message header + delta dictionary section + first table header,
-/// returning the offset of the schema mode byte.
-fn schema_mode_offset(frame: &[u8]) -> usize {
+/// returning the inline column count declared in the first table block. The
+/// column descriptors ride inline right after this count (no schema-mode byte,
+/// no schema id).
+fn first_table_column_count(frame: &[u8]) -> u64 {
     let mut pos = 12; // header
     let _delta_start = read_varint(frame, &mut pos);
     let delta_count = read_varint(frame, &mut pos);
@@ -2388,24 +2398,11 @@ fn schema_mode_offset(frame: &[u8]) -> usize {
         let name_len = read_varint(frame, &mut pos) as usize;
         pos += name_len;
     }
-    // Table header: name (varint+bytes), row_count varint, column_count varint
+    // Table header: name (varint+bytes), row_count varint, column_count varint.
     let name_len = read_varint(frame, &mut pos) as usize;
     pos += name_len;
     let _row_count = read_varint(frame, &mut pos);
-    let _column_count = read_varint(frame, &mut pos);
-    pos
-}
-
-fn read_schema_mode(frame: &[u8]) -> u8 {
-    frame[schema_mode_offset(frame)]
-}
-
-fn read_schema_mode_and_id(frame: &[u8]) -> (u8, u64) {
-    let mut pos = schema_mode_offset(frame);
-    let mode = frame[pos];
-    pos += 1;
-    let id = read_varint(frame, &mut pos);
-    (mode, id)
+    read_varint(frame, &mut pos)
 }
 
 #[test]

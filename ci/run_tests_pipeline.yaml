@@ -49,7 +49,7 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - template: compile.yaml
+          - template: templates/compile.yaml
           - script: |
               cd questdb-rs
               cargo build --examples --features almost-all-features
@@ -91,7 +91,13 @@ stages:
             displayName: "questdb-rs: fmt"
           - script: |
               cd questdb-rs
-              cargo clippy --all-targets --features almost-all-features -- -D warnings
+              # `live-server-tests` is included here so the live-server
+              # suite (egress_live_server*, egress_live_auth) is compiled
+              # and clippy-linted on every PR even though *running* it
+              # needs a real server. Without this the suite builds only in
+              # the live-server job and silently rots — removed APIs, new
+              # clippy lints — undetected.
+              cargo clippy --all-targets --features almost-all-features,live-server-tests -- -D warnings
             displayName: "questdb-rs: clippy"
           - script: |
               cd questdb-rs-ffi
@@ -219,19 +225,15 @@ stages:
               set +x
               echo "##vso[task.prependpath]$CARGO_BIN"
             displayName: "Resolve Rust toolchain"
-          - template: compile.yaml
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-              cd questdb
-              git submodule update --init --depth 1 java-questdb-client
-            displayName: git clone questdb
+          - template: templates/compile.yaml
+          - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"
@@ -271,7 +273,7 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - template: compile.yaml
+          - template: templates/compile.yaml
           # Linux and Windows runners ship with JDK 25 at $JAVA_HOME_25_X64.
           # macOS-latest doesn't, so we brew-install openjdk@25 there and
           # discover its install location with `brew --prefix`. Both
@@ -298,18 +300,14 @@ stages:
               echo "Resolved JDK 25: $JDK_HOME"
               echo "##vso[task.setvariable variable=JAVA_HOME]$JDK_HOME"
             displayName: "Resolve JDK 25"
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-              cd questdb
-              git submodule update --init --depth 1 java-questdb-client
-            displayName: git clone questdb
+          - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -402,19 +400,15 @@ stages:
               set +x
               echo "##vso[task.prependpath]$CARGO_BIN"
             displayName: "Resolve Rust toolchain"
-          - template: compile.yaml
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-              cd questdb
-              git submodule update --init --depth 1 java-questdb-client
-            displayName: git clone questdb
+          - template: templates/compile.yaml
+          - template: templates/clone_questdb.yaml
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -439,15 +433,14 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
               artifactName: qdb-log-$(Agent.OS)-linux
 
-      # Live-server fuzz coverage for the OSS-questdb tests that need a
-      # real server (bind / fragmentation / random-schema / ALTER
-      # orchestration). `--test NAME` selectors limit the build to the
-      # fuzz binaries so other live-server tests don't drag this job
-      # into unrelated breakage. Default seed gives a deterministic
-      # sweep for inbound changes; the hourly cron in
+      # Live-server coverage for the OSS-questdb tests that need a real
+      # server: the functional egress suite (egress_live_server) plus the
+      # fuzz binaries (bind / fragmentation / random-schema / ALTER
+      # orchestration), each as its own step below. Default seed gives a
+      # deterministic sweep for inbound changes; the hourly cron in
       # run_fuzz_pipeline.yaml varies the seed per build.
       - job: TestQwpEgressLiveServerFuzz
-        displayName: "QWP egress live-server fuzz suite"
+        displayName: "QWP egress live-server suite"
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 30
@@ -458,10 +451,8 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - template: compile.yaml
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-            displayName: git clone questdb
+          - template: templates/compile.yaml
+          - template: templates/clone_questdb.yaml
           - script: |
               set -euo pipefail
               JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
@@ -475,13 +466,12 @@ stages:
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
               set -euxo pipefail
               cd questdb-rs
-              # `--test NAME` selectors limit the build to the fuzz
-              # binaries — other live-server tests stay out of this
-              # job's scope.
+              # `--test NAME` selectors limit this step to the fuzz
+              # binaries; the functional suite runs as its own step below.
               cargo test --features live-server-tests \
                 --test egress_live_server_bind_fuzz \
                 --test egress_live_server_fragmentation_fuzz \
@@ -489,6 +479,14 @@ stages:
                 --test egress_live_server_alter_fuzz \
                 -- --nocapture
             displayName: "QWP egress live-server fuzz"
+          - script: |
+              set -euxo pipefail
+              cd questdb-rs
+              # Functional egress suite (per-type decode, cursor lifecycle,
+              # error taxonomy, null handling) against the same Maven-built
+              # server — behavioral coverage the fuzz binaries don't give.
+              cargo test --features live-server-tests --test egress_live_server -- --nocapture
+            displayName: "QWP egress live-server functional suite"
 
       # Cross-repo trigger: fire the questdb-enterprise
       # build-and-test-e2e-c-client pipeline with this build's SHA so

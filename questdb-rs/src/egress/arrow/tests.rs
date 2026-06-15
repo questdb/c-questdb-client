@@ -32,7 +32,6 @@ fn decoded_of(row_count: usize, columns: Vec<DecodedColumn>) -> DecodedBatch {
     DecodedBatch {
         request_id: 1,
         batch_seq: 0,
-        schema_id: 7,
         row_count,
         columns,
         flags: 0,

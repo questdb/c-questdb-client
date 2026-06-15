@@ -68,7 +68,7 @@ pub enum ErrorCode {
     RoleMismatch,
 
     /// Wire-format violation: bad magic, truncated frame, unknown discriminant,
-    /// invalid varint, schema/symbol-dict reference miss, etc.
+    /// invalid varint, symbol-dict reference miss, etc.
     ProtocolError,
 
     /// String or symbol field was not valid UTF-8.
@@ -151,8 +151,8 @@ pub enum ErrorCode {
 /// Upgrade-time topology rejection carried alongside an `Error`.
 ///
 /// Populated when the server rejects the WebSocket upgrade with HTTP `421`
-/// plus an `X-QuestDB-Role` header (per failover.md §5), or when a v2
-/// `SERVER_INFO` advertises a role that does not match the configured
+/// plus an `X-QuestDB-Role` header (per failover.md §5), or when a
+/// `SERVER_INFO` frame advertises a role that does not match the configured
 /// `target=` filter. The host-health tracker (when present) reads this to
 /// decide whether the host is in `TransientReject` (`PRIMARY_CATCHUP`) or
 /// `TopologyReject` (every other role byte) and to update zone tier from
@@ -224,7 +224,7 @@ struct ErrorInner {
     /// X-QuestDB-Role`) and target-filter mismatches against
     /// `SERVER_INFO`. `None` for every other error.
     upgrade_reject: Option<UpgradeReject>,
-    /// Set only when the rejection came from a v2 `SERVER_INFO`
+    /// Set only when the rejection came from a `SERVER_INFO`
     /// target-filter mismatch — the full server-advertised identity
     /// (`epoch`, `cluster_id`, `node_id`, `capabilities`, `server_wall_ns`)
     /// alongside the role/zone already on `upgrade_reject`. Spec
@@ -232,9 +232,10 @@ struct ErrorInner {
     /// `target=` filter exhaustion apart from "all endpoints unreachable"
     /// and identify the cluster/node that last refused.
     ///
-    /// `None` for every other error path, including the v1-pinned
-    /// `RoleMismatch` (no `SERVER_INFO` to attach) and the `421 +
-    /// X-QuestDB-Role` upgrade reject (only headers; no full `SERVER_INFO`).
+    /// `None` for every other error path, including a `RoleMismatch`
+    /// raised before any `SERVER_INFO` was read (no identity to attach)
+    /// and the `421 + X-QuestDB-Role` upgrade reject (only headers; no
+    /// full `SERVER_INFO`).
     server_info: Option<ServerInfo>,
 }
 
@@ -263,7 +264,7 @@ impl Error {
     }
 
     /// Builder: attach the full last-observed `ServerInfo` to a
-    /// `RoleMismatch` produced from the v2 `SERVER_INFO`-target-mismatch
+    /// `RoleMismatch` produced from the `SERVER_INFO` target-mismatch
     /// path. Lets diagnostics name the cluster/node that refused, on top
     /// of the role/zone already on `upgrade_reject`.
     pub fn with_server_info(mut self, info: ServerInfo) -> Error {
@@ -295,12 +296,12 @@ impl Error {
     }
 
     /// Full last-observed `SERVER_INFO` carried alongside this error.
-    /// `Some` only when the rejection came from the v2
-    /// `SERVER_INFO`-target-mismatch path; `None` everywhere else,
-    /// including v1-pinned `RoleMismatch` and the `421 + X-QuestDB-Role`
-    /// upgrade reject. Lets callers distinguish "no endpoint matched
-    /// `target=`" (this is `Some`) from "all endpoints unreachable"
-    /// (this is `None`).
+    /// `Some` only when the rejection came from the `SERVER_INFO`
+    /// target-mismatch path; `None` everywhere else, including a
+    /// `RoleMismatch` raised before any `SERVER_INFO` was read and the
+    /// `421 + X-QuestDB-Role` upgrade reject. Lets callers distinguish
+    /// "no endpoint matched `target=`" (this is `Some`) from "all
+    /// endpoints unreachable" (this is `None`).
     pub fn server_info(&self) -> Option<&ServerInfo> {
         self.0.server_info.as_ref()
     }

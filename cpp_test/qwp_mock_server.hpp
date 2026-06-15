@@ -147,7 +147,7 @@ struct ColumnSpec
     std::vector<uint8_t> data;
 };
 std::vector<uint8_t> result_batch_frame(
-    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    int64_t request_id, uint64_t batch_seq,
     size_t row_count, const std::vector<ColumnSpec>& columns);
 
 // `result_batch_frame` variant that ships a `FLAG_DELTA_SYMBOL_DICT` delta
@@ -156,7 +156,7 @@ std::vector<uint8_t> result_batch_frame(
 // connection (the client validates `delta_start == current dict size`).
 // Pair with `symbol_column_bytes` for any SYMBOL columns in `columns`.
 std::vector<uint8_t> result_batch_frame_with_dict(
-    int64_t request_id, uint64_t batch_seq, uint64_t schema_id,
+    int64_t request_id, uint64_t batch_seq,
     size_t row_count, const std::vector<ColumnSpec>& columns,
     uint64_t dict_delta_start,
     const std::vector<std::string>& dict_entries);

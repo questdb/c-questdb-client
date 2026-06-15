@@ -109,6 +109,7 @@ QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
 DECIMAL_RELEASE = (9, 2, 0)
+QWP_MIN_RELEASE = (9, 4, 3)
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
     "57896044618658097711785492504343953926634992332820282019728792003956564819968")
 QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
@@ -399,7 +400,7 @@ class TestSender(unittest.TestCase):
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
             **kwargs)
-    
+
     def _ns_to_qdb_date(self, at_ts_ns, exp_nanos: bool):
         # We first need to match QuestDB's internal microsecond resolution.
         at_ts_us = at_ts_ns // 1000
@@ -413,7 +414,7 @@ class TestSender(unittest.TestCase):
         if exp_nanos:
             extra_precision = f'{trimmed_ns:03}'
         return at_td.isoformat() + extra_precision + 'Z'
-    
+
     @property
     def client_driven_nanos_supported(self) -> bool:
         # """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
@@ -681,7 +682,7 @@ class TestSender(unittest.TestCase):
                      .table(table_name)
                      .symbol('a', 'A')
                      .at(at_ts_ns))
-                    
+
     def test_micros_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
             self.skipTest('No support for user-provided timestamps.')
@@ -897,7 +898,7 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['12.990'], ['-12.340'], ['0.001'], ['10000000.000'], [None], [None], ['0.000'], ['0.000'], ['1000.000']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
-    
+
     def test_decimal_invalid_characters(self):
         if QDB_FIXTURE.version < DECIMAL_RELEASE:
             self.skipTest('No decimal support in this version of QuestDB.')
@@ -912,7 +913,7 @@ class TestSender(unittest.TestCase):
                     .table(table_name)
                     .column_dec_str('dec', "12.34abc")
                     .at_now())
-    
+
     def test_decimal_not_available(self):
         if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
             self.skipTest('Decimal support is available in this version of QuestDB.')
@@ -1140,7 +1141,7 @@ class TestSender(unittest.TestCase):
             self.skipTest('BuildMode.API-only test')
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')
-        
+
         exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
         # Decimal columns must be created manually beforehand.
         sql_query(f'''CREATE TABLE "{table_name}" (price DECIMAL(18,3), timestamp {exp_ts_type}) TIMESTAMP(timestamp) PARTITION BY DAY;''')
@@ -1519,9 +1520,11 @@ class QwpWsTestSupport:
 
     @staticmethod
     def _require_qwp_ws_protocol():
-        if not hasattr(qls.Protocol, 'QWPWS'):
+        if QDB_FIXTURE.version < QWP_MIN_RELEASE:
             raise unittest.SkipTest(
-                'QWP/WebSocket protocol is not exposed by the system-test shim')
+                f'Server version {".".join(map(str, QDB_FIXTURE.version))} does not '
+                'support the QWP protocol version we can test. Minimum version we need: '
+                f'(QuestDB >= {".".join(map(str, QWP_MIN_RELEASE))})')
 
     @staticmethod
     def _create_qwp_ws_table(table_name):
@@ -2549,6 +2552,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     max_bounces=fuzz.max_bounces,
                     min_interval_s=fuzz.min_bounce_interval_s,
                     max_interval_s=fuzz.max_bounce_interval_s,
+                    stop_timeout_s=fuzz.bounce_stop_timeout_s,
                     writers_done=producers_done,
                     stop_event=stop_event,
                     record_failure=record_failure,
@@ -2622,6 +2626,14 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # wait through the bounce up to reconnect_max_duration_millis.
             initial_connect_retry='sync',
             reconnect_max_duration_millis=120000,
+            # The bounce tests restart the server faster than the reconnect
+            # backoff cap can track, so the client keeps backing off and
+            # misses the brief windows the server is up between restarts —
+            # close_drain then can't drain and times out. A tighter cap keeps
+            # reconnect attempts landing inside those windows. (Harmless for
+            # the non-bounce tests, which never reconnect, so the backoff
+            # never engages.)
+            reconnect_max_backoff_millis=250,
             # 2 min on close_drain — bounce-test variants need a long
             # enough budget for SFA to replay queued frames into a
             # freshly-restarted server.
@@ -4208,6 +4220,23 @@ def iter_versions(args):
         yield questdb_dir
 
 
+def _stop_and_maybe_wipe(fixture):
+    """Stop ``fixture``, reclaiming its data dir only on a clean run.
+
+    Called from the ``finally`` of each suite block. ``wipe_data_dir()``
+    deletes everything under ``data/`` (including ``data/log/log.txt``) to
+    reclaim disk between runs, but on failure we re-raise via ``sys.exit(1)``
+    and want that server log to survive for the CI "Compress QuestDB server
+    log on failure" archive step. So skip the wipe whenever an exception is
+    propagating — including the ``SystemExit`` from ``sys.exit(1)`` —
+    detected via ``sys.exc_info()`` captured before ``stop()`` runs.
+    """
+    failed = sys.exc_info()[0] is not None
+    fixture.stop()
+    if not failed:
+        fixture.wipe_data_dir()
+
+
 def run_with_fixtures(args):
     global QDB_FIXTURE
     global TLS_PROXY_FIXTURE
@@ -4262,8 +4291,7 @@ def run_with_fixtures(args):
                                 TLS_PROXY_FIXTURE.stop()
                                 TLS_PROXY_FIXTURE = None
                 finally:
-                    QDB_FIXTURE.stop()
-                    QDB_FIXTURE.wipe_data_dir()
+                    _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_smoke_suite:
             for http_auth in (False, True):
@@ -4297,8 +4325,7 @@ def run_with_fixtures(args):
                                 TLS_PROXY_FIXTURE = None
                             QWP_WS_SMOKE_TLS = False
                 finally:
-                    QDB_FIXTURE.stop()
-                    QDB_FIXTURE.wipe_data_dir()
+                    _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_protocol_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4316,8 +4343,7 @@ def run_with_fixtures(args):
                 if not _run_selected_tests(SUITE_QWP_WS_PROTOCOL):
                     sys.exit(1)
             finally:
-                QDB_FIXTURE.stop()
-                QDB_FIXTURE.wipe_data_dir()
+                _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_restart_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4335,8 +4361,7 @@ def run_with_fixtures(args):
                 if not _run_selected_tests(SUITE_QWP_WS_RESTART):
                     sys.exit(1)
             finally:
-                QDB_FIXTURE.stop()
-                QDB_FIXTURE.wipe_data_dir()
+                _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_fuzz_suite:
             QDB_FIXTURE = QuestDbFixture(
@@ -4354,8 +4379,7 @@ def run_with_fixtures(args):
                 if not _run_selected_tests(SUITE_QWP_WS_FUZZ):
                     sys.exit(1)
             finally:
-                QDB_FIXTURE.stop()
-                QDB_FIXTURE.wipe_data_dir()
+                _stop_and_maybe_wipe(QDB_FIXTURE)
 
 
 def run(args, show_help=False):

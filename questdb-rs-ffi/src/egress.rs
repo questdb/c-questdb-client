@@ -84,7 +84,7 @@ pub enum line_reader_error_code {
     /// configured `target` filter.
     line_reader_error_role_mismatch = 8,
     /// Wire-format violation: bad magic, truncated frame, unknown
-    /// discriminant, invalid varint, schema/symbol-dict reference miss, etc.
+    /// discriminant, invalid varint, symbol-dict reference miss, etc.
     line_reader_error_protocol_error = 9,
     /// String or symbol field was not valid UTF-8.
     line_reader_error_invalid_utf8 = 10,
@@ -936,11 +936,12 @@ pub unsafe extern "C" fn line_reader_server_version(
     }
 }
 
-/// Borrowed `SERVER_INFO` of the currently connected endpoint, or NULL when
-/// the server hasn't sent one (v1 protocol). The returned pointer is
-/// invalidated by any subsequent reader operation that may reconnect or
-/// receive a new `SERVER_INFO` (`line_reader_query_execute`,
-/// `line_reader_cursor_next_batch`, `line_reader_close`).
+/// Borrowed `SERVER_INFO` of the currently connected endpoint. The server
+/// always sends one, so this is NULL only while a reconnect is in flight.
+/// The returned pointer is invalidated by any subsequent reader operation
+/// that may reconnect or receive a new `SERVER_INFO`
+/// (`line_reader_query_execute`, `line_reader_cursor_next_batch`,
+/// `line_reader_close`).
 ///
 /// Returns NULL for a NULL handle, and also NULL while a `line_reader_query`
 /// / `line_reader_cursor` produced by this reader is still live — reading
@@ -1364,9 +1365,9 @@ pub unsafe extern "C" fn line_reader_failover_event_trigger_msg(
     }
 }
 
-/// `SERVER_INFO` for the new endpoint, or NULL for v1 servers. Borrowed
-/// for the duration of the call. NULL-safe: returns NULL when `ev` is
-/// NULL.
+/// `SERVER_INFO` for the new endpoint; NULL only if the server omitted
+/// it. Borrowed for the duration of the call. NULL-safe: returns NULL
+/// when `ev` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_failover_event_server_info(
     ev: *const line_reader_failover_event,
@@ -1680,7 +1681,7 @@ pub unsafe extern "C" fn line_reader_failover_progress_event_elapsed_ns(
 }
 
 /// `SERVER_INFO` for the new endpoint, or NULL outside the Reset phase
-/// / on QWP v1 servers. Borrowed for the duration of the call.
+/// (or if the server omitted it). Borrowed for the duration of the call.
 /// NULL-safe: returns NULL when `ev` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_failover_progress_event_server_info(
@@ -2631,7 +2632,8 @@ pub unsafe extern "C" fn line_reader_cursor_free(cursor: *mut line_reader_cursor
 /// Returns:
 ///   * Non-NULL borrowed batch handle on success. Invalidated by the next
 ///     `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
-///     `line_reader_cursor_free`, or mid-query failover.
+///     `line_reader_cursor_add_credit`, `line_reader_cursor_free`, or
+///     mid-query failover.
 ///   * NULL with `*err_out` left untouched when the stream has terminated
 ///     normally (no batch available).
 ///   * NULL with `*err_out` set on error; the cursor must be freed.
@@ -2846,11 +2848,11 @@ pub unsafe extern "C" fn line_reader_cursor_server_version(
     }
 }
 
-/// Borrowed `SERVER_INFO` of the cursor's currently connected endpoint, or
-/// NULL when the server hasn't sent one (v1 protocol). The returned
-/// pointer is invalidated by any subsequent cursor operation that may
-/// reconnect (`line_reader_cursor_next_batch`, `line_reader_cursor_free`).
-/// Returns NULL for a NULL handle.
+/// Borrowed `SERVER_INFO` of the cursor's currently connected endpoint.
+/// The server always sends one, so this is NULL only while a reconnect is
+/// in flight. The returned pointer is invalidated by any subsequent cursor
+/// operation that may reconnect (`line_reader_cursor_next_batch`,
+/// `line_reader_cursor_free`). Returns NULL for a NULL handle.
 ///
 /// The in-cursor counterpart to `line_reader_current_server_info`, which
 /// rejects while a cursor is live.
@@ -3022,7 +3024,10 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
 }
 
 /// Grant the server an additional CREDIT budget. Only valid for cursors
-/// started with `initial_credit > 0`.
+/// started with `initial_credit > 0`. Invalidates the current batch handle
+/// and every pointer borrowed from it (routes through `cursor_for_mut`),
+/// and may transparently trigger mid-query failover when the CREDIT write
+/// hits a transport failure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_add_credit(
     cursor: *mut line_reader_cursor,
@@ -3088,8 +3093,8 @@ unsafe fn null_out_param_err(err_out: *mut *mut line_reader_error, fn_name: &str
 /// Borrowed handle for the batch currently loaded in a cursor. Backed by
 /// the cursor's `current_batch`; invalidated by the next
 /// `line_reader_cursor_next_batch`, `line_reader_cursor_cancel`,
-/// `line_reader_cursor_free`, or mid-query failover. Never freed by the
-/// caller.
+/// `line_reader_cursor_add_credit`, `line_reader_cursor_free`, or
+/// mid-query failover. Never freed by the caller.
 #[repr(transparent)]
 pub struct line_reader_batch(BatchView<'static>);
 
