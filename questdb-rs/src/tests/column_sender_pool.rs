@@ -579,8 +579,9 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
     sender.sync(AckLevel::Ok).expect("numeric chunk flush");
     assert!(chunk.is_empty(), "flush must clear the chunk");
 
-    // Second flush with the SAME schema exercises the SchemaRegistry's
-    // REFERENCE-mode shortcut: it must still round-trip cleanly.
+    // Second flush with the SAME schema re-inlines the schema (QWP is
+    // single-version with inline schemas — no REFERENCE shortcut): it must
+    // still round-trip cleanly.
     chunk.column_i64("qty", &[40, 50], None).unwrap();
     chunk.column_f64("price", &[4.4, 5.5], None).unwrap();
     chunk

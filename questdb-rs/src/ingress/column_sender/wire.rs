@@ -39,11 +39,6 @@ pub(crate) const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 pub(crate) const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 pub(crate) const QWP_HEADER_LEN: usize = 12;
 
-/// Full schema mode emits the column-definition signature inline.
-pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
-/// Reference schema mode reuses a previously-FULL signature by id.
-pub(crate) const QWP_SCHEMA_MODE_REFERENCE: u8 = 0x01;
-
 // Wire type codes — duplicated from `buffer/qwp.rs`. See the QWP v1 spec
 // (`questdb/documentation/connect/wire-protocols/qwp-ingress-websocket.md`)
 // §Type byte table for the canonical list.

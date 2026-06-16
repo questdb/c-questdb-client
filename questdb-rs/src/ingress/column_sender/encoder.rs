@@ -45,16 +45,17 @@ use super::chunk::{
 use super::numpy_wire;
 use super::wire::{
     F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, MAX_NAME_LEN, QWP_FLAG_DEFER_COMMIT,
-    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_SCHEMA_MODE_FULL,
-    QWP_SCHEMA_MODE_REFERENCE, QWP_VERSION_1, validate_name, write_qwp_bytes, write_qwp_varint,
+    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1, validate_name,
+    write_qwp_bytes, write_qwp_varint,
 };
 
 /// Connection-scoped table-schema interner.
 ///
-/// Each unique signature gets a sequentially-assigned `u64` id. The first
-/// emit uses `QWP_SCHEMA_MODE_FULL`; subsequent emits reuse the id under
-/// `QWP_SCHEMA_MODE_REFERENCE`. Both sides of the wire build the same id
-/// mapping by first-emit order; on reconnect both sides reset.
+/// QWP is single-version with inline schemas (server #7200): the column
+/// definitions travel inline on every frame, so the interned id no longer
+/// drives the wire. The registry is retained only for its mark/rollback
+/// restore points, which keep a frame that fails mid-encode from leaving
+/// state behind.
 #[derive(Debug, Default)]
 pub(crate) struct SchemaRegistry {
     by_signature: HashMap<Vec<u8>, u64>,
@@ -254,7 +255,12 @@ fn encode_frame_after_signature(
     scratch: &EncodeScratch,
     schema_registry: &mut SchemaRegistry,
 ) -> Result<()> {
-    let (schema_id, is_new_schema) = schema_registry.intern(&scratch.signature);
+    // The registry is still snapshotted/rolled back by the caller for
+    // error recovery, but the QWP wire is single-version with inline
+    // schemas (server #7200): the column defs always travel inline right
+    // after col_count — no schema-mode byte, no schema id. Matches the
+    // row API (`QwpWsColumnarBuffer::encode_ws_replay_message`).
+    let _ = schema_registry.intern(&scratch.signature);
 
     let estimated = estimate_frame_size(
         chunk,
@@ -285,14 +291,7 @@ fn encode_frame_after_signature(
     write_qwp_varint(out, row_count as u64);
     write_qwp_varint(out, column_count as u64);
 
-    if is_new_schema {
-        out.push(QWP_SCHEMA_MODE_FULL);
-        write_qwp_varint(out, schema_id);
-        out.extend_from_slice(&scratch.signature);
-    } else {
-        out.push(QWP_SCHEMA_MODE_REFERENCE);
-        write_qwp_varint(out, schema_id);
-    }
+    out.extend_from_slice(&scratch.signature);
 
     for (col_idx, col) in chunk.columns.iter().enumerate() {
         unsafe {
@@ -1106,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn second_encode_with_same_schema_uses_reference() {
+    fn second_encode_with_same_schema_still_inlines_schema() {
         let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
@@ -1125,12 +1124,19 @@ mod tests {
         let mut out2 = Vec::new();
         encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, &mut scratch, false).unwrap();
 
-        assert!(out2.len() < out1.len());
-        assert_eq!(reg.len(), 1, "schema signature interned once");
+        // QWP is single-version with inline schemas (server #7200): the schema
+        // travels inline on every frame, so re-flushing the same schema yields
+        // a same-size frame — there is no smaller REFERENCE form. The schema
+        // bytes appear right after col_count with no schema-mode byte.
+        assert_eq!(out2.len(), out1.len());
+        assert_eq!(reg.len(), 1, "schema signature still interned once");
 
-        let schema_mode_offset = 12 + 1 + 1 + 1 + "trades".len() + 1 + 1;
-        assert_eq!(out1[schema_mode_offset], QWP_SCHEMA_MODE_FULL);
-        assert_eq!(out2[schema_mode_offset], QWP_SCHEMA_MODE_REFERENCE);
+        // [12B header][delta_start=0][new_symbols=0][table "trades"][row_count][col_count]
+        let schema_offset = 12 + 1 + 1 + 1 + "trades".len() + 1 + 1;
+        // First inline column def: varint name length (5) then "price".
+        assert_eq!(out1[schema_offset], 5);
+        assert_eq!(&out1[schema_offset + 1..schema_offset + 6], b"price");
+        assert_eq!(out1[schema_offset], out2[schema_offset]);
     }
 
     #[test]

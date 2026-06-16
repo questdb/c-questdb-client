@@ -54,13 +54,12 @@ use crate::{Result, fmt};
 
 use super::encoder::SchemaRegistry;
 use super::wire::{
-    QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC,
-    QWP_SCHEMA_MODE_FULL, QWP_SCHEMA_MODE_REFERENCE, QWP_TYPE_BINARY, QWP_TYPE_BOOLEAN,
-    QWP_TYPE_BYTE, QWP_TYPE_CHAR, QWP_TYPE_DATE, QWP_TYPE_DECIMAL64, QWP_TYPE_DECIMAL128,
-    QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY, QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH,
-    QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT, QWP_TYPE_SYMBOL,
-    QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, QWP_TYPE_VARCHAR, QWP_VERSION_1,
-    validate_name, write_qwp_bytes, write_qwp_varint,
+    QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_TYPE_BINARY,
+    QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_CHAR, QWP_TYPE_DATE, QWP_TYPE_DECIMAL64,
+    QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY,
+    QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256,
+    QWP_TYPE_SHORT, QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID,
+    QWP_TYPE_VARCHAR, QWP_VERSION_1, validate_name, write_qwp_bytes, write_qwp_varint,
 };
 
 use super::MAX_CHUNK_ROWS as MAX_ARROW_INGEST_ROWS;
@@ -3279,7 +3278,11 @@ pub(crate) fn encode_arrow_batch_into(
         signature.push(ts_byte);
     }
     let schema_mark = schema_registry.mark();
-    let (schema_id, is_new_schema) = schema_registry.intern(&signature);
+    // Snapshotted/rolled back for error recovery, but the QWP wire is
+    // single-version with inline schemas (server #7200): column defs always
+    // travel inline right after col_count — no schema-mode byte, no schema
+    // id. Matches the row API (`QwpWsColumnarBuffer::encode_ws_replay_message`).
+    let _ = schema_registry.intern(&signature);
 
     let frame_start = out.len();
     let estimated = estimate_frame_size(&classified, &resolution, ts_col_idx, row_count, table);
@@ -3305,14 +3308,7 @@ pub(crate) fn encode_arrow_batch_into(
     write_qwp_bytes(out, table.as_ref().as_bytes());
     write_qwp_varint(out, row_count as u64);
     write_qwp_varint(out, column_count as u64);
-    if is_new_schema {
-        out.push(QWP_SCHEMA_MODE_FULL);
-        write_qwp_varint(out, schema_id);
-        out.extend_from_slice(&signature);
-    } else {
-        out.push(QWP_SCHEMA_MODE_REFERENCE);
-        write_qwp_varint(out, schema_id);
-    }
+    out.extend_from_slice(&signature);
 
     let mut schema_mark_holder = Some(schema_mark);
     let mut rollback_on_err = |out: &mut Vec<u8>,
