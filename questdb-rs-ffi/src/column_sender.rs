@@ -1316,7 +1316,8 @@ pub unsafe extern "C" fn column_sender_arrow_import_free(
 }
 
 /// Number of rows in an imported Arrow column. Returns 0 for a NULL
-/// `imported` and for a logically-empty column. Cheap accessor; the
+/// `imported`, for a logically-empty column, and for a handle that has
+/// been freed or is in use by a concurrent call. Cheap accessor; the
 /// length is stored alongside the buffers.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
@@ -1324,6 +1325,19 @@ pub unsafe extern "C" fn column_sender_arrow_import_len(
     imported: *const column_sender_arrow_import,
 ) -> size_t {
     if imported.is_null() {
+        return 0;
+    }
+    let imported_mut = imported as *mut column_sender_arrow_import;
+    let guard = unsafe {
+        InUseGuard::acquire(
+            imported_mut,
+            &raw const (*imported_mut).1,
+            "column_sender_arrow_import_len",
+            "column_sender_arrow_import",
+            std::ptr::null_mut(),
+        )
+    };
+    if guard.is_none() {
         return 0;
     }
     unsafe { (*imported).0.len() }
@@ -1474,9 +1488,9 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_column(
 // NumPy column appender
 //
 // Companion to `column_sender_chunk_append_arrow_column` that takes a
-// raw contiguous NumPy buffer + a dtype tag. Widening / packing happens
-// in Rust at append time into a chunk-owned scratch arena, so callers
-// don't allocate a widened buffer themselves.
+// raw contiguous NumPy buffer + a dtype tag. The buffer is borrowed by
+// pointer (not copied) at append time; widening / packing happens at
+// flush. The caller must keep `data` alive until the next flush returns.
 //
 // Stride and non-native-endian are not supported; the caller (Python
 // client) consolidates upstream.

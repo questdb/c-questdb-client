@@ -671,6 +671,58 @@ fn array_with_null_row_skips_shape() {
 }
 
 #[test]
+fn array_2d_with_leading_null_row_preserves_values() {
+    // Regression: a null outer row before a non-null multi-dim row must not
+    // shift the inner-list offsets. Row 0 is null; row 1 is [[1,2,3],[4,5,6]].
+    let mut data = Vec::new();
+    for v in [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0] {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    let buffers = crate::egress::decoder::ArrayBuffers {
+        data_offsets: vec![0, 0, 48],
+        data: bytes::Bytes::from(data),
+        shapes: vec![2, 3],
+        shape_offsets: vec![0, 0, 2],
+        validity: Some(bytes::Bytes::from(vec![0b0000_0001u8])),
+    };
+    let s = schema_of(&[("a", ColumnKind::DoubleArray)]);
+    let b = decoded_of(2, vec![DecodedColumn::DoubleArray(buffers)]);
+    let arrow_schema = Arc::new(batch_arrow_schema(&s, &b).unwrap());
+    let rb = batch_to_record_batch(arrow_schema, &s, b, &SymbolDict::new()).unwrap();
+    let outer = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::ListArray>()
+        .unwrap();
+    assert!(outer.is_null(0));
+    assert!(outer.is_valid(1));
+    let row1 = outer.value(1);
+    let inner = row1
+        .as_any()
+        .downcast_ref::<arrow_array::ListArray>()
+        .unwrap();
+    assert_eq!(inner.len(), 2);
+    let first = inner.value(0);
+    assert_eq!(
+        first
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap()
+            .values(),
+        &[1.0, 2.0, 3.0]
+    );
+    let second = inner.value(1);
+    assert_eq!(
+        second
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap()
+            .values(),
+        &[4.0, 5.0, 6.0]
+    );
+}
+
+#[test]
 fn symbol_with_local_dict_overrides_connection_dict() {
     let mut local = SymbolDict::new();
     local

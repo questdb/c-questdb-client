@@ -43,7 +43,7 @@ use super::wire::{
     QWP_TYPE_CHAR, QWP_TYPE_DATE, QWP_TYPE_DECIMAL64, QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256,
     QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY, QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT,
     QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT, QWP_TYPE_TIMESTAMP,
-    QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID,
+    QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, write_qwp_varint,
 };
 
 /// Numpy source-dtype tag. The chunk's `NumpyDeferred` variant stores
@@ -531,7 +531,7 @@ unsafe fn emit_sentinel_le<T, const N: usize>(
         Some(v) => {
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
-                    let value = unsafe { *typed.add(i) };
+                    let value = unsafe { typed.add(i).read_unaligned() };
                     out.extend_from_slice(&to_le(value));
                 } else {
                     out.extend_from_slice(&sentinel);
@@ -570,7 +570,7 @@ unsafe fn emit_bitmap_le<T, const N: usize>(
             out.reserve(N * v.non_null_count);
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
-                    let value = unsafe { *typed.add(i) };
+                    let value = unsafe { typed.add(i).read_unaligned() };
                     out.extend_from_slice(&to_le(value));
                 }
             }
@@ -630,14 +630,14 @@ unsafe fn emit_widen_i32_sentinel<T>(
     match validity {
         None => {
             for i in 0..row_count {
-                let v = unsafe { *typed.add(i) };
+                let v = unsafe { typed.add(i).read_unaligned() };
                 out.extend_from_slice(&widen(v).to_le_bytes());
             }
         }
         Some(v) => {
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
-                    let raw = unsafe { *typed.add(i) };
+                    let raw = unsafe { typed.add(i).read_unaligned() };
                     out.extend_from_slice(&widen(raw).to_le_bytes());
                 } else {
                     out.extend_from_slice(&sentinel_bytes);
@@ -667,14 +667,14 @@ unsafe fn emit_widen_i64_sentinel<T>(
     match validity {
         None => {
             for i in 0..row_count {
-                let v = unsafe { *typed.add(i) };
+                let v = unsafe { typed.add(i).read_unaligned() };
                 out.extend_from_slice(&widen(v).to_le_bytes());
             }
         }
         Some(v) => {
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
-                    let raw = unsafe { *typed.add(i) };
+                    let raw = unsafe { typed.add(i).read_unaligned() };
                     out.extend_from_slice(&widen(raw).to_le_bytes());
                 } else {
                     out.extend_from_slice(&sentinel_bytes);
@@ -705,10 +705,9 @@ unsafe fn emit_u64_widen_i64_checked(
 ) -> Result<()> {
     let typed = data as *const u64;
     if validity.is_none() && row_count > 0 {
-        let slice = unsafe { slice::from_raw_parts(typed, row_count) };
         let mut acc: u64 = 0;
-        for &v in slice {
-            acc |= v;
+        for i in 0..row_count {
+            acc |= unsafe { typed.add(i).read_unaligned() };
         }
         if acc < (1u64 << 63) {
             unsafe {
@@ -725,14 +724,14 @@ unsafe fn emit_u64_widen_i64_checked(
     match validity {
         None => {
             for i in 0..row_count {
-                let v = unsafe { *typed.add(i) };
+                let v = unsafe { typed.add(i).read_unaligned() };
                 out.extend_from_slice(&u64_to_i64_checked(v, i)?.to_le_bytes());
             }
         }
         Some(v) => {
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
-                    let raw = unsafe { *typed.add(i) };
+                    let raw = unsafe { typed.add(i).read_unaligned() };
                     out.extend_from_slice(&u64_to_i64_checked(raw, i)?.to_le_bytes());
                 } else {
                     out.extend_from_slice(&sentinel_bytes);
@@ -761,14 +760,14 @@ unsafe fn emit_f16_to_f32(
     match validity {
         None => {
             for i in 0..row_count {
-                let bits = unsafe { *typed.add(i) };
+                let bits = unsafe { typed.add(i).read_unaligned() };
                 out.extend_from_slice(&f16_bits_to_f32(bits).to_le_bytes());
             }
         }
         Some(v) => {
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
-                    let bits = unsafe { *typed.add(i) };
+                    let bits = unsafe { typed.add(i).read_unaligned() };
                     out.extend_from_slice(&f16_bits_to_f32(bits).to_le_bytes());
                 } else {
                     out.extend_from_slice(&sentinel);
@@ -920,7 +919,7 @@ where
             out.push(0);
             out.reserve(8 * row_count);
             for i in 0..row_count {
-                let value = unsafe { *typed.add(i) };
+                let value = unsafe { typed.add(i).read_unaligned() };
                 let micros = if value == I64_NULL {
                     I64_NULL
                 } else {
@@ -937,7 +936,7 @@ where
                 if !unsafe { v.is_valid(i) } {
                     continue;
                 }
-                let value = unsafe { *typed.add(i) };
+                let value = unsafe { typed.add(i).read_unaligned() };
                 let micros = if value == I64_NULL {
                     I64_NULL
                 } else {
@@ -1056,7 +1055,7 @@ unsafe fn emit_geohash<const SRC: usize>(
         None => {
             out.push(0);
             out.reserve(1 + elem * row_count);
-            out.push(bits);
+            write_qwp_varint(out, bits as u64);
             if elem == SRC && row_count > 0 {
                 let bytes = unsafe { slice::from_raw_parts(data, SRC * row_count) };
                 out.extend_from_slice(bytes);
@@ -1072,7 +1071,7 @@ unsafe fn emit_geohash<const SRC: usize>(
             out.push(1);
             unsafe { write_qwp_bitmap_from_validity(out, v) };
             out.reserve(1 + elem * v.non_null_count);
-            out.push(bits);
+            write_qwp_varint(out, bits as u64);
             for i in 0..row_count {
                 if unsafe { v.is_valid(i) } {
                     let row_start = unsafe { data.add(i * SRC) };

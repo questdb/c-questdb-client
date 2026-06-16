@@ -68,9 +68,8 @@ typedef struct questdb_db questdb_db;
 
 /** Borrowed QWP/WS connection. Not thread-safe; belongs to the borrowing
  *  thread until returned via `questdb_db_return_conn`. Carries the
- *  per-connection schema registry and symbol-dictionary state used by all
- *  writer modes (per-type, Arrow, NumPy) and — in the future — by egress
- *  readers. */
+ *  per-connection symbol-dictionary state used by all writer modes
+ *  (per-type, Arrow, NumPy). */
 typedef struct qwpws_conn qwpws_conn;
 
 /** One DataFrame's worth of column buffers destined for one QuestDB table.

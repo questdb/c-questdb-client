@@ -302,7 +302,7 @@ fn estimate_frame_size(
                 .saturating_add(bytes_len),
             ColumnKind::Symbol { .. } => row_count.saturating_mul(5),
             #[cfg(feature = "arrow")]
-            ColumnKind::ArrowDeferred { .. } => row_count.saturating_mul(64),
+            ColumnKind::ArrowDeferred { ref arr, .. } => arr.get_buffer_memory_size(),
             ColumnKind::NumpyDeferred { dtype, .. } => {
                 dtype.bytes_per_row().saturating_mul(row_count)
             }

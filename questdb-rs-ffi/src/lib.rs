@@ -3737,6 +3737,13 @@ const MAX_ARROW_ARRAY_N_BUFFERS_PER_NODE: i64 = 16;
 #[cfg(feature = "arrow")]
 const MAX_ARROW_ARRAY_LENGTH: i64 = questdb::ingress::column_sender::MAX_CHUNK_ROWS as i64;
 
+// Residual trust boundary: the Arrow C Data Interface carries no byte length
+// for its buffers, so a producer that lies about offset/data buffer sizes or
+// about the `metadata` blob's internal lengths can drive arrow-rs into an
+// out-of-bounds read no consumer can pre-detect. The pre-walk closes every
+// gap that has a checkable invariant (NULL pointers, negative/oversized
+// counts, missing children, eagerly-dereferenced slots); the byte-size lies
+// remain the producer's responsibility, same as any C Data Interface consumer.
 #[cfg(feature = "arrow")]
 fn arrow_ingest_err(msg: impl Into<String>) -> Error {
     Error::new(ErrorCode::ArrowIngest, msg.into())
@@ -3787,6 +3794,25 @@ unsafe fn try_reserve_one<T>(v: &mut Vec<T>) -> questdb::Result<()> {
         .map_err(|_| arrow_ingest_err("Arrow schema pre-walk: reservation failed"))
 }
 
+// Minimum `n_children` a nested Arrow format string requires. arrow-rs's
+// `DataType::try_from` calls `FFI_ArrowSchema::child(0)` (plus `child(1)` for
+// run-end-encoded) unconditionally for these formats, and `child()` asserts
+// `index < n_children`. Under `panic = "abort"` a short child list would abort
+// the host inside `try_from` before any of arrow-rs's fallible parsing runs.
+// Struct (`+s`) and union (`+ud`/`+us`) use a `0..n_children` iterator instead,
+// so they need no floor here.
+#[cfg(feature = "arrow")]
+fn arrow_format_min_children(format: &str) -> i64 {
+    if format.starts_with("+w:") {
+        return 1;
+    }
+    match format {
+        "+l" | "+L" | "+vl" | "+vL" | "+m" => 1,
+        "+r" => 2,
+        _ => 0,
+    }
+}
+
 #[cfg(feature = "arrow")]
 unsafe fn validate_arrow_schema_depth(
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3821,6 +3847,15 @@ unsafe fn validate_arrow_schema_depth(
                 return Err(arrow_ingest_err(format!(
                     "Arrow schema n_children {} is negative",
                     n
+                )));
+            }
+            // `format` was just confirmed non-NULL and UTF-8 by validate_format_str.
+            let format = std::ffi::CStr::from_ptr((*s).format).to_str().unwrap_or("");
+            let min_children = arrow_format_min_children(format);
+            if n < min_children {
+                return Err(arrow_ingest_err(format!(
+                    "Arrow schema format '{}' requires at least {} child(ren) but declares {}",
+                    format, min_children, n
                 )));
             }
             if n > MAX_ARROW_SCHEMA_CHILDREN_PER_NODE {
@@ -5362,6 +5397,38 @@ mod tests {
                     "expected n_children-disagreement error, got: {}",
                     err.msg()
                 );
+            }
+        }
+
+        #[test]
+        fn schema_nested_format_missing_children_rejected() {
+            // A nested format (List/LargeList/ListView/Map/FixedSizeList) with
+            // too few children must be rejected here; otherwise
+            // DataType::try_from would call child(0) and abort the host.
+            for (fmt, n_children) in [
+                ("+l", 0),
+                ("+L", 0),
+                ("+vl", 0),
+                ("+vL", 0),
+                ("+m", 0),
+                ("+w:3", 0),
+                ("+r", 1),
+            ] {
+                unsafe {
+                    let format = CString::new(fmt).unwrap();
+                    let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                    let raw = std::alloc::alloc_zeroed(layout) as *mut FFI_ArrowSchema;
+                    (*raw).format = format.as_ptr();
+                    (*raw).n_children = n_children;
+                    let res = validate_arrow_schema_depth(raw);
+                    std::alloc::dealloc(raw as *mut u8, layout);
+                    let err = res.unwrap_err();
+                    assert!(
+                        err.msg().contains("requires at least"),
+                        "format {fmt} with {n_children} children: expected min-children rejection, got: {}",
+                        err.msg()
+                    );
+                }
             }
         }
 

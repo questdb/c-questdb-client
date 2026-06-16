@@ -1352,6 +1352,15 @@ fn write_varlen_large_offsets_no_null(
         ));
     }
     let used = (end - base) as usize;
+    if base as usize + used > arr_data.len() {
+        return Err(fmt!(
+            ArrowIngest,
+            "VARCHAR column: data slice out of bounds (base={}, used={}, data_len={})",
+            base,
+            used,
+            arr_data.len()
+        ));
+    }
     let offsets_bytes = 4usize.checked_mul(row_count + 1).ok_or_else(|| {
         fmt!(
             ArrowIngest,
@@ -1594,7 +1603,7 @@ fn write_geohash_payload(out: &mut Vec<u8>, arr: &dyn Array, bits: u8) -> Result
     let non_null = non_null_count(arr, "GEOHASH column")?;
     let label = "GEOHASH column";
     try_reserve_bytes(out, 1 + non_null * elem, label)?;
-    out.push(bits);
+    write_qwp_varint(out, bits as u64);
     let dt = arr.data_type();
     match dt {
         DataType::Int8 => {
@@ -2082,18 +2091,30 @@ fn resolve_symbol_strings<S: StrSource>(
     symbol_dict: &mut SymbolGlobalDict,
     new_symbols: &mut Vec<Vec<u8>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
+    use std::collections::HashMap;
     let row_count = arr.len();
     let non_null = non_null_count(arr, "SYMBOL column")?;
     let mut gids = Vec::with_capacity(non_null);
+    // Dedup within the column so the global dict is hit once per distinct
+    // value rather than once per row — matching the dictionary path and the
+    // row API's bulk-intern.
+    let mut seen: HashMap<&[u8], u64> = HashMap::new();
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
         }
         let bytes = source.value_bytes(row);
-        let (gid, is_new) = symbol_dict.intern(bytes)?;
-        if is_new {
-            new_symbols.push(bytes.to_vec());
-        }
+        let gid = match seen.get(bytes) {
+            Some(&gid) => gid,
+            None => {
+                let (gid, is_new) = symbol_dict.intern(bytes)?;
+                if is_new {
+                    new_symbols.push(bytes.to_vec());
+                }
+                seen.insert(bytes, gid);
+                gid
+            }
+        };
         gids.push(gid);
     }
     Ok(ArrowResolvedSymbolColumn { gids })

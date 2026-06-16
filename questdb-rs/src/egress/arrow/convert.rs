@@ -653,9 +653,11 @@ fn compute_per_level_counts(
         }
         let span = hi - lo;
         if span == 0 {
-            for level in &mut levels {
-                level.push(0);
-            }
+            // A null / empty outer row is one empty list at level 0 and
+            // contributes zero parent elements, hence zero entries at every
+            // inner level. Pushing to inner levels would shift their offsets
+            // and silently misalign every following non-null row.
+            levels[0].push(0);
             continue;
         }
         if span != ndim {
