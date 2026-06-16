@@ -95,14 +95,12 @@ pub mod _bench_internals {
     use crate::ingress::buffer::SymbolGlobalDict;
 
     use super::chunk::Chunk;
-    use super::encoder::{EncodeScratch, SchemaRegistry, encode_chunk_into};
+    use super::encoder::{EncodeScratch, encode_chunk_into};
 
     /// Opaque holder for the connection-scoped state the encoder needs.
-    /// Lets benches reuse the encoder across iterations without
-    /// promoting [`SchemaRegistry`] / [`SymbolGlobalDict`] to the
-    /// public API.
+    /// Lets benches reuse the encoder across iterations without promoting
+    /// [`SymbolGlobalDict`] to the public API.
     pub struct BenchEncoderState {
-        schema_registry: SchemaRegistry,
         symbol_dict: SymbolGlobalDict,
         scratch: EncodeScratch,
     }
@@ -116,7 +114,6 @@ pub mod _bench_internals {
     impl BenchEncoderState {
         pub fn new() -> Self {
             Self {
-                schema_registry: SchemaRegistry::new(),
                 symbol_dict: SymbolGlobalDict::new(),
                 scratch: EncodeScratch::new(),
             }
@@ -134,7 +131,6 @@ pub mod _bench_internals {
         encode_chunk_into(
             out,
             chunk,
-            &mut state.schema_registry,
             &mut state.symbol_dict,
             &mut state.scratch,
             false,

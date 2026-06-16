@@ -80,10 +80,12 @@ connection scope:
   `RawQwpWsStream` and never assembles the row-API publisher /
   driver / queue.
 
-Note that `SchemaRegistry` is now **column-sender-local** (defined in
-`column_sender/encoder.rs`), not shared. Each `ColumnConn` carries its
-own registry through the pool; the row API has its own, separate
-registry inside `QwpWsReplayEncoder`.
+Note that the column sender carries **no schema cache**. QWP is
+single-version with inline schemas (questdb #7200), so the column
+definitions (name + wire type) travel inline on every frame — right
+after the column count, with no schema-mode byte and no schema id —
+exactly like the row API
+(`QwpWsColumnarBuffer::encode_ws_replay_message`).
 
 What is *not* shared, and is duplicated verbatim where simplest, is
 the QWP response parser (one binary OK / DurableAck / error frame at
@@ -418,8 +420,9 @@ land.
   `designated_timestamp_micros` + `designated_timestamp_nanos`.
 - Implement `Validity` (Arrow-shape in: 1=valid, LSB-first). Library
   masks trailing bits beyond row_count.
-- Implement the table-header + schema-section emit. Schema interning
-  goes through the existing connection-shared `SchemaRegistry`.
+- Implement the table-header + schema-section emit. The schema (column
+  name + wire type per column) is written inline after the column count
+  on every frame — no schema-mode byte, no schema id, no schema cache.
 - Owner: 1 engineer.
 - Depends on: WS-1.
 - Done when: round-trip test for each type passes against a real
@@ -626,8 +629,9 @@ flag a deviation rather than re-litigate silently.
   behaviour without re-implementing.
 - **Encoder:** fresh `BulkChunk` encoder, no reuse of
   `QwpWsColumnarBuffer` or row-API encoder. Shares only connection-
-  scoped state (`SymbolGlobalDict`, `SchemaRegistry`, publisher).
-  Code reuse is a non-goal; perf is the goal.
+  scoped state (`SymbolGlobalDict`, publisher); the schema travels
+  inline per frame, so there is no schema cache. Code reuse is a
+  non-goal; perf is the goal.
 - **Two code paths per type:** no-null = `memcpy`; nullable = invert
   + gather in one pass.
 - **Symbol intern:** scan codes first, intern only referenced dict

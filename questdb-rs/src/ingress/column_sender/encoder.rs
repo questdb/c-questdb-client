@@ -31,7 +31,6 @@
 //!
 //! See `doc/COLUMN_SENDER_PLAN.md` for the design rationale.
 
-use std::collections::HashMap;
 use std::slice;
 
 use crate::ingress::buffer::SymbolGlobalDict;
@@ -48,63 +47,6 @@ use super::wire::{
     QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1, validate_name,
     write_qwp_bytes, write_qwp_varint,
 };
-
-/// Connection-scoped table-schema interner.
-///
-/// QWP is single-version with inline schemas (server #7200): the column
-/// definitions travel inline on every frame, so the interned id no longer
-/// drives the wire. The registry is retained only for its mark/rollback
-/// restore points, which keep a frame that fails mid-encode from leaving
-/// state behind.
-#[derive(Debug, Default)]
-pub(crate) struct SchemaRegistry {
-    by_signature: HashMap<Vec<u8>, u64>,
-    next_id: u64,
-}
-
-/// Restore point for [`SchemaRegistry`]. Captured before encoding a
-/// frame; on [`SchemaRegistry::rollback`] every signature interned
-/// after the snapshot is removed and `next_id` is reset — so a frame
-/// that fails before its bytes reach the wire never gets to claim a
-/// schema id the server hasn't seen.
-pub(crate) struct SchemaRegistryMark {
-    next_id_at_mark: u64,
-}
-
-impl SchemaRegistry {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn mark(&self) -> SchemaRegistryMark {
-        SchemaRegistryMark {
-            next_id_at_mark: self.next_id,
-        }
-    }
-
-    pub(super) fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
-        if let Some(&id) = self.by_signature.get(signature) {
-            return (id, false);
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.by_signature.insert(signature.to_vec(), id);
-        (id, true)
-    }
-
-    pub(crate) fn rollback(&mut self, mark: SchemaRegistryMark) {
-        if self.next_id == mark.next_id_at_mark {
-            return;
-        }
-        self.by_signature.retain(|_, id| *id < mark.next_id_at_mark);
-        self.next_id = mark.next_id_at_mark;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.by_signature.len()
-    }
-}
 
 /// Per-sender reusable scratch state for one flush. The contained `Vec`s
 /// are cleared (not reallocated) between flushes so a long-lived
@@ -139,7 +81,6 @@ impl EncodeScratch {
 pub(crate) fn encode_chunk_into(
     out: &mut Vec<u8>,
     chunk: &Chunk<'_>,
-    schema_registry: &mut SchemaRegistry,
     symbol_dict: &mut SymbolGlobalDict,
     scratch: &mut EncodeScratch,
     defer_commit: bool,
@@ -218,7 +159,6 @@ pub(crate) fn encode_chunk_into(
     scratch.signature.push(designated.wire_type);
 
     let frame_start = out.len();
-    let schema_mark = schema_registry.mark();
     let result = encode_frame_after_signature(
         out,
         chunk,
@@ -229,13 +169,11 @@ pub(crate) fn encode_chunk_into(
         delta_start,
         defer_commit,
         scratch,
-        schema_registry,
     );
     match result {
         Ok(()) => Ok(()),
         Err(e) => {
             out.truncate(frame_start);
-            schema_registry.rollback(schema_mark);
             symbol_dict.rollback(dict_mark);
             Err(e)
         }
@@ -253,15 +191,7 @@ fn encode_frame_after_signature(
     delta_start: u64,
     defer_commit: bool,
     scratch: &EncodeScratch,
-    schema_registry: &mut SchemaRegistry,
 ) -> Result<()> {
-    // The registry is still snapshotted/rolled back by the caller for
-    // error recovery, but the QWP wire is single-version with inline
-    // schemas (server #7200): the column defs always travel inline right
-    // after col_count — no schema-mode byte, no schema id. Matches the
-    // row API (`QwpWsColumnarBuffer::encode_ws_replay_message`).
-    let _ = schema_registry.intern(&scratch.signature);
-
     let estimated = estimate_frame_size(
         chunk,
         row_count,
@@ -1053,10 +983,9 @@ mod tests {
         chunk.column_i64(name, data, None).unwrap();
         chunk.designated_timestamp_nanos(data).unwrap();
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
         out
     }
 
@@ -1064,10 +993,9 @@ mod tests {
     fn empty_chunk_encodes_to_14_bytes() {
         let chunk = Chunk::new("trades");
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(out.len(), 14);
         assert_eq!(&out[0..4], b"QWP1");
         assert_eq!(out[5], QWP_FLAG_DELTA_SYMBOL_DICT);
@@ -1078,10 +1006,9 @@ mod tests {
     fn defer_commit_flag_is_set_when_requested() {
         let chunk = Chunk::new("trades");
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, true).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, true).unwrap();
         assert_eq!(out[5] & QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DEFER_COMMIT);
         assert_eq!(
             out[5] & QWP_FLAG_DELTA_SYMBOL_DICT,
@@ -1095,18 +1022,15 @@ mod tests {
         let data = [1i64, 2, 3];
         chunk.column_i64("a", &data, None).unwrap();
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
-            .unwrap_err();
+        let err = encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("designated"));
     }
 
     #[test]
     fn second_encode_with_same_schema_still_inlines_schema() {
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
 
@@ -1115,21 +1039,18 @@ mod tests {
         c1.column_i64("price", &p1, None).unwrap();
         c1.designated_timestamp_nanos(&p1).unwrap();
         let mut out1 = Vec::new();
-        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out1, &c1, &mut dict, &mut scratch, false).unwrap();
 
         let p2 = [3i64, 4];
         let mut c2 = Chunk::new("trades");
         c2.column_i64("price", &p2, None).unwrap();
         c2.designated_timestamp_nanos(&p2).unwrap();
         let mut out2 = Vec::new();
-        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out2, &c2, &mut dict, &mut scratch, false).unwrap();
 
-        // QWP is single-version with inline schemas (server #7200): the schema
-        // travels inline on every frame, so re-flushing the same schema yields
-        // a same-size frame — there is no smaller REFERENCE form. The schema
-        // bytes appear right after col_count with no schema-mode byte.
+        // Re-flushing the same schema re-inlines it (no REFERENCE form), so
+        // the frame is the same size.
         assert_eq!(out2.len(), out1.len());
-        assert_eq!(reg.len(), 1, "schema signature still interned once");
 
         // [12B header][delta_start=0][new_symbols=0][table "trades"][row_count][col_count]
         let schema_offset = 12 + 1 + 1 + 1 + "trades".len() + 1 + 1;
@@ -1137,29 +1058,6 @@ mod tests {
         assert_eq!(out1[schema_offset], 5);
         assert_eq!(&out1[schema_offset + 1..schema_offset + 6], b"price");
         assert_eq!(out1[schema_offset], out2[schema_offset]);
-    }
-
-    #[test]
-    fn distinct_schemas_get_distinct_ids() {
-        let mut reg = SchemaRegistry::new();
-        let mut dict = SymbolGlobalDict::new();
-        let mut scratch = EncodeScratch::new();
-        let x = [1i64];
-        let mut a = Chunk::new("a");
-        a.column_i64("x", &x, None).unwrap();
-        a.designated_timestamp_nanos(&x).unwrap();
-        let mut oa = Vec::new();
-        encode_chunk_into(&mut oa, &a, &mut reg, &mut dict, &mut scratch, false).unwrap();
-
-        let y = [1.0f64];
-        let ts = [1i64];
-        let mut b = Chunk::new("b");
-        b.column_f64("y", &y, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
-        let mut ob = Vec::new();
-        encode_chunk_into(&mut ob, &b, &mut reg, &mut dict, &mut scratch, false).unwrap();
-
-        assert_eq!(reg.len(), 2);
     }
 
     #[test]
@@ -1171,10 +1069,9 @@ mod tests {
         chunk.column_i64("price", &p, Some(&v)).unwrap();
         chunk.designated_timestamp_nanos(&p).unwrap();
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
         assert!(out.len() > 32);
     }
 
@@ -1190,10 +1087,9 @@ mod tests {
             .unwrap();
         chunk.designated_timestamp_nanos(&ts).unwrap();
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2, "alpha + gamma only, beta unsent");
     }
 
@@ -1209,16 +1105,14 @@ mod tests {
             .unwrap();
         chunk.designated_timestamp_nanos(&ts).unwrap();
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2, "alpha + gamma only, beta unsent");
     }
 
     #[test]
     fn symbol_dict_second_frame_resends_only_new_entries() {
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
         let dict_offsets = [0i32, 5, 9, 14];
@@ -1231,7 +1125,7 @@ mod tests {
             .unwrap();
         c1.designated_timestamp_nanos(&ts1).unwrap();
         let mut out1 = Vec::new();
-        encode_chunk_into(&mut out1, &c1, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out1, &c1, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2);
 
         let codes2 = [0i32, 2];
@@ -1241,7 +1135,7 @@ mod tests {
             .unwrap();
         c2.designated_timestamp_nanos(&ts2).unwrap();
         let mut out2 = Vec::new();
-        encode_chunk_into(&mut out2, &c2, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out2, &c2, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 3, "gamma added on second frame");
     }
 
@@ -1274,10 +1168,9 @@ mod tests {
             .unwrap();
         chunk.designated_timestamp_nanos(&values).unwrap();
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
 
         assert_eq!(
             row_by_row, out,
@@ -1302,10 +1195,9 @@ mod tests {
         chunk.designated_timestamp_nanos(&ts).unwrap();
 
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
 
         assert_eq!(&out[..4], b"QWP1");
         assert_eq!(dict.next_id(), 2, "two unique symbols interned");
@@ -1338,12 +1230,10 @@ mod tests {
         chunk.designated_timestamp_nanos(&ts).unwrap();
 
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
         let prior_next = dict.next_id();
-        let err = encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
-            .unwrap_err();
+        let err = encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
         assert_eq!(
             dict.next_id(),

@@ -204,12 +204,6 @@ impl PoolState {
 
 struct PoolEntry {
     conn: ColumnConn,
-    /// Connection-scoped schema interner. Travels with the slot so its
-    /// `(signature → id)` map stays coherent across borrow/return cycles;
-    /// both client and server build the same map by first-emit order, so
-    /// dropping it would resync the next FULL emit at id 0 and corrupt
-    /// the server's schema table.
-    schema_registry: super::encoder::SchemaRegistry,
     /// Connection-scoped global symbol dictionary — same coherence
     /// argument: the server tracks ids by first-emit order over the life
     /// of the WS connection, so the dict must travel with the slot.
@@ -283,7 +277,6 @@ impl QuestDb {
             })?;
             free.push(PoolEntry {
                 conn,
-                schema_registry: super::encoder::SchemaRegistry::new(),
                 symbol_dict: crate::ingress::buffer::SymbolGlobalDict::new(),
                 scratch: super::encoder::EncodeScratch::new(),
                 last_idle_at: now,
@@ -351,7 +344,6 @@ impl QuestDb {
             drop(state);
             return Ok(ColumnSender::new(
                 entry.conn,
-                entry.schema_registry,
                 entry.symbol_dict,
                 entry.scratch,
             ));
@@ -375,7 +367,6 @@ impl QuestDb {
 
         Ok(ColumnSender::new(
             conn,
-            super::encoder::SchemaRegistry::new(),
             crate::ingress::buffer::SymbolGlobalDict::new(),
             super::encoder::EncodeScratch::new(),
         ))
@@ -749,7 +740,6 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     if !must_close {
         state.free.push(PoolEntry {
             conn: sender.conn,
-            schema_registry: sender.schema_registry,
             symbol_dict: sender.symbol_dict,
             scratch: sender.scratch,
             last_idle_at: Instant::now(),

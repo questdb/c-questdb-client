@@ -25,10 +25,9 @@
 //! Borrowed-handle types for the column-major sender.
 //!
 //! A [`ColumnSender`] owns one pipelined QWP/WebSocket connection
-//! ([`super::conn::ColumnConn`]), a connection-scoped
-//! [`SchemaRegistry`](super::encoder::SchemaRegistry), and a
-//! connection-scoped [`SymbolGlobalDict`]: all three travel back into the
-//! pool together when the [`super::BorrowedSender`] is dropped.
+//! ([`super::conn::ColumnConn`]) and a connection-scoped
+//! [`SymbolGlobalDict`]: both travel back into the pool together when the
+//! [`super::BorrowedSender`] is dropped.
 
 use std::fmt::{self, Debug, Formatter};
 
@@ -42,7 +41,7 @@ use crate::{Result, error};
 use super::arrow_batch::{self, ArrowColumnOverride};
 use super::chunk::Chunk;
 use super::conn::ColumnConn;
-use super::encoder::{self, SchemaRegistry};
+use super::encoder;
 
 #[cfg(feature = "arrow")]
 use arrow_array::RecordBatch;
@@ -64,7 +63,6 @@ pub enum AckLevel {
 /// One [`ColumnConn`] in the pool, wrapped in the column-sender API.
 pub struct ColumnSender {
     pub(crate) conn: ColumnConn,
-    pub(crate) schema_registry: SchemaRegistry,
     pub(crate) symbol_dict: SymbolGlobalDict,
     pub(crate) scratch: encoder::EncodeScratch,
     /// The first frame is sent without `FLAG_DEFER_COMMIT` so the server
@@ -86,13 +84,11 @@ impl Debug for ColumnSender {
 impl ColumnSender {
     pub(crate) fn new(
         conn: ColumnConn,
-        schema_registry: SchemaRegistry,
         symbol_dict: SymbolGlobalDict,
         scratch: encoder::EncodeScratch,
     ) -> Self {
         Self {
             conn,
-            schema_registry,
             symbol_dict,
             scratch,
             first_frame_sent: false,
@@ -240,18 +236,16 @@ impl ColumnSender {
             self.conn.drain_one_ack_blocking()?;
         }
 
-        let schema = &mut self.schema_registry;
         let dict = &mut self.symbol_dict;
         let scratch = &mut self.scratch;
         let dict_mark = dict.mark();
-        let schema_mark = schema.mark();
-        let published = match self.conn.publish_qwp(|out| {
-            encoder::encode_chunk_into(out, chunk, schema, dict, scratch, defer_commit)
-        }) {
+        let published = match self
+            .conn
+            .publish_qwp(|out| encoder::encode_chunk_into(out, chunk, dict, scratch, defer_commit))
+        {
             Ok(p) => p,
             Err(e) => {
                 if e.code() != ErrorCode::SocketError {
-                    schema.rollback(schema_mark);
                     dict.rollback(dict_mark);
                 }
                 return Err(e);
@@ -287,8 +281,6 @@ impl ColumnSender {
         }
 
         let dict_mark = self.symbol_dict.mark();
-        let schema_mark = self.schema_registry.mark();
-        let schema = &mut self.schema_registry;
         let dict = &mut self.symbol_dict;
         let result = self.conn.publish_qwp(|out| {
             arrow_batch::encode_arrow_batch_into(
@@ -297,7 +289,6 @@ impl ColumnSender {
                 batch,
                 ts_col_idx,
                 overrides,
-                schema,
                 dict,
                 defer_commit,
             )
@@ -306,7 +297,6 @@ impl ColumnSender {
             Ok(p) => p,
             Err(err) => {
                 if err.code() != ErrorCode::SocketError {
-                    self.schema_registry.rollback(schema_mark);
                     self.symbol_dict.rollback(dict_mark);
                 }
                 return Err(err);

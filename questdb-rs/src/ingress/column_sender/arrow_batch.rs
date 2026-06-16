@@ -52,7 +52,6 @@ use crate::ingress::buffer::SymbolGlobalDict;
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, fmt};
 
-use super::encoder::SchemaRegistry;
 use super::wire::{
     QWP_FLAG_DEFER_COMMIT, QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_TYPE_BINARY,
     QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_CHAR, QWP_TYPE_DATE, QWP_TYPE_DECIMAL64,
@@ -3174,14 +3173,12 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
     debug_assert_eq!(out.len() - start, QWP_HEADER_LEN);
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_arrow_batch_into(
     out: &mut Vec<u8>,
     table: TableName<'_>,
     batch: &RecordBatch,
     ts_col_idx: Option<usize>,
     overrides: &[ArrowColumnOverride<'_>],
-    schema_registry: &mut SchemaRegistry,
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
 ) -> Result<()> {
@@ -3277,17 +3274,9 @@ pub(crate) fn encode_arrow_batch_into(
         write_qwp_bytes(&mut signature, &[]);
         signature.push(ts_byte);
     }
-    let schema_mark = schema_registry.mark();
-    // Snapshotted/rolled back for error recovery, but the QWP wire is
-    // single-version with inline schemas (server #7200): column defs always
-    // travel inline right after col_count — no schema-mode byte, no schema
-    // id. Matches the row API (`QwpWsColumnarBuffer::encode_ws_replay_message`).
-    let _ = schema_registry.intern(&signature);
-
     let frame_start = out.len();
     let estimated = estimate_frame_size(&classified, &resolution, ts_col_idx, row_count, table);
     if let Err(_e) = out.try_reserve(estimated) {
-        schema_registry.rollback(schema_mark);
         symbol_dict.rollback(dict_mark);
         return Err(fmt!(
             ArrowIngest,
@@ -3310,16 +3299,8 @@ pub(crate) fn encode_arrow_batch_into(
     write_qwp_varint(out, column_count as u64);
     out.extend_from_slice(&signature);
 
-    let mut schema_mark_holder = Some(schema_mark);
-    let mut rollback_on_err = |out: &mut Vec<u8>,
-                               dict: &mut SymbolGlobalDict,
-                               schema_registry: &mut SchemaRegistry,
-                               e: Error|
-     -> Error {
+    let rollback_on_err = |out: &mut Vec<u8>, dict: &mut SymbolGlobalDict, e: Error| -> Error {
         out.truncate(frame_start);
-        if let Some(m) = schema_mark_holder.take() {
-            schema_registry.rollback(m);
-        }
         dict.rollback(dict_mark);
         e
     };
@@ -3331,7 +3312,6 @@ pub(crate) fn encode_arrow_batch_into(
             return Err(rollback_on_err(
                 out,
                 symbol_dict,
-                schema_registry,
                 decorate_column(e, &col_name),
             ));
         }
@@ -3345,7 +3325,6 @@ pub(crate) fn encode_arrow_batch_into(
             return Err(rollback_on_err(
                 out,
                 symbol_dict,
-                schema_registry,
                 decorate_column(e, &field_name),
             ));
         }
@@ -3358,7 +3337,6 @@ pub(crate) fn encode_arrow_batch_into(
             return Err(rollback_on_err(
                 out,
                 symbol_dict,
-                schema_registry,
                 fmt!(
                     ArrowIngest,
                     "QWP frame payload size {} bytes exceeds u32::MAX; \
@@ -3477,15 +3455,14 @@ mod tests {
     }
 
     /// Encode `batch` for `table` (no designated ts), returning the wire
-    /// bytes. Each call uses fresh `SchemaRegistry` / `SymbolGlobalDict`
-    /// so tests are independent.
+    /// bytes. Each call uses a fresh `SymbolGlobalDict` so tests are
+    /// independent.
     fn encode(batch: &RecordBatch) -> Vec<u8> {
         encode_with_table(batch, "t")
     }
 
     fn encode_with_table(batch: &RecordBatch, table_name: &str) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         encode_arrow_batch_into(
             &mut out,
@@ -3493,7 +3470,6 @@ mod tests {
             batch,
             None,
             &[],
-            &mut reg,
             &mut dict,
             false,
         )
@@ -3505,7 +3481,6 @@ mod tests {
     /// returning the wire bytes.
     fn encode_at_ts(batch: &RecordBatch, ts_idx: usize) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         encode_arrow_batch_into(
             &mut out,
@@ -3513,7 +3488,6 @@ mod tests {
             batch,
             Some(ts_idx),
             &[],
-            &mut reg,
             &mut dict,
             false,
         )
@@ -3523,24 +3497,12 @@ mod tests {
 
     fn encode_err(batch: &RecordBatch) -> Error {
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            batch,
-            None,
-            &[],
-            &mut reg,
-            &mut dict,
-            false,
-        )
-        .unwrap_err()
+        encode_arrow_batch_into(&mut out, tbl("t"), batch, None, &[], &mut dict, false).unwrap_err()
     }
 
     fn encode_err_at_ts(batch: &RecordBatch, ts_idx: usize) -> Error {
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         encode_arrow_batch_into(
             &mut out,
@@ -3548,7 +3510,6 @@ mod tests {
             batch,
             Some(ts_idx),
             &[],
-            &mut reg,
             &mut dict,
             false,
         )
@@ -3637,19 +3598,8 @@ mod tests {
         let f = Field::new("sym", DataType::Utf8, false).with_metadata(md);
         let rb = single_col_batch(f, sb.finish());
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            &rb,
-            None,
-            &[],
-            &mut reg,
-            &mut dict,
-            false,
-        )
-        .unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false).unwrap();
         assert_qwp_header(&out, 1);
         assert_eq!(dict.next_id(), 2);
     }
@@ -4133,19 +4083,8 @@ mod tests {
         )]));
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            &rb,
-            None,
-            &[],
-            &mut reg,
-            &mut dict,
-            false,
-        )
-        .unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false).unwrap();
         // 4 rows, only 2 unique values → dict has 2 entries.
         assert_eq!(dict.next_id(), 2);
     }
@@ -4161,19 +4100,8 @@ mod tests {
         )]));
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            &rb,
-            None,
-            &[],
-            &mut reg,
-            &mut dict,
-            false,
-        )
-        .unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false).unwrap();
         assert_eq!(dict.next_id(), 2);
     }
 
@@ -5066,19 +4994,9 @@ mod tests {
         .unwrap();
         let mut out = Vec::from(b"PREFIX");
         let prior_len = out.len();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        let err = encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            &rb,
-            None,
-            &[],
-            &mut reg,
-            &mut dict,
-            false,
-        )
-        .unwrap_err();
+        let err = encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false)
+            .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
         assert_eq!(
             out.len(),
@@ -5347,18 +5265,8 @@ mod tests {
         overrides: &[ArrowColumnOverride<'_>],
     ) -> Result<(Vec<u8>, SymbolGlobalDict)> {
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(
-            &mut out,
-            tbl("t"),
-            batch,
-            None,
-            overrides,
-            &mut reg,
-            &mut dict,
-            false,
-        )?;
+        encode_arrow_batch_into(&mut out, tbl("t"), batch, None, overrides, &mut dict, false)?;
         Ok((out, dict))
     }
 

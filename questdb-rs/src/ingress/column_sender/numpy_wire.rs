@@ -1190,25 +1190,23 @@ unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescript
 mod tests {
     use super::super::Validity;
     use super::super::chunk::Chunk;
-    use super::super::encoder::{EncodeScratch, SchemaRegistry, encode_chunk_into};
+    use super::super::encoder::{EncodeScratch, encode_chunk_into};
     use super::*;
     use crate::ingress::buffer::SymbolGlobalDict;
 
     fn encode(chunk: &Chunk<'_>) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, chunk, &mut reg, &mut dict, &mut scratch, false).unwrap();
+        encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap();
         out
     }
 
     fn encode_err(chunk: &Chunk<'_>) -> crate::Error {
         let mut out = Vec::new();
-        let mut reg = SchemaRegistry::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
-        encode_chunk_into(&mut out, chunk, &mut reg, &mut dict, &mut scratch, false).unwrap_err()
+        encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap_err()
     }
 
     #[test]
@@ -1754,11 +1752,9 @@ mod tests {
         chunk.designated_timestamp_nanos(&ts).unwrap();
         let err = {
             let mut out = Vec::new();
-            let mut reg = SchemaRegistry::new();
             let mut dict = SymbolGlobalDict::new();
             let mut scratch = EncodeScratch::new();
-            encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
-                .unwrap_err()
+            encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err()
         };
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("overflows"));
@@ -1784,11 +1780,9 @@ mod tests {
         chunk.designated_timestamp_nanos(&ts).unwrap();
         let err = {
             let mut out = Vec::new();
-            let mut reg = SchemaRegistry::new();
             let mut dict = SymbolGlobalDict::new();
             let mut scratch = EncodeScratch::new();
-            encode_chunk_into(&mut out, &chunk, &mut reg, &mut dict, &mut scratch, false)
-                .unwrap_err()
+            encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap_err()
         };
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("overflows"));
