@@ -5063,11 +5063,19 @@ const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 /// Capped at [`MAX_CONN_SYMBOL_DICT_SIZE`] to mirror the server's
 /// connection-scoped dictionary ceiling and the Java reference client.
 #[cfg(feature = "_sender-qwp-ws")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SymbolGlobalDict {
     map: QwpWsSymbolHashMap<u64>,
     entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
+    cap: usize,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Default for SymbolGlobalDict {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Per-connection cap on the QWP/WS global symbol dictionary. Matches
@@ -5092,7 +5100,16 @@ impl SymbolGlobalDict {
             map: QwpWsSymbolHashMap::default(),
             entries: Vec::new(),
             next_id: 0,
+            cap: MAX_CONN_SYMBOL_DICT_SIZE,
         }
+    }
+
+    /// Same as [`new`](Self::new) but with a smaller entry cap so the
+    /// cap-rejection path can be exercised without interning millions of
+    /// symbols.
+    #[cfg(test)]
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self { cap, ..Self::new() }
     }
 
     #[cfg(test)]
@@ -5134,12 +5151,13 @@ impl SymbolGlobalDict {
         if let Some(&id) = self.map.get(bytes) {
             return Ok((id, false));
         }
-        if self.entries.len() >= MAX_CONN_SYMBOL_DICT_SIZE {
+        if self.entries.len() >= self.cap {
             return Err(crate::error::fmt!(
                 InvalidApiCall,
                 "QWP/WS connection-scoped symbol dictionary reached its \
-                 {MAX_CONN_SYMBOL_DICT_SIZE}-entry cap; drop and reopen \
-                 the connection to reset the dictionary"
+                 {}-entry cap; drop and reopen the connection to reset \
+                 the dictionary",
+                self.cap
             ));
         }
         self.entries
@@ -9039,6 +9057,52 @@ mod tests {
             vec![b"BTC-USD".to_vec()],
             "replay frames must re-emit already-known symbols"
         );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_enforces_entry_cap() {
+        let mut dict = SymbolGlobalDict::with_cap(3);
+        assert!(dict.intern(b"a").unwrap().1);
+        assert!(dict.intern(b"b").unwrap().1);
+        assert!(dict.intern(b"c").unwrap().1);
+        assert_eq!(dict.len(), 3);
+
+        // A fourth distinct symbol is rejected once the cap is reached.
+        let err = dict.intern(b"d").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("cap"), "{}", err.msg());
+
+        // An already-interned symbol still resolves at the cap.
+        let (id_a, is_new) = dict.intern(b"a").unwrap();
+        assert!(!is_new);
+        assert_eq!(id_a, 0);
+        assert_eq!(dict.len(), 3);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_rollback_restores_below_cap() {
+        let mut dict = SymbolGlobalDict::with_cap(2);
+        assert!(dict.intern(b"a").unwrap().1);
+        let mark = dict.mark();
+        assert!(dict.intern(b"b").unwrap().1);
+        // At the cap now; a new symbol is rejected.
+        assert!(dict.intern(b"c").is_err());
+        // Rolling back the second insert frees a slot.
+        dict.rollback(mark);
+        assert_eq!(dict.len(), 1);
+        let (_, is_new) = dict.intern(b"c").unwrap();
+        assert!(is_new);
+        assert_eq!(dict.len(), 2);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_cap_matches_server_ceiling() {
+        // Mirrors the egress reader cap and the Java reference client; a
+        // drift here would silently change the reconnect threshold.
+        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 8 * 1024 * 1024);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

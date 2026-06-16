@@ -1096,6 +1096,95 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
     }
 }
 
+/* Exercises the documented `array->release` ownership contract of
+ * `column_sender_flush_arrow_batch` on all three states: pre-import
+ * failure leaves release intact (caller frees), a malformed nested schema
+ * is rejected gracefully (not by aborting the panic=abort FFI crate) with
+ * release intact, and a structurally-valid batch that reaches the Arrow
+ * import step has release consumed regardless of the eventual outcome. */
+TEST(test_mock_ingress_arrow_release_contract)
+{
+    qwp_mock_c* mock;
+    questdb_db* db;
+    qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+    CHECK(conn != NULL, "mock conn borrowed");
+    if (conn == NULL)
+        return;
+    int64_t values[2] = {10, 20};
+
+    /* (A) Pre-import failure (NULL schema): release stays intact. */
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
+        line_sender_error* err = NULL;
+        bool ok = column_sender_flush_arrow_batch(
+            conn, make_table("rc_a"), &arr, NULL, NULL, 0, &err);
+        CHECK(!ok, "NULL schema → false");
+        CHECK(
+            arr.release != NULL,
+            "release intact on pre-import (NULL schema) failure");
+        if (err)
+            line_sender_error_free(err);
+        if (arr.release)
+            arr.release(&arr);
+        if (sch.release)
+            sch.release(&sch);
+    }
+
+    /* (B) Malformed nested schema (List with zero children) must be
+     * rejected before import — gracefully, not by aborting — with release
+     * intact so the caller can free it. */
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "+l", "v", &arr, &sch);
+        line_sender_error* err = NULL;
+        bool ok = column_sender_flush_arrow_batch(
+            conn, make_table("rc_b"), &arr, &sch, NULL, 0, &err);
+        CHECK(!ok, "malformed +l schema → false");
+        CHECK(err != NULL, "err_out populated on malformed schema");
+        if (err)
+        {
+            int code = (int)line_sender_error_get_code(err);
+            int accepted =
+                code == line_sender_error_arrow_ingest ||
+                code == line_sender_error_invalid_api_call;
+            CHECK(accepted, "malformed +l → structured error (not abort)");
+            line_sender_error_free(err);
+        }
+        CHECK(
+            arr.release != NULL,
+            "release intact on pre-import (malformed schema) reject");
+        if (arr.release)
+            arr.release(&arr);
+        if (sch.release)
+            sch.release(&sch);
+    }
+
+    /* (C) A structurally-valid batch reaches the Arrow import step, which
+     * consumes release (sets it NULL) whether the flush ultimately
+     * succeeds or fails afterward. The caller must NOT release it again. */
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
+        line_sender_error* err = NULL;
+        bool ok = column_sender_flush_arrow_batch(
+            conn, make_table("rc_c"), &arr, &sch, NULL, 0, &err);
+        (void)ok;
+        CHECK(
+            arr.release == NULL,
+            "release consumed once the Arrow import step is reached");
+        if (err)
+            line_sender_error_free(err);
+        if (sch.release)
+            sch.release(&sch);
+    }
+
+    mock_return_close(mock, db, conn);
+}
+
 int main(void)
 {
     RUN(test_tristate_egress_enum_values);
@@ -1133,6 +1222,7 @@ int main(void)
     RUN(test_mock_ingress_float32_float64_columns);
     RUN(test_mock_ingress_timestamp_microseconds);
     RUN(test_mock_ingress_both_designated_timestamp_variants);
+    RUN(test_mock_ingress_arrow_release_contract);
     fprintf(stderr, "Ran %d tests, %d errors\n", tests, errors);
     return errors == 0 ? 0 : 1;
 }

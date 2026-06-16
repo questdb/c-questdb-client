@@ -148,4 +148,14 @@ mod tests {
         let err = Validity::from_bitmap(&[0u8], 9).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
     }
+
+    #[test]
+    fn from_bitmap_rejects_bit_len_above_max() {
+        // bit_len is checked before the buffer-size check, so a tiny slice
+        // with an oversized bit_len returns the cap error rather than
+        // requiring a multi-megabyte allocation.
+        let err = Validity::from_bitmap(&[0u8], super::super::MAX_CHUNK_ROWS + 1).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("MAX_CHUNK_ROWS"), "{}", err.msg());
+    }
 }

@@ -342,10 +342,22 @@ class QuestDbFixtureBase:
         return data
 
     def query_version(self):
-        try:
-            res = self.http_sql_query('select build')
-        except QueryError as qe:
-            # For old versions that don't support `build` yet, parse from path.
+        # `/ping` can answer before the SQL engine can serve `select
+        # build`, so retry rather than let one 5s socket timeout decide.
+        def try_query():
+            try:
+                return ('build', self.http_sql_query('select build'))
+            except QueryError:
+                # Old versions without `build`: parse from path instead.
+                return ('legacy', None)
+            except (TimeoutError, urllib.error.URLError):
+                return False
+
+        kind, res = retry(
+            try_query,
+            timeout_sec=60,
+            msg='Timed out querying QuestDB version.')
+        if kind == 'legacy':
             return self.version
 
         vers = res['dataset'][0][0]

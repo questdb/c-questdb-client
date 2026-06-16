@@ -90,13 +90,6 @@ pub(crate) fn encode_chunk_into(
         emit_header_only_frame(out, defer_commit);
         return Ok(());
     }
-    if chunk.designated_ts.is_none() {
-        return Err(error::fmt!(
-            InvalidApiCall,
-            "Chunk has no designated timestamp; \
-             call designated_timestamp_micros or designated_timestamp_nanos before flush."
-        ));
-    }
     let row_count = chunk.row_count();
     if row_count == 0 {
         return Err(error::fmt!(
@@ -110,6 +103,13 @@ pub(crate) fn encode_chunk_into(
             "Chunk row_count {} exceeds MAX_CHUNK_ROWS ({}); split into smaller chunks",
             row_count,
             super::MAX_CHUNK_ROWS
+        ));
+    }
+    if chunk.designated_ts.is_none() {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Chunk has no designated timestamp; \
+             call designated_timestamp_micros or designated_timestamp_nanos before flush."
         ));
     }
     validate_name("table", &chunk.table)?;

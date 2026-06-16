@@ -4431,6 +4431,98 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Signed dictionary keys (Int8 / Int16 / Int32)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dict_i8_utf8_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int8Type;
+        let keys = arrow_array::Int8Array::from(vec![0i8, 1, 0, 1]);
+        let values = StringArray::from(vec!["red", "green"]);
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = single_col_batch(field, dict);
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn dict_i16_large_utf8_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int16Type;
+        let keys = arrow_array::Int16Array::from(vec![0i16, 1, 1]);
+        let values = LargeStringArray::from(vec!["AAPL", "MSFT"]);
+        let dict = DictionaryArray::<Int16Type>::try_new(keys, Arc::new(values)).unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::LargeUtf8)),
+            true,
+        );
+        let rb = single_col_batch(field, dict);
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn dict_i32_utf8_view_routes_to_symbol() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int32Type;
+        let keys = arrow_array::Int32Array::from(vec![0i32, 1, 0]);
+        let values = StringViewArray::from(vec!["x", "y"]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8View)),
+            true,
+        );
+        let rb = single_col_batch(field, dict);
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn dict_i8_dedups_and_assigns_gids() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int8Type;
+        // 4 rows reference 2 distinct slots → exactly 2 global ids.
+        let keys = arrow_array::Int8Array::from(vec![1i8, 0, 1, 0]);
+        let values = StringArray::from(vec!["A", "B"]);
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = single_col_batch(field, dict);
+        let mut out = Vec::new();
+        let mut gd = SymbolGlobalDict::new();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut gd, false).unwrap();
+        assert_eq!(gd.next_id(), 2);
+    }
+
+    #[test]
+    fn dict_i16_null_keys_skip_intern() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int16Type;
+        // Null rows must not be interned; only the one referenced slot is.
+        let keys = arrow_array::Int16Array::from(vec![Some(0i16), None, Some(0)]);
+        let values = StringArray::from(vec!["only"]);
+        let dict = DictionaryArray::<Int16Type>::try_new(keys, Arc::new(values)).unwrap();
+        let field = Field::new(
+            "s",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            true,
+        );
+        let rb = single_col_batch(field, dict);
+        let mut out = Vec::new();
+        let mut gd = SymbolGlobalDict::new();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut gd, false).unwrap();
+        assert_eq!(gd.next_id(), 1);
+    }
+
+    // -----------------------------------------------------------------
     // LargeUtf8 / LargeBinary bulk-memcpy + slow-path
     // -----------------------------------------------------------------
 

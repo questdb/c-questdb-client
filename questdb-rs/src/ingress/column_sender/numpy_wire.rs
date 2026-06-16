@@ -1209,6 +1209,29 @@ mod tests {
     }
 
     #[test]
+    fn chunk_row_count_above_max_rejected_before_read() {
+        // The encoder must reject an oversized row_count before touching the
+        // column buffer, so a deliberately tiny backing buffer paired with a
+        // huge claimed length is never dereferenced.
+        let buf = [0u8; 8];
+        let mut chunk = Chunk::new("t");
+        unsafe {
+            chunk
+                .push_numpy_deferred(
+                    "v",
+                    NumpyDtype::I8Direct,
+                    buf.as_ptr(),
+                    super::super::MAX_CHUNK_ROWS + 1,
+                    None,
+                )
+                .unwrap();
+        }
+        let err = encode_err(&chunk);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("MAX_CHUNK_ROWS"), "{}", err.msg());
+    }
+
+    #[test]
     fn i8_direct_matches_column_i8() {
         let src = [1i8, -2, 3];
         let ts = [10i64, 20, 30];

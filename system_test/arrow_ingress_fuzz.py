@@ -634,6 +634,50 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
         rb = pa.RecordBatch.from_arrays([c_geo, ts_arr], schema=schema)
         self._expect_code(rb, SenderErrorCode.ARROW_INGEST)
 
+    def test_err_malformed_list_schema_zero_children(self):
+        # pyarrow always emits structurally-valid Arrow, so hand-build a
+        # malformed C Data Interface struct directly: a List ("+l") that
+        # declares no child. The pre-import validator must reject it with
+        # ArrowIngest rather than letting arrow-rs abort the panic=abort FFI
+        # crate inside DataType::try_from -> FFI_ArrowSchema::child().
+        from arrow_ffi import ArrowArray, ArrowSchema, conn_flush_arrow_batch
+        from questdb_line_sender import _table_name as _c_table_name
+
+        arr_release_t = ctypes.CFUNCTYPE(None, ctypes.POINTER(ArrowArray))
+        sch_release_t = ctypes.CFUNCTYPE(None, ctypes.POINTER(ArrowSchema))
+        # Held in locals for the lifetime of the call. release must be
+        # non-NULL so the array passes the already-consumed check and
+        # actually reaches the schema validator.
+        arr_release = arr_release_t(lambda _p: None)
+        sch_release = sch_release_t(lambda _p: None)
+
+        arr = ArrowArray()
+        arr.length = 2
+        arr.n_buffers = 0
+        arr.n_children = 0
+        arr.release = arr_release
+
+        sch = ArrowSchema()
+        sch.format = b"+l"
+        sch.name = b"c"
+        sch.n_children = 0
+        sch.release = sch_release
+
+        table = f"arrow_in_malformed_{self._master_rng.next_int(2**32):08x}"
+        with afc.borrowed_conn(self._fixture) as conn:
+            table_name = _c_table_name(table)
+            try:
+                conn_flush_arrow_batch(
+                    conn, table_name,
+                    ctypes.byref(arr), ctypes.byref(sch),
+                )
+            except ArrowSenderError as e:
+                self.assertEqual(
+                    e.code, SenderErrorCode.ARROW_INGEST,
+                    self.label(f"malformed +l → code={e.code} msg={e}"))
+            else:
+                self.fail(self.label("malformed +l schema must be rejected"))
+
 class TestArrowIngressExtraTypes(afc.ArrowFuzzBase):
     """Arrow primitive variants that don't surface via polars but are
     accepted by the Rust ingest path through a widening / unit conversion:
