@@ -81,7 +81,7 @@ impl ImportedArrowColumn {
     pub unsafe fn import_from_ffi(
         array: &mut arrow::ffi::FFI_ArrowArray,
         schema: &arrow::ffi::FFI_ArrowSchema,
-        force_not_symbol: bool,
+        column_override: Option<arrow_batch::ArrowColumnOverride<'_>>,
     ) -> Result<Self> {
         use arrow_array::make_array;
 
@@ -90,12 +90,9 @@ impl ImportedArrowColumn {
 
         let mut field = arrow_schema::Field::try_from(schema)
             .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
-        if force_not_symbol {
+        if let Some(ov) = column_override {
             let mut metadata = field.metadata().clone();
-            metadata.insert(
-                crate::egress::arrow::metadata::SYMBOL.to_string(),
-                "false".to_string(),
-            );
+            arrow_batch::apply_override_metadata(&mut metadata, &ov);
             field = field.with_metadata(metadata);
         }
         let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }

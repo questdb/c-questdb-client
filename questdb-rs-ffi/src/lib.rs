@@ -4332,7 +4332,7 @@ pub(crate) unsafe fn arrow_ffi_import_array_sliced(
 pub(crate) unsafe fn arrow_ffi_import_column(
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
-    force_not_symbol: bool,
+    column_override: Option<questdb::ingress::column_sender::ArrowColumnOverride<'_>>,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
 ) -> Option<questdb::ingress::column_sender::ImportedArrowColumn> {
@@ -4364,7 +4364,7 @@ pub(crate) unsafe fn arrow_ffi_import_column(
         match questdb::ingress::column_sender::ImportedArrowColumn::import_from_ffi(
             &mut *array,
             &*schema,
-            force_not_symbol,
+            column_override,
         ) {
             Ok(imported) => Some(imported),
             Err(err) => {

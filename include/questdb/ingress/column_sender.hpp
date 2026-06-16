@@ -578,10 +578,12 @@ private:
  * failure (check before invoking it on the error path). `schema` is
  * borrowed only for the duration of the constructor.
  *
- * When `force_not_symbol` is true, a `Dictionary(*, Utf8 / LargeUtf8)`
- * column is emitted as `VARCHAR` (the dictionary is decoded on write)
- * instead of the default `SYMBOL`. It is a no-op for non-dictionary
- * columns.
+ * `override_kind` reclassifies the column like the batch path's
+ * `column_sender_arrow_override`: `-1` applies no override; otherwise it
+ * is a `::column_sender_arrow_override_kind` value. `override_arg` is the
+ * kind's argument — for `symbol`, `0` marks it SYMBOL and non-zero forces
+ * VARCHAR; for `geohash`, the precision bits (`1..=60`); ignored by
+ * `ipv4`/`char`.
  *
  * Not thread-safe. Bound to the importing thread until destroyed. MUST
  * outlive every `column_sender_conn::flush` that referenced it through
@@ -593,13 +595,15 @@ public:
     arrow_import(
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
-        bool force_not_symbol = false)
+        int32_t override_kind = -1,
+        uint32_t override_arg = 0)
     {
         _raw = line_sender_error::wrapped_call(
             ::column_sender_arrow_import_new,
             &array,
             &schema,
-            force_not_symbol);
+            override_kind,
+            override_arg);
     }
 
     arrow_import(const arrow_import&) = delete;

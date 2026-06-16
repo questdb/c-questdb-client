@@ -101,6 +101,34 @@ impl<'a> ArrowColumnOverride<'a> {
     }
 }
 
+// Patch a single field's metadata for one override kind. Shared by the
+// batch path (`apply_overrides`) and the chunk path (`ImportedArrowColumn`)
+// so override semantics live in one place; `classify` then reads it.
+pub(crate) fn apply_override_metadata(
+    md: &mut std::collections::HashMap<String, String>,
+    ov: &ArrowColumnOverride<'_>,
+) {
+    use crate::egress::arrow::metadata;
+    match *ov {
+        ArrowColumnOverride::Symbol { .. } => {
+            md.insert(metadata::COLUMN_TYPE.to_string(), "symbol".to_string());
+            md.insert(metadata::SYMBOL.to_string(), "true".to_string());
+        }
+        ArrowColumnOverride::NotSymbol { .. } => {
+            md.insert(metadata::SYMBOL.to_string(), "false".to_string());
+        }
+        ArrowColumnOverride::Ipv4 { .. } => {
+            md.insert(metadata::COLUMN_TYPE.to_string(), "ipv4".to_string());
+        }
+        ArrowColumnOverride::Char { .. } => {
+            md.insert(metadata::COLUMN_TYPE.to_string(), "char".to_string());
+        }
+        ArrowColumnOverride::Geohash { bits, .. } => {
+            md.insert(metadata::GEOHASH_BITS.to_string(), bits.to_string());
+        }
+    }
+}
+
 // We patch field metadata up-front rather than extending `classify`'s
 // signature: it keeps the per-column hot loop unchanged and lets the
 // override path reuse every existing metadata-driven branch.
@@ -150,42 +178,7 @@ pub(crate) fn apply_overrides(
             continue;
         };
         let mut md = field.metadata().clone();
-        match **ov {
-            ArrowColumnOverride::Symbol { .. } => {
-                md.insert(
-                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
-                    "symbol".to_string(),
-                );
-                md.insert(
-                    crate::egress::arrow::metadata::SYMBOL.to_string(),
-                    "true".to_string(),
-                );
-            }
-            ArrowColumnOverride::NotSymbol { .. } => {
-                md.insert(
-                    crate::egress::arrow::metadata::SYMBOL.to_string(),
-                    "false".to_string(),
-                );
-            }
-            ArrowColumnOverride::Ipv4 { .. } => {
-                md.insert(
-                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
-                    "ipv4".to_string(),
-                );
-            }
-            ArrowColumnOverride::Char { .. } => {
-                md.insert(
-                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
-                    "char".to_string(),
-                );
-            }
-            ArrowColumnOverride::Geohash { bits, .. } => {
-                md.insert(
-                    crate::egress::arrow::metadata::GEOHASH_BITS.to_string(),
-                    bits.to_string(),
-                );
-            }
-        }
+        apply_override_metadata(&mut md, *ov);
         if md == *field.metadata() {
             patched_fields.push(field.clone());
         } else {

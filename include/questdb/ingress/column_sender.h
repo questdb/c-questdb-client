@@ -627,9 +627,13 @@ typedef struct column_sender_arrow_import column_sender_arrow_import;
  * failure path. Depth-cap and NULL-pointer rejections leave it
  * intact. `schema` is borrowed only for the duration of this call.
  *
- * When `force_not_symbol` is true, a `Dictionary(*, Utf8 / LargeUtf8)`
- * column is emitted as `VARCHAR` (the dictionary is decoded on write)
- * instead of the default `SYMBOL`. No-op for non-dictionary columns.
+ * `override_kind` reclassifies the column like the batch path's
+ * `column_sender_arrow_override`: `-1` applies no override; otherwise it is a
+ * `column_sender_arrow_override_kind` value. `override_arg` is the kind's
+ * argument — for `symbol`, `0` marks it SYMBOL and non-zero forces VARCHAR;
+ * for `geohash`, the precision bits (`1..=60`); ignored by `ipv4`/`char`.
+ * The Arrow-type rules match the batch path (`ipv4` wants UInt32, `char`
+ * UInt16, `geohash` signed ints, `symbol` Utf8/LargeUtf8/Dictionary).
  *
  * Returns NULL on error and writes a `line_sender_error*` to
  * `*err_out`. The returned handle (when non-NULL) MUST be freed with
@@ -639,7 +643,8 @@ QUESTDB_CLIENT_API
 column_sender_arrow_import* column_sender_arrow_import_new(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    bool force_not_symbol,
+    int32_t override_kind,
+    uint32_t override_arg,
     line_sender_error** err_out);
 
 /**
