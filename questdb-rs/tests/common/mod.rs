@@ -283,6 +283,10 @@ impl QuestDbServer {
             "-Dnoebug",
             "-XX:+UnlockExperimentalVMOptions",
             "-XX:+AlwaysPreTouch",
+            // Lets the io.questdb module reach jdk.internal.vm.ContinuationScope
+            // (used by WorkerContinuation); without it every worker thread dies
+            // with IllegalAccessError and the server never binds its HTTP port.
+            "--add-exports=java.base/jdk.internal.vm=io.questdb",
             "-p",
         ])
         .arg(&jar)
