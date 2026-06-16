@@ -81,14 +81,23 @@ impl ImportedArrowColumn {
     pub unsafe fn import_from_ffi(
         array: &mut arrow::ffi::FFI_ArrowArray,
         schema: &arrow::ffi::FFI_ArrowSchema,
+        force_not_symbol: bool,
     ) -> Result<Self> {
         use arrow_array::make_array;
 
         let imported_array = unsafe { std::ptr::read(array) };
         array.release = None;
 
-        let field = arrow_schema::Field::try_from(schema)
+        let mut field = arrow_schema::Field::try_from(schema)
             .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
+        if force_not_symbol {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                crate::egress::arrow::metadata::SYMBOL.to_string(),
+                "false".to_string(),
+            );
+            field = field.with_metadata(metadata);
+        }
         let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }
             .map_err(|err| error::fmt!(ArrowIngest, "from_ffi failed: {}", err))?;
         array_data
