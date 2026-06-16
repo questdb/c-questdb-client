@@ -3068,6 +3068,23 @@ pub(crate) fn write_arrow_designated_ts_body(
                 })
             })
         }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+            ensure_timestamp_values_non_negative(arr, a.values(), label)?;
+            try_full_with_sentinel::<8>(out, arr, [0u8; 8], |row| {
+                let v = a.value(row);
+                v.checked_mul(1_000_000)
+                    .map(i64::to_le_bytes)
+                    .ok_or_else(|| {
+                        fmt!(
+                            ArrowIngest,
+                            "designated timestamp s→µs overflow at row {} (value {})",
+                            row,
+                            v
+                        )
+                    })
+            })
+        }
         other => Err(fmt!(
             ArrowIngest,
             "designated timestamp column has unsupported Arrow type {:?}",
@@ -3272,7 +3289,8 @@ pub(crate) fn encode_arrow_batch_into(
     let ts_wire_type = match designated_dtype.as_ref() {
         Some(DataType::Timestamp(TimeUnit::Nanosecond, _)) => Some(QWP_TYPE_TIMESTAMP_NANOS),
         Some(DataType::Timestamp(TimeUnit::Microsecond, _))
-        | Some(DataType::Timestamp(TimeUnit::Millisecond, _)) => Some(QWP_TYPE_TIMESTAMP),
+        | Some(DataType::Timestamp(TimeUnit::Millisecond, _))
+        | Some(DataType::Timestamp(TimeUnit::Second, _)) => Some(QWP_TYPE_TIMESTAMP),
         Some(other) => {
             symbol_dict.rollback(dict_mark);
             return Err(fmt!(
@@ -5063,6 +5081,59 @@ mod tests {
             b.finish(),
         );
         let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("s→µs overflow"),
+            "expected overflow message, got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn timestamp_second_designated_writes_ts() {
+        let mut payload = Float64Builder::new();
+        payload.append_value(1.0);
+        payload.append_value(2.0);
+        let mut ts = TimestampSecondBuilder::new();
+        ts.append_value(1);
+        ts.append_value(2);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("price", DataType::Float64, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Second, None), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(payload.finish()) as ArrayRef,
+                Arc::new(ts.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let out = encode_at_ts(&batch, 1);
+        assert_qwp_header(&out, 1);
+    }
+
+    #[test]
+    fn timestamp_second_designated_overflow_rejected() {
+        let mut ts = TimestampSecondBuilder::new();
+        ts.append_value(i64::MAX / 1_000_000 + 1);
+        ts.append_value(0);
+        let mut v = Int64Builder::new();
+        v.append_value(1);
+        v.append_value(2);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(ts.finish()) as ArrayRef,
+                Arc::new(v.finish()) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let err = encode_err_at_ts(&rb, 0);
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
         assert!(
             err.msg().contains("s→µs overflow"),
