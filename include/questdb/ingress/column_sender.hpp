@@ -578,6 +578,11 @@ private:
  * failure (check before invoking it on the error path). `schema` is
  * borrowed only for the duration of the constructor.
  *
+ * When `force_not_symbol` is true, a `Dictionary(*, Utf8 / LargeUtf8)`
+ * column is emitted as `VARCHAR` (the dictionary is decoded on write)
+ * instead of the default `SYMBOL`. It is a no-op for non-dictionary
+ * columns.
+ *
  * Not thread-safe. Bound to the importing thread until destroyed. MUST
  * outlive every `column_sender_conn::flush` that referenced it through
  * `column_chunk::append_arrow_import`.
@@ -585,10 +590,16 @@ private:
 class arrow_import
 {
 public:
-    arrow_import(::ArrowArray& array, const ::ArrowSchema& schema)
+    arrow_import(
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        bool force_not_symbol = false)
     {
         _raw = line_sender_error::wrapped_call(
-            ::column_sender_arrow_import_new, &array, &schema);
+            ::column_sender_arrow_import_new,
+            &array,
+            &schema,
+            force_not_symbol);
     }
 
     arrow_import(const arrow_import&) = delete;
