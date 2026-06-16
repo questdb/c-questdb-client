@@ -1266,54 +1266,6 @@ symbol_fn!(
 // Generic Arrow column appender
 // ===========================================================================
 
-#[cfg(feature = "arrow")]
-fn arrow_import_override_from_c(
-    override_kind: i32,
-    override_arg: u32,
-    err_out: *mut *mut line_sender_error,
-) -> Result<Option<ArrowColumnOverride<'static>>, ()> {
-    if override_kind < 0 {
-        return Ok(None);
-    }
-    let kind = override_kind as u32;
-    use column_sender_arrow_override_kind as K;
-    let ov = if kind == K::column_sender_arrow_override_symbol as u32 {
-        if override_arg == 0 {
-            ArrowColumnOverride::Symbol { column: "" }
-        } else {
-            ArrowColumnOverride::NotSymbol { column: "" }
-        }
-    } else if kind == K::column_sender_arrow_override_ipv4 as u32 {
-        ArrowColumnOverride::Ipv4 { column: "" }
-    } else if kind == K::column_sender_arrow_override_char as u32 {
-        ArrowColumnOverride::Char { column: "" }
-    } else if kind == K::column_sender_arrow_override_geohash as u32 {
-        if override_arg == 0 || override_arg > 60 {
-            crate::arrow_err_to_c_box(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                format!(
-                    "arrow import geohash override bits {} invalid (must be 1..=60)",
-                    override_arg
-                ),
-            );
-            return Err(());
-        }
-        ArrowColumnOverride::Geohash {
-            column: "",
-            bits: override_arg as u8,
-        }
-    } else {
-        crate::arrow_err_to_c_box(
-            err_out,
-            ErrorCode::InvalidApiCall,
-            format!("unknown arrow override kind {}", kind),
-        );
-        return Err(());
-    };
-    Ok(Some(ov))
-}
-
 /// Import an Arrow C Data Interface (`ArrowArray` + `ArrowSchema`) pair
 /// into an opaque handle that subsequent calls can slice / append from.
 ///
@@ -1326,34 +1278,25 @@ fn arrow_import_override_from_c(
 /// depth-cap rejection) leave it intact. `schema` is borrowed in all
 /// cases.
 ///
-/// `override_kind` reclassifies the column the same way the batch path's
-/// `column_sender_arrow_override` does: `-1` applies no override; otherwise
-/// it is a `column_sender_arrow_override_kind` value. `override_arg` carries
-/// the kind's argument — for `symbol`, `0` marks the column SYMBOL and any
-/// non-zero forces it to VARCHAR; for `geohash`, the precision bits (`1..=60`);
-/// ignored by `ipv4`/`char`. Reclassification follows the same Arrow-type
-/// rules as the batch path (e.g. `ipv4` wants UInt32, `char` UInt16, `geohash`
-/// signed integers, `symbol` Utf8/LargeUtf8/Dictionary).
+/// When `force_not_symbol` is true, a `Dictionary(*, Utf8 / LargeUtf8)`
+/// column is emitted as `VARCHAR` (the dictionary is decoded on write)
+/// instead of the default `SYMBOL`. It is a no-op for non-dictionary
+/// columns.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_arrow_import_new(
     array: *mut ArrowArray,
     schema: *const ArrowSchema,
-    override_kind: i32,
-    override_arg: u32,
+    force_not_symbol: bool,
     err_out: *mut *mut line_sender_error,
 ) -> *mut column_sender_arrow_import {
-    let column_override = match arrow_import_override_from_c(override_kind, override_arg, err_out) {
-        Ok(ov) => ov,
-        Err(()) => return std::ptr::null_mut(),
-    };
     let ffi_array = array as *mut arrow::ffi::FFI_ArrowArray;
     let ffi_schema = schema as *const arrow::ffi::FFI_ArrowSchema;
     let imported = match unsafe {
         crate::arrow_ffi_import_column(
             ffi_array,
             ffi_schema,
-            column_override,
+            force_not_symbol,
             "column_sender_arrow_import_new",
             err_out,
         )
@@ -2882,7 +2825,7 @@ mod tests {
         };
 
         let imported =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, -1, 0, &mut err) };
+            unsafe { column_sender_arrow_import_new(&mut array, &schema, false, &mut err) };
         assert!(!imported.is_null());
         assert!(err.is_null());
         assert!(array.release.is_none());
@@ -2966,13 +2909,13 @@ mod tests {
 
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let imported =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, -1, 0, &mut err) };
+            unsafe { column_sender_arrow_import_new(&mut array, &schema, false, &mut err) };
         assert!(!imported.is_null());
         assert!(err.is_null());
         assert!(array.release.is_none());
 
         let second =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, -1, 0, &mut err) };
+            unsafe { column_sender_arrow_import_new(&mut array, &schema, false, &mut err) };
         assert!(second.is_null());
         assert!(!err.is_null());
 
@@ -2980,75 +2923,6 @@ mod tests {
             line_sender_error_free(err);
             column_sender_arrow_import_free(imported);
         }
-    }
-
-    #[cfg(feature = "arrow")]
-    #[test]
-    fn arrow_import_override_arg_paths() {
-        let value_format = b"u\0";
-        let schema = ArrowSchema {
-            format: value_format.as_ptr() as *const c_char,
-            name: std::ptr::null(),
-            metadata: std::ptr::null(),
-            flags: 0,
-            n_children: 0,
-            children: std::ptr::null(),
-            dictionary: std::ptr::null_mut(),
-            release: None,
-            private_data: std::ptr::null_mut(),
-        };
-        let offsets = [0i32, 5];
-        let bytes = b"alpha";
-        let buffers = [
-            std::ptr::null(),
-            offsets.as_ptr() as *const c_void,
-            bytes.as_ptr() as *const c_void,
-        ];
-        let mut array = ArrowArray {
-            length: 1,
-            null_count: 0,
-            offset: 0,
-            n_buffers: 3,
-            n_children: 0,
-            buffers: buffers.as_ptr(),
-            children: std::ptr::null(),
-            dictionary: std::ptr::null_mut(),
-            release: Some(noop_release_array),
-            private_data: std::ptr::null_mut(),
-        };
-
-        let geohash =
-            column_sender_arrow_override_kind::column_sender_arrow_override_geohash as i32;
-        let symbol = column_sender_arrow_override_kind::column_sender_arrow_override_symbol as i32;
-
-        // Invalid geohash bits and unknown kinds are rejected before the
-        // array is consumed, so its release callback stays intact.
-        let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let bad_bits =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, geohash, 0, &mut err) };
-        assert!(bad_bits.is_null());
-        assert!(!err.is_null());
-        assert!(array.release.is_some());
-        unsafe { line_sender_error_free(err) };
-
-        err = std::ptr::null_mut();
-        let bad_kind =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, 999, 0, &mut err) };
-        assert!(bad_kind.is_null());
-        assert!(!err.is_null());
-        assert!(array.release.is_some());
-        unsafe { line_sender_error_free(err) };
-
-        // A valid override (symbol with arg != 0 forces VARCHAR) imports the
-        // string column and consumes the array.
-        err = std::ptr::null_mut();
-        let imported =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, symbol, 1, &mut err) };
-        assert!(!imported.is_null());
-        assert!(err.is_null());
-        assert!(array.release.is_none());
-
-        unsafe { column_sender_arrow_import_free(imported) };
     }
 
     #[test]
