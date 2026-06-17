@@ -774,7 +774,11 @@ fn symbol_dict_reuse_resends_only_new_symbols_on_the_wire() {
     // resuming from the global watermark (id 2).
     let (start1, syms1) = parse_delta_dict_prefix(&data_frames[1]);
     assert_eq!(start1, 2, "second frame resumes from the global watermark");
-    assert_eq!(syms1, vec![b"beta".to_vec()], "only the new symbol is resent");
+    assert_eq!(
+        syms1,
+        vec![b"beta".to_vec()],
+        "only the new symbol is resent"
+    );
 }
 
 #[test]
