@@ -4160,10 +4160,6 @@ pub(crate) unsafe fn arrow_ffi_import_record_batch(
             );
             return None;
         }
-        if let Err(e) = validate_arrow_schema_depth(schema) {
-            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
-            return None;
-        }
         if let Err(e) = validate_arrow_array_depth(array, schema) {
             arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
             return None;
@@ -4277,10 +4273,6 @@ pub(crate) unsafe fn arrow_ffi_import_array_sliced(
             );
             return None;
         }
-        if let Err(e) = validate_arrow_schema_depth(schema) {
-            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
-            return None;
-        }
         if let Err(e) = validate_arrow_array_depth(array, schema) {
             arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
             return None;
@@ -4360,10 +4352,6 @@ pub(crate) unsafe fn arrow_ffi_import_column(
                 ErrorCode::InvalidApiCall,
                 format!("{fn_name}: ArrowArray has already been consumed"),
             );
-            return None;
-        }
-        if let Err(e) = validate_arrow_schema_depth(schema) {
-            arrow_err_to_c_box(err_out, e.code(), e.msg().to_string());
             return None;
         }
         if let Err(e) = validate_arrow_array_depth(array, schema) {

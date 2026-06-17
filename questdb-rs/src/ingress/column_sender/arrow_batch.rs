@@ -1042,6 +1042,18 @@ fn write_varlen_u32_offsets_no_null(
             base
         ));
     }
+    // The fast path raw-copies the whole offset table, so only `base`/`end`
+    // are checked above. A validated array (FFI path runs `validate_full`)
+    // guarantees the intermediate offsets are monotonic; assert it so an
+    // unvalidated `build_unchecked` array trips in debug builds rather than
+    // shipping a frame with offsets pointing outside the data region.
+    debug_assert!(
+        arr_offsets[..row_count + 1]
+            .windows(2)
+            .all(|w| w[0] <= w[1]),
+        "{}: non-monotonic varlen offsets (caller must uphold validate_full)",
+        label,
+    );
     let used = (end - base) as usize;
     if base as usize + used > arr_data.len() {
         return Err(fmt!(
@@ -1900,6 +1912,19 @@ fn list_level_descend_offsets(
         if end <= start {
             return Ok((0, 0, 0));
         }
+        // `start`/`end` are offset values read from the parent level, so
+        // an unvalidated (`build_unchecked`) array can drive them past
+        // this level's offset table. `start < end` holds here, so this
+        // single bound makes `offsets[start]`, `[start + 1]` and `[end]`
+        // all in range — guarding the abort-on-panic FFI path.
+        if end >= offsets.len() {
+            return Err(fmt!(
+                ArrowIngest,
+                "ARRAY List inner offset index {} out of bounds (offsets len {})",
+                end,
+                offsets.len()
+            ));
+        }
         let next_start = checked_offset_i32(offsets[start], start)?;
         let first_end = checked_offset_i32(offsets[start + 1], start + 1)?;
         let dim = first_end.checked_sub(next_start).ok_or_else(|| {
@@ -1918,6 +1943,14 @@ fn list_level_descend_offsets(
         let offsets = la.offsets();
         if end <= start {
             return Ok((0, 0, 0));
+        }
+        if end >= offsets.len() {
+            return Err(fmt!(
+                ArrowIngest,
+                "ARRAY LargeList inner offset index {} out of bounds (offsets len {})",
+                end,
+                offsets.len()
+            ));
         }
         let next_start = checked_offset_i64(offsets[start], start)?;
         let first_end = checked_offset_i64(offsets[start + 1], start + 1)?;

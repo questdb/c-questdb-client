@@ -158,9 +158,11 @@ struct DbInner {
     pool_idle_timeout: Duration,
     state: Mutex<PoolState>,
     /// Reader pool. Lazy-init: starts empty, populated on first
-    /// `borrow_reader_owned` call. Same `pool_size` / `pool_max` /
-    /// `pool_idle_timeout` budget as the sender pool but a separate
-    /// free list so heavy ingest doesn't starve queries.
+    /// `borrow_reader_owned` call. Applies the same `pool_size` /
+    /// `pool_max` / `pool_idle_timeout` values as the sender pool but
+    /// tracks and caps them on an independent free list, so heavy ingest
+    /// can't starve queries. The two caps are enforced separately: the
+    /// combined live connection count can reach up to `2 * pool_max`.
     #[cfg(feature = "_egress")]
     reader_state: Mutex<ReaderPoolState>,
     /// Wakes the reaper thread on `shutdown` and lets a future blocking

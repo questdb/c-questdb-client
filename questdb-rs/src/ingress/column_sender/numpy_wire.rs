@@ -523,9 +523,16 @@ unsafe fn emit_sentinel_le<T, const N: usize>(
     let typed = data as *const T;
     match validity {
         None => {
-            if row_count > 0 {
-                let bytes = unsafe { slice::from_raw_parts(data, row_count * N) };
-                out.extend_from_slice(bytes);
+            if cfg!(target_endian = "little") {
+                if row_count > 0 {
+                    let bytes = unsafe { slice::from_raw_parts(data, row_count * N) };
+                    out.extend_from_slice(bytes);
+                }
+            } else {
+                for i in 0..row_count {
+                    let value = unsafe { typed.add(i).read_unaligned() };
+                    out.extend_from_slice(&to_le(value));
+                }
             }
         }
         Some(v) => {
@@ -555,13 +562,20 @@ unsafe fn emit_bitmap_le<T, const N: usize>(
     T: Copy,
 {
     let typed = data as *const T;
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
             out.reserve(N * row_count);
-            if row_count > 0 {
-                let bytes = unsafe { slice::from_raw_parts(data, row_count * N) };
-                out.extend_from_slice(bytes);
+            if cfg!(target_endian = "little") {
+                if row_count > 0 {
+                    let bytes = unsafe { slice::from_raw_parts(data, row_count * N) };
+                    out.extend_from_slice(bytes);
+                }
+            } else {
+                for i in 0..row_count {
+                    let value = unsafe { typed.add(i).read_unaligned() };
+                    out.extend_from_slice(&to_le(value));
+                }
             }
         }
         Some(v) => {
@@ -586,7 +600,7 @@ unsafe fn emit_bitmap_fsb<const N: usize>(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
 ) {
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
             out.reserve(N * row_count);
@@ -914,7 +928,7 @@ where
     // (`I64_NULL`). Map it straight through to null so an in-band NaT is
     // treated consistently with the direct (already-µs) paths instead of
     // failing the whole batch on conversion overflow.
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
             out.reserve(8 * row_count);
@@ -1001,7 +1015,7 @@ unsafe fn emit_decimal<const N: usize>(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
 ) {
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
             out.reserve(1 + N * row_count);
@@ -1051,7 +1065,7 @@ unsafe fn emit_geohash<const SRC: usize>(
             "numpy geohash bits ({bits}) exceeds source dtype width ({SRC} bytes)"
         ));
     }
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
             out.reserve(1 + elem * row_count);
@@ -1121,6 +1135,7 @@ unsafe fn emit_f64_ndarray(
         .checked_mul(8)
         .ok_or_else(|| error::fmt!(InvalidApiCall, "F64Ndarray row size overflows usize"))?;
 
+    let validity = validity.filter(|v| v.has_nulls());
     let non_null_rows = match validity {
         None => {
             out.push(0);

@@ -103,7 +103,8 @@ pub(crate) fn batch_to_record_batch(
             &mut sym_scratch,
         )?);
     }
-    RecordBatch::try_new(schema_ref, arrays).map_err(|e| to_arrow_export(e.to_string()))
+    RecordBatch::try_new(schema_ref, arrays)
+        .map_err(|e| fmt!(ProtocolError, "failed to assemble record batch: {}", e))
 }
 
 fn column_to_array(
@@ -572,21 +573,23 @@ fn array_column_to_arrow(
     };
     let elem_size = 8usize;
     if !data.len().is_multiple_of(elem_size) {
-        return Err(to_arrow_export(format!(
+        return Err(fmt!(
+            ProtocolError,
             "ARRAY wire data length {} not a multiple of element size {}",
             data.len(),
             elem_size
-        )));
+        ));
     }
     let total_elements = data.len() / elem_size;
     if let Some(&last_off) = data_offsets.last()
         && last_off as usize != data.len()
     {
-        return Err(to_arrow_export(format!(
+        return Err(fmt!(
+            ProtocolError,
             "ARRAY data_offsets tail {} disagrees with data length {}",
             last_off,
             data.len()
-        )));
+        ));
     }
     let ndim = ndim_from_field(field)?;
     let leaf_buf = bytes_to_arrow(data);

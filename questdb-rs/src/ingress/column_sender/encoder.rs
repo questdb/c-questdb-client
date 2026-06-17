@@ -632,7 +632,7 @@ unsafe fn encode_bitmap_le<T, const N: usize>(
 ) where
     T: Copy,
 {
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
             out.reserve(N * row_count);
@@ -668,7 +668,7 @@ unsafe fn encode_fixed_width_bitmap<const N: usize>(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
 ) {
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0);
             out.reserve(N * row_count);
@@ -749,7 +749,7 @@ unsafe fn encode_varchar(
     let offsets_slice = unsafe { slice::from_raw_parts(offsets, offsets_len) };
     let bytes_slice = unsafe { slice::from_raw_parts(bytes, bytes_len) };
 
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0); // null_flag
             out.reserve(4 * (row_count + 1) + bytes_len);
@@ -827,7 +827,7 @@ unsafe fn encode_varchar_large(
     let offsets_slice = unsafe { slice::from_raw_parts(offsets, offsets_len) };
     let bytes_slice = unsafe { slice::from_raw_parts(bytes, bytes_len) };
 
-    match validity {
+    match validity.filter(|v| v.has_nulls()) {
         None => {
             out.push(0); // null_flag
             out.reserve(4 * (row_count + 1) + bytes_len);
@@ -876,6 +876,7 @@ unsafe fn encode_symbol(
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
 ) {
+    let validity = validity.filter(|v| v.has_nulls());
     match validity {
         None => out.push(0),
         Some(v) => {
@@ -1239,6 +1240,82 @@ mod tests {
             dict.next_id(),
             prior_next,
             "global dict must roll back on symbol resolution failure",
+        );
+    }
+
+    fn make_chunk_uuid(rows: &[[u8; 16]], validity: Option<&Validity>, ts: &[i64]) -> Vec<u8> {
+        let mut chunk = Chunk::new("trades");
+        chunk.column_uuid("id", rows, validity).unwrap();
+        chunk.designated_timestamp_nanos(ts).unwrap();
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
+        out
+    }
+
+    fn make_chunk_ts_micros(vals: &[i64], validity: Option<&Validity>, ts: &[i64]) -> Vec<u8> {
+        let mut chunk = Chunk::new("trades");
+        chunk.column_ts_micros("t", vals, validity).unwrap();
+        chunk.designated_timestamp_nanos(ts).unwrap();
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
+        out
+    }
+
+    #[test]
+    fn all_valid_validity_matches_no_validity_uuid() {
+        let rows = [[1u8; 16], [2u8; 16], [3u8; 16]];
+        let ts = [1i64, 2, 3];
+        let bits = [0b0000_0111u8];
+        let v = Validity::from_bitmap(&bits, 3).unwrap();
+        assert_eq!(
+            make_chunk_uuid(&rows, Some(&v), &ts),
+            make_chunk_uuid(&rows, None, &ts),
+            "an all-valid validity must encode like no validity: null_flag=0, no bitmap"
+        );
+    }
+
+    #[test]
+    fn all_valid_validity_matches_no_validity_timestamp() {
+        let vals = [100i64, 200, 300];
+        let ts = [1i64, 2, 3];
+        let bits = [0b0000_0111u8];
+        let v = Validity::from_bitmap(&bits, 3).unwrap();
+        assert_eq!(
+            make_chunk_ts_micros(&vals, Some(&v), &ts),
+            make_chunk_ts_micros(&vals, None, &ts),
+        );
+    }
+
+    #[test]
+    fn validity_with_null_emits_bitmap_uuid() {
+        let rows = [[1u8; 16], [2u8; 16], [3u8; 16]];
+        let ts = [1i64, 2, 3];
+        let bits = [0b0000_0101u8]; // row 1 null
+        let v = Validity::from_bitmap(&bits, 3).unwrap();
+        assert_ne!(
+            make_chunk_uuid(&rows, Some(&v), &ts),
+            make_chunk_uuid(&rows, None, &ts),
+            "a real null must emit a bitmap and drop the null row's payload"
+        );
+    }
+
+    #[test]
+    fn uuid_payload_is_byte_verbatim() {
+        // QuestDB wire order is the caller's 16 bytes verbatim (low 64 bits
+        // little-endian then high 64 bits little-endian). A reordering bug
+        // would corrupt every UUID, so pin the passthrough.
+        let uuid = [
+            0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let out = make_chunk_uuid(&[uuid], None, &[1i64]);
+        assert!(
+            out.windows(16).any(|w| w == uuid),
+            "UUID bytes must appear verbatim in the wire frame"
         );
     }
 }

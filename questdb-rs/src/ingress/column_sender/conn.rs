@@ -405,12 +405,12 @@ impl ColumnConn {
                     popped += 1;
                 }
                 if popped == 0 {
-                    return Err(self.latch(error::fmt!(
-                        SocketError,
-                        "QWP OK sequence {} has no matching pending frame (next pending: {:?})",
-                        sequence,
-                        self.pending_acks.front().map(|p| p.fsn)
-                    )));
+                    // QWP OK acks are cumulative ("completed through
+                    // `sequence`"). An OK that advances no pending frame is
+                    // a redundant/non-advancing progress ack the server may
+                    // emit; the row API tolerates it as a no-op rather than
+                    // tearing down the connection. Match that here.
+                    return Ok(());
                 }
                 // Invariant: `pending_acks.len() + popped == in_flight_before`.
                 // A future refactor that desynchronises the two would
@@ -1128,33 +1128,39 @@ mod tests {
     }
 
     #[test]
-    fn process_unmatched_ok_latches_connection() {
+    fn process_unmatched_ok_is_tolerated_as_noop() {
         let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
-        // No pending frame: an OK that matches nothing is a protocol error.
-        let err = conn
-            .process_response(QwpResponse::Ok {
-                sequence: 0,
-                tables: vec![],
-            })
-            .expect_err("unmatched ok must error");
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(conn.must_close());
+        // No pending frame: a cumulative OK that advances nothing is a
+        // redundant progress ack, not a fatal error. It is a no-op and
+        // leaves the connection reusable.
+        conn.process_response(QwpResponse::Ok {
+            sequence: 0,
+            tables: vec![],
+        })
+        .expect("redundant ok must be tolerated");
+        assert!(!conn.must_close());
     }
 
     #[test]
-    fn process_stale_ok_below_pending_fsn_latches() {
+    fn process_stale_ok_below_pending_fsn_is_noop_and_keeps_pending() {
         let mut conn = ColumnConn::for_test(dummy_ws_stream(), false);
         conn.push_pending(5);
-        // An OK whose sequence precedes the oldest pending frame matches
-        // nothing and must latch rather than silently drop.
-        let err = conn
-            .process_response(QwpResponse::Ok {
-                sequence: 3,
-                tables: vec![],
-            })
-            .expect_err("stale ok must error");
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
-        assert!(conn.must_close());
+        // An OK whose sequence precedes the oldest pending frame advances
+        // nothing; it is tolerated as a no-op and the pending frame stays
+        // in flight for its real ack.
+        conn.process_response(QwpResponse::Ok {
+            sequence: 3,
+            tables: vec![],
+        })
+        .expect("stale ok must be tolerated");
+        assert!(!conn.must_close());
+        assert_eq!(conn.in_flight(), 1);
+        conn.process_response(QwpResponse::Ok {
+            sequence: 5,
+            tables: vec![],
+        })
+        .expect("matching ok must pop");
+        assert_eq!(conn.in_flight(), 0);
     }
 
     #[test]

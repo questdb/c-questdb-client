@@ -183,6 +183,16 @@ impl ValidityDescriptor {
     pub(crate) fn byte_len(&self) -> usize {
         self.bit_len.div_ceil(8)
     }
+
+    /// `true` iff at least one row is null. Mirrors the row API's
+    /// `uses_null_bitmap`: an all-valid validity is encoded densely with
+    /// `null_flag = 0` and no bitmap, matching the Java client and the
+    /// Arrow bulk path. `bit_len` equals the column row count (enforced by
+    /// `check_row_count`).
+    #[inline]
+    pub(crate) fn has_nulls(&self) -> bool {
+        self.non_null_count < self.bit_len
+    }
 }
 
 /// Per-column kind dispatch. Each variant carries the raw pointer(s) the
@@ -581,8 +591,11 @@ impl<'a> Chunk<'a> {
     // Bitmap-style fixed-width columns
     // -------------------------------------------------------------------
 
-    /// Append a UUID column (QWP wire type `UUID`). Each row is 16
-    /// bytes in canonical big-endian Arrow layout.
+    /// Append a UUID column (QWP wire type `UUID`). Each row is 16 bytes
+    /// in QuestDB wire order — the low 64 bits little-endian followed by
+    /// the high 64 bits little-endian. This matches the row API and the
+    /// bytes produced by Arrow egress; it is NOT canonical RFC-4122
+    /// big-endian, so callers holding big-endian UUIDs must reorder first.
     pub fn column_uuid(
         &mut self,
         name: &str,
@@ -601,8 +614,9 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Append a LONG256 column (QWP wire type `LONG256`). Each row is
-    /// 32 bytes in little-endian limb order.
+    /// Append a LONG256 column (QWP wire type `LONG256`). Each row is 32
+    /// bytes: the 256-bit value as little-endian limbs, low limb first.
+    /// This matches the row API and the bytes produced by Arrow egress.
     pub fn column_long256(
         &mut self,
         name: &str,

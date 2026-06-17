@@ -69,7 +69,10 @@ typedef struct questdb_db questdb_db;
 /** Borrowed QWP/WS connection. Not thread-safe; belongs to the borrowing
  *  thread until returned via `questdb_db_return_conn`. Carries the
  *  per-connection symbol-dictionary state used by all writer modes
- *  (per-type, Arrow, NumPy). */
+ *  (per-type, Arrow, NumPy). Freeing the handle concurrently with another
+ *  call on it is undefined behaviour: callers must establish a
+ *  happens-before ordering between the last use and the free (the internal
+ *  latch only defers the drop for already-ordered interleavings). */
 typedef struct qwpws_conn qwpws_conn;
 
 /** One DataFrame's worth of column buffers destined for one QuestDB table.
@@ -80,10 +83,12 @@ typedef struct column_sender_chunk column_sender_chunk;
  * Validity bitmap
  *
  * Arrow shape: bit = 1 means VALID, bit = 0 means NULL. LSB-first within
- * each byte. `bit_len` must equal the chunk's row count; `bits` must
- * point to at least `ceil(bit_len / 8)` bytes. Pass `bits=NULL,
- * bit_len=0` to signal "no nulls" (or pass a `NULL` pointer to the
- * column function's `validity` parameter).
+ * each byte. `bit_len` must equal the chunk's row count and is rejected
+ * if it exceeds the per-chunk row cap; `bits` must point to at least
+ * `ceil(bit_len / 8)` bytes. Pass `bits=NULL, bit_len=0` to signal "no
+ * nulls" (or pass a `NULL` pointer to the column function's `validity`
+ * parameter). A validity that marks every row valid is encoded exactly
+ * like "no nulls" (no null bitmap is emitted on the wire).
  * ------------------------------------------------------------------------- */
 
 typedef struct column_sender_validity
@@ -692,7 +697,8 @@ void column_sender_arrow_import_free(column_sender_arrow_import* imported);
 
 /**
  * Number of rows in an imported Arrow column. Returns 0 for a NULL
- * `imported` and for a logically-empty column.
+ * `imported`, for a logically-empty column, and for a handle that has
+ * been freed or is held by a concurrent call.
  */
 QUESTDB_CLIENT_API
 size_t column_sender_arrow_import_len(const column_sender_arrow_import* imported);
