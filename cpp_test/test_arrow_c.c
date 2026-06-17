@@ -823,6 +823,90 @@ static void build_primitive(
     out_sch->release = fsm_release_schema;
 }
 
+/* Append a (deliberately malformed) ArrowArray and assert it is rejected
+ * pre-import: a structured error, the producer's release left intact, and —
+ * the point of the test — no abort under the FFI crate's panic = "abort". */
+static void expect_arrow_array_rejected(
+    struct ArrowArray* arr, struct ArrowSchema* sch, const char* label)
+{
+    line_sender_error* err = NULL;
+    column_sender_chunk* chunk = column_sender_chunk_new("t", 1, &err);
+    CHECK(chunk != NULL, "chunk constructed");
+    if (err)
+    {
+        line_sender_error_free(err);
+        err = NULL;
+    }
+    if (chunk == NULL)
+    {
+        if (arr->release)
+            arr->release(arr);
+        if (sch->release)
+            sch->release(sch);
+        return;
+    }
+    bool ok = column_sender_chunk_append_arrow_column(
+        chunk, "v", 1, arr, sch, 0, 0, &err);
+    CHECK(!ok, label);
+    CHECK(err != NULL, "err_out populated on malformed array");
+    if (err)
+    {
+        int code = (int)line_sender_error_get_code(err);
+        int accepted =
+            code == line_sender_error_arrow_ingest ||
+            code == line_sender_error_invalid_api_call;
+        CHECK(accepted, "malformed array → structured error (not abort)");
+        line_sender_error_free(err);
+    }
+    CHECK(arr->release != NULL, "release intact on pre-import array reject");
+    if (arr->release)
+        arr->release(arr);
+    if (sch->release)
+        sch->release(sch);
+    column_sender_chunk_free(chunk);
+}
+
+TEST(test_chunk_append_arrow_column_malformed_array_rejected)
+{
+    int64_t values[2] = {10, 20};
+
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
+        arr.length = -1;
+        expect_arrow_array_rejected(&arr, &sch, "negative length → false");
+    }
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
+        arr.length = (int64_t)(16 * 1024 * 1024) + 1; /* > MAX_CHUNK_ROWS */
+        expect_arrow_array_rejected(&arr, &sch, "oversized length → false");
+    }
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
+        arr.offset = -1;
+        expect_arrow_array_rejected(&arr, &sch, "negative offset → false");
+    }
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
+        arr.n_buffers = 0; /* int64 layout needs validity + values */
+        expect_arrow_array_rejected(&arr, &sch, "too few buffers → false");
+    }
+    {
+        struct ArrowArray arr;
+        struct ArrowSchema sch;
+        build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
+        arr.buffers = NULL; /* n_buffers > 0 but the array is NULL */
+        expect_arrow_array_rejected(&arr, &sch, "NULL buffer pointer → false");
+    }
+}
+
 /* Open a mock + questdb_db + borrow a conn. Returns NULL on any setup
  * failure; populates *out_db / *out_mock on success. */
 static qwpws_conn* mock_borrow_conn(
@@ -1198,6 +1282,7 @@ int main(void)
     RUN(test_chunk_append_arrow_column_null_chunk);
     RUN(test_chunk_append_arrow_column_null_array_schema);
     RUN(test_chunk_append_arrow_column_valid_i64_smoke);
+    RUN(test_chunk_append_arrow_column_malformed_array_rejected);
     RUN(test_chunk_append_numpy_column_null_chunk);
     RUN(test_chunk_append_numpy_column_i64_smoke);
     RUN(test_chunk_append_numpy_column_f64_smoke);

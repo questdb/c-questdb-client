@@ -697,15 +697,17 @@ fn decode_array(r: &mut ByteReader<'_>, parent: &Bytes, row_count: usize) -> Res
                     d
                 )
             })?;
-        }
-        if total > MAX_ARRAY_ELEMENTS_PER_ROW {
-            return Err(fmt!(
-                LimitExceeded,
-                "array row {} has {} elements (max {})",
-                row,
-                total,
-                MAX_ARRAY_ELEMENTS_PER_ROW
-            ));
+            // Bound every prefix product, not just the final one: `[2^31, 0]`
+            // has zero elements but a leading dim that explodes list nesting.
+            if total > MAX_ARRAY_ELEMENTS_PER_ROW {
+                return Err(fmt!(
+                    LimitExceeded,
+                    "array row {} has {} elements (max {})",
+                    row,
+                    total,
+                    MAX_ARRAY_ELEMENTS_PER_ROW
+                ));
+            }
         }
         let byte_count = (total as usize)
             .checked_mul(8)
@@ -3596,6 +3598,29 @@ mod tests {
         col.extend_from_slice(&big.to_le_bytes());
         let (flags_byte, payload) = BatchBuilder::new(1)
             .add_column("a", ColumnKind::LongArray, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut schema: Option<Schema> = None;
+        let err = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut schema,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+    }
+
+    #[test]
+    fn decode_array_degenerate_prefix_dim_rejected() {
+        // `[2^31, 0]`: zero elements but a leading dim a final-product-only cap
+        // would miss.
+        let mut col = vec![0x00u8, 2]; // null_flag, nDims=2
+        col.extend_from_slice(&(1u32 << 31).to_le_bytes()); // dim0 = 2^31
+        col.extend_from_slice(&0u32.to_le_bytes()); // dim1 = 0
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("a", ColumnKind::DoubleArray, col)
             .build();
         let mut dict = SymbolDict::new();
         let mut schema: Option<Schema> = None;

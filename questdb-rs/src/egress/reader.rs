@@ -1205,6 +1205,8 @@ impl<'r> ReaderQuery<'r> {
             on_failover_progress: self.on_failover_progress,
             failover_resets: 0,
             data_delivered: false,
+            #[cfg(feature = "arrow")]
+            drifted_batch: None,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1353,6 +1355,11 @@ pub struct Cursor<'r> {
     /// Captured at most once (the first error wins) so a follow-up
     /// failure during teardown can't overwrite the originating cause.
     terminal_error: Option<Error>,
+    /// A batch decoded but not handed out because its Arrow schema drifted
+    /// from the pinned one, parked for replay on the next `next_arrow_batch*`
+    /// call so the rows are recoverable rather than dropped.
+    #[cfg(feature = "arrow")]
+    drifted_batch: Option<DecodedBatch>,
     /// Pin `!Send` regardless of whether the callback is installed.
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -1569,62 +1576,65 @@ impl<'r> Cursor<'r> {
                 None => Ok(None),
             };
         }
-        let outcome = match self.next_batch_inner() {
-            Ok(o) => o,
-            Err(e) => {
-                if self.done && self.terminal_error.is_none() {
-                    self.terminal_error = Some(e.clone());
+        // Replay a batch that drifted on a previous call before reading a new
+        // frame; its transport side effects already ran, so skip
+        // `next_batch_inner`.
+        let decoded = if let Some(stashed) = self.drifted_batch.take() {
+            stashed
+        } else {
+            let outcome = match self.next_batch_inner() {
+                Ok(o) => o,
+                Err(e) => {
+                    if self.done && self.terminal_error.is_none() {
+                        self.terminal_error = Some(e.clone());
+                    }
+                    return Err(e);
                 }
+            };
+            match outcome {
+                NextOutcome::Done => return Ok(None),
+                NextOutcome::HaveBatch => self
+                    .last_batch
+                    .take()
+                    .expect("HaveBatch implies last_batch"),
+            }
+        };
+        let egress_schema = match self.reader.query_schema.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                let e = fmt!(
+                    ProtocolError,
+                    "internal invariant: next_batch produced a batch without a decoded schema"
+                );
+                self.stash_arrow_terminal_error(&e);
                 return Err(e);
             }
         };
-        match outcome {
-            NextOutcome::Done => Ok(None),
-            NextOutcome::HaveBatch => {
-                let decoded = self
-                    .last_batch
-                    .take()
-                    .expect("HaveBatch implies last_batch");
-                let egress_schema = match self.reader.query_schema.as_ref() {
-                    Some(s) => s.clone(),
-                    None => {
-                        let e = fmt!(
-                            ProtocolError,
-                            "internal invariant: next_batch produced a batch without a decoded schema"
-                        );
-                        self.stash_arrow_terminal_error(&e);
-                        return Err(e);
-                    }
-                };
-                let arrow_schema = match batch_arrow_schema(&egress_schema, &decoded) {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        self.stash_arrow_terminal_error(&e);
-                        return Err(e);
-                    }
-                };
-                if let Some(expected) = expected_schema
-                    && !schemas_equal(expected.as_ref(), arrow_schema.as_ref())
-                {
-                    let e = fmt!(
-                        SchemaDrift,
-                        "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
-                        decoded.batch_seq
-                    );
-                    return Err(e);
-                }
-                match batch_to_record_batch(
-                    arrow_schema,
-                    &egress_schema,
-                    decoded,
-                    &self.reader.dict,
-                ) {
-                    Ok(rb) => Ok(Some(rb)),
-                    Err(e) => {
-                        self.stash_arrow_terminal_error(&e);
-                        Err(e)
-                    }
-                }
+        let arrow_schema = match batch_arrow_schema(&egress_schema, &decoded) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                self.stash_arrow_terminal_error(&e);
+                return Err(e);
+            }
+        };
+        if let Some(expected) = expected_schema
+            && !schemas_equal(expected.as_ref(), arrow_schema.as_ref())
+        {
+            let e = fmt!(
+                SchemaDrift,
+                "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
+                decoded.batch_seq
+            );
+            // Keep the batch so its rows stay retrievable via
+            // `Cursor::next_arrow_batch` rather than dropped.
+            self.drifted_batch = Some(decoded);
+            return Err(e);
+        }
+        match batch_to_record_batch(arrow_schema, &egress_schema, decoded, &self.reader.dict) {
+            Ok(rb) => Ok(Some(rb)),
+            Err(e) => {
+                self.stash_arrow_terminal_error(&e);
+                Err(e)
             }
         }
     }
@@ -1632,9 +1642,10 @@ impl<'r> Cursor<'r> {
     // Replay-contract stash for fatal errors that bypass `next_batch_inner`
     // (missing/invalid Arrow schema, `batch_to_record_batch`): marks the
     // cursor terminal so the error replays on every later call instead of
-    // silently advancing. Schema drift is deliberately NOT stashed — it
-    // leaves the cursor live so the caller can re-snapshot and resume on the
-    // next batch (see `next_arrow_batch_inner`).
+    // silently advancing. Schema drift is NOT terminal — it leaves the cursor
+    // live and parks the drifted batch in `drifted_batch` so the caller can
+    // re-snapshot and retrieve those rows on the next call (see
+    // `next_arrow_batch_inner`).
     #[cfg(feature = "arrow")]
     fn stash_arrow_terminal_error(&mut self, err: &Error) {
         self.done = true;
@@ -2018,6 +2029,11 @@ impl<'r> Cursor<'r> {
         // `connect_endpoint`). Drop any in-flight batch buffer so we
         // don't accidentally surface a stale view.
         self.last_batch = None;
+        // The parked drift-replay batch belongs to the old stream.
+        #[cfg(feature = "arrow")]
+        {
+            self.drifted_batch = None;
+        }
         // Allocate a fresh request_id and re-issue the same
         // QUERY_REQUEST bytes. The cursor stashed the encoded
         // payload at `execute()` time; here we patch the 8-byte

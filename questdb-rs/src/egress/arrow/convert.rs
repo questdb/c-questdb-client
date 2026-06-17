@@ -600,7 +600,8 @@ fn array_column_to_arrow(
         ArrayLeaf::Float64 => Arc::new(arrow_array::Float64Array::from(leaf_data)),
         ArrayLeaf::Int64 => Arc::new(arrow_array::Int64Array::from(leaf_data)),
     };
-    let per_level_counts = compute_per_level_counts(&shapes, &shape_offsets, ndim, row_count)?;
+    let per_level_counts =
+        compute_per_level_counts(&shapes, &shape_offsets, ndim, row_count, total_elements)?;
     nest_lists(field, leaf_array, per_level_counts, nulls, ndim)
 }
 
@@ -622,12 +623,25 @@ fn ndim_from_field(field: &Field) -> Result<usize> {
     Ok(d)
 }
 
+/// Slack in the list-node budget so genuinely empty shapes (`[3, 0]`) decode
+/// while a hostile stream of them stays bounded to ~64 MiB of offset buffers.
+const MAX_DEGENERATE_LIST_NODES: usize = 16 * 1024 * 1024;
+
 fn compute_per_level_counts(
     shapes: &[u32],
     shape_offsets: &[u32],
     ndim: usize,
     row_count: usize,
+    leaf_elements: usize,
 ) -> Result<Vec<Vec<u32>>> {
+    // Cap total list-node expansion: a degenerate `[huge, 0]` shape carries a
+    // tiny payload yet asks for billions of empty inner lists. Valid dense
+    // data needs at most `ndim * leaf` nodes; the slack covers genuine empty
+    // shapes like `[3, 0]`.
+    let mut node_budget = leaf_elements
+        .saturating_mul(ndim)
+        .saturating_add(row_count)
+        .saturating_add(MAX_DEGENERATE_LIST_NODES);
     let mut levels: Vec<Vec<u32>> = vec![Vec::new(); ndim];
     for row in 0..row_count {
         let lo = *shape_offsets
@@ -657,6 +671,9 @@ fn compute_per_level_counts(
             // contributes zero parent elements, hence zero entries at every
             // inner level. Pushing to inner levels would shift their offsets
             // and silently misalign every following non-null row.
+            node_budget = node_budget
+                .checked_sub(1)
+                .ok_or_else(|| array_expansion_exceeded(row))?;
             levels[0].push(0);
             continue;
         }
@@ -672,12 +689,12 @@ fn compute_per_level_counts(
         let row_shape = &shapes[lo..hi];
         let mut group_count: u32 = 1;
         for (level, &dim) in row_shape.iter().enumerate() {
-            if level == 0 {
-                levels[0].push(dim);
-            } else {
-                for _ in 0..group_count {
-                    levels[level].push(dim);
-                }
+            let push_count = if level == 0 { 1 } else { group_count as usize };
+            node_budget = node_budget
+                .checked_sub(push_count)
+                .ok_or_else(|| array_expansion_exceeded(row))?;
+            for _ in 0..push_count {
+                levels[level].push(dim);
             }
             group_count = group_count.checked_mul(dim).ok_or_else(|| {
                 fmt!(
@@ -690,6 +707,14 @@ fn compute_per_level_counts(
         }
     }
     Ok(levels)
+}
+
+fn array_expansion_exceeded(row: usize) -> Error {
+    fmt!(
+        ProtocolError,
+        "array row {} list expansion exceeds the per-batch element budget",
+        row
+    )
 }
 
 fn nest_lists(
@@ -751,8 +776,10 @@ fn counts_to_offsets_i32(counts: &[u32]) -> Result<ABytes> {
     let mut running: i32 = 0;
     out.extend_from_slice(&running.to_le_bytes());
     for &c in counts {
+        let c = i32::try_from(c)
+            .map_err(|_| fmt!(ProtocolError, "List child count {} exceeds i32::MAX", c))?;
         running = running
-            .checked_add(c as i32)
+            .checked_add(c)
             .ok_or_else(|| fmt!(ProtocolError, "List offset overflows i32"))?;
         out.extend_from_slice(&running.to_le_bytes());
     }
@@ -821,4 +848,36 @@ fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Optio
 /// Recover via [`try_downcast_questdb`](super::reader::try_downcast_questdb).
 pub fn external_arrow_error(e: Error) -> ArrowError {
     ArrowError::ExternalError(Box::new(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::error::ErrorCode;
+
+    #[test]
+    fn per_level_counts_rejects_degenerate_expansion() {
+        let shapes = [1u32 << 24, 0, 1u32 << 24, 0];
+        let shape_offsets = [0u32, 2, 4];
+        let err = compute_per_level_counts(&shapes, &shape_offsets, 2, 2, 0).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn per_level_counts_accepts_genuine_empty_shape() {
+        let shapes = [3u32, 0];
+        let shape_offsets = [0u32, 2];
+        let counts = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0).unwrap();
+        assert_eq!(counts[0], vec![3]);
+        assert_eq!(counts[1], vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn per_level_counts_accepts_dense_shape() {
+        let shapes = [2u32, 3];
+        let shape_offsets = [0u32, 2];
+        let counts = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6).unwrap();
+        assert_eq!(counts[0], vec![2]);
+        assert_eq!(counts[1], vec![3, 3]);
+    }
 }

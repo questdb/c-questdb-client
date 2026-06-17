@@ -1687,6 +1687,21 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
     // indices must be rebased by `leaf_offset` before use.
     let leaf_offset = leaf_array.offset();
     let leaf_values_all = leaf_array.values();
+    // List/LargeList keep absolute child offsets across a slice but
+    // FixedSizeList rebases its child; a sliced intermediate level mixes the
+    // two conventions and would mis-index the leaf. The outer level and the
+    // leaf are already slice-aware.
+    for (level_idx, level) in levels[..ndim - 1].iter().enumerate() {
+        if level.offset() != 0 {
+            return Err(fmt!(
+                ArrowIngest,
+                "ARRAY ingest does not support a sliced intermediate list level \
+                 (level {} has offset {}); copy the array before ingest",
+                level_idx,
+                level.offset()
+            ));
+        }
+    }
     // The QWP ARRAY(DOUBLE) wire format is dense with no per-element null
     // channel: a NULL leaf element would ship the undefined value-buffer slot
     // as a real double (silent corruption). Reject it. Checked per emitted

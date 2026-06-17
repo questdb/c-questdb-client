@@ -756,6 +756,11 @@ pub struct line_sender_table_name {
 
 impl line_sender_table_name {
     unsafe fn as_name<'a>(&self) -> TableName<'a> {
+        // NULL buf would make `from_raw_parts` UB even at len 0; degrade to
+        // the empty name, matching `line_sender_utf8::as_str`.
+        if self.buf.is_null() {
+            return TableName::new_unchecked("");
+        }
         unsafe {
             let str_name =
                 str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
@@ -777,6 +782,10 @@ pub struct line_sender_column_name {
 
 impl line_sender_column_name {
     fn as_name<'a>(&self) -> ColumnName<'a> {
+        // NULL-guard as in `line_sender_table_name::as_name`.
+        if self.buf.is_null() {
+            return ColumnName::new_unchecked("");
+        }
         unsafe {
             let str_name =
                 str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));

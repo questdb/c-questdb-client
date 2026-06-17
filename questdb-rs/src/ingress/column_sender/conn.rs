@@ -369,8 +369,11 @@ impl ColumnConn {
                 let response = self.recv_qwp_response()?;
                 self.process_response(response)?;
             }
-            self.drop_satisfied_durable_targets();
         }
+
+        // Prune on every sync: without this a durable-ack connection driven
+        // only with `sync(Ok)` retains one target per table for its pooled life.
+        self.drop_satisfied_durable_targets();
 
         Ok(())
     }

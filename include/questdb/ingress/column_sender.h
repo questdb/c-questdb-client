@@ -229,7 +229,13 @@ column_sender_chunk* column_sender_chunk_new(
     size_t table_name_len,
     line_sender_error** err_out);
 
-/** Discard the chunk and release its allocations. Accepts NULL. */
+/**
+ * Discard the chunk and release its allocations. Accepts NULL (no-op).
+ *
+ * Calling this twice on the same non-NULL chunk is undefined behaviour
+ * (double free): the handle is freed in place and cannot be detected as
+ * already-released. Drop your pointer after the call.
+ */
 QUESTDB_CLIENT_API
 void column_sender_chunk_free(column_sender_chunk* chunk);
 
@@ -670,6 +676,10 @@ bool column_sender_chunk_append_arrow_import(
  * Free a `column_sender_arrow_import` handle and its underlying
  * Arrow buffers. Accepts NULL `imported` and no-ops. Invalidates
  * `imported`; do not use it after this call.
+ *
+ * Calling this twice on the same non-NULL handle is undefined behaviour
+ * (double free): the handle is freed in place and a stale pointer cannot
+ * be detected. Drop your pointer after the call.
  *
  * Safe to call after every chunk that referenced this import has
  * been successfully flushed. Calling it while a chunk still

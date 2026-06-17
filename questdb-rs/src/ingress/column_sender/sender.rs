@@ -68,8 +68,10 @@ pub struct ColumnSender {
     /// The first frame is sent without `FLAG_DEFER_COMMIT` so the server
     /// commits it immediately. This lets the WAL segment roll and update
     /// `initialSymbolCount`, warming the server's `ClientSymbolCache` for
-    /// all subsequent deferred frames.
-    first_frame_sent: bool,
+    /// all subsequent deferred frames. The flag is connection-scoped: it
+    /// travels with the slot across borrow/return so a recycled warm
+    /// connection does not re-send a redundant immediate-commit frame.
+    pub(crate) first_frame_sent: bool,
 }
 
 impl Debug for ColumnSender {
@@ -86,12 +88,13 @@ impl ColumnSender {
         conn: ColumnConn,
         symbol_dict: SymbolGlobalDict,
         scratch: encoder::EncodeScratch,
+        first_frame_sent: bool,
     ) -> Self {
         Self {
             conn,
             symbol_dict,
             scratch,
-            first_frame_sent: false,
+            first_frame_sent,
         }
     }
 
@@ -167,6 +170,15 @@ impl ColumnSender {
     /// `overrides` (use `&[]` for none) supplies per-column wire-type
     /// hints without requiring the caller to patch the Arrow `Field`
     /// metadata first.
+    ///
+    /// Every column in `batch` must satisfy `ArrayData::validate_full`
+    /// (offsets monotonic and in bounds, dictionary keys in range, declared
+    /// null counts accurate) — the invariant any array built through the safe
+    /// `arrow` constructors already upholds. Arrays assembled via
+    /// `ArrayData::build_unchecked` bypass that check and can drive
+    /// out-of-range reads here; validate them before calling. The C ABI entry
+    /// point validates on the caller's behalf since it cannot assume a trusted
+    /// producer.
     #[cfg(feature = "arrow")]
     pub fn flush_arrow_batch(
         &mut self,

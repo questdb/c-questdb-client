@@ -81,22 +81,7 @@ struct InUseSlot<'a> {
     armed: bool,
 }
 
-impl<'a> InUseSlot<'a> {
-    /// Reserve a slot atomically with a cap check. Returns `Err` if
-    /// `total() >= pool_max` already holds — preserving the documented
-    /// fail-fast contract under concurrent borrows.
-    fn reserve_within_cap(
-        state: &'a Mutex<PoolState>,
-        pool_max: usize,
-    ) -> std::result::Result<Self, usize> {
-        let mut guard = lock_state(state);
-        if guard.total() >= pool_max {
-            return Err(guard.in_use);
-        }
-        guard.in_use += 1;
-        Ok(Self { state, armed: true })
-    }
-
+impl InUseSlot<'_> {
     fn commit(mut self) {
         self.armed = false;
     }
@@ -212,6 +197,10 @@ struct PoolEntry {
     /// resolution). Carried across borrow/return so its allocated
     /// capacity survives.
     scratch: super::encoder::EncodeScratch,
+    /// Whether this connection has already sent its immediate-commit first
+    /// frame. Travels with the slot so a recycled connection keeps deferring
+    /// commits instead of re-warming a cache that is already warm.
+    first_frame_sent: bool,
     last_idle_at: Instant,
 }
 
@@ -279,6 +268,7 @@ impl QuestDb {
                 conn,
                 symbol_dict: crate::ingress::buffer::SymbolGlobalDict::new(),
                 scratch: super::encoder::EncodeScratch::new(),
+                first_frame_sent: false,
                 last_idle_at: now,
             });
         }
@@ -338,28 +328,33 @@ impl QuestDb {
     }
 
     fn pick_sender(&self) -> Result<ColumnSender> {
-        let mut state = lock_state(&self.inner.state);
-        if let Some(entry) = state.free.pop() {
-            state.in_use += 1;
-            drop(state);
-            return Ok(ColumnSender::new(
-                entry.conn,
-                entry.symbol_dict,
-                entry.scratch,
-            ));
-        }
-        drop(state);
-
-        let slot = match InUseSlot::reserve_within_cap(&self.inner.state, self.inner.pool_max) {
-            Ok(slot) => slot,
-            Err(in_use) => {
+        // Pop-or-reserve under one lock so a concurrent return can't race us
+        // into opening a redundant connection past `pool_size`.
+        let slot = {
+            let mut state = lock_state(&self.inner.state);
+            if let Some(entry) = state.free.pop() {
+                state.in_use += 1;
+                drop(state);
+                return Ok(ColumnSender::new(
+                    entry.conn,
+                    entry.symbol_dict,
+                    entry.scratch,
+                    entry.first_frame_sent,
+                ));
+            }
+            if state.total() >= self.inner.pool_max {
                 return Err(error::fmt!(
                     InvalidApiCall,
                     "Connection pool exhausted: {} connections are currently borrowed and \
                      the pool is at its `pool_max` cap of {}. Return a sender or raise `pool_max`.",
-                    in_use,
+                    state.in_use,
                     self.inner.pool_max
                 ));
+            }
+            state.in_use += 1;
+            InUseSlot {
+                state: &self.inner.state,
+                armed: true,
             }
         };
         let conn = ColumnConn::connect(&self.inner.conf)?;
@@ -369,6 +364,7 @@ impl QuestDb {
             conn,
             crate::ingress::buffer::SymbolGlobalDict::new(),
             super::encoder::EncodeScratch::new(),
+            false,
         ))
     }
 
@@ -742,6 +738,7 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
             conn: sender.conn,
             symbol_dict: sender.symbol_dict,
             scratch: sender.scratch,
+            first_frame_sent: sender.first_frame_sent,
             last_idle_at: Instant::now(),
         });
     }
