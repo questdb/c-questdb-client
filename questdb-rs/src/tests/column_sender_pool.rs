@@ -84,6 +84,23 @@ impl MockServer {
     }
 
     fn spawn_with_mode(max_accepts: usize, mode: MockMode) -> Self {
+        Self::spawn_with_mode_capture(max_accepts, mode, None)
+    }
+
+    /// Like [`spawn_acking`] but also forwards every received binary frame
+    /// payload (the unmasked QWP frame bytes) over the returned channel so a
+    /// test can assert on the wire.
+    fn spawn_acking_capturing(max_accepts: usize) -> (Self, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel();
+        let server = Self::spawn_with_mode_capture(max_accepts, MockMode::AckEachFrame, Some(tx));
+        (server, rx)
+    }
+
+    fn spawn_with_mode_capture(
+        max_accepts: usize,
+        mode: MockMode,
+        capture: Option<mpsc::Sender<Vec<u8>>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
         listener
             .set_nonblocking(true)
@@ -111,12 +128,13 @@ impl MockServer {
                                 .set_nonblocking(false)
                                 .expect("set_nonblocking(false)");
                             let stop = Arc::clone(&stop_clone);
+                            let capture = capture.clone();
                             let h = thread::spawn(move || {
                                 if perform_server_upgrade(&mut stream).is_ok() {
                                     match mode {
                                         MockMode::Park => park_connection(&mut stream, &stop),
                                         MockMode::AckEachFrame => {
-                                            ack_each_frame(&mut stream, &stop)
+                                            ack_each_frame(&mut stream, &stop, capture)
                                         }
                                         MockMode::ErrorEachFrame(status) => {
                                             error_each_frame(&mut stream, &stop, status)
@@ -185,18 +203,25 @@ fn park_connection(stream: &mut std::net::TcpStream, stop: &AtomicBool) {
 /// Read each WebSocket binary frame the client sends and reply with a QWP
 /// OK ack, incrementing the wire sequence per frame. Control frames are
 /// ignored. Exits on EOF or `stop`.
-fn ack_each_frame(stream: &mut std::net::TcpStream, stop: &AtomicBool) {
+fn ack_each_frame(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut next_wire_seq: u64 = 0;
     while !stop.load(Ordering::SeqCst) {
         match read_frame(stream) {
-            Ok((_fin, opcode, _payload)) => {
+            Ok((_fin, opcode, payload)) => {
                 // Opcode 0x2 = binary; 0x8 = close; everything else is ignored.
                 if opcode == 0x8 {
                     break;
                 }
                 if opcode != 0x2 {
                     continue;
+                }
+                if let Some(tx) = &capture {
+                    let _ = tx.send(payload);
                 }
                 if write_qwp_ok_response(stream, next_wire_seq).is_err() {
                     break;
@@ -661,6 +686,95 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
     chunk.designated_timestamp_nanos(&[5, 6, 7, 8]).unwrap();
     sender.flush(&mut chunk).unwrap();
     sender.sync(AckLevel::Ok).expect("symbol flush 2");
+}
+
+/// Read a LEB128 varint at `*pos`, advancing `pos`.
+fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = buf[*pos];
+        *pos += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    value
+}
+
+/// Parse the QWP frame's delta-symbol-dict prefix (written immediately after
+/// the 12-byte header): `delta_start` varint, new-symbol count varint, then
+/// each new symbol as a length-prefixed byte string.
+fn parse_delta_dict_prefix(frame: &[u8]) -> (u64, Vec<Vec<u8>>) {
+    assert_eq!(&frame[..4], b"QWP1", "frame magic");
+    let mut pos = 12; // QWP header length
+    let delta_start = read_varint(frame, &mut pos);
+    let count = read_varint(frame, &mut pos) as usize;
+    let mut symbols = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_varint(frame, &mut pos) as usize;
+        symbols.push(frame[pos..pos + len].to_vec());
+        pos += len;
+    }
+    (delta_start, symbols)
+}
+
+#[test]
+fn symbol_dict_reuse_resends_only_new_symbols_on_the_wire() {
+    let (server, frames) = MockServer::spawn_acking_capturing(2);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_sender().expect("borrow");
+
+    let dict_bytes = b"alphabetagamma";
+    let dict_offsets: [i32; 4] = [0, 5, 9, 14];
+
+    let mut chunk = Chunk::new("trades");
+    chunk
+        .symbol_dict_i32("sym", &[0, 2, 0, 2], &dict_offsets, dict_bytes, None)
+        .unwrap();
+    chunk.designated_timestamp_nanos(&[1, 2, 3, 4]).unwrap();
+    sender.flush(&mut chunk).unwrap();
+    sender.sync(AckLevel::Ok).expect("symbol flush 1");
+
+    chunk
+        .symbol_dict_i32("sym", &[1, 0, 1, 0], &dict_offsets, dict_bytes, None)
+        .unwrap();
+    chunk.designated_timestamp_nanos(&[5, 6, 7, 8]).unwrap();
+    sender.flush(&mut chunk).unwrap();
+    sender.sync(AckLevel::Ok).expect("symbol flush 2");
+
+    drop(sender);
+    drop(db);
+    drop(server);
+
+    // Each `flush` emits a deferred data frame (table_count = 1); the trailing
+    // `sync` emits a header-only commit frame (table_count = 0). Keep only the
+    // data frames, which carry the delta-symbol-dict prefix.
+    let captured: Vec<Vec<u8>> = frames.try_iter().collect();
+    let data_frames: Vec<Vec<u8>> = captured
+        .into_iter()
+        .filter(|f| f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1)
+        .collect();
+    assert_eq!(
+        data_frames.len(),
+        2,
+        "expected two data frames among the captured frames"
+    );
+
+    // First flush references dict entries 0 and 2 ("alpha", "gamma"); the
+    // delta prefix interns both starting at global id 0.
+    let (start0, syms0) = parse_delta_dict_prefix(&data_frames[0]);
+    assert_eq!(start0, 0);
+    assert_eq!(syms0, vec![b"alpha".to_vec(), b"gamma".to_vec()]);
+
+    // Second flush references entries 1 and 0 ("beta", "alpha"). "alpha" is
+    // already in the connection-scoped global dict, so only "beta" is resent,
+    // resuming from the global watermark (id 2).
+    let (start1, syms1) = parse_delta_dict_prefix(&data_frames[1]);
+    assert_eq!(start1, 2, "second frame resumes from the global watermark");
+    assert_eq!(syms1, vec![b"beta".to_vec()], "only the new symbol is resent");
 }
 
 #[test]

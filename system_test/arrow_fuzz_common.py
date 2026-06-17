@@ -775,7 +775,7 @@ def _cmp_ipv4_sentinel(a, e, *, params):
 
 def _cmp_geohash_sentinel(a, e, *, params):
     bits = params["bits"]
-    storage_w = 8 if bits <= 7 else 16 if bits <= 15 else 32 if bits <= 31 else 64
+    storage_w = 8 if bits <= 7 else 16 if bits <= 15 else 32 if bits <= 32 else 64
     storage_sentinel = (1 << storage_w) - 1
     def _is_null(v):
         if v is None:

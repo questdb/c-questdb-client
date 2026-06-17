@@ -5488,6 +5488,62 @@ mod tests {
         );
     }
 
+    /// Build a single-row column nested `levels` deep (`List` repeated over a
+    /// `Float64` leaf), so `walk_list_leaf` reports `ndim == levels`.
+    fn nested_list_batch(levels: usize) -> RecordBatch {
+        let mut values: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![1.0f64]));
+        let mut item_field = Arc::new(Field::new("item", DataType::Float64, true));
+        for _ in 0..levels {
+            let offsets = arrow_buffer::OffsetBuffer::from_lengths([values.len()]);
+            let list = arrow_array::ListArray::new(item_field.clone(), offsets, values, None);
+            item_field = Arc::new(Field::new("item", DataType::List(item_field), true));
+            values = Arc::new(list);
+        }
+        let col_field = Field::new("a", values.data_type().clone(), true);
+        RecordBatch::try_new(arrow_schema_with(col_field), vec![values]).unwrap()
+    }
+
+    #[test]
+    fn nested_list_depth_at_max_dims_accepted() {
+        let rb = nested_list_batch(crate::ingress::MAX_ARRAY_DIMS);
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn nested_list_depth_beyond_max_dims_rejected() {
+        let rb = nested_list_batch(crate::ingress::MAX_ARRAY_DIMS + 1);
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
+        assert!(
+            err.msg().contains("exceeds MAX_ARRAY_DIMS"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn all_null_column_accepted() {
+        let mut b = Int64Builder::new();
+        b.append_null();
+        b.append_null();
+        let arr = b.finish();
+        assert_eq!(arr.null_count(), arr.len());
+        let rb = single_col_batch(Field::new("v", DataType::Int64, true), arr);
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn geohash_int64_bits_at_max_boundary_accepted() {
+        let mut b = Int64Builder::new();
+        b.append_value(0x0FFF_FFFF_FFFF_FFFF);
+        let field = Field::new("g", DataType::Int64, true).with_metadata(metadata(&[(
+            crate::egress::arrow::metadata::GEOHASH_BITS,
+            "60",
+        )]));
+        let rb = single_col_batch(field, b.finish());
+        assert_ok_with_table_count(&rb, 1);
+    }
+
     // -----------------------------------------------------------------
     // arrow_overrides
     // -----------------------------------------------------------------
