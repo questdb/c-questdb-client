@@ -362,6 +362,23 @@ pub(crate) struct RowResolvedSymbol {
     pub(crate) non_null_count: usize,
 }
 
+/// Fallibly size `v` to `len` filled with `value`, reusing existing
+/// capacity. `len` derives from a caller-supplied dictionary size that
+/// has no upper bound, so the allocation must not abort the FFI crate
+/// (`panic = "abort"`) on a huge dictionary.
+fn try_resize_filled<T: Clone>(v: &mut Vec<T>, len: usize, value: T) -> Result<()> {
+    v.clear();
+    v.try_reserve(len).map_err(|_| {
+        error::fmt!(
+            InvalidApiCall,
+            "symbol dictionary too large to encode ({} entries)",
+            len
+        )
+    })?;
+    v.resize(len, value);
+    Ok(())
+}
+
 /// Walk symbol columns, intern referenced entries against the
 /// connection-scoped global dict, and emit one [`ResolvedColumn`] per
 /// chunk column into `per_column` (length == `chunk.columns.len()`).
@@ -389,8 +406,7 @@ fn resolve_symbols(
             } => {
                 let dict_len = dict_offsets_len - 1;
                 let dict_bytes_slice = unsafe { slice::from_raw_parts(dict_bytes, dict_bytes_len) };
-                referenced_scratch.clear();
-                referenced_scratch.resize(dict_len, 0);
+                try_resize_filled(referenced_scratch, dict_len, 0)?;
                 let mut non_null_count = 0usize;
                 for i in 0..row_count {
                     if !is_valid_row(col.validity.as_ref(), i) {
@@ -400,7 +416,8 @@ fn resolve_symbols(
                     referenced_scratch[slot] = 1;
                     non_null_count += 1;
                 }
-                let mut local_to_global = vec![u64::MAX; dict_len];
+                let mut local_to_global = Vec::new();
+                try_resize_filled(&mut local_to_global, dict_len, u64::MAX)?;
                 for (slot, mark) in referenced_scratch.iter().enumerate() {
                     if *mark == 0 {
                         continue;

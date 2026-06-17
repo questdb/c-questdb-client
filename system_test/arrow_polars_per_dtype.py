@@ -428,14 +428,14 @@ class TestArrowPolarsPerDtype(afc.ArrowFuzzBase):
         })
         self._expect_success(table, df, '"c" LONG')
 
-    def test_dtype_uint8_widens_to_short(self):
+    def test_dtype_uint8_widens_to_int(self):
         import polars as pl
         table = self.fresh_table("polars_uint8")
         df = pl.DataFrame({
             "c": pl.Series([1, 2, 3, 4], dtype=pl.UInt8),
             "ts": _ts_series_ns(pl, _ROWS),
         })
-        self._expect_success(table, df, '"c" SHORT')
+        self._expect_success(table, df, '"c" INT')
 
     def test_dtype_uint64_reinterprets_as_long(self):
         import polars as pl

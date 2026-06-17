@@ -5041,6 +5041,7 @@ fn batched_type_change_error_ws(entry_name: &[u8]) -> crate::Error {
     }
 }
 
+#[cfg(feature = "_sender-qwp-ws")]
 fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
     batched_type_change_error_ws(entry_name)
 }

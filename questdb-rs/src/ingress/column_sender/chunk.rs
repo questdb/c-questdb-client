@@ -739,6 +739,7 @@ impl<'a> Chunk<'a> {
         let row_count = offsets.len() - 1;
         let row_count = check_row_count(self.row_count, row_count, validity)?;
         validate_varchar_offsets(offsets, bytes.len())?;
+        validate_varchar_utf8(&bytes[offsets[0] as usize..offsets[offsets.len() - 1] as usize])?;
         self.push_column(
             name,
             QWP_TYPE_VARCHAR,
@@ -777,6 +778,7 @@ impl<'a> Chunk<'a> {
         let row_count = offsets.len() - 1;
         let row_count = check_row_count(self.row_count, row_count, validity)?;
         validate_varchar_offsets_i64(offsets, bytes.len())?;
+        validate_varchar_utf8(&bytes[offsets[0] as usize..offsets[offsets.len() - 1] as usize])?;
         self.push_column(
             name,
             QWP_TYPE_VARCHAR,
@@ -1230,6 +1232,12 @@ impl<'a> Chunk<'a> {
     }
 }
 
+fn validate_varchar_utf8(bytes: &[u8]) -> Result<()> {
+    std::str::from_utf8(bytes)
+        .map(|_| ())
+        .map_err(|e| error::fmt!(InvalidApiCall, "VARCHAR bytes are not valid UTF-8: {}", e))
+}
+
 fn validate_varchar_offsets(offsets: &[i32], bytes_len: usize) -> Result<()> {
     let mut prev = offsets[0];
     if prev < 0 {
@@ -1439,6 +1447,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("non-decreasing"));
+    }
+
+    #[test]
+    fn varchar_rejects_invalid_utf8() {
+        let mut chunk = Chunk::new("t");
+        let offsets = [0i32, 2];
+        let err = chunk
+            .column_varchar("v", &offsets, &[0xff, 0xfe], None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("UTF-8"));
     }
 
     #[test]

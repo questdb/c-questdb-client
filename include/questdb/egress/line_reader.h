@@ -1898,8 +1898,9 @@ typedef enum line_reader_arrow_batch_result
  * Mid-stream schema drift (the underlying QuestDB table altered between
  * batches) surfaces as `line_reader_error_schema_drift` (= 22) on the
  * call that detects it; the cursor's pinned schema snapshot is then
- * cleared so the next call snapshots the new schema and resumes. The
- * batch that triggered the drift is discarded.
+ * cleared so the next call re-snapshots the new schema and resumes. The
+ * batch that triggered the drift is preserved and re-delivered (under the
+ * new schema) by that next call, not discarded.
  */
 QUESTDB_CLIENT_API
 line_reader_arrow_batch_result line_reader_cursor_next_arrow_batch(

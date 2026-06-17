@@ -52,7 +52,7 @@ stages:
           - template: templates/compile.yaml
           - script: |
               cd questdb-rs
-              cargo build --examples --features almost-all-features
+              cargo build --examples --features almost-all-features,arrow,polars
             displayName: "Build Rust examples"
           # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
           # Drop once QWP/Arrow ships in a release (revert to `--versions`).

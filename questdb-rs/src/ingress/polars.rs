@@ -235,6 +235,15 @@ impl Iterator for DataFrameBatches<'_> {
             seg_len = seg_len.min(cursor.remaining_in_chunk());
         }
         if seg_len == 0 {
+            if self.rows_emitted < self.total_rows {
+                self.poisoned = true;
+                return Some(Err(fmt!(
+                    ArrowIngest,
+                    "internal: column chunk lengths disagree ({} of {} rows emitted)",
+                    self.rows_emitted,
+                    self.total_rows
+                )));
+            }
             return None;
         }
         let compat = self.compat;
@@ -247,7 +256,21 @@ impl Iterator for DataFrameBatches<'_> {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.cursors.len());
         for cursor in &mut self.cursors {
             let offset = cursor.offset_in_chunk;
-            let sliced = cursor.current_chunk(compat).sliced(offset, seg_len);
+            let chunk = cursor.current_chunk(compat);
+            let chunk_dtype = chunk.dtype().clone();
+            let sliced = chunk.sliced(offset, seg_len);
+            if chunk_dtype != cursor.pa_field.dtype {
+                self.poisoned = true;
+                return Some(Err(fmt!(
+                    ArrowIngest,
+                    "column '{}': per-chunk Arrow dtype {:?} differs from the pinned schema \
+                     dtype {:?}; call DataFrame::rechunk() or cast the column to a stable \
+                     dtype before ingest",
+                    cursor.name,
+                    chunk_dtype,
+                    cursor.pa_field.dtype
+                )));
+            }
             let array_data = match ffi_polars_to_arrow_rs(&cursor.pa_field, sliced, &cursor.name) {
                 Ok(d) => d,
                 Err(e) => {

@@ -572,6 +572,8 @@ bool column_sender_chunk_symbol_dict_i32(
  * length. First-party producers (pyarrow, polars) always satisfy this.
  * ------------------------------------------------------------------------- */
 
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+
 /* Apache Arrow C Data Interface boilerplate. Guarded by
  * `ARROW_C_DATA_INTERFACE` so it composes safely with arrow.h,
  * nanoarrow, polars-arrow, and any other header that ships the same
@@ -615,7 +617,6 @@ struct ArrowArray
 
 #endif /* ARROW_C_DATA_INTERFACE */
 
-#ifdef QUESTDB_CLIENT_ENABLE_ARROW
 /**
  * Opaque handle wrapping an `ArrowArray` + `ArrowSchema` pair imported
  * from the Arrow C Data Interface. Lets a caller import a Polars /

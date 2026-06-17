@@ -278,6 +278,23 @@ impl NumpyDtype {
                 }
             }
         }
+        let geohash_bits = match self {
+            NumpyDtype::GeohashI8 { bits } => Some((*bits, 8u8)),
+            NumpyDtype::GeohashI16 { bits } => Some((*bits, 16u8)),
+            NumpyDtype::GeohashI32 { bits } => Some((*bits, 32u8)),
+            NumpyDtype::GeohashI64 { bits } => Some((*bits, 60u8)),
+            _ => None,
+        };
+        if let Some((bits, max_bits)) = geohash_bits
+            && (bits == 0 || bits > max_bits)
+        {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "geohash bits must be in 1..={}, got {}",
+                max_bits,
+                bits
+            ));
+        }
         Ok(())
     }
 }
@@ -1244,6 +1261,15 @@ mod tests {
         let err = encode_err(&chunk);
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("MAX_CHUNK_ROWS"), "{}", err.msg());
+    }
+
+    #[test]
+    fn geohash_dtype_rejects_invalid_bits() {
+        assert!(NumpyDtype::GeohashI8 { bits: 0 }.validate().is_err());
+        assert!(NumpyDtype::GeohashI8 { bits: 9 }.validate().is_err());
+        assert!(NumpyDtype::GeohashI64 { bits: 61 }.validate().is_err());
+        assert!(NumpyDtype::GeohashI8 { bits: 8 }.validate().is_ok());
+        assert!(NumpyDtype::GeohashI64 { bits: 60 }.validate().is_ok());
     }
 
     #[test]
