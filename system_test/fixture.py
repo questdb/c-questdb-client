@@ -563,6 +563,13 @@ class QuestDbFixture(QuestDbFixtureBase):
             # '-Debug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
+            # QuestDB's worker pools use jdk.internal.vm.ContinuationScope via
+            # io.questdb.mp.continuation.WorkerContinuation. When the server is
+            # launched as the named module io.questdb (-m below), java.base does
+            # not export jdk.internal.vm to it, so every worker thread dies with
+            # IllegalAccessError and the HTTP service never comes up. QuestDB's
+            # own launcher passes this flag; mirror it here.
+            '--add-exports=java.base/jdk.internal.vm=io.questdb',
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]

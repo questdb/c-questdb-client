@@ -194,6 +194,11 @@ class StandaloneInstance:
             '-Dnoebug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
+            # Required so the io.questdb module can reach
+            # jdk.internal.vm.ContinuationScope (used by WorkerContinuation);
+            # without it every worker thread dies with IllegalAccessError and
+            # the server never binds its HTTP port. Mirrors fixture.py.
+            '--add-exports=java.base/jdk.internal.vm=io.questdb',
             '-p', str(self.jar),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self.data_dir),
