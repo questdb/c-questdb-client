@@ -3133,8 +3133,9 @@ mod tests {
                 // Some zstd versions enforce the pledge on finish; if
                 // so, this test cannot synthesise the mismatch and we
                 // skip rather than false-pass. The defensive
-                // post-decompress check at decoder.rs:1429 is then
-                // verified only by code review.
+                // post-decompress size check (`written != frame content
+                // size`) in `zstd_decompress_body` is then verified only
+                // by code review.
                 return;
             }
         };
@@ -4483,10 +4484,11 @@ mod tests {
         /// On the wire an empty non-NULL array manifests as a dim list
         /// whose product is zero — most naturally a single dim of zero.
         /// The C++ contract test
-        /// `mock: non-null empty-data array row exposes data == NULL`
-        /// at `cpp_test/test_line_reader_mock.cpp:1091` pins this case
-        /// against the Rust reader: shape `[2, 0, 3]` decodes to a
-        /// non-null row with `data == nullptr` and `element_count == 0`.
+        /// `mock: non-null empty-data array row exposes data_offsets symmetry`
+        /// in `cpp_test/test_line_reader_mock.cpp` pins this case against
+        /// the Rust reader: shape `[2, 0, 3]` decodes to a non-null row
+        /// with a zero-length (empty) per-row data slice and
+        /// `element_count == 0`.
         #[test]
         fn array_dim_zero_is_valid_empty_array() {
             // 2D row with a zero in the first dim → 0 elements,
