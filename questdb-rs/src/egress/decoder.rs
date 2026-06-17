@@ -3554,6 +3554,57 @@ mod tests {
     }
 
     #[test]
+    fn decode_array_empty_vs_null_distinct() {
+        // 3 rows of DOUBLE_ARRAY: regular [1.0, 2.0], empty (shape [0]), NULL.
+        // QuestDB emits a non-null empty array inline with a 0-length
+        // dimension; a NULL array is carried in the validity bitmap. The
+        // view must keep them distinct: empty is non-null with 0 elements,
+        // NULL has no shape.
+        let mut col = vec![0x01u8, 0x04]; // null_flag=1, bitmap row 2 null
+        col.extend_from_slice(&build_double_array_row(&[2], &[1.0, 2.0]));
+        col.extend_from_slice(&build_double_array_row(&[0], &[])); // empty: nDims=1, dim 0
+        let (flags_byte, payload) = BatchBuilder::new(3)
+            .add_column("a", ColumnKind::DoubleArray, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut schema: Option<Schema> = None;
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut schema,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::DoubleArray(c) = view else {
+            panic!()
+        };
+        assert_eq!(c.len(), 3);
+
+        // Row 0: regular.
+        assert!(!c.is_null(0));
+        assert_eq!(c.shape(0), Some(&[2u32][..]));
+        assert_eq!(c.element_count(0), 2);
+        assert_eq!(c.element(0, 0), Some(1.0));
+        assert_eq!(c.element(0, 1), Some(2.0));
+
+        // Row 1: empty array — non-null, 1-D shape [0], zero elements. The
+        // shape is present (Some) and raw bytes are an empty (not absent)
+        // slice — this is what separates it from NULL.
+        assert!(!c.is_null(1));
+        assert_eq!(c.shape(1), Some(&[0u32][..]));
+        assert_eq!(c.element_count(1), 0);
+        assert_eq!(c.raw(1), Some(&[][..]));
+
+        // Row 2: NULL — no shape, no raw bytes.
+        assert!(c.is_null(2));
+        assert_eq!(c.shape(2), None);
+        assert_eq!(c.element_count(2), 0);
+        assert_eq!(c.raw(2), None);
+    }
+
+    #[test]
     fn decode_array_zero_dims_rejected() {
         let mut col = vec![0x00u8];
         col.push(0u8); // nDims = 0
@@ -4424,8 +4475,8 @@ mod tests {
         // ARRAY column dimension validation.
         // -----------------------------------------------------------------
 
-        /// Inverts the Java port `testArrayDimZeroIsRejected`. The QWP
-        /// spec (`docs/qwp/wire-egress.md` §11.5.1) explicitly states:
+        /// The QWP spec (`docs/qwp/wire-egress.md` §11.5.1) explicitly
+        /// states:
         ///
         /// > A non-NULL empty array is a valid value.
         ///
@@ -4436,10 +4487,6 @@ mod tests {
         /// at `cpp_test/test_line_reader_mock.cpp:1091` pins this case
         /// against the Rust reader: shape `[2, 0, 3]` decodes to a
         /// non-null row with `data == nullptr` and `element_count == 0`.
-        ///
-        /// The Java client's `testArrayDimZeroIsRejected` makes the
-        /// opposite assumption and contradicts the spec. We diverge
-        /// here on purpose.
         #[test]
         fn array_dim_zero_is_valid_empty_array() {
             // 2D row with a zero in the first dim → 0 elements,
