@@ -1278,25 +1278,38 @@ symbol_fn!(
 /// depth-cap rejection) leave it intact. `schema` is borrowed in all
 /// cases.
 ///
-/// When `force_not_symbol` is true, a `Dictionary(*, Utf8 / LargeUtf8)`
-/// column is emitted as `VARCHAR` (the dictionary is decoded on write)
-/// instead of the default `SYMBOL`. It is a no-op for non-dictionary
-/// columns.
+/// `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
+/// `symbol`: force plain Utf8 -> SYMBOL. `not_symbol`: force Dictionary ->
+/// VARCHAR. Used by `column_sender_arrow_import_new`.
+#[cfg(feature = "arrow")]
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum column_sender_symbol_mode {
+    column_sender_symbol_mode_auto = 0,
+    column_sender_symbol_mode_symbol = 1,
+    column_sender_symbol_mode_not_symbol = 2,
+}
+
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_arrow_import_new(
     array: *mut ArrowArray,
     schema: *const ArrowSchema,
-    force_not_symbol: bool,
+    symbol_mode: column_sender_symbol_mode,
     err_out: *mut *mut line_sender_error,
 ) -> *mut column_sender_arrow_import {
+    let symbol = match symbol_mode {
+        column_sender_symbol_mode::column_sender_symbol_mode_symbol => Some(true),
+        column_sender_symbol_mode::column_sender_symbol_mode_not_symbol => Some(false),
+        column_sender_symbol_mode::column_sender_symbol_mode_auto => None,
+    };
     let ffi_array = array as *mut arrow::ffi::FFI_ArrowArray;
     let ffi_schema = schema as *const arrow::ffi::FFI_ArrowSchema;
     let imported = match unsafe {
         crate::arrow_ffi_import_column(
             ffi_array,
             ffi_schema,
-            force_not_symbol,
+            symbol,
             "column_sender_arrow_import_new",
             err_out,
         )
@@ -2824,8 +2837,14 @@ mod tests {
             private_data: std::ptr::null_mut(),
         };
 
-        let imported =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, false, &mut err) };
+        let imported = unsafe {
+            column_sender_arrow_import_new(
+                &mut array,
+                &schema,
+                column_sender_symbol_mode::column_sender_symbol_mode_auto,
+                &mut err,
+            )
+        };
         assert!(!imported.is_null());
         assert!(err.is_null());
         assert!(array.release.is_none());
@@ -2908,14 +2927,26 @@ mod tests {
         };
 
         let mut err: *mut line_sender_error = std::ptr::null_mut();
-        let imported =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, false, &mut err) };
+        let imported = unsafe {
+            column_sender_arrow_import_new(
+                &mut array,
+                &schema,
+                column_sender_symbol_mode::column_sender_symbol_mode_auto,
+                &mut err,
+            )
+        };
         assert!(!imported.is_null());
         assert!(err.is_null());
         assert!(array.release.is_none());
 
-        let second =
-            unsafe { column_sender_arrow_import_new(&mut array, &schema, false, &mut err) };
+        let second = unsafe {
+            column_sender_arrow_import_new(
+                &mut array,
+                &schema,
+                column_sender_symbol_mode::column_sender_symbol_mode_auto,
+                &mut err,
+            )
+        };
         assert!(second.is_null());
         assert!(!err.is_null());
 

@@ -81,7 +81,7 @@ impl ImportedArrowColumn {
     pub unsafe fn import_from_ffi(
         array: &mut arrow::ffi::FFI_ArrowArray,
         schema: &arrow::ffi::FFI_ArrowSchema,
-        force_not_symbol: bool,
+        symbol: Option<bool>,
     ) -> Result<Self> {
         use arrow_array::make_array;
 
@@ -90,11 +90,11 @@ impl ImportedArrowColumn {
 
         let mut field = arrow_schema::Field::try_from(schema)
             .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
-        if force_not_symbol {
+        if let Some(want_symbol) = symbol {
             let mut metadata = field.metadata().clone();
             metadata.insert(
                 crate::egress::arrow::metadata::SYMBOL.to_string(),
-                "false".to_string(),
+                if want_symbol { "true" } else { "false" }.to_string(),
             );
             field = field.with_metadata(metadata);
         }

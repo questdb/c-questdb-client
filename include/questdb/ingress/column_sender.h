@@ -629,6 +629,18 @@ struct ArrowArray
 typedef struct column_sender_arrow_import column_sender_arrow_import;
 
 /**
+ * `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
+ * `symbol`: force plain Utf8 -> SYMBOL. `not_symbol`: force Dictionary ->
+ * VARCHAR. Used by `column_sender_arrow_import_new`.
+ */
+typedef enum column_sender_symbol_mode
+{
+    column_sender_symbol_mode_auto = 0,
+    column_sender_symbol_mode_symbol = 1,
+    column_sender_symbol_mode_not_symbol = 2,
+} column_sender_symbol_mode;
+
+/**
  * Import an `ArrowArray` + `ArrowSchema` pair into an opaque handle.
  *
  * Ownership of the array's buffers transfers into the returned handle.
@@ -639,9 +651,9 @@ typedef struct column_sender_arrow_import column_sender_arrow_import;
  * failure path. Depth-cap and NULL-pointer rejections leave it
  * intact. `schema` is borrowed only for the duration of this call.
  *
- * When `force_not_symbol` is true, a `Dictionary(*, Utf8 / LargeUtf8)`
- * column is emitted as `VARCHAR` (the dictionary is decoded on write)
- * instead of the default `SYMBOL`. No-op for non-dictionary columns.
+ * `symbol_mode` selects the SYMBOL-vs-VARCHAR disposition of a string
+ * column (see `column_sender_symbol_mode`); it is a no-op for
+ * non-string columns.
  *
  * Returns NULL on error and writes a `line_sender_error*` to
  * `*err_out`. The returned handle (when non-NULL) MUST be freed with
@@ -651,7 +663,7 @@ QUESTDB_CLIENT_API
 column_sender_arrow_import* column_sender_arrow_import_new(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    bool force_not_symbol,
+    column_sender_symbol_mode symbol_mode,
     line_sender_error** err_out);
 
 /**
