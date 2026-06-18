@@ -9,12 +9,11 @@
 //! ```
 
 use std::error::Error;
-use std::num::NonZeroUsize;
 
 use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
 use questdb::{
     egress::Reader,
-    ingress::{TableName, column_sender::QuestDb},
+    ingress::{column_sender::QuestDb, polars::PolarsIngestOptions},
 };
 
 const TABLE: &str = "trades_polars_demo";
@@ -46,9 +45,10 @@ fn build_df() -> DataFrame {
 fn ingest(host: &str, port: &str, df: &DataFrame) -> Result<(), Box<dyn Error>> {
     let db = QuestDb::connect(&format!("qwpws::addr={host}:{port};"))?;
     let mut sender = db.borrow_sender()?;
-    let table = TableName::new(TABLE)?;
-    let max_rows = NonZeroUsize::new(10_000);
-    sender.flush_polars_dataframe(table, df, max_rows)?;
+    // `&str` table names "just work" via `TryInto<TableName>`; optional knobs
+    // (batch size, designated-timestamp column, wire-type overrides) are built
+    // with `PolarsIngestOptions`.
+    sender.flush_polars_dataframe(TABLE, df, &PolarsIngestOptions::new().max_rows(10_000))?;
     Ok(())
 }
 

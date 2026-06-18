@@ -316,10 +316,88 @@ impl Iterator for DataFrameBatches<'_> {
 /// ≈64 × `max_rows` rows.
 const CHECKPOINT_BATCHES: usize = 64;
 
+/// Optional knobs for [`BorrowedSender::flush_polars_dataframe`].
+///
+/// Every field defaults to "off", so `PolarsIngestOptions::default()` (or
+/// [`PolarsIngestOptions::new`]) reproduces the original three-argument
+/// behaviour: [`DEFAULT_MAX_BATCH_ROWS`]-row batches, server-assigned
+/// timestamps, and wire types derived from the Arrow schema alone.
+///
+/// Build with the chainable setters:
+///
+/// ```ignore
+/// let opts = questdb::ingress::polars::PolarsIngestOptions::new()
+///     .max_rows(50_000)
+///     .timestamp_column(ColumnName::new("ts")?)
+///     .overrides(&overrides);
+/// sender.flush_polars_dataframe("trades", &df, &opts)?;
+/// ```
+///
+/// [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
+#[derive(Clone, Copy, Default)]
+pub struct PolarsIngestOptions<'a> {
+    max_rows: Option<NonZeroUsize>,
+    timestamp_column: Option<crate::ingress::ColumnName<'a>>,
+    overrides: &'a [crate::ingress::column_sender::ArrowColumnOverride<'a>],
+}
+
+impl<'a> PolarsIngestOptions<'a> {
+    /// A fresh option set with every knob defaulted to "off".
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cap each emitted [`RecordBatch`] at `rows` rows. `0` (or never calling
+    /// this) uses [`DEFAULT_MAX_BATCH_ROWS`]. Taking a plain `usize` keeps the
+    /// call site free of `NonZeroUsize` ceremony.
+    #[must_use]
+    pub fn max_rows(mut self, rows: usize) -> Self {
+        self.max_rows = NonZeroUsize::new(rows);
+        self
+    }
+
+    /// Source the per-row designated timestamp from `column` (a `Timestamp(_)`
+    /// column of the frame) instead of letting the server stamp each row on
+    /// arrival. Mirrors `ColumnSender::flush_arrow_batch_at_column`.
+    #[must_use]
+    pub fn timestamp_column(mut self, column: crate::ingress::ColumnName<'a>) -> Self {
+        self.timestamp_column = Some(column);
+        self
+    }
+
+    /// Per-column wire-type hints, applied to every batch sliced out of the
+    /// frame. Same meaning as the `overrides` argument of
+    /// `ColumnSender::flush_arrow_batch` — the intended path for Polars frames
+    /// built without pyarrow, whose Arrow schema carries no `questdb.*` field
+    /// metadata.
+    #[must_use]
+    pub fn overrides(
+        mut self,
+        overrides: &'a [crate::ingress::column_sender::ArrowColumnOverride<'a>],
+    ) -> Self {
+        self.overrides = overrides;
+        self
+    }
+}
+
 impl crate::ingress::column_sender::BorrowedSender<'_> {
-    /// Slice `df` into [`RecordBatch`]es of at most `max_rows` rows each
-    /// (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and `sync`
-    /// to commit — re-driving transparently across a connection failure.
+    /// Slice `df` into [`RecordBatch`]es of at most `options.max_rows` rows
+    /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
+    /// `sync` to commit — re-driving transparently across a connection failure.
+    ///
+    /// `table` accepts anything convertible into a [`TableName`], so a bare
+    /// `&str` works directly. `options` ([`PolarsIngestOptions`]) carries an
+    /// optional designated-timestamp column and per-column wire-type
+    /// `overrides`, both applied to every sliced batch;
+    /// `PolarsIngestOptions::default()` preserves the previous behaviour
+    /// (server-assigned timestamps, schema-derived wire types).
+    ///
+    /// Unlike `ColumnSender::flush` / `ColumnSender::flush_arrow_batch`, which
+    /// leave rows uncommitted until you call `ColumnSender::sync`, this entry
+    /// owns the commit (and the failover replay boundary).
+    ///
+    /// [`TableName`]: crate::ingress::TableName
     ///
     /// The batch loop `sync`s every [`CHECKPOINT_BATCHES`] batches; on a
     /// transient ([`ErrorCode::FailoverRetry`]) `flush`/`sync` error it
@@ -341,12 +419,17 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
     ///
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
     /// [`ReconnectPolicy`]: crate::ingress::ReconnectPolicy
-    pub fn flush_polars_dataframe(
+    pub fn flush_polars_dataframe<'t, T>(
         &mut self,
-        table: crate::ingress::TableName<'_>,
+        table: T,
         df: &DataFrame,
-        max_rows: Option<NonZeroUsize>,
-    ) -> Result<()> {
+        options: &PolarsIngestOptions<'_>,
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: crate::ingress::TableName<'t> = table.try_into()?;
         let started = std::time::Instant::now();
         let deadline = started.checked_add(self.reconnect_policy().max_duration());
         // Batches confirmed by the last successful `sync`; a transient failure
@@ -354,7 +437,7 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
         let mut committed = 0usize;
 
         loop {
-            match drive_from_checkpoint(self, table, df, max_rows, &mut committed) {
+            match drive_from_checkpoint(self, table, df, options, &mut committed) {
                 Ok(()) => return Ok(()),
                 Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
                 // Re-borrow onto a live primary (retrying the connect within the
@@ -374,17 +457,21 @@ fn drive_from_checkpoint(
     sender: &mut crate::ingress::column_sender::BorrowedSender<'_>,
     table: crate::ingress::TableName<'_>,
     df: &DataFrame,
-    max_rows: Option<NonZeroUsize>,
+    options: &PolarsIngestOptions<'_>,
     committed: &mut usize,
 ) -> Result<()> {
     use crate::ingress::column_sender::AckLevel;
 
     let skip = *committed;
-    for (idx, rb) in dataframe_to_batches(df, max_rows).enumerate() {
+    for (idx, rb) in dataframe_to_batches(df, options.max_rows).enumerate() {
         if idx < skip {
             continue;
         }
-        sender.flush_arrow_batch(table, &rb?, &[])?;
+        let rb = rb?;
+        match options.timestamp_column {
+            Some(ts) => sender.flush_arrow_batch_at_column(table, &rb, ts, options.overrides)?,
+            None => sender.flush_arrow_batch(table, &rb, options.overrides)?,
+        }
         // `idx` is 0-based; checkpoint after a full run of CHECKPOINT_BATCHES
         // (batches 63, 127, …). The sync's ack moves the replay boundary.
         if (idx + 1) % CHECKPOINT_BATCHES == 0 {

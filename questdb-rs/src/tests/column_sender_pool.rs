@@ -1181,9 +1181,8 @@ fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
 #[cfg(feature = "polars")]
 #[test]
 fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
-    use crate::ingress::TableName;
+    use crate::ingress::polars::PolarsIngestOptions;
     use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
-    use std::num::NonZeroUsize;
 
     // Endpoint A is the eager-open primary that dies on the checkpoint `sync`;
     // endpoint B is a live acking server. The DataFrame entry must catch the
@@ -1208,11 +1207,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
 
     let mut sender = db.borrow_sender().expect("borrow");
     sender
-        .flush_polars_dataframe(
-            TableName::new("trades").unwrap(),
-            &df,
-            Some(NonZeroUsize::new(2).unwrap()),
-        )
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("failover must re-drive the df onto the live endpoint");
     drop(sender);
 
@@ -1233,9 +1228,8 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
 #[cfg(feature = "polars")]
 #[test]
 fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
-    use crate::ingress::TableName;
+    use crate::ingress::polars::PolarsIngestOptions;
     use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
-    use std::num::NonZeroUsize;
 
     // The primary acks one full checkpoint and then dies mid-stream. With one
     // row per batch and a 66-row df, the first 64 batches plus the checkpoint
@@ -1263,11 +1257,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
 
     let mut sender = db.borrow_sender().expect("borrow");
     sender
-        .flush_polars_dataframe(
-            TableName::new("trades").unwrap(),
-            &df,
-            Some(NonZeroUsize::new(1).unwrap()),
-        )
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
         .expect("failover must re-drive the uncommitted tail onto the live endpoint");
     drop(sender);
 
@@ -1288,9 +1278,8 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
 #[cfg(feature = "polars")]
 #[test]
 fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
-    use crate::ingress::TableName;
+    use crate::ingress::polars::PolarsIngestOptions;
     use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
-    use std::num::NonZeroUsize;
 
     // The primary is the eager-open connection and dies during the DataFrame
     // flush. The replacement endpoint is initially unreachable but starts
@@ -1320,11 +1309,7 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
 
     let mut sender = db.borrow_sender().expect("borrow");
     sender
-        .flush_polars_dataframe(
-            TableName::new("trades").unwrap(),
-            &df,
-            Some(NonZeroUsize::new(2).unwrap()),
-        )
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("reborrow connect failures must retry until the recovery endpoint is live");
     drop(sender);
 
@@ -1337,9 +1322,8 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
 #[cfg(feature = "polars")]
 #[test]
 fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
-    use crate::ingress::TableName;
+    use crate::ingress::polars::PolarsIngestOptions;
     use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
-    use std::num::NonZeroUsize;
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
     let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
@@ -1349,11 +1333,7 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
 
     let mut sender = db.borrow_sender().expect("borrow");
     sender
-        .flush_polars_dataframe(
-            TableName::new("trades").unwrap(),
-            &df,
-            Some(NonZeroUsize::new(2).unwrap()),
-        )
+        .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("healthy single-endpoint flush must commit in one pass");
     drop(sender);
 
@@ -1366,5 +1346,41 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
         data_frame_count(&frames),
         2,
         "4 rows / 2 per batch = 2 data frames"
+    );
+}
+
+#[cfg(feature = "polars")]
+#[test]
+fn flush_polars_dataframe_applies_column_overrides() {
+    use crate::ingress::column_sender::ArrowColumnOverride;
+    use crate::ingress::polars::PolarsIngestOptions;
+    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+
+    // `ArrowColumnOverride` was documented for "Polars frames built without
+    // pyarrow" yet was previously unreachable through `flush_polars_dataframe`.
+    // A Symbol override for a plain Utf8 column must now thread through to every
+    // sliced batch and commit cleanly.
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+
+    let s = Series::new(PlSmallStr::from("s"), &["a", "b", "c", "d"]).into_column();
+    let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
+    let df = DataFrame::new(4, vec![s, i]).unwrap();
+
+    let overrides = [ArrowColumnOverride::Symbol { column: "s" }];
+    let mut sender = db.borrow_sender().expect("borrow");
+    sender
+        .flush_polars_dataframe(
+            "trades",
+            &df,
+            &PolarsIngestOptions::new().max_rows(2).overrides(&overrides),
+        )
+        .expect("symbol override must thread through the polars path and commit");
+    drop(sender);
+
+    assert_eq!(
+        data_frame_count(&frames),
+        2,
+        "4 rows / 2 per batch = 2 data frames with the override applied"
     );
 }

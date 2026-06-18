@@ -202,13 +202,22 @@ impl ColumnSender {
     /// out-of-range reads here; validate them before calling. The C ABI entry
     /// point validates on the caller's behalf since it cannot assume a trusted
     /// producer.
+    ///
+    /// `table` accepts anything convertible into a [`TableName`], so a bare
+    /// `&str` works directly (validated here) as well as a pre-validated
+    /// [`TableName`].
     #[cfg(feature = "arrow")]
-    pub fn flush_arrow_batch(
+    pub fn flush_arrow_batch<'t, T>(
         &mut self,
-        table: TableName<'_>,
+        table: T,
         batch: &RecordBatch,
         overrides: &[ArrowColumnOverride<'_>],
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
         let defer = self.first_frame_sent;
         self.flush_arrow_batch_inner(table, batch, None, overrides, defer)
             .map_err(classify_flush_error)?;
@@ -223,13 +232,18 @@ impl ColumnSender {
     /// widened to µs on the wire. `overrides` (use `&[]` for none) has
     /// the same meaning as in [`Self::flush_arrow_batch`].
     #[cfg(feature = "arrow")]
-    pub fn flush_arrow_batch_at_column(
+    pub fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
-        table: TableName<'_>,
+        table: T,
         batch: &RecordBatch,
         ts_column: ColumnName<'_>,
         overrides: &[ArrowColumnOverride<'_>],
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
         let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
         let defer = self.first_frame_sent;
         self.flush_arrow_batch_inner(table, batch, Some(ts_col_idx), overrides, defer)
