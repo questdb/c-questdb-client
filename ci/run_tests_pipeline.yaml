@@ -150,112 +150,71 @@ stages:
           - script: ctest --output-on-failure -E rust_tests
             workingDirectory: build_sanitize
             displayName: "ctest under ASan + UBSan"
-      # Runs the full system_test/test.py against a fresh build of
-      # QuestDB master. Moved off Microsoft-hosted ubuntu-latest because
-      # the QWP/WS fuzz portion of the run filled the agent disk ("No
-      # space left", SIGBUS); the hetzner-incus pool — already used by
-      # TestQwpWsFuzzLinux below and by the cron-time fuzz pipeline —
-      # has enough headroom. Pool image is built from
-      # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
-      # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
-      # zip, curl, gh, and rustup; only cmake and python3-numpy are
-      # apt-installed per job. imageName='hetzner-incus' tells
-      # compile.yaml to skip its pip step.
-      - job: TestVsQuestDBMaster
-        displayName: "Vs QuestDB master"
+      # Runs the integration matrix (system_test/test.py) and the
+      # mid-query failover suite (system_test/test_egress_failover.py)
+      # against the prebuilt QuestDB *nightly docker image* instead of a
+      # from-source build of master. The nightly image tracks master, so
+      # this keeps the "did QuestDB master break the client?" signal while
+      # dropping the Maven + Rust from-source build entirely. The server
+      # runs in a container (config injected via QDB_* env vars, ports
+      # published 1:1 on loopback); the failover crash is a `docker kill`
+      # (SIGKILL), the graceful path a `docker stop` (SIGTERM).
+      #
+      # Back on Microsoft-hosted ubuntu-latest (which ships docker
+      # pre-installed): the disk pressure that originally pushed this job
+      # to hetzner-incus came from the from-source build plus on-host
+      # server data, both now gone (the server lives in an ephemeral
+      # container, removed between configs). If fuzz-portion disk
+      # pressure ever recurs, move this job to a pool with more headroom
+      # that also has docker.
+      #
+      # Scope note: the nightly image is Linux/amd64 only, so the
+      # mac/windows fuzz legs stay from-source, as does any run that must
+      # test a specific commit not yet in nightly. QWP UDP is not
+      # exercised here (it is gated on `--repo` in test.py); that
+      # coverage still runs in the from-source jobs.
+      - job: TestVsQuestDBNightly
+        displayName: "Vs QuestDB nightly (docker)"
         pool:
-          name: hetzner-incus
+          vmImage: "ubuntu-latest"
         timeoutInMinutes: 90
         variables:
-          imageName: hetzner-incus
+          QUESTDB_IMAGE: "questdb/questdb:nightly"
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
-          - bash: |
-              rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
-            displayName: "Cleanup /tmp leftovers"
-          - bash: |
-              set -eux
-              sudo apt-get update
-              # Ubuntu 24.04's python3-numpy is 1.26 which caps NPY_MAXDIMS at 32;
-              # the >32-dim sender-rejection test (TestSender.test_f64_arr_max_dims)
-              # needs numpy >= 2.0 to construct the input array. Install numpy
-              # only via pip (apt would pull in 1.26 and pip refuses to replace
-              # debian-installed packages because the wheel RECORD file is
-              # missing). --break-system-packages overrides PEP 668.
-              sudo apt-get install -y --no-install-recommends cmake python3-pip
-              sudo python3 -m pip install --break-system-packages 'numpy>=2' pyarrow polars
-              JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
-              JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
-              for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
-                if [ ! -x "$p/bin/javac" ]; then
-                  echo "Expected JDK missing at $p" >&2
-                  ls /usr/lib/jvm/ >&2 || true
-                  exit 1
-                fi
-              done
-              # `set -x` traces `echo "##vso[...]VALUE"` as `+ echo
-              # '##vso[...]VALUE'`; Azure's stdout parser matches `##vso[`
-              # anywhere on the line and takes everything past `]` to EOL
-              # as the value, including the trailing `'` bash added.
-              # Disable trace just for these two echoes so JAVA_HOME does
-              # not end up as `/usr/lib/jvm/java-25-openjdk-amd64'`.
-              set +x
-              echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
-              echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
-            displayName: "Install missing deps + resolve JDKs"
-          - bash: |
-              set -eux
-              # `|| true` lets the fallback path take over if the file
-              # references something the build user can't read (e.g.
-              # /etc/profile.d/rust.sh sources /root/.cargo/env).
-              if [ -f /etc/profile.d/rust.sh ]; then . /etc/profile.d/rust.sh || true; fi
-              if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env" || true; fi
-              if ! command -v cargo >/dev/null 2>&1; then
-                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                  | sh -s -- -y --default-toolchain stable --profile minimal
-                . "$HOME/.cargo/env"
-              fi
-              CARGO_BIN="$(dirname "$(command -v cargo)")"
-              echo "Using cargo from: $CARGO_BIN"
-              # See JAVA_HOME comment above re: `set -x` + `##vso[...]`.
-              set +x
-              echo "##vso[task.prependpath]$CARGO_BIN"
-            displayName: "Resolve Rust toolchain"
           - template: templates/compile.yaml
-          - template: templates/clone_questdb.yaml
-          - task: Maven@3
-            displayName: "Compile QuestDB"
-            inputs:
-              mavenPOMFile: "questdb/pom.xml"
-              javaHomeOption: "Path"
-              jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: |
-              python3 system_test/test.py run --repo ./questdb -v
-            displayName: "integration test"
+              docker pull $(QUESTDB_IMAGE)
+            displayName: "Pull QuestDB nightly image"
           - script: |
-              python3 system_test/test_egress_failover.py run --repo ./questdb -v
-            displayName: "egress integration test"
+              python3 system_test/test.py run --docker $(QUESTDB_IMAGE) -v
+            displayName: "integration test (docker)"
+          - script: |
+              python3 system_test/test_egress_failover.py run --docker $(QUESTDB_IMAGE) -v
+            displayName: "egress failover test (docker)"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"
             condition: failed()
             continueOnError: true
             inputs:
-              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb/repo/data/log
+              # The docker fixtures capture `docker logs` under build/questdb/
+              # (docker/, server1/, server2/) since the containers are
+              # removed on stop().
+              rootFolderOrFile: $(Build.SourcesDirectory)/build/questdb
               includeRootFolder: false
               archiveType: zip
-              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/qdb-log-vs-nightly-$(Agent.OS).zip
               quiet: true
           - task: PublishBuildArtifacts@1
             displayName: "Publish QuestDB server log on failure"
             condition: failed()
             continueOnError: true
             inputs:
-              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-master-$(Agent.OS).zip
-              artifactName: qdb-log-vs-master-$(Agent.OS)
+              pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-vs-nightly-$(Agent.OS).zip
+              artifactName: qdb-log-vs-nightly-$(Agent.OS)
       - job: TestQwpWsFuzz
         displayName: "QWP/WS fuzz suite (mac/windows hosted)"
         strategy:

@@ -83,6 +83,7 @@ from test_arrow_fuzz_common_unit import (
 from fixture import (
     Project,
     QuestDbFixtureBase,
+    QuestDbDockerFixture,
     QuestDbExternalFixture,
     QuestDbFixture,
     TlsProxyFixture,
@@ -4159,6 +4160,13 @@ def parse_args():
         help=('Test against existing jar from a ' +
               '`mvn install -DskipTests -P build-web-console`' +
               '-ed questdb repo such as `~/questdb/repos/questdb/`'))
+    version_g.add_argument(
+        '--docker',
+        type=str,
+        metavar='IMAGE',
+        help=('Test against a QuestDB docker image, e.g. ' +
+              '`questdb/questdb:nightly`. The server runs in a container; ' +
+              'config is injected via QDB_* env vars.'))
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
@@ -4192,6 +4200,13 @@ def iter_versions(args):
     Returns a generator of prepared questdb directories.
     Ensure that the DB is stopped after each use.
     """
+    if getattr(args, 'docker', None):
+        # The "target" is a docker image reference. QuestDbDockerFixture
+        # injects config via QDB_* env vars, so there is no directory to
+        # prepare here.
+        yield args.docker
+        return
+
     if getattr(args, 'repo', None):
         # A specific repo path was provided.
         repo = pathlib.Path(args.repo)
@@ -4237,12 +4252,22 @@ def _stop_and_maybe_wipe(fixture):
         fixture.wipe_data_dir()
 
 
+def _new_fixture(target, is_docker, **kwargs):
+    """Build the fixture for the active run mode. In docker mode ``target``
+    is an image reference (``QuestDbDockerFixture``); otherwise it is a
+    prepared questdb directory (``QuestDbFixture``)."""
+    if is_docker:
+        return QuestDbDockerFixture(target, **kwargs)
+    return QuestDbFixture(target, **kwargs)
+
+
 def run_with_fixtures(args):
     global QDB_FIXTURE
     global TLS_PROXY_FIXTURE
     global BUILD_MODE
     global QWP_WS_SMOKE_TLS
 
+    is_docker = bool(getattr(args, 'docker', None))
     latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
     run_matrix_suite = _select_tests(SUITE_MATRIX).countTestCases() > 0
     run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
@@ -4253,8 +4278,9 @@ def run_with_fixtures(args):
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
             for auth in (False, True):
-                QDB_FIXTURE = QuestDbFixture(
+                QDB_FIXTURE = _new_fixture(
                     questdb_dir,
+                    is_docker,
                     auth=auth,
                     qwp_udp=bool(getattr(args, 'repo', None)))
                 TLS_PROXY_FIXTURE = None
@@ -4295,8 +4321,9 @@ def run_with_fixtures(args):
 
         if run_qwp_ws_smoke_suite:
             for http_auth in (False, True):
-                QDB_FIXTURE = QuestDbFixture(
+                QDB_FIXTURE = _new_fixture(
                     questdb_dir,
+                    is_docker,
                     auth=False,
                     http_auth=http_auth,
                     qwp_udp=False)
@@ -4328,8 +4355,9 @@ def run_with_fixtures(args):
                     _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_protocol_suite:
-            QDB_FIXTURE = QuestDbFixture(
+            QDB_FIXTURE = _new_fixture(
                 questdb_dir,
+                is_docker,
                 auth=False,
                 qwp_udp=False)
             TLS_PROXY_FIXTURE = None
@@ -4346,8 +4374,9 @@ def run_with_fixtures(args):
                 _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_restart_suite:
-            QDB_FIXTURE = QuestDbFixture(
+            QDB_FIXTURE = _new_fixture(
                 questdb_dir,
+                is_docker,
                 auth=False,
                 qwp_udp=False)
             TLS_PROXY_FIXTURE = None
@@ -4364,8 +4393,9 @@ def run_with_fixtures(args):
                 _stop_and_maybe_wipe(QDB_FIXTURE)
 
         if run_qwp_ws_fuzz_suite:
-            QDB_FIXTURE = QuestDbFixture(
+            QDB_FIXTURE = _new_fixture(
                 questdb_dir,
+                is_docker,
                 auth=False,
                 qwp_udp=False)
             TLS_PROXY_FIXTURE = None

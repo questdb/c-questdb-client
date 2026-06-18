@@ -74,7 +74,9 @@ from fixture import (
     install_questdb,
     install_questdb_from_repo,
     list_questdb_releases,
+    _docker,
     _find_java,
+    _unique_container_name,
 )
 
 
@@ -265,6 +267,137 @@ class StandaloneInstance:
             sys.stderr.write(f'    {line}\n')
 
 
+class DockerStandaloneInstance:
+    """
+    Docker-backed analogue of `StandaloneInstance` for the failover test.
+
+    Each instance is its own container running the QuestDB image (e.g.
+    `questdb/questdb:nightly`). Config is injected via QDB_* env vars and
+    ports are published 1:1 on loopback, so the helper clients connect to
+    `127.0.0.1:<port>` exactly as against the local-process fixture.
+
+    The crash/graceful distinction that the failover test depends on maps
+    onto docker signals:
+
+      - `kill()` => `docker kill` (SIGKILL): an ungraceful crash, the
+        container vanishes without the JVM running shutdown hooks, so the
+        in-flight cursor sees an abrupt reset and failover engages. This
+        is the behaviour under test; `docker stop` (SIGTERM) would let
+        the server close gracefully and would NOT exercise failover.
+      - `stop()` => `docker stop` (SIGTERM): a graceful shutdown.
+
+    Ports are published 1:1 on loopback (same as the integration
+    fixture), so the client reaches the server at 127.0.0.1:<port>. Note
+    that with a published port the optimised release server can stream
+    the next result batch into the client's buffer before `docker kill`
+    lands, so after the kill `next_batch()` may still return one or more
+    already-received batches; the exhaustion helper drains those before
+    asserting the reader surfaces an error (see exhaustion_client.rs).
+
+    The data dir is only used as a place to persist the captured
+    container log (`docker logs`) for `dump_log()` and CI archival; the
+    server's own data lives inside the ephemeral container.
+    """
+
+    def __init__(self, image, data_dir, label):
+        self.image = image
+        self.data_dir = pathlib.Path(data_dir)
+        self.label = label
+        self.host = '127.0.0.1'
+        self.http_port = None
+        self.ilp_port = None
+        self.pg_port = None
+        self._container = None
+
+    def start(self):
+        if self.data_dir.exists():
+            shutil.rmtree(self.data_dir)
+        (self.data_dir / 'log').mkdir(parents=True)
+
+        self.http_port, self.ilp_port, self.pg_port = discover_avail_ports(3)
+        self._container = _unique_container_name(f'qdb_failover_{self.label}')
+        env = {
+            'QDB_HTTP_BIND_TO': f'0.0.0.0:{self.http_port}',
+            'QDB_LINE_TCP_NET_BIND_TO': f'0.0.0.0:{self.ilp_port}',
+            'QDB_PG_NET_BIND_TO': f'0.0.0.0:{self.pg_port}',
+            'QDB_HTTP_MIN_ENABLED': 'false',
+            'QDB_LINE_UDP_ENABLED': 'false',
+            'QDB_TELEMETRY_ENABLED': 'false',
+            'QDB_CAIRO_COMMIT_LAG': '100',
+        }
+        cmd = ['run', '-d', '--name', self._container]
+        for key, value in env.items():
+            cmd += ['-e', f'{key}={value}']
+        for port in (self.http_port, self.ilp_port, self.pg_port):
+            cmd += ['-p', f'127.0.0.1:{port}:{port}']
+        cmd += [self.image]
+        sys.stderr.write(
+            f'[{self.label}] docker run {self._container} '
+            f'http={self.http_port} ilp={self.ilp_port} pg={self.pg_port}\n')
+        _docker(*cmd)
+        try:
+            _wait_for_ping(self.host, self.http_port)
+        except Exception:
+            self.dump_log()
+            self.kill()
+            raise
+        sys.stderr.write(f'[{self.label}] /ping is up.\n')
+
+    def http_exec(self, sql):
+        return _http_exec(self.host, self.http_port, sql)
+
+    def is_alive(self):
+        if self._container is None:
+            return False
+        res = _docker(
+            'inspect', '-f', '{{.State.Running}}', self._container,
+            check=False, capture=True)
+        return res.returncode == 0 and res.stdout.strip() == b'true'
+
+    def _capture_log(self):
+        if self._container is None:
+            return
+        try:
+            res = _docker(
+                'logs', self._container, check=False, capture=True)
+            log_path = self.data_dir / 'log' / 'log.txt'
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, 'wb') as log_file:
+                log_file.write(res.stdout or b'')
+        except Exception:
+            pass
+
+    def kill(self):
+        """SIGKILL via `docker kill` - simulates a crash, no graceful WS
+        Close."""
+        if self._container is not None:
+            self._capture_log()
+            _docker('kill', self._container, check=False)
+            _docker('rm', '-f', self._container, check=False)
+            self._container = None
+
+    def stop(self):
+        """SIGTERM via `docker stop` - graceful shutdown. Use kill() to
+        simulate a crash."""
+        if self._container is not None:
+            self._capture_log()
+            _docker('stop', '-t', '15', self._container, check=False)
+            _docker('rm', '-f', self._container, check=False)
+            self._container = None
+
+    def dump_log(self, tail_lines=100):
+        self._capture_log()
+        log_path = self.data_dir / 'log' / 'log.txt'
+        if not log_path.exists():
+            sys.stderr.write(f'[{self.label}] no log at {log_path}\n')
+            return
+        text = log_path.read_text(encoding='utf-8', errors='replace')
+        lines = text.splitlines()
+        sys.stderr.write(f'[{self.label}] last {tail_lines} log lines:\n')
+        for line in lines[-tail_lines:]:
+            sys.stderr.write(f'    {line}\n')
+
+
 # ---------------------------------------------------------------------------
 # Setup helpers
 # ---------------------------------------------------------------------------
@@ -370,7 +503,7 @@ def _seed_table(server, table, row_count, timeout_sec=60):
 # ---------------------------------------------------------------------------
 
 
-_ARGS = argparse.Namespace(repo=None, versions=None)
+_ARGS = argparse.Namespace(repo=None, versions=None, docker=None)
 
 
 class FailoverTest(unittest.TestCase):
@@ -398,7 +531,9 @@ class FailoverTest(unittest.TestCase):
     def setUpClass(cls):
         proj = Project()
 
-        cls.jar = _resolve_jar(_ARGS)
+        # In docker mode the image supplies the server; otherwise resolve
+        # (or download/build) a jar to run as a local process.
+        cls.jar = None if _ARGS.docker else _resolve_jar(_ARGS)
 
         # The two data dirs the test brief asks for, side by side under
         # the project's build/questdb/.
@@ -413,8 +548,16 @@ class FailoverTest(unittest.TestCase):
             cls.exhaustion_client_bin,
         ) = _build_helper_clients()
 
-        cls.server1 = StandaloneInstance(cls.jar, cls.server1_dir, 'server1')
-        cls.server2 = StandaloneInstance(cls.jar, cls.server2_dir, 'server2')
+        if _ARGS.docker:
+            cls.server1 = DockerStandaloneInstance(
+                _ARGS.docker, cls.server1_dir, 'server1')
+            cls.server2 = DockerStandaloneInstance(
+                _ARGS.docker, cls.server2_dir, 'server2')
+        else:
+            cls.server1 = StandaloneInstance(
+                cls.jar, cls.server1_dir, 'server1')
+            cls.server2 = StandaloneInstance(
+                cls.jar, cls.server2_dir, 'server2')
         cls.server1.start()
         try:
             cls.server2.start()
@@ -1014,6 +1157,11 @@ def _add_run_flags(p):
         '--versions', nargs='+',
         help='Test against this specific QuestDB version (only the '
              'first is used).')
+    p.add_argument(
+        '--docker', metavar='IMAGE',
+        help='Test against a QuestDB docker image, e.g. '
+             '`questdb/questdb:nightly`. Each instance runs in its own '
+             'container; the crash is a `docker kill` (SIGKILL).')
     p.add_argument(
         '-v', '--verbose', action='store_true',
         help='Pass -v through to unittest.')
