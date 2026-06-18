@@ -116,8 +116,9 @@ enum class line_sender_error_code
 
     /** Reconnectable failure on the column-major sender's flush/sync path
      *  (transport error, EOF, closed connection). The operation has not
-     *  committed: drop the connection, borrow a fresh one (the pool rotates
-     *  to a live endpoint), and re-drive from your source. */
+     *  committed: drop the connection, re-acquire one with
+     *  `pool::borrow_conn_with_retry` (row-aligned reconnect backoff, bounded
+     *  by `reconnect_max_duration`), and re-drive from your source. */
     failover_retry = 17,
 };
 
