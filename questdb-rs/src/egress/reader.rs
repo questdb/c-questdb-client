@@ -1466,10 +1466,11 @@ impl<'r> Cursor<'r> {
     /// happens before the first batch is yielded — including initial
     /// connect failover — is unaffected and remains transparent.
     ///
-    /// Decode errors (malformed payload, missing batch-0 schema, zstd
-    /// corruption) are NOT routed through failover — they bubble up
-    /// immediately and terminate the cursor, since reconnecting
-    /// won't fix a wire-state bug.
+    /// Failover-eligible decode errors (malformed payload, bad varint,
+    /// zstd corruption) use the same reconnect-and-replay path as
+    /// transport failures. Replaying after rows were already yielded is
+    /// still blocked unless the caller installed a replay-aware callback,
+    /// since the server restarts streaming from `batch_seq=0`.
     ///
     /// **Blocking time during failover.** When failover is engaged,
     /// this method blocks the calling thread for the duration of the
@@ -1719,58 +1720,17 @@ impl<'r> Cursor<'r> {
             let (header, payload) = match self.read_frame_raw() {
                 Ok(hp) => hp,
                 Err(e) => {
-                    if self.cancelling
-                        || !self.reader.cfg.failover
-                        || !is_failover_eligible(e.code())
-                    {
-                        // Match every other terminal path in this loop:
-                        // tear down the WS so the cursor's flags stay
-                        // coherent with the transport state, no half-cooked
-                        // cursors that defer cleanup to `Reader::Drop`.
-                        self.terminate_with_close();
-                        return Err(e);
-                    }
-                    // Silent-duplicate guard. If at least one batch was
-                    // already yielded to the caller and they didn't
-                    // install an `on_failover_reset` callback, replay
-                    // would deliver those rows again with no signal —
-                    // see `ErrorCode::FailoverWouldDuplicate`. The
-                    // exact-once contract is "rows surface to the
-                    // caller at most once unless they explicitly
-                    // opt in to seeing replays."
-                    //
-                    // The trigger error `e` is preserved in the message
-                    // so the caller still learns *why* the cursor died;
-                    // diagnostics shouldn't get worse just because we
-                    // re-classified the surface.
-                    if would_silently_duplicate(
-                        self.data_delivered,
-                        self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
-                    ) {
-                        let err = fmt!(
-                            FailoverWouldDuplicate,
-                            "mid-query failover would replay rows already delivered to the caller \
-                             (install on_failover_reset or on_failover_progress to opt in to replays); \
-                             cursor terminated. Trigger: {} ({:?})",
-                            e.msg(),
-                            e.code()
-                        );
-                        self.terminate_with_close();
-                        return Err(err);
-                    }
-                    warn_on_protocol_error_failover(&e, "mid-query frame read");
-                    self.failover_reconnect_and_replay(e)?;
+                    self.failover_after_stream_failure(e, "mid-query frame read")?;
                     continue;
                 }
             };
             // Capture wire size BEFORE the decode consumes the header.
             let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
-            // Decode is **not** failover-eligible. Anything that comes
-            // out as an error here (bad varint, unknown discriminant,
-            // missing batch-0 schema, symbol-dict miss, zstd corruption) is
-            // a wire/state bug that won't be fixed by reconnecting —
-            // and silently retrying would mask it from the user. Bubble
-            // it up as a hard failure with the cursor terminated.
+            // Decode failures can be the symptom of a dying endpoint that
+            // managed to emit one complete-but-corrupt WS frame. Route
+            // failover-eligible errors through the same replay machinery as
+            // raw read failures; deterministic codes such as
+            // UnsupportedServer remain terminal via `is_failover_eligible`.
             let t1 = std::time::Instant::now();
             let decode_result = decode_frame(
                 header,
@@ -1789,13 +1749,8 @@ impl<'r> Cursor<'r> {
             let event = match decode_result {
                 Ok(ev) => ev,
                 Err(e) => {
-                    // Tear the WS down: the server is still streaming
-                    // RESULT_BATCH frames for this `request_id`, and
-                    // leaving the transport open would let a subsequent
-                    // `Reader::prepare()` on this Reader read those stale
-                    // frames and trip the cursor's `request_id` check.
-                    self.terminate_with_close();
-                    return Err(e);
+                    self.failover_after_stream_failure(e, "mid-query frame decode")?;
+                    continue;
                 }
             };
             match event {
@@ -1976,10 +1931,9 @@ impl<'r> Cursor<'r> {
 
     /// Read one raw frame (header + payload) off the transport, with
     /// no decode. Errors here are transport-level (socket closed,
-    /// truncated WS frame, TLS reset, etc.) and are the only failures
-    /// that should drive failover. Decoding is deliberately NOT done
-    /// here — the caller decides whether decode failures bubble up as
-    /// hard errors or get routed through reconnect.
+    /// truncated WS frame, TLS reset, etc.). Decoding is deliberately
+    /// NOT done here — the caller decides whether decode failures are
+    /// failover-eligible too.
     fn read_frame_raw(
         &mut self,
     ) -> Result<(crate::egress::wire::header::FrameHeader, bytes::Bytes)> {
@@ -1995,6 +1949,48 @@ impl<'r> Cursor<'r> {
             .bytes_received
             .fetch_add(wire_bytes, Ordering::Relaxed);
         Ok((header, payload))
+    }
+
+    /// Shared failover gate for failures observed while consuming a query
+    /// stream. This covers raw transport reads and failover-eligible decode
+    /// errors so both surfaces obey the same cancellation, duplicate-delivery,
+    /// callback, budget, and endpoint-tracker rules.
+    fn failover_after_stream_failure(&mut self, e: Error, context: &str) -> Result<()> {
+        if self.cancelling || !self.reader.cfg.failover || !is_failover_eligible(e.code()) {
+            // Match every other terminal path in this loop: tear down the
+            // WS so the cursor's flags stay coherent with the transport
+            // state, with no half-cooked cursors that defer cleanup to
+            // `Reader::Drop`.
+            self.terminate_with_close();
+            return Err(e);
+        }
+        // Silent-duplicate guard. If at least one batch was already yielded
+        // to the caller and they didn't install a replay-aware callback,
+        // replay would deliver those rows again with no signal — see
+        // `ErrorCode::FailoverWouldDuplicate`. The exact-once contract is
+        // "rows surface to the caller at most once unless they explicitly
+        // opt in to seeing replays."
+        //
+        // The trigger error `e` is preserved in the message so the caller
+        // still learns *why* the cursor died; diagnostics shouldn't get
+        // worse just because we re-classified the surface.
+        if would_silently_duplicate(
+            self.data_delivered,
+            self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
+        ) {
+            let err = fmt!(
+                FailoverWouldDuplicate,
+                "mid-query failover would replay rows already delivered to the caller \
+                 (install on_failover_reset or on_failover_progress to opt in to replays); \
+                 cursor terminated. Trigger: {} ({:?})",
+                e.msg(),
+                e.code()
+            );
+            self.terminate_with_close();
+            return Err(err);
+        }
+        warn_on_protocol_error_failover(&e, context);
+        self.failover_reconnect_and_replay(e)
     }
 
     /// Mid-query failover: the underlying connection just died with

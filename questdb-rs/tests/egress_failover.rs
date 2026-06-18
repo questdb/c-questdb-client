@@ -237,7 +237,7 @@ enum Action {
     StallUpgrade(Duration),
     /// Send a single WS binary message verbatim. Lets a script deliver
     /// a malformed/corrupt frame and assert the client's decode-error
-    /// path (which is deliberately not failover-eligible).
+    /// failover path.
     SendRaw(Vec<u8>),
     /// Abortive close: set `SO_LINGER=0` on the TCP socket and drop
     /// it, causing the kernel to send a TCP RST instead of a FIN.
@@ -1140,7 +1140,8 @@ fn failover_replay_continuation_before_schema_rejected() {
         Action::SendResultEnd,
     ]]);
     let conf = format!(
-        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        "ws::addr={};failover_max_attempts=2;\
+         failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
         build_addr_list(&[&srv_a, &srv_b])
     );
 
@@ -1162,8 +1163,9 @@ fn failover_replay_continuation_before_schema_rejected() {
 
     // A drops; the reconnect-and-replay itself succeeds, but the new
     // node's first frame is `batch_seq=1` with no schema on this
-    // connection — a decode-level ProtocolError (deliberately not
-    // failover-eligible), not a silent decode against A's schema.
+    // connection. Budget is limited to the first replay, so the
+    // failover-eligible decode error from B surfaces as the original
+    // ProtocolError instead of launching a second replay.
     let err = match cursor.next_batch() {
         Ok(_) => panic!("continuation before the schema-bearing batch 0 must be rejected"),
         Err(e) => e,
@@ -2152,24 +2154,12 @@ fn role_filter_propagates_through_failover() {
 }
 
 #[test]
-fn decode_error_does_not_trigger_failover_and_closes_transport() {
+fn decode_error_triggers_failover_before_rows_are_delivered() {
     // Server A serves the initial query, then sends a malformed frame
     // (well-formed QWP1 header, but a bogus msg_kind in the payload that
-    // `decode_frame` will reject). The cursor MUST surface the decode
-    // error as a hard `ProtocolError` — decode failures are deliberately
-    // not failover-eligible (a wire/state bug isn't fixed by reconnecting,
-    // and silently retrying would mask it from the user).
-    //
-    // Server B is a tripwire: any failover attempt would dial B.
-    //
-    // Additionally, the regression we're guarding against is C1 from
-    // the review: on a decode error, the cursor used to leave the WS
-    // open while the server kept streaming frames for the dead
-    // request_id. A subsequent `Reader::prepare()` on the same Reader
-    // would then read those stale frames and trip the cursor's
-    // request_id check. We assert here that a follow-up query on the
-    // same Reader fails at the transport layer (the WS was torn down)
-    // rather than with a stale-request_id ProtocolError.
+    // `decode_frame` will reject). Before any rows have reached the
+    // caller, that corruption is equivalent to a dying endpoint: failover
+    // should replay the query on B instead of surfacing the decode error.
     let bogus_payload = vec![0xEEu8, 0, 0, 0, 0, 0, 0, 0, 0]; // unknown msg_kind.
     let bogus_frame = framed(1, 0, 0, &bogus_payload);
     let srv_a = MockServer::start(vec![vec![
@@ -2197,66 +2187,82 @@ fn decode_error_does_not_trigger_failover_and_closes_transport() {
         .execute()
         .expect("execute");
 
-    let err = match cursor.next_batch() {
-        Err(e) => e,
-        Ok(_) => panic!("must surface a decode error"),
-    };
+    let batch = cursor
+        .next_batch()
+        .expect("decode error should fail over to B");
     assert_eq!(
-        err.code(),
-        ErrorCode::ProtocolError,
-        "decode error must surface as ProtocolError, got {:?}: {}",
-        err.code(),
-        err.msg()
+        batch.map(|b| b.row_count()),
+        None,
+        "B's happy script returns RESULT_END after the replay"
     );
     assert_eq!(
         cursor.failover_resets(),
-        0,
-        "decode errors must not failover"
+        1,
+        "decode errors before delivery should trigger one replay"
     );
     assert_eq!(
         callback_fires.load(Ordering::SeqCst),
-        0,
-        "on_failover_reset must not fire on decode errors"
+        1,
+        "on_failover_reset must fire for a decode-triggered replay"
     );
     assert_eq!(
         srv_b.accepts(),
-        0,
-        "B must never be dialed on a decode error"
+        1,
+        "B must be dialed after the decode error on A"
     );
-    drop(cursor);
+}
 
-    // C1 regression guard: the WS to A was torn down by the cursor,
-    // so any follow-up `query()` on this Reader must fail at the
-    // transport layer (write/read on a closed WS), NOT with a stale
-    // ProtocolError from leftover RESULT_BATCH frames carrying the
-    // previous cursor's request_id. The server-side worker has by
-    // now seen our Close (or the half-closed TCP) and stopped its
-    // script, so any frames the server might have queued are gone.
-    let result = reader
-        .prepare("select 1")
-        .execute()
-        .and_then(|mut c| c.next_batch().map(|_| ()));
-    match result {
-        Err(e) => {
-            // A torn-down WS surfaces as a transport-flavoured failure
-            // (SocketError on the write or read), or — if tungstenite
-            // happened to flush our QUERY_REQUEST onto the socket
-            // before the close fully landed — a HandshakeError from
-            // the next read. ProtocolError with a request_id mismatch
-            // is the regression we're guarding against; spell that
-            // out so a future change can't pretend "it errored, good
-            // enough."
-            let msg = e.msg();
-            assert!(
-                !(e.code() == ErrorCode::ProtocolError && msg.contains("request_id")),
-                "follow-up query saw stale request_id frames — \
-                 the decode-error path failed to close the WS. err: {:?}: {}",
-                e.code(),
-                msg
-            );
-        }
-        Ok(()) => panic!("follow-up query unexpectedly succeeded — the WS to A should be closed"),
+#[test]
+fn decode_error_after_rows_without_callback_refuses_replay() {
+    // Once rows were yielded to a streaming caller, transparent replay would
+    // redeliver them from batch_seq=0. Decode-triggered failover must obey
+    // the same duplicate guard as socket/read failures.
+    let bogus_payload = vec![0xEEu8, 0, 0, 0, 0, 0, 0, 0, 0]; // unknown msg_kind.
+    let bogus_frame = framed(1, 0, 0, &bogus_payload);
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::SendRaw(bogus_frame),
+    ]]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    {
+        let view = cursor
+            .next_batch()
+            .expect("first next_batch")
+            .expect("first batch present");
+        assert_eq!(view.row_count(), 2);
     }
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("post-delivery decode failover without a callback must refuse to replay"),
+    };
+    assert_eq!(err.code(), ErrorCode::FailoverWouldDuplicate);
+    assert!(
+        err.msg().contains("Trigger: unknown msg_kind"),
+        "duplicate guard should preserve the decode trigger, got: {}",
+        err.msg()
+    );
+    assert_eq!(cursor.failover_resets(), 0);
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "duplicate guard must fire before dialing B"
+    );
 }
 
 #[test]
