@@ -289,6 +289,12 @@ pub enum line_sender_error_code {
     /// borrow a fresh one (the pool rotates to a live endpoint), and
     /// re-drive from your source.
     line_sender_error_failover_retry = 17,
+
+    /// Every reachable endpoint handshook but none matched the configured
+    /// `target=` role filter (e.g. `target=primary` against an all-replica
+    /// address list). Distinct from `socket_error` ("all endpoints
+    /// unreachable") so callers can tell "no primary elected" from "all down".
+    line_sender_error_role_mismatch = 18,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -334,6 +340,7 @@ impl From<ErrorCode> for line_sender_error_code {
             }
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
             ErrorCode::FailoverRetry => line_sender_error_code::line_sender_error_failover_retry,
+            ErrorCode::RoleMismatch => line_sender_error_code::line_sender_error_role_mismatch,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4448,6 +4455,8 @@ mod tests {
             (line_sender_error_arrow_ingest, 16),
             // Column-sender failover. Append-only.
             (line_sender_error_failover_retry, 17),
+            // Reader/egress role-filter exhaustion. Append-only.
+            (line_sender_error_role_mismatch, 18),
         ];
         for (variant, want) in expected {
             assert_eq!(
@@ -4484,6 +4493,7 @@ mod tests {
                 ErrorCode::ArrowUnsupportedColumnKind => "ArrowUnsupportedColumnKind",
                 ErrorCode::ArrowIngest => "ArrowIngest",
                 ErrorCode::FailoverRetry => "FailoverRetry",
+                ErrorCode::RoleMismatch => "RoleMismatch",
                 _ => "unmapped",
             }
         }
@@ -4506,6 +4516,7 @@ mod tests {
             ErrorCode::ArrowUnsupportedColumnKind,
             ErrorCode::ArrowIngest,
             ErrorCode::FailoverRetry,
+            ErrorCode::RoleMismatch,
         ] {
             assert_ne!(
                 cover(code),

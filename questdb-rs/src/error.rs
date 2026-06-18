@@ -105,6 +105,14 @@ pub enum ErrorCode {
     /// from terminal failures (auth / protocol / schema / server rejection),
     /// which must not be retried.
     FailoverRetry,
+
+    /// Every reachable endpoint completed its handshake but none advertised
+    /// a role matching the configured `target=` filter (e.g. `target=primary`
+    /// against an all-replica address list, or a 421 + `X-QuestDB-Role:
+    /// REPLICA` upgrade reject). Distinct from `SocketError` ("all endpoints
+    /// unreachable") so callers can tell "no primary elected yet" from
+    /// "everything is down".
+    RoleMismatch,
 }
 
 /// An error that occurred when using QuestDB client library.

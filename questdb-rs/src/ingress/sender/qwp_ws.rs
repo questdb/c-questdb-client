@@ -2491,7 +2491,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
                 tracker.record_zone(idx, qwp_ws_role_reject_zone(&err));
                 tracker.record_role_reject(idx, qwp_ws_role_reject_is_transient(&err));
                 let mut err = error::fmt!(
-                    SocketError,
+                    RoleMismatch,
                     "QWP/WebSocket role mismatch at {}:{}: {}",
                     endpoint.host,
                     endpoint.port,

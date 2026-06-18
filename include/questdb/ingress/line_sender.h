@@ -147,6 +147,13 @@ typedef enum line_sender_error_code
      *  reconnect backoff, bounded by `reconnect_max_duration`), and re-drive
      *  from your source. */
     line_sender_error_failover_retry = 17,
+
+    /** Every reachable endpoint handshook but none matched the configured
+     *  `target=` role filter (e.g. `target=primary` against an all-replica
+     *  address list). Distinct from `line_sender_error_socket_error`
+     *  ("all endpoints unreachable") so callers can tell "no primary
+     *  elected" from "all down". */
+    line_sender_error_role_mismatch = 18,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */

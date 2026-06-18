@@ -63,11 +63,11 @@ pub use buffer::*;
 pub(crate) mod sender;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use sender::QwpWsRoleReject;
+#[cfg(feature = "polars")]
+pub(crate) use sender::ReconnectPolicy;
 pub use sender::*;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use sender::{reconnect_backoff_step, reconnect_error_is_terminal};
-#[cfg(feature = "polars")]
-pub(crate) use sender::ReconnectPolicy;
 
 mod decimal;
 pub use decimal::DecimalView;
