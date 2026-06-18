@@ -156,7 +156,7 @@ pub(crate) fn encode_chunk_into(
         scratch.signature.push(col.wire_type);
     }
     write_qwp_bytes(&mut scratch.signature, &[]); // designated_ts has empty name
-    scratch.signature.push(designated.wire_type);
+    scratch.signature.push(designated.unit.wire_type());
 
     let frame_start = out.len();
     let result = encode_frame_after_signature(
@@ -957,7 +957,20 @@ fn encode_designated_ts(
     }
     out.push(0); // designated_ts is always non-null
     out.reserve(8 * row_count);
-    if cfg!(target_endian = "little") {
+    let scale = ts.unit.scale();
+    if scale != 1 {
+        for (row, &v) in values.iter().enumerate() {
+            let scaled = v.checked_mul(scale).ok_or_else(|| {
+                error::fmt!(
+                    InvalidTimestamp,
+                    "designated timestamp at row {} overflows microseconds ({})",
+                    row,
+                    v
+                )
+            })?;
+            out.extend_from_slice(&scaled.to_le_bytes());
+        }
+    } else if cfg!(target_endian = "little") {
         let bytes = unsafe {
             slice::from_raw_parts(ts.data as *const u8, row_count * std::mem::size_of::<i64>())
         };

@@ -524,6 +524,28 @@ public:
         return *this;
     }
 
+    column_chunk& designated_timestamp_millis(
+        const int64_t* data, size_t row_count)
+    {
+        line_sender_error::wrapped_call(
+            ::column_sender_chunk_designated_timestamp_millis,
+            _raw,
+            data,
+            row_count);
+        return *this;
+    }
+
+    column_chunk& designated_timestamp_seconds(
+        const int64_t* data, size_t row_count)
+    {
+        line_sender_error::wrapped_call(
+            ::column_sender_chunk_designated_timestamp_seconds,
+            _raw,
+            data,
+            row_count);
+        return *this;
+    }
+
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
     /**
      * Append a slice of one column from an Arrow C Data Interface array.

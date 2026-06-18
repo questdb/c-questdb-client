@@ -949,6 +949,24 @@ bool column_sender_chunk_designated_timestamp_nanos(
     size_t row_count,
     line_sender_error** err_out);
 
+/** Designated timestamp in milliseconds, widened to micros (wire type
+ * TIMESTAMP, 0x0A). */
+QUESTDB_CLIENT_API
+bool column_sender_chunk_designated_timestamp_millis(
+    column_sender_chunk* chunk,
+    const int64_t* data,
+    size_t row_count,
+    line_sender_error** err_out);
+
+/** Designated timestamp in seconds, widened to micros (wire type
+ * TIMESTAMP, 0x0A). */
+QUESTDB_CLIENT_API
+bool column_sender_chunk_designated_timestamp_seconds(
+    column_sender_chunk* chunk,
+    const int64_t* data,
+    size_t row_count,
+    line_sender_error** err_out);
+
 /* -------------------------------------------------------------------------
  * Flush / sync
  *

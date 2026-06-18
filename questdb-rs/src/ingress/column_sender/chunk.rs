@@ -362,10 +362,37 @@ pub(crate) struct ColumnDescriptor {
     pub(crate) validity: Option<ValidityDescriptor>,
 }
 
+/// Precision of a designated timestamp column. Each variant pairs a QWP
+/// wire type with the multiplier needed to reach microseconds, so an
+/// illegal (wire type, scale) combination cannot be constructed.
+pub(crate) enum DesignatedTsUnit {
+    Micros,
+    Nanos,
+    Millis,
+    Seconds,
+}
+
+impl DesignatedTsUnit {
+    pub(crate) fn wire_type(&self) -> u8 {
+        match self {
+            DesignatedTsUnit::Nanos => QWP_TYPE_TIMESTAMP_NANOS,
+            _ => QWP_TYPE_TIMESTAMP,
+        }
+    }
+
+    pub(crate) fn scale(&self) -> i64 {
+        match self {
+            DesignatedTsUnit::Millis => 1_000,
+            DesignatedTsUnit::Seconds => 1_000_000,
+            _ => 1,
+        }
+    }
+}
+
 /// Designated timestamp descriptor. Required exactly once per chunk
 /// before flush. Designated timestamps are non-null by spec.
 pub(crate) struct DesignatedTsDescriptor {
-    pub(crate) wire_type: u8,
+    pub(crate) unit: DesignatedTsUnit,
     pub(crate) data: *const i64,
 }
 
@@ -1079,17 +1106,31 @@ impl<'a> Chunk<'a> {
     /// flushing a non-empty chunk; rejects if a designated timestamp has
     /// already been set on this chunk.
     pub fn designated_timestamp_micros(&mut self, data: &'a [i64]) -> Result<&mut Self> {
-        self.set_designated_ts(QWP_TYPE_TIMESTAMP, data)
+        self.set_designated_ts(DesignatedTsUnit::Micros, data)
     }
 
     /// Same as [`designated_timestamp_micros`](Self::designated_timestamp_micros)
     /// but for a nanosecond-precision Unix epoch column (QWP wire type
     /// `TIMESTAMP_NANOS`).
     pub fn designated_timestamp_nanos(&mut self, data: &'a [i64]) -> Result<&mut Self> {
-        self.set_designated_ts(QWP_TYPE_TIMESTAMP_NANOS, data)
+        self.set_designated_ts(DesignatedTsUnit::Nanos, data)
     }
 
-    fn set_designated_ts(&mut self, wire_type: u8, data: &'a [i64]) -> Result<&mut Self> {
+    /// Millisecond-precision Unix epoch column, widened to micros on encode.
+    pub fn designated_timestamp_millis(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+        self.set_designated_ts(DesignatedTsUnit::Millis, data)
+    }
+
+    /// Second-precision Unix epoch column, widened to micros on encode.
+    pub fn designated_timestamp_seconds(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+        self.set_designated_ts(DesignatedTsUnit::Seconds, data)
+    }
+
+    fn set_designated_ts(
+        &mut self,
+        unit: DesignatedTsUnit,
+        data: &'a [i64],
+    ) -> Result<&mut Self> {
         if self.designated_ts.is_some() {
             return Err(error::fmt!(
                 InvalidApiCall,
@@ -1098,7 +1139,7 @@ impl<'a> Chunk<'a> {
         }
         let row_count = check_row_count(self.row_count, data.len(), None)?;
         self.designated_ts = Some(DesignatedTsDescriptor {
-            wire_type,
+            unit,
             data: data.as_ptr(),
         });
         self.row_count = Some(row_count);

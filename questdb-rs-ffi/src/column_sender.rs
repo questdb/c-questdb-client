@@ -2103,6 +2103,68 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
     true
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_millis(
+    chunk: *mut column_sender_chunk,
+    data: *const i64,
+    row_count: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_designated_timestamp_millis",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let data = match unsafe { typed_slice(data, row_count, err_out, "designated_ts millis") } {
+        Some(s) => s,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, inner.designated_timestamp_millis(data));
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
+    chunk: *mut column_sender_chunk,
+    data: *const i64,
+    row_count: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_designated_timestamp_seconds",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let data = match unsafe { typed_slice(data, row_count, err_out, "designated_ts seconds") } {
+        Some(s) => s,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, inner.designated_timestamp_seconds(data));
+    true
+}
+
 // ===========================================================================
 // Flush
 // ===========================================================================
