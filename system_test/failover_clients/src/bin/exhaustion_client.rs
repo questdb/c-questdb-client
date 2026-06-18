@@ -98,15 +98,52 @@ fn main() {
         // succeeded (which it can't — every endpoint is dead) or
         // returned a clean terminal (impossible without a healthy
         // server delivering RESULT_END).
-        match cursor.next_batch() {
-            Ok(_) => die(
-                "exhaustion",
-                12,
-                "next_batch returned Ok after every endpoint was killed".into(),
-            ),
-            Err(e) => {
-                eprintln!("exhausted_code={:?} exhausted_msg={}", e.code(), e.msg());
-                e.code()
+        // After every endpoint is dead the reader may still hand back
+        // batches the server streamed ahead before it died: a fast
+        // server (e.g. the release container image) can push the next
+        // batch into our receive buffer before the kill lands, whereas a
+        // slower from-source server usually has not yet. Those buffered
+        // batches are valid, already-received data, so drain them. The
+        // contract under test is that once the buffer is exhausted and
+        // the reader must touch the now-dead network, it surfaces an Err
+        // (failover budget exhausted) - not Ok forever, not a clean
+        // RESULT_END terminal, and not a panic.
+        let mut drained_after_kill = 0u32;
+        loop {
+            match cursor.next_batch() {
+                Ok(Some(_)) => {
+                    drained_after_kill += 1;
+                    // ~64 batches total for this fixture (1M rows / 16384
+                    // per batch); a generous cap still catches an "Ok
+                    // forever" / duplication bug.
+                    if drained_after_kill > 1024 {
+                        die(
+                            "exhaustion",
+                            12,
+                            "next_batch kept returning Ok(Some) after every \
+                             endpoint was killed"
+                                .into(),
+                        );
+                    }
+                }
+                Ok(None) => die(
+                    "exhaustion",
+                    12,
+                    format!(
+                        "next_batch returned Ok(None) [clean terminal] after \
+                         {drained_after_kill} buffered batches with every \
+                         endpoint dead"
+                    ),
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "exhausted_code={:?} exhausted_msg={} drained_after_kill={}",
+                        e.code(),
+                        e.msg(),
+                        drained_after_kill
+                    );
+                    break e.code();
+                }
             }
         }
     };
