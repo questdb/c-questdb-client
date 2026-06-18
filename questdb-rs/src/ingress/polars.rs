@@ -318,27 +318,27 @@ const CHECKPOINT_BATCHES: usize = 64;
 
 impl crate::ingress::column_sender::BorrowedSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `max_rows` rows each
-    /// (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
-    /// `sync` to commit — re-driving transparently across a connection
-    /// failure when failover is enabled.
+    /// (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and `sync`
+    /// to commit — re-driving transparently across a connection failure.
     ///
-    /// When the pool has failover enabled (`>1` endpoint or any `reconnect_*`
-    /// key), the batch loop `sync`s every [`CHECKPOINT_BATCHES`] batches; on a
+    /// The batch loop `sync`s every [`CHECKPOINT_BATCHES`] batches; on a
     /// transient ([`ErrorCode::FailoverRetry`]) `flush`/`sync` error it
     /// re-borrows a live connection from the pool behind the same handle
-    /// (rotating to a live endpoint), backs off per the pool's
-    /// [`ReconnectPolicy`], and re-iterates `&DataFrame` from the last
-    /// committed checkpoint. Delivery is at-least-once: a re-driven tail can
-    /// duplicate frames committed-but-unobserved before the failure; server
-    /// WAL/dedup collapses them. The reconnect budget exhausting surfaces the
-    /// terminal error.
+    /// (rotating to a live endpoint) and re-iterates `&DataFrame` from the last
+    /// committed checkpoint. The entry owns the `sync` (the replay boundary) and
+    /// returns only once the whole `df` is committed.
     ///
-    /// When failover is **not** enabled this makes a single pass of `flush`es
-    /// and returns without `sync`ing; the caller still drives
-    /// [`ColumnSender::sync`] to commit. With failover enabled the entry owns
-    /// the `sync` and returns only once the whole `df` is committed.
+    /// Reconnect matches the row API: the [`ReconnectPolicy`] parsed from the
+    /// `reconnect_*` keys (default 300s budget), centered-jittered exponential
+    /// backoff that resets on a role reject, and `AuthError` /
+    /// `ProtocolVersionError` treated as terminal.
     ///
-    /// [`ColumnSender::sync`]: crate::ingress::column_sender::ColumnSender::sync
+    /// Delivery is **at-least-once**: a re-driven tail can re-send frames
+    /// committed but unobserved before the failure, producing **duplicate rows**
+    /// unless the destination table has `DEDUP UPSERT KEYS` covering them
+    /// (QuestDB keeps duplicates by default). The reconnect budget exhausting
+    /// surfaces the terminal error.
+    ///
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
     /// [`ReconnectPolicy`]: crate::ingress::ReconnectPolicy
     pub fn flush_polars_dataframe(
@@ -347,16 +347,8 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
         df: &DataFrame,
         max_rows: Option<NonZeroUsize>,
     ) -> Result<()> {
-        if !self.failover_enabled() {
-            for rb in dataframe_to_batches(df, max_rows) {
-                self.flush_arrow_batch(table, &rb?, &[])?;
-            }
-            return Ok(());
-        }
-
-        let policy = self.reconnect_policy();
         let started = std::time::Instant::now();
-        let mut backoff = policy.initial_backoff();
+        let deadline = started.checked_add(self.reconnect_policy().max_duration());
         // Batches confirmed by the last successful `sync`; a transient failure
         // re-drives only the tail past this.
         let mut committed = 0usize;
@@ -364,22 +356,10 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
         loop {
             match drive_from_checkpoint(self, table, df, max_rows, &mut committed) {
                 Ok(()) => return Ok(()),
-                Err(err) => {
-                    if err.code() != crate::ErrorCode::FailoverRetry {
-                        return Err(err);
-                    }
-                    if started.elapsed() >= policy.max_duration() {
-                        return Err(err);
-                    }
-                    self.reborrow_from_pool()?;
-                    if !backoff.is_zero() {
-                        std::thread::sleep(backoff);
-                    }
-                    backoff = backoff
-                        .checked_mul(2)
-                        .unwrap_or(std::time::Duration::MAX)
-                        .min(policy.max_backoff());
-                }
+                Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
+                // Re-borrow onto a live primary (retrying the connect within the
+                // budget per the row API's backoff), then re-drive the tail.
+                Err(_) => self.reborrow_with_retry(deadline)?,
             }
         }
     }

@@ -1191,14 +1191,11 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
 
 #[cfg(feature = "polars")]
 #[test]
-fn flush_polars_dataframe_without_failover_makes_one_attempt() {
+fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     use crate::ingress::TableName;
     use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
     use std::num::NonZeroUsize;
 
-    // A single `addr=` with no `reconnect_*` key: failover is disabled, so the
-    // entry takes the single-pass fast path (no entry-owned `sync`, no
-    // re-borrow) — byte-for-byte today's behaviour. The caller drives `sync`.
     let (server, frames) = MockServer::spawn_acking_capturing(1);
     let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
 
@@ -1212,18 +1209,17 @@ fn flush_polars_dataframe_without_failover_makes_one_attempt() {
             &df,
             Some(NonZeroUsize::new(2).unwrap()),
         )
-        .expect("single-attempt flush must round-trip");
-    sender.sync(AckLevel::Ok).expect("caller-driven sync");
+        .expect("healthy single-endpoint flush must commit in one pass");
     drop(sender);
 
     assert_eq!(
         server.accepted(),
         1,
-        "no failover means no extra connection is opened"
+        "a healthy endpoint needs no re-borrow"
     );
     assert_eq!(
         data_frame_count(&frames),
         2,
-        "4 rows / 2 per batch = 2 data frames, sent in a single pass"
+        "4 rows / 2 per batch = 2 data frames"
     );
 }

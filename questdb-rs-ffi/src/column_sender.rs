@@ -504,6 +504,56 @@ pub unsafe extern "C" fn questdb_db_borrow_conn(
     }
 }
 
+/// Like `questdb_db_borrow_conn` but retries the connect within `budget_ms`
+/// using the row sender's reconnect backoff (centered-jittered exponential with
+/// a role-reject reset; `AuthError` / protocol-version errors are terminal). On
+/// a transient `line_sender_error_failover_retry`, drop the dead conn with
+/// `questdb_db_drop_conn` then call this to fail over with the same budget and
+/// backoff as the row API. `budget_ms == 0` makes a single attempt (no retry).
+/// Returns NULL on failure; sets `*err_out` if provided.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_borrow_conn_with_retry(
+    db: *mut questdb_db,
+    budget_ms: u64,
+    err_out: *mut *mut line_sender_error,
+) -> *mut qwpws_conn {
+    if db.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "questdb_db_borrow_conn_with_retry: db pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return std::ptr::null_mut();
+    }
+    let db_ref = unsafe { &*db };
+    match db_ref
+        .0
+        .borrow_sender_owned_with_retry(std::time::Duration::from_millis(budget_ms))
+    {
+        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicU32::new(0)))),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The pool's failover budget (`reconnect_max_duration`, default 300000 ms).
+/// Callers tracking an overall failover deadline pass the remaining budget to
+/// `questdb_db_borrow_conn_with_retry`. Returns 0 if `db` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb_db) -> u64 {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    db_ref.0.reconnect_max_duration().as_millis() as u64
+}
+
 /// Return a borrowed conn to the pool. Invalidates `conn`. Accepts NULL
 /// and no-ops. `db` is ignored — kept in the ABI for symmetry.
 ///

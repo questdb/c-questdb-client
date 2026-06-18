@@ -49,7 +49,6 @@ fn ingest(host: &str, port: &str, df: &DataFrame) -> Result<(), Box<dyn Error>> 
     let table = TableName::new(TABLE)?;
     let max_rows = NonZeroUsize::new(10_000);
     sender.flush_polars_dataframe(table, df, max_rows)?;
-    sender.sync(Default::default())?;
     Ok(())
 }
 

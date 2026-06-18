@@ -58,8 +58,10 @@ mod qwp_ws_codec;
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_driver;
 
-#[cfg(feature = "polars")]
-pub(crate) use qwp_ws_driver::ReconnectPolicy;
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use qwp_ws_driver::{
+    ReconnectPolicy, reconnect_backoff_step, reconnect_error_is_terminal,
+};
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_ownership;

@@ -49,7 +49,9 @@ use std::time::{Duration, Instant};
 use crate::egress::Reader;
 use crate::ingress::SenderBuilder;
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
-use crate::ingress::{QwpWsConnector, RawQwpWsRoundStream};
+use crate::ingress::{
+    QwpWsConnector, RawQwpWsRoundStream, reconnect_backoff_step, reconnect_error_is_terminal,
+};
 use crate::{Result, error};
 
 use super::conf::{self, PoolReap};
@@ -357,45 +359,22 @@ impl QuestDb {
         })
     }
 
-    fn pick_sender(&self) -> Result<ColumnSender> {
-        // Pop-or-reserve under one lock so a concurrent return can't race us
-        // into opening a redundant connection past `pool_size`.
-        let slot = {
-            let mut state = lock_state(&self.inner.state);
-            if let Some(entry) = state.free.pop() {
-                state.in_use += 1;
-                drop(state);
-                return Ok(ColumnSender::new(
-                    entry.conn,
-                    entry.symbol_dict,
-                    entry.scratch,
-                    entry.first_frame_sent,
-                ));
-            }
-            if state.total() >= self.inner.pool_max {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "Connection pool exhausted: {} connections are currently borrowed and \
-                     the pool is at its `pool_max` cap of {}. Return a sender or raise `pool_max`.",
-                    state.in_use,
-                    self.inner.pool_max
-                ));
-            }
-            state.in_use += 1;
-            InUseSlot {
-                state: &self.inner.state,
-                armed: true,
-            }
-        };
-        let conn = connect_conn_pool(&self.inner)?;
-        slot.commit();
+    /// Like [`borrow_sender_owned`] but retries the connect within `budget`
+    /// using the row API's reconnect backoff (the cluster may be electing a
+    /// primary). Backs the C ABI's `questdb_db_borrow_conn_with_retry`, so
+    /// C / C++ / Python callers fail over with the same backoff and budget as
+    /// the row sender.
+    #[doc(hidden)]
+    pub fn borrow_sender_owned_with_retry(&self, budget: Duration) -> Result<OwnedSender> {
+        let deadline = Instant::now().checked_add(budget);
+        Ok(OwnedSender {
+            inner: Arc::clone(&self.inner),
+            sender: Some(reconnect_pick(&self.inner, deadline)?),
+        })
+    }
 
-        Ok(ColumnSender::new(
-            conn,
-            crate::ingress::buffer::SymbolGlobalDict::new(),
-            super::encoder::EncodeScratch::new(),
-            false,
-        ))
+    fn pick_sender(&self) -> Result<ColumnSender> {
+        pick_sender_inner(&self.inner)
     }
 
     /// Manually reap idle connections.
@@ -429,11 +408,12 @@ impl QuestDb {
         self.inner.connector.reconnect_policy()
     }
 
-    /// Whether reconnect/failover is enabled for this pool — `>1` configured
-    /// endpoint or any explicit `reconnect_*` key.
-    #[cfg(feature = "polars")]
-    pub(crate) fn failover_enabled(&self) -> bool {
-        self.inner.connector.failover_enabled()
+    /// The pool's failover budget (`reconnect_max_duration`, default 300s).
+    /// Exposed so the C ABI can let callers bound an overall failover deadline.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[doc(hidden)]
+    pub fn reconnect_max_duration(&self) -> Duration {
+        self.inner.connector.reconnect_policy().max_duration()
     }
 
     /// Snapshot the number of idle (free) connections currently in the pool.
@@ -580,13 +560,6 @@ impl<'a> BorrowedSender<'a> {
         }
     }
 
-    /// Whether this borrow's pool has reconnect/failover enabled; see
-    /// [`QuestDb::failover_enabled`].
-    #[cfg(feature = "polars")]
-    pub(crate) fn failover_enabled(&self) -> bool {
-        self.db.failover_enabled()
-    }
-
     /// The pool's reconnect backoff budget; see [`QuestDb::reconnect_policy`].
     #[cfg(feature = "polars")]
     pub(crate) fn reconnect_policy(&self) -> crate::ingress::ReconnectPolicy {
@@ -617,6 +590,22 @@ impl<'a> BorrowedSender<'a> {
         }
         let fresh = self.db.pick_sender()?;
         self.sender = Some(fresh);
+        Ok(())
+    }
+
+    /// Re-borrow within `deadline`, retrying the connect with the row API's
+    /// reconnect backoff via [`reconnect_pick`]. The dropped connection's dict
+    /// goes with it; the fresh one brings a dict consistent with the server it
+    /// re-drives onto.
+    #[cfg(feature = "polars")]
+    pub(crate) fn reborrow_with_retry(&mut self, deadline: Option<Instant>) -> Result<()> {
+        if let Some(mut sender) = self.sender.take() {
+            if sender.conn.in_flight() > 0 {
+                sender.mark_must_close();
+            }
+            return_to_pool(&self.db.inner, sender);
+        }
+        self.sender = Some(reconnect_pick(&self.db.inner, deadline)?);
         Ok(())
     }
 }
@@ -811,6 +800,88 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
         });
     }
     drop(state);
+}
+
+/// Pop a free connection or open a fresh one within `pool_max`. Reserves the
+/// pool slot under one lock so a concurrent return can't race past `pool_size`.
+fn pick_sender_inner(inner: &Arc<DbInner>) -> Result<ColumnSender> {
+    let slot = {
+        let mut state = lock_state(&inner.state);
+        if let Some(entry) = state.free.pop() {
+            state.in_use += 1;
+            drop(state);
+            return Ok(ColumnSender::new(
+                entry.conn,
+                entry.symbol_dict,
+                entry.scratch,
+                entry.first_frame_sent,
+            ));
+        }
+        if state.total() >= inner.pool_max {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Connection pool exhausted: {} connections are currently borrowed and \
+                 the pool is at its `pool_max` cap of {}. Return a sender or raise `pool_max`.",
+                state.in_use,
+                inner.pool_max
+            ));
+        }
+        state.in_use += 1;
+        InUseSlot {
+            state: &inner.state,
+            armed: true,
+        }
+    };
+    let conn = connect_conn_pool(inner)?;
+    slot.commit();
+    Ok(ColumnSender::new(
+        conn,
+        crate::ingress::buffer::SymbolGlobalDict::new(),
+        super::encoder::EncodeScratch::new(),
+        false,
+    ))
+}
+
+/// Re-acquire a live connection within `deadline`, retrying with the row API's
+/// reconnect backoff: a failed pick (every endpoint role-rejecting while the
+/// cluster elects a primary, or a transient transport error) backs off and
+/// retries; `AuthError` / `ProtocolVersionError` and deadline exhaustion are
+/// terminal.
+fn reconnect_pick(inner: &Arc<DbInner>, deadline: Option<Instant>) -> Result<ColumnSender> {
+    let policy = inner.connector.reconnect_policy();
+    let mut backoff = policy.initial_backoff();
+    loop {
+        match pick_sender_inner(inner) {
+            Ok(cs) => return Ok(cs),
+            Err(e) if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) => {
+                return Err(e);
+            }
+            Err(e) => {
+                let (sleep_for, next) = reconnect_backoff_step(
+                    &e,
+                    policy.initial_backoff(),
+                    policy.max_backoff(),
+                    backoff,
+                );
+                sleep_until_deadline(sleep_for, deadline);
+                backoff = next;
+            }
+        }
+    }
+}
+
+fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
+fn sleep_until_deadline(sleep_for: Duration, deadline: Option<Instant>) {
+    let d = match deadline {
+        Some(dl) => sleep_for.min(dl.saturating_duration_since(Instant::now())),
+        None => sleep_for,
+    };
+    if !d.is_zero() {
+        thread::sleep(d);
+    }
 }
 
 /// Open one connection through `connector`, driving `health` so it rotates

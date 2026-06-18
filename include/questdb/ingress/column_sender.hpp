@@ -916,6 +916,26 @@ public:
         return borrowed_conn{_raw, raw};
     }
 
+    /**
+     * Borrow a conn, retrying the connect within `budget_ms` using the row
+     * sender's reconnect backoff. On a transient `failover_retry`, drop the
+     * dead conn then call this with `reconnect_max_duration_ms()` (or your
+     * tracked remaining budget). Throws on a terminal error or budget
+     * exhaustion.
+     */
+    borrowed_conn borrow_conn_with_retry(uint64_t budget_ms)
+    {
+        auto* raw = line_sender_error::wrapped_call(
+            ::questdb_db_borrow_conn_with_retry, _raw, budget_ms);
+        return borrowed_conn{_raw, raw};
+    }
+
+    /** The pool's failover budget (`reconnect_max_duration`) in milliseconds. */
+    uint64_t reconnect_max_duration_ms() const noexcept
+    {
+        return ::questdb_db_reconnect_max_duration_ms(_raw);
+    }
+
     /** Close + drop idle conns beyond `pool_size`. Returns count closed. */
     size_t reap_idle() noexcept
     {

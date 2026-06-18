@@ -1891,6 +1891,28 @@ pub(super) fn reconnect_sleep_duration(
     }
 }
 
+/// One reconnect backoff step for the column-sender re-borrow loop, matching the
+/// row runner's discipline: returns the delay to sleep before the next attempt
+/// (role-reject → fixed `initial_backoff`; else centered-jittered `backoff`) and
+/// the updated `backoff` state (role-reject resets to `initial_backoff`; else
+/// doubles, capped at `max_backoff`).
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) fn reconnect_backoff_step(
+    err: &Error,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    backoff: Duration,
+) -> (Duration, Duration) {
+    let role_reject = is_qwp_ws_role_reject_error(err);
+    let sleep_for = reconnect_sleep_duration(role_reject, initial_backoff, backoff);
+    let next_backoff = if role_reject {
+        initial_backoff
+    } else {
+        double_duration(backoff).min(max_backoff)
+    };
+    (sleep_for, next_backoff)
+}
+
 pub(super) fn retry_budget_exhausted_error(
     context: &str,
     attempts: usize,
