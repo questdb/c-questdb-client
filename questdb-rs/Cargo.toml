@@ -172,6 +172,11 @@ sync-reader-ws = ["_egress", "_keystore-roots"]
 ## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
 compression-zstd = ["_egress", "dep:zstd"]
 
+## Pooled `Db` facade: a custom high-performance pool of ingest `Sender`s and
+## egress `Reader`s behind one cloneable handle. Pulls in the egress reader
+## (WS) plus the HTTP and QWP/WS sender transports the facade relies on.
+pool = ["sync-reader-ws", "sync-sender-http", "sync-sender-qwp-ws"]
+
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
 ## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
@@ -180,6 +185,7 @@ live-server-tests = [
     "compression-zstd",
     "sync-sender-http",
     "sync-sender-qwp-ws",
+    "pool",
 ]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
@@ -200,6 +206,7 @@ almost-all-features = [
     "sync-sender",
     "sync-reader-ws",
     "compression-zstd",
+    "pool",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",
@@ -254,6 +261,10 @@ required-features = ["sync-reader-ws"]
 [[example]]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws"]
+
+[[example]]
+name = "db_pool"
+required-features = ["pool"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR

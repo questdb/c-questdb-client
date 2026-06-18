@@ -47,6 +47,15 @@ pub mod ingress;
 #[cfg(feature = "_egress")]
 pub mod egress;
 
+// Custom high-performance connection pooling + the `Db` facade. Gated on
+// `pool`, which pulls in both the egress reader and the sender transports the
+// facade needs.
+#[cfg(feature = "pool")]
+pub mod pool;
+
+#[cfg(feature = "pool")]
+pub mod db;
+
 pub use error::*;
 
 #[cfg(test)]
