@@ -1989,8 +1989,15 @@ fn replay_write_failure_uses_remaining_execute_budget() {
     );
     let r = *resets.lock().unwrap();
     assert_eq!(
-        r, 1,
-        "only the successful replay to A should fire on_failover_reset"
+        cursor.failover_resets(),
+        r,
+        "failover reset counter and callback must move together"
+    );
+    assert!(
+        (1..=2).contains(&r),
+        "expected one reset if B's abortive close is observed on replay write, \
+         or two if the write is accepted locally and the reset is observed on \
+         the next read; got {r}"
     );
     drop(cursor);
     assert_eq!(
