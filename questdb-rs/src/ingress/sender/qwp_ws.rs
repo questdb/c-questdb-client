@@ -2457,13 +2457,13 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
         tracker.begin_round(true);
     }
 
-    let mut last_endpoint_idx = None;
-    let mut last_error = None;
+    let mut last_transport_endpoint_idx = None;
+    let mut last_role_mismatch = None;
+    let mut last_transport_err = None;
     let mut role_reject_count = 0usize;
     let mut latched_typed_error = None;
 
     while let Some(idx) = tracker.pick_next() {
-        last_endpoint_idx = Some(idx);
         let endpoint = &endpoints[idx];
         match establish_connection(
             &endpoint.host,
@@ -2500,14 +2500,15 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
                 if let Some(role_reject) = role_reject {
                     err = err.with_qwp_ws_role_reject(role_reject);
                 }
-                last_error = Some(err);
+                last_role_mismatch = Some(err);
             }
             Err(err) => {
                 tracker.record_transport_error(idx);
                 if err.code() == crate::ErrorCode::ProtocolVersionError {
                     latched_typed_error = Some(err.clone());
                 }
-                last_error = Some(err);
+                last_transport_endpoint_idx = Some(idx);
+                last_transport_err = Some(err);
             }
         }
     }
@@ -2516,7 +2517,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
         return Err(err);
     }
     if *qwp_ws.request_durable_ack && role_reject_count == endpoints.len() {
-        let role_reject = last_error
+        let role_reject = last_role_mismatch
             .as_ref()
             .and_then(|err| err.qwp_ws_role_reject().cloned());
         let mut err = error::fmt!(
@@ -2528,19 +2529,19 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
         }
         return Err(err);
     }
-    if let Some(err) = last_error {
-        if is_qwp_ws_role_reject_error(&err) {
-            return Err(err);
-        }
+    if let Some(err) = last_role_mismatch {
+        return Err(err);
+    }
+    if let Some(err) = last_transport_err {
         return Err(qwp_ws_all_endpoints_unreachable_error(
             endpoints,
-            last_endpoint_idx,
+            last_transport_endpoint_idx,
             Some(err),
         ));
     }
     Err(qwp_ws_all_endpoints_unreachable_error(
         endpoints,
-        last_endpoint_idx,
+        last_transport_endpoint_idx,
         None,
     ))
 }

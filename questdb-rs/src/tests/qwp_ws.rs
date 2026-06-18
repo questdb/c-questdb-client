@@ -3535,6 +3535,61 @@ fn qwp_ws_initial_connect_retryable_status_tries_next_endpoint() {
 }
 
 #[test]
+fn qwp_ws_initial_connect_mixed_role_and_transport_prefers_role_mismatch() {
+    let (role_port, role_handle) = spawn_role_reject_upgrade_server(1, "PRIMARY_CATCHUP");
+    let status_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    status_listener.set_nonblocking(true).unwrap();
+    let status_port = status_listener.local_addr().unwrap().port();
+    let status_handle = thread::spawn(move || {
+        let started = Instant::now();
+        let mut attempts = 0usize;
+        while attempts < 1 && started.elapsed() < Duration::from_secs(5) {
+            match status_listener.accept() {
+                Ok((mut stream, _)) => {
+                    attempts += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let _ = read_request_until_blank(&mut stream).unwrap();
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\n\
+                              Connection: close\r\n\
+                              Content-Length: 0\r\n\
+                              \r\n",
+                        )
+                        .unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("status listener failed: {err}"),
+            }
+        }
+        attempts
+    });
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{role_port},127.0.0.1:{status_port};\
+         initial_connect_retry=off;"
+    );
+    let result = SenderBuilder::from_conf(&conf).unwrap().build();
+
+    assert_eq!(role_handle.join().unwrap(), 1);
+    assert_eq!(status_handle.join().unwrap(), 1);
+
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
+    assert!(err.msg().contains("role mismatch"), "got: {}", err.msg());
+    assert!(err.msg().contains("PRIMARY_CATCHUP"), "got: {}", err.msg());
+    assert!(!err.msg().contains("HTTP status 500"), "got: {}", err.msg());
+}
+
+#[test]
 fn qwp_ws_initial_connect_unsupported_version_tries_next_endpoint() {
     let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_port = first_listener.local_addr().unwrap().port();
@@ -3747,7 +3802,7 @@ fn qwp_ws_sync_initial_retry_malformed_101_retries_after_round_exhaustion() {
 }
 
 #[test]
-fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
+fn qwp_ws_sync_initial_retry_mixed_role_and_transport_prefers_role_mismatch() {
     let (role_port, role_handle) = spawn_role_reject_upgrade_server(1, "PRIMARY_CATCHUP");
     let status_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     status_listener.set_nonblocking(true).unwrap();
@@ -3798,21 +3853,16 @@ fn qwp_ws_sync_initial_retry_mixed_role_and_transport_reports_last_failure() {
     assert_eq!(status_handle.join().unwrap(), 1);
 
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
     assert!(
         err.msg()
             .contains("QWP/WebSocket initial connect retry budget exhausted"),
         "got: {}",
         err.msg()
     );
-    assert!(
-        err.msg()
-            .contains("QWP/WebSocket all endpoints unreachable"),
-        "got: {}",
-        err.msg()
-    );
-    assert!(err.msg().contains("HTTP status 500"), "got: {}", err.msg());
-    assert!(!err.msg().contains("role mismatch"), "got: {}", err.msg());
+    assert!(err.msg().contains("role mismatch"), "got: {}", err.msg());
+    assert!(err.msg().contains("PRIMARY_CATCHUP"), "got: {}", err.msg());
+    assert!(!err.msg().contains("HTTP status 500"), "got: {}", err.msg());
 }
 
 #[test]
