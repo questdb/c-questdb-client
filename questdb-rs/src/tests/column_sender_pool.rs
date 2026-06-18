@@ -480,6 +480,304 @@ fn fail_fast_at_pool_max() {
 }
 
 #[test]
+fn row_sender_pool_borrows_recycles_and_caps() {
+    let server = MockServer::spawn_acking(16);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    // The row-sender pool is lazy: nothing exists until the first borrow.
+    assert_eq!(db.row_sender_free_count(), 0);
+    assert_eq!(db.row_sender_in_use_count(), 0);
+
+    {
+        let _s1 = db.borrow_row_sender().expect("borrow row sender");
+        assert_eq!(db.row_sender_in_use_count(), 1);
+        assert_eq!(db.row_sender_free_count(), 0);
+    } // Drop returns it to the row pool.
+
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(
+        db.row_sender_free_count(),
+        1,
+        "a clean row sender must be recycled on return"
+    );
+
+    // Re-borrow reuses the recycled sender (no new connection).
+    let s2 = db.borrow_row_sender().expect("reuse recycled");
+    assert_eq!(db.row_sender_free_count(), 0);
+    assert_eq!(db.row_sender_in_use_count(), 1);
+
+    // Auto-grow up to the row pool's independent `pool_max`.
+    let s3 = db.borrow_row_sender().expect("grow to pool_max");
+    assert_eq!(db.row_sender_in_use_count(), 2);
+
+    // A third concurrent borrow exceeds pool_max=2 — fail-fast.
+    let err = db.borrow_row_sender().expect_err("must fail-fast at cap");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
+
+    drop(s2);
+    drop(s3);
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.row_sender_free_count(), 2);
+    drop(db);
+}
+
+#[test]
+fn row_sender_pool_flush_round_trip() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let mut sender = db.borrow_row_sender().expect("borrow row sender");
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender
+        .flush(&mut buf)
+        .expect("row-major flush over a pooled QWP/WS sender");
+    drop(sender);
+
+    // The flushed sender is clean, so it returns to the pool for reuse.
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.row_sender_free_count(), 1);
+    drop(db);
+}
+
+#[test]
+fn manual_reap_closes_idle_row_senders() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=1;pool_max=3;pool_idle_timeout_ms=50;pool_reap=manual;",
+    ))
+    .unwrap();
+
+    // Park two row senders in the free list.
+    let b1 = db.borrow_row_sender().expect("b1");
+    let b2 = db.borrow_row_sender().expect("b2 (grow)");
+    drop(b1);
+    drop(b2);
+    assert_eq!(db.row_sender_free_count(), 2);
+
+    // Reap before the idle timeout — nothing closed.
+    assert_eq!(db.reap_idle(), 0);
+    assert_eq!(db.row_sender_free_count(), 2);
+
+    // Past the timeout: the row pool keeps no warm floor, so both are reaped.
+    thread::sleep(Duration::from_millis(120));
+    let closed = db.reap_idle();
+    assert_eq!(closed, 2, "both idle row senders must be reaped");
+    assert_eq!(db.row_sender_free_count(), 0);
+    drop(db);
+}
+
+#[test]
+fn row_sender_pool_grows_and_reuses_physical_connections() {
+    let server = MockServer::spawn_acking(16);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+
+    // `pool_size=1` eager-opens exactly one *column* connection.
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 1),
+        "eager-open must connect one column slot; accepted={}",
+        server.accepted()
+    );
+
+    // Three concurrent row borrows each open a fresh connection.
+    let r1 = db.borrow_row_sender().expect("r1");
+    let r2 = db.borrow_row_sender().expect("r2 (grow)");
+    let r3 = db.borrow_row_sender().expect("r3 (grow)");
+    assert_eq!(db.row_sender_in_use_count(), 3);
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 4),
+        "each row borrow must open a fresh connection; accepted={}",
+        server.accepted()
+    );
+
+    drop(r1);
+    drop(r2);
+    drop(r3);
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.row_sender_free_count(), 3);
+
+    // Re-borrowing reuses recycled connections — no new accepts.
+    let _a = db.borrow_row_sender().expect("reuse 1");
+    let _b = db.borrow_row_sender().expect("reuse 2");
+    assert_eq!(db.row_sender_free_count(), 1);
+    assert_eq!(
+        server.accepted(),
+        4,
+        "reuse must not open new connections"
+    );
+}
+
+#[test]
+fn row_sender_mark_must_close_drops_instead_of_recycling() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let mut sender = db.borrow_row_sender().expect("borrow");
+    sender.mark_must_close();
+    drop(sender);
+
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(
+        db.row_sender_free_count(),
+        0,
+        "a must-close row sender must be dropped, not recycled"
+    );
+
+    // The next borrow therefore opens a brand-new connection.
+    let _fresh = db.borrow_row_sender().expect("re-borrow after drop");
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 3),
+        "re-borrow must open a new connection (1 column + 2 row); accepted={}",
+        server.accepted()
+    );
+}
+
+#[test]
+fn row_and_column_senders_borrowed_together_are_independent() {
+    let server = MockServer::spawn_acking(16);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let col = db.borrow_sender().expect("column sender");
+    let mut row = db.borrow_row_sender().expect("row sender");
+
+    // Each pool tracks its own borrow on an independent counter.
+    assert_eq!(db.in_use_count(), 1);
+    assert_eq!(db.row_sender_in_use_count(), 1);
+
+    // The row sender works while a column sender is concurrently held.
+    let mut buf = row.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "x")
+        .unwrap()
+        .column_f64("price", 1.0)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    row.flush(&mut buf)
+        .expect("row flush while a column sender is also borrowed");
+
+    drop(row);
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.row_sender_free_count(), 1);
+    // The column borrow is unaffected by row-pool activity.
+    assert_eq!(db.in_use_count(), 1);
+    assert_eq!(db.free_count(), 0);
+
+    drop(col);
+    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.free_count(), 1);
+    drop(db);
+}
+
+#[test]
+fn concurrent_row_borrow_and_return_does_not_deadlock_or_leak() {
+    let server = MockServer::spawn_acking(32);
+    let db =
+        Arc::new(QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap());
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let db = Arc::clone(&db);
+        handles.push(thread::spawn(move || {
+            for _ in 0..16 {
+                let borrow = db
+                    .borrow_row_sender()
+                    .expect("borrow_row_sender under contention");
+                std::hint::black_box(&borrow);
+                thread::yield_now();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("worker thread");
+    }
+    // After all workers finish: every borrow returned, nothing leaked, and the
+    // free list never exceeded the cap.
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert!(db.row_sender_free_count() >= 1);
+    assert!(
+        db.row_sender_free_count() <= 8,
+        "free list must not exceed pool_max; free={}",
+        db.row_sender_free_count()
+    );
+}
+
+#[test]
+fn auto_reaper_closes_idle_row_senders() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
+    ))
+    .unwrap();
+    let b1 = db.borrow_row_sender().expect("b1");
+    let b2 = db.borrow_row_sender().expect("b2 (grow)");
+    drop(b1);
+    drop(b2);
+    assert_eq!(db.row_sender_free_count(), 2);
+
+    // The background reaper wakes on a `max(5s, timeout/12)` ticker (the 5s
+    // floor applies here). The row pool keeps no warm floor, so every idle row
+    // sender is drained.
+    let reaped = wait_until(Duration::from_secs(8), || db.row_sender_free_count() == 0);
+    assert!(
+        reaped,
+        "auto reaper failed to drain idle row senders; free={}",
+        db.row_sender_free_count()
+    );
+    drop(db);
+}
+
+#[test]
+fn row_sender_build_failure_releases_in_use_slot() {
+    // Bring the pool up against a live server (the column eager-open succeeds),
+    // then kill the server so a subsequent row-sender build cannot connect. The
+    // failed build must release the `in_use` slot it reserved rather than
+    // permanently burning a pool slot.
+    let server = MockServer::spawn_acking(4);
+    let port = server.port();
+    let db = QuestDb::connect(&format!(
+        "qwpws::addr=127.0.0.1:{port};auth_timeout=500;reconnect_max_duration_millis=100;"
+    ))
+    .unwrap();
+    drop(server); // the port now refuses connections
+
+    // Make sure the port is actually closed before exercising the build path.
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+        }),
+        "mock server port must stop accepting after drop"
+    );
+
+    let err = db
+        .borrow_row_sender()
+        .expect_err("build must fail against a dead endpoint");
+    assert_ne!(
+        err.code(),
+        ErrorCode::InvalidApiCall,
+        "expected a connect error, not a pool-cap error: {}",
+        err.msg()
+    );
+    assert_eq!(
+        db.row_sender_in_use_count(),
+        0,
+        "a failed build must not leak an in_use slot"
+    );
+    assert_eq!(db.row_sender_free_count(), 0);
+    drop(db);
+}
+
+#[test]
 fn concurrent_borrow_and_return_does_not_deadlock_or_leak() {
     let server = MockServer::spawn(16);
     let db =

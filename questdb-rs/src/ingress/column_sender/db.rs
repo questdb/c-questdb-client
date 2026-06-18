@@ -35,6 +35,13 @@
 //! itself to the pool on `Drop`. Slots whose underlying connection has
 //! latched into `must_close=true` are dropped on return instead of being
 //! recycled.
+//!
+//! The same `QuestDb` can also hand out **row-major**
+//! [`crate::ingress::Sender`] handles via [`QuestDb::borrow_row_sender`]
+//! ([`BorrowedRowSender`]) — the classic ILP `Buffer` + `flush` API. These
+//! live in an independent, lazily-grown free list (rebuilt from the connect
+//! string), capped separately by `pool_max`, so a caller can pull either a
+//! column-major or a row-major sender from one shared pool handle.
 
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
@@ -47,7 +54,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "_egress")]
 use crate::egress::Reader;
-use crate::ingress::SenderBuilder;
+use crate::ingress::{Sender, SenderBuilder};
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
 use crate::ingress::{
     QwpWsConnector, RawQwpWsRoundStream, reconnect_backoff_step, reconnect_error_is_terminal,
@@ -78,6 +85,12 @@ fn lock_health(
 
 #[cfg(feature = "_egress")]
 fn lock_reader_state(m: &Mutex<ReaderPoolState>) -> std::sync::MutexGuard<'_, ReaderPoolState> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_row_sender_state(
+    m: &Mutex<RowSenderPoolState>,
+) -> std::sync::MutexGuard<'_, RowSenderPoolState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -142,6 +155,40 @@ impl Drop for ReaderInUseSlot<'_> {
     }
 }
 
+/// Row-major sender equivalent of [`ReaderInUseSlot`]: reserves an `in_use`
+/// slot under the cap and releases it on drop unless `commit` is called.
+struct RowSenderInUseSlot<'a> {
+    state: &'a Mutex<RowSenderPoolState>,
+    armed: bool,
+}
+
+impl<'a> RowSenderInUseSlot<'a> {
+    fn reserve_within_cap(
+        state: &'a Mutex<RowSenderPoolState>,
+        pool_max: usize,
+    ) -> std::result::Result<Self, usize> {
+        let mut guard = lock_row_sender_state(state);
+        if guard.total() >= pool_max {
+            return Err(guard.in_use);
+        }
+        guard.in_use += 1;
+        Ok(Self { state, armed: true })
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RowSenderInUseSlot<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = lock_row_sender_state(self.state);
+            state.in_use = state.in_use.saturating_sub(1);
+        }
+    }
+}
+
 /// Connection pool for the column-major sender API.
 ///
 /// Construct with [`QuestDb::connect`]. Share the pool across threads — its
@@ -158,11 +205,11 @@ pub struct QuestDb {
 
 struct DbInner {
     /// Original connect string. Kept verbatim so the reader pool
-    /// (`Reader::from_conf`) can spin up a new connection with the same
-    /// settings — the reader's parser accepts the writer's scheme prefixes
-    /// and ignores pool_* keys, so no translation is needed. The sender pool
-    /// connects through the pre-resolved `connector` instead.
-    #[cfg(feature = "_egress")]
+    /// (`Reader::from_conf`) and the row-major sender pool
+    /// (`SenderBuilder::from_conf`) can spin up a new connection with the
+    /// same settings — both parsers accept the writer's scheme prefixes and
+    /// ignore pool_* keys, so no translation is needed. The column-sender
+    /// pool connects through the pre-resolved `connector` instead.
     conf: String,
     /// Resolved, reusable QWP/WebSocket connect ingredients (endpoint list,
     /// TLS, auth, config). Every sender connection — eager-open, auto-grow,
@@ -185,10 +232,16 @@ struct DbInner {
     /// `borrow_reader_owned` call. Applies the same `pool_size` /
     /// `pool_max` / `pool_idle_timeout` values as the sender pool but
     /// tracks and caps them on an independent free list, so heavy ingest
-    /// can't starve queries. The two caps are enforced separately: the
-    /// combined live connection count can reach up to `2 * pool_max`.
+    /// can't starve queries. The caps are enforced separately, so the
+    /// combined live connection count across the column-sender, reader, and
+    /// row-major-sender pools can reach up to `3 * pool_max`.
     #[cfg(feature = "_egress")]
     reader_state: Mutex<ReaderPoolState>,
+    /// Row-major (`crate::ingress::Sender`) pool. Lazy-init, independent free
+    /// list and `pool_max` cap, rebuilt from `conf` via
+    /// `SenderBuilder::from_conf`. Lets callers borrow a classic ILP row
+    /// sender from the same `QuestDb` handle as the column-major senders.
+    row_sender_state: Mutex<RowSenderPoolState>,
     /// Wakes the reaper thread on `shutdown` and lets a future blocking
     /// borrow wait for a free slot once we grow `borrow_sender` past
     /// fail-fast (not in v1).
@@ -256,6 +309,30 @@ struct ReaderPoolEntry {
     last_idle_at: Instant,
 }
 
+#[derive(Default)]
+struct RowSenderPoolState {
+    /// Idle row-major senders, oldest at front, newest at back (push on
+    /// return / pop on borrow). Same FIFO/LIFO discipline as the column
+    /// sender free list.
+    free: Vec<RowSenderPoolEntry>,
+    /// Currently-borrowed row senders + in-flight grow operations.
+    in_use: usize,
+}
+
+impl RowSenderPoolState {
+    fn total(&self) -> usize {
+        self.free.len() + self.in_use
+    }
+}
+
+struct RowSenderPoolEntry {
+    /// A classic ILP row sender. It owns its connection and per-connection
+    /// state internally, so (like the reader pool) we don't track extra
+    /// fields alongside it.
+    sender: Sender,
+    last_idle_at: Instant,
+}
+
 impl QuestDb {
     /// Open a pool against `conf`.
     ///
@@ -303,7 +380,6 @@ impl QuestDb {
         }
 
         let inner = Arc::new(DbInner {
-            #[cfg(feature = "_egress")]
             conf: conf.to_owned(),
             connector,
             health: Mutex::new(health),
@@ -313,6 +389,7 @@ impl QuestDb {
             state: Mutex::new(PoolState { free, in_use: 0 }),
             #[cfg(feature = "_egress")]
             reader_state: Mutex::new(ReaderPoolState::default()),
+            row_sender_state: Mutex::new(RowSenderPoolState::default()),
             cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
         });
@@ -339,6 +416,25 @@ impl QuestDb {
     pub fn borrow_sender(&self) -> Result<BorrowedSender<'_>> {
         let cs = self.pick_sender()?;
         Ok(BorrowedSender::new(self, cs))
+    }
+
+    /// Borrow a **row-major** ([`crate::ingress::Sender`]) ILP sender from the
+    /// pool, the companion to the column-major [`Self::borrow_sender`].
+    ///
+    /// The row-sender pool is lazy: it starts empty and opens a fresh
+    /// `Sender` (via `SenderBuilder::from_conf` on the original connect
+    /// string) on demand, recycling returned senders through an independent
+    /// free list and `pool_max` cap. Borrow at the cap returns
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
+    ///
+    /// The returned [`BorrowedRowSender`] derefs to `Sender`, so the usual
+    /// `Buffer` build + `flush` flow works unchanged, and returns the sender
+    /// to the pool on `Drop` (unless its connection latched `must_close`, or
+    /// [`BorrowedRowSender::mark_must_close`] was called, in which case it is
+    /// dropped and the next borrow opens a fresh one).
+    pub fn borrow_row_sender(&self) -> Result<BorrowedRowSender<'_>> {
+        let sender = self.pick_row_sender()?;
+        Ok(BorrowedRowSender::new(self, sender))
     }
 
     /// FFI escape hatch: like [`Self::borrow_sender`] but the returned
@@ -375,6 +471,36 @@ impl QuestDb {
 
     fn pick_sender(&self) -> Result<ColumnSender> {
         pick_sender_inner(&self.inner)
+    }
+
+    fn pick_row_sender(&self) -> Result<Sender> {
+        let mut state = lock_row_sender_state(&self.inner.row_sender_state);
+        if let Some(entry) = state.free.pop() {
+            state.in_use += 1;
+            drop(state);
+            return Ok(entry.sender);
+        }
+        drop(state);
+
+        let slot = match RowSenderInUseSlot::reserve_within_cap(
+            &self.inner.row_sender_state,
+            self.inner.pool_max,
+        ) {
+            Ok(slot) => slot,
+            Err(in_use) => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Row-sender pool exhausted: {} row senders are currently borrowed \
+                     and the pool is at its `pool_max` cap of {}. Return a sender or \
+                     raise `pool_max`.",
+                    in_use,
+                    self.inner.pool_max
+                ));
+            }
+        };
+        let sender = SenderBuilder::from_conf(&self.inner.conf)?.build()?;
+        slot.commit();
+        Ok(sender)
     }
 
     fn pick_replacement_sender(&self) -> Result<ColumnSender> {
@@ -449,6 +575,18 @@ impl QuestDb {
     #[doc(hidden)]
     pub fn in_use_count(&self) -> usize {
         lock_state(&self.inner.state).in_use
+    }
+
+    /// Snapshot the number of idle (free) row senders currently in the pool.
+    #[doc(hidden)]
+    pub fn row_sender_free_count(&self) -> usize {
+        lock_row_sender_state(&self.inner.row_sender_state).free.len()
+    }
+
+    /// Snapshot the number of currently-borrowed row senders.
+    #[doc(hidden)]
+    pub fn row_sender_in_use_count(&self) -> usize {
+        lock_row_sender_state(&self.inner.row_sender_state).in_use
     }
 
     /// FFI escape hatch: borrow a reader from the egress pool.
@@ -733,6 +871,88 @@ impl Drop for OwnedSender {
             return_to_pool(&self.inner, sender);
         }
     }
+}
+
+/// A row-major [`crate::ingress::Sender`] borrowed from a [`QuestDb`] pool.
+///
+/// Companion to [`BorrowedSender`] (the column-major handle). Derefs to
+/// `Sender`, so the usual `Buffer` build + `flush` flow works unchanged. On
+/// `Drop` the sender is returned to the row-sender pool, unless its connection
+/// has latched `must_close` (or [`Self::mark_must_close`] was called), in which
+/// case it is dropped and the next borrow opens a fresh one.
+///
+/// `BorrowedRowSender` is **not** `Send` or `Sync`: the borrowed connection
+/// belongs to the borrowing thread for the duration of the borrow.
+pub struct BorrowedRowSender<'a> {
+    db: &'a QuestDb,
+    sender: Option<Sender>,
+    must_close: bool,
+    /// !Send / !Sync marker, mirroring [`BorrowedSender`].
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl<'a> BorrowedRowSender<'a> {
+    fn new(db: &'a QuestDb, sender: Sender) -> Self {
+        Self {
+            db,
+            sender: Some(sender),
+            must_close: false,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Force this sender to be dropped (not recycled) when the borrow ends.
+    /// Use after an error that may have left the connection unusable.
+    pub fn mark_must_close(&mut self) {
+        self.must_close = true;
+    }
+}
+
+impl Debug for BorrowedRowSender<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowedRowSender")
+            .field("sender", &self.sender)
+            .finish()
+    }
+}
+
+impl Deref for BorrowedRowSender<'_> {
+    type Target = Sender;
+
+    fn deref(&self) -> &Self::Target {
+        self.sender
+            .as_ref()
+            .expect("borrowed row sender already returned")
+    }
+}
+
+impl DerefMut for BorrowedRowSender<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.sender
+            .as_mut()
+            .expect("borrowed row sender already returned")
+    }
+}
+
+impl Drop for BorrowedRowSender<'_> {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            return_row_sender_to_pool(&self.db.inner, sender, self.must_close);
+        }
+    }
+}
+
+fn return_row_sender_to_pool(inner: &Arc<DbInner>, sender: Sender, must_close: bool) {
+    let must_close = must_close || sender.must_close();
+    let mut state = lock_row_sender_state(&inner.row_sender_state);
+    state.in_use = state.in_use.saturating_sub(1);
+    if !must_close {
+        state.free.push(RowSenderPoolEntry {
+            sender,
+            last_idle_at: Instant::now(),
+        });
+    }
+    drop(state);
 }
 
 /// Owned (lifetime-free) variant of a borrowed reader used by the C FFI.
@@ -1029,8 +1249,8 @@ fn reaper_loop(inner: Arc<DbInner>, tick: Duration) {
 }
 
 fn reap_idle_inner(inner: &DbInner) -> usize {
-    #[cfg_attr(not(feature = "_egress"), allow(unused_mut))]
     let mut dropped = reap_idle_senders(inner);
+    dropped += reap_idle_row_senders(inner);
     #[cfg(feature = "_egress")]
     {
         dropped += reap_idle_readers(inner);
@@ -1059,6 +1279,31 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
             if idle_for > inner.pool_idle_timeout {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.conn);
+            } else {
+                i += 1;
+            }
+        }
+        to_drop
+    };
+    let dropped = to_drop.len();
+    drop(to_drop);
+    dropped
+}
+
+fn reap_idle_row_senders(inner: &DbInner) -> usize {
+    // Row-sender pool is lazy-init (no pre-population at connect), so there is
+    // no warm-min floor to preserve — reap any sender parked longer than the
+    // idle timeout.
+    let to_drop: Vec<Sender> = {
+        let mut state = lock_row_sender_state(&inner.row_sender_state);
+        let mut to_drop = Vec::new();
+        let now = Instant::now();
+        let mut i = 0;
+        while i < state.free.len() {
+            let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
+            if idle_for > inner.pool_idle_timeout {
+                let entry = state.free.remove(i);
+                to_drop.push(entry.sender);
             } else {
                 i += 1;
             }
@@ -1113,5 +1358,6 @@ const _: fn() = || {
         let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
     }
     assert_not_send::<BorrowedSender<'_>>();
+    assert_not_send::<BorrowedRowSender<'_>>();
     assert_not_send::<crate::ingress::column_sender::Chunk<'_>>();
 };
