@@ -115,6 +115,40 @@ impl MockServer {
         (server, rx)
     }
 
+    #[cfg(feature = "polars")]
+    fn spawn_acking_on_port_after_delay(port: u16, max_accepts: usize, delay: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop_clone = Arc::clone(&stop);
+        let accepted_clone = Arc::clone(&accepted);
+
+        let join = thread::Builder::new()
+            .name("column-sender-pool-delayed-mock-server".to_string())
+            .spawn(move || {
+                thread::sleep(delay);
+                let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind delayed port");
+                listener
+                    .set_nonblocking(true)
+                    .expect("set_nonblocking on delayed listener");
+                run_mock_server_accept_loop(
+                    listener,
+                    max_accepts,
+                    MockMode::AckEachFrame,
+                    None,
+                    stop_clone,
+                    accepted_clone,
+                );
+            })
+            .expect("spawn delayed mock server");
+
+        Self {
+            port,
+            stop,
+            accepted,
+            join: Some(join),
+        }
+    }
+
     fn spawn_with_mode_capture(
         max_accepts: usize,
         mode: MockMode,
@@ -134,52 +168,14 @@ impl MockServer {
         let join = thread::Builder::new()
             .name("column-sender-pool-mock-server".to_string())
             .spawn(move || {
-                let mut handles = Vec::new();
-                while !stop_clone.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            if accepted_clone.fetch_add(1, Ordering::SeqCst) >= max_accepts {
-                                // Past the budget — drop without upgrade so
-                                // the client sees a failed connect.
-                                continue;
-                            }
-                            stream
-                                .set_nonblocking(false)
-                                .expect("set_nonblocking(false)");
-                            let stop = Arc::clone(&stop_clone);
-                            let capture = capture.clone();
-                            let h = thread::spawn(move || {
-                                if perform_server_upgrade(&mut stream).is_ok() {
-                                    match mode {
-                                        MockMode::Park => park_connection(&mut stream, &stop),
-                                        MockMode::AckEachFrame => {
-                                            ack_each_frame(&mut stream, &stop, capture)
-                                        }
-                                        MockMode::ErrorEachFrame(status) => {
-                                            error_each_frame(&mut stream, &stop, status)
-                                        }
-                                        MockMode::UpgradeThenClose => {
-                                            // Drop the stream immediately: the
-                                            // client's next read sees EOF.
-                                        }
-                                        #[cfg(feature = "polars")]
-                                        MockMode::AckThenClose(n) => {
-                                            ack_then_close(&mut stream, &stop, n)
-                                        }
-                                    }
-                                }
-                            });
-                            handles.push(h);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(_) => break,
-                    }
-                }
-                for h in handles {
-                    let _ = h.join();
-                }
+                run_mock_server_accept_loop(
+                    listener,
+                    max_accepts,
+                    mode,
+                    capture,
+                    stop_clone,
+                    accepted_clone,
+                );
             })
             .expect("spawn mock server");
 
@@ -197,6 +193,58 @@ impl MockServer {
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+fn run_mock_server_accept_loop(
+    listener: TcpListener,
+    max_accepts: usize,
+    mode: MockMode,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    accepted: Arc<AtomicUsize>,
+) {
+    let mut handles = Vec::new();
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                if accepted.fetch_add(1, Ordering::SeqCst) >= max_accepts {
+                    // Past the budget — drop without upgrade so the client sees
+                    // a failed connect.
+                    continue;
+                }
+                stream
+                    .set_nonblocking(false)
+                    .expect("set_nonblocking(false)");
+                let stop = Arc::clone(&stop);
+                let capture = capture.clone();
+                let h = thread::spawn(move || {
+                    if perform_server_upgrade(&mut stream).is_ok() {
+                        match mode {
+                            MockMode::Park => park_connection(&mut stream, &stop),
+                            MockMode::AckEachFrame => ack_each_frame(&mut stream, &stop, capture),
+                            MockMode::ErrorEachFrame(status) => {
+                                error_each_frame(&mut stream, &stop, status)
+                            }
+                            MockMode::UpgradeThenClose => {
+                                // Drop the stream immediately: the client's
+                                // next read sees EOF.
+                            }
+                            #[cfg(feature = "polars")]
+                            MockMode::AckThenClose(n) => ack_then_close(&mut stream, &stop, n),
+                        }
+                    }
+                });
+                handles.push(h);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    for h in handles {
+        let _ = h.join();
     }
 }
 
@@ -347,6 +395,11 @@ fn conf_for_endpoints(ports: &[u16], extras: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("qwpws::addr={addrs};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}")
+}
+
+fn unused_local_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused local port");
+    listener.local_addr().expect("unused local addr").port()
 }
 
 #[test]
@@ -957,7 +1010,7 @@ fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
     let live = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for_endpoints(
         &[primary.port(), live.port()],
-        "pool_size=1;pool_max=2;",
+        "pool_size=1;pool_max=1;",
     ))
     .unwrap();
 
@@ -993,6 +1046,49 @@ fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
         1,
         "the dead primary must be skipped, not re-attempted"
     );
+}
+
+#[test]
+fn failed_reborrow_keeps_handle_erroring_without_panicking() {
+    let primary = MockServer::spawn_upgrade_then_close(1);
+    let unreachable_port = unused_local_port();
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), unreachable_port],
+        "pool_size=1;pool_max=1;\
+         reconnect_initial_backoff_millis=1;\
+         reconnect_max_backoff_millis=1;",
+    ))
+    .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(2), || primary.accepted() == 1),
+        "eager-open must connect to the primary; accepted={}",
+        primary.accepted()
+    );
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    let err = sender.sync(AckLevel::Ok).expect_err("primary died");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+
+    let err = sender
+        .reborrow_from_pool()
+        .expect_err("replacement endpoint is unreachable");
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert_eq!(
+        db.in_use_count(),
+        1,
+        "failed same-handle reborrow must retain the logical pool slot"
+    );
+
+    let sync_after_failed_reborrow =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sender.sync(AckLevel::Ok)));
+    let err = sync_after_failed_reborrow
+        .expect("using the sender after failed reborrow must not panic")
+        .expect_err("the retained terminal sender should report an error");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+
+    drop(sender);
+    assert_eq!(db.in_use_count(), 0);
 }
 
 #[test]
@@ -1186,6 +1282,55 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
         primary.accepted(),
         1,
         "the dead primary must not be re-attempted"
+    );
+}
+
+#[cfg(feature = "polars")]
+#[test]
+fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
+    use crate::ingress::TableName;
+    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use std::num::NonZeroUsize;
+
+    // The primary is the eager-open connection and dies during the DataFrame
+    // flush. The replacement endpoint is initially unreachable but starts
+    // accepting inside the reconnect budget, so `flush_polars_dataframe` should
+    // keep trying the replacement-connect step instead of surfacing the first
+    // SocketError from `reborrow_from_pool`.
+    let primary = MockServer::spawn_upgrade_then_close(1);
+    let recovery_port = unused_local_port();
+    let recovery =
+        MockServer::spawn_acking_on_port_after_delay(recovery_port, 2, Duration::from_millis(150));
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), recovery_port],
+        "pool_size=1;pool_max=2;\
+         reconnect_initial_backoff_millis=20;\
+         reconnect_max_backoff_millis=20;",
+    ))
+    .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(2), || primary.accepted() == 1),
+        "eager-open must connect to the primary; accepted={}",
+        primary.accepted()
+    );
+
+    let i = Series::new(PlSmallStr::from("i"), &[1i64, 2]).into_column();
+    let df = DataFrame::new(2, vec![i]).unwrap();
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    sender
+        .flush_polars_dataframe(
+            TableName::new("trades").unwrap(),
+            &df,
+            Some(NonZeroUsize::new(2).unwrap()),
+        )
+        .expect("reborrow connect failures must retry until the recovery endpoint is live");
+    drop(sender);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || recovery.accepted() >= 1),
+        "the delayed recovery endpoint must eventually be used"
     );
 }
 

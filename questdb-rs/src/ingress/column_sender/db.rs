@@ -398,6 +398,28 @@ impl QuestDb {
         ))
     }
 
+    fn pick_replacement_sender(&self) -> Result<ColumnSender> {
+        // Same-handle replacement: the BorrowedSender already owns one logical
+        // in-use slot, so this must not reserve another one or pool_max=1 would
+        // reject replacing a dead connection.
+        if let Some(entry) = lock_state(&self.inner.state).free.pop() {
+            return Ok(ColumnSender::new(
+                entry.conn,
+                entry.symbol_dict,
+                entry.scratch,
+                entry.first_frame_sent,
+            ));
+        }
+
+        let conn = connect_conn_pool(&self.inner)?;
+        Ok(ColumnSender::new(
+            conn,
+            crate::ingress::buffer::SymbolGlobalDict::new(),
+            super::encoder::EncodeScratch::new(),
+            false,
+        ))
+    }
+
     /// Manually reap idle connections.
     ///
     /// Closes free-list entries that have been idle longer than
@@ -605,18 +627,24 @@ impl<'a> BorrowedSender<'a> {
     /// own dict, consistent with the server it talks to, so the unchanged
     /// delta-dict encoder re-drives correctly on the re-iterated source.
     ///
-    /// A failed connection is dropped (not recycled); a clean connection with
-    /// un-sync'd in-flight frames is also dropped, mirroring [`Drop`], so the
-    /// next borrower never commits this caller's data.
+    /// The current connection stays behind this handle until a replacement has
+    /// been opened. If replacement connect fails, the handle remains populated
+    /// (possibly with a terminal connection) so later safe calls report errors
+    /// instead of panicking. Once replacement succeeds, a failed connection is
+    /// dropped (not recycled); a clean connection with un-sync'd in-flight
+    /// frames is also dropped, mirroring [`Drop`], so the next borrower never
+    /// commits this caller's data.
     pub fn reborrow_from_pool(&mut self) -> Result<()> {
-        if let Some(mut sender) = self.sender.take() {
+        if let Some(sender) = self.sender.as_mut() {
             if sender.conn.in_flight() > 0 {
                 sender.mark_must_close();
             }
-            return_to_pool(&self.db.inner, sender);
+            record_sender_transport_failure(&self.db.inner, sender);
         }
-        let fresh = self.db.pick_sender()?;
-        self.sender = Some(fresh);
+        let fresh = self.db.pick_replacement_sender()?;
+        if let Some(old) = self.sender.replace(fresh) {
+            finish_replaced_sender(&self.db.inner, old);
+        }
         Ok(())
     }
 }
@@ -837,10 +865,7 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     // tracker so the next borrow rotates away from the dead peer (until it
     // re-probes healthy). A pool-driven `mark_must_close` (un-sync'd pending
     // frames) or a server-data rejection leaves the endpoint healthy.
-    if sender.conn.transport_dead() {
-        let idx = sender.conn.endpoint_idx();
-        lock_health(&inner.health).record_mid_stream_failure(idx);
-    }
+    record_sender_transport_failure(inner, &sender);
     let mut state = lock_state(&inner.state);
     state.in_use = state.in_use.saturating_sub(1);
     if !must_close {
@@ -853,6 +878,29 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
         });
     }
     drop(state);
+}
+
+fn finish_replaced_sender(inner: &Arc<DbInner>, sender: ColumnSender) {
+    let must_close = sender.must_close();
+    record_sender_transport_failure(inner, &sender);
+    let mut state = lock_state(&inner.state);
+    if !must_close && state.total() < inner.pool_max {
+        state.free.push(PoolEntry {
+            conn: sender.conn,
+            symbol_dict: sender.symbol_dict,
+            scratch: sender.scratch,
+            first_frame_sent: sender.first_frame_sent,
+            last_idle_at: Instant::now(),
+        });
+    }
+    drop(state);
+}
+
+fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &ColumnSender) {
+    if sender.conn.transport_dead() {
+        let idx = sender.conn.endpoint_idx();
+        lock_health(&inner.health).record_mid_stream_failure(idx);
+    }
 }
 
 fn spawn_reaper(inner: Arc<DbInner>) -> std::io::Result<JoinHandle<()>> {

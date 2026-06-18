@@ -364,25 +364,55 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
         loop {
             match drive_from_checkpoint(self, table, df, max_rows, &mut committed) {
                 Ok(()) => return Ok(()),
-                Err(err) => {
+                Err(mut err) => {
                     if err.code() != crate::ErrorCode::FailoverRetry {
                         return Err(err);
                     }
-                    if started.elapsed() >= policy.max_duration() {
-                        return Err(err);
+
+                    let mut slept_before_reborrow = false;
+                    loop {
+                        if started.elapsed() >= policy.max_duration() {
+                            return Err(err);
+                        }
+                        match self.reborrow_from_pool() {
+                            Ok(()) => break,
+                            Err(connect_err) if reborrow_error_is_retryable(&connect_err) => {
+                                err = connect_err;
+                                slept_before_reborrow |=
+                                    sleep_before_reborrow_retry(started, policy, &mut backoff);
+                            }
+                            Err(connect_err) => return Err(connect_err),
+                        }
                     }
-                    self.reborrow_from_pool()?;
-                    if !backoff.is_zero() {
-                        std::thread::sleep(backoff);
+                    if !slept_before_reborrow {
+                        sleep_before_reborrow_retry(started, policy, &mut backoff);
                     }
-                    backoff = backoff
-                        .checked_mul(2)
-                        .unwrap_or(std::time::Duration::MAX)
-                        .min(policy.max_backoff());
                 }
             }
         }
     }
+}
+
+fn reborrow_error_is_retryable(err: &crate::Error) -> bool {
+    err.code() == crate::ErrorCode::SocketError
+}
+
+fn sleep_before_reborrow_retry(
+    started: std::time::Instant,
+    policy: crate::ingress::ReconnectPolicy,
+    backoff: &mut std::time::Duration,
+) -> bool {
+    let remaining = policy.max_duration().saturating_sub(started.elapsed());
+    let sleep_for = (*backoff).min(remaining);
+    let slept = !sleep_for.is_zero();
+    if slept {
+        std::thread::sleep(sleep_for);
+    }
+    *backoff = backoff
+        .checked_mul(2)
+        .unwrap_or(std::time::Duration::MAX)
+        .min(policy.max_backoff());
+    slept
 }
 
 /// Single forward pass over `df`, skipping the first `*committed` batches (the
