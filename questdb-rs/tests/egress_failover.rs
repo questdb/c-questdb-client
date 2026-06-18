@@ -690,21 +690,6 @@ fn drop_at_connect_script() -> Script {
     vec![Action::HardDrop]
 }
 
-/// Sends SERVER_INFO (so `connect_endpoint` succeeds), then drops the
-/// TCP stream **before** reading the client's QUERY_REQUEST. The
-/// client's `write_message(QUERY_REQUEST)` race-fails on this dead
-/// socket — exercises the M3 path where reconnect succeeds but the
-/// immediate replay write fails.
-fn drop_after_server_info_script(role: ServerRole, node_id: &str) -> Script {
-    vec![
-        Action::SendServerInfo {
-            role,
-            node_id: node_id.into(),
-        },
-        Action::HardDrop,
-    ]
-}
-
 fn build_addr_list(servers: &[&MockServer]) -> String {
     servers
         .iter()
@@ -1461,13 +1446,13 @@ fn failover_disabled_surfaces_socket_error() {
 fn attempts_exhausted_surfaces_error() {
     // A is healthy for the initial connect, then drops mid-query. B
     // is broken at connect-time (drops before SERVER_INFO). With
-    // max_attempts=4, the cursor's first failure should burn 4 outer
+    // max_attempts=4, the cursor's first failure should burn 3 outer
     // reconnect attempts, all of which fail.
     //
     // Dial accounting:
     //   - Initial connect: 1 dial to A (success).
-    //   - Mid-stream failure on A. `reconnect_with_failover` runs
-    //     `attempts_total = 4` outer attempts. Each outer attempt
+    //   - Mid-stream failure on A. `reconnect_with_failover` has 3
+    //     reconnect rounds (`max_attempts - 1`). Each outer round
     //     invokes `walk_via_tracker(allow_reset_pass=true)`:
     //       1. pick B (Unknown < TransportError) → fail
     //       2. pick A (TransportError) → fail
@@ -1475,8 +1460,8 @@ fn attempts_exhausted_surfaces_error() {
     //       4. pick A (lowest-index Unknown) → fail
     //       5. pick B → fail
     //     → 4 dials per outer attempt (2 per host).
-    //   - Reconnect total: 4 × 4 = 16 dials, split A=8, B=8.
-    //   - Grand total: 1 + 16 = 17, with A=9, B=8.
+    //   - Reconnect total: 3 × 4 = 12 dials, split A=6, B=6.
+    //   - Grand total: 1 + 12 = 13, with A=7, B=6.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         // Subsequent accepts: TCP-level drop so even the connect fails.
@@ -1504,24 +1489,24 @@ fn attempts_exhausted_surfaces_error() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial to A + 4 outer reconnects × 4 dials each = 17 total.
+    // 1 initial to A + 3 outer reconnects × 4 dials each = 13 total.
     // A bears the initial + half of each reconnect attempt's 4 dials,
-    // so A=9, B=8.
+    // so A=7, B=6.
     let total = srv_a.accepts() + srv_b.accepts();
     assert_eq!(
         total,
-        17,
-        "expected 17 total dial attempts (1 initial + 4 outer reconnects × 4 dials each); \
+        13,
+        "expected 13 total dial attempts (1 initial + 3 outer reconnects × 4 dials each); \
          got A={}, B={}",
         srv_a.accepts(),
         srv_b.accepts()
     );
     assert_eq!(
         srv_a.accepts(),
-        9,
+        7,
         "A receives the initial + 2 dials per outer attempt"
     );
-    assert_eq!(srv_b.accepts(), 8, "B receives 2 dials per outer attempt");
+    assert_eq!(srv_b.accepts(), 6, "B receives 2 dials per outer attempt");
 }
 
 #[test]
@@ -1733,11 +1718,11 @@ fn backoff_bounded_by_jitter_ceiling() {
     // backoff sleep across the schedule MUST NOT exceed the sum of
     // the per-attempt jitter ceilings.
     //
-    // Setup: initial=20ms, max=200ms, max_attempts=3 → 4 outer
-    // attempts; sleeps between attempts use base 20ms, 40ms, 80ms.
+    // Setup: initial=20ms, max=200ms, max_attempts=3 → 2 reconnect
+    // rounds; sleeps use base 20ms, then 40ms.
     // Sum of bases (= upper bound on total sleep under full-jitter)
-    // is 140ms. The walk itself does host_count × 2 dials per outer
-    // attempt × 4 attempts = 16 dials on loopback. Allow 500ms slack
+    // is 60ms. The walk itself does host_count × 2 dials per outer
+    // attempt × 2 attempts = 8 dials on loopback. Allow generous slack
     // for scheduler noise and connect overhead on busy CI runners.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
@@ -1753,9 +1738,9 @@ fn backoff_bounded_by_jitter_ceiling() {
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
-    // Sum of jitter ceilings (140ms) + scheduler/connect slack (500ms)
+    // Sum of jitter ceilings (60ms) + scheduler/connect slack (580ms)
     // = 640ms upper bound. A regression that disables the cap or
-    // reverts to deterministic backoff (140ms minimum + dials)
+    // reverts to deterministic backoff (60ms minimum + dials)
     // wouldn't trip this, but one that *runs away* (e.g. backoff
     // doubling without saturation) would push elapsed well over 1s.
     assert!(
@@ -1911,14 +1896,14 @@ fn single_endpoint_failover_exhausts_budget() {
     // Dial accounting with `failover_max_attempts=4`:
     //   - Initial connect: 1 dial (success — serves the query, then drops).
     //   - Mid-stream failure on the single host triggers
-    //     `reconnect_with_failover`, which runs
-    //     `attempts_total = max_attempts = 4` outer reconnect attempts.
+    //     `reconnect_with_failover`, which has 3 reconnect rounds
+    //     (`max_attempts - 1`).
     //   - Each outer attempt invokes `walk_via_tracker(allow_reset_pass=true)`:
     //     pick the host → fail → fall-through reset → re-pick the
     //     same host → fail. That's 2 dials per outer attempt against
     //     the single configured endpoint.
-    //   - Reconnect total: 4 × 2 = 8 dials.
-    //   - Grand total: 1 + 8 = 9. The single per-Execute reconnect
+    //   - Reconnect total: 3 × 2 = 6 dials.
+    //   - Grand total: 1 + 6 = 7. The single per-Execute reconnect
     //     walk returns Err on exhaustion; no outer replay-cycle
     //     wrapper rearms it.
     let srv = MockServer::start(vec![
@@ -1947,53 +1932,38 @@ fn single_endpoint_failover_exhausts_budget() {
         "unexpected code: {:?}",
         err.code()
     );
-    // 1 initial + 4 outer reconnect attempts × 2 dials per attempt
-    // (walk + fall-through reset walk on the single host) = 9.
+    // 1 initial + 3 outer reconnect attempts × 2 dials per attempt
+    // (walk + fall-through reset walk on the single host) = 7.
     assert_eq!(
         srv.accepts(),
-        9,
-        "expected exactly 9 dials against the single endpoint \
-         (1 initial + 4 reconnect attempts × 2 dials per attempt); got {}",
+        7,
+        "expected exactly 7 dials against the single endpoint \
+         (1 initial + 3 reconnect attempts × 2 dials per attempt); got {}",
         srv.accepts()
     );
 }
 
 #[test]
-fn write_fail_after_reconnect_terminates_or_recovers_via_outer_loop() {
-    // A: serves the initial query, then drops mid-stream → triggers
-    // failover. B: accepts the WS upgrade and sends SERVER_INFO (so
-    // `connect_endpoint` returns Ok), then drops before the client's
-    // QUERY_REQUEST write lands. Two paths are possible depending on
-    // when the kernel surfaces B's TCP drop to tungstenite's buffered
-    // send:
-    //   (a) `write_message(QUERY_REQUEST)` to B fails synchronously —
-    //       `failover_reconnect_and_replay` tears the transport down
-    //       and surfaces the write error. No in-call retry: the per-
-    //       Execute `failover_max_duration_ms` budget already burned
-    //       once inside `reconnect_with_failover`, and dialing again
-    //       from here would compound it (this matches the Java
-    //       reference client `QwpQueryClient.executeImpl`, which owns
-    //       one deadline per Execute).
-    //   (b) tungstenite buffers the send and reports `Ok` — the
-    //       cursor returns from the first failover (1 reset callback);
-    //       the next `next_batch` reads from B, sees the close, and
-    //       the per-batch failover loop triggers a *second* outer
-    //       failover that lands on A's recovered slot (2nd callback).
-    // Both outcomes are correct: a single in-call write failure no
-    // longer earns a free second budget, but the per-batch loop's
-    // existing failover machinery still recovers from a delayed read
-    // failure.
+fn replay_write_failure_uses_remaining_execute_budget() {
+    // A: serves the initial query, then drops mid-stream. B: accepts the
+    // reconnect and sends SERVER_INFO, but abortively closes before the
+    // replayed QUERY_REQUEST can land. That failed replay write is the
+    // second Execute attempt in Java's model; with `failover_max_attempts=3`,
+    // the cursor still has one failover round left and should recover on
+    // A's second script.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
-        // If the test takes path (b), the second failover lands here.
         happy_script(ServerRole::Standalone, "a-recovered"),
     ]);
-    let srv_b = MockServer::start(vec![drop_after_server_info_script(
-        ServerRole::Standalone,
-        "b",
-    )]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AbortiveRst,
+    ]]);
     let conf = format!(
-        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        "ws::addr={};failover_max_attempts=3;failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("connect to A");
@@ -2013,41 +1983,31 @@ fn write_fail_after_reconnect_terminates_or_recovers_via_outer_loop() {
         .execute()
         .expect("execute");
 
-    let outcome = match cursor.next_batch() {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => panic!("unexpected RESULT_BATCH delivery"),
-        Err(e) => Err((e.code(), e.msg().to_string())),
-    };
+    assert!(
+        cursor.next_batch().expect("must recover via A").is_none(),
+        "recovered query should complete without batches"
+    );
     let r = *resets.lock().unwrap();
+    assert_eq!(
+        r, 1,
+        "only the successful replay to A should fire on_failover_reset"
+    );
     drop(cursor);
-
-    match outcome {
-        Ok(()) => {
-            // Path (b): cursor recovered through the outer loop after
-            // the first failover landed on B and the read tripped.
-            assert_eq!(
-                r, 2,
-                "path (b) (buffered write to B) must produce exactly 2 reset events"
-            );
-            assert_eq!(
-                reader.current_addr().port,
-                srv_a.addr.port(),
-                "recovered cursor must end up bound to A's recovered slot"
-            );
-        }
-        Err((code, msg)) => {
-            // Path (a): synchronous write fail on B; no callback
-            // fired because we never reached the success branch.
-            // Cursor must surface a transport-class error.
-            assert_eq!(r, 0, "path (a) must not fire a reset callback");
-            assert!(
-                matches!(code, ErrorCode::SocketError | ErrorCode::ProtocolError),
-                "path (a) error must be transport-class; got {:?}: {}",
-                code,
-                msg,
-            );
-        }
-    }
+    assert_eq!(
+        reader.current_addr().port,
+        srv_a.addr.port(),
+        "recovered cursor must end up bound to A's recovered slot"
+    );
+    assert_eq!(
+        srv_a.accepts(),
+        2,
+        "A should see the initial query plus the final successful replay"
+    );
+    assert_eq!(
+        srv_b.accepts(),
+        1,
+        "B should consume exactly one failed replay attempt"
+    );
 }
 
 #[test]
@@ -2098,12 +2058,12 @@ fn backoff_caps_at_max_ms() {
     // Counterpart to `backoff_grows_between_attempts` (which only
     // checks the lower bound). Here we set the cap WAY below the
     // value the doubling would otherwise reach, then verify that
-    // total elapsed is closer to "8 sleeps × cap" than to "8
+    // total elapsed is closer to "9 sleeps × cap" than to "9
     // sleeps in pure doubling".
     //
-    // initial=10, max=20, max_attempts=8 → 8 sleeps:
-    //   - capped:    10 + 20*7 ≈ 150 ms  (plus dial time)
-    //   - uncapped: 10+20+40+80+160+320+640+1280 ≈ 2550 ms
+    // initial=10, max=20, max_attempts=10 → 9 reconnect rounds:
+    //   - capped:    10 + 20*8 ≈ 170 ms  (plus dial time)
+    //   - uncapped: 10+20+40+80+160+320+640+1280+2560 ≈ 5110 ms
     // Anything well below the uncapped figure proves the `.min(max_ms)`
     // is firing.
     let srv_a = MockServer::start(vec![
@@ -2112,7 +2072,7 @@ fn backoff_caps_at_max_ms() {
     ]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=8;failover_backoff_initial_ms=10;failover_backoff_max_ms=20",
+        "ws::addr={};failover_max_attempts=10;failover_backoff_initial_ms=10;failover_backoff_max_ms=20",
         build_addr_list(&[&srv_a, &srv_b])
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect");
@@ -2120,9 +2080,9 @@ fn backoff_caps_at_max_ms() {
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
-    // A working cap totals ~150 ms of backoff plus the 8 dial round-
-    // trips; an uncapped run would total ~2.55 s of backoff alone
-    // (10+20+40+80+160+320+640+1280) plus dials. The 2 s threshold
+    // A working cap totals ~170 ms of backoff plus the 9 dial round-
+    // trips; an uncapped run would total ~5.11 s of backoff alone
+    // (10+20+40+80+160+320+640+1280+2560) plus dials. The 2 s threshold
     // sits well below the uncapped *backoff floor* and well above any
     // realistic capped run — including the slack a loaded CI runner
     // can add to each dial. Tightening this threshold has bitten us
@@ -2631,6 +2591,18 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         1,
         "callback must have fired exactly once"
     );
+    assert_eq!(
+        srv_a.accepts(),
+        3,
+        "A should see the initial query plus exactly one exhausted reconnect walk; \
+         a reset per-failure budget would dial it more often"
+    );
+    assert_eq!(
+        srv_b.accepts(),
+        3,
+        "B should see the successful first reset plus exactly one exhausted reconnect walk; \
+         a reset per-failure budget would dial it more often"
+    );
 
     // Cursor terminal: follow-up next_batch keeps surfacing the
     // exhaustion error (same code as the first call) rather than
@@ -2646,6 +2618,75 @@ fn failover_resets_counter_after_success_then_exhaustion() {
         err.code(),
         "replayed terminal error code must match the originating error"
     );
+}
+
+#[test]
+fn failover_duration_budget_spans_successful_resets() {
+    // The duration budget is per Execute, matching Java
+    // QwpQueryClient. A successful replay must not reset the deadline:
+    // if the first reconnect consumes the wall-clock budget, a second
+    // mid-query failure in the same cursor must give up immediately
+    // rather than earning a fresh failover window.
+    let srv_a = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "a"),
+        // Tripwire: if the deadline is incorrectly recreated for the
+        // second failure, the cursor can reconnect here and finish
+        // cleanly instead of surfacing deadline exhaustion.
+        happy_script(ServerRole::Standalone, "a-recovered"),
+    ]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::Sleep(Duration::from_millis(150)),
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b-slow".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::HardDrop,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=5;\
+         failover_backoff_initial_ms=0;failover_backoff_max_ms=0;\
+         failover_max_duration_ms=100",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+
+    let resets = Arc::new(AtomicUsize::new(0));
+    let resets_cb = Arc::clone(&resets);
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(move |_| {
+            resets_cb.fetch_add(1, Ordering::SeqCst);
+        })
+        .execute()
+        .expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("second failure must exhaust the original deadline"),
+    };
+    assert!(
+        err.msg().contains("failover_max_duration_ms")
+            || err.msg().contains("wall-clock budget exhausted")
+            || matches!(
+                err.code(),
+                ErrorCode::SocketError | ErrorCode::ProtocolError
+            ),
+        "unexpected error: code={:?} msg={}",
+        err.code(),
+        err.msg()
+    );
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "only the first reconnect should reset successfully"
+    );
+    assert_eq!(
+        srv_a.accepts(),
+        1,
+        "A's recovered slot must not be dialed after the per-Execute deadline is spent"
+    );
+    assert_eq!(srv_b.accepts(), 1, "B is used only for the first reset");
 }
 
 #[test]
@@ -2844,7 +2885,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
     //     failover budget would exhaust, and the final-endpoint
     //     assertion would fail.
     //
-    // `failover_max_attempts=3` (so `attempts_total=2`) keeps the
+    // `failover_max_attempts=3` (two reconnect rounds) keeps the
     // budget tight: only ONE failover dial is permitted to land,
     // forcing the rotation to be correct on the first try.
     let s0 = MockServer::start(vec![
@@ -2894,7 +2935,7 @@ fn rotation_wraps_to_index_zero_when_failed_is_last() {
     );
 
     // S1 and S2 must NOT have been dialed during failover. With
-    // `attempts_total=2` and a successful first dial, only one
+    // With two reconnect rounds and a successful first dial, only one
     // failover attempt happens and it must hit S0 (the wrap target).
     // If S1 or S2 saw a connect during failover, the rotation
     // produced a different first index. (Initial-walk dials count
@@ -3534,7 +3575,7 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
     // A: happy initial + drops mid-stream + recovers on the 3rd accept.
     // B: drop_at_connect on accept #1, then recovers.
     //
-    // With `failover_max_attempts=3` (attempts_total=2), the test
+    // With `failover_max_attempts=3` (two reconnect rounds), the test
     // forces the fall-through reset to be the path that recovers.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
@@ -3587,8 +3628,8 @@ fn tracker_fall_through_reset_gives_dead_hosts_a_second_pass() {
 /// be re-walked indefinitely inside a single outer attempt.
 #[test]
 fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
-    // 1 host, failover_max_attempts=3 (attempts_total=3 outer
-    // reconnect attempts). Each outer attempt: walk (1 dial) +
+    // 1 host, failover_max_attempts=3 (two reconnect rounds).
+    // Each outer round: walk (1 dial) +
     // fall-through reset walk (1 dial) = 2 dials.
     let srv = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "x"),
@@ -3606,14 +3647,14 @@ fn tracker_fall_through_reset_runs_at_most_once_per_outer_attempt() {
     drop(cursor);
     drop(reader);
 
-    // attempts_total=3 outer attempts × 2 dials per attempt = 6
-    // reconnect dials. Plus 1 initial = 7. If the fall-through reset
+    // Two reconnect rounds × 2 dials per round = 4
+    // reconnect dials. Plus 1 initial = 5. If the fall-through reset
     // were not bounded to one pass, this would be unbounded (the
     // walk would loop forever resetting and re-walking).
     assert_eq!(
         srv.accepts(),
-        7,
-        "expected 1 initial + 3 outer reconnect attempts × 2 dials/attempt; got {}",
+        5,
+        "expected 1 initial + 2 outer reconnect attempts × 2 dials/attempt; got {}",
         srv.accepts()
     );
 }
@@ -3947,7 +3988,7 @@ fn failover_max_duration_caps_total_wall_clock() {
 
 /// `failover_max_duration_ms=0` is the documented "unbounded"
 /// sentinel — the deadline branch must be entirely inert. With
-/// `max_attempts=1` (one reconnect attempt) and a dead host, the
+/// `max_attempts=2` (one reconnect attempt) and a dead host, the
 /// attempts cap should bound the loop, not the (absent) deadline.
 #[test]
 fn failover_max_duration_zero_means_unbounded() {
@@ -3956,7 +3997,7 @@ fn failover_max_duration_zero_means_unbounded() {
         drop_at_connect_script(),
     ]);
     let conf = format!(
-        "ws::addr={};failover_max_attempts=1;\
+        "ws::addr={};failover_max_attempts=2;\
          failover_backoff_initial_ms=1;failover_backoff_max_ms=2;\
          failover_max_duration_ms=0",
         srv.url()
@@ -4418,16 +4459,16 @@ fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
         events
     );
 
-    // Retrying fires once per outer-loop iteration. With
-    // failover_max_attempts=4, attempts_total=4.
+    // Retrying fires once per reconnect round. With
+    // failover_max_attempts=4, three rounds are available.
     let retrying: Vec<_> = events
         .iter()
         .filter(|e| e.phase == FailoverPhase::Retrying)
         .collect();
     assert_eq!(
         retrying.len(),
-        4,
-        "expected exactly 4 Retrying events (attempts_total=4): {:?}",
+        3,
+        "expected exactly 3 Retrying events: {:?}",
         events
     );
     // Attempts must be strictly increasing.

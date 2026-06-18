@@ -105,7 +105,7 @@ pub struct Reader {
     /// Wrapped in [`Arc`] so reconnect attempts share a single
     /// allocation: each attempt would otherwise deep-clone the addr
     /// vec, the path string, and the boxed auth payload — with
-    /// `failover_max_attempts` up to `1024`, that's thousands of
+    /// `failover_max_attempts` up to `1024`, that's hundreds of
     /// allocations per failure event. Reference-count bumps are free
     /// in comparison.
     cfg: Arc<ReaderConfig>,
@@ -254,10 +254,10 @@ impl Reader {
     ///   (refused / timed out / TLS error / etc.).
     /// - whatever the last attempt returned otherwise.
     ///
-    /// The initial connect deliberately does **not** apply the failover
-    /// backoff schedule — it walks every address once and reports back.
-    /// Mid-query failover (via [`Cursor::next_batch`]) is what uses
-    /// `failover_backoff_*` to space retries.
+    /// The initial connect deliberately does **not** apply the egress
+    /// failover backoff schedule — it walks every address once and
+    /// reports back. Mid-query failover (via [`Cursor::next_batch`]) is
+    /// what uses `failover_backoff_*` to space retries.
     ///
     /// The tracker is constructed fresh here, so every host starts at
     /// `Unknown` state and the priority-based pick degenerates to the
@@ -429,32 +429,26 @@ impl Reader {
     /// — `record_mid_stream_failure` demotes it from `Healthy` to
     /// `TransportError` so the tracker won't reach for it first on the
     /// next walk.
-    /// `on_attempt` is invoked once per outer-loop iteration right
-    /// before the `walk_via_tracker` dial runs (after the inter-attempt
-    /// backoff sleep, so the wall-clock cost of the backoff is included
-    /// in the elapsed measurement the caller derives). Passed by `&mut
-    /// dyn` instead of generic `impl FnMut` so adding the hook doesn't
-    /// monomorphise this large function per call site — there is one
-    /// non-trivial caller (`Cursor::failover_reconnect_and_replay`).
+    /// `budget` is cursor-owned and spans the whole `Execute()` call:
+    /// reconnect rounds, backoff growth, and the wall-clock deadline do
+    /// not reset after a successful replay.
+    ///
+    /// `on_attempt` is invoked once per reconnect round right before
+    /// the `walk_via_tracker` dial runs (after the configured
+    /// post-failure backoff sleep, so the wall-clock cost of the
+    /// backoff is included in the elapsed measurement the caller
+    /// derives). Passed by `&mut dyn` instead of generic `impl FnMut`
+    /// so adding the hook doesn't monomorphise this large function per
+    /// call site — there is one non-trivial caller
+    /// (`Cursor::failover_reconnect_and_replay`).
     fn reconnect_with_failover(
         &mut self,
         failed_idx: usize,
+        budget: &mut FailoverBudget,
         on_attempt: &mut dyn FnMut(u32),
     ) -> Result<u32> {
         let cfg = Arc::clone(&self.cfg);
-        // Mid-query path: `failover_max_attempts` counts reconnect
-        // rounds (no initial connect to subtract — we already had one).
-        let attempts_total = cfg.failover_max_attempts.max(1);
-        let mut backoff_ms = cfg.failover_backoff_initial_ms;
         let mut last_err: Option<Error> = None;
-        // Failover.md §11.9.1 wall-clock budget. `0` is the documented
-        // "unbounded" sentinel — translate to `None` so the inner
-        // arithmetic doesn't have to deal with a special case.
-        let deadline: Option<std::time::Instant> = if cfg.failover_max_duration_ms == 0 {
-            None
-        } else {
-            Some(std::time::Instant::now() + Duration::from_millis(cfg.failover_max_duration_ms))
-        };
         let mut deadline_exhausted = false;
         // Spec invariant (failover.md §2.3): mid-stream demote MUST run
         // before the next `begin_round(forget=true)` — reversing the
@@ -479,52 +473,31 @@ impl Reader {
         // long-running diagnostics see real dial pressure, not just the
         // attempt index that landed.
         let mut total_dials: u32 = 0;
-        // Outer-attempt counter — i.e. how many `walk_via_tracker` rounds
-        // actually fired. Distinct from `attempts_total` (the configured
-        // cap) because the deadline branch below can break out of the
-        // loop before issuing a walk, leaving the configured value
-        // misleadingly higher than reality. Used by both exhaustion
-        // error messages so diagnostics report real effort, not policy.
+        // Per-failure reconnect counter — i.e. how many
+        // `walk_via_tracker` rounds this call fired. Distinct from the
+        // cursor-level budget because this call can enter with only
+        // part of the original per-Execute budget left.
         let mut attempts_made: u32 = 0;
-        for attempt in 0..attempts_total {
-            if attempt > 0 {
-                // Failover.md §11.9 + §3.1: full-jitter `[0, base)`.
-                // Single-user egress benefits from the lowest expected
-                // recovery time; thundering-herd damping isn't a
-                // concern at one client per workload.
-                let jittered_ms = self.failover_rng.full_jitter_ms(backoff_ms);
-                // §11.9.1 deadline interplay: the sleep is clamped to
-                // `deadline - now`. If `now >= deadline`, the failover
-                // budget is exhausted — exit without sleeping or
-                // walking again. Per spec, the deadline check gates
-                // failover eligibility (not total Execute wall-clock).
-                let sleep_dur = match deadline {
-                    Some(dl) => match dl.checked_duration_since(std::time::Instant::now()) {
-                        Some(remaining) if !remaining.is_zero() => {
-                            std::cmp::min(Duration::from_millis(jittered_ms), remaining)
-                        }
-                        _ => {
-                            deadline_exhausted = true;
-                            break;
-                        }
-                    },
-                    None => Duration::from_millis(jittered_ms),
-                };
-                std::thread::sleep(sleep_dur);
-                backoff_ms = backoff_ms
-                    .saturating_mul(2)
-                    .min(cfg.failover_backoff_max_ms);
+        loop {
+            match budget.before_reconnect_round(&cfg, &mut self.failover_rng) {
+                Ok(()) => {}
+                Err(FailoverBudgetStop::AttemptsExhausted) => break,
+                Err(FailoverBudgetStop::DeadlineExhausted) => {
+                    deadline_exhausted = true;
+                    break;
+                }
             }
-            // Count the attempt only after the deadline gate above has
-            // let us through; otherwise we'd over-report attempts in
-            // the wall-clock-exhausted message.
+            // Count the attempt only after the shared budget gate above
+            // has let us through; otherwise we'd over-report attempts
+            // in exhaustion messages.
             attempts_made = attempts_made.saturating_add(1);
             // Fire the per-attempt hook *after* the deadline gate (so
             // the count we report matches the one the exhaustion errors
             // report) and *before* the dial (so observers see "about
-            // to dial attempt N" rather than retroactive "dial N
-            // finished"). Pass the 1-based attempt number; the caller
-            // already knows the trigger and start time.
+            // to dial attempt N for this failure" rather than
+            // retroactive "dial N finished"). Pass the 1-based attempt
+            // number; the caller already knows the trigger and start
+            // time.
             on_attempt(attempts_made);
             match walk_via_tracker(
                 &mut self.tracker,
@@ -585,11 +558,9 @@ impl Reader {
             ));
         }
         Err(last_err.unwrap_or_else(|| {
-            // `attempts_made` rather than `attempts_total` (the
-            // configured cap): the two are equal on natural exhaustion,
-            // but a future change to the loop's break conditions
-            // shouldn't quietly turn this into a lie about how many
-            // attempts actually ran.
+            // Report the attempts this call actually ran; the
+            // cursor-level cap may have been partly spent by earlier
+            // successful failovers in the same Execute.
             fmt!(
                 SocketError,
                 "failover exhausted after {} attempts",
@@ -766,14 +737,13 @@ pub struct FailoverEvent {
     /// from now on. Different from `Cursor::request_id` *before* the
     /// failover.
     pub new_request_id: i64,
-    /// Count of reconnect attempts the failover machinery burned
-    /// before this success — every dial inside the single
-    /// `reconnect_with_failover` walk that landed. `1` means the
-    /// first reconnect attempt succeeded and its replay write went
-    /// through cleanly. Larger values mean earlier reconnects in
-    /// this walk missed (rotating through endpoints) before one
-    /// landed. Pairs with [`elapsed`](Self::elapsed) — both measure
-    /// the same failover event.
+    /// Count of reconnect dials the current failover cycle burned
+    /// before this success. `1` means the first reconnect dial
+    /// succeeded and its replay write went through cleanly. Larger
+    /// values mean earlier dials in this cycle missed (rotating
+    /// through endpoints) before one landed. Pairs with
+    /// [`elapsed`](Self::elapsed) — both measure the same failover
+    /// event.
     pub attempts: u32,
     /// The error that triggered this failover (the failure of the
     /// previous connection). The full error — code + message — is
@@ -1191,6 +1161,7 @@ impl<'r> ReaderQuery<'r> {
             .write_message(encoded_request.clone())?;
 
         self.reader.cursor_active = true;
+        let failover_budget = FailoverBudget::new(&self.reader.cfg);
         Ok(Cursor {
             reader: self.reader,
             request_id,
@@ -1203,6 +1174,7 @@ impl<'r> ReaderQuery<'r> {
             encoded_request,
             on_failover_reset: self.on_failover_reset,
             on_failover_progress: self.on_failover_progress,
+            failover_budget,
             failover_resets: 0,
             data_delivered: false,
             #[cfg(feature = "arrow")]
@@ -1251,6 +1223,74 @@ const CANCEL_DRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 // ---------------------------------------------------------------------------
 // Cursor + BatchView
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailoverBudgetStop {
+    AttemptsExhausted,
+    DeadlineExhausted,
+}
+
+/// Mutable per-Execute failover budget.
+///
+/// A cursor may fail over, replay, then fail again before the query
+/// reaches its terminal frame. The public knobs are per Execute, not
+/// per outage, so reconnect rounds, backoff growth, and the wall-clock
+/// deadline all live here on the cursor rather than inside
+/// `Reader::reconnect_with_failover`.
+struct FailoverBudget {
+    reconnect_rounds_remaining: u32,
+    next_backoff_ms: u64,
+    deadline: Option<std::time::Instant>,
+}
+
+impl FailoverBudget {
+    fn new(cfg: &ReaderConfig) -> Self {
+        let deadline = if cfg.failover_max_duration_ms == 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + Duration::from_millis(cfg.failover_max_duration_ms))
+        };
+        Self {
+            reconnect_rounds_remaining: cfg.failover_reconnect_rounds(),
+            next_backoff_ms: cfg.failover_backoff_initial_ms,
+            deadline,
+        }
+    }
+
+    fn before_reconnect_round(
+        &mut self,
+        cfg: &ReaderConfig,
+        rng: &mut FailoverRng,
+    ) -> std::result::Result<(), FailoverBudgetStop> {
+        if self.reconnect_rounds_remaining == 0 {
+            return Err(FailoverBudgetStop::AttemptsExhausted);
+        }
+
+        // Failover.md §11.9 + §3.1: the first reconnect sleeps the
+        // configured initial backoff, then subsequent rounds grow the
+        // base exponentially up to the configured max. A zero initial
+        // backoff is the documented "no sleeps" sentinel.
+        let jittered_ms = rng.full_jitter_ms(self.next_backoff_ms);
+        let sleep_dur = match self.deadline {
+            Some(dl) => match dl.checked_duration_since(std::time::Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => {
+                    std::cmp::min(Duration::from_millis(jittered_ms), remaining)
+                }
+                _ => return Err(FailoverBudgetStop::DeadlineExhausted),
+            },
+            None => Duration::from_millis(jittered_ms),
+        };
+        std::thread::sleep(sleep_dur);
+        if self.next_backoff_ms > 0 {
+            self.next_backoff_ms = self
+                .next_backoff_ms
+                .saturating_mul(2)
+                .min(cfg.failover_backoff_max_ms);
+        }
+        self.reconnect_rounds_remaining = self.reconnect_rounds_remaining.saturating_sub(1);
+        Ok(())
+    }
+}
 
 /// Reason the stream ended. Surfaced via [`Cursor::terminal`] once
 /// `next_batch` returns `None`.
@@ -1302,6 +1342,10 @@ pub struct Cursor<'r> {
     /// User callback fired at every phase of a mid-query failover
     /// lifecycle. See [`ReaderQuery::on_failover_progress`].
     on_failover_progress: Option<FailoverProgressCallback<'r>>,
+    /// Shared per-Execute budget for mid-query failover. This spans
+    /// every reconnect in the cursor's life; it must not reset after a
+    /// successful replay.
+    failover_budget: FailoverBudget,
     /// Number of successful failover resets observed by this cursor
     /// since `execute()`. Useful for tests and for asserting the
     /// query did not silently restart under the user's feet.
@@ -1433,14 +1477,13 @@ impl<'r> Cursor<'r> {
     /// (capped by `failover_backoff_max_ms`), then dials, handshakes,
     /// and reads `SERVER_INFO` against the next endpoint. The
     /// worst-case wall-clock blocking time is approximately
-    /// `2 × failover_max_attempts × failover_backoff_max_ms` plus
-    /// per-attempt connect+handshake overhead — with the parse-time
-    /// caps that's up to ~2 hours. There is no per-call timeout, no
-    /// AtomicBool cancel hook, and no progress callback today; if
-    /// you need bounded latency, set `failover_max_attempts` and
-    /// `failover_backoff_max_ms` to values appropriate for your SLA,
-    /// or set `failover=off` and handle reconnect at the
-    /// application layer.
+    /// `2 × (failover_max_attempts - 1) × failover_backoff_max_ms`
+    /// plus per-attempt connect+handshake overhead — with the
+    /// parse-time caps that's up to ~2 hours. There is no per-call timeout or
+    /// AtomicBool cancel hook; use `on_failover_progress` for observability.
+    /// If you need bounded latency, set `failover_max_attempts` and
+    /// `failover_backoff_max_ms` to values appropriate for your SLA, or set
+    /// `failover=off` and handle reconnect at the application layer.
     pub fn next_batch(&mut self) -> Result<Option<BatchView<'_>>> {
         // Replay-on-terminal guard. If the cursor previously terminated
         // with an error, surface that error on every subsequent call
@@ -1963,218 +2006,210 @@ impl<'r> Cursor<'r> {
     /// discard accumulated rows. On exhausted budget or hard error,
     /// the cursor is marked terminal and the failure is propagated.
     fn failover_reconnect_and_replay(&mut self, trigger: Error) -> Result<()> {
-        let started = std::time::Instant::now();
-        let failed_idx = self.reader.addr_idx;
-        // Snapshot the failing endpoint before reconnect mutates
-        // `addr_idx` — `FailoverEvent` reports it back to the user.
-        let failed_addr = self.reader.cfg.addrs[failed_idx].clone();
+        let mut trigger = trigger;
+        loop {
+            let started = std::time::Instant::now();
+            let failed_idx = self.reader.addr_idx;
+            // Snapshot the failing endpoint before reconnect mutates
+            // `addr_idx` — `FailoverEvent` reports it back to the user.
+            let failed_addr = self.reader.cfg.addrs[failed_idx].clone();
 
-        // Phase: Disconnected. Fires before the retry loop runs so an
-        // SLO dashboard sees the outage *now*, not retroactively when
-        // a reconnect lands or the budget exhausts.
-        if let Some(cb) = self.on_failover_progress.as_mut() {
-            let event = FailoverProgressEvent {
-                phase: FailoverPhase::Disconnected,
-                failed_addr: failed_addr.clone(),
-                new_addr: None,
-                new_server_info: None,
-                new_request_id: None,
-                attempt: 0,
-                trigger: trigger.clone(),
-                elapsed: started.elapsed(),
-                final_error: None,
+            // Phase: Disconnected. Fires before the retry loop runs so an
+            // SLO dashboard sees the outage *now*, not retroactively when
+            // a reconnect lands or the budget exhausts.
+            if let Some(cb) = self.on_failover_progress.as_mut() {
+                let event = FailoverProgressEvent {
+                    phase: FailoverPhase::Disconnected,
+                    failed_addr: failed_addr.clone(),
+                    new_addr: None,
+                    new_server_info: None,
+                    new_request_id: None,
+                    attempt: 0,
+                    trigger: trigger.clone(),
+                    elapsed: started.elapsed(),
+                    final_error: None,
+                };
+                cb(&event);
+            }
+
+            // Phase: Retrying. The closure fires once per outer-loop
+            // iteration of `reconnect_with_failover`. We split the borrow
+            // on `self` so the closure can mutate the progress callback
+            // while `reader.reconnect_with_failover` holds a `&mut Reader`.
+            // `last_attempt` is tracked outside the closure so the GaveUp
+            // event can report the final attempt count even when the
+            // reconnect loop breaks out via the wall-clock-deadline path
+            // (which doesn't surface the count in its `Err`).
+            let mut last_attempt: u32 = 0;
+            let reconnect_result = {
+                let Self {
+                    reader,
+                    on_failover_progress,
+                    failover_budget,
+                    ..
+                } = self;
+                let failed_addr_ref = &failed_addr;
+                let trigger_ref = &trigger;
+                reader.reconnect_with_failover(failed_idx, failover_budget, &mut |attempt: u32| {
+                    last_attempt = attempt;
+                    if let Some(cb) = on_failover_progress.as_mut() {
+                        let event = FailoverProgressEvent {
+                            phase: FailoverPhase::Retrying,
+                            failed_addr: failed_addr_ref.clone(),
+                            new_addr: None,
+                            new_server_info: None,
+                            new_request_id: None,
+                            attempt,
+                            trigger: trigger_ref.clone(),
+                            elapsed: started.elapsed(),
+                            final_error: None,
+                        };
+                        cb(&event);
+                    }
+                })
             };
-            cb(&event);
-        }
-
-        // Phase: Retrying. The closure fires once per outer-loop
-        // iteration of `reconnect_with_failover`. We split the borrow
-        // on `self` so the closure can mutate the progress callback
-        // while `reader.reconnect_with_failover` holds a `&mut Reader`.
-        // `last_attempt` is tracked outside the closure so the GaveUp
-        // event can report the final attempt count even when the
-        // reconnect loop breaks out via the wall-clock-deadline path
-        // (which doesn't surface the count in its `Err`).
-        let mut last_attempt: u32 = 0;
-        let reconnect_result = {
-            let Self {
-                reader,
-                on_failover_progress,
-                ..
-            } = self;
-            let failed_addr_ref = &failed_addr;
-            let trigger_ref = &trigger;
-            reader.reconnect_with_failover(failed_idx, &mut |attempt: u32| {
-                last_attempt = attempt;
-                if let Some(cb) = on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::Retrying,
-                        failed_addr: failed_addr_ref.clone(),
-                        new_addr: None,
-                        new_server_info: None,
-                        new_request_id: None,
-                        attempt,
-                        trigger: trigger_ref.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: None,
-                    };
-                    cb(&event);
+            let attempts = match reconnect_result {
+                Ok(n) => n,
+                Err(e) => {
+                    // Phase: GaveUp. Fire before mutating state / returning
+                    // so the callback sees the cursor in its
+                    // about-to-be-terminal form and can correlate against
+                    // the error the caller is about to receive via
+                    // `next_batch`.
+                    if let Some(cb) = self.on_failover_progress.as_mut() {
+                        let event = FailoverProgressEvent {
+                            phase: FailoverPhase::GaveUp,
+                            failed_addr: failed_addr.clone(),
+                            new_addr: None,
+                            new_server_info: None,
+                            new_request_id: None,
+                            attempt: last_attempt,
+                            trigger: trigger.clone(),
+                            elapsed: started.elapsed(),
+                            final_error: Some(e.clone()),
+                        };
+                        cb(&event);
+                    }
+                    self.reader.cursor_active = false;
+                    self.done = true;
+                    // Surface the most diagnostic error. The original
+                    // `trigger` is almost always a generic transport
+                    // failure (socket close, decode error). Anything
+                    // specific the reconnect saw — auth rejected, role
+                    // mismatched on every endpoint, config-level issue —
+                    // tells the user *what to fix* and should win over
+                    // the original cause-of-death.
+                    return Err(if prefer_over_trigger(e.code()) {
+                        e
+                    } else {
+                        trigger
+                    });
                 }
-            })
-        };
-        let attempts = match reconnect_result {
-            Ok(n) => n,
-            Err(e) => {
-                // Phase: GaveUp. Fire before mutating state / returning
-                // so the callback sees the cursor in its
-                // about-to-be-terminal form and can correlate against
-                // the error the caller is about to receive via
-                // `next_batch`.
-                if let Some(cb) = self.on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::GaveUp,
-                        failed_addr: failed_addr.clone(),
-                        new_addr: None,
-                        new_server_info: None,
-                        new_request_id: None,
-                        attempt: last_attempt,
-                        trigger: trigger.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: Some(e.clone()),
-                    };
-                    cb(&event);
-                }
-                self.reader.cursor_active = false;
-                self.done = true;
-                // Surface the most diagnostic error. The original
-                // `trigger` is almost always a generic transport
-                // failure (socket close, decode error). Anything
-                // specific the reconnect saw — auth rejected, role
-                // mismatched on every endpoint, config-level issue —
-                // tells the user *what to fix* and should win over
-                // the original cause-of-death.
-                return Err(if prefer_over_trigger(e.code()) {
-                    e
-                } else {
-                    trigger
-                });
+            };
+            // Reset connection-scoped state. The new connection has its
+            // own (empty) dict and per-query schema already (set up by
+            // `connect_endpoint`). Drop any in-flight batch buffer so we
+            // don't accidentally surface a stale view.
+            self.last_batch = None;
+            // The parked drift-replay batch belongs to the old stream.
+            #[cfg(feature = "arrow")]
+            {
+                self.drifted_batch = None;
             }
-        };
-        // Reset connection-scoped state. The new connection has its
-        // own (empty) dict and per-query schema already (set up by
-        // `connect_endpoint`). Drop any in-flight batch buffer so we
-        // don't accidentally surface a stale view.
-        self.last_batch = None;
-        // The parked drift-replay batch belongs to the old stream.
-        #[cfg(feature = "arrow")]
-        {
-            self.drifted_batch = None;
-        }
-        // Allocate a fresh request_id and re-issue the same
-        // QUERY_REQUEST bytes. The cursor stashed the encoded
-        // payload at `execute()` time; here we patch the 8-byte
-        // request_id span in place and write the buffer
-        // verbatim. No builder clone, no Bind clone, no
-        // re-encode — and crucially no memcpy of the body
-        // either: the previous `write_message` call has dropped
-        // its `Bytes` clone, so this clone is uniquely owned and
-        // `try_into_mut` recovers the underlying `BytesMut`
-        // zero-copy. With `failover_max_attempts` up to `1024`
-        // and queries that may carry multi-MB `Bind::Binary`
-        // payloads, this is the difference between a few bytes
-        // and gigabytes of churn per failure event.
-        let new_rid = self.reader.alloc_request_id();
-        self.request_id = new_rid;
-        self.encoded_request = patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
-        match self
-            .reader
-            .transport_mut()
-            .and_then(|t| t.write_message(self.encoded_request.clone()))
-        {
-            Ok(()) => {
-                self.failover_resets = self.failover_resets.saturating_add(1);
-                let new_addr = self.reader.cfg.addrs[self.reader.addr_idx].clone();
-                let new_server_info = self.reader.server_info.clone();
-                // Phase: Reset. Fire BEFORE the legacy on_failover_reset
-                // so a single sink that subscribes to both sees a
-                // consistent ordering. The two callbacks carry the same
-                // logical event; on_failover_progress is the modern
-                // surface and on_failover_reset is preserved for
-                // backward compat.
-                if let Some(cb) = self.on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::Reset,
-                        failed_addr: failed_addr.clone(),
-                        new_addr: Some(new_addr.clone()),
-                        new_server_info: new_server_info.clone(),
-                        new_request_id: Some(new_rid),
-                        attempt: attempts,
-                        trigger: trigger.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: None,
-                    };
-                    cb(&event);
+            // Allocate a fresh request_id and re-issue the same
+            // QUERY_REQUEST bytes. The cursor stashed the encoded
+            // payload at `execute()` time; here we patch the 8-byte
+            // request_id span in place and write the buffer
+            // verbatim. No builder clone, no Bind clone, no
+            // re-encode — and crucially no memcpy of the body
+            // either: the previous `write_message` call has dropped
+            // its `Bytes` clone, so this clone is uniquely owned and
+            // `try_into_mut` recovers the underlying `BytesMut`
+            // zero-copy. With `failover_max_attempts` up to `1024`
+            // and queries that may carry multi-MB `Bind::Binary`
+            // payloads, this is the difference between a few bytes
+            // and gigabytes of churn per failure event.
+            let new_rid = self.reader.alloc_request_id();
+            self.request_id = new_rid;
+            self.encoded_request =
+                patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
+            match self
+                .reader
+                .transport_mut()
+                .and_then(|t| t.write_message(self.encoded_request.clone()))
+            {
+                Ok(()) => {
+                    self.failover_resets = self.failover_resets.saturating_add(1);
+                    let new_addr = self.reader.cfg.addrs[self.reader.addr_idx].clone();
+                    let new_server_info = self.reader.server_info.clone();
+                    // Phase: Reset. Fire BEFORE the legacy on_failover_reset
+                    // so a single sink that subscribes to both sees a
+                    // consistent ordering. The two callbacks carry the same
+                    // logical event; on_failover_progress is the modern
+                    // surface and on_failover_reset is preserved for
+                    // backward compat.
+                    if let Some(cb) = self.on_failover_progress.as_mut() {
+                        let event = FailoverProgressEvent {
+                            phase: FailoverPhase::Reset,
+                            failed_addr: failed_addr.clone(),
+                            new_addr: Some(new_addr.clone()),
+                            new_server_info: new_server_info.clone(),
+                            new_request_id: Some(new_rid),
+                            attempt: attempts,
+                            trigger: trigger.clone(),
+                            elapsed: started.elapsed(),
+                            final_error: None,
+                        };
+                        cb(&event);
+                    }
+                    if let Some(cb) = self.on_failover_reset.as_mut() {
+                        let event = FailoverEvent {
+                            failed_addr,
+                            new_addr,
+                            new_server_info,
+                            new_request_id: new_rid,
+                            attempts,
+                            trigger,
+                            elapsed: started.elapsed(),
+                        };
+                        cb(&event);
+                    }
+                    return Ok(());
                 }
-                if let Some(cb) = self.on_failover_reset.as_mut() {
-                    let event = FailoverEvent {
-                        failed_addr,
-                        new_addr,
-                        new_server_info,
-                        new_request_id: new_rid,
-                        attempts,
-                        trigger,
-                        elapsed: started.elapsed(),
-                    };
-                    cb(&event);
+                Err(e) => {
+                    // The freshly reconnected socket died while sending the
+                    // replayed QUERY_REQUEST. That failed replay is the next
+                    // Execute attempt in Java's model, so it has already spent
+                    // the reconnect round that got us here. If the same
+                    // cursor-owned budget still has room, feed the write error
+                    // back through the same reconnect loop; do not invent a
+                    // separate write-retry schedule.
+                    warn_on_protocol_error_failover(&e, "replay query write");
+                    if !self.reader.cfg.failover || !is_failover_eligible(e.code()) {
+                        if let Some(cb) = self.on_failover_progress.as_mut() {
+                            let event = FailoverProgressEvent {
+                                phase: FailoverPhase::GaveUp,
+                                failed_addr: failed_addr.clone(),
+                                new_addr: None,
+                                new_server_info: None,
+                                new_request_id: None,
+                                attempt: attempts,
+                                trigger: trigger.clone(),
+                                elapsed: started.elapsed(),
+                                final_error: Some(e.clone()),
+                            };
+                            cb(&event);
+                        }
+                        if let Some(dead) = self.reader.transport.take() {
+                            drop(dead);
+                        }
+                        self.reader.cursor_active = false;
+                        self.done = true;
+                        return Err(e);
+                    }
+                    trigger = e;
+                    continue;
                 }
-                Ok(())
-            }
-            Err(e) => {
-                // Write (or build/encode) failed on the freshly-
-                // connected socket — typically a TCP RST landing
-                // between `accept` and our first write. Tear down the
-                // new transport: no QUERY_REQUEST was sent, so the
-                // server is sitting idle waiting for one. Letting it
-                // linger until `Reader` drops would hold the FD and
-                // leave the server's per-connection resources
-                // allocated longer than necessary. Once
-                // `cursor_active=false`, `Drop for Cursor` skips its
-                // `close_in_place`, so this is the last chance to
-                // close the WS cleanly. Take the transport out so the
-                // FD is released here rather than at the eventual
-                // Reader drop. The original `trigger` already burned
-                // one `failover_max_duration_ms` budget through
-                // `reconnect_with_failover`; surfacing the write
-                // failure (rather than spinning another inner cycle)
-                // keeps that budget honest as a per-Execute bound and
-                // mirrors the Java reference client.
-                //
-                // Phase: GaveUp. From the observer's perspective this
-                // is also a terminal exhaustion — the reconnect itself
-                // succeeded but the replay write failed, and we will
-                // not loop again. Fire the same terminal phase so a
-                // dashboard that watches GaveUp gets a single
-                // consistent event for "cursor is dead, won't recover."
-                if let Some(cb) = self.on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::GaveUp,
-                        failed_addr: failed_addr.clone(),
-                        new_addr: None,
-                        new_server_info: None,
-                        new_request_id: None,
-                        attempt: attempts,
-                        trigger: trigger.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: Some(e.clone()),
-                    };
-                    cb(&event);
-                }
-                if let Some(dead) = self.reader.transport.take() {
-                    drop(dead);
-                }
-                self.reader.cursor_active = false;
-                self.done = true;
-                Err(e)
             }
         }
     }

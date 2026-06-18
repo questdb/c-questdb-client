@@ -44,8 +44,8 @@
 //! | `client_id`        | optional; sent only when set                             |
 //! | `target`           | `any`/`primary`/`replica` (default `any`)                |
 //! | `failover`         | `true`/`false` — mid-query reconnect on transport failure (`true`) |
-//! | `failover_max_attempts`        | retry attempts after a transport failure (`8`, must be `>= 1`); ignored when `failover=off` |
-//! | `failover_backoff_initial_ms`  | initial backoff between attempts (`50`); ignored when `failover=off` |
+//! | `failover_max_attempts`        | total Execute attempts, including the initial attempt (`8`, must be `>= 1`); ignored when `failover=off` |
+//! | `failover_backoff_initial_ms`  | first post-failure sleep (`50`; `0` disables sleeps); ignored when `failover=off` |
 //! | `failover_backoff_max_ms`      | max backoff between attempts (`1000`); ignored when `failover=off` |
 //! | `username`         | basic auth                                               |
 //! | `password`         | basic auth                                               |
@@ -436,24 +436,23 @@ pub struct ReaderConfig {
     /// the parser (so configs aren't rejected on a partial enable/disable
     /// flip) but have no effect — transport failures surface immediately.
     pub failover: bool,
-    /// Cap on the number of mid-stream reconnect rounds after a
-    /// transport failure (default `8`). The initial connect is counted
-    /// separately; the total connect rounds before a failure is
-    /// propagated is `1` initial connect plus `failover_max_attempts`
-    /// reconnect rounds. Must be `>= 1`. Ignored when
+    /// Cap on total `Execute()` attempts for one query (default `8`):
+    /// the initial attempt plus at most `failover_max_attempts - 1`
+    /// reconnect/replay rounds. Must be `>= 1`. Ignored when
     /// [`failover`](Self::failover) is `false`.
     pub failover_max_attempts: u32,
-    /// Initial backoff between failover attempts, in milliseconds.
+    /// First post-failure sleep, in milliseconds. `0` disables
+    /// failover sleeps entirely.
     /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_backoff_initial_ms: u64,
     /// Maximum (capped) backoff between failover attempts, in milliseconds.
     /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_backoff_max_ms: u64,
-    /// Wall-clock budget per `Execute()` once failover has been triggered,
-    /// in milliseconds. `0` means unbounded. Bounds failover eligibility,
-    /// not total Execute wall-clock — a single `WalkTracker` round can run
-    /// up to `host_count × auth_timeout_ms` after the deadline check
-    /// passes. Failover.md §11.9.1 / §7.
+    /// Wall-clock budget per `Execute()`, in milliseconds. `0` means
+    /// unbounded. Bounds failover eligibility, not total Execute
+    /// wall-clock — a single `WalkTracker` round can run up to
+    /// `host_count × auth_timeout_ms` after the deadline check passes.
+    /// Failover.md §11.9.1 / §7.
     ///
     /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_max_duration_ms: u64,
@@ -1082,12 +1081,6 @@ impl ReaderConfig {
                 MAX_FAILOVER_MAX_ATTEMPTS
             ));
         }
-        if self.failover_backoff_initial_ms == 0 {
-            return Err(fmt!(
-                ConfigError,
-                "\"failover_backoff_initial_ms\" must be > 0"
-            ));
-        }
         if self.failover_backoff_max_ms < self.failover_backoff_initial_ms {
             return Err(fmt!(
                 ConfigError,
@@ -1170,6 +1163,10 @@ impl ReaderConfig {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn failover_reconnect_rounds(&self) -> u32 {
+        self.failover_max_attempts.saturating_sub(1)
     }
 
     /// Read-only view of the parsed endpoint list. The list is populated
@@ -1750,10 +1747,10 @@ mod tests {
     }
 
     #[test]
-    fn failover_backoff_initial_zero_rejected() {
-        let err =
-            ReaderConfig::from_conf("ws::addr=h:1;failover_backoff_initial_ms=0").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ConfigError);
+    fn failover_backoff_initial_zero_disables_sleep() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_backoff_initial_ms=0").unwrap();
+        assert_eq!(c.failover_backoff_initial_ms, 0);
+        assert_eq!(c.failover_backoff_max_ms, DEFAULT_FAILOVER_BACKOFF_MAX_MS);
     }
 
     #[test]
@@ -2206,6 +2203,15 @@ mod tests {
     }
 
     #[test]
+    fn failover_max_attempts_counts_initial_execute_attempt() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_max_attempts=1").unwrap();
+        assert_eq!(c.failover_reconnect_rounds(), 0);
+
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_max_attempts=8").unwrap();
+        assert_eq!(c.failover_reconnect_rounds(), 7);
+    }
+
+    #[test]
     fn endpoint_display_common_cases() {
         // Hostnames and IPv4 literals format unbracketed — `host:port`
         // is the path users will actually see in connect strings,
@@ -2354,11 +2360,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_post_parse_backoff_zero_initial() {
+    fn validate_accepts_post_parse_backoff_zero_initial() {
         let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.failover_backoff_initial_ms = 0;
-        let err = c.validate().unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ConfigError);
+        c.validate().unwrap();
     }
 
     #[test]
