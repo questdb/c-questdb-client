@@ -38,7 +38,7 @@
 //!
 //! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
 //!
-//! The one-call shortcut is [`ColumnSender::flush_polars_dataframe`].
+//! The one-call shortcut is [`BorrowedSender::flush_polars_dataframe`].
 //! For full control over slicing and per-batch retry, drive the
 //! iterator directly:
 //!
@@ -48,7 +48,7 @@
 //! }
 //! ```
 //!
-//! [`ColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::ColumnSender::flush_polars_dataframe
+//! [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -315,39 +315,6 @@ impl Iterator for DataFrameBatches<'_> {
 /// stays under it, keeps the pipeline full, and bounds a failover re-drive to
 /// ≈64 × `max_rows` rows.
 const CHECKPOINT_BATCHES: usize = 64;
-
-impl crate::ingress::column_sender::ColumnSender {
-    /// Single-attempt DataFrame flush — the raw building block with **no**
-    /// failover. Slices `df` into [`RecordBatch`]es of at most `max_rows` rows
-    /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]) and publishes every slice
-    /// through this connection via [`ColumnSender::flush_arrow_batch`].
-    ///
-    /// One QWP/WebSocket frame per slice. The first frame is sent as
-    /// an immediate commit and later frames are deferred; call
-    /// [`ColumnSender::sync`] after the last frame to drain ACKs.
-    ///
-    /// On error, partial frames may already have hit the wire; failed
-    /// flushes follow the same connection-latching semantics as
-    /// [`ColumnSender::flush_arrow_batch`]. A transient (`FailoverRetry`)
-    /// error surfaces to the caller — only the
-    /// [`BorrowedSender::flush_polars_dataframe`] entry, which can re-borrow a
-    /// live connection from the pool, re-drives transparently.
-    ///
-    /// [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
-    /// [`ColumnSender::flush_arrow_batch`]: crate::ingress::column_sender::ColumnSender::flush_arrow_batch
-    /// [`ColumnSender::sync`]: crate::ingress::column_sender::ColumnSender::sync
-    pub fn flush_polars_dataframe(
-        &mut self,
-        table: crate::ingress::TableName<'_>,
-        df: &DataFrame,
-        max_rows: Option<NonZeroUsize>,
-    ) -> Result<()> {
-        for rb in dataframe_to_batches(df, max_rows) {
-            self.flush_arrow_batch(table, &rb?, &[])?;
-        }
-        Ok(())
-    }
-}
 
 impl crate::ingress::column_sender::BorrowedSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `max_rows` rows each
