@@ -2171,7 +2171,7 @@ enum QwpWsZoneTier {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct QwpWsHostHealthTracker {
+pub(crate) struct QwpWsHostHealthTracker {
     states: Vec<QwpWsHostState>,
     attempted_this_round: Vec<bool>,
     zone_tiers: Vec<QwpWsZoneTier>,
@@ -2180,7 +2180,7 @@ pub(super) struct QwpWsHostHealthTracker {
 }
 
 impl QwpWsHostHealthTracker {
-    pub(super) fn new(host_count: usize) -> Self {
+    pub(crate) fn new(host_count: usize) -> Self {
         assert!(host_count > 0, "host_count must be > 0");
         Self {
             states: vec![QwpWsHostState::HealthUnknown; host_count],
@@ -2269,7 +2269,7 @@ impl QwpWsHostHealthTracker {
         self.attempted_this_round[idx] = true;
     }
 
-    pub(super) fn record_mid_stream_failure(&mut self, idx: usize) {
+    pub(crate) fn record_mid_stream_failure(&mut self, idx: usize) {
         if self.states[idx] == QwpWsHostState::Healthy {
             self.states[idx] = QwpWsHostState::FailedThisRound;
         }
@@ -2281,15 +2281,15 @@ impl QwpWsHostHealthTracker {
     }
 }
 
-pub(super) struct QwpWsConnectRoundSuccess {
-    pub(super) endpoint_idx: usize,
-    pub(super) stream: WsStream,
-    pub(super) negotiated_version: u8,
-    pub(super) server_max_batch_size: usize,
-    pub(super) leftover: Vec<u8>,
+pub(crate) struct QwpWsConnectRoundSuccess {
+    pub(crate) endpoint_idx: usize,
+    pub(crate) stream: WsStream,
+    pub(crate) negotiated_version: u8,
+    pub(crate) server_max_batch_size: usize,
+    pub(crate) leftover: Vec<u8>,
 }
 
-pub(super) fn qwp_ws_configured_endpoints(
+pub(crate) fn qwp_ws_configured_endpoints(
     host: &str,
     port: &str,
     qwp_ws: &QwpWsConfig,
@@ -2441,7 +2441,7 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
-pub(super) fn connect_qwp_ws_endpoint_round(
+pub(crate) fn connect_qwp_ws_endpoint_round(
     endpoints: &Arc<[QwpWsEndpoint]>,
     tracker: &mut QwpWsHostHealthTracker,
     previous_idx: &mut Option<usize>,

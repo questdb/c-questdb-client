@@ -1527,14 +1527,29 @@ impl<'r> Cursor<'r> {
     pub fn fetch_all_arrow(
         &mut self,
     ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>)> {
+        // Materialise-whole: nothing leaves the library until the full
+        // result is built, so a mid-query failover can re-read it
+        // transparently. Opt into replay and discard the partial
+        // accumulation when the cursor reports a reset.
+        self.enable_internal_replay();
         let mut reader = self.as_arrow_reader()?;
+        let mut resets_seen = reader.failover_resets();
         let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
-        for item in reader.by_ref() {
-            batches.push(item.map_err(|e| {
+        loop {
+            // Manual drive (not `for`/`by_ref`) so the reset counter can be
+            // polled between batches without holding an iterator borrow.
+            let Some(item) = reader.next() else { break };
+            let rb = item.map_err(|e| {
                 crate::egress::arrow::try_downcast_questdb(&e)
                     .cloned()
                     .unwrap_or_else(|| fmt!(ArrowExport, "{}", e))
-            })?);
+            })?;
+            let resets_now = reader.failover_resets();
+            if resets_now != resets_seen {
+                resets_seen = resets_now;
+                batches.clear();
+            }
+            batches.push(rb);
         }
         Ok((reader.schema(), batches))
     }
@@ -1863,6 +1878,27 @@ impl<'r> Cursor<'r> {
     /// query did or did not silently restart.
     pub fn failover_resets(&self) -> u32 {
         self.failover_resets
+    }
+
+    /// Opt this cursor into transparent mid-query replay from the
+    /// materialise-whole adapters (`fetch_all_polars`, `fetch_all_arrow`).
+    /// Those adapters hold the entire result internally and discard their
+    /// accumulator on a reset (tracked via [`Cursor::failover_resets`]), so
+    /// replay-from-`batch_seq 0` re-reads the whole result exactly once —
+    /// nothing has left the library. Installing a no-op reset callback is
+    /// what clears the silent-duplicate guard in `next_batch_inner` (see
+    /// [`would_silently_duplicate`]); the streaming entry points
+    /// (`iter_polars`, `next_polars`, `next_arrow_batch`) deliberately do
+    /// **not** call this, so a batch already yielded to the caller still
+    /// surfaces [`ErrorCode::FailoverWouldDuplicate`].
+    ///
+    /// Leaves a user-installed callback in place: if the caller already
+    /// opted into replays, that contract wins.
+    #[cfg(feature = "arrow")]
+    pub(crate) fn enable_internal_replay(&mut self) {
+        if self.on_failover_reset.is_none() && self.on_failover_progress.is_none() {
+            self.on_failover_reset = Some(Box::new(|_: &FailoverEvent| {}));
+        }
     }
 
     /// The endpoint the cursor's underlying connection is currently

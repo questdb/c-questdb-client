@@ -47,6 +47,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "_egress")]
 use crate::egress::Reader;
+use crate::ingress::SenderBuilder;
+use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
+use crate::ingress::{QwpWsConnector, RawQwpWsRoundStream};
 use crate::{Result, error};
 
 use super::conf::{self, PoolReap};
@@ -65,6 +68,12 @@ fn lock_state(m: &Mutex<PoolState>) -> std::sync::MutexGuard<'_, PoolState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn lock_health(
+    m: &Mutex<QwpWsHostHealthTracker>,
+) -> std::sync::MutexGuard<'_, QwpWsHostHealthTracker> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(feature = "_egress")]
 fn lock_reader_state(m: &Mutex<ReaderPoolState>) -> std::sync::MutexGuard<'_, ReaderPoolState> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -72,8 +81,8 @@ fn lock_reader_state(m: &Mutex<ReaderPoolState>) -> std::sync::MutexGuard<'_, Re
 
 /// RAII guard that increments `state.in_use` on construction and
 /// decrements it on drop unless [`InUseSlot::commit`] is called first.
-/// Closes the leak window between `state.in_use += 1` and
-/// `ColumnConn::connect`: a panic in the connect path (allocator OOM,
+/// Closes the leak window between `state.in_use += 1` and the connect
+/// round: a panic in the connect path (allocator OOM,
 /// TLS handshake panic) would otherwise skip the matching decrement
 /// and permanently strand a pool slot.
 struct InUseSlot<'a> {
@@ -146,13 +155,26 @@ pub struct QuestDb {
 }
 
 struct DbInner {
-    /// Original connect string. Kept verbatim so auto-grow can spin up a
-    /// new connection with the same settings — for either the sender
-    /// pool (`ColumnConn::connect`) or the reader pool
-    /// (`Reader::from_conf`). The reader's parser accepts the writer's
-    /// scheme prefixes and ignores pool_* keys, so no translation is
-    /// needed.
+    /// Original connect string. Kept verbatim so the reader pool
+    /// (`Reader::from_conf`) can spin up a new connection with the same
+    /// settings — the reader's parser accepts the writer's scheme prefixes
+    /// and ignores pool_* keys, so no translation is needed. The sender pool
+    /// connects through the pre-resolved `connector` instead.
+    #[cfg(feature = "_egress")]
     conf: String,
+    /// Resolved, reusable QWP/WebSocket connect ingredients (endpoint list,
+    /// TLS, auth, config). Every sender connection — eager-open, auto-grow,
+    /// and failover re-borrow — opens through this connector so it rotates
+    /// across the configured endpoints. A single-endpoint pool behaves
+    /// exactly as before (one endpoint, no rotation).
+    connector: QwpWsConnector,
+    /// One health tracker shared by every connect attempt. A connect failure
+    /// or a mid-stream transport death marks the offending endpoint unhealthy
+    /// so subsequent borrows skip it until it re-probes healthy; role rejects
+    /// rotate to the writable primary. Pool-level (not per-conn) so the pool
+    /// stops handing out connections to a dead peer rather than rediscovering
+    /// it one connection at a time.
+    health: Mutex<QwpWsHostHealthTracker>,
     pool_size: usize,
     pool_max: usize,
     pool_idle_timeout: Duration,
@@ -252,10 +274,13 @@ impl QuestDb {
         let parsed = conf::parse(conf)?;
         let pool_cfg = parsed.pool;
 
+        let connector = SenderBuilder::from_conf(conf)?.build_qwp_ws_connector()?;
+        let mut health = QwpWsHostHealthTracker::new(connector.endpoint_count());
+
         let mut free = Vec::with_capacity(pool_cfg.pool_size);
         let now = Instant::now();
         for slot in 0..pool_cfg.pool_size {
-            let conn = ColumnConn::connect(conf).map_err(|err| {
+            let conn = connect_conn(&connector, &mut health).map_err(|err| {
                 crate::Error::new(
                     err.code(),
                     format!(
@@ -276,7 +301,10 @@ impl QuestDb {
         }
 
         let inner = Arc::new(DbInner {
+            #[cfg(feature = "_egress")]
             conf: conf.to_owned(),
+            connector,
+            health: Mutex::new(health),
             pool_size: pool_cfg.pool_size,
             pool_max: pool_cfg.pool_max,
             pool_idle_timeout: pool_cfg.pool_idle_timeout,
@@ -359,7 +387,7 @@ impl QuestDb {
                 armed: true,
             }
         };
-        let conn = ColumnConn::connect(&self.inner.conf)?;
+        let conn = connect_conn_pool(&self.inner)?;
         slot.commit();
 
         Ok(ColumnSender::new(
@@ -392,6 +420,20 @@ impl QuestDb {
     /// any reaper-join errors explicitly in the future.
     pub fn close(self) {
         drop(self);
+    }
+
+    /// The pool's reconnect backoff budget, parsed from the connect string's
+    /// `reconnect_*` keys.
+    #[cfg(feature = "polars")]
+    pub(crate) fn reconnect_policy(&self) -> crate::ingress::ReconnectPolicy {
+        self.inner.connector.reconnect_policy()
+    }
+
+    /// Whether reconnect/failover is enabled for this pool — `>1` configured
+    /// endpoint or any explicit `reconnect_*` key.
+    #[cfg(feature = "polars")]
+    pub(crate) fn failover_enabled(&self) -> bool {
+        self.inner.connector.failover_enabled()
     }
 
     /// Snapshot the number of idle (free) connections currently in the pool.
@@ -536,6 +578,46 @@ impl<'a> BorrowedSender<'a> {
             sender: Some(sender),
             _not_send: PhantomData,
         }
+    }
+
+    /// Whether this borrow's pool has reconnect/failover enabled; see
+    /// [`QuestDb::failover_enabled`].
+    #[cfg(feature = "polars")]
+    pub(crate) fn failover_enabled(&self) -> bool {
+        self.db.failover_enabled()
+    }
+
+    /// The pool's reconnect backoff budget; see [`QuestDb::reconnect_policy`].
+    #[cfg(feature = "polars")]
+    pub(crate) fn reconnect_policy(&self) -> crate::ingress::ReconnectPolicy {
+        self.db.reconnect_policy()
+    }
+
+    /// Drop the current connection (and its paired connection-scoped
+    /// `SymbolGlobalDict`) back to the pool and obtain a fresh one **behind
+    /// the same handle**, so the caller's `BorrowedSender` stays valid.
+    ///
+    /// This is the column sender's failover primitive: after a transient
+    /// (`ErrorCode::FailoverRetry`) flush/sync failure, call this to swap onto
+    /// a live connection — the pool's connect path rotates across endpoints,
+    /// skips the dead one, and follows the writable primary. The dropped
+    /// connection's dict is discarded with it; the fresh connection brings its
+    /// own dict, consistent with the server it talks to, so the unchanged
+    /// delta-dict encoder re-drives correctly on the re-iterated source.
+    ///
+    /// A failed connection is dropped (not recycled); a clean connection with
+    /// un-sync'd in-flight frames is also dropped, mirroring [`Drop`], so the
+    /// next borrower never commits this caller's data.
+    pub fn reborrow_from_pool(&mut self) -> Result<()> {
+        if let Some(mut sender) = self.sender.take() {
+            if sender.conn.in_flight() > 0 {
+                sender.mark_must_close();
+            }
+            return_to_pool(&self.db.inner, sender);
+        }
+        let fresh = self.db.pick_sender()?;
+        self.sender = Some(fresh);
+        Ok(())
     }
 }
 
@@ -731,8 +813,34 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
     drop(state);
 }
 
+/// Open one connection through `connector`, driving `health` so it rotates
+/// across endpoints and skips unhealthy / role-rejecting ones. Used by the
+/// eager-open loop where the tracker is still owned by value.
+fn connect_conn(
+    connector: &QwpWsConnector,
+    health: &mut QwpWsHostHealthTracker,
+) -> Result<ColumnConn> {
+    let raw: RawQwpWsRoundStream = connector.connect_round(health)?;
+    ColumnConn::from_round_stream(raw)
+}
+
+/// Same as [`connect_conn`] but takes the live pool, locking the shared health
+/// tracker for the duration of the connect round.
+fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
+    let mut health = lock_health(&inner.health);
+    connect_conn(&inner.connector, &mut health)
+}
+
 fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     let must_close = sender.must_close();
+    // A transport-dead connection marks its endpoint unhealthy in the shared
+    // tracker so the next borrow rotates away from the dead peer (until it
+    // re-probes healthy). A pool-driven `mark_must_close` (un-sync'd pending
+    // frames) or a server-data rejection leaves the endpoint healthy.
+    if sender.conn.transport_dead() {
+        let idx = sender.conn.endpoint_idx();
+        lock_health(&inner.health).record_mid_stream_failure(idx);
+    }
     let mut state = lock_state(&inner.state);
     state.in_use = state.in_use.saturating_sub(1);
     if !must_close {

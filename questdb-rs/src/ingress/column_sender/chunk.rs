@@ -1126,11 +1126,7 @@ impl<'a> Chunk<'a> {
         self.set_designated_ts(DesignatedTsUnit::Seconds, data)
     }
 
-    fn set_designated_ts(
-        &mut self,
-        unit: DesignatedTsUnit,
-        data: &'a [i64],
-    ) -> Result<&mut Self> {
+    fn set_designated_ts(&mut self, unit: DesignatedTsUnit, data: &'a [i64]) -> Result<&mut Self> {
         if self.designated_ts.is_some() {
             return Err(error::fmt!(
                 InvalidApiCall,

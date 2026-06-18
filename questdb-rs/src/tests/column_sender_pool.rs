@@ -58,6 +58,16 @@ enum MockMode {
     AckEachFrame,
     /// Reply to every QWP frame with an error ack carrying `status`.
     ErrorEachFrame(u8),
+    /// Complete the WS upgrade, then immediately close the socket. A client
+    /// that opened the connection succeeds, but its first `flush`/`sync` read
+    /// hits EOF and surfaces a transient (`FailoverRetry`) transport failure —
+    /// simulating a peer that dies after connect. Used to drive failover.
+    UpgradeThenClose,
+    /// Ack the first `n` binary frames, then close the socket — a peer that
+    /// dies mid-stream after committing a prefix. The client's next read hits
+    /// EOF and surfaces a transient (`FailoverRetry`) failure.
+    #[cfg(feature = "polars")]
+    AckThenClose(usize),
 }
 
 /// Spawn a mock server that performs the WS upgrade for up to `max_accepts`
@@ -81,6 +91,15 @@ impl MockServer {
 
     fn spawn_erroring(max_accepts: usize, status: u8) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::ErrorEachFrame(status))
+    }
+
+    fn spawn_upgrade_then_close(max_accepts: usize) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::UpgradeThenClose)
+    }
+
+    #[cfg(feature = "polars")]
+    fn spawn_ack_then_close(max_accepts: usize, ack_first: usize) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::AckThenClose(ack_first))
     }
 
     fn spawn_with_mode(max_accepts: usize, mode: MockMode) -> Self {
@@ -138,6 +157,14 @@ impl MockServer {
                                         }
                                         MockMode::ErrorEachFrame(status) => {
                                             error_each_frame(&mut stream, &stop, status)
+                                        }
+                                        MockMode::UpgradeThenClose => {
+                                            // Drop the stream immediately: the
+                                            // client's next read sees EOF.
+                                        }
+                                        #[cfg(feature = "polars")]
+                                        MockMode::AckThenClose(n) => {
+                                            ack_then_close(&mut stream, &stop, n)
                                         }
                                     }
                                 }
@@ -270,10 +297,56 @@ fn error_each_frame(stream: &mut std::net::TcpStream, stop: &AtomicBool, status:
     }
 }
 
+/// Ack the first `n` binary frames the client sends, then close the socket so
+/// the client's next read hits EOF. Models a peer that commits a prefix and
+/// then dies mid-stream.
+#[cfg(feature = "polars")]
+fn ack_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut next_wire_seq: u64 = 0;
+    let mut acked = 0usize;
+    while !stop.load(Ordering::SeqCst) && acked < n {
+        match read_frame(stream) {
+            Ok((_fin, opcode, _payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                if write_qwp_ok_response(stream, next_wire_seq).is_err() {
+                    break;
+                }
+                next_wire_seq += 1;
+                acked += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    // Returning drops the stream: the client's next read sees EOF.
+}
+
 fn conf_for(port: u16, extras: &str) -> String {
     format!(
         "qwpws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}"
     )
+}
+
+/// Build a conf string with a comma-joined endpoint list (`addr=h1,h2,...`),
+/// which enables endpoint rotation / failover in the pool's connect path.
+fn conf_for_endpoints(ports: &[u16], extras: &str) -> String {
+    let addrs = ports
+        .iter()
+        .map(|p| format!("127.0.0.1:{p}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("qwpws::addr={addrs};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}")
 }
 
 #[test]
@@ -841,6 +914,149 @@ fn close_joins_reaper_cleanly() {
     );
 }
 
+// ---------- F0: endpoint rotation + health, transient classification ----------
+
+#[test]
+fn transient_transport_failure_maps_to_failover_retry() {
+    // A peer that upgrades then closes: the client's sync read hits EOF, a
+    // transport death that must surface as the distinct FailoverRetry code
+    // (not SocketError), so callers can tell "retry on a fresh conn" apart.
+    let server = MockServer::spawn_upgrade_then_close(2);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_sender().expect("borrow");
+    let err = sender
+        .sync(AckLevel::Ok)
+        .expect_err("server closed mid-sync must error");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+    assert!(sender.must_close(), "transport-dead conn must be latched");
+}
+
+#[test]
+fn server_data_rejection_stays_terminal_not_failover_retry() {
+    // A server-data rejection (status 0x09 → ServerFlushError) is terminal:
+    // re-driving on a fresh conn would fail identically. It must NOT be
+    // re-tagged FailoverRetry.
+    let server = MockServer::spawn_erroring(2, 0x09);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_sender().expect("borrow");
+    let err = sender
+        .sync(AckLevel::Ok)
+        .expect_err("server data rejection must surface");
+    assert_eq!(err.code(), ErrorCode::ServerFlushError);
+    assert_ne!(err.code(), ErrorCode::FailoverRetry);
+}
+
+#[test]
+fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
+    // Endpoint A (first in the list) is the primary that the eager-open lands
+    // on, then dies on the first sync. Endpoint B is a live acking server.
+    // After the transient failure, `reborrow_from_pool` must rotate to B and
+    // must NOT re-attempt the dead A (the pool-level health tracker marks it
+    // unhealthy on the dead conn's return).
+    let primary = MockServer::spawn_upgrade_then_close(1);
+    let live = MockServer::spawn_acking(2);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), live.port()],
+        "pool_size=1;pool_max=2;",
+    ))
+    .unwrap();
+
+    // Eager-open connected to the primary (first endpoint).
+    assert!(
+        wait_until(Duration::from_secs(2), || primary.accepted() == 1),
+        "eager-open must connect to the primary; accepted={}",
+        primary.accepted()
+    );
+    assert_eq!(live.accepted(), 0, "live endpoint must be untouched so far");
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    let err = sender
+        .sync(AckLevel::Ok)
+        .expect_err("primary died mid-sync");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+
+    // Swap onto a live connection behind the same handle.
+    sender
+        .reborrow_from_pool()
+        .expect("re-borrow must land on the live endpoint");
+    sender
+        .sync(AckLevel::Ok)
+        .expect("sync on the live endpoint must succeed");
+
+    assert!(
+        wait_until(Duration::from_secs(2), || live.accepted() == 1),
+        "re-borrow must connect to the live endpoint; accepted={}",
+        live.accepted()
+    );
+    assert_eq!(
+        primary.accepted(),
+        1,
+        "the dead primary must be skipped, not re-attempted"
+    );
+}
+
+#[test]
+fn reborrow_on_single_endpoint_pool_reuses_the_same_endpoint() {
+    // A single-endpoint pool must behave exactly as today: a re-borrow simply
+    // opens a fresh connection to the one endpoint.
+    let server = MockServer::spawn_acking(3);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    sender.sync(AckLevel::Ok).expect("first sync");
+
+    sender
+        .reborrow_from_pool()
+        .expect("re-borrow on a single endpoint");
+    sender.sync(AckLevel::Ok).expect("sync after re-borrow");
+
+    // Exactly one slot remains in use behind the handle (no leak, no growth
+    // past the borrow).
+    assert_eq!(db.in_use_count(), 1);
+    drop(sender);
+    assert_eq!(db.in_use_count(), 0);
+}
+
+#[test]
+fn dead_endpoint_stays_skipped_across_repeated_reborrows() {
+    // Once the primary is marked unhealthy, it stays skipped on every
+    // subsequent borrow that the live endpoint can serve — the pool does not
+    // rediscover the dead peer one connection at a time. The live endpoint
+    // takes all the traffic; the dead one's accept count never grows past the
+    // single eager-open.
+    let dead = MockServer::spawn_upgrade_then_close(1);
+    let live = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[dead.port(), live.port()],
+        "pool_size=1;pool_max=2;",
+    ))
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(2), || dead.accepted() == 1),
+        "eager-open must land on the first endpoint"
+    );
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    // First sync hits the dead eager-open conn.
+    let err = sender.sync(AckLevel::Ok).expect_err("primary died");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry);
+
+    for _ in 0..3 {
+        sender
+            .reborrow_from_pool()
+            .expect("re-borrow rotates to live");
+        sender
+            .sync(AckLevel::Ok)
+            .expect("live endpoint accepts the sync");
+    }
+
+    assert_eq!(
+        dead.accepted(),
+        1,
+        "the dead endpoint must stay skipped, never re-attempted"
+    );
+}
+
 fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -852,4 +1068,162 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+// ---------- F1: retry-from-source at the DataFrame entry ----------
+
+#[cfg(feature = "polars")]
+fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
+    // A QWP data frame carries `table_count >= 1` at bytes 6..8; the
+    // header-only commit frame the `sync` sends has `table_count == 0`.
+    frames
+        .try_iter()
+        .filter(|f| f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1)
+        .count()
+}
+
+#[cfg(feature = "polars")]
+#[test]
+fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
+    use crate::ingress::TableName;
+    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use std::num::NonZeroUsize;
+
+    // Endpoint A is the eager-open primary that dies on the checkpoint `sync`;
+    // endpoint B is a live acking server. The DataFrame entry must catch the
+    // transient failure, re-borrow onto B, and re-drive every batch there so
+    // all rows land (at-least-once).
+    let primary = MockServer::spawn_upgrade_then_close(1);
+    let (live, frames) = MockServer::spawn_acking_capturing(2);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), live.port()],
+        "pool_size=1;pool_max=2;",
+    ))
+    .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(2), || primary.accepted() == 1),
+        "eager-open must connect to the primary; accepted={}",
+        primary.accepted()
+    );
+
+    let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4, 5, 6]).into_column();
+    let df = DataFrame::new(6, vec![i]).unwrap();
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    sender
+        .flush_polars_dataframe(
+            TableName::new("trades").unwrap(),
+            &df,
+            Some(NonZeroUsize::new(2).unwrap()),
+        )
+        .expect("failover must re-drive the df onto the live endpoint");
+    drop(sender);
+
+    // 6 rows / 2 rows-per-batch = 3 data frames, all re-driven onto the live
+    // endpoint (the whole df: the primary died before any checkpoint committed).
+    assert_eq!(
+        data_frame_count(&frames),
+        3,
+        "the live endpoint must receive every batch of the re-driven df"
+    );
+    assert_eq!(
+        primary.accepted(),
+        1,
+        "the dead primary must not be re-attempted"
+    );
+}
+
+#[cfg(feature = "polars")]
+#[test]
+fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
+    use crate::ingress::TableName;
+    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use std::num::NonZeroUsize;
+
+    // The primary acks one full checkpoint and then dies mid-stream. With one
+    // row per batch and a 66-row df, the first 64 batches plus the checkpoint
+    // `sync`'s commit frame are 65 binary frames; acking 66 commits that
+    // checkpoint (`committed = 64`) and lands the kill before the final commit
+    // (frame 68), so the entry fails over and must re-drive only the 2-batch
+    // tail onto the live endpoint — not the already-committed 64-batch prefix.
+    let primary = MockServer::spawn_ack_then_close(1, 66);
+    let (live, frames) = MockServer::spawn_acking_capturing(2);
+    let db = QuestDb::connect(&conf_for_endpoints(
+        &[primary.port(), live.port()],
+        "pool_size=1;pool_max=2;",
+    ))
+    .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(2), || primary.accepted() == 1),
+        "eager-open must connect to the primary; accepted={}",
+        primary.accepted()
+    );
+
+    let vals: Vec<i64> = (1..=66).collect();
+    let i = Series::new(PlSmallStr::from("i"), vals.as_slice()).into_column();
+    let df = DataFrame::new(66, vec![i]).unwrap();
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    sender
+        .flush_polars_dataframe(
+            TableName::new("trades").unwrap(),
+            &df,
+            Some(NonZeroUsize::new(1).unwrap()),
+        )
+        .expect("failover must re-drive the uncommitted tail onto the live endpoint");
+    drop(sender);
+
+    // 66 batches − 64 committed on the primary (one CHECKPOINT_BATCHES run) = 2
+    // re-driven onto the live endpoint; the committed prefix is not re-sent.
+    assert_eq!(
+        data_frame_count(&frames),
+        2,
+        "only the uncommitted tail must reach the live endpoint"
+    );
+    assert_eq!(
+        primary.accepted(),
+        1,
+        "the dead primary must not be re-attempted"
+    );
+}
+
+#[cfg(feature = "polars")]
+#[test]
+fn flush_polars_dataframe_without_failover_makes_one_attempt() {
+    use crate::ingress::TableName;
+    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use std::num::NonZeroUsize;
+
+    // A single `addr=` with no `reconnect_*` key: failover is disabled, so the
+    // entry takes the single-pass fast path (no entry-owned `sync`, no
+    // re-borrow) — byte-for-byte today's behaviour. The caller drives `sync`.
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+
+    let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
+    let df = DataFrame::new(4, vec![i]).unwrap();
+
+    let mut sender = db.borrow_sender().expect("borrow");
+    sender
+        .flush_polars_dataframe(
+            TableName::new("trades").unwrap(),
+            &df,
+            Some(NonZeroUsize::new(2).unwrap()),
+        )
+        .expect("single-attempt flush must round-trip");
+    sender.sync(AckLevel::Ok).expect("caller-driven sync");
+    drop(sender);
+
+    assert_eq!(
+        server.accepted(),
+        1,
+        "no failover means no extra connection is opened"
+    );
+    assert_eq!(
+        data_frame_count(&frames),
+        2,
+        "4 rows / 2 per batch = 2 data frames, sent in a single pass"
+    );
 }

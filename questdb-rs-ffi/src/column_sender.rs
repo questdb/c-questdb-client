@@ -2248,11 +2248,13 @@ pub unsafe extern "C" fn column_sender_flush(
 /// source the timestamp from a `Timestamp(_)` column inside the batch.
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL)
-/// and the function has invoked it internally. On failure, `array->release`
-/// may also have been consumed if the call reached the Arrow import
-/// step before failing — callers MUST check `array->release != NULL`
-/// before invoking it on the failure path. `schema` is always
-/// borrowed.
+/// and the function has invoked it internally. On a **transient**
+/// (`line_sender_error_failover_retry`) failure `array` is left intact
+/// (re-exported back into `*array` with a fresh `release`) so the caller
+/// can drop+re-borrow a live conn and retry with the same array. On any
+/// other failure `array->release` may have been consumed if the call
+/// reached the Arrow import step — callers MUST check `array->release != NULL`
+/// before invoking it on the failure path. `schema` is always borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 ///
@@ -2528,8 +2530,40 @@ unsafe fn arrow_batch_impl(
         Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name(), &overrides),
         None => sender.flush_arrow_batch(table_name, &rb, &overrides),
     };
-    bubble!(err_out, result);
-    true
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            // A transient (reconnectable) failure must leave the caller's
+            // `array` intact so it can drop+re-borrow a live conn and retry
+            // with the same data. The import already consumed `array->release`,
+            // so we re-export the still-live `RecordBatch` back into `*array`,
+            // restoring a valid release. A terminal error consumes the array
+            // as before (the data is unusable on any conn).
+            if err.code() == ErrorCode::FailoverRetry {
+                unsafe { reexport_record_batch_into(rb, array) };
+            }
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
+/// Re-export `rb` back into the caller's `*array` (a Struct array, one child
+/// per column — the shape `arrow_ffi_import_record_batch` accepts on retry),
+/// restoring `array->release` consumed during import. Best-effort: an export
+/// failure leaves `array->release == NULL`, which the caller already must
+/// tolerate per the documented ownership contract.
+#[cfg(feature = "arrow")]
+unsafe fn reexport_record_batch_into(
+    rb: arrow_array::RecordBatch,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+) {
+    use arrow_array::{Array, StructArray};
+    let struct_array = StructArray::from(rb);
+    let array_data = struct_array.into_data();
+    if let Ok((ffi_array, _ffi_schema)) = arrow::ffi::to_ffi(&array_data) {
+        unsafe { std::ptr::write(array, ffi_array) };
+    }
 }
 
 /// Block until all in-flight frames are acknowledged at the requested

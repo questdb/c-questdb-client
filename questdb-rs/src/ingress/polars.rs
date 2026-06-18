@@ -310,11 +310,17 @@ impl Iterator for DataFrameBatches<'_> {
     }
 }
 
+/// Number of batches flushed between `sync` checkpoints. The QWP in-flight
+/// cap is 127 deferred frames (128 − 1 reserved for the commit frame); 64
+/// stays under it, keeps the pipeline full, and bounds a failover re-drive to
+/// ≈64 × `max_rows` rows.
+const CHECKPOINT_BATCHES: usize = 64;
+
 impl crate::ingress::column_sender::ColumnSender {
-    /// Slice `df` into [`RecordBatch`]es of at most `max_rows` rows each
-    /// (defaults to [`DEFAULT_MAX_BATCH_ROWS`]) and publish every slice
-    /// through this pooled connection via
-    /// [`ColumnSender::flush_arrow_batch`].
+    /// Single-attempt DataFrame flush — the raw building block with **no**
+    /// failover. Slices `df` into [`RecordBatch`]es of at most `max_rows` rows
+    /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]) and publishes every slice
+    /// through this connection via [`ColumnSender::flush_arrow_batch`].
     ///
     /// One QWP/WebSocket frame per slice. The first frame is sent as
     /// an immediate commit and later frames are deferred; call
@@ -322,8 +328,12 @@ impl crate::ingress::column_sender::ColumnSender {
     ///
     /// On error, partial frames may already have hit the wire; failed
     /// flushes follow the same connection-latching semantics as
-    /// [`ColumnSender::flush_arrow_batch`].
+    /// [`ColumnSender::flush_arrow_batch`]. A transient (`FailoverRetry`)
+    /// error surfaces to the caller — only the
+    /// [`BorrowedSender::flush_polars_dataframe`] entry, which can re-borrow a
+    /// live connection from the pool, re-drives transparently.
     ///
+    /// [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
     /// [`ColumnSender::flush_arrow_batch`]: crate::ingress::column_sender::ColumnSender::flush_arrow_batch
     /// [`ColumnSender::sync`]: crate::ingress::column_sender::ColumnSender::sync
     pub fn flush_polars_dataframe(
@@ -337,6 +347,105 @@ impl crate::ingress::column_sender::ColumnSender {
         }
         Ok(())
     }
+}
+
+impl crate::ingress::column_sender::BorrowedSender<'_> {
+    /// Slice `df` into [`RecordBatch`]es of at most `max_rows` rows each
+    /// (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
+    /// `sync` to commit — re-driving transparently across a connection
+    /// failure when failover is enabled.
+    ///
+    /// When the pool has failover enabled (`>1` endpoint or any `reconnect_*`
+    /// key), the batch loop `sync`s every [`CHECKPOINT_BATCHES`] batches; on a
+    /// transient ([`ErrorCode::FailoverRetry`]) `flush`/`sync` error it
+    /// re-borrows a live connection from the pool behind the same handle
+    /// (rotating to a live endpoint), backs off per the pool's
+    /// [`ReconnectPolicy`], and re-iterates `&DataFrame` from the last
+    /// committed checkpoint. Delivery is at-least-once: a re-driven tail can
+    /// duplicate frames committed-but-unobserved before the failure; server
+    /// WAL/dedup collapses them. The reconnect budget exhausting surfaces the
+    /// terminal error.
+    ///
+    /// When failover is **not** enabled this makes a single pass of `flush`es
+    /// and returns without `sync`ing; the caller still drives
+    /// [`ColumnSender::sync`] to commit. With failover enabled the entry owns
+    /// the `sync` and returns only once the whole `df` is committed.
+    ///
+    /// [`ColumnSender::sync`]: crate::ingress::column_sender::ColumnSender::sync
+    /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
+    /// [`ReconnectPolicy`]: crate::ingress::ReconnectPolicy
+    pub fn flush_polars_dataframe(
+        &mut self,
+        table: crate::ingress::TableName<'_>,
+        df: &DataFrame,
+        max_rows: Option<NonZeroUsize>,
+    ) -> Result<()> {
+        if !self.failover_enabled() {
+            for rb in dataframe_to_batches(df, max_rows) {
+                self.flush_arrow_batch(table, &rb?, &[])?;
+            }
+            return Ok(());
+        }
+
+        let policy = self.reconnect_policy();
+        let started = std::time::Instant::now();
+        let mut backoff = policy.initial_backoff();
+        // Batches confirmed by the last successful `sync`; a transient failure
+        // re-drives only the tail past this.
+        let mut committed = 0usize;
+
+        loop {
+            match drive_from_checkpoint(self, table, df, max_rows, &mut committed) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if err.code() != crate::ErrorCode::FailoverRetry {
+                        return Err(err);
+                    }
+                    if started.elapsed() >= policy.max_duration() {
+                        return Err(err);
+                    }
+                    self.reborrow_from_pool()?;
+                    if !backoff.is_zero() {
+                        std::thread::sleep(backoff);
+                    }
+                    backoff = backoff
+                        .checked_mul(2)
+                        .unwrap_or(std::time::Duration::MAX)
+                        .min(policy.max_backoff());
+                }
+            }
+        }
+    }
+}
+
+/// Single forward pass over `df`, skipping the first `*committed` batches (the
+/// tail already durable from an earlier attempt), flushing each remaining
+/// batch and `sync`ing every [`CHECKPOINT_BATCHES`]. `*committed` is advanced
+/// to the batch count made durable by each successful checkpoint `sync`, so on
+/// a transient error the caller re-drives only the uncommitted tail.
+fn drive_from_checkpoint(
+    sender: &mut crate::ingress::column_sender::BorrowedSender<'_>,
+    table: crate::ingress::TableName<'_>,
+    df: &DataFrame,
+    max_rows: Option<NonZeroUsize>,
+    committed: &mut usize,
+) -> Result<()> {
+    use crate::ingress::column_sender::AckLevel;
+
+    let skip = *committed;
+    for (idx, rb) in dataframe_to_batches(df, max_rows).enumerate() {
+        if idx < skip {
+            continue;
+        }
+        sender.flush_arrow_batch(table, &rb?, &[])?;
+        // `idx` is 0-based; checkpoint after a full run of CHECKPOINT_BATCHES
+        // (batches 63, 127, …). The sync's ack moves the replay boundary.
+        if (idx + 1) % CHECKPOINT_BATCHES == 0 {
+            sender.sync(AckLevel::Ok)?;
+            *committed = idx + 1;
+        }
+    }
+    sender.sync(AckLevel::Ok)
 }
 
 fn ffi_polars_to_arrow_rs(

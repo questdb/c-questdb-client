@@ -282,6 +282,13 @@ pub enum line_sender_error_code {
     /// FFI struct contract). Only emitted with the `arrow` feature
     /// enabled.
     line_sender_error_arrow_ingest = 16,
+
+    /// A reconnectable failure on the column-major sender's flush/sync
+    /// path (transport error, EOF, closed connection). The operation has
+    /// not committed: drop the connection (`questdb_db_drop_conn`),
+    /// borrow a fresh one (the pool rotates to a live endpoint), and
+    /// re-drive from your source.
+    line_sender_error_failover_retry = 17,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -326,6 +333,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_arrow_unsupported_column_kind
             }
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
+            ErrorCode::FailoverRetry => line_sender_error_code::line_sender_error_failover_retry,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4438,6 +4446,8 @@ mod tests {
             // New since 7.0.0 — arrow feature. Append-only.
             (line_sender_error_arrow_unsupported_column_kind, 15),
             (line_sender_error_arrow_ingest, 16),
+            // Column-sender failover. Append-only.
+            (line_sender_error_failover_retry, 17),
         ];
         for (variant, want) in expected {
             assert_eq!(
@@ -4473,6 +4483,7 @@ mod tests {
                 ErrorCode::ServerRejection => "ServerRejection",
                 ErrorCode::ArrowUnsupportedColumnKind => "ArrowUnsupportedColumnKind",
                 ErrorCode::ArrowIngest => "ArrowIngest",
+                ErrorCode::FailoverRetry => "FailoverRetry",
                 _ => "unmapped",
             }
         }
@@ -4494,6 +4505,7 @@ mod tests {
             ErrorCode::ServerRejection,
             ErrorCode::ArrowUnsupportedColumnKind,
             ErrorCode::ArrowIngest,
+            ErrorCode::FailoverRetry,
         ] {
             assert_ne!(
                 cover(code),

@@ -42,7 +42,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
-use crate::ingress::SenderBuilder;
+use crate::ingress::RawQwpWsRoundStream;
 use crate::ingress::sender::qwp_ws::WsStream;
 use crate::ws::frame::{self, FrameError, FrameHeader, Opcode, encode_client_frame};
 use crate::ws::mask::{MaskKeySource, apply_mask};
@@ -124,19 +124,32 @@ pub(crate) struct ColumnConn {
     /// Sticky: once `true`, the connection cannot be used for further
     /// publishes; the pool drops the slot on return.
     must_close: bool,
+    /// Sticky: set when `must_close` was latched by a **transport-level**
+    /// failure (socket write/read error, EOF, server-closed, framing/parse
+    /// error) — i.e. the cases that surface as `FailoverRetry`. The pool reads
+    /// this on return to decide whether to mark the connection's endpoint
+    /// unhealthy: a transport death rotates future borrows away from the dead
+    /// peer, but a server-data rejection (schema / `ServerFlushError`) or a
+    /// pool-driven `mark_must_close` (un-sync'd pending frames) leaves the
+    /// endpoint healthy.
+    transport_dead: bool,
+    /// Index into the pool's configured endpoint list this connection was
+    /// opened against. The pool marks this endpoint unhealthy in its shared
+    /// health tracker when the connection dies, so subsequent borrows rotate
+    /// to a live endpoint instead of re-hitting the dead peer.
+    endpoint_idx: usize,
     max_buf_size: usize,
     request_timeout: Duration,
     durable_ack_opt_in: bool,
 }
 
 impl ColumnConn {
-    /// Open a fresh column-sender connection. The pool layer
-    /// ([`super::QuestDb::connect`]) has already extracted pool-specific
-    /// knobs and refused `sf_*` keys; this function only reaches the
-    /// remaining QWP/WS settings via [`SenderBuilder::from_conf`].
-    pub(crate) fn connect(conf: &str) -> Result<Self> {
-        let builder = SenderBuilder::from_conf(conf)?;
-        let raw = builder.build_qwp_ws_raw_stream()?;
+    /// Wrap an already-connected, endpoint-tagged raw QWP/WS stream
+    /// ([`RawQwpWsRoundStream`]) opened by the pool's shared
+    /// [`crate::ingress::QwpWsConnector`]. Endpoint selection, TLS, auth, and
+    /// the HTTP→WS upgrade have already happened; this only attaches the
+    /// per-connection ack-bookkeeping state.
+    pub(crate) fn from_round_stream(raw: RawQwpWsRoundStream) -> Result<Self> {
         let mask_keys = MaskKeySource::new()
             .map_err(|e| error::fmt!(SocketError, "MaskKeySource init failed: {}", e.0))?;
         Ok(Self {
@@ -151,6 +164,8 @@ impl ColumnConn {
             durable_watermarks: HashMap::new(),
             pending_durable_targets: HashMap::new(),
             must_close: false,
+            transport_dead: false,
+            endpoint_idx: raw.endpoint_idx,
             max_buf_size: raw.max_buf_size,
             request_timeout: raw.request_timeout,
             durable_ack_opt_in: raw.durable_ack_opt_in,
@@ -175,6 +190,8 @@ impl ColumnConn {
             durable_watermarks: HashMap::new(),
             pending_durable_targets: HashMap::new(),
             must_close: false,
+            transport_dead: false,
+            endpoint_idx: 0,
             max_buf_size: 1 << 20,
             request_timeout: Duration::from_secs(30),
             durable_ack_opt_in,
@@ -188,6 +205,17 @@ impl ColumnConn {
 
     pub(crate) fn must_close(&self) -> bool {
         self.must_close
+    }
+
+    /// `true` when `must_close` was latched by a transport-level failure (the
+    /// pool then marks this connection's endpoint unhealthy).
+    pub(crate) fn transport_dead(&self) -> bool {
+        self.transport_dead
+    }
+
+    /// Index of the pool endpoint this connection was opened against.
+    pub(crate) fn endpoint_idx(&self) -> usize {
+        self.endpoint_idx
     }
 
     /// Force the connection into the terminal `must_close` state so
@@ -480,9 +508,15 @@ impl ColumnConn {
     }
 
     /// Latches the connection as terminal and returns the originating
-    /// error. Used by every socket-side failure path.
+    /// error. Used by every socket-side failure path. A `SocketError` is a
+    /// transport death (reconnectable), so it also flags `transport_dead` for
+    /// the pool's endpoint-health bookkeeping; server-data rejections
+    /// (`ServerFlushError` / schema) latch without that flag.
     fn latch(&mut self, err: crate::Error) -> crate::Error {
         self.must_close = true;
+        if err.code() == crate::ErrorCode::SocketError {
+            self.transport_dead = true;
+        }
         err
     }
 
@@ -555,6 +589,7 @@ impl ColumnConn {
                         Opcode::Pong => continue,
                         Opcode::Close => {
                             self.must_close = true;
+                            self.transport_dead = true;
                             return Err(error::fmt!(
                                 SocketError,
                                 "QWP/WebSocket server closed the connection"
@@ -627,6 +662,7 @@ impl ColumnConn {
                 }
                 Opcode::Close => {
                     self.must_close = true;
+                    self.transport_dead = true;
                     return Err(error::fmt!(
                         SocketError,
                         "QWP/WebSocket server closed the connection"

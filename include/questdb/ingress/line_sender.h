@@ -139,6 +139,12 @@ typedef enum line_sender_error_code
      *  (column count, name encoding, C Data Interface contract).
      *  `arrow` feature only. */
     line_sender_error_arrow_ingest = 16,
+
+    /** Reconnectable failure on the column-major sender's flush/sync
+     *  path (transport error, EOF, closed connection). The operation
+     *  has not committed: drop the connection, borrow a fresh one (the
+     *  pool rotates to a live endpoint), and re-drive from your source. */
+    line_sender_error_failover_retry = 17,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */

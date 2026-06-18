@@ -46,6 +46,28 @@ use super::encoder;
 #[cfg(feature = "arrow")]
 use arrow_array::RecordBatch;
 
+/// Map a flush/sync failure onto the failover taxonomy.
+///
+/// Transport-level failures — connection reset, EOF, server-closed, framing
+/// errors — surface from [`ColumnConn`] as [`ErrorCode::SocketError`] and are
+/// **transient**: a fresh connection from the pool (which rotates to a live
+/// endpoint) can re-drive the uncommitted tail. We re-tag these
+/// [`ErrorCode::FailoverRetry`] so callers can tell "retry on a fresh conn"
+/// from "give up".
+///
+/// Everything else stays terminal: `AuthError` / `ProtocolVersionError`
+/// (credentials / negotiation), `ServerFlushError` and `ServerRejection`
+/// (the server refused the *data*), and `InvalidApiCall` / schema rejections
+/// (a re-drive would fail identically until the retry budget drains). This is
+/// the finer split the failover design calls for over the row API's coarse
+/// `reconnect_error_is_terminal`.
+fn classify_flush_error(err: crate::Error) -> crate::Error {
+    if err.code() == ErrorCode::SocketError {
+        return crate::Error::new(ErrorCode::FailoverRetry, err.msg().to_owned());
+    }
+    err
+}
+
 /// Acknowledgement level for [`ColumnSender::sync`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -147,7 +169,8 @@ impl ColumnSender {
     /// connection (and their acks) rather than reusing it.
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
         let defer = self.first_frame_sent;
-        self.flush_inner(chunk, defer)?;
+        self.flush_inner(chunk, defer)
+            .map_err(classify_flush_error)?;
         self.first_frame_sent = true;
         Ok(())
     }
@@ -187,7 +210,8 @@ impl ColumnSender {
         overrides: &[ArrowColumnOverride<'_>],
     ) -> Result<()> {
         let defer = self.first_frame_sent;
-        self.flush_arrow_batch_inner(table, batch, None, overrides, defer)?;
+        self.flush_arrow_batch_inner(table, batch, None, overrides, defer)
+            .map_err(classify_flush_error)?;
         self.first_frame_sent = true;
         Ok(())
     }
@@ -208,7 +232,8 @@ impl ColumnSender {
     ) -> Result<()> {
         let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
         let defer = self.first_frame_sent;
-        self.flush_arrow_batch_inner(table, batch, Some(ts_col_idx), overrides, defer)?;
+        self.flush_arrow_batch_inner(table, batch, Some(ts_col_idx), overrides, defer)
+            .map_err(classify_flush_error)?;
         self.first_frame_sent = true;
         Ok(())
     }
@@ -229,8 +254,11 @@ impl ColumnSender {
 
         // Send a commit-triggering empty frame (no FLAG_DEFER_COMMIT).
         let mut commit_chunk = Chunk::new("");
-        self.flush_inner(&mut commit_chunk, /* defer_commit = */ false)?;
-        self.conn.sync_all_acks(ack_level)
+        self.flush_inner(&mut commit_chunk, /* defer_commit = */ false)
+            .map_err(classify_flush_error)?;
+        self.conn
+            .sync_all_acks(ack_level)
+            .map_err(classify_flush_error)
     }
 
     fn flush_inner(&mut self, chunk: &mut Chunk<'_>, defer_commit: bool) -> Result<()> {

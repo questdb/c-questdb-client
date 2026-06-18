@@ -113,6 +113,12 @@ enum class line_sender_error_code
      *  Arrow C Data Interface). Only raised with the `arrow` feature
      *  enabled. */
     arrow_ingest = 16,
+
+    /** Reconnectable failure on the column-major sender's flush/sync path
+     *  (transport error, EOF, closed connection). The operation has not
+     *  committed: drop the connection, borrow a fresh one (the pool rotates
+     *  to a live endpoint), and re-drive from your source. */
+    failover_retry = 17,
 };
 
 /** The protocol used to connect with. */

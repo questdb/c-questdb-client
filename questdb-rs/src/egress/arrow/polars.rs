@@ -36,10 +36,24 @@ impl Cursor<'_> {
     /// errors as `NoSchema`. Drift detection is inherited from
     /// [`Cursor::iter_polars`].
     pub fn fetch_all_polars(&mut self) -> Result<DataFrame> {
+        // Materialise-whole: the full result is built internally before
+        // anything is handed back, so a mid-query failover replays the
+        // query from `batch_seq 0` transparently. Opt into replay and
+        // drop the partial accumulation when the cursor reports a reset.
+        self.enable_internal_replay();
         let mut iter = self.iter_polars()?;
+        let mut resets_seen = iter.failover_resets();
         let mut acc: Option<DataFrame> = None;
-        for item in iter.by_ref() {
+        loop {
+            // Manual drive (not `for`/`by_ref`) so the reset counter can be
+            // polled between batches without holding an iterator borrow.
+            let Some(item) = iter.next() else { break };
             let df = item?;
+            let resets_now = iter.failover_resets();
+            if resets_now != resets_seen {
+                resets_seen = resets_now;
+                acc = None;
+            }
             acc = Some(match acc {
                 None => df,
                 Some(mut prev) => {
@@ -70,6 +84,13 @@ pub struct CursorPolarsIter<'r, 'c> {
     schema: SchemaRef,
     pending: Option<RecordBatch>,
     poisoned: bool,
+    /// `Cursor::failover_resets()` at the point `schema` was pinned. A
+    /// later batch arriving with a higher count is the first frame of a
+    /// transparently-replayed query (re-read from `batch_seq 0` on a new
+    /// endpoint), so the pinned schema is re-snapshotted from it rather
+    /// than treated as drift. `fetch_all_polars` reads the same counter to
+    /// discard its partial `vstack` accumulation.
+    resets_at_pin: u32,
 }
 
 impl<'r, 'c> CursorPolarsIter<'r, 'c> {
@@ -81,11 +102,13 @@ impl<'r, 'c> CursorPolarsIter<'r, 'c> {
             )
         })?;
         let schema = first.schema();
+        let resets_at_pin = cursor.failover_resets();
         Ok(Self {
             cursor,
             schema,
             pending: Some(first),
             poisoned: false,
+            resets_at_pin,
         })
     }
 
@@ -93,6 +116,13 @@ impl<'r, 'c> CursorPolarsIter<'r, 'c> {
     /// (see [`has_tentative_array`]).
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// Reconnect count observed by the underlying cursor. `fetch_all_polars`
+    /// polls this between batches: an increase means the query was replayed
+    /// from scratch, so anything accumulated so far must be dropped.
+    pub(crate) fn failover_resets(&self) -> u32 {
+        self.cursor.failover_resets()
     }
 }
 
@@ -106,9 +136,22 @@ impl Iterator for CursorPolarsIter<'_, '_> {
         let rb = if let Some(rb) = self.pending.take() {
             rb
         } else {
-            match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
+            // A transparent mid-query failover re-reads the result from
+            // `batch_seq 0` on a new endpoint, so the pinned schema is
+            // re-snapshotted from the first replayed batch instead of
+            // being compared against it. Pass `None` (no drift check)
+            // for that frame so the new node's batch 0 isn't rejected.
+            let drift_check = if self.cursor.failover_resets() == self.resets_at_pin {
+                Some(&self.schema)
+            } else {
+                None
+            };
+            match self.cursor.next_arrow_batch_inner(drift_check) {
                 Ok(Some(rb)) => {
-                    if has_tentative_array(&self.schema) && rb.schema() != self.schema {
+                    if self.cursor.failover_resets() != self.resets_at_pin {
+                        self.schema = rb.schema();
+                        self.resets_at_pin = self.cursor.failover_resets();
+                    } else if has_tentative_array(&self.schema) && rb.schema() != self.schema {
                         self.poisoned = true;
                         return Some(Err(Error::new(
                             ErrorCode::SchemaDrift,

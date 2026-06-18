@@ -40,6 +40,13 @@ pub struct CursorRecordBatchReader<'r, 'c> {
     schema: SchemaRef,
     pending: Option<RecordBatch>,
     poisoned: bool,
+    /// `Cursor::failover_resets()` at the point `schema` was pinned. A
+    /// later batch arriving with a higher count is the first frame of a
+    /// transparently-replayed query (re-read from `batch_seq 0` on a new
+    /// endpoint), so the pinned schema is re-snapshotted from it rather
+    /// than treated as drift. `fetch_all_arrow` reads the same counter to
+    /// discard its partial accumulation.
+    resets_at_pin: u32,
 }
 
 impl<'r, 'c> CursorRecordBatchReader<'r, 'c> {
@@ -51,11 +58,13 @@ impl<'r, 'c> CursorRecordBatchReader<'r, 'c> {
             )
         })?;
         let schema = first.schema();
+        let resets_at_pin = cursor.failover_resets();
         Ok(Self {
             cursor,
             schema,
             pending: Some(first),
             poisoned: false,
+            resets_at_pin,
         })
     }
 
@@ -63,6 +72,13 @@ impl<'r, 'c> CursorRecordBatchReader<'r, 'c> {
     /// trait method, exposed for callers without the trait imported.
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// Reconnect count observed by the underlying cursor. `fetch_all_arrow`
+    /// polls this between batches: an increase means the query was replayed
+    /// from scratch, so anything accumulated so far must be dropped.
+    pub(crate) fn failover_resets(&self) -> u32 {
+        self.cursor.failover_resets()
     }
 }
 
@@ -76,9 +92,23 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
         if let Some(rb) = self.pending.take() {
             return Some(Ok(rb));
         }
-        match self.cursor.next_arrow_batch_inner(Some(&self.schema)) {
+        // A transparent mid-query failover re-reads the result from
+        // `batch_seq 0` on a new endpoint, so the pinned schema is
+        // re-snapshotted from the first replayed batch instead of being
+        // compared against it; the drift check resumes against the new
+        // schema. Pass `None` (no drift check) for that first replayed
+        // frame so the new node's batch 0 isn't rejected as drift.
+        let drift_check = if self.cursor.failover_resets() == self.resets_at_pin {
+            Some(&self.schema)
+        } else {
+            None
+        };
+        match self.cursor.next_arrow_batch_inner(drift_check) {
             Ok(Some(rb)) => {
-                if has_tentative_array(&self.schema) && rb.schema() != self.schema {
+                if self.cursor.failover_resets() != self.resets_at_pin {
+                    self.schema = rb.schema();
+                    self.resets_at_pin = self.cursor.failover_resets();
+                } else if has_tentative_array(&self.schema) && rb.schema() != self.schema {
                     self.poisoned = true;
                     return Some(Err(external_arrow_error(Error::new(
                         ErrorCode::SchemaDrift,

@@ -97,6 +97,14 @@ pub enum ErrorCode {
     /// name encoding, ARROW C Data Interface invariants on a freshly
     /// imported array, etc.). Only emitted on the `arrow` feature.
     ArrowIngest,
+
+    /// A reconnectable failure on the column-major sender's flush/sync path
+    /// (transport error, EOF, or a closed connection). The operation has not
+    /// committed; the caller should obtain a fresh connection from the pool
+    /// (which rotates to a live endpoint) and re-drive from its source. Distinct
+    /// from terminal failures (auth / protocol / schema / server rejection),
+    /// which must not be retried.
+    FailoverRetry,
 }
 
 /// An error that occurred when using QuestDB client library.

@@ -4556,3 +4556,186 @@ fn progress_callback_disconnected_fires_before_any_dial() {
         "Disconnected must fire before the first Retrying"
     );
 }
+
+// ---------------------------------------------------------------------------
+// F4 — egress read failover wired into the materialise-whole DataFrame
+//      helpers. `fetch_all_polars` / `fetch_all_arrow` install an internal
+//      reset opt-in and discard their partial accumulation on a mid-query
+//      failover, so replay-from-batch-0 yields a complete, in-order result.
+//      The streaming entry points (`iter_polars`) deliberately keep
+//      surfacing `FailoverWouldDuplicate`.
+// ---------------------------------------------------------------------------
+
+/// Server A: schema-bearing batch 0, then drop mid-stream. Server B:
+/// the full result (its own batch 0 + a continuation + RESULT_END).
+/// Shared by the F4 materialise-whole and streaming scenarios so both
+/// see the identical "data delivered, then connection dies" sequence.
+#[cfg(feature = "polars")]
+fn f4_drop_after_batch_servers() -> (MockServer, MockServer) {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![10, 20]),
+        },
+        Action::SendBatch {
+            batch_seq: 1,
+            column: BatchColumn::Long(vec![30]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    (srv_a, srv_b)
+}
+
+/// Materialise-whole path: a mid-query failover after the first batch
+/// must replay transparently — the internal reset opt-in clears the
+/// silent-duplicate guard, the partial accumulation from server A is
+/// discarded, and `fetch_all_polars` returns B's complete, in-order
+/// result exactly once (no A rows, no duplicates).
+#[test]
+#[cfg(feature = "polars")]
+fn fetch_all_polars_failover_after_batch_yields_complete_result() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // No user callback: the helper installs its own internal reset.
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let df = cursor
+        .fetch_all_polars()
+        .expect("materialise-whole must replay transparently");
+
+    assert_eq!(cursor.failover_resets(), 1, "exactly one reset to server B");
+    assert_eq!(df.height(), 3, "A's partial batch must be discarded");
+    let col = &df.columns()[0];
+    assert_eq!(col.name().as_str(), "v");
+    let series = col.as_materialized_series();
+    let vals = series.i64().expect("LONG column");
+    assert_eq!(
+        (vals.get(0), vals.get(1), vals.get(2)),
+        (Some(10), Some(20), Some(30)),
+        "result must be B's rows in order, with no carry-over from A"
+    );
+}
+
+/// Same `fetch_all_polars` transparency, but a user-supplied
+/// `on_failover_reset` is already installed: the helper must leave it in
+/// place (not clobber the caller's contract) and still produce the
+/// complete result. The callback fires exactly once.
+#[test]
+#[cfg(feature = "polars")]
+fn fetch_all_polars_preserves_user_reset_callback() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let resets = Arc::new(AtomicUsize::new(0));
+    let resets_cb = Arc::clone(&resets);
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(move |_ev: &FailoverEvent| {
+            resets_cb.fetch_add(1, Ordering::SeqCst);
+        })
+        .execute()
+        .expect("execute");
+
+    let df = cursor.fetch_all_polars().expect("replay transparently");
+    assert_eq!(df.height(), 3);
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "the user-installed reset callback must still fire"
+    );
+}
+
+/// Streaming path: the same drop-after-batch scenario through
+/// `iter_polars` must NOT silently reset — one batch has already left
+/// the iterator, so a mid-query failover surfaces
+/// `FailoverWouldDuplicate` for the consumer to re-issue.
+#[test]
+#[cfg(feature = "polars")]
+fn iter_polars_failover_after_batch_surfaces_would_duplicate() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let mut iter = cursor.iter_polars().expect("iter_polars");
+
+    // First DataFrame: A's batch 0, before the drop.
+    let first = iter
+        .next()
+        .expect("first item present")
+        .expect("first batch ok");
+    assert_eq!(first.height(), 2);
+
+    // Second pull observes A's drop. A batch already left the iterator
+    // and no replay opt-in is installed on this streaming path, so the
+    // cursor refuses to replay.
+    let err = match iter.next() {
+        Some(Err(e)) => e,
+        other => panic!("streaming failover must surface an error; got {:?}", other),
+    };
+    assert_eq!(err.code(), ErrorCode::FailoverWouldDuplicate);
+
+    drop(iter);
+    assert_eq!(
+        cursor.failover_resets(),
+        0,
+        "the guard must fire before any reconnect on the streaming path"
+    );
+}
+
+/// Materialise-whole Arrow path mirrors the polars one:
+/// `fetch_all_arrow` discards its partial batch vector on the mid-query
+/// failover and returns B's complete batch set, pinned to B's schema.
+#[test]
+#[cfg(feature = "polars")]
+fn fetch_all_arrow_failover_after_batch_yields_complete_result() {
+    let (srv_a, srv_b) = f4_drop_after_batch_servers();
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let (_schema, batches) = cursor
+        .fetch_all_arrow()
+        .expect("materialise-whole must replay transparently");
+
+    assert_eq!(cursor.failover_resets(), 1, "exactly one reset to server B");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 3,
+        "A's partial batch must be discarded; only B's rows remain"
+    );
+}
