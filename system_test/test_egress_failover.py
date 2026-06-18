@@ -286,6 +286,19 @@ class DockerStandaloneInstance:
         the server close gracefully and would NOT exercise failover.
       - `stop()` => `docker stop` (SIGTERM): a graceful shutdown.
 
+    Networking uses `--network host` rather than published ports. A
+    published port goes through docker-proxy, a userland copy-loop that
+    eagerly drains the server's stream into its own buffer regardless of
+    the WS reader's app-level pacing; after `docker kill` the client
+    keeps reading those buffered batches, so the exhaustion tests (which
+    require next_batch() to fail once every endpoint is dead) wrongly see
+    Ok. `--network host` removes docker-proxy, so the client talks
+    straight to the server on loopback and the kill is observed
+    immediately - exactly as for a local process. (Consequence:
+    docker-mode failover requires a Linux host with real host
+    networking; Docker Desktop on macOS/Windows cannot reach a
+    host-networked container, so use --repo there.)
+
     The data dir is only used as a place to persist the captured
     container log (`docker logs`) for `dump_log()` and CI archival; the
     server's own data lives inside the ephemeral container.
@@ -317,11 +330,13 @@ class DockerStandaloneInstance:
             'QDB_TELEMETRY_ENABLED': 'false',
             'QDB_CAIRO_COMMIT_LAG': '100',
         }
-        cmd = ['run', '-d', '--name', self._container]
+        # --network host (not -p): see the class docstring. The server
+        # binds the discovered ports directly on the host stack, so the
+        # client reaches it on 127.0.0.1:<port> with no docker-proxy
+        # buffering between them.
+        cmd = ['run', '-d', '--name', self._container, '--network', 'host']
         for key, value in env.items():
             cmd += ['-e', f'{key}={value}']
-        for port in (self.http_port, self.ilp_port, self.pg_port):
-            cmd += ['-p', f'127.0.0.1:{port}:{port}']
         cmd += [self.image]
         sys.stderr.write(
             f'[{self.label}] docker run {self._container} '
