@@ -18,7 +18,7 @@
 # questdb-building job working whichever way questdb master flips next.
 steps:
   - script: |
-      git clone --depth 1 https://github.com/questdb/questdb.git
+      git clone --depth 1 --branch steve-rm-bins https://github.com/questdb/questdb.git
     displayName: git clone questdb
   - bash: |
       # No `pipefail`: the version extraction is `sed ... | head -1`, and

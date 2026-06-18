@@ -233,7 +233,7 @@ stages:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-DskipTests -Pbuild-web-console,build-binaries$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"
@@ -307,7 +307,7 @@ stages:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-DskipTests -Pbuild-web-console,build-binaries$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -404,7 +404,7 @@ stages:
               mavenPOMFile: "questdb/pom.xml"
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME)"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-DskipTests -Pbuild-web-console,build-binaries$(CLIENT_PROFILE)"
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
@@ -457,7 +457,7 @@ stages:
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "default"
-              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+              options: "-DskipTests -Pbuild-web-console,build-binaries$(CLIENT_PROFILE)"
           - script: |
               set -euxo pipefail
               cd questdb-rs
