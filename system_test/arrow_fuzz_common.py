@@ -73,6 +73,7 @@ __all__ = [
     "existing_sender",
     "borrowed_conn",
     "temp_sf_dir",
+    "sfa_file_count",
     "wait_for_rows",
     "make_table_name",
     "drop_table_safe",
@@ -153,6 +154,12 @@ def temp_sf_dir(prefix: str = "arrow_"):
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+def sfa_file_count(sf_dir: str, sender_id: str) -> int:
+    slot_dir = os.path.join(sf_dir, sender_id)
+    if not os.path.isdir(slot_dir):
+        return 0
+    return sum(1 for name in os.listdir(slot_dir) if name.endswith(".sfa"))
+
 def wait_for_rows(
     fixture, table: str, expected: int, *, timeout: float = 20.0
 ) -> int:
@@ -201,11 +208,12 @@ def drop_table_safe(fixture, table: str) -> None:
         )
 
 @contextlib.contextmanager
-def borrowed_conn(fixture, **conf_extras: str):
+def borrowed_conn(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
     """Open a `questdb_db*` pool from the fixture, borrow one
     `qwpws_conn*`, and yield the raw conn pointer. Returns the conn
     to the pool on exit (or drops it if the conn latched as terminal)
-    and closes the pool."""
+    and closes the pool. Set `sync_on_exit=False` when a test needs to
+    assert the exact `column_sender_sync` error."""
     from test import skip_if_unsupported_qwp_ws_fixture
     conf = ingress_conf(fixture, **conf_extras).encode("utf-8")
     try:
@@ -221,10 +229,11 @@ def borrowed_conn(fixture, **conf_extras: str):
             raise
         try:
             yield conn
-            try:
-                column_sender_sync(conn, 0)
-            except SenderError:
-                pass
+            if sync_on_exit:
+                try:
+                    column_sender_sync(conn, 0)
+                except SenderError:
+                    pass
         finally:
             if conn_must_close(conn):
                 db_drop_conn(db, conn)

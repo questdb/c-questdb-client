@@ -5,6 +5,8 @@ import ctypes
 import datetime as _dt
 import os
 import sys
+import threading
+import time
 import unittest
 import uuid as _uuid_mod
 from decimal import Decimal
@@ -18,6 +20,7 @@ from arrow_ffi import (
     ArrowSenderError,
     SenderErrorCode,
 )
+from questdb_line_sender import QwpWsErrorCategory, QwpWsErrorPolicy
 
 _FUZZ_ITERATIONS = int(os.environ.get("ARROW_INGRESS_FUZZ_ITERATIONS", "6"))
 _ROWS_PER_BATCH = int(os.environ.get("ARROW_INGRESS_FUZZ_ROWS", "12"))
@@ -887,6 +890,603 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
         self._ingest_two_batches(table, rb1, rb2)
         afc.wait_for_rows(self._fixture, table, 8)
 
+class TestArrowIngressSfa(afc.ArrowFuzzBase):
+    """Columnar Arrow ingress through the QWP/WebSocket SFA backend."""
+
+    SUITE_LABEL = "arrow_ingress_sfa"
+    BOUNCE_COUNT = 2
+    BOUNCE_BATCH_ROWS = 5
+
+    def _sfa_extras(self, sender_id: str, sf_dir: str) -> Dict[str, str]:
+        return {
+            "sender_id": sender_id,
+            "sf_dir": sf_dir,
+            "pool_size": "1",
+            "pool_max": "1",
+            "pool_reap": "manual",
+            "reconnect_max_duration_millis": "30000",
+            "close_flush_timeout_millis": "30000",
+        }
+
+    def _sfa_conf_for_port(
+        self,
+        port: int,
+        sender_id: str,
+        sf_dir: str,
+        **overrides: str,
+    ) -> bytes:
+        extras = self._sfa_extras(sender_id, sf_dir)
+        extras.update(overrides)
+        parts = [f"qwpws::addr={self._fixture.host}:{port};"]
+        parts.extend(f"{key}={value};" for key, value in extras.items())
+        return "".join(parts).encode("utf-8")
+
+    def _require_managed_plain_qwp_ws(self, purpose: str) -> None:
+        from test import QuestDbFixture
+
+        if not isinstance(self._fixture, QuestDbFixture):
+            self.skipTest(f"{purpose} requires a managed QuestDB fixture")
+        if self._fixture.auth:
+            self.skipTest(f"{purpose} runs without auth")
+        if getattr(self._fixture, "http_auth", False):
+            self.skipTest(f"{purpose} runs without HTTP auth")
+        if self._fixture.http:
+            self.skipTest(f"{purpose} runs outside the HTTP ILP matrix")
+
+    @staticmethod
+    def _exported_batch(rb: pa.RecordBatch):
+        arr, sch = afc.pyarrow_export_record_batch(rb)
+        return arr, sch
+
+    def _flush_batch(self, conn, table: str, rb: pa.RecordBatch) -> None:
+        table_name = afc._c_table_name(table)
+        arr, sch = self._exported_batch(rb)
+        try:
+            afc.conn_flush_arrow_batch(
+                conn,
+                table_name,
+                ctypes.byref(arr),
+                ctypes.byref(sch),
+                ts_column_name=b"ts",
+            )
+        finally:
+            if sch.release:
+                sch.release(ctypes.byref(sch))
+
+    def test_sfa_single_batch_round_trip_and_cleans_slot(self):
+        table = self.fresh_table("arrow_sfa_smoke")
+        sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
+        schema = pa.schema([
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("px", pa.float64(), nullable=False),
+            KIND_REGISTRY["symbol"].make_field("sym", nullable=False),
+            pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+        ])
+        rb = pa.RecordBatch.from_arrays(
+            [
+                pa.array([0, 1, 2], type=pa.int64()),
+                pa.array([10.5, 20.5, 30.5], type=pa.float64()),
+                pa.array(["alpha", "bravo", "charlie"], type=pa.utf8()),
+                pa.array(
+                    [
+                        1_700_000_000_000_000,
+                        1_700_000_000_001_000,
+                        1_700_000_000_002_000,
+                    ],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+            ],
+            schema=schema,
+        )
+
+        with afc.temp_sf_dir("arrow_sfa_smoke_") as sf_dir:
+            afc.ingest_via_arrow(
+                self._fixture,
+                table,
+                rb,
+                sender_conf_extras=self._sfa_extras(sender_id, sf_dir),
+            )
+            self.assertEqual(
+                afc.sfa_file_count(sf_dir, sender_id),
+                0,
+                self.label("SFA files left after synced single-batch ingest"),
+            )
+
+        afc.wait_for_rows(self._fixture, table, 3)
+        resp = self._fixture.http_sql_query(
+            f"select id, px, sym from '{table}' order by ts"
+        )
+        self.assertEqual(
+            resp["dataset"],
+            [[0, 10.5, "alpha"], [1, 20.5, "bravo"], [2, 30.5, "charlie"]],
+            self.label(),
+        )
+
+    def test_sfa_schema_evolution_across_batches(self):
+        table = self.fresh_table("arrow_sfa_schema")
+        sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
+
+        rb1 = pa.RecordBatch.from_arrays(
+            [
+                pa.array([0, 1], type=pa.int64()),
+                pa.array(
+                    [1_700_000_000_000_000, 1_700_000_000_001_000],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+            ],
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]),
+        )
+        rb2 = pa.RecordBatch.from_arrays(
+            [
+                pa.array([2, 3], type=pa.int64()),
+                pa.array(["r2", "r3"], type=pa.utf8()),
+                pa.array([20.5, 30.5], type=pa.float64()),
+                pa.array(
+                    [1_700_000_000_002_000, 1_700_000_000_003_000],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+            ],
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                KIND_REGISTRY["symbol"].make_field("host", nullable=False),
+                pa.field("px", pa.float64(), nullable=False),
+                pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]),
+        )
+
+        with afc.temp_sf_dir("arrow_sfa_schema_") as sf_dir:
+            with afc.borrowed_conn(
+                self._fixture,
+                **self._sfa_extras(sender_id, sf_dir),
+            ) as conn:
+                self._flush_batch(conn, table, rb1)
+                self._flush_batch(conn, table, rb2)
+            self.assertEqual(
+                afc.sfa_file_count(sf_dir, sender_id),
+                0,
+                self.label("SFA files left after schema-evolution ingest"),
+            )
+
+        afc.wait_for_rows(self._fixture, table, 4)
+        resp = self._fixture.http_sql_query(
+            f"select id, host, px from '{table}' order by ts"
+        )
+        self.assertEqual(
+            resp["dataset"],
+            [[0, None, None], [1, None, None], [2, "r2", 20.5], [3, "r3", 30.5]],
+            self.label(),
+        )
+
+    def test_sfa_write_rejection_reports_once_and_continues(self):
+        table = self.fresh_table("arrow_sfa_reject")
+        sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
+        afc.exec_ddl(
+            self._fixture,
+            f'CREATE TABLE "{table}" '
+            '(id LONG, px DOUBLE, bad LONG, ts TIMESTAMP) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL',
+        )
+
+        valid1 = pa.RecordBatch.from_arrays(
+            [
+                pa.array([0], type=pa.int64()),
+                pa.array([10.5], type=pa.float64()),
+                pa.array([1_700_000_000_000_000], type=pa.timestamp("us", tz="UTC")),
+            ],
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("px", pa.float64(), nullable=False),
+                pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]),
+        )
+        rejected = pa.RecordBatch.from_arrays(
+            [
+                pa.array([1], type=pa.int64()),
+                pa.array(["not-a-long"], type=pa.utf8()),
+                pa.array([1_700_000_000_001_000], type=pa.timestamp("us", tz="UTC")),
+            ],
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("bad", pa.utf8(), nullable=False),
+                pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]),
+        )
+        valid2 = pa.RecordBatch.from_arrays(
+            [
+                pa.array([2], type=pa.int64()),
+                pa.array([20.5], type=pa.float64()),
+                pa.array([1_700_000_000_002_000], type=pa.timestamp("us", tz="UTC")),
+            ],
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("px", pa.float64(), nullable=False),
+                pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]),
+        )
+
+        with afc.temp_sf_dir("arrow_sfa_reject_") as sf_dir:
+            with afc.borrowed_conn(
+                self._fixture,
+                sync_on_exit=False,
+                **self._sfa_extras(sender_id, sf_dir),
+            ) as conn:
+                self._flush_batch(conn, table, valid1)
+                self._flush_batch(conn, table, rejected)
+                self._flush_batch(conn, table, valid2)
+
+                with self.assertRaises(ArrowSenderError) as raised:
+                    afc.column_sender_sync(conn, 0)
+                err = raised.exception
+                self.assertEqual(err.code, SenderErrorCode.SERVER_REJECTION)
+                diagnostic = err.qwp_ws_error
+                self.assertIsNotNone(diagnostic)
+                self.assertEqual(
+                    diagnostic.category,
+                    QwpWsErrorCategory.SCHEMA_MISMATCH,
+                )
+                self.assertEqual(
+                    diagnostic.applied_policy,
+                    QwpWsErrorPolicy.DROP_AND_CONTINUE,
+                )
+                self.assertEqual(diagnostic.status, 0x03)
+                self.assertEqual(diagnostic.from_fsn, 1)
+                self.assertEqual(diagnostic.to_fsn, 1)
+
+                afc.column_sender_sync(conn, 0)
+
+            self.assertEqual(
+                afc.sfa_file_count(sf_dir, sender_id),
+                0,
+                self.label("SFA files left after rejection recovery"),
+            )
+
+        afc.wait_for_rows(self._fixture, table, 2)
+        resp = self._fixture.http_sql_query(
+            f"select id, px from '{table}' order by id"
+        )
+        self.assertEqual(
+            resp["dataset"],
+            [[0, 10.5], [2, 20.5]],
+            self.label(),
+        )
+
+    def test_sfa_new_owner_recovers_server_accepted_unacked_batch(self):
+        from test import (
+            QwpWsDropAckProxy,
+            QuestDbFixture,
+            skip_if_unsupported_qwp_ws_fixture,
+        )
+
+        if not isinstance(self._fixture, QuestDbFixture):
+            self.skipTest("SFA restart recovery requires a managed QuestDB fixture")
+        if self._fixture.auth:
+            self.skipTest("SFA drop-ACK proxy tests run without auth")
+        if getattr(self._fixture, "http_auth", False):
+            self.skipTest("SFA drop-ACK proxy tests run without HTTP auth")
+        if self._fixture.http:
+            self.skipTest("SFA drop-ACK proxy tests run outside the HTTP ILP matrix")
+
+        table = self.fresh_table("arrow_sfa_restart")
+        sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
+        afc.exec_ddl(
+            self._fixture,
+            f'CREATE TABLE "{table}" '
+            '(id LONG, px DOUBLE, ts TIMESTAMP) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL '
+            'DEDUP UPSERT KEYS(ts, id)',
+        )
+        rb = pa.RecordBatch.from_arrays(
+            [
+                pa.array([0, 1, 2], type=pa.int64()),
+                pa.array([10.5, 20.5, 30.5], type=pa.float64()),
+                pa.array(
+                    [
+                        1_700_000_000_000_000,
+                        1_700_000_000_001_000,
+                        1_700_000_000_002_000,
+                    ],
+                    type=pa.timestamp("us", tz="UTC"),
+                ),
+            ],
+            schema=pa.schema([
+                pa.field("id", pa.int64(), nullable=False),
+                pa.field("px", pa.float64(), nullable=False),
+                pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+            ]),
+        )
+
+        with afc.temp_sf_dir("arrow_sfa_restart_") as sf_dir:
+            proxy = QwpWsDropAckProxy(
+                self._fixture.host,
+                self._fixture.http_server_port,
+            )
+            proxy.start()
+            conf = self._sfa_conf_for_port(
+                proxy.port,
+                sender_id,
+                sf_dir,
+                reconnect_max_duration_millis="120000",
+                close_flush_timeout_millis="0",
+            )
+            db = None
+            conn = None
+            stopped = False
+            try:
+                try:
+                    db = afc.db_connect(conf)
+                except afc.SenderError as e:
+                    skip_if_unsupported_qwp_ws_fixture(e, self._fixture)
+                    raise
+                try:
+                    conn = afc.db_borrow_conn(db)
+                except afc.SenderError as e:
+                    skip_if_unsupported_qwp_ws_fixture(e, self._fixture)
+                    raise
+                self._flush_batch(conn, table, rb)
+                proxy.join()
+                self._fixture.stop()
+                stopped = True
+            finally:
+                if db is not None and conn is not None:
+                    if afc.conn_must_close(conn):
+                        afc.db_drop_conn(db, conn)
+                    else:
+                        afc.db_return_conn(db, conn)
+                afc.db_close(db)
+                if proxy.is_alive():
+                    proxy.close()
+                if stopped:
+                    self._fixture.start()
+
+            self.assertGreater(
+                afc.sfa_file_count(sf_dir, sender_id),
+                0,
+                self.label(
+                    "server-accepted unacked frame did not leave recoverable SFA files"
+                ),
+            )
+
+            recover_extras = self._sfa_extras(sender_id, sf_dir)
+            recover_extras.update({
+                "reconnect_max_duration_millis": "120000",
+                "close_flush_timeout_millis": "120000",
+            })
+            with afc.borrowed_conn(
+                self._fixture,
+                sync_on_exit=False,
+                **recover_extras,
+            ) as conn:
+                afc.column_sender_sync(conn, 0)
+
+            self.assertEqual(
+                afc.sfa_file_count(sf_dir, sender_id),
+                0,
+                self.label("SFA files left after new-owner recovery"),
+            )
+
+        afc.wait_for_rows(self._fixture, table, 3, timeout=60.0)
+        resp = self._fixture.http_sql_query(
+            f"select id, px from '{table}' order by id"
+        )
+        self.assertEqual(
+            resp["dataset"],
+            [[0, 10.5], [1, 20.5], [2, 30.5]],
+            self.label(),
+        )
+
+    def test_sfa_arrow_producer_survives_server_bounces(self):
+        self._require_managed_plain_qwp_ws("SFA bounce fuzz")
+
+        table = self.fresh_table("arrow_sfa_bounce")
+        sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
+        afc.exec_ddl(
+            self._fixture,
+            f'CREATE TABLE "{table}" '
+            '(id LONG, px DOUBLE, sym SYMBOL, ts TIMESTAMP) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL '
+            'DEDUP UPSERT KEYS(ts, id)',
+        )
+
+        stop_producer = threading.Event()
+        rows_produced = 0
+        producer_errors: List[BaseException] = []
+        progress_lock = threading.Lock()
+
+        def make_batch(first_id: int, count: int) -> pa.RecordBatch:
+            ids = list(range(first_id, first_id + count))
+            return pa.RecordBatch.from_arrays(
+                [
+                    pa.array(ids, type=pa.int64()),
+                    pa.array([row_id * 0.5 for row_id in ids], type=pa.float64()),
+                    pa.array(
+                        [f"sym-{row_id % 4}" for row_id in ids],
+                        type=pa.utf8(),
+                    ),
+                    pa.array(
+                        [
+                            1_700_000_100_000_000 + row_id * 1_000
+                            for row_id in ids
+                        ],
+                        type=pa.timestamp("us", tz="UTC"),
+                    ),
+                ],
+                schema=pa.schema([
+                    pa.field("id", pa.int64(), nullable=False),
+                    pa.field("px", pa.float64(), nullable=False),
+                    KIND_REGISTRY["symbol"].make_field("sym", nullable=False),
+                    pa.field("ts", pa.timestamp("us", tz="UTC"), nullable=False),
+                ]),
+            )
+
+        def current_rows() -> int:
+            with progress_lock:
+                return rows_produced
+
+        def producer(sf_dir: str) -> None:
+            nonlocal rows_produced
+            extras = self._sfa_extras(sender_id, sf_dir)
+            extras.update({
+                "initial_connect_retry": "sync",
+                "reconnect_max_duration_millis": "120000",
+                "reconnect_max_backoff_millis": "250",
+                "close_flush_timeout_millis": "120000",
+            })
+            try:
+                with afc.borrowed_conn(self._fixture, **extras) as conn:
+                    next_id = 0
+                    while not stop_producer.is_set():
+                        batch = make_batch(next_id, self.BOUNCE_BATCH_ROWS)
+                        self._flush_batch(conn, table, batch)
+                        next_id += self.BOUNCE_BATCH_ROWS
+                        with progress_lock:
+                            rows_produced = next_id
+                        time.sleep(0.005)
+            except BaseException as exc:
+                producer_errors.append(exc)
+
+        with afc.temp_sf_dir("arrow_sfa_bounce_") as sf_dir:
+            producer_thread = threading.Thread(
+                target=producer,
+                args=(sf_dir,),
+                name="arrow-sfa-bounce-producer",
+                daemon=True,
+            )
+            producer_thread.start()
+            try:
+                startup_deadline = time.monotonic() + 5
+                while (
+                    current_rows() == 0
+                    and not producer_errors
+                    and time.monotonic() < startup_deadline
+                ):
+                    time.sleep(0.01)
+                if producer_errors:
+                    raise AssertionError(
+                        "producer failed before first server bounce"
+                    ) from producer_errors[0]
+                self.assertGreater(
+                    current_rows(),
+                    0,
+                    self.label("producer did not flush before first bounce"),
+                )
+
+                for bounce_index in range(self.BOUNCE_COUNT):
+                    rows_before_stop = current_rows()
+                    stopped = False
+                    try:
+                        self._fixture.stop()
+                        stopped = True
+                        time.sleep(0.05)
+                        self._fixture.start()
+                        stopped = False
+                    finally:
+                        if stopped:
+                            self._fixture.start()
+                    rows_at_restart = current_rows()
+                    restart_deadline = time.monotonic() + 10
+                    while (
+                        current_rows() <= rows_at_restart
+                        and not producer_errors
+                        and time.monotonic() < restart_deadline
+                    ):
+                        time.sleep(0.01)
+                    if producer_errors:
+                        raise AssertionError(
+                            f"producer failed after restart #{bounce_index + 1}"
+                        ) from producer_errors[0]
+                    self.assertGreater(
+                        current_rows(),
+                        rows_at_restart,
+                        self.label(
+                            f"producer made no progress after restart "
+                            f"#{bounce_index + 1}"
+                        ),
+                    )
+                    self.assertGreater(
+                        current_rows(),
+                        rows_before_stop,
+                        self.label(
+                            f"producer made no progress during bounce "
+                            f"#{bounce_index + 1}"
+                        ),
+                    )
+            finally:
+                stop_producer.set()
+                producer_thread.join(180)
+
+            self.assertFalse(
+                producer_thread.is_alive(),
+                self.label(
+                    f"producer did not finish within 180s "
+                    f"(rows_produced={current_rows()})"
+                ),
+            )
+            if producer_errors:
+                raise AssertionError(
+                    f"producer failed across server bounces "
+                    f"(rows_produced={current_rows()})"
+                ) from producer_errors[0]
+
+            expected = current_rows()
+            self.assertGreater(expected, 0, self.label("producer wrote zero rows"))
+            afc.wait_for_rows(self._fixture, table, expected, timeout=60.0)
+            resp = self._fixture.http_sql_query(
+                f"select count(), count_distinct(id), min(id), max(id) "
+                f"from '{table}'"
+            )
+            self.assertEqual(
+                resp["dataset"],
+                [[expected, expected, 0, expected - 1]],
+                self.label(),
+            )
+            self.assertEqual(
+                afc.sfa_file_count(sf_dir, sender_id),
+                0,
+                self.label("SFA files left after bounce fuzz"),
+            )
+
+    def test_sfa_random_arrow_ingest(self):
+        full_pool = [
+            (n, s) for n, s in KIND_REGISTRY.items()
+            if s.supports_arrow_ingest
+        ]
+        nullable_pool = [(n, s) for n, s in full_pool if s.supports_server_null]
+        sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
+        with afc.temp_sf_dir("arrow_sfa_fuzz_") as sf_dir:
+            extras = self._sfa_extras(sender_id, sf_dir)
+            for it in range(_FUZZ_ITERATIONS):
+                with self.subTest(iter=it):
+                    null_mode = ("valid", "partial", "all_null")[it % 3]
+                    pool = full_pool if null_mode == "valid" else nullable_pool
+                    self._master_rng.shuffle(pool)
+                    picked = pool[: 4 + (it % 4)]
+                    kinds = [
+                        (f"c{i}_{n}", s) for i, (n, s) in enumerate(picked)
+                    ]
+                    rb, _vpc = _build_record_batch_with_ts(
+                        self._master_rng,
+                        _ROWS_PER_BATCH,
+                        kinds,
+                        null_mode=null_mode,
+                    )
+                    table = self.fresh_table(f"arrow_sfa_fuzz_{it}")
+                    afc.create_table_from_kinds(self._fixture, table, kinds)
+                    afc.ingest_via_arrow(
+                        self._fixture,
+                        table,
+                        rb,
+                        sender_conf_extras=extras,
+                    )
+                    afc.wait_for_rows(self._fixture, table, rb.num_rows)
+                    self.assertEqual(
+                        afc.sfa_file_count(sf_dir, sender_id),
+                        0,
+                        self.label(f"SFA files left after fuzz iter={it}"),
+                    )
+
 class TestArrowIngressFuzz(afc.ArrowFuzzBase):
     """Random subsets of kinds × random null modes × random DTS variants."""
 
@@ -921,6 +1521,7 @@ def register(loop_registry):
     loop_registry.append(TestArrowIngressExtraTypes)
     loop_registry.append(TestArrowIngressUnsupportedTypes)
     loop_registry.append(TestArrowIngressMultiBatch)
+    loop_registry.append(TestArrowIngressSfa)
     loop_registry.append(TestArrowIngressFuzz)
 
 if __name__ == "__main__":
