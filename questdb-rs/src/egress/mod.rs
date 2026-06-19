@@ -111,4 +111,38 @@ pub mod _bench_internals {
     pub use crate::egress::schema::Schema;
     pub use crate::egress::symbol_dict::SymbolDict;
     pub use bytes::Bytes;
+
+    /// Assemble an already-decoded [`DecodedBatch`] into an
+    /// `arrow_array::RecordBatch`, mirroring the in-crate
+    /// `Cursor::next_arrow_batch` assembly path (`batch_arrow_schema` +
+    /// `batch_to_record_batch`) so a server-free decode→assemble
+    /// benchmark can isolate the column-build cost on top of the raw
+    /// decode. The egress `schema` and `dict` are the ones
+    /// [`decode_result_batch`] populated for the same payload.
+    #[cfg(feature = "arrow")]
+    pub fn bench_batch_to_record_batch(
+        schema: &Schema,
+        batch: DecodedBatch,
+        dict: &SymbolDict,
+    ) -> crate::egress::error::Result<arrow_array::RecordBatch> {
+        use std::sync::Arc;
+        let arrow_schema = Arc::new(crate::egress::arrow::batch_arrow_schema(schema, &batch)?);
+        crate::egress::arrow::batch_to_record_batch(arrow_schema, schema, batch, dict)
+    }
+
+    /// Full decode→assemble→polars path for the `→ polars DataFrame`
+    /// decoder bench arm: assemble the decoded batch into a
+    /// `RecordBatch` (see [`bench_batch_to_record_batch`]) and hand it
+    /// to polars via the Arrow C Data Interface
+    /// (`record_batch_to_dataframe`). This is the honest
+    /// `decode_plus_assemble`-to-DataFrame microbench with no network.
+    #[cfg(feature = "polars")]
+    pub fn bench_batch_to_polars(
+        schema: &Schema,
+        batch: DecodedBatch,
+        dict: &SymbolDict,
+    ) -> crate::egress::error::Result<polars::frame::DataFrame> {
+        let rb = bench_batch_to_record_batch(schema, batch, dict)?;
+        crate::egress::arrow::polars::record_batch_to_dataframe(rb)
+    }
 }

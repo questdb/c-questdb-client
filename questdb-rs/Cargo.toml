@@ -75,7 +75,14 @@ arrow-data = { version = "58", optional = true, default-features = false }
 # 64-byte aligned allocations for build-pass Arrow buffers (validity,
 # BOOLEAN bit-pack, ARRAY offsets, SYMBOL union dict).
 aligned-vec = { version = "0.6", optional = true }
-polars = { version = ">=0.50, <1.0", optional = true, default-features = false, features = ["dtype-categorical"] }
+# `dtype-datetime` + `timezones` are required for the egress
+# `Series::from_arrow` path: every QuestDB table has a designated
+# TIMESTAMP, which the decoder maps to the tz-aware Arrow
+# `Timestamp(Microsecond, Some("UTC"))`. Without these, materialising a
+# real result set into a polars `DataFrame` (`fetch_all_polars` /
+# `next_polars` / `iter_polars`) fails at runtime on the timestamp
+# column. `dtype-date` covers QuestDB DATE columns symmetrically.
+polars = { version = ">=0.50, <1.0", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "timezones"] }
 polars-arrow = { version = ">=0.50, <1.0", optional = true, default-features = false, features = ["compute"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -302,6 +309,30 @@ required-features = ["sync-sender-qwp-ws"]
 [[example]]
 name = "polars"
 required-features = ["polars", "sync-sender-qwp-ws"]
+
+# Step 3 (doc/QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust Polars ingress parity
+# on the S1 narrow schema. Measures flush_polars_dataframe() e2e + the
+# column-sender encode floor and emits the §3.2 JSON metric contract
+# (client="rust-polars", direction="ingress"). Uses ureq for the DEDUP
+# table create + WAL count gate, hence sync-sender-http. The crate's
+# polars dep currently needs a nightly toolchain. Run with:
+#
+#   cargo +nightly run --release --example qwp_ingress_polars \
+#       --features polars,sync-sender-qwp-ws,sync-sender-http
+[[example]]
+name = "qwp_ingress_polars"
+required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
+
+# Step 3 (§6) — Rust Polars egress parity on S1. Reads the table back via
+# fetch_all_polars / iter_polars / next_polars and reports decode vs
+# assemble vs the honest decode_plus_assemble sum, emitting the §3.2 JSON
+# (direction="egress"). Run with:
+#
+#   cargo +nightly run --release --example qwp_egress_polars \
+#       --features polars,sync-reader-ws,sync-sender-http
+[[example]]
+name = "qwp_egress_polars"
+required-features = ["polars", "sync-reader-ws", "sync-sender-http"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR

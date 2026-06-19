@@ -67,6 +67,8 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
+#[cfg(feature = "polars")]
+use questdb::egress::_bench_internals::bench_batch_to_polars;
 use questdb::egress::_bench_internals::{
     Bytes, Schema, SymbolDict, ZstdScratch, decode_result_batch,
 };
@@ -318,6 +320,13 @@ fn build_workload(row_count: usize) -> Bytes {
         cols.len()
     );
 
+    serialize_batch(&cols, row_count)
+}
+
+/// Serialise a column set into a single `RESULT_BATCH` payload (the
+/// post-FrameHeader bytes `decode_result_batch` consumes). Shared by
+/// the 15-column wide workload and the S1 narrow workload.
+fn serialize_batch(cols: &[ColSpec], row_count: usize) -> Bytes {
     let mut out = Vec::new();
     // Frame prefix: msg_kind + request_id + batch_seq.
     out.push(MSG_KIND_RESULT_BATCH);
@@ -330,18 +339,63 @@ fn build_workload(row_count: usize) -> Bytes {
     varint_u64(cols.len() as u64, &mut out);
 
     // Columns inline: per-column (name, kind). No schema-mode byte, no schema id.
-    for c in &cols {
+    for c in cols {
         varint_u64(c.name.len() as u64, &mut out);
         out.extend_from_slice(c.name.as_bytes());
         out.push(c.kind.as_u8());
     }
 
     // Per-column bodies, in declaration order.
-    for c in &cols {
+    for c in cols {
         out.extend_from_slice(&c.body);
     }
 
     Bytes::from(out)
+}
+
+/// Synthesise the **S1 narrow** `RESULT_BATCH` payload (plan §3.1): the
+/// 5-column headline schema the cross-client parity table reads back —
+/// `ts` TIMESTAMP, `id` LONG, `price` DOUBLE, `sym` SYMBOL (card 8),
+/// `note` VARCHAR (~16 bytes). This is the workload behind the
+/// `→ polars DataFrame` decoder arm: it matches the S1 examples and,
+/// unlike the wide 15-col workload, sticks to the dtypes the crate's
+/// minimal polars feature set (`dtype-categorical` only — no `dtype-i16`
+/// / `dtype-i8`) can build a `Series` from.
+#[cfg(feature = "polars")]
+fn build_s1_workload(row_count: usize) -> Bytes {
+    let cols: Vec<ColSpec> = vec![
+        ColSpec {
+            name: "ts",
+            kind: ColumnKind::Timestamp,
+            body: fixed_le_bytes(row_count, |i| {
+                let base: i64 = 1_700_000_000_000_000;
+                // 1 µs spacing — mirrors the S1 monotonic-unique ts.
+                (base + (i as i64)).to_le_bytes()
+            }),
+        },
+        ColSpec {
+            name: "id",
+            kind: ColumnKind::Long,
+            body: fixed_le_bytes(row_count, |i| (i as i64).to_le_bytes()),
+        },
+        ColSpec {
+            name: "price",
+            kind: ColumnKind::Double,
+            body: fixed_le_bytes(row_count, |i| ((i as f64) * 0.25).to_le_bytes()),
+        },
+        ColSpec {
+            name: "sym",
+            kind: ColumnKind::Symbol,
+            // Cardinality 8 to match the S1 SYMBOL column.
+            body: symbol_body(row_count, 8, 1),
+        },
+        ColSpec {
+            name: "note",
+            kind: ColumnKind::Varchar,
+            body: varchar_body(row_count),
+        },
+    ];
+    serialize_batch(&cols, row_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +446,72 @@ fn bench_decoder(c: &mut Criterion) {
             });
         },
     );
+
+    // `→ polars DataFrame` arms (plan §6 / §3.6): the honest
+    // `decode_plus_assemble` micro on the **S1 narrow** schema (the
+    // shape the cross-client parity table reads back; the wide 15-col
+    // workload above carries Int16/Int8 columns the crate's minimal
+    // polars feature set can't build a Series from). The `decode` arm
+    // is the floor; the `to_polars` arm decodes the same S1 payload and
+    // then assembles it into a polars DataFrame (Arrow RecordBatch build
+    // + zero-copy Arrow C Data Interface handoff), so the difference
+    // isolates the assemble cost. Only compiled when the `polars`
+    // feature is on; the decode-only arm above keeps the bench runnable
+    // under `sync-reader-ws` alone.
+    #[cfg(feature = "polars")]
+    {
+        let s1_payload = build_s1_workload(row_count);
+        {
+            let mut dict = SymbolDict::new();
+            let mut reg: Option<Schema> = None;
+            let mut scratch = ZstdScratch::new();
+            let batch = decode_result_batch(&s1_payload, 0, &mut dict, &mut reg, &mut scratch)
+                .expect("synthesised S1 workload must decode cleanly");
+            assert_eq!(batch.row_count, row_count, "S1 row count round-trip");
+            assert_eq!(batch.columns.len(), 5, "S1 column count round-trip");
+            let schema = reg.as_ref().expect("schema populated by decode");
+            let df = bench_batch_to_polars(schema, batch, &dict)
+                .expect("S1 batch must assemble into a polars DataFrame");
+            assert_eq!(df.height(), row_count, "S1 polars height round-trip");
+            assert_eq!(df.width(), 5, "S1 polars width round-trip");
+        }
+        group.bench_function(format!("s1_5col_{}_rows_decode", row_count), |b| {
+            b.iter(|| {
+                let mut dict = SymbolDict::new();
+                let mut reg: Option<Schema> = None;
+                let mut scratch = ZstdScratch::new();
+                let batch = decode_result_batch(
+                    black_box(&s1_payload),
+                    0,
+                    &mut dict,
+                    &mut reg,
+                    &mut scratch,
+                )
+                .expect("decode");
+                black_box(batch);
+            });
+        });
+        group.bench_function(format!("s1_5col_{}_rows_to_polars", row_count), |b| {
+            b.iter(|| {
+                let mut dict = SymbolDict::new();
+                let mut reg: Option<Schema> = None;
+                let mut scratch = ZstdScratch::new();
+                let batch = decode_result_batch(
+                    black_box(&s1_payload),
+                    0,
+                    &mut dict,
+                    &mut reg,
+                    &mut scratch,
+                )
+                .expect("decode");
+                let schema = reg.as_ref().expect("schema populated by decode");
+                let df = bench_batch_to_polars(schema, batch, &dict)
+                    .expect("decoded batch must assemble into a polars DataFrame");
+                black_box(df);
+            });
+        });
+    }
+
     group.finish();
 }
 
