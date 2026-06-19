@@ -631,7 +631,7 @@ unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Erro
 }
 
 #[cold]
-unsafe fn set_err_out_from_error_with_qwpws(
+pub(crate) unsafe fn set_err_out_from_error_with_qwpws(
     err_out: *mut *mut line_sender_error,
     err: Error,
     qwp_ws_error: Option<QwpWsSenderError>,

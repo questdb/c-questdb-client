@@ -47,7 +47,7 @@ use questdb::{Error, ErrorCode};
 
 #[cfg(feature = "arrow")]
 use crate::{line_sender_column_name, line_sender_table_name};
-use crate::{line_sender_error, set_err_out_from_error};
+use crate::{line_sender_error, set_err_out_from_error, set_err_out_from_error_with_qwpws};
 
 // ===========================================================================
 // Opaque handles
@@ -425,7 +425,8 @@ macro_rules! bubble {
         match $expr {
             Ok(value) => value,
             Err(err) => {
-                unsafe { set_err_out_from_error($err_out, err) };
+                let qwp_ws_error = err.qwp_ws_rejection().cloned();
+                unsafe { set_err_out_from_error_with_qwpws($err_out, err, qwp_ws_error) };
                 return false;
             }
         }

@@ -922,9 +922,9 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         return "".join(parts).encode("utf-8")
 
     def _require_managed_plain_qwp_ws(self, purpose: str) -> None:
-        from test import QuestDbFixture
+        from test import QuestDbDockerFixture, QuestDbFixture
 
-        if not isinstance(self._fixture, QuestDbFixture):
+        if not isinstance(self._fixture, (QuestDbFixture, QuestDbDockerFixture)):
             self.skipTest(f"{purpose} requires a managed QuestDB fixture")
         if self._fixture.auth:
             self.skipTest(f"{purpose} runs without auth")
@@ -932,6 +932,13 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
             self.skipTest(f"{purpose} runs without HTTP auth")
         if self._fixture.http:
             self.skipTest(f"{purpose} runs outside the HTTP ILP matrix")
+
+    def _require_persistent_restart_qwp_ws(self, purpose: str) -> None:
+        from test import QuestDbFixture
+
+        self._require_managed_plain_qwp_ws(purpose)
+        if not isinstance(self._fixture, QuestDbFixture):
+            self.skipTest(f"{purpose} requires restart with persistent server data")
 
     @staticmethod
     def _exported_batch(rb: pa.RecordBatch):
@@ -994,7 +1001,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
 
         afc.wait_for_rows(self._fixture, table, 3)
         resp = self._fixture.http_sql_query(
-            f"select id, px, sym from '{table}' order by ts"
+            f"select id, px, sym from '{table}' order by id"
         )
         self.assertEqual(
             resp["dataset"],
@@ -1052,7 +1059,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
 
         afc.wait_for_rows(self._fixture, table, 4)
         resp = self._fixture.http_sql_query(
-            f"select id, host, px from '{table}' order by ts"
+            f"select id, host, px from '{table}' order by id"
         )
         self.assertEqual(
             resp["dataset"],
@@ -1156,11 +1163,12 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
     def test_sfa_new_owner_recovers_server_accepted_unacked_batch(self):
         from test import (
             QwpWsDropAckProxy,
+            QuestDbDockerFixture,
             QuestDbFixture,
             skip_if_unsupported_qwp_ws_fixture,
         )
 
-        if not isinstance(self._fixture, QuestDbFixture):
+        if not isinstance(self._fixture, (QuestDbFixture, QuestDbDockerFixture)):
             self.skipTest("SFA restart recovery requires a managed QuestDB fixture")
         if self._fixture.auth:
             self.skipTest("SFA drop-ACK proxy tests run without auth")
@@ -1278,7 +1286,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         )
 
     def test_sfa_arrow_producer_survives_server_bounces(self):
-        self._require_managed_plain_qwp_ws("SFA bounce fuzz")
+        self._require_persistent_restart_qwp_ws("SFA bounce fuzz")
 
         table = self.fresh_table("arrow_sfa_bounce")
         sender_id = f"arrow-sfa-{_uuid_mod.uuid4().hex[:8]}"
@@ -1335,7 +1343,11 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 "close_flush_timeout_millis": "120000",
             })
             try:
-                with afc.borrowed_conn(self._fixture, **extras) as conn:
+                with afc.borrowed_conn(
+                    self._fixture,
+                    sync_on_exit=False,
+                    **extras,
+                ) as conn:
                     next_id = 0
                     while not stop_producer.is_set():
                         batch = make_batch(next_id, self.BOUNCE_BATCH_ROWS)
@@ -1344,6 +1356,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                         with progress_lock:
                             rows_produced = next_id
                         time.sleep(0.005)
+                    afc.column_sender_sync(conn, 0)
             except BaseException as exc:
                 producer_errors.append(exc)
 
