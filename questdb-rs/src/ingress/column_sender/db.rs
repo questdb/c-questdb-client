@@ -54,11 +54,11 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "_egress")]
 use crate::egress::Reader;
-use crate::ingress::{Sender, SenderBuilder};
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
 use crate::ingress::{
     QwpWsConnector, RawQwpWsRoundStream, reconnect_backoff_step, reconnect_error_is_terminal,
 };
+use crate::ingress::{Sender, SenderBuilder};
 use crate::{Result, error};
 
 use super::conf::{self, PoolReap};
@@ -580,7 +580,9 @@ impl QuestDb {
     /// Snapshot the number of idle (free) row senders currently in the pool.
     #[doc(hidden)]
     pub fn row_sender_free_count(&self) -> usize {
-        lock_row_sender_state(&self.inner.row_sender_state).free.len()
+        lock_row_sender_state(&self.inner.row_sender_state)
+            .free
+            .len()
     }
 
     /// Snapshot the number of currently-borrowed row senders.

@@ -609,11 +609,7 @@ fn row_sender_pool_grows_and_reuses_physical_connections() {
     let _a = db.borrow_row_sender().expect("reuse 1");
     let _b = db.borrow_row_sender().expect("reuse 2");
     assert_eq!(db.row_sender_free_count(), 1);
-    assert_eq!(
-        server.accepted(),
-        4,
-        "reuse must not open new connections"
-    );
+    assert_eq!(server.accepted(), 4, "reuse must not open new connections");
 }
 
 #[test]
