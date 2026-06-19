@@ -130,8 +130,11 @@ typedef enum column_sender_ack_level
  *   `pool_reap`            (`auto`|`manual`, default `auto`)
  *                                       background reaper opt-in.
  *
- * Store-and-forward keys (`sf_*`, `sender_id`) are refused — use the
- * row-major `line_sender_*` API for on-disk durability.
+ * Store-and-forward is opt-in: `sf_dir` selects the queue-backed column
+ * sender, and `sender_id` / `sf_*` keys are accepted only with `sf_dir`.
+ * In store-and-forward v1 the effective pool size is one active borrower:
+ * explicit `pool_size > 1` or `pool_max > 1` is rejected, and an omitted
+ * `pool_max` is treated as 1 for the column sender.
  */
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
@@ -153,6 +156,10 @@ void questdb_db_close(questdb_db* db);
  *  1. If a previously-returned conn is in the free list, hand it out.
  *  2. Otherwise, if pool size < `pool_max`, open a new connection.
  *  3. Otherwise (at cap), return NULL + `line_sender_error_invalid_api_call`.
+ *
+ * In store-and-forward mode, v1 supports one active borrower. A second
+ * concurrent borrow fails until the borrowed conn is returned. If the previous
+ * SFA backend was force-dropped, the next borrow reopens the same slot.
  *
  * The returned conn is bound to the calling thread until returned.
  */
@@ -200,14 +207,16 @@ void questdb_db_return_conn(
     qwpws_conn* conn);
 
 /**
- * Force-drop a borrowed conn instead of recycling it. Marks the conn
- * terminal (qwpws_conn_must_close becomes true) before the usual
- * pool-return path runs, so the underlying connection is closed and
- * dropped. Invalidates `conn`. Accepts NULL `conn` and no-ops.
+ * Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
+ * (qwpws_conn_must_close becomes true) before the usual pool-return path runs.
+ * Invalidates `conn`. Accepts NULL `conn` and no-ops.
  *
  * Use this in error-recovery paths where the conn may hold in-flight
  * uncommitted frames that the next borrower would otherwise commit
- * alongside their own (the round-3 dirty-sender concern).
+ * alongside their own (the round-3 dirty-sender concern). In
+ * store-and-forward mode this removes the current backend from the pool and
+ * releases the slot lock; unresolved frames remain in `sf_dir` for the next
+ * owner to replay.
  *
  * Mutually exclusive with `questdb_db_return_conn` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
@@ -998,13 +1007,19 @@ bool column_sender_chunk_designated_timestamp_seconds(
  * ACK. On success, `chunk` is cleared (allocations retained) and `true`
  * is returned. On failure, `chunk` is left untouched.
  *
- * The first flush is sent as an immediate commit. Later flushes are sent
- * with QWP's deferred-commit flag so callers can pipeline many chunks.
- * Call `column_sender_sync` after the final flush to send the commit frame
- * and wait until all in-flight frames are acknowledged at `ack_level`.
+ * Direct mode: the first flush is sent as an immediate commit. Later flushes
+ * are sent with QWP's deferred-commit flag so callers can pipeline many
+ * chunks. Call `column_sender_sync` after the final flush to send the commit
+ * frame and wait until all in-flight frames are acknowledged at `ack_level`.
  *
- * The connection keeps one protocol in-flight slot reserved for the sync
- * commit frame. If that reserve would be exhausted, flush returns
+ * Store-and-forward mode: every flushed frame is non-deferred and is first
+ * accepted into the local SFA queue. `column_sender_sync` does not send a
+ * commit frame; it waits for frames already published to the local queue up to
+ * the sync-call boundary. `column_sender_flush` success means local queue
+ * acceptance, not server acknowledgement.
+ *
+ * In direct mode, the connection keeps one protocol in-flight slot reserved
+ * for the sync commit frame. If that reserve would be exhausted, flush returns
  * `line_sender_error_invalid_api_call`; call `column_sender_sync` before
  * flushing more chunks.
  * ------------------------------------------------------------------------- */

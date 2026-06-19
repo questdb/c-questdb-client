@@ -717,8 +717,10 @@ public:
     }
 
     /**
-     * Send a commit-triggering frame and wait for in-flight acks at
-     * the requested level. Throws on error.
+     * Wait for in-flight frames at the requested level. In direct mode this
+     * sends the commit-triggering frame first. In store-and-forward mode,
+     * frames are already non-deferred, so this waits for the published local
+     * queue boundary. Throws on error.
      */
     void sync(column_sender_ack_level level = column_sender_ack_level::ok)
     {
@@ -836,7 +838,9 @@ public:
     /**
      * Force the conn to drop on return instead of recycling. Use when
      * the conn holds in-flight uncommitted frames that the next
-     * borrower would otherwise commit alongside their own.
+     * borrower would otherwise commit alongside their own. In
+     * store-and-forward mode unresolved frames remain in the SFA slot for
+     * replay by the next owner.
      */
     void drop_on_return() noexcept { _force_drop = true; }
 

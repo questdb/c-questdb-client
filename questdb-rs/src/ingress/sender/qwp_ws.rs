@@ -61,7 +61,7 @@ use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
-use super::qwp_ws_publisher::QwpWsReplayEncoder;
+use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::OutboundFrame;
 use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
@@ -203,6 +203,7 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     append_deadline: Duration,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -213,6 +214,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     progress: SfaProgressView,
     cold_effects: VecDeque<RunnerColdEffect>,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -221,6 +223,7 @@ struct SyncQwpWsPendingRunnerCore {
     pending_connect: QwpWsPendingConnect,
     progress: SfaProgressView,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -291,9 +294,11 @@ where
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
+        let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -302,6 +307,7 @@ where
                 progress,
                 cold_effects: VecDeque::new(),
                 backpressure: thread_backpressure,
+                ok_completed_upper: thread_ok_completed_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -318,6 +324,7 @@ where
             producer,
             lifecycle,
             backpressure,
+            ok_completed_upper,
             append_deadline,
             stop,
             thread: Some(thread),
@@ -336,9 +343,11 @@ where
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
+        let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -347,6 +356,7 @@ where
                 pending_connect,
                 progress,
                 backpressure: thread_backpressure,
+                ok_completed_upper: thread_ok_completed_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -363,6 +373,7 @@ where
             producer,
             lifecycle,
             backpressure,
+            ok_completed_upper,
             append_deadline,
             stop,
             thread: Some(thread),
@@ -463,6 +474,33 @@ where
         let store = self.lock_shared()?;
         check_store_error(&store)?;
         Ok(store.completed_fsn())
+    }
+
+    fn ok_fsn(&self) -> crate::Result<Option<u64>> {
+        self.check_error()?;
+        let completed_upper = if let Some(producer) = self.producer.as_ref() {
+            producer
+                .completed_fsn()
+                .map_or(0, |fsn| fsn.saturating_add(1))
+        } else {
+            let store = self.lock_shared()?;
+            check_store_error(&store)?;
+            store.completed_fsn().map_or(0, |fsn| fsn.saturating_add(1))
+        };
+        let upper = self
+            .ok_completed_upper
+            .load(Ordering::Acquire)
+            .max(completed_upper);
+        Ok(upper.checked_sub(1))
+    }
+
+    fn poll_sender_error_overlapping(
+        &self,
+        from_fsn: u64,
+        to_fsn: u64,
+    ) -> crate::Result<Option<QwpWsSenderError>> {
+        let mut store = self.lock_shared()?;
+        Ok(store.poll_sender_error_overlapping(from_fsn, to_fsn))
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
@@ -600,6 +638,16 @@ impl BackpressureNotifier {
     }
 }
 
+fn update_atomic_max(cell: &AtomicU64, value: u64) {
+    let mut current = cell.load(Ordering::Acquire);
+    while value > current {
+        match cell.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl QwpWsPendingConnect {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -729,6 +777,7 @@ impl SyncQwpWsPendingRunnerCore {
                     progress: self.progress.clone(),
                     cold_effects: VecDeque::new(),
                     backpressure: Arc::clone(&self.backpressure),
+                    ok_completed_upper: Arc::clone(&self.ok_completed_upper),
                     lifecycle: self.lifecycle.clone(),
                 });
                 RunnerStep::Continue
@@ -941,6 +990,9 @@ where
     where
         Q: PublicationLog,
     {
+        if let Some(fsn) = progress.ok_fsn {
+            update_atomic_max(&self.ok_completed_upper, fsn.saturating_add(1));
+        }
         self.enqueue_hot_response_events(progress.events);
         if self.flush_cold_effects(shared) == RunnerStep::Stop {
             return RunnerStep::Stop;
@@ -2555,6 +2607,19 @@ pub(crate) fn connect_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<SyncProtocolHandler> {
+    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
+        connect_qwp_ws_background_state(host, port, use_tls, tls_settings, qwp_ws, auth_header)?,
+    )))
+}
+
+pub(crate) fn connect_qwp_ws_background_state(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<String>,
+) -> crate::Result<SyncQwpWsHandlerState> {
     let orphan_config = OrphanDrainerConfig::new(
         host,
         port,
@@ -2612,15 +2677,13 @@ pub(crate) fn connect_qwp_ws(
         orphan_config,
     );
 
-    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
-        SyncQwpWsHandlerState {
-            encoder,
-            runner,
-            server_max_batch_size,
-            orphan_pool,
-            close_drain_timeout: *qwp_ws.close_flush_timeout,
-        },
-    )))
+    Ok(SyncQwpWsHandlerState {
+        encoder,
+        runner,
+        server_max_batch_size,
+        orphan_pool,
+        close_drain_timeout: *qwp_ws.close_flush_timeout,
+    })
 }
 
 fn orphan_candidates(qwp_ws: &QwpWsConfig) -> Vec<std::path::PathBuf> {
@@ -2848,6 +2911,26 @@ pub(crate) fn flush_qwp_ws(
     })
 }
 
+pub(crate) fn publish_qwp_ws_payload_background(
+    state: &mut SyncQwpWsHandlerState,
+    payload: &[u8],
+    max_buf_size: usize,
+) -> crate::Result<u64> {
+    if payload.is_empty() {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Could not flush buffer: QWP/WebSocket encoded message is empty."
+        ));
+    }
+    if payload.len() > max_buf_size {
+        return Err(qwp_ws_encoded_message_size_error(
+            payload.len(),
+            max_buf_size,
+        ));
+    }
+    state.runner.publish_replay_payload(payload)
+}
+
 pub(crate) fn flush_qwp_ws_manual(
     state: &mut ManualQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,
@@ -2913,6 +2996,20 @@ pub(crate) fn qwp_ws_acked_fsn_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     state.runner.acked_fsn()
+}
+
+pub(crate) fn qwp_ws_ok_fsn_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    state.runner.ok_fsn()
+}
+
+pub(crate) fn qwp_ws_poll_sender_error_in_range_background(
+    state: &SyncQwpWsHandlerState,
+    from_fsn: u64,
+    to_fsn: u64,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    state.runner.poll_sender_error_overlapping(from_fsn, to_fsn)
 }
 
 pub(crate) fn qwp_ws_published_fsn_manual(
@@ -3997,6 +4094,7 @@ mod tests {
             progress,
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -4048,6 +4146,7 @@ mod tests {
             progress: progress.clone(),
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -4103,16 +4202,19 @@ mod tests {
         let lifecycle = store.lifecycle();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let mut core = SyncQwpWsRunnerCore {
             send_core,
             progress: progress.clone(),
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::clone(&ok_completed_upper),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
 
         assert_eq!(core.drive_step(&shared, &stop), RunnerStep::Continue);
+        assert_eq!(ok_completed_upper.load(Ordering::Acquire), 1);
         assert_eq!(progress.completed_fsn(), None);
 
         let mut guard = Some(shared.lock().unwrap());
@@ -4133,6 +4235,27 @@ mod tests {
             let _ = step_thread.join();
             panic!("durable ACK progress waited for shared-store mutex");
         });
+    }
+
+    #[test]
+    fn threaded_sfa_ok_fsn_uses_completed_fsn_lower_bound() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"sfa-completed").unwrap();
+        let (store, send_core) = driver.into_parts();
+        let progress = store.progress_view();
+        progress.complete_through_fsn(receipt.fsn).unwrap();
+        let runner =
+            SyncQwpWsRunner::start_with_append_deadline(store, send_core, Duration::from_secs(5));
+
+        assert_eq!(runner.ok_fsn().unwrap(), Some(receipt.fsn));
     }
 
     #[test]

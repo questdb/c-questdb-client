@@ -49,8 +49,11 @@ use crate::ingress::column_sender::{AckLevel, Chunk, QuestDb};
 use crate::tests::qwp_ws::{
     perform_server_upgrade, read_frame, write_qwp_error_response, write_qwp_ok_response,
 };
+use tempfile::TempDir;
 
-#[derive(Clone, Copy, Debug)]
+const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
+
+#[derive(Clone, Debug)]
 enum MockMode {
     /// Park the connection after upgrade — used by pool-only tests.
     Park,
@@ -58,6 +61,10 @@ enum MockMode {
     AckEachFrame,
     /// Reply to every QWP frame with an error ack carrying `status`.
     ErrorEachFrame(u8),
+    /// Reject the first QWP frame with `status`, then ACK later frames.
+    ErrorFirstThenAck(u8),
+    /// Capture every binary frame but delay ACKs until the flag is set.
+    AckWhenReleased(Arc<AtomicBool>),
     /// Complete the WS upgrade, then immediately close the socket. A client
     /// that opened the connection succeeds, but its first `flush`/`sync` read
     /// hits EOF and surfaces a transient (`FailoverRetry`) transport failure —
@@ -91,6 +98,23 @@ impl MockServer {
 
     fn spawn_erroring(max_accepts: usize, status: u8) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::ErrorEachFrame(status))
+    }
+
+    fn spawn_error_first_then_ack(max_accepts: usize, status: u8) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::ErrorFirstThenAck(status))
+    }
+
+    fn spawn_ack_when_released_capturing(
+        max_accepts: usize,
+    ) -> (Self, Arc<AtomicBool>, mpsc::Receiver<Vec<u8>>) {
+        let release = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let server = Self::spawn_with_mode_capture(
+            max_accepts,
+            MockMode::AckWhenReleased(Arc::clone(&release)),
+            Some(tx),
+        );
+        (server, release, rx)
     }
 
     fn spawn_upgrade_then_close(max_accepts: usize) -> Self {
@@ -218,6 +242,7 @@ fn run_mock_server_accept_loop(
                     .expect("set_nonblocking(false)");
                 let stop = Arc::clone(&stop);
                 let capture = capture.clone();
+                let mode = mode.clone();
                 let h = thread::spawn(move || {
                     if perform_server_upgrade(&mut stream).is_ok() {
                         match mode {
@@ -225,6 +250,12 @@ fn run_mock_server_accept_loop(
                             MockMode::AckEachFrame => ack_each_frame(&mut stream, &stop, capture),
                             MockMode::ErrorEachFrame(status) => {
                                 error_each_frame(&mut stream, &stop, status)
+                            }
+                            MockMode::ErrorFirstThenAck(status) => {
+                                error_first_then_ack(&mut stream, &stop, status)
+                            }
+                            MockMode::AckWhenReleased(release) => {
+                                ack_when_released(&mut stream, &stop, &release, capture)
                             }
                             MockMode::UpgradeThenClose => {
                                 // Drop the stream immediately: the client's
@@ -345,6 +376,81 @@ fn error_each_frame(stream: &mut std::net::TcpStream, stop: &AtomicBool, status:
     }
 }
 
+fn error_first_then_ack(stream: &mut std::net::TcpStream, stop: &AtomicBool, status: u8) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut next_wire_seq: u64 = 0;
+    while !stop.load(Ordering::SeqCst) {
+        match read_frame(stream) {
+            Ok((_fin, opcode, _payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                let result = if next_wire_seq == 0 {
+                    write_qwp_error_response(stream, status, next_wire_seq, b"injected")
+                } else {
+                    write_qwp_ok_response(stream, next_wire_seq)
+                };
+                if result.is_err() {
+                    break;
+                }
+                next_wire_seq += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn ack_when_released(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    release: &AtomicBool,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut next_wire_seq: u64 = 0;
+    while !stop.load(Ordering::SeqCst) {
+        match read_frame(stream) {
+            Ok((_fin, opcode, payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                if let Some(tx) = &capture {
+                    let _ = tx.send(payload);
+                }
+                while !stop.load(Ordering::SeqCst) && !release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if write_qwp_ok_response(stream, next_wire_seq).is_err() {
+                    break;
+                }
+                next_wire_seq += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// Ack the first `n` binary frames the client sends, then close the socket so
 /// the client's next read hits EOF. Models a peer that commits a prefix and
 /// then dies mid-stream.
@@ -397,6 +503,51 @@ fn conf_for_endpoints(ports: &[u16], extras: &str) -> String {
     format!("qwpws::addr={addrs};auth_timeout=2000;reconnect_max_duration_millis=1000;{extras}")
 }
 
+fn append_one_symbol_row<'a>(chunk: &mut Chunk<'a>, symbol: &'a [u8], timestamp: &'a [i64; 1]) {
+    static CODES: [i32; 1] = [0];
+    static OFFSETS: [i32; 2] = [0, 5];
+    assert_eq!(
+        symbol.len(),
+        5,
+        "test helper expects fixed-width symbol payloads"
+    );
+    chunk
+        .symbol_dict_i32("sym", &CODES, &OFFSETS, symbol, None)
+        .unwrap();
+    chunk.designated_timestamp_nanos(timestamp).unwrap();
+}
+
+fn read_test_varint(bytes: &[u8], pos: &mut usize) -> u64 {
+    let mut shift = 0;
+    let mut value = 0u64;
+    loop {
+        let b = bytes[*pos];
+        *pos += 1;
+        value |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
+    }
+}
+
+fn read_test_bytes<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a [u8] {
+    let len = read_test_varint(bytes, pos) as usize;
+    let start = *pos;
+    *pos += len;
+    &bytes[start..start + len]
+}
+
+fn read_symbol_prefix(payload: &[u8]) -> Vec<Vec<u8>> {
+    const QWP_HEADER_LEN: usize = 12;
+    let mut pos = QWP_HEADER_LEN;
+    assert_eq!(read_test_varint(payload, &mut pos), 0, "delta_start");
+    let count = read_test_varint(payload, &mut pos);
+    (0..count)
+        .map(|_| read_test_bytes(payload, &mut pos).to_vec())
+        .collect()
+}
+
 fn unused_local_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused local port");
     listener.local_addr().expect("unused local addr").port()
@@ -410,13 +561,156 @@ fn refuses_non_qwp_ws_schema() {
 }
 
 #[test]
-fn refuses_sf_dir() {
-    let err = QuestDb::connect("qwpws::addr=localhost:9000;sf_dir=/tmp/sf;").unwrap_err();
+fn refuses_store_and_forward_keys_without_sf_dir() {
+    let err = QuestDb::connect("qwpws::addr=localhost:9000;sender_id=s1;").unwrap_err();
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert!(
-        err.msg().contains("store-and-forward") && err.msg().contains("sf_dir"),
+        err.msg().contains("sf_dir") && err.msg().contains("sender_id"),
         "msg: {}",
         err.msg()
+    );
+}
+
+#[test]
+fn store_and_forward_pool_allows_one_active_borrower() {
+    let server = MockServer::spawn(2);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let sender = db.borrow_sender().unwrap();
+    let err = db.borrow_sender().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("store-and-forward"), "{}", err.msg());
+
+    drop(sender);
+    let _again = db.borrow_sender().unwrap();
+}
+
+#[test]
+fn store_and_forward_sync_reports_drop_and_continue_once() {
+    let server = MockServer::spawn_error_first_then_ack(1, QWP_STATUS_SCHEMA_MISMATCH);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let mut chunk = Chunk::new("trades");
+    let qty1 = [1_i64];
+    let ts1 = [1_i64];
+    chunk.column_i64("qty", &qty1, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts1).unwrap();
+    sender.flush(&mut chunk).unwrap();
+    let err = sender
+        .sync(AckLevel::Ok)
+        .expect_err("first SFA frame is schema-rejected");
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        err.qwp_ws_rejection().and_then(|error| error.status),
+        Some(QWP_STATUS_SCHEMA_MISMATCH)
+    );
+
+    let qty2 = [2_i64];
+    let ts2 = [2_i64];
+    chunk.column_i64("qty", &qty2, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts2).unwrap();
+    sender.flush(&mut chunk).unwrap();
+    sender
+        .sync(AckLevel::Ok)
+        .expect("old drop-and-continue rejection must not poison later sync");
+}
+
+#[test]
+fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow() {
+    let server = MockServer::spawn(4);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    {
+        let mut sender = db.borrow_sender().unwrap();
+        sender.mark_must_close();
+        assert!(sender.must_close());
+    }
+
+    assert_eq!(db.free_count(), 0, "forced SFA backend must not recycle");
+    assert_eq!(db.in_use_count(), 0);
+
+    let _again = db
+        .borrow_sender()
+        .expect("next borrow should reopen the SFA slot");
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 2),
+        "SFA force-drop should reopen on next borrow; accepted={}",
+        server.accepted()
+    );
+}
+
+#[test]
+fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk() {
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_sender().unwrap();
+
+    let ts1 = [1_i64];
+    let mut first = Chunk::new("trades");
+    append_one_symbol_row(&mut first, b"alpha", &ts1);
+    sender.flush(&mut first).unwrap();
+    assert!(
+        first.is_empty(),
+        "successful SFA flush should clear the chunk"
+    );
+    let first_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(read_symbol_prefix(&first_payload), vec![b"alpha".to_vec()]);
+
+    let ts2 = [2_i64];
+    let mut failed = Chunk::new("trades");
+    append_one_symbol_row(&mut failed, b"bravo", &ts2);
+    let err = sender
+        .flush(&mut failed)
+        .expect_err("second publish should time out behind max_in_flight=1");
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(
+        err.msg()
+            .contains("timed out waiting for local queue capacity"),
+        "msg: {}",
+        err.msg()
+    );
+    assert!(
+        !failed.is_empty(),
+        "definitely-not-appended SFA failure must keep the chunk retryable"
+    );
+
+    release_acks.store(true, Ordering::SeqCst);
+    sender.sync(AckLevel::Ok).unwrap();
+
+    let ts3 = [3_i64];
+    let mut third = Chunk::new("trades");
+    append_one_symbol_row(&mut third, b"gamma", &ts3);
+    sender.flush(&mut third).unwrap();
+    sender.sync(AckLevel::Ok).unwrap();
+    let third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        read_symbol_prefix(&third_payload),
+        vec![b"alpha".to_vec(), b"gamma".to_vec()],
+        "failed bravo publish must not remain in the replay symbol dictionary"
     );
 }
 

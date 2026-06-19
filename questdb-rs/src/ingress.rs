@@ -415,6 +415,8 @@ pub(crate) struct QwpWsAddrScan {
 /// without re-parsing the connect string.
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct QwpWsConnector {
+    host: String,
+    port: String,
     endpoints: std::sync::Arc<[conf::QwpWsEndpoint]>,
     use_tls: bool,
     tls_settings: Option<tls::TlsSettings>,
@@ -429,6 +431,14 @@ impl QwpWsConnector {
     /// tracker to this.
     pub(crate) fn endpoint_count(&self) -> usize {
         self.endpoints.len()
+    }
+
+    pub(crate) fn max_buf_size(&self) -> usize {
+        self.max_buf_size
+    }
+
+    pub(crate) fn request_durable_ack(&self) -> bool {
+        *self.qwp_ws.request_durable_ack
     }
 
     /// Reconnect backoff budget parsed from the connect string's
@@ -469,6 +479,17 @@ impl QwpWsConnector {
             request_timeout: *self.qwp_ws.request_timeout,
             durable_ack_opt_in: *self.qwp_ws.request_durable_ack,
         })
+    }
+
+    pub(crate) fn connect_sfa_background(&self) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
+        sender::qwp_ws::connect_qwp_ws_background_state(
+            self.host.as_str(),
+            self.port.as_str(),
+            self.use_tls,
+            self.tls_settings.clone(),
+            &self.qwp_ws,
+            self.auth_header.clone(),
+        )
     }
 }
 
@@ -2597,6 +2618,8 @@ impl SenderBuilder {
             &qwp_ws,
         );
         Ok(QwpWsConnector {
+            host: self.host.to_string(),
+            port: self.port.to_string(),
             endpoints,
             use_tls,
             tls_settings,

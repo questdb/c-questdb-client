@@ -569,11 +569,12 @@ pub unsafe extern "C" fn questdb_db_return_conn(_db: *mut questdb_db, conn: *mut
     unsafe { finalize_or_defer(conn, state, 0) };
 }
 
-/// Force-drop a borrowed conn instead of recycling it. Marks the conn
-/// terminal (`qwpws_conn_must_close` becomes `true`) so the underlying
-/// connection is closed and removed from the pool. Accepts NULL and
-/// no-ops. As with `questdb_db_return_conn`, a racing in-flight call
-/// defers the drop to that call's exit path.
+/// Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
+/// (`qwpws_conn_must_close` becomes `true`) so the underlying backend is
+/// removed from the pool. In store-and-forward mode unresolved frames remain in
+/// the SFA slot for replay by the next owner. Accepts NULL and no-ops. As with
+/// `questdb_db_return_conn`, a racing in-flight call defers the drop to that
+/// call's exit path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_drop_conn(_db: *mut questdb_db, conn: *mut qwpws_conn) {
     if conn.is_null() {
@@ -2219,14 +2220,15 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
 // Flush
 // ===========================================================================
 
-/// Encode `chunk` into a QWP/WebSocket frame, write it to the socket,
-/// and return immediately — without waiting for the server's ack.
+/// Encode `chunk` into a QWP/WebSocket frame, publish it, and return
+/// immediately without waiting for the server's ack. Direct mode writes to the
+/// socket. Store-and-forward mode appends to the local SFA queue.
 ///
-/// Ready acks are drained non-blocking before the write. Deferred
-/// flushes keep one in-flight slot reserved for the later
-/// `column_sender_sync` commit frame; if that reserve would be
-/// consumed, the call fails and the caller must sync before flushing
-/// more chunks.
+/// In direct mode, ready acks are drained non-blocking before the write.
+/// Deferred flushes keep one in-flight slot reserved for the later
+/// `column_sender_sync` commit frame; if that reserve would be consumed, the
+/// call fails and the caller must sync before flushing more chunks. In SFA mode
+/// frames are non-deferred and `flush` success means local queue acceptance.
 ///
 /// On success, `chunk` is cleared and the call returns `true`. On
 /// failure, `chunk` is left untouched and `false` is returned (with
@@ -2617,7 +2619,9 @@ unsafe fn reexport_record_batch_into(
 }
 
 /// Block until all in-flight frames are acknowledged at the requested
-/// `ack_level`.
+/// `ack_level`. In direct mode this sends a commit-triggering frame first. In
+/// store-and-forward mode all data frames are already non-deferred, so sync
+/// waits for the local queue boundary published before the call.
 ///
 /// `column_sender_ack_level_ok` waits for every in-flight frame's
 /// WAL-commit ack. `column_sender_ack_level_durable` additionally waits

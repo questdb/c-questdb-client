@@ -2075,6 +2075,69 @@ pub(crate) fn resolve_arrow_symbols(
     })
 }
 
+fn build_replay_symbol_prefix(
+    symbol_dict: &SymbolGlobalDict,
+    resolution: &mut ArrowSymbolResolution,
+) -> Result<()> {
+    let dense_count = replay_symbol_dense_count(&resolution.per_column)?;
+    resolution.delta_start = 0;
+    resolution.new_symbols.clear();
+    resolution
+        .new_symbols
+        .try_reserve(dense_count)
+        .map_err(|_| {
+            fmt!(
+                ArrowIngest,
+                "symbol dictionary too large to encode ({} entries)",
+                dense_count
+            )
+        })?;
+    for id in 0..dense_count {
+        let id_u64 = u64::try_from(id).map_err(|_| {
+            fmt!(
+                ArrowIngest,
+                "symbol dictionary too large to encode ({} entries)",
+                dense_count
+            )
+        })?;
+        let entry = symbol_dict.entry(id_u64).ok_or_else(|| {
+            fmt!(
+                ArrowIngest,
+                "internal: missing symbol dictionary entry for global id {}",
+                id_u64
+            )
+        })?;
+        resolution.new_symbols.push(entry.to_vec());
+    }
+    Ok(())
+}
+
+fn replay_symbol_dense_count(per_column: &[Option<ArrowResolvedSymbolColumn>]) -> Result<usize> {
+    let mut highest: Option<u64> = None;
+    for column in per_column.iter().filter_map(Option::as_ref) {
+        for &gid in &column.gids {
+            highest = Some(highest.map_or(gid, |h| h.max(gid)));
+        }
+    }
+    let Some(highest) = highest else {
+        return Ok(0);
+    };
+    let count = highest.checked_add(1).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "symbol dictionary too large to encode (highest id {})",
+            highest
+        )
+    })?;
+    usize::try_from(count).map_err(|_| {
+        fmt!(
+            ArrowIngest,
+            "symbol dictionary too large to encode ({} entries)",
+            count
+        )
+    })
+}
+
 /// Resolve a single Arrow symbol column against the global dict. Yields
 /// `None` for non-symbol kinds so callers can store per-column entries
 /// in a positional vec without branching.
@@ -3268,6 +3331,49 @@ pub(crate) fn encode_arrow_batch_into(
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
 ) -> Result<()> {
+    encode_arrow_batch_into_mode(
+        out,
+        table,
+        batch,
+        ts_col_idx,
+        overrides,
+        symbol_dict,
+        defer_commit,
+        /* replay_symbols = */ false,
+    )
+}
+
+pub(crate) fn encode_arrow_batch_replay_into(
+    out: &mut Vec<u8>,
+    table: TableName<'_>,
+    batch: &RecordBatch,
+    ts_col_idx: Option<usize>,
+    overrides: &[ArrowColumnOverride<'_>],
+    symbol_dict: &mut SymbolGlobalDict,
+) -> Result<()> {
+    encode_arrow_batch_into_mode(
+        out,
+        table,
+        batch,
+        ts_col_idx,
+        overrides,
+        symbol_dict,
+        /* defer_commit = */ false,
+        /* replay_symbols = */ true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_arrow_batch_into_mode(
+    out: &mut Vec<u8>,
+    table: TableName<'_>,
+    batch: &RecordBatch,
+    ts_col_idx: Option<usize>,
+    overrides: &[ArrowColumnOverride<'_>],
+    symbol_dict: &mut SymbolGlobalDict,
+    defer_commit: bool,
+    replay_symbols: bool,
+) -> Result<()> {
     let schema = batch.schema();
     let schema = if overrides.is_empty() {
         schema
@@ -3325,13 +3431,17 @@ pub(crate) fn encode_arrow_batch_into(
     }
 
     let dict_mark = symbol_dict.mark();
-    let resolution = match resolve_arrow_symbols(&classified, symbol_dict) {
+    let mut resolution = match resolve_arrow_symbols(&classified, symbol_dict) {
         Ok(r) => r,
         Err(e) => {
             symbol_dict.rollback(dict_mark);
             return Err(e);
         }
     };
+    if replay_symbols && let Err(e) = build_replay_symbol_prefix(symbol_dict, &mut resolution) {
+        symbol_dict.rollback(dict_mark);
+        return Err(e);
+    }
 
     let designated_dtype = ts_col_idx.map(|idx| schema.field(idx).data_type().clone());
     let ts_wire_type = match designated_dtype.as_ref() {

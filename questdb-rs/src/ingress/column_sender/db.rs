@@ -226,6 +226,7 @@ struct DbInner {
     health: Mutex<QwpWsHostHealthTracker>,
     pool_size: usize,
     pool_max: usize,
+    sfa_mode: bool,
     pool_idle_timeout: Duration,
     state: Mutex<PoolState>,
     /// Reader pool. Lazy-init: starts empty, populated on first
@@ -267,19 +268,7 @@ impl PoolState {
 }
 
 struct PoolEntry {
-    conn: ColumnConn,
-    /// Connection-scoped global symbol dictionary — same coherence
-    /// argument: the server tracks ids by first-emit order over the life
-    /// of the WS connection, so the dict must travel with the slot.
-    symbol_dict: crate::ingress::buffer::SymbolGlobalDict,
-    /// Reusable encode scratch (signature, new-symbols, per-column
-    /// resolution). Carried across borrow/return so its allocated
-    /// capacity survives.
-    scratch: super::encoder::EncodeScratch,
-    /// Whether this connection has already sent its immediate-commit first
-    /// frame. Travels with the slot so a recycled connection keeps deferring
-    /// commits instead of re-warming a cache that is already warm.
-    first_frame_sent: bool,
+    sender: ColumnSender,
     last_idle_at: Instant,
 }
 
@@ -346,11 +335,14 @@ impl QuestDb {
     /// | `pool_idle_timeout_ms` | 60000   | Above-`pool_size` idle connections are closed after this long. |
     /// | `pool_reap`            | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
     ///
-    /// Store-and-forward keys (`sf_*`, `sender_id`) are **refused** here —
-    /// see `doc/COLUMN_SENDER_PLAN.md` §8. Use the row-major
-    /// [`crate::ingress::Sender`] API if you need on-disk durability.
+    /// `sf_dir` opts the column sender into store-and-forward mode. In that
+    /// mode v1 supports one active borrower: explicit `pool_size > 1` or
+    /// `pool_max > 1` is rejected, and an omitted `pool_max` is treated as 1.
+    /// `sender_id` and other `sf_*` keys require explicit `sf_dir`.
+    ///
     pub fn connect(conf: &str) -> Result<Self> {
         let parsed = conf::parse(conf)?;
+        let sfa_mode = parsed.store_and_forward;
         let pool_cfg = parsed.pool;
 
         let connector = SenderBuilder::from_conf(conf)?.build_qwp_ws_connector()?;
@@ -358,25 +350,47 @@ impl QuestDb {
 
         let mut free = Vec::with_capacity(pool_cfg.pool_size);
         let now = Instant::now();
-        for slot in 0..pool_cfg.pool_size {
-            let conn = connect_conn(&connector, &mut health).map_err(|err| {
+        if sfa_mode {
+            let state = connector.connect_sfa_background().map_err(|err| {
                 crate::Error::new(
                     err.code(),
                     format!(
-                        "Failed to open pool slot {} of {}: {}",
-                        slot + 1,
-                        pool_cfg.pool_size,
+                        "Failed to open store-and-forward column sender: {}",
                         err.msg()
                     ),
                 )
             })?;
             free.push(PoolEntry {
-                conn,
-                symbol_dict: crate::ingress::buffer::SymbolGlobalDict::new(),
-                scratch: super::encoder::EncodeScratch::new(),
-                first_frame_sent: false,
+                sender: ColumnSender::new_store_and_forward(
+                    state,
+                    connector.max_buf_size(),
+                    connector.request_durable_ack(),
+                ),
                 last_idle_at: now,
             });
+        } else {
+            for slot in 0..pool_cfg.pool_size {
+                let conn = connect_conn(&connector, &mut health).map_err(|err| {
+                    crate::Error::new(
+                        err.code(),
+                        format!(
+                            "Failed to open pool slot {} of {}: {}",
+                            slot + 1,
+                            pool_cfg.pool_size,
+                            err.msg()
+                        ),
+                    )
+                })?;
+                free.push(PoolEntry {
+                    sender: ColumnSender::new_direct(
+                        conn,
+                        crate::ingress::buffer::SymbolGlobalDict::new(),
+                        super::encoder::EncodeScratch::new(),
+                        false,
+                    ),
+                    last_idle_at: now,
+                });
+            }
         }
 
         let inner = Arc::new(DbInner {
@@ -385,6 +399,7 @@ impl QuestDb {
             health: Mutex::new(health),
             pool_size: pool_cfg.pool_size,
             pool_max: pool_cfg.pool_max,
+            sfa_mode,
             pool_idle_timeout: pool_cfg.pool_idle_timeout,
             state: Mutex::new(PoolState { free, in_use: 0 }),
             #[cfg(feature = "_egress")]
@@ -504,16 +519,17 @@ impl QuestDb {
     }
 
     fn pick_replacement_sender(&self) -> Result<ColumnSender> {
+        if self.inner.sfa_mode {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "column sender store-and-forward manages reconnects in its background runner"
+            ));
+        }
         // Same-handle replacement: the BorrowedSender already owns one logical
         // in-use slot, so this must not reserve another one or pool_max=1 would
         // reject replacing a dead connection.
         if let Some(entry) = lock_state(&self.inner.state).free.pop() {
-            return Ok(ColumnSender::new(
-                entry.conn,
-                entry.symbol_dict,
-                entry.scratch,
-                entry.first_frame_sent,
-            ));
+            return Ok(entry.sender);
         }
 
         let conn = connect_conn_pool(&self.inner)?;
@@ -749,7 +765,10 @@ impl<'a> BorrowedSender<'a> {
     /// commits this caller's data.
     pub fn reborrow_from_pool(&mut self) -> Result<()> {
         if let Some(sender) = self.sender.as_mut() {
-            if sender.conn.in_flight() > 0 {
+            if sender.is_store_and_forward() {
+                return Ok(());
+            }
+            if sender.in_flight() > 0 {
                 sender.mark_must_close();
             }
             record_sender_transport_failure(&self.db.inner, sender);
@@ -828,7 +847,7 @@ impl Drop for BorrowedSender<'_> {
         // borrower's first flush commit the previous borrower's data
         // attributed to whatever table the new borrower targets.
         // Latch must_close so the connection is discarded instead.
-        if sender.conn.in_flight() > 0 {
+        if sender.in_flight() > 0 {
             sender.mark_must_close();
         }
         return_to_pool(&self.db.inner, sender);
@@ -867,7 +886,7 @@ impl OwnedSender {
 impl Drop for OwnedSender {
     fn drop(&mut self) {
         if let Some(mut sender) = self.sender.take() {
-            if sender.conn.in_flight() > 0 {
+            if sender.in_flight() > 0 {
                 sender.mark_must_close();
             }
             return_to_pool(&self.inner, sender);
@@ -1075,35 +1094,68 @@ fn pick_sender_inner(inner: &Arc<DbInner>) -> Result<ColumnSender> {
         if let Some(entry) = state.free.pop() {
             state.in_use += 1;
             drop(state);
-            return Ok(ColumnSender::new(
-                entry.conn,
-                entry.symbol_dict,
-                entry.scratch,
-                entry.first_frame_sent,
-            ));
+            return Ok(entry.sender);
         }
-        if state.total() >= inner.pool_max {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "Connection pool exhausted: {} connections are currently borrowed and \
-                 the pool is at its `pool_max` cap of {}. Return a sender or raise `pool_max`.",
-                state.in_use,
-                inner.pool_max
-            ));
-        }
-        state.in_use += 1;
-        InUseSlot {
-            state: &inner.state,
-            armed: true,
+        if inner.sfa_mode {
+            if state.in_use == 0 {
+                state.in_use += 1;
+                InUseSlot {
+                    state: &inner.state,
+                    armed: true,
+                }
+            } else {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "column sender store-and-forward supports one active borrower in v1; \
+                     return the borrowed sender before borrowing another"
+                ));
+            }
+        } else {
+            if state.total() >= inner.pool_max {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Connection pool exhausted: {} sender(s) in use, pool_max={}. \
+                     Drop a BorrowedSender or increase pool_max.",
+                    state.in_use,
+                    inner.pool_max
+                ));
+            }
+            state.in_use += 1;
+            InUseSlot {
+                state: &inner.state,
+                armed: true,
+            }
         }
     };
+    if inner.sfa_mode {
+        let sender = connect_sfa_pool(inner)?;
+        slot.commit();
+        return Ok(sender);
+    }
     let conn = connect_conn_pool(inner)?;
     slot.commit();
-    Ok(ColumnSender::new(
+    Ok(ColumnSender::new_direct(
         conn,
         crate::ingress::buffer::SymbolGlobalDict::new(),
         super::encoder::EncodeScratch::new(),
         false,
+    ))
+}
+
+fn connect_sfa_pool(inner: &Arc<DbInner>) -> Result<ColumnSender> {
+    let state = inner.connector.connect_sfa_background().map_err(|err| {
+        crate::Error::new(
+            err.code(),
+            format!(
+                "Failed to open store-and-forward column sender: {}",
+                err.msg()
+            ),
+        )
+    })?;
+    Ok(ColumnSender::new_store_and_forward(
+        state,
+        inner.connector.max_buf_size(),
+        inner.connector.request_durable_ack(),
     ))
 }
 
@@ -1178,10 +1230,7 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     state.in_use = state.in_use.saturating_sub(1);
     if !must_close {
         state.free.push(PoolEntry {
-            conn: sender.conn,
-            symbol_dict: sender.symbol_dict,
-            scratch: sender.scratch,
-            first_frame_sent: sender.first_frame_sent,
+            sender,
             last_idle_at: Instant::now(),
         });
     }
@@ -1194,10 +1243,7 @@ fn finish_replaced_sender(inner: &Arc<DbInner>, sender: ColumnSender) {
     let mut state = lock_state(&inner.state);
     if !must_close && state.total() < inner.pool_max {
         state.free.push(PoolEntry {
-            conn: sender.conn,
-            symbol_dict: sender.symbol_dict,
-            scratch: sender.scratch,
-            first_frame_sent: sender.first_frame_sent,
+            sender,
             last_idle_at: Instant::now(),
         });
     }
@@ -1205,8 +1251,9 @@ fn finish_replaced_sender(inner: &Arc<DbInner>, sender: ColumnSender) {
 }
 
 fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &ColumnSender) {
-    if sender.conn.transport_dead() {
-        let idx = sender.conn.endpoint_idx();
+    if sender.transport_dead()
+        && let Some(idx) = sender.endpoint_idx()
+    {
         lock_health(&inner.health).record_mid_stream_failure(idx);
     }
 }
@@ -1264,7 +1311,7 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
     // Drop the to-be-closed connections OUTSIDE the lock so closing a connection
     // (which may take an unbounded amount of time) does not stall concurrent
     // borrows.
-    let to_drop: Vec<ColumnConn> = {
+    let to_drop: Vec<ColumnSender> = {
         let mut state = lock_state(&inner.state);
         let mut to_drop = Vec::new();
         let now = Instant::now();
@@ -1280,7 +1327,7 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
             let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
             if idle_for > inner.pool_idle_timeout {
                 let entry = state.free.remove(i);
-                to_drop.push(entry.conn);
+                to_drop.push(entry.sender);
             } else {
                 i += 1;
             }
