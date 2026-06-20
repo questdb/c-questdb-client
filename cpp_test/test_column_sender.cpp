@@ -92,22 +92,22 @@ TEST_CASE("column_chunk fluent chaining returns the same chunk")
 
 TEST_CASE("pool construction throws on invalid connect string")
 {
-    CHECK_THROWS_AS(qdb::pool{"http::not-a-qwp-string;"}, qdb::line_sender_error);
+    CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, qdb::line_sender_error);
 }
 
 TEST_CASE("borrowed_conn returns conn to pool on destructor")
 {
     auto mock = spawn_mock(1);
-    qdb::pool db{conf_for(mock->addr())};
+    questdb::pool db{conf_for(mock->addr())};
 
     {
-        auto conn = db.borrow_conn();
+        auto conn = db.borrow_sender();
         CHECK(conn->c_ptr() != nullptr);
         CHECK_FALSE(conn->must_close());
     }
     int accepts_before = mock->accepts();
     {
-        auto conn = db.borrow_conn();
+        auto conn = db.borrow_sender();
         CHECK(conn->c_ptr() != nullptr);
     }
     CHECK(mock->accepts() == accepts_before);
@@ -116,8 +116,8 @@ TEST_CASE("borrowed_conn returns conn to pool on destructor")
 TEST_CASE("borrowed_conn move transfers ownership without double-return")
 {
     auto mock = spawn_mock(1);
-    qdb::pool db{conf_for(mock->addr())};
-    auto a = db.borrow_conn();
+    questdb::pool db{conf_for(mock->addr())};
+    auto a = db.borrow_sender();
     ::qwpws_conn* raw = a->c_ptr();
     REQUIRE(raw != nullptr);
 
@@ -128,8 +128,8 @@ TEST_CASE("borrowed_conn move transfers ownership without double-return")
 TEST_CASE("column_chunk flush round-trips through the mock")
 {
     auto mock = spawn_mock(1);
-    qdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_conn();
+    questdb::pool db{conf_for(mock->addr())};
+    auto conn = db.borrow_sender();
 
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10, 20, 30};
@@ -149,8 +149,8 @@ TEST_CASE("column_chunk flush round-trips through the mock")
 TEST_CASE("flush rejects oversized table name")
 {
     auto mock = spawn_mock(1);
-    qdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_conn();
+    questdb::pool db{conf_for(mock->addr())};
+    auto conn = db.borrow_sender();
 
     std::string oversized(200, 'x');
     qdb::column_chunk chunk{oversized};
@@ -166,16 +166,16 @@ TEST_CASE("flush rejects oversized table name")
 TEST_CASE("drop_on_return drops the conn instead of recycling it")
 {
     auto mock = spawn_mock(2);
-    qdb::pool db{conf_for(mock->addr())};
+    questdb::pool db{conf_for(mock->addr())};
 
     int accepts_before;
     {
-        auto conn = db.borrow_conn();
+        auto conn = db.borrow_sender();
         accepts_before = mock->accepts();
         conn.drop_on_return();
     }
     {
-        auto conn = db.borrow_conn();
+        auto conn = db.borrow_sender();
         CHECK(conn->c_ptr() != nullptr);
     }
     CHECK(mock->accepts() == accepts_before + 1);
@@ -184,10 +184,10 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
 TEST_CASE("pool is move-constructible and move-assignable")
 {
     auto mock = spawn_mock(1);
-    qdb::pool a{conf_for(mock->addr())};
+    questdb::pool a{conf_for(mock->addr())};
     REQUIRE(a.c_ptr() != nullptr);
 
-    qdb::pool b{std::move(a)};
+    questdb::pool b{std::move(a)};
     CHECK(a.c_ptr() == nullptr);
     CHECK(b.c_ptr() != nullptr);
 }
@@ -195,9 +195,9 @@ TEST_CASE("pool is move-constructible and move-assignable")
 TEST_CASE("pool reap_idle is callable")
 {
     auto mock = spawn_mock(2);
-    qdb::pool db{conf_for(mock->addr(), "pool_idle_timeout_ms=1;")};
+    questdb::pool db{conf_for(mock->addr(), "pool_idle_timeout_ms=1;")};
     {
-        auto conn = db.borrow_conn();
+        auto conn = db.borrow_sender();
         (void)conn;
     }
     [[maybe_unused]] size_t closed = db.reap_idle();

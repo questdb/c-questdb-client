@@ -38,6 +38,7 @@
 #include <utility>
 
 #include "../ingress/line_sender_core.hpp" // utf8_view
+#include "../ingress/column_sender.hpp" // questdb::ingress::pool (borrow_reader)
 
 namespace questdb::egress
 {
@@ -768,6 +769,18 @@ public:
         ::line_reader_reset_timing(_impl);
     }
 
+    /** Mark a pool-borrowed reader to be dropped (not recycled) when it is
+     *  returned to its pool on destruction. Mirrors Rust
+     *  `BorrowedReader::mark_must_close`. No-op for standalone readers
+     *  (constructed from a config string / `from_env`), which are closed on
+     *  destruction regardless.
+     *  @throws line_reader_error if this reader has been moved from. */
+    void mark_must_close()
+    {
+        ensure_impl();
+        ::line_reader_mark_must_close(_impl);
+    }
+
     /** Negotiated QWP server version.
      *  @throws line_reader_error if the connection is not yet established
      *          or this reader has been moved from. */
@@ -811,6 +824,16 @@ public:
 private:
     explicit reader(::line_reader* impl) noexcept : _impl{impl} {}
 
+    /// Borrow a pooled reader from a `questdb_db` pool. Backs
+    /// `questdb::ingress::pool::borrow_reader`. The returned reader is
+    /// equivalent to a standalone one; on destruction `line_reader_close`
+    /// returns it to the pool (or drops it if marked must-close).
+    static reader borrow_from_pool(::questdb_db* db)
+    {
+        return reader{
+            line_reader_error::wrapped_call(::questdb_db_borrow_reader, db)};
+    }
+
     /// Throw `line_reader_error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the reader has been moved from or already
     /// closed — calling any method that derefs it would pass `nullptr`
@@ -827,6 +850,7 @@ private:
     ::line_reader* _impl;
     friend class cursor;
     friend class ::questdb::egress::query;
+    friend class ::questdb::ingress::pool;
 };
 
 /**
@@ -2743,3 +2767,18 @@ inline cursor query::execute()
 }
 
 } // namespace questdb::egress
+
+namespace questdb::ingress
+{
+/**
+ * Out-of-line definition of `pool::borrow_reader` (declared in
+ * `questdb/ingress/column_sender.hpp`). Defined here, alongside the egress
+ * `reader` type and the `questdb_db_borrow_reader` C entry point it wraps, so
+ * the heavy egress header stays off the sender-only include path — the
+ * C++ analogue of the Rust pool referencing `egress::Reader`.
+ */
+inline ::questdb::egress::reader pool::borrow_reader()
+{
+    return ::questdb::egress::reader::borrow_from_pool(_raw);
+}
+} // namespace questdb::ingress

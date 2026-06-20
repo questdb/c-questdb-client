@@ -183,7 +183,7 @@ struct MockConn
         db = questdb_db_connect(conf.c_str(), conf.size(), &err);
         REQUIRE(db != nullptr);
         REQUIRE(err == nullptr);
-        conn = questdb_db_borrow_conn(db, &err);
+        conn = questdb_db_borrow_sender(db, &err);
         REQUIRE(conn != nullptr);
         REQUIRE(err == nullptr);
     }

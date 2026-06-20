@@ -1972,3 +1972,423 @@ fn flush_polars_dataframe_applies_column_overrides() {
         "4 rows / 2 per batch = 2 data frames with the override applied"
     );
 }
+
+/// Reader-pool (egress) ergonomic API tests: [`QuestDb::borrow_reader`] /
+/// [`crate::ingress::column_sender::BorrowedReader`].
+///
+/// Gated on `sync-reader-ws` (which provides `Reader` and implies `_egress`).
+/// The mock endpoint completes the WS upgrade (QWP version 1), emits one
+/// minimal `SERVER_INFO` frame — the reader's first expected frame at connect
+/// — then parks the connection, draining to EOF. That is enough to drive
+/// pool borrow / return / grow / reap / cap mechanics without a full query
+/// round-trip. The same endpoint also satisfies the column-sender eager-open
+/// at `connect` (which ignores the unsolicited `SERVER_INFO` while parked).
+#[cfg(feature = "sync-reader-ws")]
+mod reader_pool {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{conf_for, park_connection, wait_until};
+    use crate::egress::error::ErrorCode as EgressErrorCode;
+    // Front-door import: `QuestDb` is re-exported at the crate root.
+    use crate::QuestDb;
+    use crate::tests::qwp_ws::{perform_server_upgrade, write_server_info_frame};
+
+    /// Mock egress endpoint. See the module docs for the per-connection
+    /// behaviour (upgrade → `SERVER_INFO` → park).
+    struct ReaderMockServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        accepted: Arc<AtomicUsize>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ReaderMockServer {
+        fn spawn(max_accepts: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+            listener
+                .set_nonblocking(true)
+                .expect("set_nonblocking on listener");
+            let port = listener.local_addr().expect("local_addr").port();
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let stop_c = Arc::clone(&stop);
+            let accepted_c = Arc::clone(&accepted);
+
+            let join = thread::Builder::new()
+                .name("reader-pool-mock-server".to_string())
+                .spawn(move || {
+                    let mut handles = Vec::new();
+                    while !stop_c.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                if accepted_c.fetch_add(1, Ordering::SeqCst) >= max_accepts {
+                                    // Past budget: drop without upgrading so the
+                                    // client observes a failed connect.
+                                    continue;
+                                }
+                                stream
+                                    .set_nonblocking(false)
+                                    .expect("set_nonblocking(false)");
+                                let stop_h = Arc::clone(&stop_c);
+                                handles.push(thread::spawn(move || {
+                                    if perform_server_upgrade(&mut stream).is_ok()
+                                        && write_server_info_frame(&mut stream).is_ok()
+                                    {
+                                        park_connection(&mut stream, &stop_h);
+                                    }
+                                }));
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    for h in handles {
+                        let _ = h.join();
+                    }
+                })
+                .expect("spawn reader mock server");
+
+            Self {
+                port,
+                stop,
+                accepted,
+                join: Some(join),
+            }
+        }
+
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ReaderMockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.join.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Lazy-init: no readers exist until the first borrow; a borrow then a
+    /// drop recycles the same physical connection (no second connect).
+    #[test]
+    fn reader_borrow_returns_and_recycles_connection() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+        // The reader pool starts empty — the eager-open only warms the
+        // column-sender pool.
+        assert_eq!(db.reader_free_count(), 0);
+        assert_eq!(db.reader_in_use_count(), 0);
+
+        let reader = db.borrow_reader().expect("borrow reader");
+        assert_eq!(db.reader_in_use_count(), 1);
+        assert_eq!(db.reader_free_count(), 0);
+        let after_first_borrow = server.accepted();
+
+        drop(reader);
+        assert_eq!(db.reader_in_use_count(), 0);
+        assert_eq!(db.reader_free_count(), 1, "a clean reader must be recycled");
+
+        // Re-borrow reuses the recycled reader — no new connection.
+        let _again = db.borrow_reader().expect("re-borrow reuses");
+        assert_eq!(db.reader_in_use_count(), 1);
+        assert_eq!(db.reader_free_count(), 0);
+        assert_eq!(
+            server.accepted(),
+            after_first_borrow,
+            "reuse must not open a new connection"
+        );
+    }
+
+    /// `BorrowedReader` derefs to the underlying [`crate::egress::Reader`] for
+    /// both `&self` and `&mut self` methods.
+    #[test]
+    fn borrowed_reader_derefs_to_underlying_reader() {
+        let server = ReaderMockServer::spawn(4);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+        let mut reader = db.borrow_reader().expect("borrow reader");
+        // Deref (&Reader): a `&self` accessor.
+        let _ = reader.bytes_received();
+        // DerefMut (&mut Reader): build — but do not execute — a query, which
+        // is a `&mut self` method that performs no I/O.
+        {
+            let _query = reader.prepare("SELECT 1");
+        }
+        drop(reader);
+        assert_eq!(db.reader_in_use_count(), 0);
+        assert_eq!(db.reader_free_count(), 1);
+    }
+
+    /// The reader pool auto-grows up to `pool_max` under concurrent borrows
+    /// and reuses recycled connections afterwards.
+    #[test]
+    fn reader_pool_grows_and_reuses_physical_connections() {
+        let server = ReaderMockServer::spawn(16);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+
+        // `pool_size=1` eager-opens exactly one *column* connection.
+        assert!(
+            wait_until(Duration::from_secs(2), || server.accepted() == 1),
+            "eager-open must connect one column slot; accepted={}",
+            server.accepted()
+        );
+
+        // Three concurrent reader borrows each open a fresh connection.
+        let r1 = db.borrow_reader().expect("r1");
+        let r2 = db.borrow_reader().expect("r2 (grow)");
+        let r3 = db.borrow_reader().expect("r3 (grow)");
+        assert_eq!(db.reader_in_use_count(), 3);
+        assert!(
+            wait_until(Duration::from_secs(2), || server.accepted() == 4),
+            "each reader borrow must open a fresh connection (1 column + 3 readers); accepted={}",
+            server.accepted()
+        );
+
+        drop(r1);
+        drop(r2);
+        drop(r3);
+        assert_eq!(db.reader_in_use_count(), 0);
+        assert_eq!(db.reader_free_count(), 3);
+
+        // Re-borrowing reuses recycled connections — no new accepts.
+        let _a = db.borrow_reader().expect("reuse 1");
+        let _b = db.borrow_reader().expect("reuse 2");
+        assert_eq!(db.reader_free_count(), 1);
+        assert_eq!(server.accepted(), 4, "reuse must not open new connections");
+    }
+
+    /// Borrowing past `pool_max` fails fast with an egress `InvalidApiCall`
+    /// rather than blocking or over-committing.
+    #[test]
+    fn reader_pool_fails_fast_at_cap() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+        let _r1 = db.borrow_reader().expect("r1");
+        let _r2 = db.borrow_reader().expect("r2 (grow to cap)");
+        let err = db
+            .borrow_reader()
+            .expect_err("must fail-fast at the reader cap");
+        assert_eq!(err.code(), EgressErrorCode::InvalidApiCall);
+        assert!(
+            err.msg().contains("Reader pool exhausted"),
+            "unexpected message: {}",
+            err.msg()
+        );
+        // The cap rejection must not have leaked an `in_use` slot.
+        assert_eq!(db.reader_in_use_count(), 2);
+    }
+
+    /// `mark_must_close` forces the reader to be dropped (not recycled) on
+    /// return, so the next borrow opens a brand-new connection.
+    #[test]
+    fn reader_mark_must_close_drops_instead_of_recycling() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+        let mut reader = db.borrow_reader().expect("borrow");
+        reader.mark_must_close();
+        drop(reader);
+
+        assert_eq!(db.reader_in_use_count(), 0);
+        assert_eq!(
+            db.reader_free_count(),
+            0,
+            "a must-close reader must be dropped, not recycled"
+        );
+
+        // The next borrow therefore opens a brand-new connection.
+        let _fresh = db.borrow_reader().expect("re-borrow after must-close");
+        assert!(
+            wait_until(Duration::from_secs(2), || server.accepted() == 3),
+            "re-borrow must open a new connection (1 column + 2 readers); accepted={}",
+            server.accepted()
+        );
+    }
+
+    /// The reader, column-sender, and row-sender pools are capped and tracked
+    /// independently: all three can be borrowed at once from a single
+    /// `QuestDb` even when each pool's `pool_max` is only 2 (combined live
+    /// connection ceiling `3 * pool_max`).
+    #[test]
+    fn reader_and_sender_pools_are_independent() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+        let col = db.borrow_sender().expect("column sender"); // reuses the eager free slot
+        let row = db.borrow_row_sender().expect("row sender"); // opens a fresh connection
+        let reader = db.borrow_reader().expect("reader"); // opens a fresh connection
+
+        // Each pool tracks its own borrow on an independent counter.
+        assert_eq!(db.in_use_count(), 1);
+        assert_eq!(db.row_sender_in_use_count(), 1);
+        assert_eq!(db.reader_in_use_count(), 1);
+
+        // 1 column eager-open + 1 row + 1 reader = three independent live
+        // connections, each pool capped separately at pool_max=2.
+        assert!(
+            wait_until(Duration::from_secs(2), || server.accepted() == 3),
+            "expected 3 independent connections; accepted={}",
+            server.accepted()
+        );
+
+        drop(reader);
+        assert_eq!(db.reader_in_use_count(), 0);
+        assert_eq!(db.reader_free_count(), 1);
+        // The sender borrows are unaffected by reader-pool activity.
+        assert_eq!(db.in_use_count(), 1);
+        assert_eq!(db.row_sender_in_use_count(), 1);
+
+        drop(row);
+        drop(col);
+        assert_eq!(db.in_use_count(), 0);
+        assert_eq!(db.row_sender_in_use_count(), 0);
+        assert_eq!(db.reader_in_use_count(), 0);
+        drop(db);
+    }
+
+    /// A failed reader build (dead endpoint) releases the `in_use` slot it
+    /// reserved instead of permanently burning a pool slot, and surfaces a
+    /// connect error rather than a pool-cap error.
+    #[test]
+    fn reader_build_failure_releases_in_use_slot() {
+        let server = ReaderMockServer::spawn(4);
+        let port = server.port();
+        let db = QuestDb::connect(&conf_for(port, "")).unwrap();
+        drop(server); // the port now refuses connections
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+            }),
+            "mock server port must stop accepting after drop"
+        );
+
+        let err = db
+            .borrow_reader()
+            .expect_err("reader build must fail against a dead endpoint");
+        assert_ne!(
+            err.code(),
+            EgressErrorCode::InvalidApiCall,
+            "expected a connect error, not a pool-cap error: {}",
+            err.msg()
+        );
+        assert_eq!(
+            db.reader_in_use_count(),
+            0,
+            "a failed build must not leak an in_use slot"
+        );
+        assert_eq!(db.reader_free_count(), 0);
+        drop(db);
+    }
+
+    /// Many threads hammering borrow/return on the reader pool must neither
+    /// deadlock nor leak slots, and the free list must never exceed the cap.
+    #[test]
+    fn concurrent_reader_borrow_and_return_does_not_deadlock_or_leak() {
+        let server = ReaderMockServer::spawn(64);
+        let db =
+            Arc::new(QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for _ in 0..16 {
+                    let borrow = db
+                        .borrow_reader()
+                        .expect("borrow_reader under contention");
+                    std::hint::black_box(&borrow);
+                    thread::yield_now();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+        // After all workers finish: every borrow returned, nothing leaked, and
+        // the free list never exceeded the cap.
+        assert_eq!(db.reader_in_use_count(), 0);
+        assert!(db.reader_free_count() >= 1);
+        assert!(
+            db.reader_free_count() <= 8,
+            "free list must not exceed pool_max; free={}",
+            db.reader_free_count()
+        );
+    }
+
+    /// `pool_reap=manual`: idle readers above the (zero) warm floor are closed
+    /// only when `reap_idle` is called, and only after the idle timeout.
+    #[test]
+    fn manual_reap_closes_idle_readers() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "pool_size=1;pool_max=3;pool_idle_timeout_ms=50;pool_reap=manual;",
+        ))
+        .unwrap();
+
+        let b1 = db.borrow_reader().expect("b1");
+        let b2 = db.borrow_reader().expect("b2 (grow)");
+        drop(b1);
+        drop(b2);
+        assert_eq!(db.reader_free_count(), 2);
+
+        // Reap before the idle timeout — nothing closed.
+        let _ = db.reap_idle();
+        assert_eq!(db.reader_free_count(), 2);
+
+        // Past the timeout: the reader pool keeps no warm floor (lazy-init),
+        // so every idle reader is drained.
+        thread::sleep(Duration::from_millis(120));
+        let _ = db.reap_idle();
+        assert_eq!(
+            db.reader_free_count(),
+            0,
+            "idle readers past the timeout must be reaped"
+        );
+        drop(db);
+    }
+
+    /// `pool_reap=auto`: the background reaper drains idle readers without an
+    /// explicit `reap_idle` call.
+    #[test]
+    fn auto_reaper_closes_idle_readers() {
+        let server = ReaderMockServer::spawn(8);
+        let db = QuestDb::connect(&conf_for(
+            server.port(),
+            "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
+        ))
+        .unwrap();
+
+        let b1 = db.borrow_reader().expect("b1");
+        let b2 = db.borrow_reader().expect("b2 (grow)");
+        drop(b1);
+        drop(b2);
+        assert_eq!(db.reader_free_count(), 2);
+
+        // The background reaper wakes on a `max(5s, timeout/12)` ticker (the
+        // 5s floor applies here). The reader pool keeps no warm floor, so
+        // every idle reader is drained.
+        let reaped = wait_until(Duration::from_secs(8), || db.reader_free_count() == 0);
+        assert!(
+            reaped,
+            "auto reaper failed to drain idle readers; free={}",
+            db.reader_free_count()
+        );
+        drop(db);
+    }
+}

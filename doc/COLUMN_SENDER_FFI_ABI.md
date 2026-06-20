@@ -140,7 +140,7 @@ inputs.
 ### 2.5 Threading
 
 - A `questdb_db` (the pool) is **thread-safe**. Share it across
-  threads. `questdb_db_borrow_conn` and `questdb_db_return_conn`
+  threads. `questdb_db_borrow_sender` and `questdb_db_return_conn`
   are safe to call concurrently.
 - A `qwpws_conn` (a borrow) is **not thread-safe**. It belongs to
   the borrowing thread until returned. Do not pass it across threads.
@@ -186,7 +186,7 @@ multiple connections. The pool absorbs both cases:
                           │   ├─ connection #2 (lazy) │
                           │   └─ ...                  │
                           └──────────┬────────────────┘
-                                     │ borrow_conn / return_conn
+                                     │ borrow_sender / return_conn
                                      ▼
                           ┌──────────────────────────┐
                           │  qwpws_conn (borrowed)   │
@@ -205,7 +205,7 @@ return per work unit (or per thread).
 | Key                    | Default | Description                                                                                                                                  |
 |------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------|
 | `pool_size`            | 1       | Warm / minimum connections, opened eagerly at `questdb_db_connect`. All N go through the full WS upgrade before `connect` returns. The pool never shrinks below this. |
-| `pool_max`             | 64      | Hard cap on auto-grow. When all current conns are checked out and pool size < `pool_max`, a new connection is opened on demand. When at `pool_max`, `borrow_conn` fails fast (see §4.3).                       |
+| `pool_max`             | 64      | Hard cap on auto-grow. When all current conns are checked out and pool size < `pool_max`, a new connection is opened on demand. When at `pool_max`, `borrow_sender` fails fast (see §4.3).                       |
 | `pool_idle_timeout_ms` | 60000   | Connections *above* `pool_size` are closed after this much idle time in the pool's free list. Set to 0 to disable shrink (the pool only grows). |
 | `pool_reap`            | `auto`  | `auto` — pool spawns a background thread that periodically reaps idle connections per `pool_idle_timeout_ms`. `manual` — no background thread; caller invokes `questdb_db_reap_idle` on its own cadence. |
 
@@ -268,7 +268,7 @@ void questdb_db_close(questdb_db* db);
  * Do not share across threads.
  */
 QUESTDB_CLIENT_API
-qwpws_conn* questdb_db_borrow_conn(
+qwpws_conn* questdb_db_borrow_sender(
     questdb_db* db,
     line_sender_error** err_out);
 
@@ -1125,7 +1125,7 @@ int send_one_chunk(questdb_db* db) {
     qwpws_conn* conn = NULL;
     column_sender_chunk* chunk = NULL;
 
-    conn = questdb_db_borrow_conn(db, &err);
+    conn = questdb_db_borrow_sender(db, &err);
     if (!conn) goto fail;
 
     chunk = column_sender_chunk_new("trades", 6, &err);

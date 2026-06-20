@@ -49,6 +49,23 @@ pub mod egress;
 
 pub use error::*;
 
+// --- Primary entry point -------------------------------------------------
+//
+// `QuestDb` is the connection/pool handle for a QuestDB instance. It spans
+// both directions — it hands out column-major and row-major senders (write)
+// *and* query readers (read) — so it lives at the crate root rather than
+// inside `ingress` or `egress`. Those modules remain the home of the
+// specialised, direction-specific types (`Chunk`, `AckLevel`, `ColumnView`,
+// `Cursor`, `Bind`, …); the common path is just `use questdb::QuestDb`.
+//
+// These are re-exports: the original `ingress::column_sender::*` paths keep
+// working, so this is purely additive.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub use ingress::column_sender::{BorrowedRowSender, BorrowedSender, QuestDb};
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
+pub use ingress::column_sender::BorrowedReader;
+
 #[cfg(test)]
 mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};

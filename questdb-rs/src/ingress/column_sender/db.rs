@@ -472,7 +472,7 @@ impl QuestDb {
 
     /// Like [`borrow_sender_owned`] but retries the connect within `budget`
     /// using the row API's reconnect backoff (the cluster may be electing a
-    /// primary). Backs the C ABI's `questdb_db_borrow_conn_with_retry`, so
+    /// primary). Backs the C ABI's `questdb_db_borrow_sender_with_retry`, so
     /// C / C++ / Python callers fail over with the same backoff and budget as
     /// the row sender.
     #[doc(hidden)]
@@ -605,6 +605,34 @@ impl QuestDb {
     #[doc(hidden)]
     pub fn row_sender_in_use_count(&self) -> usize {
         lock_row_sender_state(&self.inner.row_sender_state).in_use
+    }
+
+    /// Borrow a query [`Reader`] from the egress pool.
+    ///
+    /// Egress companion to [`Self::borrow_sender`] (column-major ingest) and
+    /// [`Self::borrow_row_sender`] (row-major ingest): pulls a [`Reader`]
+    /// from the pool's reader free list, lazily opening a fresh connection
+    /// (via `Reader::from_conf` on the original connect string) when the
+    /// free list is empty and the pool is below `pool_max`. The reader pool
+    /// is lazily grown and capped **independently** of the two sender pools,
+    /// so heavy ingest can't starve queries and vice versa (the combined
+    /// live-connection ceiling across all three pools is `3 * pool_max`).
+    ///
+    /// Borrow at the cap returns
+    /// [`InvalidApiCall`](crate::egress::error::ErrorCode::InvalidApiCall).
+    ///
+    /// The returned [`BorrowedReader`] derefs to `Reader`, so the usual
+    /// `prepare` / `execute` cursor flow works unchanged, and returns the
+    /// reader to the pool on `Drop` — unless its transport has been torn
+    /// down (or [`BorrowedReader::mark_must_close`] was called), in which
+    /// case it is dropped and the next borrow opens a fresh one.
+    ///
+    /// Like [`BorrowedSender`], [`BorrowedReader`] is **not** `Send` or
+    /// `Sync`: borrow one reader per worker thread from the same `QuestDb`.
+    #[cfg(feature = "_egress")]
+    pub fn borrow_reader(&self) -> crate::egress::error::Result<BorrowedReader<'_>> {
+        let reader = self.pick_reader()?;
+        Ok(BorrowedReader::new(self, reader))
     }
 
     /// FFI escape hatch: borrow a reader from the egress pool.
@@ -974,6 +1002,84 @@ fn return_row_sender_to_pool(inner: &Arc<DbInner>, sender: Sender, must_close: b
         });
     }
     drop(state);
+}
+
+/// A query [`Reader`] borrowed from a [`QuestDb`] pool.
+///
+/// Egress companion to [`BorrowedSender`] (column-major) and
+/// [`BorrowedRowSender`] (row-major). Derefs to `Reader`, so the usual
+/// `prepare` / `execute` cursor flow works unchanged. On `Drop` the reader
+/// is returned to the reader pool, unless its transport has been torn down
+/// (or [`Self::mark_must_close`] was called), in which case it is dropped
+/// and the next borrow opens a fresh one.
+///
+/// `BorrowedReader` is **not** `Send` or `Sync`: the borrowed connection
+/// belongs to the borrowing thread for the duration of the borrow.
+#[cfg(feature = "_egress")]
+pub struct BorrowedReader<'a> {
+    db: &'a QuestDb,
+    reader: Option<Reader>,
+    must_close: bool,
+    /// !Send / !Sync marker, mirroring [`BorrowedSender`].
+    _not_send: PhantomData<Rc<()>>,
+}
+
+#[cfg(feature = "_egress")]
+impl<'a> BorrowedReader<'a> {
+    fn new(db: &'a QuestDb, reader: Reader) -> Self {
+        Self {
+            db,
+            reader: Some(reader),
+            must_close: false,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// Force this reader to be dropped (not recycled) when the borrow ends.
+    /// Use after an error that may have left the connection unusable.
+    pub fn mark_must_close(&mut self) {
+        self.must_close = true;
+    }
+}
+
+#[cfg(feature = "_egress")]
+impl Debug for BorrowedReader<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        // `Reader` is not `Debug`; surface only the handle state.
+        f.debug_struct("BorrowedReader")
+            .field("borrowed", &self.reader.is_some())
+            .field("must_close", &self.must_close)
+            .finish()
+    }
+}
+
+#[cfg(feature = "_egress")]
+impl Deref for BorrowedReader<'_> {
+    type Target = Reader;
+
+    fn deref(&self) -> &Self::Target {
+        self.reader
+            .as_ref()
+            .expect("borrowed reader already returned")
+    }
+}
+
+#[cfg(feature = "_egress")]
+impl DerefMut for BorrowedReader<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.reader
+            .as_mut()
+            .expect("borrowed reader already returned")
+    }
+}
+
+#[cfg(feature = "_egress")]
+impl Drop for BorrowedReader<'_> {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            return_reader_to_pool(&self.db.inner, reader, self.must_close);
+        }
+    }
 }
 
 /// Owned (lifetime-free) variant of a borrowed reader used by the C FFI.
@@ -1408,5 +1514,7 @@ const _: fn() = || {
     }
     assert_not_send::<BorrowedSender<'_>>();
     assert_not_send::<BorrowedRowSender<'_>>();
+    #[cfg(feature = "_egress")]
+    assert_not_send::<BorrowedReader<'_>>();
     assert_not_send::<crate::ingress::column_sender::Chunk<'_>>();
 };

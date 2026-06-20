@@ -366,7 +366,7 @@ void line_reader_mark_must_close(line_reader* reader);
 
 /* Reader pool (provided by `questdb/ingress/column_sender.h`'s
  * `questdb_db` opaque). Same FFI surface as the writer-side
- * `questdb_db_borrow_conn` / `_return_conn`, but for `line_reader`
+ * `questdb_db_borrow_sender` / `_return_conn`, but for `line_reader`
  * handles. Lives here because it wraps the `line_reader` type. */
 struct questdb_db;
 

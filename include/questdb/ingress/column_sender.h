@@ -164,12 +164,12 @@ void questdb_db_close(questdb_db* db);
  * The returned conn is bound to the calling thread until returned.
  */
 QUESTDB_CLIENT_API
-qwpws_conn* questdb_db_borrow_conn(
+qwpws_conn* questdb_db_borrow_sender(
     questdb_db* db,
     line_sender_error** err_out);
 
 /**
- * Like `questdb_db_borrow_conn` but retries the connect within `budget_ms`
+ * Like `questdb_db_borrow_sender` but retries the connect within `budget_ms`
  * using the row sender's reconnect backoff (centered-jittered exponential with
  * a role-reject reset; authentication and protocol-version errors are
  * terminal). On a transient `line_sender_error_failover_retry`, drop the dead
@@ -178,7 +178,7 @@ qwpws_conn* questdb_db_borrow_conn(
  * Returns NULL on failure and sets `*err_out` if provided.
  */
 QUESTDB_CLIENT_API
-qwpws_conn* questdb_db_borrow_conn_with_retry(
+qwpws_conn* questdb_db_borrow_sender_with_retry(
     questdb_db* db,
     uint64_t budget_ms,
     line_sender_error** err_out);
@@ -186,7 +186,7 @@ qwpws_conn* questdb_db_borrow_conn_with_retry(
 /**
  * The pool's failover budget (`reconnect_max_duration`, default 300000 ms).
  * Callers tracking an overall failover deadline pass the remaining budget to
- * `questdb_db_borrow_conn_with_retry`. Returns 0 if `db` is NULL.
+ * `questdb_db_borrow_sender_with_retry`. Returns 0 if `db` is NULL.
  */
 QUESTDB_CLIENT_API
 uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);

@@ -4366,3 +4366,85 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 //    content-size header. The mock does not currently emit zstd
 //    frames; needs a small bytes-sender shim.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Pool integration: `questdb::pool::borrow_reader()`.
+//
+// Mirrors the Rust `QuestDb::borrow_reader` coverage
+// (questdb-rs/src/tests/column_sender_pool.rs::reader_pool). The unified pool
+// hands out query readers as well as senders; a borrowed reader returns to
+// the pool on destruction unless `mark_must_close()` was called.
+//
+// Each pool eager-opens `pool_size` column connections at construction
+// (script[0..pool_size]); reader borrows consume the trailing scripts. The
+// reader connection sends SERVER_INFO at connect, then parks on the query
+// request that never arrives.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+qm::Script reader_park_script(uint8_t role = qm::ROLE_PRIMARY)
+{
+    return qm::Script{
+        qm::ActionSendServerInfo{role, "test-cluster", "node-A"},
+        qm::ActionAwaitQueryRequest{}, // park: this test never executes a query
+    };
+}
+
+std::string pool_conf(const std::string& addr)
+{
+    return "ws::addr=" + addr + ";pool_size=1;pool_reap=manual;";
+}
+} // namespace
+
+TEST_CASE("pool::borrow_reader borrows a usable reader and recycles it")
+{
+    // script[0] = column eager-open (parks); script[1..] = reader borrows.
+    qm::MockServer srv({
+        qm::Script{qm::ActionAwaitClientFrame{0x51}},
+        reader_park_script(),
+    });
+    questdb::pool db{pool_conf(srv.addr())};
+
+    {
+        // Resembles the Rust `let mut reader = db.borrow_reader()?;`.
+        auto reader = db.borrow_reader();
+        CHECK(reader.server_version() == 1);
+        CHECK_FALSE(reader.current_host().empty());
+        auto info = reader.server_info();
+        CHECK(info.cluster_id() == "test-cluster");
+    } // <- returned to the pool here
+
+    // Re-borrowing reuses the recycled reader — no new connection is opened.
+    int accepts_before_reuse = srv.accepts();
+    {
+        auto reader = db.borrow_reader();
+        CHECK(reader.server_version() == 1);
+    }
+    CHECK(srv.accepts() == accepts_before_reuse);
+}
+
+TEST_CASE("pool::borrow_reader honours mark_must_close (drops, not recycles)")
+{
+    qm::MockServer srv({
+        qm::Script{qm::ActionAwaitClientFrame{0x51}}, // column eager-open
+        reader_park_script(), // first reader borrow
+        reader_park_script(), // re-borrow after the must-close drop
+    });
+    questdb::pool db{pool_conf(srv.addr())};
+
+    {
+        auto reader = db.borrow_reader();
+        CHECK(reader.server_version() == 1);
+        reader.mark_must_close(); // drop on return instead of recycling
+    }
+
+    // The must-close reader was dropped, so the next borrow opens a fresh
+    // connection (one more accept).
+    int accepts_before = srv.accepts();
+    {
+        auto reader = db.borrow_reader();
+        CHECK(reader.server_version() == 1);
+    }
+    CHECK(srv.accepts() == accepts_before + 1);
+}

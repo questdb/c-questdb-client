@@ -36,6 +36,16 @@
 // intentionally not wrapped here; it is awkward to use from C++ without
 // a NumPy host. C++ callers needing it can drop to the raw C API.
 
+// Forward declaration so the unified `pool` can hand out query readers via
+// `pool::borrow_reader()`, mirroring the Rust `QuestDb::borrow_reader`. The
+// method is DEFINED out-of-line in `questdb/egress/line_reader.hpp` so the
+// heavy egress header stays off the sender-only include path; include that
+// header to call it.
+namespace questdb::egress
+{
+class reader;
+}
+
 namespace questdb::ingress
 {
 
@@ -797,7 +807,7 @@ class pool;
  * RAII guard for a borrowed connection. On destruction the conn is
  * returned to the pool (or dropped if it has latched must-close).
  *
- * Constructed only via `pool::borrow_conn()`.
+ * Constructed only via `pool::borrow_sender()`.
  */
 class borrowed_conn
 {
@@ -913,10 +923,10 @@ public:
     const ::questdb_db* c_ptr() const noexcept { return _raw; }
 
     /** Borrow a conn. Throws on cap exhaustion or transport failure. */
-    borrowed_conn borrow_conn()
+    borrowed_conn borrow_sender()
     {
         auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_conn, _raw);
+            ::questdb_db_borrow_sender, _raw);
         return borrowed_conn{_raw, raw};
     }
 
@@ -927,12 +937,29 @@ public:
      * tracked remaining budget). Throws on a terminal error or budget
      * exhaustion.
      */
-    borrowed_conn borrow_conn_with_retry(uint64_t budget_ms)
+    borrowed_conn borrow_sender_with_retry(uint64_t budget_ms)
     {
         auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_conn_with_retry, _raw, budget_ms);
+            ::questdb_db_borrow_sender_with_retry, _raw, budget_ms);
         return borrowed_conn{_raw, raw};
     }
+
+    /**
+     * Borrow a query reader from the pool, mirroring Rust
+     * `QuestDb::borrow_reader`. Readers are pooled on a separate,
+     * independently-capped free list that shares the `pool_size` /
+     * `pool_max` / `pool_idle_timeout_ms` budget; the pool is lazy (a
+     * connection opens on first borrow). The returned `reader` is
+     * equivalent to a standalone one and returns itself to the pool on
+     * destruction — unless `reader::mark_must_close()` was called, in which
+     * case it is dropped. Throws `line_reader_error` on cap exhaustion or
+     * transport failure.
+     *
+     * DEFINED in `questdb/egress/line_reader.hpp` (the reader-pool entry
+     * points live alongside the `reader` type, matching the C headers).
+     * Include that header to call this.
+     */
+    ::questdb::egress::reader borrow_reader();
 
     /** The pool's failover budget (`reconnect_max_duration`) in milliseconds. */
     uint64_t reconnect_max_duration_ms() const noexcept
@@ -960,3 +987,14 @@ private:
 };
 
 } // namespace questdb::ingress
+
+namespace questdb
+{
+// `questdb::pool` is the canonical, top-level spelling of the connection
+// pool. The pool is cross-cutting — it hands out write-side senders
+// (`borrow_sender`) and read-side query readers (`borrow_reader`) — so it
+// belongs at the top-level `questdb` namespace rather than under `ingress`.
+// This re-export is the C++ analogue of the Rust `questdb::QuestDb`
+// re-export; `questdb::ingress::pool` remains valid for back-compat.
+using ingress::pool;
+} // namespace questdb

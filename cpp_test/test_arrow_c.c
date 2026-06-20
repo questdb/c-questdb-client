@@ -909,7 +909,7 @@ TEST(test_chunk_append_arrow_column_malformed_array_rejected)
 
 /* Open a mock + questdb_db + borrow a conn. Returns NULL on any setup
  * failure; populates *out_db / *out_mock on success. */
-static qwpws_conn* mock_borrow_conn(
+static qwpws_conn* mock_borrow_sender(
     qwp_mock_c** out_mock,
     questdb_db** out_db)
 {
@@ -933,7 +933,7 @@ static qwpws_conn* mock_borrow_conn(
         qwp_mock_c_stop(mock);
         return NULL;
     }
-    qwpws_conn* conn = questdb_db_borrow_conn(db, &err);
+    qwpws_conn* conn = questdb_db_borrow_sender(db, &err);
     if (conn == NULL)
     {
         if (err)
@@ -964,7 +964,7 @@ static void run_arrow_flush(
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+    qwpws_conn* conn = mock_borrow_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
     {
@@ -1006,7 +1006,7 @@ TEST(test_mock_ingress_null_array_via_real_conn)
      * covered above. */
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+    qwpws_conn* conn = mock_borrow_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;
@@ -1147,7 +1147,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         qwp_mock_c* mock;
         questdb_db* db;
-        qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+        qwpws_conn* conn = mock_borrow_sender(&mock, &db);
         CHECK(conn != NULL, "mock conn borrowed");
         if (conn == NULL)
         {
@@ -1190,7 +1190,7 @@ TEST(test_mock_ingress_arrow_release_contract)
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+    qwpws_conn* conn = mock_borrow_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;

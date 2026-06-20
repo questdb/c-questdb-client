@@ -479,7 +479,7 @@ pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
 /// `doc/COLUMN_SENDER_FFI_ABI.md` §4.3 for the selection rules. Returns
 /// NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_conn(
+pub unsafe extern "C" fn questdb_db_borrow_sender(
     db: *mut questdb_db,
     err_out: *mut *mut line_sender_error,
 ) -> *mut qwpws_conn {
@@ -489,7 +489,7 @@ pub unsafe extern "C" fn questdb_db_borrow_conn(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "questdb_db_borrow_conn: db pointer is NULL".to_string(),
+                    "questdb_db_borrow_sender: db pointer is NULL".to_string(),
                 ),
             );
         }
@@ -505,7 +505,7 @@ pub unsafe extern "C" fn questdb_db_borrow_conn(
     }
 }
 
-/// Like `questdb_db_borrow_conn` but retries the connect within `budget_ms`
+/// Like `questdb_db_borrow_sender` but retries the connect within `budget_ms`
 /// using the row sender's reconnect backoff (centered-jittered exponential with
 /// a role-reject reset; `AuthError` / protocol-version errors are terminal). On
 /// a transient `line_sender_error_failover_retry`, drop the dead conn with
@@ -513,7 +513,7 @@ pub unsafe extern "C" fn questdb_db_borrow_conn(
 /// backoff as the row API. `budget_ms == 0` makes a single attempt (no retry).
 /// Returns NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_conn_with_retry(
+pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
     db: *mut questdb_db,
     budget_ms: u64,
     err_out: *mut *mut line_sender_error,
@@ -524,7 +524,7 @@ pub unsafe extern "C" fn questdb_db_borrow_conn_with_retry(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "questdb_db_borrow_conn_with_retry: db pointer is NULL".to_string(),
+                    "questdb_db_borrow_sender_with_retry: db pointer is NULL".to_string(),
                 ),
             );
         }
@@ -545,7 +545,7 @@ pub unsafe extern "C" fn questdb_db_borrow_conn_with_retry(
 
 /// The pool's failover budget (`reconnect_max_duration`, default 300000 ms).
 /// Callers tracking an overall failover deadline pass the remaining budget to
-/// `questdb_db_borrow_conn_with_retry`. Returns 0 if `db` is NULL.
+/// `questdb_db_borrow_sender_with_retry`. Returns 0 if `db` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb_db) -> u64 {
     if db.is_null() {
