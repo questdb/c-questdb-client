@@ -554,7 +554,7 @@ This differs from direct mode, where in-flight un-synced frames live only in the
 socket connection and are not replayable.
 
 Explicit force-drop APIs need a defined SFA meaning. The C
-`questdb_db_drop_conn` and C++ `borrowed_conn::drop_on_return()` contracts say
+`questdb_db_drop_column_sender` and C++ `borrowed_column_sender::drop_on_return()` contracts say
 "do not recycle this borrowed handle." In SFA mode, honoring that contract must
 not delete queued frames. The preferred behavior is:
 
@@ -841,7 +841,7 @@ direct-only behavior:
   `pool_max=1` unless the user explicitly sets an invalid larger value.
 - C/C++ `sync()` docs: direct mode sends a commit-triggering frame; SFA mode
   does not. SFA `sync()` waits for the already-published local queue boundary.
-- C `questdb_db_drop_conn` and C++ `drop_on_return()`: document and implement
+- C `questdb_db_drop_column_sender` and C++ `drop_on_return()`: document and implement
   the SFA force-drop semantics from section 7.7.
 - Python `Client.from_conf()` / `Client.dataframe()` docs or release notes:
   `sf_dir` affects dataframe ingestion through the Rust column-sender backend,
@@ -989,7 +989,7 @@ Other future work:
 
 - Borrowed sender drop returns a usable SFA backend to the pool without
   discarding unresolved frames.
-- `questdb_db_drop_conn` / C++ `drop_on_return()` remove the current SFA
+- `questdb_db_drop_column_sender` / C++ `drop_on_return()` remove the current SFA
   backend from the pool, release the slot lock, and leave unresolved frames
   replayable for the next owner.
 - Owning `QuestDb`/C handle drop releases the slot lock and leaves unresolved

@@ -32,7 +32,7 @@ class _QuestdbDb(ctypes.Structure):
 
 
 class _QwpwsConn(ctypes.Structure):
-    """Opaque `qwpws_conn*` (borrowed pooled connection)."""
+    """Opaque `column_sender*` (borrowed pooled connection)."""
 
 
 class ArrowSenderError(_SenderError):
@@ -193,21 +193,21 @@ _db_borrow_conn = _setsig(
 )
 
 _db_return_conn = _setsig(
-    "questdb_db_return_conn",
+    "questdb_db_return_column_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(_QwpwsConn),
 )
 
 _db_drop_conn = _setsig(
-    "questdb_db_drop_conn",
+    "questdb_db_drop_column_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(_QwpwsConn),
 )
 
 _conn_must_close = _setsig(
-    "qwpws_conn_must_close",
+    "column_sender_must_close",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
 )
@@ -336,7 +336,7 @@ def db_close(db_ptr) -> None:
 
 
 def db_borrow_conn(db_ptr):
-    """Borrow a pooled `qwpws_conn*`."""
+    """Borrow a pooled `column_sender*`."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     conn = _db_borrow_conn(db_ptr, ctypes.byref(err_ref))
     if not conn:

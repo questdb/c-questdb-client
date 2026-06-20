@@ -322,7 +322,8 @@ private:
     friend class column_chunk;
     friend class arrow_import;
     friend class pool;
-    friend class borrowed_conn;
+    friend class borrowed_column_sender;
+    friend class borrowed_row_sender;
 
     template <
         typename T,

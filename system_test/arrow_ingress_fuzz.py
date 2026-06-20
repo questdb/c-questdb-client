@@ -667,7 +667,7 @@ class TestArrowIngressErrors(afc.ArrowFuzzBase):
         sch.release = sch_release
 
         table = f"arrow_in_malformed_{self._master_rng.next_int(2**32):08x}"
-        with afc.borrowed_conn(self._fixture) as conn:
+        with afc.borrowed_column_sender(self._fixture) as conn:
             table_name = _c_table_name(table)
             try:
                 conn_flush_arrow_batch(
@@ -826,7 +826,7 @@ class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
             conn_flush_arrow_batch, pyarrow_export_record_batch,
         )
         from questdb_line_sender import _table_name as _c_table_name
-        with afc.borrowed_conn(self._fixture) as conn:
+        with afc.borrowed_column_sender(self._fixture) as conn:
             for rb in (rb1, rb2):
                 table_name = _c_table_name(table)
                 arr, sch = pyarrow_export_record_batch(rb)
@@ -1045,7 +1045,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         )
 
         with afc.temp_sf_dir("arrow_sfa_schema_") as sf_dir:
-            with afc.borrowed_conn(
+            with afc.borrowed_column_sender(
                 self._fixture,
                 **self._sfa_extras(sender_id, sf_dir),
             ) as conn:
@@ -1115,7 +1115,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         )
 
         with afc.temp_sf_dir("arrow_sfa_reject_") as sf_dir:
-            with afc.borrowed_conn(
+            with afc.borrowed_column_sender(
                 self._fixture,
                 sync_on_exit=False,
                 **self._sfa_extras(sender_id, sf_dir),
@@ -1262,7 +1262,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 "reconnect_max_duration_millis": "120000",
                 "close_flush_timeout_millis": "120000",
             })
-            with afc.borrowed_conn(
+            with afc.borrowed_column_sender(
                 self._fixture,
                 sync_on_exit=False,
                 **recover_extras,
@@ -1343,7 +1343,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 "close_flush_timeout_millis": "120000",
             })
             try:
-                with afc.borrowed_conn(
+                with afc.borrowed_column_sender(
                     self._fixture,
                     sync_on_exit=False,
                     **extras,

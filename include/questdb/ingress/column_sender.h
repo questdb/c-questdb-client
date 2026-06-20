@@ -67,13 +67,20 @@ extern "C" {
 typedef struct questdb_db questdb_db;
 
 /** Borrowed QWP/WS connection. Not thread-safe; belongs to the borrowing
- *  thread until returned via `questdb_db_return_conn`. Carries the
+ *  thread until returned via `questdb_db_return_column_sender`. Carries the
  *  per-connection symbol-dictionary state used by all writer modes
  *  (per-type, Arrow, NumPy). Freeing the handle concurrently with another
  *  call on it is undefined behaviour: callers must establish a
  *  happens-before ordering between the last use and the free (the internal
  *  latch only defers the drop for already-ordered interleavings). */
-typedef struct qwpws_conn qwpws_conn;
+typedef struct column_sender column_sender;
+
+/** Borrowed row-major QWP/WS sender. Not thread-safe; belongs to the
+ *  borrowing thread until returned via `questdb_db_return_row_sender`.
+ *  Builds rows through an ordinary `line_sender_buffer` and sends them with
+ *  `row_sender_flush` / `row_sender_flush_and_keep`. Companion to
+ *  `column_sender` (column-major) and `reader` (query). */
+typedef struct row_sender row_sender;
 
 /** One DataFrame's worth of column buffers destined for one QuestDB table.
  *  Owned by the caller. */
@@ -144,8 +151,8 @@ questdb_db* questdb_db_connect(
 
 /**
  * Close the pool and all its connections. Accepts NULL and no-ops.
- * Outstanding `qwpws_conn` handles remain valid and return their
- * connections on `questdb_db_return_conn` — the pool's state is
+ * Outstanding `column_sender` handles remain valid and return their
+ * connections on `questdb_db_return_column_sender` — the pool's state is
  * reference-counted internally.
  */
 QUESTDB_CLIENT_API
@@ -164,7 +171,7 @@ void questdb_db_close(questdb_db* db);
  * The returned conn is bound to the calling thread until returned.
  */
 QUESTDB_CLIENT_API
-qwpws_conn* questdb_db_borrow_column_sender(
+column_sender* questdb_db_borrow_column_sender(
     questdb_db* db,
     line_sender_error** err_out);
 
@@ -173,12 +180,12 @@ qwpws_conn* questdb_db_borrow_column_sender(
  * using the row sender's reconnect backoff (centered-jittered exponential with
  * a role-reject reset; authentication and protocol-version errors are
  * terminal). On a transient `line_sender_error_failover_retry`, drop the dead
- * conn with `questdb_db_drop_conn` then call this to fail over with the same
+ * conn with `questdb_db_drop_column_sender` then call this to fail over with the same
  * budget and backoff as the row API. `budget_ms == 0` makes a single attempt.
  * Returns NULL on failure and sets `*err_out` if provided.
  */
 QUESTDB_CLIENT_API
-qwpws_conn* questdb_db_borrow_column_sender_with_retry(
+column_sender* questdb_db_borrow_column_sender_with_retry(
     questdb_db* db,
     uint64_t budget_ms,
     line_sender_error** err_out);
@@ -198,17 +205,17 @@ uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);
  * `db` is currently ignored — the conn carries its own reference to
  * the pool — but accepted for symmetry with the borrow call.
  *
- * Mutually exclusive with `questdb_db_drop_conn` on the same `conn`:
+ * Mutually exclusive with `questdb_db_drop_column_sender` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_return_conn(
+void questdb_db_return_column_sender(
     questdb_db* db,
-    qwpws_conn* conn);
+    column_sender* conn);
 
 /**
  * Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
- * (qwpws_conn_must_close becomes true) before the usual pool-return path runs.
+ * (column_sender_must_close becomes true) before the usual pool-return path runs.
  * Invalidates `conn`. Accepts NULL `conn` and no-ops.
  *
  * Use this in error-recovery paths where the conn may hold in-flight
@@ -218,13 +225,13 @@ void questdb_db_return_conn(
  * releases the slot lock; unresolved frames remain in `sf_dir` for the next
  * owner to replay.
  *
- * Mutually exclusive with `questdb_db_return_conn` on the same `conn`:
+ * Mutually exclusive with `questdb_db_return_column_sender` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
  */
 QUESTDB_CLIENT_API
-void questdb_db_drop_conn(
+void questdb_db_drop_column_sender(
     questdb_db* db,
-    qwpws_conn* conn);
+    column_sender* conn);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
  * `questdb_db_return_reader`, `questdb_db_dbg_reader_*_count`) live in
@@ -249,7 +256,97 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * the pool such conns are dropped, not recycled.
  */
 QUESTDB_CLIENT_API
-bool qwpws_conn_must_close(const qwpws_conn* conn);
+bool column_sender_must_close(const column_sender* conn);
+
+/* -------------------------------------------------------------------------
+ * Row-major sender borrow
+ *
+ * The pool hands out three kinds of borrow: column-major senders
+ * (`column_sender`, above), row-major senders (`row_sender`, here), and
+ * query readers (`reader`, in `questdb/egress/reader.h`). A `row_sender`
+ * builds rows with the ordinary `line_sender_buffer` API (from
+ * `line_sender.h`) and flushes them with `row_sender_flush`.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Borrow a row-major sender from the pool. Returns NULL on failure and
+ * sets `*err_out` if provided. The row-sender pool is lazy and
+ * independently capped (it shares `pool_max`); a borrow at the cap returns
+ * `line_sender_error_invalid_api_call`. The returned sender is bound to the
+ * calling thread until returned.
+ */
+QUESTDB_CLIENT_API
+row_sender* questdb_db_borrow_row_sender(
+    questdb_db* db,
+    line_sender_error** err_out);
+
+/**
+ * Like `questdb_db_borrow_row_sender` but retries the connect within
+ * `budget_ms` using the pool's reconnect backoff (authentication and
+ * protocol-version errors are terminal). `budget_ms == 0` makes a single
+ * attempt. Returns NULL on failure and sets `*err_out` if provided.
+ */
+QUESTDB_CLIENT_API
+row_sender* questdb_db_borrow_row_sender_with_retry(
+    questdb_db* db,
+    uint64_t budget_ms,
+    line_sender_error** err_out);
+
+/**
+ * Return a borrowed row sender to the pool. Invalidates `sender`. Accepts
+ * NULL and no-ops. `db` is ignored (the sender carries its own pool
+ * back-reference) but kept in the ABI for symmetry with the borrow call.
+ *
+ * Mutually exclusive with `questdb_db_drop_row_sender` on the same
+ * `sender`: call exactly one of the two.
+ */
+QUESTDB_CLIENT_API
+void questdb_db_return_row_sender(
+    questdb_db* db,
+    row_sender* sender);
+
+/**
+ * Force-drop a borrowed row sender instead of recycling it: the underlying
+ * connection is closed and the next borrow opens a fresh one. Invalidates
+ * `sender`. Accepts NULL and no-ops.
+ *
+ * Mutually exclusive with `questdb_db_return_row_sender` on the same
+ * `sender`: call exactly one of the two.
+ */
+QUESTDB_CLIENT_API
+void questdb_db_drop_row_sender(
+    questdb_db* db,
+    row_sender* sender);
+
+/**
+ * `true` if the row sender will be dropped rather than recycled on return
+ * (it was force-marked, or a flush left the connection unusable), or if
+ * `sender` is NULL. `false` only when it is safely reusable.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_must_close(const row_sender* sender);
+
+/**
+ * Flush the buffer of rows through the borrowed row sender, then clear the
+ * buffer. Returns `true` on success; on failure returns `false` and sets
+ * `*err_out`. Mirrors `line_sender_flush` for the standalone sender.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_flush(
+    row_sender* sender,
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/**
+ * Flush the buffer of rows through the borrowed row sender, keeping the
+ * buffer intact (clear it before starting a new batch). Mirrors
+ * `line_sender_flush_and_keep`.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_flush_and_keep(
+    row_sender* sender,
+    const line_sender_buffer* buffer,
+    line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------
  * Chunk lifecycle
@@ -1026,7 +1123,7 @@ bool column_sender_chunk_designated_timestamp_seconds(
 
 QUESTDB_CLIENT_API
 bool column_sender_flush(
-    qwpws_conn* conn,
+    column_sender* conn,
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
@@ -1038,7 +1135,7 @@ bool column_sender_flush(
  */
 QUESTDB_CLIENT_API
 bool column_sender_sync(
-    qwpws_conn* conn, uint32_t ack_level, line_sender_error** err_out);
+    column_sender* conn, uint32_t ack_level, line_sender_error** err_out);
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 
@@ -1092,7 +1189,7 @@ typedef struct column_sender_arrow_override
  */
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch(
-    qwpws_conn* conn,
+    column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
@@ -1108,7 +1205,7 @@ bool column_sender_flush_arrow_batch(
  */
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch_at_column(
-    qwpws_conn* conn,
+    column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,

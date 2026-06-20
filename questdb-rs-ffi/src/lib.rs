@@ -70,6 +70,8 @@ use questdb::{
 };
 use std::time::Duration;
 
+use questdb::ingress::column_sender::OwnedRowSender;
+
 mod ndarr;
 use ndarr::StrideArrayView;
 
@@ -285,7 +287,7 @@ pub enum line_sender_error_code {
 
     /// A reconnectable failure on the column-major sender's flush/sync
     /// path (transport error, EOF, closed connection). The operation has
-    /// not committed: drop the connection (`questdb_db_drop_conn`),
+    /// not committed: drop the connection (`questdb_db_drop_column_sender`),
     /// borrow a fresh one (the pool rotates to a live endpoint), and
     /// re-drive from your source.
     line_sender_error_failover_retry = 17,
@@ -3631,6 +3633,171 @@ pub unsafe extern "C" fn line_sender_flush(
             Ok(()) => true,
             Err(err) => {
                 set_err_out_from_sender_error(err_out, sender, err);
+                false
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Row-sender pool borrow (row-major QWP/WS sender)
+//
+// The pool (`questdb_db`) hands out three kinds of borrow: column-major
+// senders (`column_sender`), row-major senders (`row_sender`, below), and
+// query readers (`reader`). A `row_sender` builds rows with the ordinary
+// `line_sender_buffer` and flushes them with `row_sender_flush`.
+// ===========================================================================
+
+/// A row-major QWP/WS sender borrowed from a `questdb_db` pool. Opaque and
+/// not thread-safe: it belongs to the borrowing thread until returned with
+/// `questdb_db_return_row_sender` (recycle) or `questdb_db_drop_row_sender`
+/// (force-close). Build rows with a `line_sender_buffer` and send them with
+/// `row_sender_flush` / `row_sender_flush_and_keep`.
+pub struct row_sender(OwnedRowSender);
+
+/// Borrow a row-major sender from the pool. Returns NULL on failure and sets
+/// `*err_out` if provided. The row-sender pool is lazy and independently
+/// capped (shares `pool_max`); a borrow at the cap returns
+/// `line_sender_error_invalid_api_call`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_borrow_row_sender(
+    db: *mut questdb_db,
+    err_out: *mut *mut line_sender_error,
+) -> *mut row_sender {
+    if db.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "questdb_db_borrow_row_sender: db pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return ptr::null_mut();
+    }
+    let db_ref = unsafe { &*db };
+    match db_ref.0.borrow_row_sender_owned() {
+        Ok(owned) => Box::into_raw(Box::new(row_sender(owned))),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Like `questdb_db_borrow_row_sender` but retries the connect within
+/// `budget_ms` using the pool's reconnect backoff (auth / protocol-version
+/// errors are terminal). `budget_ms == 0` makes a single attempt. Returns
+/// NULL on failure; sets `*err_out` if provided.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_borrow_row_sender_with_retry(
+    db: *mut questdb_db,
+    budget_ms: u64,
+    err_out: *mut *mut line_sender_error,
+) -> *mut row_sender {
+    if db.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "questdb_db_borrow_row_sender_with_retry: db pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return ptr::null_mut();
+    }
+    let db_ref = unsafe { &*db };
+    match db_ref
+        .0
+        .borrow_row_sender_owned_with_retry(Duration::from_millis(budget_ms))
+    {
+        Ok(owned) => Box::into_raw(Box::new(row_sender(owned))),
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Return a borrowed row sender to the pool. Invalidates `sender`. Accepts
+/// NULL and no-ops. `db` is ignored (the sender carries its own pool
+/// back-reference) but kept in the ABI for symmetry with the borrow call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_return_row_sender(
+    _db: *mut questdb_db,
+    sender: *mut row_sender,
+) {
+    if sender.is_null() {
+        return;
+    }
+    unsafe { drop(Box::from_raw(sender)) };
+}
+
+/// Force-drop a borrowed row sender instead of recycling it: the underlying
+/// connection is closed and the next borrow opens a fresh one. Invalidates
+/// `sender`. Accepts NULL and no-ops.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_drop_row_sender(_db: *mut questdb_db, sender: *mut row_sender) {
+    if sender.is_null() {
+        return;
+    }
+    unsafe {
+        (*sender).0.mark_must_close();
+        drop(Box::from_raw(sender));
+    }
+}
+
+/// `true` if the row sender will be dropped rather than recycled on return
+/// (force-marked, or a flush left the connection unusable), or if `sender`
+/// is NULL. `false` only when it is safely reusable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn row_sender_must_close(sender: *const row_sender) -> bool {
+    if sender.is_null() {
+        return true;
+    }
+    unsafe { (*sender).0.must_close() }
+}
+
+/// Flush the buffer of rows through the borrowed row sender, then clear the
+/// buffer. Returns `true` on success; on failure returns `false` and sets
+/// `*err_out`. Mirrors `line_sender_flush` for the standalone sender.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn row_sender_flush(
+    sender: *mut row_sender,
+    buffer: *mut line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let s = (*sender).0.get_mut();
+        let buffer = unwrap_buffer_mut(buffer);
+        match s.flush(buffer) {
+            Ok(()) => true,
+            Err(err) => {
+                set_err_out_from_sender_error(err_out, s, err);
+                false
+            }
+        }
+    }
+}
+
+/// Flush the buffer of rows through the borrowed row sender, keeping the
+/// buffer intact (clear it before starting a new batch). Mirrors
+/// `line_sender_flush_and_keep`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn row_sender_flush_and_keep(
+    sender: *mut row_sender,
+    buffer: *const line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let s = (*sender).0.get_mut();
+        let buffer = unwrap_buffer(buffer);
+        match s.flush_and_keep(buffer) {
+            Ok(()) => true,
+            Err(err) => {
+                set_err_out_from_sender_error(err_out, s, err);
                 false
             }
         }

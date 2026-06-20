@@ -26,7 +26,7 @@
 //!
 //! Mirrors `doc/COLUMN_SENDER_FFI_ABI.md`. The ABI re-uses
 //! `line_sender_error*` for fallible-call error reporting; opaque types
-//! (`questdb_db`, `qwpws_conn`, `column_sender_chunk`) are heap-allocated
+//! (`questdb_db`, `column_sender`, `column_sender_chunk`) are heap-allocated
 //! and freed through their dedicated `_close` / `_free` / `_return_conn`
 //! entry points.
 
@@ -57,24 +57,24 @@ use crate::{line_sender_error, set_err_out_from_error, set_err_out_from_error_wi
 pub struct questdb_db(pub(crate) QuestDb);
 
 /// Borrowed QWP/WS connection. Owns a pool slot until
-/// `questdb_db_return_conn` is called. Bundles the per-connection
+/// `questdb_db_return_column_sender` is called. Bundles the per-connection
 /// schema registry and symbol-dict state used by all writer modes.
 ///
-/// **Not thread-safe.** A `qwpws_conn*` must not be used from more than
+/// **Not thread-safe.** A `column_sender*` must not be used from more than
 /// one thread at a time. The second tuple field is a CAS-checked latch
 /// on every FFI entry (mutation, accessor, and free); a non-blocking
 /// contending caller observes `line_sender_error_invalid_api_call`
-/// instead of a data race. When `questdb_db_return_conn` is observed
+/// instead of a data race. When `questdb_db_return_column_sender` is observed
 /// to interleave with an in-flight call (the latch sees `IN_USE` when
 /// the free arrives), the box's drop is deferred to the in-flight
 /// call's exit path, preventing UAF for that ordering.
 ///
 /// Callers must still ensure happens-before ordering between the last
-/// FFI call on `conn` and `questdb_db_return_conn(conn)` — e.g. by
+/// FFI call on `conn` and `questdb_db_return_column_sender(conn)` — e.g. by
 /// confining `conn` to a single thread, or by an external barrier — so
 /// the latch's CAS sees the close intent. A true concurrent free
 /// without such ordering is undefined behavior.
-pub struct qwpws_conn(OwnedColumnSender, AtomicU32);
+pub struct column_sender(OwnedColumnSender, AtomicU32);
 
 /// One DataFrame's worth of column buffers destined for one QuestDB table.
 /// Owned by the caller; not bound to a connection.
@@ -89,7 +89,7 @@ pub struct qwpws_conn(OwnedColumnSender, AtomicU32);
 /// **Not thread-safe.** Single-threaded by contract; the latch in the
 /// second tuple field detects in-thread reentrance and out-of-order
 /// free/use sequences, deferring a free observed mid-call until the
-/// active call exits. The same caveat as [`qwpws_conn`] applies: the
+/// active call exits. The same caveat as [`column_sender`] applies: the
 /// caller must establish happens-before between the last column call
 /// on `chunk` and `column_sender_chunk_free(chunk)`.
 pub struct column_sender_chunk(Chunk<'static>, AtomicU32);
@@ -118,7 +118,7 @@ impl FfiHandle for column_sender_arrow_import {
     unsafe fn on_deferred_close(_handle: *mut Self, _latch_prev: u32) {}
 }
 
-impl FfiHandle for qwpws_conn {
+impl FfiHandle for column_sender {
     unsafe fn on_deferred_close(handle: *mut Self, latch_prev: u32) {
         if latch_prev & LATCH_DROP != 0 {
             unsafe { (*handle).0.get_mut().mark_must_close() };
@@ -465,9 +465,9 @@ pub unsafe extern "C" fn questdb_db_connect(
 
 /// Close the pool and all its connections. Accepts NULL and no-ops.
 ///
-/// Outstanding `qwpws_conn` handles remain valid (they hold an
+/// Outstanding `column_sender` handles remain valid (they hold an
 /// internal reference to the pool's state) and return themselves on
-/// `questdb_db_return_conn`.
+/// `questdb_db_return_column_sender`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
     if !db.is_null() {
@@ -482,7 +482,7 @@ pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
 pub unsafe extern "C" fn questdb_db_borrow_column_sender(
     db: *mut questdb_db,
     err_out: *mut *mut line_sender_error,
-) -> *mut qwpws_conn {
+) -> *mut column_sender {
     if db.is_null() {
         unsafe {
             set_err_out_from_error(
@@ -497,7 +497,7 @@ pub unsafe extern "C" fn questdb_db_borrow_column_sender(
     }
     let db_ref = unsafe { &*db };
     match db_ref.0.borrow_column_sender_owned() {
-        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicU32::new(0)))),
+        Ok(owned) => Box::into_raw(Box::new(column_sender(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             std::ptr::null_mut()
@@ -509,7 +509,7 @@ pub unsafe extern "C" fn questdb_db_borrow_column_sender(
 /// using the row sender's reconnect backoff (centered-jittered exponential with
 /// a role-reject reset; `AuthError` / protocol-version errors are terminal). On
 /// a transient `line_sender_error_failover_retry`, drop the dead conn with
-/// `questdb_db_drop_conn` then call this to fail over with the same budget and
+/// `questdb_db_drop_column_sender` then call this to fail over with the same budget and
 /// backoff as the row API. `budget_ms == 0` makes a single attempt (no retry).
 /// Returns NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
@@ -517,7 +517,7 @@ pub unsafe extern "C" fn questdb_db_borrow_column_sender_with_retry(
     db: *mut questdb_db,
     budget_ms: u64,
     err_out: *mut *mut line_sender_error,
-) -> *mut qwpws_conn {
+) -> *mut column_sender {
     if db.is_null() {
         unsafe {
             set_err_out_from_error(
@@ -535,7 +535,7 @@ pub unsafe extern "C" fn questdb_db_borrow_column_sender_with_retry(
         .0
         .borrow_column_sender_owned_with_retry(std::time::Duration::from_millis(budget_ms))
     {
-        Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicU32::new(0)))),
+        Ok(owned) => Box::into_raw(Box::new(column_sender(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
             std::ptr::null_mut()
@@ -562,7 +562,10 @@ pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb
 /// in-flight call's exit path performs the actual `Box::from_raw`, so
 /// the caller never sees UAF.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_return_conn(_db: *mut questdb_db, conn: *mut qwpws_conn) {
+pub unsafe extern "C" fn questdb_db_return_column_sender(
+    _db: *mut questdb_db,
+    conn: *mut column_sender,
+) {
     if conn.is_null() {
         return;
     }
@@ -571,13 +574,16 @@ pub unsafe extern "C" fn questdb_db_return_conn(_db: *mut questdb_db, conn: *mut
 }
 
 /// Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
-/// (`qwpws_conn_must_close` becomes `true`) so the underlying backend is
+/// (`column_sender_must_close` becomes `true`) so the underlying backend is
 /// removed from the pool. In store-and-forward mode unresolved frames remain in
 /// the SFA slot for replay by the next owner. Accepts NULL and no-ops. As with
-/// `questdb_db_return_conn`, a racing in-flight call defers the drop to that
+/// `questdb_db_return_column_sender`, a racing in-flight call defers the drop to that
 /// call's exit path.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_drop_conn(_db: *mut questdb_db, conn: *mut qwpws_conn) {
+pub unsafe extern "C" fn questdb_db_drop_column_sender(
+    _db: *mut questdb_db,
+    conn: *mut column_sender,
+) {
     if conn.is_null() {
         return;
     }
@@ -614,7 +620,7 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
 /// need to distinguish "contended" from "terminal", confine `conn` to
 /// one thread so the latch can never be contended at this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool {
+pub unsafe extern "C" fn column_sender_must_close(conn: *const column_sender) -> bool {
     if conn.is_null() {
         return true;
     }
@@ -622,10 +628,10 @@ pub unsafe extern "C" fn qwpws_conn_must_close(conn: *const qwpws_conn) -> bool 
     let mut err_box: *mut line_sender_error = std::ptr::null_mut();
     let guard = unsafe {
         InUseGuard::acquire(
-            conn as *mut qwpws_conn,
+            conn as *mut column_sender,
             state,
-            "qwpws_conn_must_close",
-            "qwpws_conn",
+            "column_sender_must_close",
+            "column_sender",
             &mut err_box,
         )
     };
@@ -2239,7 +2245,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
 /// remaining in-flight acks.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush(
-    conn: *mut qwpws_conn,
+    conn: *mut column_sender,
     chunk: *mut column_sender_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -2260,7 +2266,7 @@ pub unsafe extern "C" fn column_sender_flush(
             conn,
             &raw const (*conn).1,
             "column_sender_flush",
-            "qwpws_conn",
+            "column_sender",
             err_out,
         )
     } {
@@ -2321,7 +2327,7 @@ pub unsafe extern "C" fn column_sender_flush(
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush_arrow_batch(
-    conn: *mut qwpws_conn,
+    conn: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -2351,7 +2357,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch(
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
-    conn: *mut qwpws_conn,
+    conn: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -2533,7 +2539,7 @@ unsafe fn arrow_overrides_from_c<'a>(
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl(
-    conn: *mut qwpws_conn,
+    conn: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -2555,7 +2561,7 @@ unsafe fn arrow_batch_impl(
             conn,
             &raw const (*conn).1,
             "column_sender_flush_arrow_batch",
-            "qwpws_conn",
+            "column_sender",
             err_out,
         )
     } {
@@ -2631,7 +2637,7 @@ unsafe fn reexport_record_batch_into(
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_sync(
-    conn: *mut qwpws_conn,
+    conn: *mut column_sender,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -2656,7 +2662,7 @@ pub unsafe extern "C" fn column_sender_sync(
             conn,
             &raw const (*conn).1,
             "column_sender_sync",
-            "qwpws_conn",
+            "column_sender",
             err_out,
         )
     } {

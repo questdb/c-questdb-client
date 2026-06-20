@@ -82,7 +82,7 @@ const _: () = assert!(
 );
 
 #[doc(hidden)]
-pub use db::OwnedColumnSender;
+pub use db::{OwnedColumnSender, OwnedRowSender};
 
 #[cfg(feature = "_egress")]
 #[doc(hidden)]

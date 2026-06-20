@@ -692,19 +692,19 @@ inline column_chunk& column_chunk::append_arrow_import(
 #endif
 
 /**
- * Borrowed `::qwpws_conn*` wrapper exposing flush / sync / Arrow-batch
- * ingest. Owned by `borrowed_conn`; do not construct directly.
+ * Borrowed `::column_sender*` wrapper exposing flush / sync / Arrow-batch
+ * ingest. Owned by `borrowed_column_sender`; do not construct directly.
  */
 class column_sender_conn
 {
 public:
-    explicit column_sender_conn(::qwpws_conn* raw) noexcept
+    explicit column_sender_conn(::column_sender* raw) noexcept
         : _raw{raw}
     {
     }
 
-    ::qwpws_conn* c_ptr() noexcept { return _raw; }
-    const ::qwpws_conn* c_ptr() const noexcept { return _raw; }
+    ::column_sender* c_ptr() noexcept { return _raw; }
+    const ::column_sender* c_ptr() const noexcept { return _raw; }
 
     /**
      * `true` if the conn has latched into terminal must-close. Pool
@@ -712,7 +712,7 @@ public:
      */
     bool must_close() const noexcept
     {
-        return ::qwpws_conn_must_close(_raw);
+        return ::column_sender_must_close(_raw);
     }
 
     /**
@@ -797,7 +797,7 @@ public:
 #endif
 
 private:
-    ::qwpws_conn* _raw;
+    ::column_sender* _raw;
 };
 
 /** Forward decl. */
@@ -809,13 +809,13 @@ class pool;
  *
  * Constructed only via `pool::borrow_column_sender()`.
  */
-class borrowed_conn
+class borrowed_column_sender
 {
 public:
-    borrowed_conn(const borrowed_conn&) = delete;
-    borrowed_conn& operator=(const borrowed_conn&) = delete;
+    borrowed_column_sender(const borrowed_column_sender&) = delete;
+    borrowed_column_sender& operator=(const borrowed_column_sender&) = delete;
 
-    borrowed_conn(borrowed_conn&& other) noexcept
+    borrowed_column_sender(borrowed_column_sender&& other) noexcept
         : _db{other._db}
         , _conn{std::move(other._conn)}
         , _force_drop{other._force_drop}
@@ -824,7 +824,7 @@ public:
         other._force_drop = false;
     }
 
-    borrowed_conn& operator=(borrowed_conn&& other) noexcept
+    borrowed_column_sender& operator=(borrowed_column_sender&& other) noexcept
     {
         if (this != &other)
         {
@@ -838,7 +838,7 @@ public:
         return *this;
     }
 
-    ~borrowed_conn() noexcept { release(); }
+    ~borrowed_column_sender() noexcept { release(); }
 
     column_sender_conn* operator->() noexcept { return &_conn; }
     const column_sender_conn* operator->() const noexcept { return &_conn; }
@@ -857,7 +857,7 @@ public:
 private:
     friend class pool;
 
-    borrowed_conn(::questdb_db* db, ::qwpws_conn* raw) noexcept
+    borrowed_column_sender(::questdb_db* db, ::column_sender* raw) noexcept
         : _db{db}
         , _conn{raw}
     {
@@ -865,19 +865,127 @@ private:
 
     void release() noexcept
     {
-        ::qwpws_conn* raw = _conn.c_ptr();
+        ::column_sender* raw = _conn.c_ptr();
         if (_db && raw)
         {
-            if (_force_drop || ::qwpws_conn_must_close(raw))
-                ::questdb_db_drop_conn(_db, raw);
+            if (_force_drop || ::column_sender_must_close(raw))
+                ::questdb_db_drop_column_sender(_db, raw);
             else
-                ::questdb_db_return_conn(_db, raw);
+                ::questdb_db_return_column_sender(_db, raw);
         }
         _db = nullptr;
     }
 
     ::questdb_db* _db;
     column_sender_conn _conn;
+    bool _force_drop{false};
+};
+
+/**
+ * RAII guard for a borrowed row-major sender. On destruction the sender is
+ * returned to the pool (or dropped if `drop_on_return()` was called, or a
+ * flush left it must-close). Build rows with a
+ * `questdb::ingress::line_sender_buffer` and send them via `flush()` /
+ * `flush_and_keep()`.
+ *
+ * Constructed only via `pool::borrow_row_sender()`.
+ */
+class borrowed_row_sender
+{
+public:
+    borrowed_row_sender(const borrowed_row_sender&) = delete;
+    borrowed_row_sender& operator=(const borrowed_row_sender&) = delete;
+
+    borrowed_row_sender(borrowed_row_sender&& other) noexcept
+        : _db{other._db}
+        , _sender{other._sender}
+        , _force_drop{other._force_drop}
+    {
+        other._db = nullptr;
+        other._sender = nullptr;
+        other._force_drop = false;
+    }
+
+    borrowed_row_sender& operator=(borrowed_row_sender&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            _db = other._db;
+            _sender = other._sender;
+            _force_drop = other._force_drop;
+            other._db = nullptr;
+            other._sender = nullptr;
+            other._force_drop = false;
+        }
+        return *this;
+    }
+
+    ~borrowed_row_sender() noexcept { release(); }
+
+    /**
+     * Send the buffer of rows to QuestDB, then clear the buffer.
+     * @throws line_sender_error on failure.
+     */
+    void flush(line_sender_buffer& buffer)
+    {
+        buffer.may_init();
+        line_sender_error::wrapped_call(
+            ::row_sender_flush, _sender, buffer._impl);
+    }
+
+    /**
+     * Send the buffer of rows to QuestDB, keeping the buffer intact (clear
+     * it before starting a new batch). A never-initialised (empty) buffer
+     * is a no-op.
+     * @throws line_sender_error on failure.
+     */
+    void flush_and_keep(const line_sender_buffer& buffer)
+    {
+        if (buffer._impl)
+            line_sender_error::wrapped_call(
+                ::row_sender_flush_and_keep, _sender, buffer._impl);
+    }
+
+    /**
+     * `true` if this sender will be dropped rather than recycled on return
+     * (force-marked, or a flush left the connection unusable).
+     */
+    bool must_close() const noexcept
+    {
+        return _sender && ::row_sender_must_close(_sender);
+    }
+
+    /** Force the sender to drop on return instead of recycling. */
+    void drop_on_return() noexcept { _force_drop = true; }
+
+    ::row_sender* c_ptr() noexcept { return _sender; }
+    const ::row_sender* c_ptr() const noexcept { return _sender; }
+
+private:
+    friend class pool;
+
+    borrowed_row_sender(::questdb_db* db, ::row_sender* raw) noexcept
+        : _db{db}
+        , _sender{raw}
+    {
+    }
+
+    void release() noexcept
+    {
+        if (_db && _sender)
+        {
+            if (_force_drop || ::row_sender_must_close(_sender))
+                ::questdb_db_drop_row_sender(_db, _sender);
+            else
+                ::questdb_db_return_row_sender(_db, _sender);
+        }
+        _db = nullptr;
+        _sender = nullptr;
+    }
+
+    ::questdb_db* _db;
+    ::row_sender* _sender;
     bool _force_drop{false};
 };
 
@@ -923,11 +1031,11 @@ public:
     const ::questdb_db* c_ptr() const noexcept { return _raw; }
 
     /** Borrow a conn. Throws on cap exhaustion or transport failure. */
-    borrowed_conn borrow_column_sender()
+    borrowed_column_sender borrow_column_sender()
     {
         auto* raw = line_sender_error::wrapped_call(
             ::questdb_db_borrow_column_sender, _raw);
-        return borrowed_conn{_raw, raw};
+        return borrowed_column_sender{_raw, raw};
     }
 
     /**
@@ -937,11 +1045,38 @@ public:
      * tracked remaining budget). Throws on a terminal error or budget
      * exhaustion.
      */
-    borrowed_conn borrow_column_sender_with_retry(uint64_t budget_ms)
+    borrowed_column_sender borrow_column_sender_with_retry(uint64_t budget_ms)
     {
         auto* raw = line_sender_error::wrapped_call(
             ::questdb_db_borrow_column_sender_with_retry, _raw, budget_ms);
-        return borrowed_conn{_raw, raw};
+        return borrowed_column_sender{_raw, raw};
+    }
+
+    /**
+     * Borrow a row-major sender from the pool, mirroring Rust
+     * `QuestDb::borrow_row_sender`. Row senders are pooled on a separate,
+     * independently-capped free list that shares the pool budget; the pool
+     * is lazy (a connection opens on first borrow). Build rows with a
+     * `line_sender_buffer` and flush them through the returned guard. Throws
+     * on cap exhaustion or transport failure.
+     */
+    borrowed_row_sender borrow_row_sender()
+    {
+        auto* raw = line_sender_error::wrapped_call(
+            ::questdb_db_borrow_row_sender, _raw);
+        return borrowed_row_sender{_raw, raw};
+    }
+
+    /**
+     * Borrow a row-major sender, retrying the connect within `budget_ms`
+     * using the pool's reconnect backoff. Throws on a terminal error or
+     * budget exhaustion.
+     */
+    borrowed_row_sender borrow_row_sender_with_retry(uint64_t budget_ms)
+    {
+        auto* raw = line_sender_error::wrapped_call(
+            ::questdb_db_borrow_row_sender_with_retry, _raw, budget_ms);
+        return borrowed_row_sender{_raw, raw};
     }
 
     /**

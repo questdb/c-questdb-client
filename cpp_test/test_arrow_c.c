@@ -759,7 +759,7 @@ TEST(test_error_codes_survive_ffi_boundary)
  * `line_sender_buffer_append_arrow` C suite. Each test:
  *   1. Builds a single-column ArrowArray + ArrowSchema on the stack.
  *   2. Spins up `qwp_mock_c` (1-slot, accepts one QWP1 binary frame).
- *   3. Opens a `questdb_db` against the mock + borrows a `qwpws_conn`.
+ *   3. Opens a `questdb_db` against the mock + borrows a `column_sender`.
  *   4. Calls `column_sender_flush_arrow_batch[_at_column]`.
  *   5. Accepts either ok=true OR a documented structured error code.
  * Per-column wire correctness is owned by the Rust unit tests under
@@ -909,7 +909,7 @@ TEST(test_chunk_append_arrow_column_malformed_array_rejected)
 
 /* Open a mock + questdb_db + borrow a conn. Returns NULL on any setup
  * failure; populates *out_db / *out_mock on success. */
-static qwpws_conn* mock_borrow_column_sender(
+static column_sender* mock_borrow_column_sender(
     qwp_mock_c** out_mock,
     questdb_db** out_db)
 {
@@ -933,7 +933,7 @@ static qwpws_conn* mock_borrow_column_sender(
         qwp_mock_c_stop(mock);
         return NULL;
     }
-    qwpws_conn* conn = questdb_db_borrow_column_sender(db, &err);
+    column_sender* conn = questdb_db_borrow_column_sender(db, &err);
     if (conn == NULL)
     {
         if (err)
@@ -948,10 +948,10 @@ static qwpws_conn* mock_borrow_column_sender(
 }
 
 static void mock_return_close(
-    qwp_mock_c* mock, questdb_db* db, qwpws_conn* conn)
+    qwp_mock_c* mock, questdb_db* db, column_sender* conn)
 {
     if (conn != NULL && db != NULL)
-        questdb_db_return_conn(db, conn);
+        questdb_db_return_column_sender(db, conn);
     if (db != NULL)
         questdb_db_close(db);
     if (mock != NULL)
@@ -964,7 +964,7 @@ static void run_arrow_flush(
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_column_sender(&mock, &db);
+    column_sender* conn = mock_borrow_column_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
     {
@@ -1006,7 +1006,7 @@ TEST(test_mock_ingress_null_array_via_real_conn)
      * covered above. */
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_column_sender(&mock, &db);
+    column_sender* conn = mock_borrow_column_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;
@@ -1147,7 +1147,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         qwp_mock_c* mock;
         questdb_db* db;
-        qwpws_conn* conn = mock_borrow_column_sender(&mock, &db);
+        column_sender* conn = mock_borrow_column_sender(&mock, &db);
         CHECK(conn != NULL, "mock conn borrowed");
         if (conn == NULL)
         {
@@ -1190,7 +1190,7 @@ TEST(test_mock_ingress_arrow_release_contract)
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_column_sender(&mock, &db);
+    column_sender* conn = mock_borrow_column_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;

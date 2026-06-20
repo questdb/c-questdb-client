@@ -1196,6 +1196,10 @@ private:
     _backend_kind _backend{_backend_kind::ilp};
 
     friend class line_sender;
+    // Pool-borrowed row sender (defined in column_sender.hpp); flushes this
+    // buffer through `row_sender_flush`, so it needs the same `_impl` access
+    // as `line_sender`.
+    friend class borrowed_row_sender;
 };
 
 class _user_agent

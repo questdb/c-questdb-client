@@ -95,7 +95,7 @@ TEST_CASE("pool construction throws on invalid connect string")
     CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, qdb::line_sender_error);
 }
 
-TEST_CASE("borrowed_conn returns conn to pool on destructor")
+TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
@@ -113,12 +113,12 @@ TEST_CASE("borrowed_conn returns conn to pool on destructor")
     CHECK(mock->accepts() == accepts_before);
 }
 
-TEST_CASE("borrowed_conn move transfers ownership without double-return")
+TEST_CASE("borrowed_column_sender move transfers ownership without double-return")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
     auto a = db.borrow_column_sender();
-    ::qwpws_conn* raw = a->c_ptr();
+    ::column_sender* raw = a->c_ptr();
     REQUIRE(raw != nullptr);
 
     auto b = std::move(a);

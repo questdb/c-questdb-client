@@ -55,7 +55,7 @@ bool example(const std::string& host, const std::string& port)
         ::line_sender_error_free(err);
         return false;
     }
-    ::qwpws_conn* raw_conn = ::questdb_db_borrow_column_sender(db, &err);
+    ::column_sender* raw_conn = ::questdb_db_borrow_column_sender(db, &err);
     if (!raw_conn)
     {
         size_t err_len = 0;
@@ -117,10 +117,10 @@ bool example(const std::string& host, const std::string& port)
         std::fprintf(stderr, "Error: %s\n", e.what());
     }
 
-    if (::qwpws_conn_must_close(raw_conn))
-        ::questdb_db_drop_conn(db, raw_conn);
+    if (::column_sender_must_close(raw_conn))
+        ::questdb_db_drop_column_sender(db, raw_conn);
     else
-        ::questdb_db_return_conn(db, raw_conn);
+        ::questdb_db_return_column_sender(db, raw_conn);
     ::questdb_db_close(db);
     return ok;
 }

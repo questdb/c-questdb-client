@@ -845,6 +845,67 @@ fn row_sender_pool_flush_round_trip() {
 }
 
 #[test]
+fn row_sender_owned_borrow_flushes_and_recycles() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    // The owned handle is the FFI escape hatch backing
+    // `questdb_db_borrow_row_sender`: it carries an `Arc<DbInner>` and
+    // returns the sender to the pool on Drop.
+    let mut owned = db
+        .borrow_row_sender_owned()
+        .expect("borrow owned row sender");
+    assert_eq!(db.row_sender_in_use_count(), 1);
+    assert!(!owned.must_close());
+
+    let sender = owned.get_mut();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender
+        .flush(&mut buf)
+        .expect("row-major flush over an owned pooled QWP/WS sender");
+    drop(owned);
+
+    // Clean sender returns to the pool for reuse.
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.row_sender_free_count(), 1);
+
+    // `_with_retry` with a zero budget makes a single attempt and reuses the
+    // recycled sender.
+    let owned2 = db
+        .borrow_row_sender_owned_with_retry(Duration::ZERO)
+        .expect("owned retry borrow");
+    assert_eq!(db.row_sender_in_use_count(), 1);
+    assert_eq!(db.row_sender_free_count(), 0);
+    drop(owned2);
+    assert_eq!(db.row_sender_free_count(), 1);
+    drop(db);
+}
+
+#[test]
+fn row_sender_owned_mark_must_close_drops_not_recycles() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let mut owned = db.borrow_row_sender_owned().expect("borrow owned");
+    owned.mark_must_close();
+    assert!(owned.must_close());
+    drop(owned);
+
+    // Marked must-close: dropped, not recycled.
+    assert_eq!(db.row_sender_in_use_count(), 0);
+    assert_eq!(db.row_sender_free_count(), 0);
+    drop(db);
+}
+
+#[test]
 fn manual_reap_closes_idle_row_senders() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(

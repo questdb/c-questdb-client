@@ -487,6 +487,59 @@ impl QuestDb {
         })
     }
 
+    /// FFI escape hatch: like [`Self::borrow_row_sender`] but the returned
+    /// handle is not lifetime-bound to `&self` (it carries an `Arc<DbInner>`
+    /// so it can outlive the user-facing `QuestDb` pointer). Backs the C ABI's
+    /// `questdb_db_borrow_row_sender`. See [`Self::borrow_column_sender_owned`]
+    /// for the owned-handle rationale.
+    #[doc(hidden)]
+    pub fn borrow_row_sender_owned(&self) -> Result<OwnedRowSender> {
+        let sender = self.pick_row_sender()?;
+        Ok(OwnedRowSender {
+            inner: Arc::clone(&self.inner),
+            sender: Some(sender),
+            must_close: false,
+        })
+    }
+
+    /// Like [`Self::borrow_row_sender_owned`] but retries the connect within
+    /// `budget` using the pool's reconnect backoff (the cluster may be electing
+    /// a primary; `AuthError` / protocol-version errors are terminal). Backs
+    /// the C ABI's `questdb_db_borrow_row_sender_with_retry`. `budget`
+    /// `Duration::ZERO` makes a single attempt.
+    #[doc(hidden)]
+    pub fn borrow_row_sender_owned_with_retry(&self, budget: Duration) -> Result<OwnedRowSender> {
+        let deadline = Instant::now().checked_add(budget);
+        let policy = self.inner.connector.reconnect_policy();
+        let mut backoff = policy.initial_backoff();
+        loop {
+            match self.pick_row_sender() {
+                Ok(sender) => {
+                    return Ok(OwnedRowSender {
+                        inner: Arc::clone(&self.inner),
+                        sender: Some(sender),
+                        must_close: false,
+                    });
+                }
+                Err(e)
+                    if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) =>
+                {
+                    return Err(e);
+                }
+                Err(e) => {
+                    let (sleep_for, next) = reconnect_backoff_step(
+                        &e,
+                        policy.initial_backoff(),
+                        policy.max_backoff(),
+                        backoff,
+                    );
+                    sleep_until_deadline(sleep_for, deadline);
+                    backoff = next;
+                }
+            }
+        }
+    }
+
     fn pick_column_sender(&self) -> Result<ColumnSender> {
         pick_column_sender_inner(&self.inner)
     }
@@ -1005,6 +1058,59 @@ fn return_row_sender_to_pool(inner: &Arc<DbInner>, sender: Sender, must_close: b
         });
     }
     drop(state);
+}
+
+/// Owned, non-lifetime-bound row-major [`Sender`] borrowed from a [`QuestDb`]
+/// pool — the row-sender analogue of [`OwnedColumnSender`].
+///
+/// Holds an `Arc<DbInner>` so the pool's state outlives the user-facing
+/// `QuestDb` pointer: the C ABI can free its `questdb_db*` before dropping
+/// outstanding `row_sender*` handles without invalidating the free list /
+/// mutex. On `Drop` the sender is returned to the row-sender pool unless it
+/// (or the caller, via [`Self::mark_must_close`]) marked it must-close, in
+/// which case it is dropped and the next borrow opens a fresh one.
+#[doc(hidden)]
+pub struct OwnedRowSender {
+    inner: Arc<DbInner>,
+    sender: Option<Sender>,
+    must_close: bool,
+}
+
+impl OwnedRowSender {
+    /// Borrow the underlying [`Sender`] mutably. Always returns a live
+    /// reference until `Drop` runs.
+    pub fn get_mut(&mut self) -> &mut Sender {
+        self.sender
+            .as_mut()
+            .expect("OwnedRowSender already returned to the pool")
+    }
+
+    /// Inspect the wrapped sender without taking ownership.
+    pub fn get(&self) -> &Sender {
+        self.sender
+            .as_ref()
+            .expect("OwnedRowSender already returned to the pool")
+    }
+
+    /// Force this sender to be dropped (not recycled) when it is returned.
+    /// Use after an error that may have left the connection unusable.
+    pub fn mark_must_close(&mut self) {
+        self.must_close = true;
+    }
+
+    /// `true` if this sender will be dropped rather than recycled on return —
+    /// either marked explicitly or its connection latched must-close.
+    pub fn must_close(&self) -> bool {
+        self.must_close || self.sender.as_ref().is_some_and(|s| s.must_close())
+    }
+}
+
+impl Drop for OwnedRowSender {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            return_row_sender_to_pool(&self.inner, sender, self.must_close);
+        }
+    }
 }
 
 /// A query [`Reader`] borrowed from a [`QuestDb`] pool.

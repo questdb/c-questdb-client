@@ -142,7 +142,7 @@ typedef enum line_sender_error_code
 
     /** Reconnectable failure on the column-major sender's flush/sync
      *  path (transport error, EOF, closed connection). The operation
-     *  has not committed: drop the connection with `questdb_db_drop_conn`,
+     *  has not committed: drop the connection with `questdb_db_drop_column_sender`,
      *  re-acquire one with `questdb_db_borrow_column_sender_with_retry` (row-aligned
      *  reconnect backoff, bounded by `reconnect_max_duration`), and re-drive
      *  from your source. */

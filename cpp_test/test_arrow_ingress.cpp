@@ -76,7 +76,7 @@ TEST_CASE("column_sender_conn surfaces error_code on NULL-conn failure")
 // append_arrow API. Each TEST_CASE spins up an in-process mock and a
 // 1-slot `questdb_db` pool, then drives one
 // `column_sender_flush_arrow_batch[_at_column]` call against a borrowed
-// `qwpws_conn*`.
+// `column_sender*`.
 //
 // Per-type wire correctness is covered by the Rust unit tests in
 // `questdb-rs/src/ingress/column_sender/arrow_batch.rs`; here we only
@@ -171,7 +171,7 @@ struct MockConn
 {
     qm::MockServer server;
     questdb_db* db = nullptr;
-    qwpws_conn* conn = nullptr;
+    column_sender* conn = nullptr;
 
     MockConn()
         : server(std::vector<qm::Script>{
@@ -193,7 +193,7 @@ struct MockConn
         if (db != nullptr)
         {
             if (conn != nullptr)
-                questdb_db_return_conn(db, conn);
+                questdb_db_return_column_sender(db, conn);
             questdb_db_close(db);
         }
     }

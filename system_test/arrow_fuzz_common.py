@@ -71,7 +71,7 @@ __all__ = [
     "EDGE_GEOHASH_BITS",
     "arrow_cursor",
     "existing_sender",
-    "borrowed_conn",
+    "borrowed_column_sender",
     "temp_sf_dir",
     "sfa_file_count",
     "wait_for_rows",
@@ -216,9 +216,9 @@ def drop_table_safe(fixture, table: str) -> None:
         )
 
 @contextlib.contextmanager
-def borrowed_conn(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
+def borrowed_column_sender(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
     """Open a `questdb_db*` pool from the fixture, borrow one
-    `qwpws_conn*`, and yield the raw conn pointer. Returns the conn
+    `column_sender*`, and yield the raw conn pointer. Returns the conn
     to the pool on exit (or drops it if the conn latched as terminal)
     and closes the pool. Set `sync_on_exit=False` when a test needs to
     assert the exact `column_sender_sync` error."""
@@ -262,7 +262,7 @@ def ingest_via_arrow(
     """Ingest one RecordBatch through `column_sender_flush_arrow_batch`.
     If `ts_col` is None the server stamps each row on arrival."""
     extras = sender_conf_extras or {}
-    with borrowed_conn(fixture, **extras) as conn:
+    with borrowed_column_sender(fixture, **extras) as conn:
         table_name = _c_table_name(table)
         arr, sch = pyarrow_export_record_batch(record_batch)
         try:
