@@ -429,6 +429,11 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_arrow_egress
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_arrow_egress.cpp)
+    # test_arrow_egress drives the egress reader via the standalone
+    # `reader(utf8_view)` constructor, so it must opt into the same
+    # internal-constructor declarations as the other reader tests above.
+    target_compile_definitions(
+        test_arrow_egress PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
     compile_test(
         test_arrow_ingress
         cpp_test/qwp_mock_server.cpp
