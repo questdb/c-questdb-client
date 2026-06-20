@@ -807,7 +807,7 @@ class pool;
  * RAII guard for a borrowed connection. On destruction the conn is
  * returned to the pool (or dropped if it has latched must-close).
  *
- * Constructed only via `pool::borrow_sender()`.
+ * Constructed only via `pool::borrow_column_sender()`.
  */
 class borrowed_conn
 {
@@ -923,10 +923,10 @@ public:
     const ::questdb_db* c_ptr() const noexcept { return _raw; }
 
     /** Borrow a conn. Throws on cap exhaustion or transport failure. */
-    borrowed_conn borrow_sender()
+    borrowed_conn borrow_column_sender()
     {
         auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_sender, _raw);
+            ::questdb_db_borrow_column_sender, _raw);
         return borrowed_conn{_raw, raw};
     }
 
@@ -937,10 +937,10 @@ public:
      * tracked remaining budget). Throws on a terminal error or budget
      * exhaustion.
      */
-    borrowed_conn borrow_sender_with_retry(uint64_t budget_ms)
+    borrowed_conn borrow_column_sender_with_retry(uint64_t budget_ms)
     {
         auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_sender_with_retry, _raw, budget_ms);
+            ::questdb_db_borrow_column_sender_with_retry, _raw, budget_ms);
         return borrowed_conn{_raw, raw};
     }
 
@@ -992,7 +992,7 @@ namespace questdb
 {
 // `questdb::pool` is the canonical, top-level spelling of the connection
 // pool. The pool is cross-cutting — it hands out write-side senders
-// (`borrow_sender`) and read-side query readers (`borrow_reader`) — so it
+// (`borrow_column_sender`) and read-side query readers (`borrow_reader`) — so it
 // belongs at the top-level `questdb` namespace rather than under `ingress`.
 // This re-export is the C++ analogue of the Rust `questdb::QuestDb`
 // re-export; `questdb::ingress::pool` remains valid for back-compat.

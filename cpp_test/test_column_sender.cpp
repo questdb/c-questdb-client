@@ -101,13 +101,13 @@ TEST_CASE("borrowed_conn returns conn to pool on destructor")
     questdb::pool db{conf_for(mock->addr())};
 
     {
-        auto conn = db.borrow_sender();
+        auto conn = db.borrow_column_sender();
         CHECK(conn->c_ptr() != nullptr);
         CHECK_FALSE(conn->must_close());
     }
     int accepts_before = mock->accepts();
     {
-        auto conn = db.borrow_sender();
+        auto conn = db.borrow_column_sender();
         CHECK(conn->c_ptr() != nullptr);
     }
     CHECK(mock->accepts() == accepts_before);
@@ -117,7 +117,7 @@ TEST_CASE("borrowed_conn move transfers ownership without double-return")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto a = db.borrow_sender();
+    auto a = db.borrow_column_sender();
     ::qwpws_conn* raw = a->c_ptr();
     REQUIRE(raw != nullptr);
 
@@ -129,7 +129,7 @@ TEST_CASE("column_chunk flush round-trips through the mock")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_sender();
+    auto conn = db.borrow_column_sender();
 
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10, 20, 30};
@@ -150,7 +150,7 @@ TEST_CASE("flush rejects oversized table name")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_sender();
+    auto conn = db.borrow_column_sender();
 
     std::string oversized(200, 'x');
     qdb::column_chunk chunk{oversized};
@@ -170,12 +170,12 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
 
     int accepts_before;
     {
-        auto conn = db.borrow_sender();
+        auto conn = db.borrow_column_sender();
         accepts_before = mock->accepts();
         conn.drop_on_return();
     }
     {
-        auto conn = db.borrow_sender();
+        auto conn = db.borrow_column_sender();
         CHECK(conn->c_ptr() != nullptr);
     }
     CHECK(mock->accepts() == accepts_before + 1);
@@ -197,7 +197,7 @@ TEST_CASE("pool reap_idle is callable")
     auto mock = spawn_mock(2);
     questdb::pool db{conf_for(mock->addr(), "pool_idle_timeout_ms=1;")};
     {
-        auto conn = db.borrow_sender();
+        auto conn = db.borrow_column_sender();
         (void)conn;
     }
     [[maybe_unused]] size_t closed = db.reap_idle();

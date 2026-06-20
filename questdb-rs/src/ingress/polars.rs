@@ -38,7 +38,7 @@
 //!
 //! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
 //!
-//! The one-call shortcut is [`BorrowedSender::flush_polars_dataframe`].
+//! The one-call shortcut is [`BorrowedColumnSender::flush_polars_dataframe`].
 //! For full control over slicing and per-batch retry, drive the
 //! iterator directly:
 //!
@@ -48,7 +48,7 @@
 //! }
 //! ```
 //!
-//! [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
+//! [`BorrowedColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedColumnSender::flush_polars_dataframe
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -316,7 +316,7 @@ impl Iterator for DataFrameBatches<'_> {
 /// ≈64 × `max_rows` rows.
 const CHECKPOINT_BATCHES: usize = 64;
 
-/// Optional knobs for [`BorrowedSender::flush_polars_dataframe`].
+/// Optional knobs for [`BorrowedColumnSender::flush_polars_dataframe`].
 ///
 /// Every field defaults to "off", so `PolarsIngestOptions::default()` (or
 /// [`PolarsIngestOptions::new`]) reproduces the original three-argument
@@ -333,7 +333,7 @@ const CHECKPOINT_BATCHES: usize = 64;
 /// sender.flush_polars_dataframe("trades", &df, &opts)?;
 /// ```
 ///
-/// [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
+/// [`BorrowedColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedColumnSender::flush_polars_dataframe
 #[derive(Clone, Copy, Default)]
 pub struct PolarsIngestOptions<'a> {
     max_rows: Option<NonZeroUsize>,
@@ -381,7 +381,7 @@ impl<'a> PolarsIngestOptions<'a> {
     }
 }
 
-impl crate::ingress::column_sender::BorrowedSender<'_> {
+impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `options.max_rows` rows
     /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
     /// `sync` to commit — re-driving transparently across a connection failure.
@@ -454,7 +454,7 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
 /// to the batch count made durable by each successful checkpoint `sync`, so on
 /// a transient error the caller re-drives only the uncommitted tail.
 fn drive_from_checkpoint(
-    sender: &mut crate::ingress::column_sender::BorrowedSender<'_>,
+    sender: &mut crate::ingress::column_sender::BorrowedColumnSender<'_>,
     table: crate::ingress::TableName<'_>,
     df: &DataFrame,
     options: &PolarsIngestOptions<'_>,

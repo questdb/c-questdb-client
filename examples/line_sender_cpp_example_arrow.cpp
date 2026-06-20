@@ -55,13 +55,13 @@ bool example(const std::string& host, const std::string& port)
         ::line_sender_error_free(err);
         return false;
     }
-    ::qwpws_conn* raw_conn = ::questdb_db_borrow_sender(db, &err);
+    ::qwpws_conn* raw_conn = ::questdb_db_borrow_column_sender(db, &err);
     if (!raw_conn)
     {
         size_t err_len = 0;
         const char* err_msg = ::line_sender_error_msg(err, &err_len);
         std::fprintf(
-            stderr, "questdb_db_borrow_sender: %.*s\n",
+            stderr, "questdb_db_borrow_column_sender: %.*s\n",
             static_cast<int>(err_len), err_msg);
         ::line_sender_error_free(err);
         ::questdb_db_close(db);

@@ -186,7 +186,7 @@ _db_close = _setsig(
 )
 
 _db_borrow_conn = _setsig(
-    "questdb_db_borrow_sender",
+    "questdb_db_borrow_column_sender",
     ctypes.POINTER(_QwpwsConn),
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),

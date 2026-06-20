@@ -384,7 +384,7 @@ void reader_mark_must_close(reader* reader);
 
 /* Reader pool (provided by `questdb/ingress/column_sender.h`'s
  * `questdb_db` opaque). Same FFI surface as the writer-side
- * `questdb_db_borrow_sender` / `_return_conn`, but for `reader`
+ * `questdb_db_borrow_column_sender` / `_return_conn`, but for `reader`
  * handles. Lives here because it wraps the `reader` type.
  *
  * A reader-only consumer can open, use, and close the pool through

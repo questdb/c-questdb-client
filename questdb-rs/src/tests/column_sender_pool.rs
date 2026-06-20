@@ -581,13 +581,13 @@ fn store_and_forward_pool_allows_one_active_borrower() {
     );
     let db = QuestDb::connect(&conf).unwrap();
 
-    let sender = db.borrow_sender().unwrap();
-    let err = db.borrow_sender().unwrap_err();
+    let sender = db.borrow_column_sender().unwrap();
+    let err = db.borrow_column_sender().unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("store-and-forward"), "{}", err.msg());
 
     drop(sender);
-    let _again = db.borrow_sender().unwrap();
+    let _again = db.borrow_column_sender().unwrap();
 }
 
 #[test]
@@ -599,7 +599,7 @@ fn store_and_forward_sync_reports_drop_and_continue_once() {
         &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_sender().unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
 
     let mut chunk = Chunk::new("trades");
     let qty1 = [1_i64];
@@ -637,7 +637,7 @@ fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow() 
     let db = QuestDb::connect(&conf).unwrap();
 
     {
-        let mut sender = db.borrow_sender().unwrap();
+        let mut sender = db.borrow_column_sender().unwrap();
         sender.mark_must_close();
         assert!(sender.must_close());
     }
@@ -646,7 +646,7 @@ fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow() 
     assert_eq!(db.in_use_count(), 0);
 
     let _again = db
-        .borrow_sender()
+        .borrow_column_sender()
         .expect("next borrow should reopen the SFA slot");
     assert!(
         wait_until(Duration::from_secs(2), || server.accepted() == 2),
@@ -667,7 +667,7 @@ fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk() {
         ),
     );
     let db = QuestDb::connect(&conf).unwrap();
-    let mut sender = db.borrow_sender().unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
 
     let ts1 = [1_i64];
     let mut first = Chunk::new("trades");
@@ -733,7 +733,7 @@ fn borrow_and_return_reuses_connection() {
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
     assert_eq!(db.free_count(), 1);
     {
-        let _borrow = db.borrow_sender().expect("borrow");
+        let _borrow = db.borrow_column_sender().expect("borrow");
         assert_eq!(db.free_count(), 0);
         assert_eq!(db.in_use_count(), 1);
     }
@@ -749,9 +749,9 @@ fn borrow_and_return_reuses_connection() {
 fn auto_grow_opens_new_connection_until_pool_max() {
     let server = MockServer::spawn(4);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
-    let b1 = db.borrow_sender().expect("b1");
-    let b2 = db.borrow_sender().expect("b2 (auto-grow)");
-    let b3 = db.borrow_sender().expect("b3 (auto-grow)");
+    let b1 = db.borrow_column_sender().expect("b1");
+    let b2 = db.borrow_column_sender().expect("b2 (auto-grow)");
+    let b3 = db.borrow_column_sender().expect("b3 (auto-grow)");
     assert_eq!(db.free_count(), 0);
     assert_eq!(db.in_use_count(), 3);
     wait_until(Duration::from_secs(2), || server.accepted() == 3);
@@ -766,9 +766,11 @@ fn auto_grow_opens_new_connection_until_pool_max() {
 fn fail_fast_at_pool_max() {
     let server = MockServer::spawn(4);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
-    let _b1 = db.borrow_sender().expect("b1");
-    let _b2 = db.borrow_sender().expect("b2");
-    let err = db.borrow_sender().expect_err("must fail-fast at cap");
+    let _b1 = db.borrow_column_sender().expect("b1");
+    let _b2 = db.borrow_column_sender().expect("b2");
+    let err = db
+        .borrow_column_sender()
+        .expect_err("must fail-fast at cap");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
 }
@@ -936,7 +938,7 @@ fn row_and_column_senders_borrowed_together_are_independent() {
     let server = MockServer::spawn_acking(16);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let col = db.borrow_sender().expect("column sender");
+    let col = db.borrow_column_sender().expect("column sender");
     let mut row = db.borrow_row_sender().expect("row sender");
 
     // Each pool tracks its own borrow on an independent counter.
@@ -1077,7 +1079,9 @@ fn concurrent_borrow_and_return_does_not_deadlock_or_leak() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for _ in 0..16 {
-                let borrow = db.borrow_sender().expect("borrow_sender under contention");
+                let borrow = db
+                    .borrow_column_sender()
+                    .expect("borrow_column_sender under contention");
                 // Tiny critical section to encourage contention.
                 std::hint::black_box(&borrow);
                 thread::yield_now();
@@ -1100,9 +1104,9 @@ fn manual_reap_closes_excess_idle_connections() {
         "pool_size=1;pool_max=3;pool_idle_timeout_ms=50;pool_reap=manual;",
     ))
     .unwrap();
-    let b1 = db.borrow_sender().expect("b1");
-    let b2 = db.borrow_sender().expect("b2 (grow)");
-    let b3 = db.borrow_sender().expect("b3 (grow)");
+    let b1 = db.borrow_column_sender().expect("b1");
+    let b2 = db.borrow_column_sender().expect("b2 (grow)");
+    let b3 = db.borrow_column_sender().expect("b3 (grow)");
     drop(b1);
     drop(b2);
     drop(b3);
@@ -1131,9 +1135,9 @@ fn auto_reaper_closes_excess_idle_connections() {
         "pool_size=1;pool_max=3;pool_idle_timeout_ms=100;pool_reap=auto;",
     ))
     .unwrap();
-    let b1 = db.borrow_sender().expect("b1");
-    let b2 = db.borrow_sender().expect("b2");
-    let b3 = db.borrow_sender().expect("b3");
+    let b1 = db.borrow_column_sender().expect("b1");
+    let b2 = db.borrow_column_sender().expect("b2");
+    let b3 = db.borrow_column_sender().expect("b3");
     drop(b1);
     drop(b2);
     drop(b3);
@@ -1156,7 +1160,7 @@ fn auto_reaper_closes_excess_idle_connections() {
 fn refuses_durable_ack_without_opt_in() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Durable)
         .expect_err("durable without opt-in must fail");
@@ -1194,7 +1198,7 @@ fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
     });
 
     let db = QuestDb::connect(&conf_for(port, "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Durable)
         .expect_err("durable without opt-in must fail before publish");
@@ -1220,7 +1224,7 @@ fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
 fn empty_chunk_flush_round_trips() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     assert_eq!(chunk.row_count(), 0);
     sender.flush(&mut chunk).unwrap();
@@ -1235,7 +1239,7 @@ fn empty_chunk_flush_round_trips() {
 fn deferred_flush_reserves_slot_for_sync_commit() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "close_flush_timeout_millis=50;")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
 
     for _ in 0..127 {
@@ -1262,7 +1266,7 @@ fn deferred_flush_reserves_slot_for_sync_commit() {
 fn flush_clears_chunk_for_reuse_and_can_repeat() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     for _ in 0..3 {
         sender.flush(&mut chunk).unwrap();
@@ -1274,7 +1278,7 @@ fn flush_clears_chunk_for_reuse_and_can_repeat() {
 fn flush_rejects_chunk_with_no_designated_timestamp() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
     chunk
         .column_i64("price", &[1, 2, 3], None)
@@ -1294,7 +1298,7 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
 
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
 
     let mut chunk = Chunk::new("trades");
     chunk.column_i64("qty", &[10, 20, 30], None).unwrap();
@@ -1341,7 +1345,7 @@ fn varchar_chunk_round_trips() {
 
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
 
     let mut chunk = Chunk::new("logs");
     // 4 rows: "alpha", null, "gamma", "δ" (multi-byte UTF-8).
@@ -1376,7 +1380,7 @@ fn varchar_chunk_round_trips() {
 fn symbol_chunk_round_trips_and_reuses_global_dict() {
     let server = MockServer::spawn_acking(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
 
     // Caller has a 3-entry dict; first chunk only references entries 0 and 2,
     // so the wire's delta-symbol-dict prefix carries those two new symbols.
@@ -1439,7 +1443,7 @@ fn parse_delta_dict_prefix(frame: &[u8]) -> (u64, Vec<Vec<u8>>) {
 fn symbol_dict_reuse_resends_only_new_symbols_on_the_wire() {
     let (server, frames) = MockServer::spawn_acking_capturing(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
 
     let dict_bytes = b"alphabetagamma";
     let dict_offsets: [i32; 4] = [0, 5, 9, 14];
@@ -1505,7 +1509,7 @@ fn server_error_latches_conn_and_pool_drops_it() {
     ))
     .unwrap();
     {
-        let mut sender = db.borrow_sender().expect("borrow");
+        let mut sender = db.borrow_column_sender().expect("borrow");
         let err = sender
             .sync(AckLevel::Ok)
             .expect_err("server error must surface");
@@ -1520,7 +1524,7 @@ fn server_error_latches_conn_and_pool_drops_it() {
     assert_eq!(db.free_count(), 0, "latched conn must not be recycled");
     assert_eq!(db.in_use_count(), 0);
     // The next borrow must therefore open a brand-new physical connection.
-    let _fresh = db.borrow_sender().expect("re-borrow after drop");
+    let _fresh = db.borrow_column_sender().expect("re-borrow after drop");
     assert!(
         wait_until(Duration::from_secs(2), || server.accepted() == 2),
         "re-borrow must open a new connection; accepted={}",
@@ -1540,7 +1544,7 @@ fn close_joins_reaper_cleanly() {
     ))
     .unwrap();
     // Borrow + return so we have something to reap eventually.
-    let _ = db.borrow_sender().expect("borrow").must_close();
+    let _ = db.borrow_column_sender().expect("borrow").must_close();
     // close() must return promptly (no hang) — the join is the test.
     let start = Instant::now();
     db.close();
@@ -1564,7 +1568,7 @@ fn transient_transport_failure_maps_to_failover_retry() {
     // (not SocketError), so callers can tell "retry on a fresh conn" apart.
     let server = MockServer::spawn_upgrade_then_close(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Ok)
         .expect_err("server closed mid-sync must error");
@@ -1579,7 +1583,7 @@ fn server_data_rejection_stays_terminal_not_failover_retry() {
     // re-tagged FailoverRetry.
     let server = MockServer::spawn_erroring(2, 0x09);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Ok)
         .expect_err("server data rejection must surface");
@@ -1610,7 +1614,7 @@ fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
     );
     assert_eq!(live.accepted(), 0, "live endpoint must be untouched so far");
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Ok)
         .expect_err("primary died mid-sync");
@@ -1654,7 +1658,7 @@ fn failed_reborrow_keeps_handle_erroring_without_panicking() {
         primary.accepted()
     );
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender.sync(AckLevel::Ok).expect_err("primary died");
     assert_eq!(err.code(), ErrorCode::FailoverRetry);
 
@@ -1686,7 +1690,7 @@ fn reborrow_on_single_endpoint_pool_reuses_the_same_endpoint() {
     let server = MockServer::spawn_acking(3);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     sender.sync(AckLevel::Ok).expect("first sync");
 
     sender
@@ -1720,7 +1724,7 @@ fn dead_endpoint_stays_skipped_across_repeated_reborrows() {
         "eager-open must land on the first endpoint"
     );
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     // First sync hits the dead eager-open conn.
     let err = sender.sync(AckLevel::Ok).expect_err("primary died");
     assert_eq!(err.code(), ErrorCode::FailoverRetry);
@@ -1793,7 +1797,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4, 5, 6]).into_column();
     let df = DataFrame::new(6, vec![i]).unwrap();
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("failover must re-drive the df onto the live endpoint");
@@ -1843,7 +1847,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     let i = Series::new(PlSmallStr::from("i"), vals.as_slice()).into_column();
     let df = DataFrame::new(66, vec![i]).unwrap();
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
         .expect("failover must re-drive the uncommitted tail onto the live endpoint");
@@ -1895,7 +1899,7 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2]).into_column();
     let df = DataFrame::new(2, vec![i]).unwrap();
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("reborrow connect failures must retry until the recovery endpoint is live");
@@ -1919,7 +1923,7 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
     let df = DataFrame::new(4, vec![i]).unwrap();
 
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("healthy single-endpoint flush must commit in one pass");
@@ -1956,7 +1960,7 @@ fn flush_polars_dataframe_applies_column_overrides() {
     let df = DataFrame::new(4, vec![s, i]).unwrap();
 
     let overrides = [ArrowColumnOverride::Symbol { column: "s" }];
-    let mut sender = db.borrow_sender().expect("borrow");
+    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe(
             "trades",
@@ -2229,7 +2233,7 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-        let col = db.borrow_sender().expect("column sender"); // reuses the eager free slot
+        let col = db.borrow_column_sender().expect("column sender"); // reuses the eager free slot
         let row = db.borrow_row_sender().expect("row sender"); // opens a fresh connection
         let reader = db.borrow_reader().expect("reader"); // opens a fresh connection
 

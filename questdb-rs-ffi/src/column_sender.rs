@@ -38,7 +38,7 @@ use std::str;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use questdb::ingress::column_sender::{
-    AckLevel, Chunk, NumpyDtype, OwnedSender, QuestDb, Validity,
+    AckLevel, Chunk, NumpyDtype, OwnedColumnSender, QuestDb, Validity,
 };
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
@@ -74,7 +74,7 @@ pub struct questdb_db(pub(crate) QuestDb);
 /// confining `conn` to a single thread, or by an external barrier — so
 /// the latch's CAS sees the close intent. A true concurrent free
 /// without such ordering is undefined behavior.
-pub struct qwpws_conn(OwnedSender, AtomicU32);
+pub struct qwpws_conn(OwnedColumnSender, AtomicU32);
 
 /// One DataFrame's worth of column buffers destined for one QuestDB table.
 /// Owned by the caller; not bound to a connection.
@@ -479,7 +479,7 @@ pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
 /// `doc/COLUMN_SENDER_FFI_ABI.md` §4.3 for the selection rules. Returns
 /// NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_sender(
+pub unsafe extern "C" fn questdb_db_borrow_column_sender(
     db: *mut questdb_db,
     err_out: *mut *mut line_sender_error,
 ) -> *mut qwpws_conn {
@@ -489,14 +489,14 @@ pub unsafe extern "C" fn questdb_db_borrow_sender(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "questdb_db_borrow_sender: db pointer is NULL".to_string(),
+                    "questdb_db_borrow_column_sender: db pointer is NULL".to_string(),
                 ),
             );
         }
         return std::ptr::null_mut();
     }
     let db_ref = unsafe { &*db };
-    match db_ref.0.borrow_sender_owned() {
+    match db_ref.0.borrow_column_sender_owned() {
         Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
@@ -505,7 +505,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sender(
     }
 }
 
-/// Like `questdb_db_borrow_sender` but retries the connect within `budget_ms`
+/// Like `questdb_db_borrow_column_sender` but retries the connect within `budget_ms`
 /// using the row sender's reconnect backoff (centered-jittered exponential with
 /// a role-reject reset; `AuthError` / protocol-version errors are terminal). On
 /// a transient `line_sender_error_failover_retry`, drop the dead conn with
@@ -513,7 +513,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sender(
 /// backoff as the row API. `budget_ms == 0` makes a single attempt (no retry).
 /// Returns NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
+pub unsafe extern "C" fn questdb_db_borrow_column_sender_with_retry(
     db: *mut questdb_db,
     budget_ms: u64,
     err_out: *mut *mut line_sender_error,
@@ -524,7 +524,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    "questdb_db_borrow_sender_with_retry: db pointer is NULL".to_string(),
+                    "questdb_db_borrow_column_sender_with_retry: db pointer is NULL".to_string(),
                 ),
             );
         }
@@ -533,7 +533,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
     let db_ref = unsafe { &*db };
     match db_ref
         .0
-        .borrow_sender_owned_with_retry(std::time::Duration::from_millis(budget_ms))
+        .borrow_column_sender_owned_with_retry(std::time::Duration::from_millis(budget_ms))
     {
         Ok(owned) => Box::into_raw(Box::new(qwpws_conn(owned, AtomicU32::new(0)))),
         Err(err) => {
@@ -545,7 +545,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sender_with_retry(
 
 /// The pool's failover budget (`reconnect_max_duration`, default 300000 ms).
 /// Callers tracking an overall failover deadline pass the remaining budget to
-/// `questdb_db_borrow_sender_with_retry`. Returns 0 if `db` is NULL.
+/// `questdb_db_borrow_column_sender_with_retry`. Returns 0 if `db` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb_db) -> u64 {
     if db.is_null() {

@@ -61,7 +61,7 @@ pub use error::*;
 // These are re-exports: the original `ingress::column_sender::*` paths keep
 // working, so this is purely additive.
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub use ingress::column_sender::{BorrowedRowSender, BorrowedSender, QuestDb};
+pub use ingress::column_sender::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
 pub use ingress::column_sender::BorrowedReader;

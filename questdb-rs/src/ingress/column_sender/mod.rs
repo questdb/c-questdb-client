@@ -32,12 +32,12 @@
 //! The user model is `DataFrame → Table`:
 //!
 //! - Open a connection pool with [`QuestDb::connect`].
-//! - Borrow a sender with [`QuestDb::borrow_sender`].
+//! - Borrow a sender with [`QuestDb::borrow_column_sender`].
 //! - Build a [`Chunk`] of column buffers for one table, then pin a
 //!   designated timestamp on it.
 //! - Flush chunks to publish them without waiting for ACKs, then call
 //!   [`ColumnSender::sync`] to commit and wait at the requested [`AckLevel`].
-//! - Drop the [`BorrowedSender`] to return its connection to the pool.
+//! - Drop the [`BorrowedColumnSender`] to return its connection to the pool.
 
 #[cfg(feature = "arrow")]
 mod arrow_batch;
@@ -58,7 +58,7 @@ pub use chunk::Chunk;
 pub use chunk::ImportedArrowColumn;
 #[cfg(feature = "_egress")]
 pub use db::BorrowedReader;
-pub use db::{BorrowedRowSender, BorrowedSender, QuestDb};
+pub use db::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
 pub use numpy_wire::NumpyDtype;
 pub use sender::{AckLevel, ColumnSender};
 pub use validity::Validity;
@@ -82,7 +82,7 @@ const _: () = assert!(
 );
 
 #[doc(hidden)]
-pub use db::OwnedSender;
+pub use db::OwnedColumnSender;
 
 #[cfg(feature = "_egress")]
 #[doc(hidden)]
