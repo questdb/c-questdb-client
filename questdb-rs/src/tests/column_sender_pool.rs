@@ -2301,16 +2301,15 @@ mod reader_pool {
     #[test]
     fn concurrent_reader_borrow_and_return_does_not_deadlock_or_leak() {
         let server = ReaderMockServer::spawn(64);
-        let db =
-            Arc::new(QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap());
+        let db = Arc::new(
+            QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=8;")).unwrap(),
+        );
         let mut handles = Vec::new();
         for _ in 0..8 {
             let db = Arc::clone(&db);
             handles.push(thread::spawn(move || {
                 for _ in 0..16 {
-                    let borrow = db
-                        .borrow_reader()
-                        .expect("borrow_reader under contention");
+                    let borrow = db.borrow_reader().expect("borrow_reader under contention");
                     std::hint::black_box(&borrow);
                     thread::yield_now();
                 }

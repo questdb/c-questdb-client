@@ -56,9 +56,9 @@ pub use arrow_batch::ArrowColumnOverride;
 pub use chunk::Chunk;
 #[cfg(feature = "arrow")]
 pub use chunk::ImportedArrowColumn;
-pub use db::{BorrowedRowSender, BorrowedSender, QuestDb};
 #[cfg(feature = "_egress")]
 pub use db::BorrowedReader;
+pub use db::{BorrowedRowSender, BorrowedSender, QuestDb};
 pub use numpy_wire::NumpyDtype;
 pub use sender::{AckLevel, ColumnSender};
 pub use validity::Validity;
