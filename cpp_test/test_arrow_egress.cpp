@@ -1,7 +1,7 @@
 // Mock-server-driven exhaustive tests for the Arrow C Data Interface
-// egress export. Drives `line_reader_cursor_next_arrow_batch` against
+// egress export. Drives `reader_cursor_next_arrow_batch` against
 // `qwp_mock_server` (the same in-process WebSocket+QWP1 mock used by
-// `test_line_reader_mock.cpp`) so every assertion runs without a live
+// `test_reader_mock.cpp`) so every assertion runs without a live
 // QuestDB instance.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -9,7 +9,7 @@
 
 #include "qwp_mock_server.hpp"
 
-#include <questdb/egress/line_reader.hpp>
+#include <questdb/egress/reader.hpp>
 
 #include <array>
 #include <cstdint>
@@ -99,7 +99,7 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
 
     // `next_arrow_batch` snapshots schema eagerly. With ZERO batches the
     // adapter must EITHER:
-    //   - throw `line_reader_error_no_schema` (when QWP protocol path
+    //   - throw `reader_error_no_schema` (when QWP protocol path
     //     reaches `as_arrow_reader` with no first batch), OR
     //   - return `nullopt` directly (when the inner pump terminates
     //     first).
@@ -108,7 +108,7 @@ TEST_CASE("arrow egress: empty stream returns _end without touching out_*")
         auto b = h.cursor.next_arrow_batch();
         CHECK(!b.has_value());
     }
-    catch (const egress::line_reader_error&)
+    catch (const egress::reader_error&)
     {
         // _error path acceptable per the doc.
     }
@@ -537,7 +537,7 @@ TEST_CASE("arrow egress: schema drift — array ndim change between batches thro
         (void)h.cursor.next_arrow_batch();
         FAIL("expected schema_drift on second batch with changed array ndim");
     }
-    catch (const egress::line_reader_error& e)
+    catch (const egress::reader_error& e)
     {
         CHECK(e.code() == egress::error_code::schema_drift);
     }

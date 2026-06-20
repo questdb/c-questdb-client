@@ -228,6 +228,16 @@ Validity: `pool_size <= pool_max` must hold; otherwise
 
 ### 4.3 Pool functions
 
+> **Reader-only consumers:** `questdb_db_connect` reports the ingress
+> `line_sender_error`. A read-only path that only borrows readers can
+> instead call `questdb_db_connect_reader` (declared in
+> `questdb/egress/reader.h`), which opens the same pool but reports
+> the egress `reader_error` — so the whole lifecycle
+> (`questdb_db_connect_reader` → `questdb_db_borrow_reader` →
+> `questdb_db_return_reader` → `questdb_db_close`) uses a single error
+> type and never includes this ingress header. `questdb_db_close` is
+> re-declared in the egress header for the same reason.
+
 ```c
 /**
  * Open a connection pool. Eagerly opens `pool_size` connections; any

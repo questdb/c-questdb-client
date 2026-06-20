@@ -315,6 +315,51 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<crate::Error> for Error {
+    /// Bridge an ingress [`crate::Error`] into an egress [`Error`].
+    ///
+    /// The unified connection pool ([`crate::QuestDb`]) is opened with the
+    /// ingress-flavoured [`crate::QuestDb::connect`], which yields an ingress
+    /// [`crate::Error`] on failure. A consumer that only ever borrows
+    /// *readers* from that pool would otherwise have to handle both the
+    /// ingress and egress error types just to open it. This conversion lets
+    /// such a consumer — and the reader-only FFI entry point
+    /// `questdb_db_connect_reader` — surface a single egress error type
+    /// across connect + borrow.
+    ///
+    /// The human-readable message is preserved verbatim; the category is
+    /// mapped to the closest egress [`ErrorCode`]. Only the codes the
+    /// connect / borrow path can realistically emit are mapped explicitly;
+    /// codes that belong to the ingress encode/flush path (and any future
+    /// `#[non_exhaustive]` ingress variant) fall back to
+    /// [`ErrorCode::SocketError`] — a transport-class default that never
+    /// downgrades a real failure into something a caller might treat as
+    /// benign. The verbatim message still carries the precise detail.
+    fn from(err: crate::Error) -> Self {
+        use crate::ErrorCode as IngressCode;
+        let code = match err.code() {
+            IngressCode::CouldNotResolveAddr => ErrorCode::CouldNotResolveAddr,
+            IngressCode::ConfigError => ErrorCode::ConfigError,
+            IngressCode::InvalidApiCall => ErrorCode::InvalidApiCall,
+            IngressCode::SocketError => ErrorCode::SocketError,
+            IngressCode::InvalidUtf8 => ErrorCode::InvalidUtf8,
+            IngressCode::AuthError => ErrorCode::AuthError,
+            IngressCode::TlsError => ErrorCode::TlsError,
+            IngressCode::RoleMismatch => ErrorCode::RoleMismatch,
+            IngressCode::ProtocolVersionError => ErrorCode::UnsupportedServer,
+            IngressCode::HttpNotSupported => ErrorCode::UnsupportedServer,
+            IngressCode::ServerRejection => ErrorCode::ProtocolError,
+            // Encode/flush-path codes (InvalidName, InvalidTimestamp,
+            // InvalidDecimal, ArrayError, ServerFlushError, Arrow*,
+            // FailoverRetry) cannot surface from connect()/borrow_reader();
+            // collapse them — and any future ingress variant — onto a
+            // transport-class default. The verbatim message is preserved.
+            _ => ErrorCode::SocketError,
+        };
+        Error::new(code, err.msg().to_string())
+    }
+}
+
 /// `Result` alias scoped to the egress error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -405,5 +450,50 @@ mod tests {
     fn upgrade_reject_is_transient_case_insensitive() {
         let r = UpgradeReject::new(0x99, "primary_catchup", None);
         assert!(r.is_transient(), "case-insensitive match per spec §5");
+    }
+
+    #[test]
+    fn from_ingress_error_preserves_message_and_maps_code() {
+        use crate::ErrorCode as IngressCode;
+        // Connect-path codes map to their egress counterpart.
+        let cases = [
+            (
+                IngressCode::CouldNotResolveAddr,
+                ErrorCode::CouldNotResolveAddr,
+            ),
+            (IngressCode::ConfigError, ErrorCode::ConfigError),
+            (IngressCode::InvalidApiCall, ErrorCode::InvalidApiCall),
+            (IngressCode::SocketError, ErrorCode::SocketError),
+            (IngressCode::InvalidUtf8, ErrorCode::InvalidUtf8),
+            (IngressCode::AuthError, ErrorCode::AuthError),
+            (IngressCode::TlsError, ErrorCode::TlsError),
+            (IngressCode::RoleMismatch, ErrorCode::RoleMismatch),
+            (
+                IngressCode::ProtocolVersionError,
+                ErrorCode::UnsupportedServer,
+            ),
+            (IngressCode::HttpNotSupported, ErrorCode::UnsupportedServer),
+            (IngressCode::ServerRejection, ErrorCode::ProtocolError),
+        ];
+        for (ingress_code, expected) in cases {
+            let ingress = crate::Error::new(ingress_code, "connect blew up");
+            let egress: Error = ingress.into();
+            assert_eq!(egress.code(), expected, "code map for {ingress_code:?}");
+            assert_eq!(
+                egress.msg(),
+                "connect blew up",
+                "message preserved verbatim for {ingress_code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_ingress_error_falls_back_to_socket_error() {
+        // An encode/flush-path code that cannot surface from connect()
+        // collapses to the transport-class default rather than guessing.
+        let ingress = crate::Error::new(crate::ErrorCode::ArrayError, "unexpected");
+        let egress: Error = ingress.into();
+        assert_eq!(egress.code(), ErrorCode::SocketError);
+        assert_eq!(egress.msg(), "unexpected");
     }
 }

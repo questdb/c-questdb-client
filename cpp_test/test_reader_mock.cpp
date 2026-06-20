@@ -16,7 +16,7 @@
  *
  ******************************************************************************/
 
-// Mock-server-driven tests for the line_reader FFI.
+// Mock-server-driven tests for the reader FFI.
 //
 // Uses cpp_test/qwp_mock_server.* — an in-process WebSocket + QWP1 mock
 // — to cover the surface that needs a connected reader receiving real
@@ -31,7 +31,7 @@
 
 #include "qwp_mock_server.hpp"
 
-#include <questdb/egress/line_reader.hpp>
+#include <questdb/egress/reader.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -106,7 +106,7 @@ TEST_CASE("mock: handshake + immediate ResultEnd drives cursor terminus")
     auto cur = reader.execute("select 1"_utf8);
     // Empty result → next_batch() returns false on first call.
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == line_reader_terminal_kind_end);
+    CHECK(cur.terminal_kind() == reader_terminal_kind_end);
 
     CHECK(srv.captured_requests().size() == 1);
     CHECK(srv.captured_requests()[0][0] == qm::MSG_QUERY_REQUEST);
@@ -138,7 +138,7 @@ TEST_CASE("mock: column getter — i32 (Int) round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 3);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_int);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_int);
 
     auto v0 = batch.column(0).get<int32_t>(0);
     auto v1 = batch.column(0).get<int32_t>(1);
@@ -387,10 +387,10 @@ TEST_CASE("mock: QueryError(parse) surfaces as ServerParseError")
         auto cur = reader.execute("nonsense"_utf8);
         while (cur.next_batch()) {}
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_server_parse_error);
+        CHECK(e.code() == reader_error_server_parse_error);
         CHECK(std::strlen(e.what()) > 0);
     }
     CHECK(threw);
@@ -417,10 +417,10 @@ TEST_CASE("mock: QueryError(internal) surfaces as ServerInternalError")
         auto cur = reader.execute("x"_utf8);
         while (cur.next_batch()) {}
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_server_internal_error);
+        CHECK(e.code() == reader_error_server_internal_error);
     }
     CHECK(threw);
 }
@@ -445,10 +445,10 @@ TEST_CASE("mock: QueryError(security) surfaces as ServerSecurityError")
         auto cur = reader.execute("x"_utf8);
         while (cur.next_batch()) {}
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_server_security_error);
+        CHECK(e.code() == reader_error_server_security_error);
     }
     CHECK(threw);
 }
@@ -468,7 +468,7 @@ TEST_CASE("mock: ExecDone yields terminal_kind == exec_done")
     auto reader = connect_to(srv);
     auto cur = reader.execute("create table x(a int)"_utf8);
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == line_reader_terminal_kind_exec_done);
+    CHECK(cur.terminal_kind() == reader_terminal_kind_exec_done);
 }
 
 // ---------------------------------------------------------------------------
@@ -589,7 +589,7 @@ TEST_CASE("mock: bytes_received increases after a batch is consumed")
 
 namespace
 {
-void run_query_error_test(uint8_t status, ::line_reader_error_code expected)
+void run_query_error_test(uint8_t status, ::reader_error_code expected)
 {
     qm::Script s = {
         qm::ActionSendServerInfo{},
@@ -605,7 +605,7 @@ void run_query_error_test(uint8_t status, ::line_reader_error_code expected)
         auto cur = reader.execute("x"_utf8);
         while (cur.next_batch()) {}
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         CHECK(e.code() == expected);
@@ -618,21 +618,21 @@ TEST_CASE("mock: QueryError(schema_mismatch) surfaces as ServerSchemaMismatch")
 {
     run_query_error_test(
         qm::STATUS_SCHEMA_MISMATCH,
-        line_reader_error_server_schema_mismatch);
+        reader_error_server_schema_mismatch);
 }
 
 TEST_CASE("mock: QueryError(limit_exceeded) surfaces as ServerLimitExceeded")
 {
     run_query_error_test(
         qm::STATUS_LIMIT_EXCEEDED,
-        line_reader_error_server_limit_exceeded);
+        reader_error_server_limit_exceeded);
 }
 
 TEST_CASE("mock: QueryError(cancelled) surfaces as Cancelled")
 {
     run_query_error_test(
         qm::STATUS_CANCELLED,
-        line_reader_error_cancelled);
+        reader_error_cancelled);
 }
 
 // ---------------------------------------------------------------------------
@@ -661,12 +661,12 @@ TEST_CASE("mock: cursor::cancel writes MSG_CANCEL and surfaces Cancelled")
     {
         cur.cancel();
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         // cancel() returns once the cursor is drained. If the server
         // CANCELLED status arrives during the drain, it surfaces here.
         threw = true;
-        CHECK(e.code() == line_reader_error_cancelled);
+        CHECK(e.code() == reader_error_cancelled);
     }
     // Whether cancel() throws or returns cleanly depends on race timing,
     // but the wire MUST contain a MSG_CANCEL byte regardless.
@@ -811,10 +811,10 @@ TEST_CASE("mock: add_credit on terminal cursor returns InvalidApiCall")
     {
         cur.add_credit(64);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_invalid_api_call);
+        CHECK(e.code() == reader_error_invalid_api_call);
         // Pin the wording so a future docstring/error-message refactor
         // can't quietly drop the "terminal" diagnostic.
         const std::string m = std::string(e.what());
@@ -889,7 +889,7 @@ TEST_CASE("mock: add_credit failover on write failure replays credit on B")
     {
         cur.add_credit(1024);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         // Tolerate a single-cycle replay failure surfacing as a
         // transport-class error — this can happen on platforms where
@@ -899,7 +899,7 @@ TEST_CASE("mock: add_credit failover on write failure replays credit on B")
         // the 'done' guard fired against a still-live cursor, a
         // different bug we don't want to mask.
         threw = true;
-        REQUIRE(e.code() != line_reader_error_invalid_api_call);
+        REQUIRE(e.code() != reader_error_invalid_api_call);
     }
     CHECK_FALSE(threw);
     CHECK(cur.failover_resets() == 1);
@@ -1002,8 +1002,8 @@ TEST_CASE("mock: failover trampoline fires once with populated event fields")
     CHECK(cap->new_host == "127.0.0.1");
     CHECK(cap->attempts >= 1);
     // Trigger is a transport-class error.
-    CHECK((cap->trigger_code == line_reader_error_socket_error ||
-           cap->trigger_code == line_reader_error_protocol_error));
+    CHECK((cap->trigger_code == reader_error_socket_error ||
+           cap->trigger_code == reader_error_protocol_error));
     REQUIRE(cap->server_info_present);
     CHECK(cap->new_node_id == "b");
 }
@@ -1055,7 +1055,7 @@ TEST_CASE("mock: column::shape + elements<double> round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 2);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_double_array);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_double_array);
 
     auto col = batch.column(0);
     REQUIRE(col.is_array());
@@ -1103,7 +1103,7 @@ TEST_CASE("mock: LONG_ARRAY column rejected (not supported in this revision)")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     CHECK_THROWS_AS(
-        (void)batch.column(0), questdb::egress::line_reader_error);
+        (void)batch.column(0), questdb::egress::reader_error);
 }
 
 TEST_CASE("mock: non-null empty-data array row exposes data_offsets symmetry")
@@ -1424,7 +1424,7 @@ void run_bind_round_trip(Fn&& bind_apply)
 // Run a bind that the upstream encoder rejects (Symbol / Binary / Ipv4
 // / array kinds — see questdb-rs/src/egress/binds.rs::check_bindable).
 // The FFI surface exposes these; assert the rejection surfaces as a
-// line_reader_error with InvalidBind code rather than a panic / abort.
+// reader_error with InvalidBind code rather than a panic / abort.
 template <typename Fn>
 void run_bind_rejection(Fn&& bind_apply)
 {
@@ -1443,13 +1443,13 @@ void run_bind_rejection(Fn&& bind_apply)
     {
         (void)q.execute();
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_invalid_bind);
+    CHECK(code == reader_error_invalid_bind);
 }
 } // namespace
 
@@ -1465,19 +1465,19 @@ TEST_CASE("mock: WebSocket upgrade rejected with 401 surfaces a connect-time err
 
     const std::string conf = "ws::addr=" + srv.addr() + ";";
     line_sender_utf8 c{conf.size(), conf.c_str()};
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_conf(c, &err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_conf(c, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
-    const auto code = line_reader_error_get_code(err);
+    const auto code = reader_error_get_code(err);
     // The mock returns HTTP 401 during the upgrade handshake. Upstream
     // currently surfaces this as either AuthError or HandshakeError
     // depending on which layer caught it; both are correct
     // connection-establishment failures. Anything else (e.g.
     // socket_error, config_error, success) is a regression.
-    CHECK((code == line_reader_error_auth_error
-        || code == line_reader_error_handshake_error));
-    line_reader_error_free(err);
+    CHECK((code == reader_error_auth_error
+        || code == reader_error_handshake_error));
+    reader_error_free(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,21 +1494,21 @@ TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
     const std::string conf =
         "ws::addr=" + srv1.addr() + "," + srv2.addr() + ";";
     line_sender_utf8 c{conf.size(), conf.c_str()};
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_conf(c, &err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_conf(c, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     // Either AuthError (both endpoints actually replied 401) or
     // HandshakeError (race on one endpoint surfacing as a different
     // class). The aggregated-message check below is the part that
     // actually pins the new behaviour.
-    const auto code = line_reader_error_get_code(err);
-    CHECK((code == line_reader_error_auth_error
-        || code == line_reader_error_handshake_error));
+    const auto code = reader_error_get_code(err);
+    CHECK((code == reader_error_auth_error
+        || code == reader_error_handshake_error));
     size_t mlen = 0;
-    const char* msg = line_reader_error_msg(err, &mlen);
+    const char* msg = reader_error_msg(err, &mlen);
     const std::string m{msg, mlen};
-    if (code == line_reader_error_auth_error)
+    if (code == reader_error_auth_error)
     {
         // AuthError is terminal on the first 401: credentials are
         // cluster-wide, so retrying every host would flood server logs
@@ -1517,7 +1517,7 @@ TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
         // immediately). The diagnostic names the endpoint that refused.
         CHECK(m.find(srv1.addr()) != std::string::npos);
     }
-    line_reader_error_free(err);
+    reader_error_free(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,7 +1541,7 @@ TEST_CASE("mock: CACHE_RESET mid-stream is consumed without breaking the cursor"
     // the terminal — a regression that mishandled the cache-reset
     // discriminant would either throw or return a phantom batch here.
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == line_reader_terminal_kind_end);
+    CHECK(cur.terminal_kind() == reader_terminal_kind_end);
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,14 +1558,14 @@ TEST_CASE("mock: CACHE_RESET mid-stream is consumed without breaking the cursor"
 // before it could reach the FFI.
 namespace
 {
-::line_reader* raw_handle(questdb::egress::reader& r) noexcept
+::reader* raw_handle(questdb::egress::reader& r) noexcept
 {
-    struct reader_layout { ::line_reader* impl; };
+    struct reader_layout { ::reader* impl; };
     return reinterpret_cast<reader_layout*>(&r)->impl;
 }
-::line_reader_query* raw_handle(questdb::egress::query& q) noexcept
+::reader_query* raw_handle(questdb::egress::query& q) noexcept
 {
-    struct query_layout { ::line_reader_query* impl; };
+    struct query_layout { ::reader_query* impl; };
     return reinterpret_cast<query_layout*>(&q)->impl;
 }
 } // namespace
@@ -1578,13 +1578,13 @@ TEST_CASE("mock: query_new rejects invalid UTF-8 SQL with InvalidUtf8")
 
     static const unsigned char bad[] = {'s', 'e', 'l', 'e', 'c', 't', 0xFF};
     line_sender_utf8 sql{7, reinterpret_cast<const char*>(bad)};
-    line_reader_error* err = nullptr;
-    line_reader_query* q =
-        line_reader_prepare(raw_handle(reader), sql, &err);
+    reader_error* err = nullptr;
+    reader_query* q =
+        reader_prepare(raw_handle(reader), sql, &err);
     REQUIRE(q == nullptr);
     REQUIRE(err != nullptr);
-    CHECK(line_reader_error_get_code(err) == line_reader_error_invalid_utf8);
-    line_reader_error_free(err);
+    CHECK(reader_error_get_code(err) == reader_error_invalid_utf8);
+    reader_error_free(err);
     // No QUERY_REQUEST should have hit the wire.
     CHECK(srv.captured_requests().empty());
 }
@@ -1601,7 +1601,7 @@ TEST_CASE("mock: bind_varchar with invalid UTF-8 surfaces InvalidUtf8 at execute
     auto q = reader.prepare("X"_utf8);
     static const unsigned char bad[] = {0xC3, 0x28};  // invalid 2-byte UTF-8
     line_sender_utf8 v{2, reinterpret_cast<const char*>(bad)};
-    line_reader_query_bind_varchar(raw_handle(q), v);
+    reader_query_bind_varchar(raw_handle(q), v);
     // bind_varchar stashes the deferred error; execute() must surface
     // it as InvalidUtf8 without touching the wire.
     bool threw = false;
@@ -1610,13 +1610,13 @@ TEST_CASE("mock: bind_varchar with invalid UTF-8 surfaces InvalidUtf8 at execute
     {
         (void)q.execute();
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_invalid_utf8);
+    CHECK(code == reader_error_invalid_utf8);
     CHECK(srv.captured_requests().empty());
 }
 
@@ -1629,7 +1629,7 @@ TEST_CASE("mock: bind_varchar deferred error wins over a later valid bind")
     auto q = reader.prepare("X"_utf8);
     static const unsigned char bad[] = {0xC3, 0x28};
     line_sender_utf8 v_bad{2, reinterpret_cast<const char*>(bad)};
-    line_reader_query_bind_varchar(raw_handle(q), v_bad);
+    reader_query_bind_varchar(raw_handle(q), v_bad);
     // A second, valid bind must not overwrite the first error.
     q.bind_i32(7);
     bool threw = false;
@@ -1638,13 +1638,13 @@ TEST_CASE("mock: bind_varchar deferred error wins over a later valid bind")
     {
         (void)q.execute();
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_invalid_utf8);
+    CHECK(code == reader_error_invalid_utf8);
 }
 
 TEST_CASE("mock: bind variants round-trip without crashing")
@@ -1793,13 +1793,13 @@ TEST_CASE("mock: column_name fails cleanly on out-of-range index")
     {
         (void)batch.column_name(99);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_invalid_api_call);
+    CHECK(code == reader_error_invalid_api_call);
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,7 +1830,7 @@ TEST_CASE("mock: get_ipv4 round-trips high-bit IPs without sign-flipping")
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_ipv4);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_ipv4);
 
     auto v0 = batch.column(0).get<uint32_t>(0);
     auto v1 = batch.column(0).get<uint32_t>(1);
@@ -1865,7 +1865,7 @@ TEST_CASE("mock: get_i32 rejects an IPV4 column with a type-mismatch error")
     auto batch_opt = cur.next_batch();
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_ipv4);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_ipv4);
 
     bool threw = false;
     questdb::egress::error_code code{};
@@ -1873,13 +1873,13 @@ TEST_CASE("mock: get_i32 rejects an IPV4 column with a type-mismatch error")
     {
         (void)batch.column(0).get<int32_t>(0);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_invalid_api_call);
+    CHECK(code == reader_error_invalid_api_call);
 }
 
 TEST_CASE("mock: get_ipv4 rejects an INT column with a type-mismatch error")
@@ -1910,13 +1910,13 @@ TEST_CASE("mock: get_ipv4 rejects an INT column with a type-mismatch error")
     {
         (void)batch.column(0).get<uint32_t>(0);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_invalid_api_call);
+    CHECK(code == reader_error_invalid_api_call);
 }
 
 // ---------------------------------------------------------------------------
@@ -1960,13 +1960,13 @@ TEST_CASE("mock: typed getters reject mismatched column kind")
         {
             fn();
         }
-        catch (const questdb::egress::line_reader_error& e)
+        catch (const questdb::egress::reader_error& e)
         {
             threw = true;
             code = e.code();
         }
         CHECK(threw);
-        CHECK(code == line_reader_error_invalid_api_call);
+        CHECK(code == reader_error_invalid_api_call);
     };
 
     SUBCASE("get_bool")        { expect_throws([&]{ (void)batch.column(0).get<bool>(0); }); }
@@ -2022,13 +2022,13 @@ TEST_CASE("mock: column accessors reject out-of-range indices")
         {
             fn();
         }
-        catch (const questdb::egress::line_reader_error& e)
+        catch (const questdb::egress::reader_error& e)
         {
             threw = true;
             code = e.code();
         }
         CHECK(threw);
-        CHECK(code == line_reader_error_invalid_api_call);
+        CHECK(code == reader_error_invalid_api_call);
     };
 
     SUBCASE("column_kind out-of-range column")
@@ -2088,9 +2088,9 @@ TEST_CASE("mock: get_i64 round-trips TIMESTAMP / DATE / TIMESTAMP_NANOS")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.column_count() == 3);
-    CHECK(batch.column_kind(0) == line_reader_column_kind_timestamp);
-    CHECK(batch.column_kind(1) == line_reader_column_kind_date);
-    CHECK(batch.column_kind(2) == line_reader_column_kind_timestamp_nanos);
+    CHECK(batch.column_kind(0) == reader_column_kind_timestamp);
+    CHECK(batch.column_kind(1) == reader_column_kind_date);
+    CHECK(batch.column_kind(2) == reader_column_kind_timestamp_nanos);
 
     auto v0 = batch.column(0).get<int64_t>(0);
     auto v1 = batch.column(1).get<int64_t>(0);
@@ -2146,13 +2146,13 @@ TEST_CASE(
             (void)col.elements<double>(0, &cnt);
         }
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_protocol_error);
+    CHECK(code == reader_error_protocol_error);
 }
 
 // ---------------------------------------------------------------------------
@@ -2217,7 +2217,7 @@ TEST_CASE(
     line_sender_utf8 bad_v{2, reinterpret_cast<const char*>(bad)};
 
     // Bad bind first: stashes deferred_err.
-    line_reader_query_bind_varchar(raw_handle(q), bad_v);
+    reader_query_bind_varchar(raw_handle(q), bad_v);
 
     // Subsequent binds: each MUST be a no-op now. Pre-fix, these would
     // push into the upstream builder and shift indices.
@@ -2232,13 +2232,13 @@ TEST_CASE(
     {
         (void)q.execute();
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
     }
     CHECK(threw);
-    CHECK(code == line_reader_error_invalid_utf8);
+    CHECK(code == reader_error_invalid_utf8);
     // Wire never saw the request — the deferred error short-circuits
     // execute() before the builder is consumed.
     CHECK(srv.captured_requests().empty());
@@ -2301,7 +2301,7 @@ TEST_CASE("mock: cursor::terminal_exec_done returns op_type and rows_affected")
     auto reader = connect_to(srv);
     auto cur = reader.execute("update t set x = 1"_utf8);
     CHECK_FALSE(cur.next_batch());
-    REQUIRE(cur.terminal_kind() == line_reader_terminal_kind_exec_done);
+    REQUIRE(cur.terminal_kind() == reader_terminal_kind_exec_done);
 
     auto info = cur.terminal_exec_done();
     REQUIRE(info.has_value());
@@ -2417,7 +2417,7 @@ TEST_CASE("mock: C++ wrapper move-assignment — reader / query / cursor")
     {
         // Two independent readers, two live queries. Move-assigning q2
         // over q1 must free q1's impl (releasing reader1's `active`
-        // flag through `line_reader_query_free`) and transfer q2's impl
+        // flag through `reader_query_free`) and transfer q2's impl
         // into q1. The successor execute() then runs against reader2.
         qm::Script s1 = {qm::ActionSendServerInfo{}};
         qm::Script s2 = {
@@ -2531,14 +2531,14 @@ TEST_CASE("mock: next_batch is idempotent after the stream terminus")
     auto reader = connect_to(srv);
     auto cur = reader.execute("select 1"_utf8);
     CHECK_FALSE(cur.next_batch());
-    REQUIRE(cur.terminal_kind() == line_reader_terminal_kind_end);
+    REQUIRE(cur.terminal_kind() == reader_terminal_kind_end);
 
     // Repeated calls after the terminus must keep returning false and
     // NOT throw. Five iterations is overkill but cheap insurance.
     for (int i = 0; i < 5; ++i)
     {
         CHECK_FALSE(cur.next_batch());
-        CHECK(cur.terminal_kind() == line_reader_terminal_kind_end);
+        CHECK(cur.terminal_kind() == reader_terminal_kind_end);
     }
 }
 
@@ -2558,12 +2558,12 @@ TEST_CASE("mock: target=primary against replica-only endpoint surfaces role_mism
 
     const std::string conf = "ws::addr=" + srv.addr() + ";target=primary;";
     line_sender_utf8 c{conf.size(), conf.c_str()};
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_conf(c, &err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_conf(c, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
-    CHECK(line_reader_error_get_code(err) == line_reader_error_role_mismatch);
-    line_reader_error_free(err);
+    CHECK(reader_error_get_code(err) == reader_error_role_mismatch);
+    reader_error_free(err);
 }
 
 // ---------------------------------------------------------------------------
@@ -2572,7 +2572,7 @@ TEST_CASE("mock: target=primary against replica-only endpoint surfaces role_mism
 // frames the friendly builders refuse to emit. Uses `ActionSendRaw`
 // (otherwise dead code in this suite — the friendly builders cover the
 // happy path). Each test connects, executes a no-op query, and asserts
-// `next_batch()` surfaces `line_reader_error_protocol_error` with the
+// `next_batch()` surfaces `reader_error_protocol_error` with the
 // cursor torn down.
 // ---------------------------------------------------------------------------
 
@@ -2581,7 +2581,7 @@ namespace
 
 void run_malformed_batch(
     qm::Script script,
-    ::line_reader_error_code expected = line_reader_error_protocol_error)
+    ::reader_error_code expected = reader_error_protocol_error)
 {
     qm::MockServer srv({std::move(script)});
     // Disable failover. ProtocolError is failover-eligible by default,
@@ -2599,7 +2599,7 @@ void run_malformed_batch(
         cur.next_batch();
         FAIL("expected error from malformed frame");
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         CHECK(e.code() == expected);
@@ -2673,7 +2673,7 @@ TEST_CASE("mock: invalid_utf8 — RESULT_BATCH column name is not valid UTF-8")
         }},
         qm::ActionSendResultEnd{},
     };
-    run_malformed_batch(s, line_reader_error_invalid_utf8);
+    run_malformed_batch(s, reader_error_invalid_utf8);
 }
 
 TEST_CASE("mock: protocol_error — over-long varint in batch_seq")
@@ -2802,7 +2802,7 @@ TEST_CASE("mock: ActionSendRaw delivers a hand-built SERVER_INFO frame")
 }
 
 // Move-assigning over a reader that still owns a live cursor would
-// drive `line_reader_close` down its defense-in-depth leak branch
+// drive `reader_close` down its defense-in-depth leak branch
 // (cursor holds a laundered `&mut Reader`; freeing would dangle). The
 // C++ wrapper must surface that as an exception rather than letting
 // the leak happen silently.
@@ -2825,18 +2825,18 @@ TEST_CASE("mock: reader move-assign with live cursor throws")
     // Take a cursor on `reader_a`. While `cur` is alive, the underlying
     // C reader's active flag is set.
     auto cur = reader_a.execute("select 1"_utf8);
-    CHECK(::line_reader_has_active_query(
-              reinterpret_cast<const ::line_reader*>(0)) == 0);
+    CHECK(::reader_has_active_query(
+              reinterpret_cast<const ::reader*>(0)) == 0);
 
     bool threw = false;
     try
     {
         reader_a = std::move(reader_b);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_invalid_api_call);
+        CHECK(e.code() == reader_error_invalid_api_call);
         // Pin the wording so a future error-message refactor can't
         // quietly drop the "leak" / "live" diagnostic that the user
         // needs to debug the contract violation.
@@ -2849,7 +2849,7 @@ TEST_CASE("mock: reader move-assign with live cursor throws")
     // The destination reader is unchanged: `cur` still works and drains
     // to its terminal. No use-after-free, no observable leak.
     CHECK_FALSE(cur.next_batch());
-    CHECK(cur.terminal_kind() == line_reader_terminal_kind_end);
+    CHECK(cur.terminal_kind() == reader_terminal_kind_end);
 }
 
 // Once the cursor is destroyed the active flag clears and the same
@@ -2912,10 +2912,10 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
         {
             (void)reader.server_version();
         }
-        catch (const questdb::egress::line_reader_error& e)
+        catch (const questdb::egress::reader_error& e)
         {
             threw = true;
-            CHECK(e.code() == line_reader_error_invalid_api_call);
+            CHECK(e.code() == reader_error_invalid_api_call);
         }
         CHECK(threw);
 
@@ -2940,10 +2940,10 @@ TEST_CASE("mock: reader metadata getters reject while a cursor is live")
 }
 
 // ---------------------------------------------------------------------------
-// FFI ABI smoke for every supported `line_reader_query_bind_*`.
+// FFI ABI smoke for every supported `reader_query_bind_*`.
 //
 // Each bind goes through the C ABI (`questdb::egress::query::bind_*` ->
-// `line_reader_query_bind_*` -> `mutate_query` -> upstream `bind_*`), so
+// `reader_query_bind_*` -> `mutate_query` -> upstream `bind_*`), so
 // the captured QUERY_REQUEST is a byte-level snapshot of the marshalling.
 // Sentinel values are chosen so a wrong argument order, sign-extension
 // bug, or off-by-one width on any single bind produces a localised diff
@@ -3153,14 +3153,14 @@ TEST_CASE(
 // ---------------------------------------------------------------------------
 // FFI thread-safety contract: Reader migration + concurrent stats reads.
 //
-// `line_reader_bytes_received` / `_read_ns` / `_decode_ns` /
+// `reader_bytes_received` / `_read_ns` / `_decode_ns` /
 // `_credit_granted_total` are documented at `questdb-rs-ffi/src/egress.rs`
 // as safe to call from a monitoring thread while another thread is
-// driving a cursor through `line_reader_query_execute`. The Reader is
+// driving a cursor through `reader_query_execute`. The Reader is
 // stored in an `UnsafeCell<Reader>` next to a cloned `Arc<ReaderStats>`
-// inside the C-side `line_reader` struct; the stat getters use
+// inside the C-side `reader` struct; the stat getters use
 // `ptr::addr_of!` to reach the Arc field without synthesising an
-// intermediate `&line_reader` reborrow that would otherwise cover the
+// intermediate `&reader` reborrow that would otherwise cover the
 // cell and disturb the laundered `&mut Reader` held by an in-flight
 // query. This test exercises that exact shape from C++:
 //
@@ -3168,7 +3168,7 @@ TEST_CASE(
 //    drives a multi-batch cursor through `next_batch()`.
 //  - The main thread hammers `reader.bytes_received()` /
 //    `read_ns()` / `decode_ns()` / `credit_granted_total()` on the same
-//    `line_reader*` handle.
+//    `reader*` handle.
 //
 // Under `QUESTDB_SANITIZE` (ASan + UBSan today; TSan if/when wired in)
 // a regression that routes a stat getter through a non-atomic field, or
@@ -3412,7 +3412,7 @@ TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhau
     {
         bool fired{false};
         uint32_t attempt{0};
-        std::optional<line_reader_error_code> final_code;
+        std::optional<reader_error_code> final_code;
         std::string final_msg;
         uint64_t elapsed_ns{0};
     };
@@ -3429,7 +3429,7 @@ TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhau
                                cap->attempt = ev.attempt();
                                if (auto c = ev.final_error_code())
                                    cap->final_code =
-                                       static_cast<line_reader_error_code>(*c);
+                                       static_cast<reader_error_code>(*c);
                                cap->final_msg = std::string(ev.final_error_msg());
                                cap->elapsed_ns = ev.elapsed_ns();
                            }
@@ -3440,7 +3440,7 @@ TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhau
     {
         while (cur.next_batch()) {}
     }
-    catch (const questdb::egress::line_reader_error&)
+    catch (const questdb::egress::reader_error&)
     {
         threw = true;
     }
@@ -3449,8 +3449,8 @@ TEST_CASE("mock: progress callback fires GaveUp with final_error on budget exhau
     CHECK(cap->fired);
     CHECK(cap->attempt >= 1);
     REQUIRE(cap->final_code.has_value());
-    CHECK((*cap->final_code == line_reader_error_socket_error ||
-           *cap->final_code == line_reader_error_protocol_error));
+    CHECK((*cap->final_code == reader_error_socket_error ||
+           *cap->final_code == reader_error_protocol_error));
     CHECK_FALSE(cap->final_msg.empty());
     CHECK(cap->elapsed_ns > 0);
 }
@@ -3506,7 +3506,7 @@ TEST_CASE("mock: progress callback alone unlocks replay-after-data-delivered")
     {
         CHECK_FALSE(cur.next_batch());
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         FAIL_CHECK("unexpected error: " << e.what());
@@ -4072,7 +4072,7 @@ TEST_CASE("mock: batch::column — DOUBLE_ARRAY round-trip")
     REQUIRE(da.row_count() == 3);
     REQUIRE(da.has_nulls());
     // Scalar accessors on an array column raise.
-    CHECK_THROWS_AS(da.values<double>(), eg::line_reader_error);
+    CHECK_THROWS_AS(da.values<double>(), eg::reader_error);
     CHECK_FALSE(da.is_null(0));
     CHECK(da.is_null(1));
     CHECK_FALSE(da.is_null(2));
@@ -4132,7 +4132,7 @@ TEST_CASE("mock: batch::symbol — column codes + dictionary bulk round-trip")
     CHECK(dict[0] == "alpha");
     CHECK(dict[1] == "beta");
     CHECK(dict[2] == "gamma");
-    CHECK_THROWS_AS(dict[3], eg::line_reader_error);
+    CHECK_THROWS_AS(dict[3], eg::reader_error);
 
     auto col = batch.column(0);
     REQUIRE(col.kind() == eg::column_kind::symbol);
@@ -4187,8 +4187,8 @@ TEST_CASE("mock: array accessors on a scalar column raise")
     auto col = batch_opt->column(0);
     REQUIRE_FALSE(col.is_array());
     size_t dummy = 0;
-    CHECK_THROWS_AS(col.shape(0, &dummy), eg::line_reader_error);
-    CHECK_THROWS_AS(col.elements<double>(0, &dummy), eg::line_reader_error);
+    CHECK_THROWS_AS(col.shape(0, &dummy), eg::reader_error);
+    CHECK_THROWS_AS(col.elements<double>(0, &dummy), eg::reader_error);
 }
 
 TEST_CASE(

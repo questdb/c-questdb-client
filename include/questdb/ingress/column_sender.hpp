@@ -38,7 +38,7 @@
 
 // Forward declaration so the unified `pool` can hand out query readers via
 // `pool::borrow_reader()`, mirroring the Rust `QuestDb::borrow_reader`. The
-// method is DEFINED out-of-line in `questdb/egress/line_reader.hpp` so the
+// method is DEFINED out-of-line in `questdb/egress/reader.hpp` so the
 // heavy egress header stays off the sender-only include path; include that
 // header to call it.
 namespace questdb::egress
@@ -952,10 +952,10 @@ public:
      * connection opens on first borrow). The returned `reader` is
      * equivalent to a standalone one and returns itself to the pool on
      * destruction — unless `reader::mark_must_close()` was called, in which
-     * case it is dropped. Throws `line_reader_error` on cap exhaustion or
+     * case it is dropped. Throws `reader_error` on cap exhaustion or
      * transport failure.
      *
-     * DEFINED in `questdb/egress/line_reader.hpp` (the reader-pool entry
+     * DEFINED in `questdb/egress/reader.hpp` (the reader-pool entry
      * points live alongside the `reader` type, matching the C headers).
      * Include that header to call this.
      */

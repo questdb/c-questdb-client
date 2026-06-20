@@ -5,7 +5,7 @@
  * and the Python system tests under `system_test/`. */
 
 #include <questdb/ingress/column_sender.h>
-#include <questdb/egress/line_reader.h>
+#include <questdb/egress/reader.h>
 #include <questdb/ingress/line_sender.h>
 
 #include "qwp_mock_c.h"
@@ -71,19 +71,19 @@ static line_sender_column_name make_col(const char* name)
 
 TEST(test_tristate_egress_enum_values)
 {
-    CHECK(line_reader_arrow_batch_ok == 0, "ok = 0");
-    CHECK(line_reader_arrow_batch_end == 1, "end = 1");
-    CHECK(line_reader_arrow_batch_error == 2, "error = 2");
+    CHECK(reader_arrow_batch_ok == 0, "ok = 0");
+    CHECK(reader_arrow_batch_end == 1, "end = 1");
+    CHECK(reader_arrow_batch_error == 2, "error = 2");
 }
 
 TEST(test_appended_reader_error_codes_have_distinct_values)
 {
     CHECK(
-        line_reader_error_schema_drift != line_reader_error_no_schema &&
-        line_reader_error_no_schema != line_reader_error_arrow_export &&
-        line_reader_error_arrow_export != line_reader_error_schema_drift,
+        reader_error_schema_drift != reader_error_no_schema &&
+        reader_error_no_schema != reader_error_arrow_export &&
+        reader_error_arrow_export != reader_error_schema_drift,
         "schema_drift / no_schema / arrow_export distinct");
-    CHECK(line_reader_error_schema_drift > line_reader_error_failover_would_duplicate,
+    CHECK(reader_error_schema_drift > reader_error_failover_would_duplicate,
           "schema_drift appended (not renumbered)");
 }
 
@@ -98,24 +98,24 @@ TEST(test_egress_null_cursor_returns_error_tristate)
 {
     struct ArrowArray arr;
     struct ArrowSchema sch;
-    line_reader_error* err = NULL;
-    line_reader_arrow_batch_result rc =
-        line_reader_cursor_next_arrow_batch(NULL, &arr, &sch, &err);
-    CHECK(rc == line_reader_arrow_batch_error, "NULL cursor → error");
+    reader_error* err = NULL;
+    reader_arrow_batch_result rc =
+        reader_cursor_next_arrow_batch(NULL, &arr, &sch, &err);
+    CHECK(rc == reader_arrow_batch_error, "NULL cursor → error");
     CHECK(err != NULL, "err_out populated");
     if (err)
-        line_reader_error_free(err);
+        reader_error_free(err);
 }
 
 TEST(test_egress_null_out_array_returns_error_tristate)
 {
     struct ArrowSchema sch;
-    line_reader_error* err = NULL;
-    line_reader_arrow_batch_result rc =
-        line_reader_cursor_next_arrow_batch(NULL, NULL, &sch, &err);
-    CHECK(rc == line_reader_arrow_batch_error, "NULL out_array → error");
+    reader_error* err = NULL;
+    reader_arrow_batch_result rc =
+        reader_cursor_next_arrow_batch(NULL, NULL, &sch, &err);
+    CHECK(rc == reader_arrow_batch_error, "NULL out_array → error");
     if (err)
-        line_reader_error_free(err);
+        reader_error_free(err);
 }
 
 TEST(test_ingress_null_conn_returns_false)
@@ -746,9 +746,9 @@ TEST(test_error_codes_survive_ffi_boundary)
 {
     int sender_code = (int)line_sender_error_arrow_unsupported_column_kind;
     int ingest_code = (int)line_sender_error_arrow_ingest;
-    int drift_code = (int)line_reader_error_schema_drift;
-    int no_schema_code = (int)line_reader_error_no_schema;
-    int export_code = (int)line_reader_error_arrow_export;
+    int drift_code = (int)reader_error_schema_drift;
+    int no_schema_code = (int)reader_error_no_schema;
+    int export_code = (int)reader_error_arrow_export;
     CHECK(sender_code != ingest_code, "sender codes distinct");
     CHECK(drift_code != no_schema_code, "reader codes distinct");
     CHECK(no_schema_code != export_code, "reader codes distinct");

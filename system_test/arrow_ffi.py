@@ -1,6 +1,6 @@
 """ctypes bindings for the Apache Arrow C Data Interface exports.
 
-Wraps `line_reader_cursor_next_arrow_batch` (egress) and
+Wraps `reader_cursor_next_arrow_batch` (egress) and
 `column_sender_flush_arrow_batch[_at_column]` (ingress) from
 `libquestdb_client`. Layout of `ArrowArray` / `ArrowSchema` mirrors
 the Apache Arrow spec:
@@ -125,8 +125,8 @@ class SenderErrorCode:
 
 
 class ReaderErrorCode:
-    """`line_reader_error_code` discriminants. Pinned in
-    `questdb-rs-ffi/src/egress.rs::line_reader_error_code`."""
+    """`reader_error_code` discriminants. Pinned in
+    `questdb-rs-ffi/src/egress.rs::reader_error_code`."""
     COULD_NOT_RESOLVE_ADDR = 0
     CONFIG_ERROR = 1
     INVALID_API_CALL = 2
@@ -160,7 +160,7 @@ def _setsig(name, restype, *argtypes):
 
 
 _next_arrow_batch = _setsig(
-    "line_reader_cursor_next_arrow_batch",
+    "reader_cursor_next_arrow_batch",
     ctypes.c_int,
     ctypes.POINTER(_LineReaderCursor),
     ctypes.POINTER(ArrowArray),
@@ -262,7 +262,7 @@ _column_sender_sync = _setsig(
 
 
 def next_arrow_batch(cursor_ptr) -> Tuple[int, ArrowArray, ArrowSchema]:
-    """Drive `line_reader_cursor_next_arrow_batch`. On OK, returns the
+    """Drive `reader_cursor_next_arrow_batch`. On OK, returns the
     populated structs; the caller becomes responsible for invoking the
     `release` callback inside each struct."""
     arr = ArrowArray()

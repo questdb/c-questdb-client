@@ -1,4 +1,4 @@
-#include <questdb/egress/line_reader.h>
+#include <questdb/egress/reader.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,18 +54,18 @@ int main(int argc, const char* argv[])
     (void)argc;
     (void)argv;
 
-    line_reader_error* err = NULL;
-    line_reader* reader = NULL;
-    line_reader_cursor* cursor = NULL;
+    reader_error* err = NULL;
+    reader* reader = NULL;
+    reader_cursor* cursor = NULL;
 
     line_sender_utf8 conf = QDB_UTF8_LITERAL("ws::addr=localhost:9000;");
-    reader = line_reader_from_conf(conf, &err);
+    reader = reader_from_conf(conf, &err);
     if (!reader)
         goto on_error;
 
     line_sender_utf8 sql = QDB_UTF8_LITERAL(
         "SELECT x AS n, x * 1.5 AS d FROM long_sequence(5)");
-    cursor = line_reader_execute(reader, sql, &err);
+    cursor = reader_execute(reader, sql, &err);
     if (!cursor)
         goto on_error;
 
@@ -73,11 +73,11 @@ int main(int argc, const char* argv[])
     {
         struct ArrowArray arr;
         struct ArrowSchema sch;
-        line_reader_arrow_batch_result rc =
-            line_reader_cursor_next_arrow_batch(cursor, &arr, &sch, &err);
-        if (rc == line_reader_arrow_batch_end)
+        reader_arrow_batch_result rc =
+            reader_cursor_next_arrow_batch(cursor, &arr, &sch, &err);
+        if (rc == reader_arrow_batch_end)
             break;
-        if (rc == line_reader_arrow_batch_error)
+        if (rc == reader_arrow_batch_error)
             goto on_error;
 
         print_batch(&arr, &sch);
@@ -88,16 +88,16 @@ int main(int argc, const char* argv[])
             sch.release(&sch);
     }
 
-    line_reader_cursor_free(cursor);
-    line_reader_close(reader);
+    reader_cursor_free(cursor);
+    reader_close(reader);
     return 0;
 
 on_error:;
     size_t err_len = 0;
-    const char* err_msg = line_reader_error_msg(err, &err_len);
+    const char* err_msg = reader_error_msg(err, &err_len);
     fprintf(stderr, "Error: %.*s\n", (int)err_len, err_msg);
-    line_reader_error_free(err);
-    line_reader_cursor_free(cursor);
-    line_reader_close(reader);
+    reader_error_free(err);
+    reader_cursor_free(cursor);
+    reader_close(reader);
     return 1;
 }

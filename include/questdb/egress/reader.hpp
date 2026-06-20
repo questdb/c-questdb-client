@@ -24,7 +24,7 @@
 
 #pragma once
 
-#include "line_reader.h"
+#include "reader.h"
 
 #include <array>
 #include <cstdint>
@@ -44,9 +44,9 @@ namespace questdb::egress
 {
 
 // ---------------------------------------------------------------------------
-// Thread safety (mirrors the contract documented in `line_reader.h`).
+// Thread safety (mirrors the contract documented in `reader.h`).
 //
-// All four wrapper handles (`reader`, `query`, `cursor`, `line_reader_error`)
+// All four wrapper handles (`reader`, `query`, `cursor`, `reader_error`)
 // are move-only — `std::move` lets you transfer ownership, but the
 // destination thread inherits the same per-handle access rules:
 //
@@ -59,7 +59,7 @@ namespace questdb::egress
 //                            either across threads is undefined behaviour
 //                            (their internal failover-callback closure is
 //                            `!Send`).
-//   `line_reader_error`    — has no thread affinity; may be created on
+//   `reader_error`    — has no thread affinity; may be created on
 //                            one thread and destroyed/inspected on
 //                            another, but must not be used concurrently.
 //
@@ -68,159 +68,159 @@ namespace questdb::egress
 // ---------------------------------------------------------------------------
 
 /**
- * Stripped-prefix `enum class` mirroring `::line_reader_error_code`. The
+ * Stripped-prefix `enum class` mirroring `::reader_error_code`. The
  * underlying type is `int` and each variant has the same discriminant as
  * its C counterpart, so the two are reinterpret-castable. Matches the
  * style of `questdb::ingress::line_sender_error_code`.
  */
 enum class error_code : int
 {
-    could_not_resolve_addr = ::line_reader_error_could_not_resolve_addr,
-    config_error           = ::line_reader_error_config_error,
-    invalid_api_call       = ::line_reader_error_invalid_api_call,
-    socket_error           = ::line_reader_error_socket_error,
-    tls_error              = ::line_reader_error_tls_error,
-    handshake_error        = ::line_reader_error_handshake_error,
-    auth_error             = ::line_reader_error_auth_error,
-    unsupported_server     = ::line_reader_error_unsupported_server,
-    role_mismatch          = ::line_reader_error_role_mismatch,
-    protocol_error         = ::line_reader_error_protocol_error,
-    invalid_utf8           = ::line_reader_error_invalid_utf8,
-    invalid_bind           = ::line_reader_error_invalid_bind,
+    could_not_resolve_addr = ::reader_error_could_not_resolve_addr,
+    config_error           = ::reader_error_config_error,
+    invalid_api_call       = ::reader_error_invalid_api_call,
+    socket_error           = ::reader_error_socket_error,
+    tls_error              = ::reader_error_tls_error,
+    handshake_error        = ::reader_error_handshake_error,
+    auth_error             = ::reader_error_auth_error,
+    unsupported_server     = ::reader_error_unsupported_server,
+    role_mismatch          = ::reader_error_role_mismatch,
+    protocol_error         = ::reader_error_protocol_error,
+    invalid_utf8           = ::reader_error_invalid_utf8,
+    invalid_bind           = ::reader_error_invalid_bind,
     // Values 12 and 13 are reserved (formerly invalid_timestamp /
-    // invalid_decimal — removed; see line_reader.h).
-    server_schema_mismatch = ::line_reader_error_server_schema_mismatch,
-    server_parse_error     = ::line_reader_error_server_parse_error,
-    server_internal_error  = ::line_reader_error_server_internal_error,
-    server_security_error  = ::line_reader_error_server_security_error,
-    limit_exceeded         = ::line_reader_error_limit_exceeded,
-    server_limit_exceeded     = ::line_reader_error_server_limit_exceeded,
-    cancelled                 = ::line_reader_error_cancelled,
-    failover_would_duplicate  = ::line_reader_error_failover_would_duplicate,
+    // invalid_decimal — removed; see reader.h).
+    server_schema_mismatch = ::reader_error_server_schema_mismatch,
+    server_parse_error     = ::reader_error_server_parse_error,
+    server_internal_error  = ::reader_error_server_internal_error,
+    server_security_error  = ::reader_error_server_security_error,
+    limit_exceeded         = ::reader_error_limit_exceeded,
+    server_limit_exceeded     = ::reader_error_server_limit_exceeded,
+    cancelled                 = ::reader_error_cancelled,
+    failover_would_duplicate  = ::reader_error_failover_would_duplicate,
 
     /** Streaming Arrow adapter observed a mid-stream schema change. The
      *  cursor is still usable; re-call `next_arrow_batch` after dropping
      *  any partial state to snapshot the new schema. Only raised with
      *  the `arrow` feature enabled. */
-    schema_drift     = ::line_reader_error_schema_drift,
+    schema_drift     = ::reader_error_schema_drift,
     /** `next_arrow_batch` was called on a stream that terminated before
      *  any batch was produced — no schema to snapshot. Only raised with
      *  the `arrow` feature enabled. */
-    no_schema        = ::line_reader_error_no_schema,
+    no_schema        = ::reader_error_no_schema,
     /** Arrow C Data Interface export failed (arrow-rs rejected the
      *  produced `ArrayData`'s invariants). Indicates a client bug —
      *  not user-recoverable. Only raised with the `arrow` feature
      *  enabled. */
-    arrow_export     = ::line_reader_error_arrow_export,
+    arrow_export     = ::reader_error_arrow_export,
 };
 
 /**
- * Stripped-prefix `enum class` mirroring `::line_reader_column_kind`. The
+ * Stripped-prefix `enum class` mirroring `::reader_column_kind`. The
  * discriminants match the QWP wire bytes (so reinterpret-casting between
  * the two is sound).
  */
 enum class column_kind : int
 {
-    boolean         = ::line_reader_column_kind_boolean,
-    byte            = ::line_reader_column_kind_byte,
-    short_          = ::line_reader_column_kind_short,
-    int_            = ::line_reader_column_kind_int,
-    long_           = ::line_reader_column_kind_long,
-    float_          = ::line_reader_column_kind_float,
-    double_         = ::line_reader_column_kind_double,
-    symbol          = ::line_reader_column_kind_symbol,
-    timestamp       = ::line_reader_column_kind_timestamp,
-    date            = ::line_reader_column_kind_date,
-    uuid            = ::line_reader_column_kind_uuid,
-    long256         = ::line_reader_column_kind_long256,
-    geohash         = ::line_reader_column_kind_geohash,
-    varchar         = ::line_reader_column_kind_varchar,
-    timestamp_nanos = ::line_reader_column_kind_timestamp_nanos,
-    double_array    = ::line_reader_column_kind_double_array,
-    long_array      = ::line_reader_column_kind_long_array,
-    decimal64       = ::line_reader_column_kind_decimal64,
-    decimal128      = ::line_reader_column_kind_decimal128,
-    decimal256      = ::line_reader_column_kind_decimal256,
-    char_           = ::line_reader_column_kind_char,
-    binary          = ::line_reader_column_kind_binary,
-    ipv4            = ::line_reader_column_kind_ipv4,
+    boolean         = ::reader_column_kind_boolean,
+    byte            = ::reader_column_kind_byte,
+    short_          = ::reader_column_kind_short,
+    int_            = ::reader_column_kind_int,
+    long_           = ::reader_column_kind_long,
+    float_          = ::reader_column_kind_float,
+    double_         = ::reader_column_kind_double,
+    symbol          = ::reader_column_kind_symbol,
+    timestamp       = ::reader_column_kind_timestamp,
+    date            = ::reader_column_kind_date,
+    uuid            = ::reader_column_kind_uuid,
+    long256         = ::reader_column_kind_long256,
+    geohash         = ::reader_column_kind_geohash,
+    varchar         = ::reader_column_kind_varchar,
+    timestamp_nanos = ::reader_column_kind_timestamp_nanos,
+    double_array    = ::reader_column_kind_double_array,
+    long_array      = ::reader_column_kind_long_array,
+    decimal64       = ::reader_column_kind_decimal64,
+    decimal128      = ::reader_column_kind_decimal128,
+    decimal256      = ::reader_column_kind_decimal256,
+    char_           = ::reader_column_kind_char,
+    binary          = ::reader_column_kind_binary,
+    ipv4            = ::reader_column_kind_ipv4,
 };
 
 /**
- * Stripped-prefix `enum class` mirroring `::line_reader_server_role`.
+ * Stripped-prefix `enum class` mirroring `::reader_server_role`.
  */
 enum class server_role : int
 {
-    standalone       = ::line_reader_server_role_standalone,
-    primary          = ::line_reader_server_role_primary,
-    replica          = ::line_reader_server_role_replica,
-    primary_catchup  = ::line_reader_server_role_primary_catchup,
-    other            = ::line_reader_server_role_other,
+    standalone       = ::reader_server_role_standalone,
+    primary          = ::reader_server_role_primary,
+    replica          = ::reader_server_role_replica,
+    primary_catchup  = ::reader_server_role_primary_catchup,
+    other            = ::reader_server_role_other,
 };
 
 /**
- * Stripped-prefix `enum class` mirroring `::line_reader_terminal_kind`.
+ * Stripped-prefix `enum class` mirroring `::reader_terminal_kind`.
  */
 enum class terminal_kind : int
 {
-    none      = ::line_reader_terminal_kind_none,
-    end       = ::line_reader_terminal_kind_end,
-    exec_done = ::line_reader_terminal_kind_exec_done,
+    none      = ::reader_terminal_kind_none,
+    end       = ::reader_terminal_kind_end,
+    exec_done = ::reader_terminal_kind_exec_done,
 };
 
 // ---------------------------------------------------------------------------
 // Bridging equality operators between the C enums and their stripped-prefix
 // `enum class` counterparts. The discriminants match (same `int` underlying
 // type, same values), so a `static_cast<int>` round-trip is exact. This
-// keeps existing C-prefix usage (`e.code() == line_reader_error_config_error`)
+// keeps existing C-prefix usage (`e.code() == reader_error_config_error`)
 // compiling while new code can prefer `error_code::config_error`.
 // ---------------------------------------------------------------------------
-inline bool operator==(error_code l, ::line_reader_error_code r) noexcept
+inline bool operator==(error_code l, ::reader_error_code r) noexcept
 { return static_cast<int>(l) == static_cast<int>(r); }
-inline bool operator==(::line_reader_error_code l, error_code r) noexcept
+inline bool operator==(::reader_error_code l, error_code r) noexcept
 { return r == l; }
-inline bool operator!=(error_code l, ::line_reader_error_code r) noexcept
+inline bool operator!=(error_code l, ::reader_error_code r) noexcept
 { return !(l == r); }
-inline bool operator!=(::line_reader_error_code l, error_code r) noexcept
+inline bool operator!=(::reader_error_code l, error_code r) noexcept
 { return !(l == r); }
 
-inline bool operator==(column_kind l, ::line_reader_column_kind r) noexcept
+inline bool operator==(column_kind l, ::reader_column_kind r) noexcept
 { return static_cast<int>(l) == static_cast<int>(r); }
-inline bool operator==(::line_reader_column_kind l, column_kind r) noexcept
+inline bool operator==(::reader_column_kind l, column_kind r) noexcept
 { return r == l; }
-inline bool operator!=(column_kind l, ::line_reader_column_kind r) noexcept
+inline bool operator!=(column_kind l, ::reader_column_kind r) noexcept
 { return !(l == r); }
-inline bool operator!=(::line_reader_column_kind l, column_kind r) noexcept
+inline bool operator!=(::reader_column_kind l, column_kind r) noexcept
 { return !(l == r); }
 
-inline bool operator==(server_role l, ::line_reader_server_role r) noexcept
+inline bool operator==(server_role l, ::reader_server_role r) noexcept
 { return static_cast<int>(l) == static_cast<int>(r); }
-inline bool operator==(::line_reader_server_role l, server_role r) noexcept
+inline bool operator==(::reader_server_role l, server_role r) noexcept
 { return r == l; }
-inline bool operator!=(server_role l, ::line_reader_server_role r) noexcept
+inline bool operator!=(server_role l, ::reader_server_role r) noexcept
 { return !(l == r); }
-inline bool operator!=(::line_reader_server_role l, server_role r) noexcept
+inline bool operator!=(::reader_server_role l, server_role r) noexcept
 { return !(l == r); }
 
-inline bool operator==(terminal_kind l, ::line_reader_terminal_kind r) noexcept
+inline bool operator==(terminal_kind l, ::reader_terminal_kind r) noexcept
 { return static_cast<int>(l) == static_cast<int>(r); }
-inline bool operator==(::line_reader_terminal_kind l, terminal_kind r) noexcept
+inline bool operator==(::reader_terminal_kind l, terminal_kind r) noexcept
 { return r == l; }
-inline bool operator!=(terminal_kind l, ::line_reader_terminal_kind r) noexcept
+inline bool operator!=(terminal_kind l, ::reader_terminal_kind r) noexcept
 { return !(l == r); }
-inline bool operator!=(::line_reader_terminal_kind l, terminal_kind r) noexcept
+inline bool operator!=(::reader_terminal_kind l, terminal_kind r) noexcept
 { return !(l == r); }
 
 /**
- * Egress error. Mirrors `line_reader_error` from the C API.
+ * Egress error. Mirrors `reader_error` from the C API.
  *
  * Thrown by `reader` and `cursor` methods on failure. The raw error code is
  * available via `code()`; the human-readable message via `what()`.
  */
-class line_reader_error : public std::runtime_error
+class reader_error : public std::runtime_error
 {
 public:
-    line_reader_error(error_code code, const std::string& what)
+    reader_error(error_code code, const std::string& what)
         : std::runtime_error{what}
         , _code{code}
     {
@@ -230,11 +230,11 @@ public:
     error_code code() const noexcept { return _code; }
 
 private:
-    static line_reader_error from_c(::line_reader_error* c_err)
+    static reader_error from_c(::reader_error* c_err)
     {
-        const auto c_code = ::line_reader_error_get_code(c_err);
+        const auto c_code = ::reader_error_get_code(c_err);
         size_t c_len = 0;
-        const char* c_msg = ::line_reader_error_msg(c_err, &c_len);
+        const char* c_msg = ::reader_error_msg(c_err, &c_len);
         std::string msg;
         try
         {
@@ -242,17 +242,17 @@ private:
         }
         catch (...)
         {
-            ::line_reader_error_free(c_err);
+            ::reader_error_free(c_err);
             throw;
         }
-        ::line_reader_error_free(c_err);
-        return line_reader_error{static_cast<error_code>(c_code), msg};
+        ::reader_error_free(c_err);
+        return reader_error{static_cast<error_code>(c_code), msg};
     }
 
     template <typename F, typename... Args>
     static auto wrapped_call(F&& f, Args&&... args)
     {
-        ::line_reader_error* c_err{nullptr};
+        ::reader_error* c_err{nullptr};
         auto result = f(std::forward<Args>(args)..., &c_err);
         if (c_err) throw from_c(c_err);
         return result;
@@ -365,7 +365,7 @@ struct terminal_exec_done_info
 class server_info_view
 {
 public:
-    explicit server_info_view(const ::line_reader_server_info* impl) noexcept
+    explicit server_info_view(const ::reader_server_info* impl) noexcept
         : _impl{impl} {}
 
     /** True if a `SERVER_INFO` is available. */
@@ -373,41 +373,41 @@ public:
 
     server_role role() const noexcept
     {
-        return static_cast<server_role>(::line_reader_server_info_role(_impl));
+        return static_cast<server_role>(::reader_server_info_role(_impl));
     }
     uint8_t role_byte() const noexcept
     {
-        return ::line_reader_server_info_role_byte(_impl);
+        return ::reader_server_info_role_byte(_impl);
     }
     uint64_t epoch() const noexcept
     {
-        return ::line_reader_server_info_epoch(_impl);
+        return ::reader_server_info_epoch(_impl);
     }
     uint32_t capabilities() const noexcept
     {
-        return ::line_reader_server_info_capabilities(_impl);
+        return ::reader_server_info_capabilities(_impl);
     }
     int64_t server_wall_ns() const noexcept
     {
-        return ::line_reader_server_info_server_wall_ns(_impl);
+        return ::reader_server_info_server_wall_ns(_impl);
     }
     std::string_view cluster_id() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_server_info_cluster_id(_impl, &buf, &len);
+        ::reader_server_info_cluster_id(_impl, &buf, &len);
         return {buf, len};
     }
     std::string_view node_id() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_server_info_node_id(_impl, &buf, &len);
+        ::reader_server_info_node_id(_impl, &buf, &len);
         return {buf, len};
     }
 
 private:
-    const ::line_reader_server_info* _impl;
+    const ::reader_server_info* _impl;
 };
 
 /**
@@ -417,7 +417,7 @@ private:
 class failover_event_view
 {
 public:
-    explicit failover_event_view(const ::line_reader_failover_event* impl) noexcept
+    explicit failover_event_view(const ::reader_failover_event* impl) noexcept
         : _impl{impl} {}
 
     // Non-copyable: `_impl` is borrowed, valid only during the callback.
@@ -430,56 +430,56 @@ public:
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_failover_event_failed_host(_impl, &buf, &len);
+        ::reader_failover_event_failed_host(_impl, &buf, &len);
         return {buf, len};
     }
     uint16_t failed_port() const noexcept
     {
-        return ::line_reader_failover_event_failed_port(_impl);
+        return ::reader_failover_event_failed_port(_impl);
     }
     std::string_view new_host() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_failover_event_new_host(_impl, &buf, &len);
+        ::reader_failover_event_new_host(_impl, &buf, &len);
         return {buf, len};
     }
     uint16_t new_port() const noexcept
     {
-        return ::line_reader_failover_event_new_port(_impl);
+        return ::reader_failover_event_new_port(_impl);
     }
     int64_t new_request_id() const noexcept
     {
-        return ::line_reader_failover_event_new_request_id(_impl);
+        return ::reader_failover_event_new_request_id(_impl);
     }
     uint32_t attempts() const noexcept
     {
-        return ::line_reader_failover_event_attempts(_impl);
+        return ::reader_failover_event_attempts(_impl);
     }
     uint64_t elapsed_ns() const noexcept
     {
-        return ::line_reader_failover_event_elapsed_ns(_impl);
+        return ::reader_failover_event_elapsed_ns(_impl);
     }
     error_code trigger_code() const noexcept
     {
         return static_cast<error_code>(
-            ::line_reader_failover_event_trigger_code(_impl));
+            ::reader_failover_event_trigger_code(_impl));
     }
     std::string_view trigger_msg() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_failover_event_trigger_msg(_impl, &buf, &len);
+        ::reader_failover_event_trigger_msg(_impl, &buf, &len);
         return {buf, len};
     }
     server_info_view server_info() const noexcept
     {
         return server_info_view{
-            ::line_reader_failover_event_server_info(_impl)};
+            ::reader_failover_event_server_info(_impl)};
     }
 
 private:
-    const ::line_reader_failover_event* _impl;
+    const ::reader_failover_event* _impl;
 };
 
 /** User callback type for failover-reset notifications. */
@@ -487,18 +487,18 @@ using failover_callback = std::function<void(const failover_event_view&)>;
 
 /**
  * Lifecycle phase of a failover-progress event. Numeric values match
- * `line_reader_failover_phase` and the Rust `FailoverPhase` enum.
+ * `reader_failover_phase` and the Rust `FailoverPhase` enum.
  */
 enum class failover_phase : int
 {
     disconnected =
-        ::line_reader_failover_phase::line_reader_failover_phase_disconnected,
+        ::reader_failover_phase::reader_failover_phase_disconnected,
     retrying =
-        ::line_reader_failover_phase::line_reader_failover_phase_retrying,
+        ::reader_failover_phase::reader_failover_phase_retrying,
     reset =
-        ::line_reader_failover_phase::line_reader_failover_phase_reset,
+        ::reader_failover_phase::reader_failover_phase_reset,
     gave_up =
-        ::line_reader_failover_phase::line_reader_failover_phase_gave_up,
+        ::reader_failover_phase::reader_failover_phase_gave_up,
 };
 
 /**
@@ -513,7 +513,7 @@ class failover_progress_event_view
 {
 public:
     explicit failover_progress_event_view(
-        const ::line_reader_failover_progress_event* impl) noexcept
+        const ::reader_failover_progress_event* impl) noexcept
         : _impl{impl} {}
 
     // Non-copyable: `_impl` is borrowed, valid only during the callback.
@@ -527,7 +527,7 @@ public:
     failover_phase phase() const noexcept
     {
         return static_cast<failover_phase>(
-            ::line_reader_failover_progress_event_phase(_impl));
+            ::reader_failover_progress_event_phase(_impl));
     }
 
     /** Endpoint that died. Set on every phase. */
@@ -535,12 +535,12 @@ public:
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_failover_progress_event_failed_host(_impl, &buf, &len);
+        ::reader_failover_progress_event_failed_host(_impl, &buf, &len);
         return {buf, len};
     }
     uint16_t failed_port() const noexcept
     {
-        return ::line_reader_failover_progress_event_failed_port(_impl);
+        return ::reader_failover_progress_event_failed_port(_impl);
     }
 
     /** New-endpoint host (Reset phase only). Returns empty otherwise. */
@@ -548,20 +548,20 @@ public:
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_failover_progress_event_new_host(_impl, &buf, &len);
+        ::reader_failover_progress_event_new_host(_impl, &buf, &len);
         return {buf, len};
     }
     /** New-endpoint port (Reset phase only). Returns 0 otherwise. */
     uint16_t new_port() const noexcept
     {
-        return ::line_reader_failover_progress_event_new_port(_impl);
+        return ::reader_failover_progress_event_new_port(_impl);
     }
 
     /** New `request_id` (Reset phase only). `std::nullopt` otherwise. */
     std::optional<int64_t> new_request_id() const noexcept
     {
         int64_t out = 0;
-        if (::line_reader_failover_progress_event_new_request_id(_impl, &out))
+        if (::reader_failover_progress_event_new_request_id(_impl, &out))
             return out;
         return std::nullopt;
     }
@@ -569,43 +569,43 @@ public:
     /** 1-based attempt counter. See header docs for per-phase semantics. */
     uint32_t attempt() const noexcept
     {
-        return ::line_reader_failover_progress_event_attempt(_impl);
+        return ::reader_failover_progress_event_attempt(_impl);
     }
 
     /** Trigger (original cause-of-death) error code. */
     error_code trigger_code() const noexcept
     {
         return static_cast<error_code>(
-            ::line_reader_failover_progress_event_trigger_code(_impl));
+            ::reader_failover_progress_event_trigger_code(_impl));
     }
     /** Trigger error message (UTF-8). */
     std::string_view trigger_msg() const noexcept
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_failover_progress_event_trigger_msg(_impl, &buf, &len);
+        ::reader_failover_progress_event_trigger_msg(_impl, &buf, &len);
         return {buf, len};
     }
 
     /** Wall-clock nanoseconds since the disconnect. */
     uint64_t elapsed_ns() const noexcept
     {
-        return ::line_reader_failover_progress_event_elapsed_ns(_impl);
+        return ::reader_failover_progress_event_elapsed_ns(_impl);
     }
 
     /** `SERVER_INFO` for the new endpoint (Reset phase only). */
     server_info_view server_info() const noexcept
     {
         return server_info_view{
-            ::line_reader_failover_progress_event_server_info(_impl)};
+            ::reader_failover_progress_event_server_info(_impl)};
     }
 
     /** Final error code (GaveUp phase only). `std::nullopt` otherwise. */
     std::optional<error_code> final_error_code() const noexcept
     {
-        ::line_reader_error_code raw =
-            ::line_reader_error_code::line_reader_error_invalid_api_call;
-        if (::line_reader_failover_progress_event_final_error_code(_impl, &raw))
+        ::reader_error_code raw =
+            ::reader_error_code::reader_error_invalid_api_call;
+        if (::reader_failover_progress_event_final_error_code(_impl, &raw))
             return static_cast<error_code>(raw);
         return std::nullopt;
     }
@@ -614,13 +614,13 @@ public:
     {
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_failover_progress_event_final_error_msg(
+        ::reader_failover_progress_event_final_error_msg(
             _impl, &buf, &len);
         return {buf, len};
     }
 
 private:
-    const ::line_reader_failover_progress_event* _impl;
+    const ::reader_failover_progress_event* _impl;
 };
 
 /** User callback type for failover-progress notifications. */
@@ -645,14 +645,20 @@ inline ::line_sender_utf8 to_c_utf8(::questdb::ingress::utf8_view view) noexcept
 class reader
 {
 public:
+#ifdef QUESTDB_READER_INTERNAL_CONSTRUCTORS
+    // Internal / test-only standalone constructors. NOT part of the
+    // supported public API: obtain a reader from the pool via
+    // `questdb::ingress::pool::borrow_reader()`. Visible only when
+    // `QUESTDB_READER_INTERNAL_CONSTRUCTORS` is defined (the in-tree
+    // test-suite / example programs). See `reader.h` for the rationale.
     /**
      * Open a reader using the given config string (e.g.
      * `"ws::addr=localhost:9000;"`).
-     * @throws line_reader_error on failure.
+     * @throws reader_error on failure.
      */
     explicit reader(::questdb::ingress::utf8_view config)
-        : _impl{line_reader_error::wrapped_call(
-              ::line_reader_from_conf, to_c_utf8(config))}
+        : _impl{reader_error::wrapped_call(
+              ::reader_from_conf, to_c_utf8(config))}
     {
     }
 
@@ -660,15 +666,16 @@ public:
      * Open a reader using the config string stored in the
      * `QDB_CLIENT_CONF` environment variable. The variable's value
      * follows the same format as the constructor's `config` argument.
-     * @throws line_reader_error with `config_error` if the variable is
+     * @throws reader_error with `config_error` if the variable is
      *         unset or its value is malformed; with `invalid_utf8` if
      *         the variable is set but its bytes are not valid UTF-8.
      */
     static reader from_env()
     {
         return reader{
-            line_reader_error::wrapped_call(::line_reader_from_env)};
+            reader_error::wrapped_call(::reader_from_env)};
     }
+#endif /* QUESTDB_READER_INTERNAL_CONSTRUCTORS */
 
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
@@ -682,9 +689,9 @@ public:
      * Move-assign. Closes the previously-held reader before adopting
      * `other`'s impl.
      *
-     * @throws line_reader_error with `invalid_api_call` if a `query` or
+     * @throws reader_error with `invalid_api_call` if a `query` or
      *         `cursor` produced by this reader is still live. Replacing
-     *         the impl in that state would force `line_reader_close` down
+     *         the impl in that state would force `reader_close` down
      *         its defense-in-depth branch and silently leak the underlying
      *         reader (so the live cursor's internal `&mut Reader` stays
      *         valid rather than dangling). Surfacing it here as an
@@ -695,31 +702,31 @@ public:
     {
         if (this != &other)
         {
-            if (_impl && ::line_reader_has_active_query(_impl))
+            if (_impl && ::reader_has_active_query(_impl))
             {
-                throw line_reader_error{
+                throw reader_error{
                     error_code::invalid_api_call,
                     "reader::operator=(reader&&): a query or cursor is "
                     "still live on the destination reader. Move-assigning "
                     "now would leak the underlying reader (see "
-                    "line_reader_close). Destroy the outstanding cursor / "
+                    "reader_close). Destroy the outstanding cursor / "
                     "query first."};
             }
-            ::line_reader_close(_impl);
+            ::reader_close(_impl);
             _impl = other._impl;
             other._impl = nullptr;
         }
         return *this;
     }
 
-    ~reader() noexcept { ::line_reader_close(_impl); }
+    ~reader() noexcept { ::reader_close(_impl); }
 
     /**
      * Execute a SQL statement with no binds and return a streaming cursor.
      * Convenience for `query(sql).execute()`. The cursor borrows from
      * this reader; this reader MUST outlive the cursor. Only one cursor
      * may be live at a time.
-     * @throws line_reader_error on failure.
+     * @throws reader_error on failure.
      */
     cursor execute(::questdb::ingress::utf8_view sql);
 
@@ -729,44 +736,44 @@ public:
      * outlive the query and the cursor. Validation of the SQL is
      * deferred to `query::execute`.
      *
-     * @throws line_reader_error if a query or cursor is already in flight
+     * @throws reader_error if a query or cursor is already in flight
      *         on this reader.
      */
     query prepare(::questdb::ingress::utf8_view sql);
 
     /** Cumulative bytes successfully read from the wire.
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     uint64_t bytes_received() const
     {
         ensure_impl();
-        return ::line_reader_bytes_received(_impl);
+        return ::reader_bytes_received(_impl);
     }
     /** Cumulative CREDIT bytes granted to the server on this connection.
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     uint64_t credit_granted_total() const
     {
         ensure_impl();
-        return ::line_reader_credit_granted_total(_impl);
+        return ::reader_credit_granted_total(_impl);
     }
     /** Cumulative `read` time in nanoseconds (saturating).
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     uint64_t read_ns() const
     {
         ensure_impl();
-        return ::line_reader_read_ns(_impl);
+        return ::reader_read_ns(_impl);
     }
     /** Cumulative decode time in nanoseconds (saturating).
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     uint64_t decode_ns() const
     {
         ensure_impl();
-        return ::line_reader_decode_ns(_impl);
+        return ::reader_decode_ns(_impl);
     }
-    /** @throws line_reader_error if this reader has been moved from. */
+    /** @throws reader_error if this reader has been moved from. */
     void reset_timing()
     {
         ensure_impl();
-        ::line_reader_reset_timing(_impl);
+        ::reader_reset_timing(_impl);
     }
 
     /** Mark a pool-borrowed reader to be dropped (not recycled) when it is
@@ -774,67 +781,67 @@ public:
      *  `BorrowedReader::mark_must_close`. No-op for standalone readers
      *  (constructed from a config string / `from_env`), which are closed on
      *  destruction regardless.
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     void mark_must_close()
     {
         ensure_impl();
-        ::line_reader_mark_must_close(_impl);
+        ::reader_mark_must_close(_impl);
     }
 
     /** Negotiated QWP server version.
-     *  @throws line_reader_error if the connection is not yet established
+     *  @throws reader_error if the connection is not yet established
      *          or this reader has been moved from. */
     uint8_t server_version() const
     {
         ensure_impl();
         uint8_t v = 0;
-        line_reader_error::wrapped_call(
-            ::line_reader_server_version, _impl, &v);
+        reader_error::wrapped_call(
+            ::reader_server_version, _impl, &v);
         return v;
     }
 
     /** Last-seen `SERVER_INFO`. The server always sends one, so the view
      *  is empty only while a reconnect is in flight; it is invalidated by
      *  any reader operation that may reconnect.
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     server_info_view server_info() const
     {
         ensure_impl();
-        return server_info_view{::line_reader_current_server_info(_impl)};
+        return server_info_view{::reader_current_server_info(_impl)};
     }
 
     /** Host of the endpoint the reader is currently connected to.
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     std::string_view current_host() const
     {
         ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_current_addr_host(_impl, &buf, &len);
+        ::reader_current_addr_host(_impl, &buf, &len);
         return {buf, len};
     }
     /** Port of the endpoint the reader is currently connected to.
-     *  @throws line_reader_error if this reader has been moved from. */
+     *  @throws reader_error if this reader has been moved from. */
     uint16_t current_port() const
     {
         ensure_impl();
-        return ::line_reader_current_addr_port(_impl);
+        return ::reader_current_addr_port(_impl);
     }
 
 private:
-    explicit reader(::line_reader* impl) noexcept : _impl{impl} {}
+    explicit reader(::reader* impl) noexcept : _impl{impl} {}
 
     /// Borrow a pooled reader from a `questdb_db` pool. Backs
     /// `questdb::ingress::pool::borrow_reader`. The returned reader is
-    /// equivalent to a standalone one; on destruction `line_reader_close`
+    /// equivalent to a standalone one; on destruction `reader_close`
     /// returns it to the pool (or drops it if marked must-close).
     static reader borrow_from_pool(::questdb_db* db)
     {
         return reader{
-            line_reader_error::wrapped_call(::questdb_db_borrow_reader, db)};
+            reader_error::wrapped_call(::questdb_db_borrow_reader, db)};
     }
 
-    /// Throw `line_reader_error{invalid_api_call}` if `_impl` is null.
+    /// Throw `reader_error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the reader has been moved from or already
     /// closed — calling any method that derefs it would pass `nullptr`
     /// into the C layer where `(*reader).0.get()` is instant UB. Throwing
@@ -842,12 +849,12 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "reader has been closed or moved from."};
     }
 
-    ::line_reader* _impl;
+    ::reader* _impl;
     friend class cursor;
     friend class ::questdb::egress::query;
     friend class ::questdb::ingress::pool;
@@ -876,7 +883,7 @@ public:
     {
         if (this != &other)
         {
-            ::line_reader_query_free(_impl);
+            ::reader_query_free(_impl);
             _impl = other._impl;
             _callback = std::move(other._callback);
             _progress_callback = std::move(other._progress_callback);
@@ -885,79 +892,79 @@ public:
         return *this;
     }
 
-    ~query() noexcept { ::line_reader_query_free(_impl); }
+    ~query() noexcept { ::reader_query_free(_impl); }
 
     query& bind_bool(bool v)
     {
         ensure_impl();
-        ::line_reader_query_bind_bool(_impl, v);
+        ::reader_query_bind_bool(_impl, v);
         return *this;
     }
 
     query& bind_i8(int8_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_i8(_impl, v);
+        ::reader_query_bind_i8(_impl, v);
         return *this;
     }
     query& bind_i16(int16_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_i16(_impl, v);
+        ::reader_query_bind_i16(_impl, v);
         return *this;
     }
     query& bind_i32(int32_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_i32(_impl, v);
+        ::reader_query_bind_i32(_impl, v);
         return *this;
     }
     query& bind_i64(int64_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_i64(_impl, v);
+        ::reader_query_bind_i64(_impl, v);
         return *this;
     }
     query& bind_f32(float v)
     {
         ensure_impl();
-        ::line_reader_query_bind_f32(_impl, v);
+        ::reader_query_bind_f32(_impl, v);
         return *this;
     }
     query& bind_f64(double v)
     {
         ensure_impl();
-        ::line_reader_query_bind_f64(_impl, v);
+        ::reader_query_bind_f64(_impl, v);
         return *this;
     }
     query& bind_timestamp_micros(int64_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_timestamp_micros(_impl, v);
+        ::reader_query_bind_timestamp_micros(_impl, v);
         return *this;
     }
     query& bind_timestamp_nanos(int64_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_timestamp_nanos(_impl, v);
+        ::reader_query_bind_timestamp_nanos(_impl, v);
         return *this;
     }
     query& bind_date_millis(int64_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_date_millis(_impl, v);
+        ::reader_query_bind_date_millis(_impl, v);
         return *this;
     }
     query& bind_char(uint16_t v)
     {
         ensure_impl();
-        ::line_reader_query_bind_char(_impl, v);
+        ::reader_query_bind_char(_impl, v);
         return *this;
     }
     query& bind_decimal64(int64_t v, int8_t scale)
     {
         ensure_impl();
-        ::line_reader_query_bind_decimal64(_impl, v, scale);
+        ::reader_query_bind_decimal64(_impl, v, scale);
         return *this;
     }
     /**
@@ -972,25 +979,25 @@ public:
     query& bind_decimal128(uint64_t mantissa_lo, int64_t mantissa_hi, int8_t scale)
     {
         ensure_impl();
-        ::line_reader_query_bind_decimal128(_impl, mantissa_lo, mantissa_hi, scale);
+        ::reader_query_bind_decimal128(_impl, mantissa_lo, mantissa_hi, scale);
         return *this;
     }
     query& bind_decimal256(const std::array<uint8_t, 32>& bytes, int8_t scale)
     {
         ensure_impl();
-        ::line_reader_query_bind_decimal256(_impl, bytes.data(), scale);
+        ::reader_query_bind_decimal256(_impl, bytes.data(), scale);
         return *this;
     }
     query& bind_geohash(uint64_t v, uint8_t precision_bits)
     {
         ensure_impl();
-        ::line_reader_query_bind_geohash(_impl, v, precision_bits);
+        ::reader_query_bind_geohash(_impl, v, precision_bits);
         return *this;
     }
     query& bind_varchar(::questdb::ingress::utf8_view v)
     {
         ensure_impl();
-        ::line_reader_query_bind_varchar(_impl, to_c_utf8(v));
+        ::reader_query_bind_varchar(_impl, to_c_utf8(v));
         return *this;
     }
     /**
@@ -999,29 +1006,29 @@ public:
      * Not supported by Phase 1 servers — `execute()` will throw
      * `error_code::invalid_bind`. The method is part of the public ABI
      * for forward-compatibility; see
-     * `::line_reader_query_bind_binary` in the C header for the
+     * `::reader_query_bind_binary` in the C header for the
      * server-side rationale.
      */
     query& bind_binary(const uint8_t* buf, size_t len)
     {
         ensure_impl();
         if (buf == nullptr && len != 0)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "bind_binary: NULL buffer with non-zero length"};
-        ::line_reader_query_bind_binary(_impl, buf, len);
+        ::reader_query_bind_binary(_impl, buf, len);
         return *this;
     }
     query& bind_uuid(const std::array<uint8_t, 16>& bytes)
     {
         ensure_impl();
-        ::line_reader_query_bind_uuid(_impl, bytes.data());
+        ::reader_query_bind_uuid(_impl, bytes.data());
         return *this;
     }
     query& bind_long256(const std::array<uint8_t, 32>& bytes)
     {
         ensure_impl();
-        ::line_reader_query_bind_long256(_impl, bytes.data());
+        ::reader_query_bind_long256(_impl, bytes.data());
         return *this;
     }
     /**
@@ -1029,13 +1036,13 @@ public:
      *
      * Not supported by Phase 1 servers — `execute()` will throw
      * `error_code::invalid_bind`. The method is part of the public ABI
-     * for forward-compatibility; see `::line_reader_query_bind_ipv4`
+     * for forward-compatibility; see `::reader_query_bind_ipv4`
      * in the C header for the server-side rationale.
      */
     query& bind_ipv4(uint32_t host_order)
     {
         ensure_impl();
-        ::line_reader_query_bind_ipv4(_impl, host_order);
+        ::reader_query_bind_ipv4(_impl, host_order);
         return *this;
     }
     /**
@@ -1051,14 +1058,14 @@ public:
     query& bind_null(column_kind kind)
     {
         ensure_impl();
-        ::line_reader_query_bind_null(
+        ::reader_query_bind_null(
             _impl, static_cast<uint32_t>(kind));
         return *this;
     }
     query& bind_null_varchar()
     {
         ensure_impl();
-        ::line_reader_query_bind_null_varchar(_impl);
+        ::reader_query_bind_null_varchar(_impl);
         return *this;
     }
     /**
@@ -1070,31 +1077,31 @@ public:
     query& bind_null_binary()
     {
         ensure_impl();
-        ::line_reader_query_bind_null_binary(_impl);
+        ::reader_query_bind_null_binary(_impl);
         return *this;
     }
     query& bind_null_decimal64(int8_t scale)
     {
         ensure_impl();
-        ::line_reader_query_bind_null_decimal64(_impl, scale);
+        ::reader_query_bind_null_decimal64(_impl, scale);
         return *this;
     }
     query& bind_null_decimal128(int8_t scale)
     {
         ensure_impl();
-        ::line_reader_query_bind_null_decimal128(_impl, scale);
+        ::reader_query_bind_null_decimal128(_impl, scale);
         return *this;
     }
     query& bind_null_decimal256(int8_t scale)
     {
         ensure_impl();
-        ::line_reader_query_bind_null_decimal256(_impl, scale);
+        ::reader_query_bind_null_decimal256(_impl, scale);
         return *this;
     }
     query& bind_null_geohash(uint8_t precision_bits)
     {
         ensure_impl();
-        ::line_reader_query_bind_null_geohash(_impl, precision_bits);
+        ::reader_query_bind_null_geohash(_impl, precision_bits);
         return *this;
     }
 
@@ -1102,7 +1109,7 @@ public:
     query& initial_credit(uint64_t credit)
     {
         ensure_impl();
-        ::line_reader_query_initial_credit(_impl, credit);
+        ::reader_query_initial_credit(_impl, credit);
         return *this;
     }
 
@@ -1148,7 +1155,7 @@ public:
         // pointer to the destroyed callback.
         auto new_callback =
             std::make_unique<failover_callback>(std::move(cb));
-        ::line_reader_query_on_failover_reset(
+        ::reader_query_on_failover_reset(
             _impl,
             &query::trampoline,
             new_callback.get());
@@ -1176,7 +1183,7 @@ public:
         ensure_impl();
         auto new_callback =
             std::make_unique<failover_progress_callback>(std::move(cb));
-        ::line_reader_query_on_failover_progress(
+        ::reader_query_on_failover_progress(
             _impl,
             &query::progress_trampoline,
             new_callback.get());
@@ -1185,15 +1192,15 @@ public:
     }
 
     /** Consume the query and return a streaming cursor.
-     *  @throws line_reader_error with `invalid_api_call` if the query has
+     *  @throws reader_error with `invalid_api_call` if the query has
      *  already been consumed (by a previous `execute()`) or moved from.
-     *  @throws line_reader_error on transport / protocol failure. */
+     *  @throws reader_error on transport / protocol failure. */
     cursor execute();
 
 private:
-    explicit query(::line_reader_query* impl) noexcept : _impl{impl} {}
+    explicit query(::reader_query* impl) noexcept : _impl{impl} {}
 
-    /// Throw `line_reader_error{invalid_api_call}` if `_impl` is null.
+    /// Throw `reader_error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the query has been moved from or already
     /// consumed by `execute()` — calling any method that derefs it would
     /// pass `nullptr` into the C layer, where `Box::from_raw(nullptr)` /
@@ -1202,13 +1209,13 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "query has been consumed by execute() or moved from."};
     }
 
     static void trampoline(
-        const ::line_reader_failover_event* ev, void* user_data) noexcept
+        const ::reader_failover_event* ev, void* user_data) noexcept
     {
         auto* cb = static_cast<failover_callback*>(user_data);
         if (cb && *cb)
@@ -1227,7 +1234,7 @@ private:
     }
 
     static void progress_trampoline(
-        const ::line_reader_failover_progress_event* ev,
+        const ::reader_failover_progress_event* ev,
         void* user_data) noexcept
     {
         auto* cb = static_cast<failover_progress_callback*>(user_data);
@@ -1244,7 +1251,7 @@ private:
         }
     }
 
-    ::line_reader_query* _impl;
+    ::reader_query* _impl;
     std::unique_ptr<failover_callback> _callback;
     std::unique_ptr<failover_progress_callback> _progress_callback;
     friend class reader;
@@ -1281,7 +1288,7 @@ public:
         : _d{}
     {
     }
-    explicit symbol_dict_view(::line_reader_symbol_dict d) noexcept
+    explicit symbol_dict_view(::reader_symbol_dict d) noexcept
         : _d{d}
     {
     }
@@ -1310,7 +1317,7 @@ public:
     }
 
     /** Entry table: `entry_count()` entries addressing `heap()`. */
-    const ::line_reader_symbol_entry* entries() const noexcept
+    const ::reader_symbol_entry* entries() const noexcept
     {
         return _d.entries;
     }
@@ -1319,7 +1326,7 @@ public:
     std::string_view operator[](size_t i) const
     {
         if (i >= _d.entry_count)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "symbol_dict_view: index out of range"};
         const auto& e = _d.entries[i];
@@ -1327,13 +1334,13 @@ public:
             reinterpret_cast<const char*>(_d.heap + e.offset), e.length};
     }
 
-    const ::line_reader_symbol_dict& c_data() const noexcept
+    const ::reader_symbol_dict& c_data() const noexcept
     {
         return _d;
     }
 
 private:
-    ::line_reader_symbol_dict _d;
+    ::reader_symbol_dict _d;
 };
 
 // Typed views handed to `column::visit`. `kind` disambiguates within a
@@ -1486,7 +1493,7 @@ struct symbol_view
             return std::nullopt;
         const uint32_t code = codes[row];
         if (code >= dict.entry_count())
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "symbol_view::resolve: code out of dictionary range"};
         return dict[code];
@@ -1635,16 +1642,16 @@ public:
     {
         ensure_scalar("column::values<T>");
         if (!_scalar.values)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::values<T>: column has no dense values "
                 "(variable-width or SYMBOL)"};
         if (sizeof(T) != _scalar.value_stride)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::values<T>: sizeof(T) != value_stride"};
         if (!is_kind_compatible<T>(kind()))
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::values<T>: T is not in the kind whitelist for this "
                 "column kind (stride matches but semantics differ); use the "
@@ -1663,15 +1670,15 @@ public:
     {
         ensure_scalar("column::values<T>(kind)");
         if (kind() != required)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::values<T>(kind): column kind mismatch"};
         if (!_scalar.values)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::values<T>(kind): column has no dense values"};
         if (sizeof(T) != _scalar.value_stride)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::values<T>(kind): sizeof(T) != value_stride"};
         return static_cast<const T*>(_scalar.values);
@@ -1741,7 +1748,7 @@ public:
             return std::nullopt;
         const uint32_t code = _scalar.symbol_codes[row];
         if (code >= _dict.entry_count())
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::symbol: code out of dictionary range"};
         return _dict[code];
@@ -2005,22 +2012,22 @@ public:
         case column_kind::double_array:
             return std::forward<Visitor>(v)(make_array_view<double>());
         case column_kind::long_array:
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::visit: LONG_ARRAY is not supported in this revision"};
         default:
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "column::visit: unknown column kind"};
         }
     }
 
     // ---- Raw C-side data (escape hatches) ----
-    const ::line_reader_column_data& c_scalar_data() const noexcept
+    const ::reader_column_data& c_scalar_data() const noexcept
     {
         return _scalar;
     }
-    const ::line_reader_array_data& c_array_data() const noexcept
+    const ::reader_array_data& c_array_data() const noexcept
     {
         return _array;
     }
@@ -2029,7 +2036,7 @@ private:
     friend class batch;
 
     static column make_scalar(
-        ::line_reader_column_data d, symbol_dict_view dict) noexcept
+        ::reader_column_data d, symbol_dict_view dict) noexcept
     {
         column c;
         c._scalar = d;
@@ -2037,7 +2044,7 @@ private:
         c._is_array = false;
         return c;
     }
-    static column make_array(::line_reader_array_data d) noexcept
+    static column make_array(::reader_array_data d) noexcept
     {
         column c;
         c._array = d;
@@ -2118,7 +2125,7 @@ private:
     void ensure_scalar(const char* what) const
     {
         if (_is_array)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 std::string{what} +
                     ": column is an array; use the array "
@@ -2127,7 +2134,7 @@ private:
     void ensure_array(const char* what) const
     {
         if (!_is_array)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 std::string{what} +
                     ": column is not an array; use the "
@@ -2136,14 +2143,14 @@ private:
     void ensure_kind(egress::column_kind expected, const char* what) const
     {
         if (kind() != expected)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 std::string{what} + ": column kind mismatch"};
     }
     void ensure_row_in_range(size_t row, const char* what) const
     {
         if (row >= row_count())
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 std::string{what} + ": row index out of range"};
     }
@@ -2161,8 +2168,8 @@ private:
         return false;
     }
 
-    ::line_reader_column_data _scalar{};
-    ::line_reader_array_data _array{};
+    ::reader_column_data _scalar{};
+    ::reader_array_data _array{};
     symbol_dict_view _dict{};
     bool _is_array{false};
 };
@@ -2231,7 +2238,7 @@ inline const double* column::elements<double>(
 {
     ensure_array("column::elements<double>");
     if (kind() != column_kind::double_array)
-        throw line_reader_error{
+        throw reader_error{
             error_code::invalid_api_call,
             "column::elements<double>: column is not DOUBLE_ARRAY"};
     size_t bytes = 0;
@@ -2257,7 +2264,7 @@ public:
         : _impl{nullptr}
     {
     }
-    explicit batch(const ::line_reader_batch* impl) noexcept
+    explicit batch(const ::reader_batch* impl) noexcept
         : _impl{impl}
     {
     }
@@ -2273,31 +2280,31 @@ public:
 
     size_t row_count() const noexcept
     {
-        return _impl ? ::line_reader_batch_row_count(_impl) : 0;
+        return _impl ? ::reader_batch_row_count(_impl) : 0;
     }
     size_t column_count() const noexcept
     {
-        return _impl ? ::line_reader_batch_column_count(_impl) : 0;
+        return _impl ? ::reader_batch_column_count(_impl) : 0;
     }
     int64_t request_id() const noexcept
     {
-        return _impl ? ::line_reader_batch_request_id(_impl) : 0;
+        return _impl ? ::reader_batch_request_id(_impl) : 0;
     }
     uint64_t seq() const noexcept
     {
-        return _impl ? ::line_reader_batch_seq(_impl) : 0;
+        return _impl ? ::reader_batch_seq(_impl) : 0;
     }
     uint8_t flags() const noexcept
     {
-        return _impl ? ::line_reader_batch_flags(_impl) : 0;
+        return _impl ? ::reader_batch_flags(_impl) : 0;
     }
 
     egress::column_kind column_kind(size_t col_idx) const
     {
         ensure_impl();
-        ::line_reader_column_kind k{};
-        line_reader_error::wrapped_call(
-            ::line_reader_batch_column_kind, _impl, col_idx, &k);
+        ::reader_column_kind k{};
+        reader_error::wrapped_call(
+            ::reader_batch_column_kind, _impl, col_idx, &k);
         return static_cast<egress::column_kind>(k);
     }
 
@@ -2306,8 +2313,8 @@ public:
         ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
-        line_reader_error::wrapped_call(
-            ::line_reader_batch_column_name, _impl, col_idx, &buf, &len);
+        reader_error::wrapped_call(
+            ::reader_batch_column_name, _impl, col_idx, &buf, &len);
         return std::string_view{buf, len};
     }
 
@@ -2321,25 +2328,25 @@ public:
     egress::column column(size_t col_idx) const
     {
         ensure_impl();
-        ::line_reader_column_kind k_raw{};
-        line_reader_error::wrapped_call(
-            ::line_reader_batch_column_kind, _impl, col_idx, &k_raw);
-        if (k_raw == ::line_reader_column_kind_double_array)
+        ::reader_column_kind k_raw{};
+        reader_error::wrapped_call(
+            ::reader_batch_column_kind, _impl, col_idx, &k_raw);
+        if (k_raw == ::reader_column_kind_double_array)
         {
-            ::line_reader_array_data d{};
-            line_reader_error::wrapped_call(
-                ::line_reader_batch_array_column_data, _impl, col_idx, &d);
+            ::reader_array_data d{};
+            reader_error::wrapped_call(
+                ::reader_batch_array_column_data, _impl, col_idx, &d);
             return egress::column::make_array(d);
         }
-        if (k_raw == ::line_reader_column_kind_long_array)
-            throw line_reader_error{
+        if (k_raw == ::reader_column_kind_long_array)
+            throw reader_error{
                 error_code::invalid_api_call,
                 "batch::column: LONG_ARRAY is not supported in this revision"};
-        ::line_reader_column_data d{};
-        line_reader_error::wrapped_call(
-            ::line_reader_batch_column_data, _impl, col_idx, &d);
+        ::reader_column_data d{};
+        reader_error::wrapped_call(
+            ::reader_batch_column_data, _impl, col_idx, &d);
         symbol_dict_view dict{};
-        if (d.kind == ::line_reader_column_kind_symbol)
+        if (d.kind == ::reader_column_kind_symbol)
             dict = symbol_dict();
         return egress::column::make_scalar(d, dict);
     }
@@ -2348,7 +2355,7 @@ public:
      * Look up a column by name. O(N) over `column_count()`, intended
      * for the common case where N is small (typically < 50). For tight
      * loops cache the index from a one-time lookup.
-     * @throws line_reader_error with `invalid_api_call` if no column
+     * @throws reader_error with `invalid_api_call` if no column
      *         matches `name`.
      */
     egress::column column_by_name(std::string_view name) const
@@ -2359,7 +2366,7 @@ public:
             if (column_name(i) == name)
                 return column(i);
         }
-        throw line_reader_error{
+        throw reader_error{
             error_code::invalid_api_call,
             "batch::column_by_name: no column named '" + std::string{name} +
                 "'"};
@@ -2384,9 +2391,9 @@ public:
     egress::symbol_dict_view symbol_dict() const
     {
         ensure_impl();
-        ::line_reader_symbol_dict d{};
-        line_reader_error::wrapped_call(
-            ::line_reader_batch_symbol_dict, _impl, &d);
+        ::reader_symbol_dict d{};
+        reader_error::wrapped_call(
+            ::reader_batch_symbol_dict, _impl, &d);
         return egress::symbol_dict_view{d};
     }
 
@@ -2399,12 +2406,12 @@ public:
         ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
-        line_reader_error::wrapped_call(
-            ::line_reader_batch_symbol, _impl, col_idx, code, &buf, &len);
+        reader_error::wrapped_call(
+            ::reader_batch_symbol, _impl, col_idx, code, &buf, &len);
         return std::string_view{buf, len};
     }
 
-    const ::line_reader_batch* c_impl() const noexcept
+    const ::reader_batch* c_impl() const noexcept
     {
         return _impl;
     }
@@ -2413,12 +2420,12 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "batch handle is invalid (no batch loaded)"};
     }
 
-    const ::line_reader_batch* _impl;
+    const ::reader_batch* _impl;
 };
 
 /**
@@ -2449,7 +2456,7 @@ public:
     {
         if (this != &other)
         {
-            ::line_reader_cursor_free(_impl);
+            ::reader_cursor_free(_impl);
             _impl = other._impl;
             _failover_callback = std::move(other._failover_callback);
             _failover_progress_callback =
@@ -2459,7 +2466,7 @@ public:
         return *this;
     }
 
-    ~cursor() noexcept { ::line_reader_cursor_free(_impl); }
+    ~cursor() noexcept { ::reader_cursor_free(_impl); }
 
     /**
      * Advance to the next batch.
@@ -2470,18 +2477,18 @@ public:
      *         `batch::symbol_dict`). Invalidated by the next `next_batch`,
      *         `cancel`, `add_credit`, cursor destruction, or mid-query
      *         failover; do not cache across batches.
-     * @throws line_reader_error on transport / protocol failure.
+     * @throws reader_error on transport / protocol failure.
      */
     std::optional<egress::batch> next_batch()
     {
         ensure_impl();
-        ::line_reader_error* c_err{nullptr};
-        const ::line_reader_batch* p =
-            ::line_reader_cursor_next_batch(_impl, &c_err);
+        ::reader_error* c_err{nullptr};
+        const ::reader_batch* p =
+            ::reader_cursor_next_batch(_impl, &c_err);
         if (!p)
         {
             if (c_err)
-                throw line_reader_error::from_c(c_err);
+                throw reader_error::from_c(c_err);
             return std::nullopt;
         }
         return egress::batch{p};
@@ -2560,7 +2567,7 @@ public:
      *         (no further batches).
      * @return An owned `arrow_batch` on success. See the struct's
      *         documentation for release responsibilities.
-     * @throws line_reader_error on transport / protocol failure or any
+     * @throws reader_error on transport / protocol failure or any
      *         Arrow-specific error (`schema_drift`, `no_schema`,
      *         `arrow_export`).
      *
@@ -2571,30 +2578,30 @@ public:
     std::optional<arrow_batch> next_arrow_batch()
     {
         ensure_impl();
-        ::line_reader_error* c_err{nullptr};
+        ::reader_error* c_err{nullptr};
         arrow_batch out{};
-        const auto rc = ::line_reader_cursor_next_arrow_batch(
+        const auto rc = ::reader_cursor_next_arrow_batch(
             _impl, &out.array, &out.schema, &c_err);
         switch (rc)
         {
-            case ::line_reader_arrow_batch_ok:
+            case ::reader_arrow_batch_ok:
                 return out;
-            case ::line_reader_arrow_batch_end:
+            case ::reader_arrow_batch_end:
                 return std::nullopt;
-            case ::line_reader_arrow_batch_error:
+            case ::reader_arrow_batch_error:
             default:
-                throw line_reader_error::from_c(c_err);
+                throw reader_error::from_c(c_err);
         }
     }
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
     // ---- Introspection -----------------------------------------------------
 
-    /** @throws line_reader_error if this cursor has been moved from. */
+    /** @throws reader_error if this cursor has been moved from. */
     int64_t request_id() const
     {
         ensure_impl();
-        return ::line_reader_cursor_request_id(_impl);
+        return ::reader_cursor_request_id(_impl);
     }
     /**
      * Single-thread only: bound by the cursor's one-thread-at-a-time
@@ -2602,83 +2609,83 @@ public:
      * `reader::credit_granted_total()` instead — same counter, served
      * by an atomic on the reader handle.
      *
-     * @throws line_reader_error if this cursor has been moved from.
+     * @throws reader_error if this cursor has been moved from.
      */
     uint64_t credit_granted_total() const
     {
         ensure_impl();
-        return ::line_reader_cursor_credit_granted_total(_impl);
+        return ::reader_cursor_credit_granted_total(_impl);
     }
-    /** @throws line_reader_error if this cursor has been moved from. */
+    /** @throws reader_error if this cursor has been moved from. */
     uint32_t failover_resets() const
     {
         ensure_impl();
-        return ::line_reader_cursor_failover_resets(_impl);
+        return ::reader_cursor_failover_resets(_impl);
     }
-    /** @throws line_reader_error if this cursor has been moved from. */
+    /** @throws reader_error if this cursor has been moved from. */
     std::string_view current_host() const
     {
         ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
-        ::line_reader_cursor_current_addr_host(_impl, &buf, &len);
+        ::reader_cursor_current_addr_host(_impl, &buf, &len);
         return {buf, len};
     }
-    /** @throws line_reader_error if this cursor has been moved from. */
+    /** @throws reader_error if this cursor has been moved from. */
     uint16_t current_port() const
     {
         ensure_impl();
-        return ::line_reader_cursor_current_addr_port(_impl);
+        return ::reader_cursor_current_addr_port(_impl);
     }
     /** Negotiated QWP version of the cursor's underlying connection.
-     *  @throws line_reader_error if the connection is poisoned after a
+     *  @throws reader_error if the connection is poisoned after a
      *          failed failover, or this cursor has been moved from. */
     uint8_t server_version() const
     {
         ensure_impl();
         uint8_t v = 0;
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_server_version, _impl, &v);
+        reader_error::wrapped_call(
+            ::reader_cursor_server_version, _impl, &v);
         return v;
     }
     /** Last-seen `SERVER_INFO` of the cursor's connected endpoint. The
      *  server always sends one, so the view is empty only while a
      *  reconnect is in flight; it is invalidated by any cursor operation
      *  that may reconnect.
-     *  @throws line_reader_error if this cursor has been moved from. */
+     *  @throws reader_error if this cursor has been moved from. */
     server_info_view server_info() const
     {
         ensure_impl();
         return server_info_view{
-            ::line_reader_cursor_current_server_info(_impl)};
+            ::reader_cursor_current_server_info(_impl)};
     }
 
-    /** @throws line_reader_error if this cursor has been moved from. */
+    /** @throws reader_error if this cursor has been moved from. */
     egress::terminal_kind terminal_kind() const
     {
         ensure_impl();
         return static_cast<egress::terminal_kind>(
-            ::line_reader_cursor_terminal_kind(_impl));
+            ::reader_cursor_terminal_kind(_impl));
     }
 
     /** If the terminal is `RESULT_END`, return its info; otherwise nullopt.
-     *  @throws line_reader_error if this cursor has been moved from. */
+     *  @throws reader_error if this cursor has been moved from. */
     nullable<terminal_end_info> terminal_end() const
     {
         ensure_impl();
         terminal_end_info info{};
-        if (!::line_reader_cursor_terminal_end(
+        if (!::reader_cursor_terminal_end(
                 _impl, &info.final_seq, &info.total_rows))
             return std::nullopt;
         return info;
     }
     /** If the terminal is `EXEC_DONE`, return its info; otherwise nullopt.
-     *  @throws line_reader_error if this cursor has been moved from. */
+     *  @throws reader_error if this cursor has been moved from. */
     nullable<terminal_exec_done_info> terminal_exec_done() const
     {
         ensure_impl();
         terminal_exec_done_info info{};
-        if (!::line_reader_cursor_terminal_exec_done(
+        if (!::reader_cursor_terminal_exec_done(
                 _impl, &info.op_type, &info.rows_affected))
             return std::nullopt;
         return info;
@@ -2687,30 +2694,30 @@ public:
     // ---- Lifecycle ---------------------------------------------------------
 
     /** Send a CANCEL frame and drain the stream until terminal.
-     *  @throws line_reader_error on transport failure or if this cursor
+     *  @throws reader_error on transport failure or if this cursor
      *          has been moved from. */
     void cancel()
     {
         ensure_impl();
-        line_reader_error::wrapped_call(::line_reader_cursor_cancel, _impl);
+        reader_error::wrapped_call(::reader_cursor_cancel, _impl);
     }
 
     /** Grant additional CREDIT to the server. Invalidates the current
      *  `batch` and everything borrowed from it, and may transparently
      *  trigger mid-query failover on a transport failure.
-     *  @throws line_reader_error on transport failure or if this cursor
+     *  @throws reader_error on transport failure or if this cursor
      *          has been moved from. */
     void add_credit(uint64_t additional_bytes)
     {
         ensure_impl();
-        line_reader_error::wrapped_call(
-            ::line_reader_cursor_add_credit, _impl, additional_bytes);
+        reader_error::wrapped_call(
+            ::reader_cursor_add_credit, _impl, additional_bytes);
     }
 
 private:
-    explicit cursor(::line_reader_cursor* impl) noexcept : _impl{impl} {}
+    explicit cursor(::reader_cursor* impl) noexcept : _impl{impl} {}
 
-    /// Throw `line_reader_error{invalid_api_call}` if `_impl` is null.
+    /// Throw `reader_error{invalid_api_call}` if `_impl` is null.
     /// A null `_impl` means the cursor has been moved from or already
     /// closed — calling any method that derefs it would pass `nullptr`
     /// into the C layer where `&mut *cursor` is instant UB. Throwing
@@ -2718,12 +2725,12 @@ private:
     void ensure_impl() const
     {
         if (!_impl)
-            throw line_reader_error{
+            throw reader_error{
                 error_code::invalid_api_call,
                 "cursor has been closed or moved from."};
     }
 
-    ::line_reader_cursor* _impl;
+    ::reader_cursor* _impl;
     /// Heap-stored failover callback transferred from `query::execute()`.
     /// The C trampoline holds a raw pointer to this object via `user_data`,
     /// so it MUST live as long as the cursor.
@@ -2738,15 +2745,15 @@ private:
 inline query reader::prepare(::questdb::ingress::utf8_view sql)
 {
     ensure_impl();
-    return query{line_reader_error::wrapped_call(
-        ::line_reader_prepare, _impl, to_c_utf8(sql))};
+    return query{reader_error::wrapped_call(
+        ::reader_prepare, _impl, to_c_utf8(sql))};
 }
 
 inline cursor reader::execute(::questdb::ingress::utf8_view sql)
 {
     ensure_impl();
-    return cursor{line_reader_error::wrapped_call(
-        ::line_reader_execute, _impl, to_c_utf8(sql))};
+    return cursor{reader_error::wrapped_call(
+        ::reader_execute, _impl, to_c_utf8(sql))};
 }
 
 inline cursor query::execute()
@@ -2754,12 +2761,12 @@ inline cursor query::execute()
     ensure_impl();
     auto cb = std::move(_callback); // transfer to cursor (or drop on error)
     auto pcb = std::move(_progress_callback);
-    ::line_reader_error* c_err = nullptr;
+    ::reader_error* c_err = nullptr;
     // The C call consumes `_impl` regardless of outcome and sets it to
     // NULL on return — so a subsequent `~query()` calling `_query_free`
     // is a NULL no-op without us having to clear `_impl` explicitly here.
-    auto* c = ::line_reader_query_execute(&_impl, &c_err);
-    if (!c) throw line_reader_error::from_c(c_err);
+    auto* c = ::reader_query_execute(&_impl, &c_err);
+    if (!c) throw reader_error::from_c(c_err);
     cursor result{c};
     result._failover_callback = std::move(cb);
     result._failover_progress_callback = std::move(pcb);

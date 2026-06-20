@@ -1,4 +1,4 @@
-#include <questdb/egress/line_reader.hpp>
+#include <questdb/egress/reader.hpp>
 #include <iostream>
 
 using namespace questdb::ingress::literals;
@@ -40,7 +40,7 @@ int main()
         }
         return 0;
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         std::cerr << "Error (code " << static_cast<int>(e.code())
                   << "): " << e.what() << "\n";

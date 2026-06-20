@@ -41,7 +41,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include <questdb/egress/line_reader.hpp>
+#include <questdb/egress/reader.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
 #include <atomic>
@@ -227,7 +227,7 @@ TEST_CASE("smoke: select 1::long as v")
     auto& batch = *batch_opt;
     CHECK(batch.row_count() == 1);
     CHECK(batch.column_count() == 1);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_long);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
     const auto v = batch.column(0).get<int64_t>(0);
     REQUIRE(v.has_value());
     CHECK(*v == 1);
@@ -250,7 +250,7 @@ TEST_CASE("multi-row literal: long_sequence(5)")
         auto& batch = *bo;
         const size_t rows = batch.row_count();
         REQUIRE(batch.column_count() == 1);
-        REQUIRE(batch.column_kind(0) == line_reader_column_kind_long);
+        REQUIRE(batch.column_kind(0) == reader_column_kind_long);
         for (size_t r = 0; r < rows; ++r)
         {
             const auto v = batch.column(0).get<int64_t>(r);
@@ -276,8 +276,8 @@ TEST_CASE("multi-column type dispatch: long + double")
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 3);
     REQUIRE(batch.column_count() == 2);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_long);
-    REQUIRE(batch.column_kind(1) == line_reader_column_kind_double);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
+    REQUIRE(batch.column_kind(1) == reader_column_kind_double);
 
     for (size_t r = 0; r < 3; ++r)
     {
@@ -315,8 +315,8 @@ TEST_CASE("bind: i32 + varchar")
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 3);
     REQUIRE(batch.column_count() == 2);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_long);
-    REQUIRE(batch.column_kind(1) == line_reader_column_kind_varchar);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
+    REQUIRE(batch.column_kind(1) == reader_column_kind_varchar);
 
     for (size_t r = 0; r < 3; ++r)
     {
@@ -343,7 +343,7 @@ TEST_CASE("bind: f64 round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 1);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_double);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_double);
     const auto v = batch.column(0).get<double>(0);
     REQUIRE(v.has_value());
     CHECK(*v == doctest::Approx(3.14159));
@@ -372,7 +372,7 @@ TEST_CASE("column_validity: bitmap matches null pattern, empty when no nulls")
     auto& batch = *batch_opt;
         REQUIRE(batch.row_count() == 5);
         REQUIRE(batch.column_count() == 1);
-        REQUIRE(batch.column_kind(0) == line_reader_column_kind_long);
+        REQUIRE(batch.column_kind(0) == reader_column_kind_long);
 
         const auto col0 = batch.column(0);
         const uint8_t* vbits = col0.validity();
@@ -445,7 +445,7 @@ TEST_CASE("bind: decimal128 sign-extension round-trip")
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 1);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_decimal128);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_decimal128);
     const auto d = batch.column(0).get_decimal128(0);
     REQUIRE(d.has_value());
     CHECK(d->low == static_cast<uint64_t>(-1LL));
@@ -472,10 +472,10 @@ TEST_CASE("single-cursor invariant: second query rejected")
         // Discard the result; we only care that this throws.
         (void)reader.execute("select x from long_sequence(1)"_utf8);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_invalid_api_call);
+        CHECK(e.code() == reader_error_invalid_api_call);
     }
     CHECK(threw);
     // cur1 closes at scope exit; the next test verifies a follow-up cursor
@@ -566,7 +566,7 @@ TEST_CASE("terminal_kind reaches end after stream completes")
     // SELECT streams terminate with `end` carrying total_rows; `exec_done`
     // is the terminator for non-result statements (DDL/DML), so a SELECT
     // here must always land on `end`.
-    REQUIRE(cur.terminal_kind() == line_reader_terminal_kind_end);
+    REQUIRE(cur.terminal_kind() == reader_terminal_kind_end);
     const auto info = cur.terminal_end();
     REQUIRE(info.has_value());
     CHECK(info->total_rows == 2);
@@ -595,7 +595,7 @@ TEST_CASE("invalid SQL surfaces a server error")
         auto cur = reader.execute("syntactically invalid !!!"_utf8);
         cur.next_batch();
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
         code = e.code();
@@ -611,8 +611,8 @@ TEST_CASE("invalid SQL surfaces a server error")
     // (e.g.) `socket_error`, `cancelled`, or any client-side code
     // would fail this check loudly instead of being masked by an
     // any-message-is-fine assertion.
-    CHECK((code == line_reader_error_server_parse_error
-        || code == line_reader_error_server_internal_error));
+    CHECK((code == reader_error_server_parse_error
+        || code == reader_error_server_internal_error));
 }
 
 TEST_CASE("get_i64 type-mismatch on string column is reported, not a crash")
@@ -630,10 +630,10 @@ TEST_CASE("get_i64 type-mismatch on string column is reported, not a crash")
     {
         (void)batch.column(0).get<int64_t>(0);
     }
-    catch (const questdb::egress::line_reader_error& e)
+    catch (const questdb::egress::reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_invalid_api_call);
+        CHECK(e.code() == reader_error_invalid_api_call);
     }
     CHECK(threw);
 }
@@ -693,12 +693,12 @@ TEST_CASE("ingress sender → egress reader round-trip for primitives")
                 if (batch.row_count() == 1 && batch.column_count() == 1)
                 {
                     const auto k = batch.column_kind(0);
-                    if (k == line_reader_column_kind_long)
+                    if (k == reader_column_kind_long)
                     {
                         auto v = batch.column(0).get<int64_t>(0);
                         if (v) n = *v;
                     }
-                    else if (k == line_reader_column_kind_int)
+                    else if (k == reader_column_kind_int)
                     {
                         auto v = batch.column(0).get<int32_t>(0);
                         if (v) n = *v;
@@ -715,7 +715,7 @@ TEST_CASE("ingress sender → egress reader round-trip for primitives")
                 break;
             }
         }
-        catch (const questdb::egress::line_reader_error&)
+        catch (const questdb::egress::reader_error&)
         {
             // Table may not be visible yet; retry.
         }
@@ -755,7 +755,7 @@ TEST_CASE("ingress sender → egress reader round-trip for primitives")
 
 // ---------------------------------------------------------------------------
 // Batch / column bulk descriptor — live coverage of the new columnar API.
-// Mock-level coverage of every kind lives in `test_line_reader_mock.cpp`;
+// Mock-level coverage of every kind lives in `test_reader_mock.cpp`;
 // these three TEST_CASEs validate the kinds whose mock helper code is itself
 // new (SYMBOL dict, DOUBLE_ARRAY four-buffer layout) plus a baseline scalar
 // cross-check, so we close the loop against a real QuestDB.
@@ -785,13 +785,13 @@ bool wait_for_rows(
                 if (batch.row_count() == 1 && batch.column_count() == 1)
                 {
                     const auto k = batch.column_kind(0);
-                    if (k == line_reader_column_kind_long)
+                    if (k == reader_column_kind_long)
                     {
                         auto v = batch.column(0).get<int64_t>(0);
                         if (v)
                             n = *v;
                     }
-                    else if (k == line_reader_column_kind_int)
+                    else if (k == reader_column_kind_int)
                     {
                         auto v = batch.column(0).get<int32_t>(0);
                         if (v)
@@ -809,7 +809,7 @@ bool wait_for_rows(
             if (n >= expected)
                 return true;
         }
-        catch (const questdb::egress::line_reader_error&)
+        catch (const questdb::egress::reader_error&)
         {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -834,9 +834,9 @@ TEST_CASE(
     REQUIRE(batch_opt);
     auto& batch = *batch_opt;
     REQUIRE(batch.row_count() == 5);
-    REQUIRE(batch.column_kind(0) == line_reader_column_kind_long);
-    REQUIRE(batch.column_kind(1) == line_reader_column_kind_double);
-    REQUIRE(batch.column_kind(2) == line_reader_column_kind_varchar);
+    REQUIRE(batch.column_kind(0) == reader_column_kind_long);
+    REQUIRE(batch.column_kind(1) == reader_column_kind_double);
+    REQUIRE(batch.column_kind(2) == reader_column_kind_varchar);
 
     auto col_n = batch.column(0);
     auto col_d = batch.column(1);
@@ -908,7 +908,7 @@ TEST_CASE("live: batch — SYMBOL column codes + dictionary round-trip")
     {
         auto& batch = *batch_opt;
         const size_t rows = batch.row_count();
-        REQUIRE(batch.column_kind(0) == line_reader_column_kind_symbol);
+        REQUIRE(batch.column_kind(0) == reader_column_kind_symbol);
 
         auto col = batch.column(0);
         REQUIRE(col.kind() == eg::column_kind::symbol);
@@ -992,13 +992,13 @@ TEST_CASE("live: batch::column — DOUBLE_ARRAY round-trip")
     {
         auto& batch = *batch_opt;
         const size_t rows = batch.row_count();
-        REQUIRE(batch.column_kind(0) == line_reader_column_kind_double_array);
+        REQUIRE(batch.column_kind(0) == reader_column_kind_double_array);
 
         auto ac = batch.column(0);
         REQUIRE(ac.is_array());
         REQUIRE(ac.kind() == eg::column_kind::double_array);
         // Scalar accessors on an array column raise.
-        CHECK_THROWS_AS(ac.values<double>(), eg::line_reader_error);
+        CHECK_THROWS_AS(ac.values<double>(), eg::reader_error);
 
         for (size_t r = 0; r < rows; ++r)
         {

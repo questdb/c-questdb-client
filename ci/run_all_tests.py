@@ -33,10 +33,10 @@ def main():
     # unconditionally in CI.
     cpp_tests = [
         'test_line_sender',
-        'test_line_reader_offline',
-        'test_line_reader_mock',
-        'line_reader_c_smoke',
-        'test_line_reader',  # live-broker; skips per-test when no broker reachable
+        'test_reader_offline',
+        'test_reader_mock',
+        'reader_c_smoke',
+        'test_reader',  # live-broker; skips per-test when no broker reachable
         'test_arrow_c',
         'test_arrow_egress',
         'test_arrow_ingress',

@@ -4525,7 +4525,7 @@ mod tests {
         /// whose product is zero — most naturally a single dim of zero.
         /// The C++ contract test
         /// `mock: non-null empty-data array row exposes data_offsets symmetry`
-        /// in `cpp_test/test_line_reader_mock.cpp` pins this case against
+        /// in `cpp_test/test_reader_mock.cpp` pins this case against
         /// the Rust reader: shape `[2, 0, 3]` decodes to a non-null row
         /// with a zero-length (empty) per-row data slice and
         /// `element_count == 0`.

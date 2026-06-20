@@ -654,7 +654,7 @@ impl QuestDb {
     }
 
     /// Construct an opaque pool reference that downstream code (the
-    /// FFI's `line_reader` wrapper, in particular) can hold to return
+    /// FFI's `reader` wrapper, in particular) can hold to return
     /// readers without having to expose [`DbInner`].
     #[cfg(feature = "_egress")]
     #[doc(hidden)]
@@ -1129,7 +1129,7 @@ impl OwnedReader {
     /// After this call, `Drop` no longer decrements the pool's
     /// `in_use` counter — the caller has assumed responsibility for
     /// either dropping the returned `Reader` into oblivion (e.g.
-    /// `line_reader_close`'s leak-on-active branch) or routing it
+    /// `reader_close`'s leak-on-active branch) or routing it
     /// back to the pool via [`ReaderPoolHandle::return_reader`].
     /// Forgetting both permanently burns one pool slot.
     pub fn take(mut self) -> Option<Reader> {
@@ -1147,7 +1147,7 @@ impl Drop for OwnedReader {
 }
 
 /// Opaque handle to a [`QuestDb`] pool, used by the FFI's
-/// `line_reader` wrapper to return readers without exposing
+/// `reader` wrapper to return readers without exposing
 /// `DbInner`. Cheap to clone (just bumps the inner `Arc`).
 #[cfg(feature = "_egress")]
 #[doc(hidden)]
@@ -1167,7 +1167,7 @@ impl ReaderPoolHandle {
 
     /// Release the `in_use` slot that was reserved when this reader
     /// was borrowed, without returning the `Reader` itself. Used by
-    /// the FFI leak-on-active path: when a `line_reader_close` arrives
+    /// the FFI leak-on-active path: when a `reader_close` arrives
     /// with a cursor still live, the underlying `Reader` cannot be
     /// extracted (UnsafeCell aliasing with the in-flight `&mut Reader`),
     /// so it leaks — but the pool's borrow accounting must still drop

@@ -1,4 +1,4 @@
-#include <questdb/egress/line_reader.hpp>
+#include <questdb/egress/reader.hpp>
 
 #include <arrow/array.h>
 #include <arrow/c/bridge.h>
@@ -50,7 +50,7 @@ bool example()
         }
         return true;
     }
-    catch (const egress::line_reader_error& e)
+    catch (const egress::reader_error& e)
     {
         std::fprintf(stderr, "Error: %s\n", e.what());
         return false;

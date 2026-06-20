@@ -228,7 +228,7 @@ void questdb_db_drop_conn(
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
  * `questdb_db_return_reader`, `questdb_db_dbg_reader_*_count`) live in
- * `questdb/egress/line_reader.h` alongside the `line_reader` type
+ * `questdb/egress/reader.h` alongside the `reader` type
  * they wrap. */
 
 /**

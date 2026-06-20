@@ -29,7 +29,7 @@
 // view (`fixed_view<T>` / `decimal_view` / `varlen_view` / ...), eliminating
 // the per-kind `switch` users would otherwise need.
 
-#include <questdb/egress/line_reader.hpp>
+#include <questdb/egress/reader.hpp>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -275,7 +275,7 @@ int main()
         }
         return 0;
     }
-    catch (const eg::line_reader_error& e)
+    catch (const eg::reader_error& e)
     {
         std::cerr << "Error (code " << static_cast<int>(e.code())
                   << "): " << e.what() << '\n';

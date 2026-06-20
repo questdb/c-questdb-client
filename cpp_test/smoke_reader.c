@@ -1,14 +1,14 @@
 /*
- * Smoke test for the line_reader FFI.
+ * Smoke test for the reader FFI.
  *
  * Two phases:
  *
  *  1. Closed-port phase (always runs). Targets 127.0.0.1:1 (the TCPMUX
  *     well-known port that is virtually never bound) and asserts that
- *     `line_reader_from_conf` reaches the connect path, fails cleanly,
+ *     `reader_from_conf` reaches the connect path, fails cleanly,
  *     and surfaces a non-NULL error that the FFI can then free. This
  *     exercises symbol resolution, FFI argument marshalling, error
- *     allocation, and `line_reader_close`'s NULL-idempotent behaviour
+ *     allocation, and `reader_close`'s NULL-idempotent behaviour
  *     — all without fighting a developer machine that happens to have
  *     a QuestDB broker running on the default port (the case that
  *     broke the previous `WILL_FAIL`-based smoke).
@@ -16,7 +16,7 @@
  *  2. Lifecycle phase (gated on `QDB_LIVE_BROKER_ADDR`). When the env
  *     var is set, drives `_from_conf` → `_query_new` → `_query_execute`
  *     → `_cursor_next_batch` → `_batch_column_data` →
- *     `line_reader_column_data_get_i64` → `_cursor_free` → `_close`
+ *     `reader_column_data_get_i64` → `_cursor_free` → `_close`
  *     against a real broker. The whole
  *     point of the C ABI is Cython-consumability; the C++ doctest
  *     suite covers these symbols but doesn't prove they link or
@@ -30,7 +30,7 @@
  * SIGABRT are correctly reported as failures rather than passes.
  */
 
-#include <questdb/egress/line_reader.h>
+#include <questdb/egress/reader.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,16 +41,16 @@ static int closed_port_phase(void)
     line_sender_utf8 conf =
         QDB_UTF8_LITERAL("ws::addr=127.0.0.1:1;");
 
-    line_reader_error* err = NULL;
-    line_reader* reader = line_reader_from_conf(conf, &err);
+    reader_error* err = NULL;
+    reader* reader = reader_from_conf(conf, &err);
 
     if (reader != NULL)
     {
         fprintf(
             stderr,
-            "smoke: expected line_reader_from_conf to fail against a "
+            "smoke: expected reader_from_conf to fail against a "
             "guaranteed-closed port, but it succeeded\n");
-        line_reader_close(reader);
+        reader_close(reader);
         return 1;
     }
 
@@ -58,26 +58,92 @@ static int closed_port_phase(void)
     {
         fprintf(
             stderr,
-            "smoke: line_reader_from_conf returned NULL but did not set "
+            "smoke: reader_from_conf returned NULL but did not set "
             "an error — FFI error-propagation contract violated\n");
         return 1;
     }
 
     size_t msg_len = 0;
-    const char* msg = line_reader_error_msg(err, &msg_len);
+    const char* msg = reader_error_msg(err, &msg_len);
     if (msg == NULL || msg_len == 0)
     {
         fprintf(
             stderr,
             "smoke: error has empty message — error-message accessor "
             "broken\n");
-        line_reader_error_free(err);
+        reader_error_free(err);
         return 1;
     }
 
     /* Drop the error and confirm the NULL-idempotent close path. */
-    line_reader_error_free(err);
-    line_reader_close(NULL);
+    reader_error_free(err);
+    reader_close(NULL);
+    return 0;
+}
+
+/*
+ * Reader-only pool phase (always runs). Proves a read-only C consumer
+ * can open, fail, and tear down the connection pool using ONLY
+ * <questdb/egress/reader.h> and ONLY the `reader_error`
+ * type — i.e. without including <questdb/ingress/column_sender.h> or
+ * declaring a `line_sender_error`. This is the whole point of
+ * `questdb_db_connect_reader`: the pool's connect call no longer drags
+ * the ingress error type onto the read path.
+ *
+ * Targets the same guaranteed-closed 127.0.0.1:1 port via a `qwpws::`
+ * connect string. `questdb_db_connect_reader` eagerly opens the pool's
+ * writer slot during the call, so the connect fails cleanly and the
+ * failure is reported as a `reader_error*` (not a
+ * `line_sender_error*`). Also exercises the NULL-idempotent
+ * `questdb_db_close` / `questdb_db_return_reader` paths.
+ */
+static int pool_reader_only_phase(void)
+{
+    static const char conf[] = "qwpws::addr=127.0.0.1:1;";
+
+    reader_error* err = NULL;
+    struct questdb_db* db =
+        questdb_db_connect_reader(conf, strlen(conf), &err);
+
+    if (db != NULL)
+    {
+        fprintf(
+            stderr,
+            "smoke pool: expected questdb_db_connect_reader to fail "
+            "against a guaranteed-closed port, but it succeeded\n");
+        questdb_db_close(db);
+        if (err != NULL)
+            reader_error_free(err);
+        return 1;
+    }
+
+    if (err == NULL)
+    {
+        fprintf(
+            stderr,
+            "smoke pool: questdb_db_connect_reader returned NULL but did "
+            "not set an error — FFI error-propagation contract violated\n");
+        return 1;
+    }
+
+    size_t msg_len = 0;
+    const char* msg = reader_error_msg(err, &msg_len);
+    if (msg == NULL || msg_len == 0)
+    {
+        fprintf(
+            stderr,
+            "smoke pool: connect error has empty message — egress error "
+            "accessor broken on the pool connect path\n");
+        reader_error_free(err);
+        return 1;
+    }
+
+    /* Single egress error type, freed through the egress accessor. */
+    reader_error_free(err);
+
+    /* NULL-idempotent teardown paths reachable from this header. */
+    questdb_db_return_reader(NULL, NULL);
+    questdb_db_close(NULL);
     return 0;
 }
 
@@ -89,10 +155,10 @@ static int closed_port_phase(void)
  */
 static int live_lifecycle_phase(const char* addr)
 {
-    line_reader_error* err = NULL;
-    line_reader* reader = NULL;
-    line_reader_query* query = NULL;
-    line_reader_cursor* cursor = NULL;
+    reader_error* err = NULL;
+    reader* reader = NULL;
+    reader_query* query = NULL;
+    reader_cursor* cursor = NULL;
     int rc = 1;
 
     /*
@@ -114,22 +180,22 @@ static int live_lifecycle_phase(const char* addr)
     }
     line_sender_utf8 conf = {(size_t)n, conf_buf};
 
-    reader = line_reader_from_conf(conf, &err);
+    reader = reader_from_conf(conf, &err);
     if (!reader)
         goto fail;
 
     line_sender_utf8 sql = QDB_UTF8_LITERAL("select 1");
-    query = line_reader_prepare(reader, sql, &err);
+    query = reader_prepare(reader, sql, &err);
     if (!query)
         goto fail;
 
-    cursor = line_reader_query_execute(&query, &err);
+    cursor = reader_query_execute(&query, &err);
     /* `_query_execute` consumed query — must now be NULL. */
     if (query != NULL)
     {
         fprintf(
             stderr,
-            "smoke live: line_reader_query_execute did not nullify its "
+            "smoke live: reader_query_execute did not nullify its "
             "query in-out parameter — ownership contract violated\n");
         goto fail;
     }
@@ -141,14 +207,14 @@ static int live_lifecycle_phase(const char* addr)
      * after consuming the single one-row batch. Verify that we see
      * exactly that row with the expected value, exercising
      * `_batch_row_count`, `_batch_column_count`, `_batch_column_data`,
-     * and `line_reader_column_data_get_i64` — the four most-used
+     * and `reader_column_data_get_i64` — the four most-used
      * per-row accessors on the bulk path.
      */
     int batch_count = 0;
     long long captured_value = 0;
     int captured_is_null = -1;
-    const line_reader_batch* batch;
-    while ((batch = line_reader_cursor_next_batch(cursor, &err)) != NULL)
+    const reader_batch* batch;
+    while ((batch = reader_cursor_next_batch(cursor, &err)) != NULL)
     {
         ++batch_count;
         if (batch_count > 16)
@@ -160,8 +226,8 @@ static int live_lifecycle_phase(const char* addr)
             goto fail;
         }
 
-        const size_t rows = line_reader_batch_row_count(batch);
-        const size_t cols = line_reader_batch_column_count(batch);
+        const size_t rows = reader_batch_row_count(batch);
+        const size_t cols = reader_batch_column_count(batch);
         if (cols == 0)
         {
             fprintf(
@@ -170,16 +236,16 @@ static int live_lifecycle_phase(const char* addr)
             goto fail;
         }
 
-        line_reader_column_data d;
-        if (!line_reader_batch_column_data(batch, 0, &d, &err))
+        reader_column_data d;
+        if (!reader_batch_column_data(batch, 0, &d, &err))
             goto fail;
         /*
          * QuestDB returns `select 1` as a LONG (i64). Accept INT too
          * in case a future server emits it as INT — we just need the
          * column-kind discriminant to give us a usable type.
          */
-        if (d.kind != line_reader_column_kind_long &&
-            d.kind != line_reader_column_kind_int)
+        if (d.kind != reader_column_kind_long &&
+            d.kind != reader_column_kind_int)
         {
             fprintf(
                 stderr,
@@ -193,10 +259,10 @@ static int live_lifecycle_phase(const char* addr)
         {
             bool is_null = false;
             int64_t v = 0;
-            if (d.kind == line_reader_column_kind_long)
-                v = line_reader_column_data_get_i64(&d, r, &is_null);
+            if (d.kind == reader_column_kind_long)
+                v = reader_column_data_get_i64(&d, r, &is_null);
             else
-                v = (int64_t)line_reader_column_data_get_i32(&d, r, &is_null);
+                v = (int64_t)reader_column_data_get_i32(&d, r, &is_null);
             captured_value = (long long)v;
             captured_is_null = is_null ? 1 : 0;
         }
@@ -230,7 +296,7 @@ fail:;
     if (err != NULL)
     {
         size_t err_len = 0;
-        const char* err_msg = line_reader_error_msg(err, &err_len);
+        const char* err_msg = reader_error_msg(err, &err_len);
         fprintf(
             stderr,
             "smoke live: %.*s\n",
@@ -254,16 +320,20 @@ cleanup:
      * `_query_execute` itself failed before consuming the query.
      */
     if (err != NULL)
-        line_reader_error_free(err);
-    line_reader_cursor_free(cursor);
-    line_reader_query_free(query);
-    line_reader_close(reader);
+        reader_error_free(err);
+    reader_cursor_free(cursor);
+    reader_query_free(query);
+    reader_close(reader);
     return rc;
 }
 
 int main(void)
 {
     int rc = closed_port_phase();
+    if (rc != 0)
+        return rc;
+
+    rc = pool_reader_only_phase();
     if (rc != 0)
         return rc;
 

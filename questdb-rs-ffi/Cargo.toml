@@ -28,14 +28,14 @@ features = [
 # No default features. Existing consumers who only want the line sender
 # get exactly that — the egress reader is opt-in. Enable
 # `sync-reader-ws` explicitly (in Cargo.toml or via `--features`) to
-# bring the `line_reader_*` symbols back in.
+# bring the `reader_*` symbols back in.
 default = []
 # Expose the config parsing C API.
 # This used by `py-questdb-client` to parse the config file.
 # It is exposed here to avoid having multiple copies of the `questdb-confstr`
 # crate in the final binary.
 confstr-ffi = ["dep:questdb-confstr-ffi"]
-# Expose the synchronous WebSocket egress reader API (`line_reader_*`).
+# Expose the synchronous WebSocket egress reader API (`reader_*`).
 # Forwarded to the upstream `questdb-rs` feature of the same name.
 # Opt-in (NOT a default feature) so existing builds of `questdb-rs-ffi`
 # don't silently grow ~70 new exported symbols + a WebSocket transport
@@ -44,7 +44,7 @@ confstr-ffi = ["dep:questdb-confstr-ffi"]
 sync-reader-ws = ["questdb-rs/sync-reader-ws", "questdb-rs/compression-zstd"]
 
 # Apache Arrow integration (egress + ingress over QWP/WS). Adds the
-# `line_reader_cursor_next_arrow_batch` C export (egress) and the
+# `reader_cursor_next_arrow_batch` C export (egress) and the
 # `column_sender_chunk_append_arrow_column` / `column_sender_flush_arrow_batch[_at_column]`
 # exports (ingress), plus the Arrow C Data Interface struct
 # declarations. See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
