@@ -294,7 +294,8 @@ static column_sender_chunk* make_chunk_t(void)
     return chunk;
 }
 
-static void check_invalid_api_call(line_sender_error* err, const char* tag)
+/* Non-owning assertion helper. The caller must free err after all checks. */
+static void assert_invalid_api_call(line_sender_error* err, const char* tag)
 {
     CHECK(err != NULL, tag);
     if (err)
@@ -303,7 +304,6 @@ static void check_invalid_api_call(line_sender_error* err, const char* tag)
             line_sender_error_get_code(err) ==
                 line_sender_error_invalid_api_call,
             "code == invalid_api_call");
-        line_sender_error_free(err);
     }
 }
 
@@ -340,7 +340,9 @@ TEST(test_chunk_append_numpy_column_null_chunk)
         NULL,
         &err);
     CHECK(!ok, "NULL chunk → false");
-    check_invalid_api_call(err, "NULL chunk → invalid_api_call");
+    assert_invalid_api_call(err, "NULL chunk → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
 }
 
 TEST(test_chunk_append_numpy_column_i64_smoke)
@@ -476,7 +478,9 @@ TEST(test_chunk_append_numpy_column_decimal_scale_too_high)
         &extras,
         &err);
     CHECK(!ok, "decimal scale 19 → false");
-    check_invalid_api_call(err, "decimal scale 19 → invalid_api_call");
+    assert_invalid_api_call(err, "decimal scale 19 → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -503,7 +507,9 @@ TEST(test_chunk_append_numpy_column_decimal_scale_negative)
         &extras,
         &err);
     CHECK(!ok, "decimal scale -1 → false");
-    check_invalid_api_call(err, "decimal scale -1 → invalid_api_call");
+    assert_invalid_api_call(err, "decimal scale -1 → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -527,7 +533,9 @@ TEST(test_chunk_append_numpy_column_geohash_requires_extras)
         NULL,
         &err);
     CHECK(!ok, "geohash w/o extras → false");
-    check_invalid_api_call(err, "geohash w/o extras → invalid_api_call");
+    assert_invalid_api_call(err, "geohash w/o extras → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -554,7 +562,9 @@ TEST(test_chunk_append_numpy_column_geohash_bits_zero)
         &extras,
         &err);
     CHECK(!ok, "geohash bits 0 → false");
-    check_invalid_api_call(err, "geohash bits 0 → invalid_api_call");
+    assert_invalid_api_call(err, "geohash bits 0 → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -581,7 +591,9 @@ TEST(test_chunk_append_numpy_column_geohash_bits_too_high)
         &extras,
         &err);
     CHECK(!ok, "geohash bits 9 → false");
-    check_invalid_api_call(err, "geohash bits 9 → invalid_api_call");
+    assert_invalid_api_call(err, "geohash bits 9 → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -605,7 +617,9 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_requires_extras)
         NULL,
         &err);
     CHECK(!ok, "ndarray w/o extras → false");
-    check_invalid_api_call(err, "ndarray w/o extras → invalid_api_call");
+    assert_invalid_api_call(err, "ndarray w/o extras → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -633,7 +647,9 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_zero)
         &extras,
         &err);
     CHECK(!ok, "ndarray ndim 0 → false");
-    check_invalid_api_call(err, "ndarray ndim 0 → invalid_api_call");
+    assert_invalid_api_call(err, "ndarray ndim 0 → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -664,7 +680,9 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_too_high)
         &extras,
         &err);
     CHECK(!ok, "ndarray ndim 33 → false");
-    check_invalid_api_call(err, "ndarray ndim 33 → invalid_api_call");
+    assert_invalid_api_call(err, "ndarray ndim 33 → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -692,7 +710,9 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_null_shape)
         &extras,
         &err);
     CHECK(!ok, "ndarray null shape → false");
-    check_invalid_api_call(err, "ndarray null shape → invalid_api_call");
+    assert_invalid_api_call(err, "ndarray null shape → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -721,7 +741,9 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_zero_dim)
         &extras,
         &err);
     CHECK(!ok, "ndarray zero-dim → false");
-    check_invalid_api_call(err, "ndarray zero-dim → invalid_api_call");
+    assert_invalid_api_call(err, "ndarray zero-dim → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
     column_sender_chunk_free(chunk);
 }
 
@@ -778,7 +800,7 @@ TEST(test_chunk_append_numpy_column_data_len_too_small)
         NULL,
         &err);
     CHECK(!ok, "undersized data_len_bytes → false");
-    check_invalid_api_call(err, "undersized buffer → invalid_api_call");
+    assert_invalid_api_call(err, "undersized buffer → invalid_api_call");
     if (err)
     {
         CHECK(
@@ -813,7 +835,7 @@ TEST(test_chunk_append_numpy_column_mistagged_dtype_rejected)
         NULL,
         &err);
     CHECK(!ok, "int8 buffer mis-tagged f64 → false");
-    check_invalid_api_call(err, "mis-tagged dtype → invalid_api_call");
+    assert_invalid_api_call(err, "mis-tagged dtype → invalid_api_call");
     if (err)
         line_sender_error_free(err);
     column_sender_chunk_free(chunk);
