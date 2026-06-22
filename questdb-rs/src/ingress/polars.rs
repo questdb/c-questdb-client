@@ -312,10 +312,11 @@ impl Iterator for DataFrameBatches<'_> {
     }
 }
 
-/// Number of batches flushed between `sync` checkpoints. The QWP in-flight
-/// cap is 127 deferred frames (128 − 1 reserved for the commit frame); 64
-/// stays under it, keeps the pipeline full, and bounds a failover re-drive to
-/// ≈64 × `max_rows` rows.
+/// Number of batches between commit checkpoints. The ≤63 publish-only
+/// (deferred) frames that accumulate between checkpoints stay under the QWP
+/// 127-deferred in-flight cap; the checkpoint itself is a non-deferred ACKing
+/// flush that drains in-flight to zero. 64 keeps the pipeline full and bounds a
+/// failover re-drive to ≈64 × `max_rows` rows.
 const CHECKPOINT_BATCHES: usize = 64;
 
 /// Optional knobs for [`BorrowedColumnSender::flush_polars_dataframe`].
@@ -386,7 +387,8 @@ impl<'a> PolarsIngestOptions<'a> {
 impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `options.max_rows` rows
     /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
-    /// `sync` to commit — re-driving transparently across a connection failure.
+    /// commit at checkpoint boundaries — re-driving transparently across a
+    /// connection failure.
     ///
     /// `table` accepts anything convertible into a [`TableName`], so a bare
     /// `&str` works directly. `options` ([`PolarsIngestOptions`]) carries an
@@ -401,12 +403,15 @@ impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
     ///
     /// [`TableName`]: crate::ingress::TableName
     ///
-    /// The batch loop `sync`s every [`CHECKPOINT_BATCHES`] batches; on a
-    /// transient ([`ErrorCode::FailoverRetry`]) `flush`/`sync` error it
-    /// re-borrows a live connection from the pool behind the same handle
-    /// (rotating to a live endpoint) and re-iterates `&DataFrame` from the last
-    /// committed checkpoint. The entry owns the `sync` (the replay boundary) and
-    /// returns only once the whole `df` is committed.
+    /// The batch loop commits a checkpoint boundary every
+    /// [`CHECKPOINT_BATCHES`] batches — an ACKing flush that publishes the
+    /// batch and waits for the server's OK ack — and a trailing wait covers
+    /// any tail past the last checkpoint. On a transient
+    /// ([`ErrorCode::FailoverRetry`]) error it re-borrows a live connection
+    /// from the pool behind the same handle (rotating to a live endpoint) and
+    /// re-iterates `&DataFrame` from the last committed checkpoint. The entry
+    /// owns the commit (the replay boundary) and returns only once the whole
+    /// `df` is committed.
     ///
     /// Reconnect matches the row API: the [`ReconnectPolicy`] parsed from the
     /// `reconnect_*` keys (default 300s budget), centered-jittered exponential
@@ -434,8 +439,8 @@ impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
         let table: crate::ingress::TableName<'t> = table.try_into()?;
         let started = std::time::Instant::now();
         let deadline = started.checked_add(self.reconnect_policy().max_duration());
-        // Batches confirmed by the last successful `sync`; a transient failure
-        // re-drives only the tail past this.
+        // Batches confirmed by the last successful checkpoint; a transient
+        // failure re-drives only the tail past this.
         let mut committed = 0usize;
 
         loop {
