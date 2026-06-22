@@ -253,10 +253,67 @@ class TestArrowRoundTripFuzz(afc.ArrowFuzzBase):
                         f"col={col_name} row={r}: in={ev!r} out={av!r}"
                     ))
 
+    def _run_sliced_iteration(self, it: int, null_mode: str) -> None:
+        """Build a batch padded with rows that must NOT be ingested, then
+        send only the inner window via `slice_window`. The sliced arrays
+        carry non-zero offsets across the FFI boundary; a regression that
+        ignored `array.offset()` would emit the leading pad rows (or wrong
+        varlen/bool bytes) and the row-by-row compare below would catch
+        it."""
+        full_pool = _round_trip_capable_kinds()
+        if null_mode in ("partial", "all_null"):
+            pool = [(n, s) for n, s in full_pool if s.supports_server_null]
+        else:
+            pool = full_pool
+        self._master_rng.shuffle(pool)
+        picked = pool[: 3 + (it % 4)]
+        kinds = [(f"c{i}_{n}", s) for i, (n, s) in enumerate(picked)]
+        table = self.fresh_table(f"arrow_rt_sliced_{it}")
+        afc.create_table_from_kinds(self._fixture, table, kinds)
+        n = _ROWS_PER_BATCH
+        pad = 2 + (it % 3)
+        total = pad + n + pad
+        ts_base = 1_700_000_000_000_000 + it * 10_000_000
+        rb_full, _vpc = _build_batch(
+            self._master_rng, total, kinds,
+            null_mode=null_mode, ts_base_us=ts_base,
+        )
+        # Expected = the inner window only; the encoder must reproduce it
+        # despite the surrounding pad rows present in the parent buffers.
+        rb_window = rb_full.slice(pad, n)
+        afc.ingest_via_arrow(
+            self._fixture, table, rb_full, slice_window=(pad, n),
+        )
+        afc.wait_for_rows(self._fixture, table, n)
+        rb_out = _read_back(self._fixture, table, kinds)
+        self.assertEqual(rb_out.num_rows, n,
+                         self.label(f"sliced iter={it} mode={null_mode}"))
+        for col_idx, (col_name, spec) in enumerate(kinds):
+            for r in range(n):
+                ev = _canonicalise_value(
+                    _scalar_to_python(rb_window.column(col_idx)[r], spec), spec)
+                av = _canonicalise_value(
+                    _scalar_to_python(rb_out.column(col_idx)[r], spec), spec)
+                if not spec.compare(av, ev):
+                    self.fail(self.label(
+                        f"sliced iter={it} mode={null_mode} kind={spec.name} "
+                        f"col={col_name} row={r}: in={ev!r} out={av!r}"
+                    ))
+
     def test_random_schemas_all_valid(self):
         for it in range(_FUZZ_ITERATIONS):
             with self.subTest(iter=it):
                 self._run_random_iteration(it, "valid")
+
+    def test_random_schemas_sliced_window(self):
+        for it in range(_FUZZ_ITERATIONS):
+            with self.subTest(iter=it):
+                self._run_sliced_iteration(it, "valid")
+
+    def test_random_schemas_sliced_window_partial_null(self):
+        for it in range(_FUZZ_ITERATIONS):
+            with self.subTest(iter=it):
+                self._run_sliced_iteration(it, "partial")
 
     def test_random_schemas_partial_null(self):
         for it in range(_FUZZ_ITERATIONS):

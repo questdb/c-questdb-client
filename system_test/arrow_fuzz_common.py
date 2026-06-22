@@ -258,11 +258,25 @@ def ingest_via_arrow(
     *,
     ts_col: Optional[bytes] = b"ts",
     sender_conf_extras: Optional[Dict[str, str]] = None,
+    slice_window: Optional[Tuple[int, int]] = None,
 ) -> None:
     """Ingest one RecordBatch through `column_sender_flush_arrow_batch_at_column`
     (when `ts_col` is set) or `column_sender_flush_arrow_batch_server_stamped`
-    (when `ts_col` is None — the server stamps each row on arrival)."""
+    (when `ts_col` is None — the server stamps each row on arrival).
+
+    When `slice_window=(offset, length)` is supplied the batch is sliced to
+    that window *before* the C Data Interface export. A sliced pyarrow
+    array carries a non-zero `offset` that survives the FFI boundary, so
+    the Rust encoder receives arrays with `offset() != 0` — exercising the
+    offset/slice-sensitive paths (bit-packed booleans, re-based varlen
+    offset tables, FixedSizeBinary `offset * elem` value-data slicing,
+    designated-timestamp slicing) end-to-end against the live server.
+    Nothing else in `system_test/` produced non-zero-offset arrays before,
+    so this is the only system-level coverage of that surface."""
     extras = sender_conf_extras or {}
+    if slice_window is not None:
+        window_offset, window_length = slice_window
+        record_batch = record_batch.slice(window_offset, window_length)
     with borrowed_column_sender(fixture, **extras) as conn:
         table_name = _c_table_name(table)
         arr, sch = pyarrow_export_record_batch(record_batch)

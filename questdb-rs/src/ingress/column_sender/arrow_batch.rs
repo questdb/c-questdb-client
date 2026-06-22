@@ -4166,6 +4166,165 @@ mod tests {
             .collect()
     }
 
+    // -----------------------------------------------------------------
+    // QWP body decoders (test-only)
+    //
+    // The `assert_ok_with_table_count` helper only validates the frame
+    // header + payload byte-length self-consistency; it never inspects a
+    // column body. The decoders below parse the body so tests can assert
+    // the *emitted values* equal the logical Arrow window. This is the
+    // load-bearing coverage for the unsafe column-major encoder, which
+    // applies `array.offset()` to value/offset buffers — a silent
+    // off-by-offset regression there would otherwise pass every
+    // existing sliced-array test.
+
+    fn decode_varint(bytes: &[u8], pos: &mut usize) -> u64 {
+        let mut shift = 0;
+        let mut value = 0u64;
+        loop {
+            let b = bytes[*pos];
+            *pos += 1;
+            value |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    fn decode_lp_bytes<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a [u8] {
+        let len = decode_varint(bytes, pos) as usize;
+        let start = *pos;
+        *pos += len;
+        &bytes[start..start + len]
+    }
+
+    /// Parse a single-table, single-column frame (as produced by
+    /// `encode`) down to the column body. Returns
+    /// `(row_count, wire_type_byte, body_slice)`. Asserts the frame
+    /// shape so the returned body slice is unambiguous.
+    fn decode_single_column(bytes: &[u8]) -> (usize, u8, &[u8]) {
+        assert_eq!(&bytes[..4], b"QWP1", "bad magic");
+        assert_eq!(
+            u16::from_le_bytes([bytes[6], bytes[7]]),
+            1,
+            "decode_single_column expects exactly one table"
+        );
+        let payload_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        assert_eq!(
+            payload_len + QWP_HEADER_LEN,
+            bytes.len(),
+            "payload_len header must match frame length"
+        );
+        let mut pos = QWP_HEADER_LEN;
+        let _delta_start = decode_varint(bytes, &mut pos);
+        let new_syms = decode_varint(bytes, &mut pos);
+        for _ in 0..new_syms {
+            let _ = decode_lp_bytes(bytes, &mut pos);
+        }
+        let _table = decode_lp_bytes(bytes, &mut pos);
+        let row_count = decode_varint(bytes, &mut pos) as usize;
+        let col_count = decode_varint(bytes, &mut pos) as usize;
+        assert_eq!(
+            col_count, 1,
+            "decode_single_column expects exactly one column"
+        );
+        let _name = decode_lp_bytes(bytes, &mut pos);
+        let type_byte = bytes[pos];
+        pos += 1;
+        (row_count, type_byte, &bytes[pos..])
+    }
+
+    /// Decode an INT (i32) column body. i32 is not a sparse-null kind, so
+    /// the body is `flag(0) + row_count * i32_le`; null rows carry the
+    /// `i32::MIN` sentinel rather than a bitmap.
+    fn decode_i32_body(body: &[u8], rows: usize) -> Vec<i32> {
+        assert_eq!(body[0], 0, "i32 must never set the bitmap flag");
+        let vals = &body[1..];
+        (0..rows)
+            .map(|i| i32::from_le_bytes(vals[i * 4..i * 4 + 4].try_into().unwrap()))
+            .collect()
+    }
+
+    /// Decode a LONG (i64) column body. Same shape as i32 with 8-byte
+    /// values and an `i64::MIN` null sentinel.
+    fn decode_i64_body(body: &[u8], rows: usize) -> Vec<i64> {
+        assert_eq!(body[0], 0, "i64 must never set the bitmap flag");
+        let vals = &body[1..];
+        (0..rows)
+            .map(|i| i64::from_le_bytes(vals[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect()
+    }
+
+    /// Decode a BOOLEAN column body: `flag(0) + ceil(rows/8)` bit-packed
+    /// bytes, bit `i` = row `i`.
+    fn decode_bool_body(body: &[u8], rows: usize) -> Vec<bool> {
+        assert_eq!(body[0], 0, "bool must never set the bitmap flag");
+        let packed = &body[1..];
+        (0..rows)
+            .map(|i| (packed[i / 8] >> (i % 8)) & 1 == 1)
+            .collect()
+    }
+
+    /// Decode a VARCHAR (utf8) column body into per-row `Option<String>`.
+    /// Handles both the no-null path (`flag(0) + (rows+1) u32 offsets +
+    /// data`) and the sparse path (`flag(1) + bitmap + (non_null+1) u32
+    /// offsets + data`).
+    fn decode_utf8_body(body: &[u8], rows: usize) -> Vec<Option<String>> {
+        let use_bitmap = body[0];
+        let mut pos = 1usize;
+        let mut is_null = vec![false; rows];
+        if use_bitmap == 1 {
+            let bitmap_bytes = rows.div_ceil(8);
+            for (i, slot) in is_null.iter_mut().enumerate() {
+                *slot = (body[pos + i / 8] >> (i % 8)) & 1 == 1;
+            }
+            pos += bitmap_bytes;
+        } else {
+            assert_eq!(use_bitmap, 0, "unexpected bitmap flag {use_bitmap}");
+        }
+        let non_null = is_null.iter().filter(|n| !**n).count();
+        let off_start = pos;
+        let read_off = |k: usize| {
+            u32::from_le_bytes(
+                body[off_start + k * 4..off_start + k * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        };
+        let data_start = off_start + (non_null + 1) * 4;
+        let mut out = Vec::with_capacity(rows);
+        let mut k = 0usize;
+        for &null in &is_null {
+            if null {
+                out.push(None);
+            } else {
+                let s = read_off(k);
+                let e = read_off(k + 1);
+                out.push(Some(
+                    String::from_utf8(body[data_start + s..data_start + e].to_vec()).unwrap(),
+                ));
+                k += 1;
+            }
+        }
+        out
+    }
+
+    /// Decode a non-null UUID column body: `flag(0) + row_count * 16`
+    /// raw bytes. Directly exercises the `a.offset() * elem` value-data
+    /// arithmetic in the FixedSizeBinary path.
+    fn decode_uuid_body(body: &[u8], rows: usize) -> Vec<[u8; 16]> {
+        assert_eq!(body[0], 0, "non-null UUID has no bitmap");
+        let vals = &body[1..];
+        (0..rows)
+            .map(|i| {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(&vals[i * 16..i * 16 + 16]);
+                a
+            })
+            .collect()
+    }
+
     #[test]
     fn qwp_bitmap_aligned_trailing_bits() {
         use arrow_buffer::BooleanBuffer;
@@ -5527,8 +5686,40 @@ mod tests {
         let full = b.finish();
         let sliced = full.slice(2, 4);
         assert_eq!(sliced.len(), 4);
+        // `questdb.column_type=int` pins the 4-byte INT path; a plain
+        // Int32 would default-widen to LONG (covered separately below).
+        let field = Field::new("v", DataType::Int32, false).with_metadata(metadata(&[(
+            crate::egress::arrow::metadata::COLUMN_TYPE,
+            "int",
+        )]));
+        let rb = single_col_batch(field, sliced);
+        let out = encode(&rb);
+        assert_qwp_header(&out, 1);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 4);
+        assert_eq!(ty, QWP_TYPE_INT);
+        // Window [2, 6) of 0..8 — NOT the pre-slice [0, 4).
+        assert_eq!(decode_i32_body(body, rows), vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn sliced_int32_default_widens_to_long_window() {
+        // A plain Int32 (no `column_type` hint) default-widens to a
+        // 64-bit LONG. The widen loop reads `a.values()` on the *sliced*
+        // array, so it must observe the windowed elements only.
+        let mut b = Int32Builder::new();
+        for v in 0..8 {
+            b.append_value(v * 10);
+        }
+        let full = b.finish();
+        let sliced = full.slice(2, 4);
         let rb = single_col_batch(Field::new("v", DataType::Int32, false), sliced);
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 4);
+        assert_eq!(ty, QWP_TYPE_LONG);
+        // Window [2, 6) of {0,10,20,30,40,50,60,70} = [20, 30, 40, 50].
+        assert_eq!(decode_i64_body(body, rows), vec![20, 30, 40, 50]);
     }
 
     #[test]
@@ -5540,7 +5731,21 @@ mod tests {
         let full = b.finish();
         let sliced = full.slice(1, 3);
         let rb = single_col_batch(Field::new("s", DataType::Utf8, false), sliced);
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        assert_qwp_header(&out, 1);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 3);
+        assert_eq!(ty, QWP_TYPE_VARCHAR);
+        // Window [1, 4): the varlen offset table must be re-based to the
+        // sliced data, not the original offset-0 buffer.
+        assert_eq!(
+            decode_utf8_body(body, rows),
+            vec![
+                Some("bb".to_string()),
+                Some("ccc".to_string()),
+                Some("dddd".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -5551,9 +5756,160 @@ mod tests {
             b.append_value(v);
         }
         let full = b.finish();
+        // offset 3 is not a multiple of 8 → drives the shift+OR
+        // bit-packing *fallback*, the path the claim flagged as untested
+        // at the value level.
         let sliced = full.slice(3, 5);
+        assert_eq!(
+            sliced.to_data().offset() % 8,
+            3,
+            "must hit the unaligned path"
+        );
         let rb = single_col_batch(Field::new("flag", DataType::Boolean, false), sliced);
-        assert_ok_with_table_count(&rb, 1);
+        let out = encode(&rb);
+        assert_qwp_header(&out, 1);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 5);
+        assert_eq!(ty, QWP_TYPE_BOOLEAN);
+        // Window [3, 8) of [t,f,t,f,t,f,t,f,t] = [f,t,f,t,f].
+        assert_eq!(
+            decode_bool_body(body, rows),
+            vec![false, true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn sliced_bool_aligned_offset_emits_sliced_window() {
+        use arrow_array::builder::BooleanBuilder;
+        let mut b = BooleanBuilder::new();
+        // Deliberately NON-periodic so the window [8,13) differs from the
+        // pre-slice prefix [0,5); a regression that ignored the
+        // byte-aligned `value_buf.offset()/8` start would otherwise read
+        // the prefix and silently pass.
+        let vals = [
+            true, true, true, true, true, true, true, true, // bits 0..7 (prefix)
+            false, false, true, false, true, // window rows 8..12
+            true, false, true, // padding
+        ];
+        for v in vals {
+            b.append_value(v);
+        }
+        let full = b.finish();
+        // offset 8 is byte-aligned → fast memcpy path (NOT the fallback).
+        let sliced = full.slice(8, 5);
+        assert_eq!(
+            sliced.to_data().offset(),
+            8,
+            "must keep a byte-aligned non-zero bit offset (fast path)"
+        );
+        let rb = single_col_batch(Field::new("flag", DataType::Boolean, false), sliced);
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 5);
+        assert_eq!(ty, QWP_TYPE_BOOLEAN);
+        // Window [8, 13) = [f,f,t,f,t], NOT the prefix [t,t,t,t,t].
+        assert_eq!(
+            decode_bool_body(body, rows),
+            vec![false, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn sliced_int64_array_emits_sliced_window_only() {
+        let mut b = Int64Builder::new();
+        for v in 0..6 {
+            b.append_value(v * 100);
+        }
+        let full = b.finish();
+        let sliced = full.slice(2, 3);
+        let rb = single_col_batch(Field::new("v", DataType::Int64, false), sliced);
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 3);
+        assert_eq!(ty, QWP_TYPE_LONG);
+        // Window [2, 5) of {0,100,200,300,400,500} = [200, 300, 400].
+        assert_eq!(decode_i64_body(body, rows), vec![200, 300, 400]);
+    }
+
+    #[test]
+    fn sliced_int32_with_nulls_in_window_emits_sentinels() {
+        let mut b = Int32Builder::new();
+        // idx:     0    1     2    3     4    5    6     7
+        // value:  10  null   20  null   30   40  null  50
+        b.append_value(10);
+        b.append_null();
+        b.append_value(20);
+        b.append_null();
+        b.append_value(30);
+        b.append_value(40);
+        b.append_null();
+        b.append_value(50);
+        let full = b.finish();
+        let sliced = full.slice(2, 4); // idx [2,6) = [20, null, 30, 40]
+        let field = Field::new("v", DataType::Int32, true).with_metadata(metadata(&[(
+            crate::egress::arrow::metadata::COLUMN_TYPE,
+            "int",
+        )]));
+        let rb = single_col_batch(field, sliced);
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 4);
+        assert_eq!(ty, QWP_TYPE_INT);
+        // Null at window index 1 → i32::MIN sentinel; the rest are the
+        // values from the sliced window, proving the sentinel patch keys
+        // off the *sliced* null buffer offset.
+        assert_eq!(decode_i32_body(body, rows), vec![20, i32::MIN, 30, 40]);
+    }
+
+    #[test]
+    fn sliced_utf8_with_nulls_in_window_rebases_offsets() {
+        let mut b = StringBuilder::new();
+        // idx:    0     1    2     3      4     5
+        // value: "a"  null  "bb" "ccc"  null  "dddd"
+        b.append_value("a");
+        b.append_null();
+        b.append_value("bb");
+        b.append_value("ccc");
+        b.append_null();
+        b.append_value("dddd");
+        let full = b.finish();
+        let sliced = full.slice(1, 4); // idx [1,5) = [null, "bb", "ccc", null]
+        let rb = single_col_batch(Field::new("s", DataType::Utf8, true), sliced);
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 4);
+        assert_eq!(ty, QWP_TYPE_VARCHAR);
+        // Exercises bitmap + dense (non-null-only) offset table over a
+        // sliced window.
+        assert_eq!(
+            decode_utf8_body(body, rows),
+            vec![None, Some("bb".to_string()), Some("ccc".to_string()), None,]
+        );
+    }
+
+    #[test]
+    fn sliced_uuid_array_emits_sliced_window_only() {
+        // FixedSizeBinary(16) → UUID. Note arrow-rs normalises a sliced
+        // FixedSizeBinaryArray to `offset() == 0` with a pre-windowed
+        // `value_data()`, so the `a.offset() * elem` multiply stays 0
+        // here; this guards the value-copy producing the correct window
+        // (a regression copying the wrong byte range is caught).
+        let mut b = FixedSizeBinaryBuilder::new(16);
+        let rows: [[u8; 16]; 4] = [[0x00; 16], [0x11; 16], [0x22; 16], [0x33; 16]];
+        for r in &rows {
+            b.append_value(r).unwrap();
+        }
+        let full = b.finish();
+        let sliced = full.slice(1, 2); // idx [1,3) = [0x11.., 0x22..]
+        let rb = single_col_batch(
+            Field::new("id", DataType::FixedSizeBinary(16), false),
+            sliced,
+        );
+        let out = encode(&rb);
+        let (n, ty, body) = decode_single_column(&out);
+        assert_eq!(n, 2);
+        assert_eq!(ty, QWP_TYPE_UUID);
+        assert_eq!(decode_uuid_body(body, n), vec![[0x11u8; 16], [0x22u8; 16]]);
     }
 
     // -----------------------------------------------------------------

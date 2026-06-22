@@ -149,6 +149,71 @@ class TestBuildRecordBatch(unittest.TestCase):
         self.assertEqual(rb.column(0).null_count, 8)
 
 
+class TestSlicedRecordBatchOffsets(unittest.TestCase):
+    """Server-free guard for the non-zero-offset / sliced-array surface.
+
+    The Rust unit tests cannot easily produce `offset() != 0` because
+    arrow-rs re-bases `Array::slice()` to offset 0, but an FFI-imported
+    sliced array *does* carry the offset. These tests pin the Python side
+    of that path: a sliced `RecordBatch` must (a) carry the window offset
+    on every column and (b) survive the Arrow C Data Interface round-trip
+    with exactly the windowed values — which is what `ingest_via_arrow(...,
+    slice_window=...)` relies on to feed offset arrays to the encoder."""
+
+    def _batch(self, n: int):
+        rnd = afc.Rng(0x5117_ED00)
+        kinds = [
+            ("c_int", afc.KIND_REGISTRY["int"]),
+            ("c_long", afc.KIND_REGISTRY["long"]),
+            ("c_bool", afc.KIND_REGISTRY["boolean"]),
+            ("c_uuid", afc.KIND_REGISTRY["uuid"]),
+            ("c_symbol", afc.KIND_REGISTRY["symbol"]),
+        ]
+        return kinds, afc.build_record_batch(kinds, rnd, n, null_mode="valid")
+
+    def test_slice_carries_window_offset_on_every_column(self):
+        _kinds, rb = self._batch(12)
+        off, length = 3, 6
+        sl = rb.slice(off, length)
+        self.assertEqual(sl.num_rows, length)
+        for i in range(sl.num_columns):
+            self.assertEqual(
+                sl.column(i).offset, off,
+                f"column {i} ({sl.schema.field(i).name}) lost the slice offset",
+            )
+
+    def test_sliced_batch_round_trips_through_c_data_interface(self):
+        import arrow_ffi
+        _kinds, rb = self._batch(12)
+        off, length = 3, 6
+        sl = rb.slice(off, length)
+        arr, sch = arrow_ffi.pyarrow_export_record_batch(sl)
+        rt = arrow_ffi.pyarrow_import_record_batch(arr, sch)
+        self.assertEqual(rt.num_rows, length)
+        for c in range(sl.num_columns):
+            name = sl.schema.field(c).name
+            for r in range(length):
+                self.assertEqual(
+                    rt.column(c)[r].as_py(), sl.column(c)[r].as_py(),
+                    f"FFI round-trip mismatch col={name} row={r}",
+                )
+
+    def test_window_differs_from_unsliced_prefix(self):
+        # Guards the test itself: the window must not coincide with the
+        # offset-0 prefix, otherwise an offset-ignoring bug would be
+        # invisible.
+        _kinds, rb = self._batch(12)
+        off, length = 3, 6
+        sl = rb.slice(off, length)
+        prefix = rb.slice(0, length)
+        differs = any(
+            sl.column(c)[r].as_py() != prefix.column(c)[r].as_py()
+            for c in range(sl.num_columns)
+            for r in range(length)
+        )
+        self.assertTrue(differs, "sliced window must differ from the prefix")
+
+
 class TestEdgeCorpora(unittest.TestCase):
     def test_edge_floats_contain_nan_inf_minus_zero(self):
         self.assertTrue(any(math.isnan(v) for v in afc.EDGE_FLOATS))
