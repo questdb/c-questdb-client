@@ -2315,6 +2315,16 @@ impl QwpWsHostHealthTracker {
         Some(idx)
     }
 
+    pub(super) fn pick_next_and_claim_connect_round(
+        &mut self,
+        reset_if_exhausted: bool,
+    ) -> Option<usize> {
+        if reset_if_exhausted && self.is_round_exhausted() {
+            self.begin_round(true);
+        }
+        self.pick_next_and_claim()
+    }
+
     pub(super) fn record_success(&mut self, idx: usize) {
         self.states[idx] = QwpWsHostState::Healthy;
         self.attempted_this_round[idx] = true;
@@ -2565,10 +2575,6 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     if let Some(idx) = previous_idx.take() {
         health.with_tracker(|t| t.record_mid_stream_failure(idx));
     }
-    if health.with_tracker(|t| t.is_round_exhausted()) {
-        health.with_tracker(|t| t.begin_round(true));
-    }
-
     let mut last_transport_endpoint_idx = None;
     let mut last_role_mismatch = None;
     let mut last_transport_err = None;
@@ -2578,7 +2584,13 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     // Pick + claim under the lock, then drop it for the blocking connect, then
     // re-acquire only to record the outcome. The lock is never held across
     // `establish_connection`.
-    while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim()) {
+    //
+    // Reset and claim under one tracker lock. Otherwise a single-endpoint
+    // contender can claim the just-reset round before this caller does.
+    // Do this only for the first pick so failed attempts terminate normally.
+    let mut first_pick = true;
+    while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim_connect_round(first_pick)) {
+        first_pick = false;
         let endpoint = &endpoints[idx];
         match establish_connection(
             &endpoint.host,
@@ -3500,6 +3512,21 @@ mod tests {
         // A fresh round re-probes from scratch.
         tracker.begin_round(true);
         assert!(tracker.pick_next_and_claim().is_some());
+    }
+
+    #[test]
+    fn connect_round_start_resets_and_claims_single_endpoint_atomically() {
+        let mut tracker = QwpWsHostHealthTracker::new(1);
+        tracker.record_success(0);
+        assert!(tracker.is_round_exhausted());
+
+        assert_eq!(tracker.pick_next_and_claim(), None);
+        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
+        assert!(tracker.is_round_exhausted());
+
+        tracker.record_transport_error(0);
+        assert_eq!(tracker.pick_next_and_claim_connect_round(false), None);
+        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
     }
 
     #[test]
