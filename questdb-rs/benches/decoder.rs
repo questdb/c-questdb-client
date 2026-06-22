@@ -67,16 +67,16 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-#[cfg(feature = "arrow")]
-use questdb::egress::_bench_internals::bench_batch_to_record_batch;
 #[cfg(feature = "polars")]
 use questdb::egress::_bench_internals::bench_batch_to_polars;
-#[cfg(feature = "polars")]
-use questdb::egress::arrow::polars::record_batch_to_dataframe;
+#[cfg(feature = "arrow")]
+use questdb::egress::_bench_internals::bench_batch_to_record_batch;
 use questdb::egress::_bench_internals::{
     Bytes, Schema, SymbolDict, ZstdScratch, decode_result_batch,
 };
 use questdb::egress::ColumnKind;
+#[cfg(feature = "polars")]
+use questdb::egress::arrow::polars::record_batch_to_dataframe;
 
 // ---------------------------------------------------------------------------
 // Wire-format helpers. Replicate the minimum of what the decoder's tests
@@ -567,18 +567,24 @@ fn bench_decoder(c: &mut Criterion) {
                 bench_batch_to_record_batch(schema, batch, &dict)
                     .expect("S1 batch must assemble into an arrow RecordBatch")
             };
-            group.bench_function(format!("s1_5col_{}_rows_to_polars_col_id", row_count), |b| {
-                b.iter(|| {
-                    let sub = rb.project(&[1]).expect("project");
-                    black_box(record_batch_to_dataframe(sub).expect("to df"));
-                });
-            });
-            group.bench_function(format!("s1_5col_{}_rows_to_polars_col_sym", row_count), |b| {
-                b.iter(|| {
-                    let sub = rb.project(&[3]).expect("project");
-                    black_box(record_batch_to_dataframe(sub).expect("to df"));
-                });
-            });
+            group.bench_function(
+                format!("s1_5col_{}_rows_to_polars_col_id", row_count),
+                |b| {
+                    b.iter(|| {
+                        let sub = rb.project(&[1]).expect("project");
+                        black_box(record_batch_to_dataframe(sub).expect("to df"));
+                    });
+                },
+            );
+            group.bench_function(
+                format!("s1_5col_{}_rows_to_polars_col_sym", row_count),
+                |b| {
+                    b.iter(|| {
+                        let sub = rb.project(&[3]).expect("project");
+                        black_box(record_batch_to_dataframe(sub).expect("to df"));
+                    });
+                },
+            );
             group.bench_function(
                 format!("s1_5col_{}_rows_to_polars_col_note", row_count),
                 |b| {
