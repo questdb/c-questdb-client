@@ -349,6 +349,14 @@ borrowed from the same `db`.
  * Create an empty chunk for the given table. The table name must be
  * valid (same rules as line_sender_table_name; max 127 bytes UTF-8).
  *
+ * Name validation timing: this raw-pointer entrypoint validates only
+ * UTF-8 here; the name grammar AND the 127-byte length cap are deferred
+ * to the first flush (matching the Rust Chunk::new contract). If you
+ * already hold a pre-validated line_sender_table_name, prefer
+ * column_sender_chunk_new_validated, which validates grammar eagerly at
+ * line_sender_table_name_init time — the same type/timing as the Arrow
+ * flush entrypoints.
+ *
  * Does not require a sender — the chunk is pure data until flushed.
  *
  * The chunk is owned by the caller and must be either flushed with
@@ -359,6 +367,21 @@ QUESTDB_CLIENT_API
 column_sender_chunk* column_sender_chunk_new(
     const char* table_name,
     size_t table_name_len,
+    line_sender_error** err_out);
+
+/**
+ * Create an empty chunk from a pre-validated line_sender_table_name.
+ *
+ * Typed, eager-grammar-validation counterpart to column_sender_chunk_new:
+ * the grammar was already checked when the line_sender_table_name was
+ * built, so this never sets *err_out; only the 127-byte length cap is
+ * applied at flush — identical type and validation timing to the Arrow
+ * flush entrypoints. Use it to share one validated table name between the
+ * chunk and Arrow paths instead of re-passing raw const char* bytes.
+ */
+QUESTDB_CLIENT_API
+column_sender_chunk* column_sender_chunk_new_validated(
+    line_sender_table_name table,
     line_sender_error** err_out);
 
 /**

@@ -96,11 +96,42 @@ class column_sender_conn;
 class column_chunk
 {
 public:
-    /** Build a chunk targeting `table` (validated at flush time). */
+    /**
+     * Build a chunk targeting `table`.
+     *
+     * Name validation timing: the table name grammar AND the 127-byte
+     * length cap are both deferred to flush (mirrors
+     * `::column_sender_chunk_new`). If you already hold a pre-validated
+     * `table_name_view` — e.g. to share it with `flush_arrow_batch`,
+     * which requires that type — prefer `from_validated`, which reports
+     * grammar errors eagerly at `table_name_view` construction (the same
+     * type/timing as the Arrow flush entrypoints).
+     */
     explicit column_chunk(std::string_view table)
     {
         _raw = line_sender_error::wrapped_call(
             ::column_sender_chunk_new, table.data(), table.size());
+    }
+
+    /**
+     * Build a chunk from a pre-validated `table_name_view`.
+     *
+     * Typed, eager-grammar-validation counterpart to the
+     * `std::string_view` constructor: the name grammar was validated when
+     * the `table_name_view` was constructed (same type and timing as
+     * `flush_arrow_batch`), while the 127-byte length cap is still applied
+     * at flush. Prefer this when you already hold a validated table name
+     * and want to share it between the chunk and Arrow paths. Exposed as a
+     * named factory rather than a constructor overload to avoid ambiguity
+     * with the `std::string_view` constructor on string literals.
+     */
+    static column_chunk from_validated(table_name_view table)
+    {
+        ::line_sender_table_name table_c{table.size(), table.data()};
+        column_chunk chunk;
+        chunk._raw = line_sender_error::wrapped_call(
+            ::column_sender_chunk_new_validated, table_c);
+        return chunk;
     }
 
     column_chunk(const column_chunk&) = delete;
@@ -595,6 +626,10 @@ public:
 #endif
 
 private:
+    /// Leaves `_raw` null; used by `from_validated` before it installs the
+    /// freshly-constructed handle.
+    column_chunk() = default;
+
     ::column_sender_chunk* _raw{nullptr};
 };
 

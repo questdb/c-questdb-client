@@ -356,11 +356,51 @@ bool row_sender_flush_and_keep(
  * Create an empty chunk for the given table. The chunk is caller-owned
  * and must be freed with `column_sender_chunk_free` or flushed via
  * `column_sender_flush` (which clears but does not free it).
+ *
+ * Name validation timing: this entrypoint takes the table name as a raw
+ * `const char*` + length and validates ONLY that the bytes are UTF-8
+ * here. Both the name grammar (illegal characters, dot placement, BOM)
+ * AND the 127-byte length cap are DEFERRED to the first flush — a
+ * malformed name is accepted here and only surfaces as an error from
+ * `column_sender_flush*`. This matches the deferred-validation contract
+ * of the Rust `Chunk::new`.
+ *
+ * If you already hold a pre-validated `line_sender_table_name` (e.g.
+ * because you also flush Arrow batches via
+ * `column_sender_flush_arrow_batch_at_column`, which requires that type),
+ * prefer `column_sender_chunk_new_validated`: it takes the validated
+ * handle directly and reports grammar errors EAGERLY at
+ * `line_sender_table_name_init` time — the same type and timing as the
+ * Arrow flush entrypoints — so a bad name does not surface at two
+ * different points depending on which path you take.
  */
 QUESTDB_CLIENT_API
 column_sender_chunk* column_sender_chunk_new(
     const char* table_name,
     size_t table_name_len,
+    line_sender_error** err_out);
+
+/**
+ * Create an empty chunk from a pre-validated `line_sender_table_name`.
+ *
+ * Typed, eager-grammar-validation counterpart to
+ * `column_sender_chunk_new`. The name grammar was already checked when
+ * the `line_sender_table_name` was built (`line_sender_table_name_init`
+ * returns false for an illegal name), so this constructor cannot fail on
+ * the name and never sets `*err_out`. The 127-byte length cap is still
+ * applied at the first flush — identical type AND validation timing to
+ * the Arrow flush entrypoints (`column_sender_flush_arrow_batch_at_column`
+ * / `_server_stamped`), which also take a `line_sender_table_name`.
+ *
+ * Use this when you validated the table name once and want to share it
+ * between the chunk path and an Arrow flush, instead of being forced to
+ * re-pass raw `const char*` bytes through `column_sender_chunk_new`. The
+ * chunk is caller-owned and freed/flushed exactly like one returned by
+ * `column_sender_chunk_new`.
+ */
+QUESTDB_CLIENT_API
+column_sender_chunk* column_sender_chunk_new_validated(
+    line_sender_table_name table,
     line_sender_error** err_out);
 
 /**
@@ -1225,6 +1265,13 @@ typedef struct column_sender_arrow_override
  * UTF-8 in `column`, has an unknown `kind`, or — for
  * `column_sender_arrow_override_geohash` — carries `arg` outside
  * `1..=60`.
+ *
+ * Name validation timing: `table` is a `line_sender_table_name`, so the
+ * name grammar was validated EAGERLY at `line_sender_table_name_init`
+ * time; only the 127-byte length cap is checked here at flush. The chunk
+ * path's raw `column_sender_chunk_new` instead defers BOTH checks to
+ * flush. To get this same eager/typed behaviour on the chunk path, build
+ * the chunk with `column_sender_chunk_new_validated`.
  */
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch_server_stamped(

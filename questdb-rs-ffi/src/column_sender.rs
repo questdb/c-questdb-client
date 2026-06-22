@@ -46,8 +46,11 @@ use questdb::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use questdb::{Error, ErrorCode};
 
 #[cfg(feature = "arrow")]
-use crate::{line_sender_column_name, line_sender_table_name};
-use crate::{line_sender_error, set_err_out_from_error, set_err_out_from_error_with_qwpws};
+use crate::line_sender_column_name;
+use crate::{
+    line_sender_error, line_sender_table_name, set_err_out_from_error,
+    set_err_out_from_error_with_qwpws,
+};
 
 // ===========================================================================
 // Opaque handles
@@ -691,11 +694,26 @@ pub struct ArrowSchema {
 // Chunk lifecycle
 // ===========================================================================
 
-/// Create an empty chunk for `table_name` (validated UTF-8).
+/// Create an empty chunk from a raw `table_name` buffer (validated UTF-8
+/// only at this point).
 ///
-/// Table name grammar and length validation is deferred to first flush —
-/// matches the deferred-validation contract of `Chunk::new` in the Rust
-/// API.
+/// **Name validation timing — read this.** This entrypoint takes the
+/// table name as raw `const char*` + length and validates *only* that the
+/// bytes are UTF-8 here. Both the name **grammar** (illegal characters
+/// such as `?`, `.` placement, BOM) **and** the 127-byte length cap are
+/// **deferred to the first flush**, matching the deferred-validation
+/// contract of `Chunk::new` in the Rust API: a malformed name is accepted
+/// by `column_sender_chunk_new` and only surfaces as an error from
+/// `column_sender_flush*`.
+///
+/// If you already hold a pre-validated [`line_sender_table_name`] (for
+/// example because you also flush Arrow batches via
+/// `column_sender_flush_arrow_batch_at_column`, which requires that type),
+/// prefer [`column_sender_chunk_new_validated`]: it accepts the validated
+/// handle directly and reports grammar errors *eagerly* at
+/// `line_sender_table_name_init` time — the same type and timing as the
+/// Arrow flush entrypoints — so the same bad name doesn't surface at two
+/// different points depending on which path you take.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_new(
     table_name: *const c_char,
@@ -708,6 +726,40 @@ pub unsafe extern "C" fn column_sender_chunk_new(
     };
     Box::into_raw(Box::new(column_sender_chunk(
         Chunk::new(table),
+        AtomicU32::new(0),
+    )))
+}
+
+/// Create an empty chunk from a pre-validated [`line_sender_table_name`].
+///
+/// Typed, eager-grammar-validation counterpart to
+/// [`column_sender_chunk_new`]. The name grammar was already checked when
+/// the [`line_sender_table_name`] was built (`line_sender_table_name_init`
+/// returns `false` for an illegal name), so this constructor cannot fail
+/// on the name and never writes `*err_out`. The 127-byte length cap is
+/// still applied at the first flush — identical type *and* validation
+/// timing to the Arrow flush entrypoints
+/// (`column_sender_flush_arrow_batch_at_column` /
+/// `_server_stamped`), which also take a [`line_sender_table_name`].
+///
+/// Use this when you already validated the table name once (e.g. to share
+/// it between the chunk path and an Arrow flush) instead of being forced
+/// to re-pass raw `const char*` bytes through [`column_sender_chunk_new`].
+/// `err_out` is accepted for ABI symmetry with the other constructors but
+/// is never set: a [`line_sender_table_name`] is validated by
+/// construction.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_new_validated(
+    table: line_sender_table_name,
+    _err_out: *mut *mut line_sender_error,
+) -> *mut column_sender_chunk {
+    // The newtype was grammar-validated at `line_sender_table_name_init`
+    // time, so `as_name()` is infallible — there is no name failure path.
+    // The 127-byte cap is enforced at flush by `validate_table_name`,
+    // exactly as it is for the Arrow flush entrypoints.
+    let table = unsafe { table.as_name() };
+    Box::into_raw(Box::new(column_sender_chunk(
+        Chunk::new(table.as_ref()),
         AtomicU32::new(0),
     )))
 }
@@ -2861,6 +2913,60 @@ mod tests {
         assert!(chunk.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn chunk_new_validated_accepts_prevalidated_table_name() {
+        // M7 regression: a caller who already validated a table name into a
+        // `line_sender_table_name` (e.g. to reuse it across an Arrow flush via
+        // `column_sender_flush_arrow_batch_at_column`) must be able to feed the
+        // SAME validated handle into the chunk path, rather than being forced
+        // to re-pass raw `const char*` bytes to `column_sender_chunk_new`.
+        let raw = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let mut table = line_sender_table_name {
+            len: 0,
+            buf: std::ptr::null(),
+        };
+        let ok = unsafe {
+            crate::line_sender_table_name_init(
+                &mut table,
+                raw.len(),
+                raw.as_ptr() as *const c_char,
+                &mut err,
+            )
+        };
+        assert!(ok, "valid table name should init");
+        assert!(err.is_null());
+
+        let chunk = unsafe { column_sender_chunk_new_validated(table, &mut err) };
+        assert!(
+            !chunk.is_null(),
+            "validated chunk constructor should succeed"
+        );
+        assert!(err.is_null());
+
+        // The resulting chunk behaves identically to one built via the raw
+        // `column_sender_chunk_new` entrypoint.
+        let name = b"price";
+        let data: [i64; 3] = [1, 2, 3];
+        let appended = unsafe {
+            column_sender_chunk_column_i64(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(appended, "column_i64 should succeed on the validated chunk");
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            3
+        );
+        unsafe { column_sender_chunk_free(chunk) };
     }
 
     #[test]
