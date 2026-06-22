@@ -1303,11 +1303,15 @@ int send_one_chunk(questdb_db* db) {
     if (!column_sender_chunk_designated_timestamp_nanos(
             chunk, timestamps_ns, 3, &err)) goto fail;
 
-    if (!column_sender_flush(conn, chunk, &err)) goto fail;
-    /* flush returned: chunk cleared & reusable; ACK wait is deferred */
-    if (!column_sender_sync(
-            conn, column_sender_ack_level_ok, &err)) goto fail;
-    /* sync returned: server has WAL-committed all flushed chunks */
+    /* One call: publish this chunk as a boundary and wait until the
+       server has WAL-committed it (and everything published before it).
+       This is the common safe shape — "send this batch and return when
+       it is committed". On success the chunk is cleared & reusable.
+       To pipeline many chunks for throughput instead, call
+       column_sender_flush per chunk (publish-only) and drain once at the
+       end with column_sender_sync(conn, column_sender_ack_level_ok). */
+    if (!column_sender_flush_and_wait(
+            conn, chunk, column_sender_ack_level_ok, &err)) goto fail;
 
     column_sender_chunk_free(chunk);
     questdb_db_return_column_sender(db, conn);

@@ -218,6 +218,9 @@ fn main() -> questdb::Result<()> {
             humanise(total_rows)
         );
     }
+    // This example pipelines many chunks (publish-only `flush`) and drains
+    // once here for throughput. To instead publish one batch and wait for its
+    // commit in a single call, use `sender.flush_and_wait(&mut chunk, AckLevel::Ok)`.
     sender.sync(AckLevel::Ok)?;
     eprintln!();
     let send_elapsed = send_start.elapsed();

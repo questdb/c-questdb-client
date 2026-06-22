@@ -35,9 +35,21 @@
 //! - Borrow a sender with [`QuestDb::borrow_column_sender`].
 //! - Build a [`Chunk`] of column buffers for one table, then pin a
 //!   designated timestamp on it.
-//! - Flush chunks to publish them without waiting for ACKs, then call
-//!   [`ColumnSender::sync`] to commit and wait at the requested [`AckLevel`].
+//! - Publish a batch and wait for the server to commit it in one call with
+//!   [`ColumnSender::flush_and_wait`] (the common safe shape: "send this batch
+//!   and return when it is committed"). To pipeline many batches for
+//!   throughput instead, publish each with [`ColumnSender::flush`] and drain
+//!   once at the end with [`ColumnSender::sync`] at the requested [`AckLevel`].
 //! - Drop the [`BorrowedColumnSender`] to return its connection to the pool.
+//!
+//! ```ignore
+//! let mut sender = db.borrow_column_sender()?;
+//! let mut chunk = Chunk::new("trades");
+//! chunk.column_f64("price", &prices, None)?;
+//! chunk.designated_timestamp_nanos(&timestamps_ns)?;
+//! // One call: publish + wait until the server WAL-commits this batch.
+//! sender.flush_and_wait(&mut chunk, AckLevel::Ok)?;
+//! ```
 
 #[cfg(feature = "arrow")]
 mod arrow_batch;
