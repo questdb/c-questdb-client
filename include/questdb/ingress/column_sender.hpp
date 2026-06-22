@@ -898,8 +898,8 @@ public:
      * `array` (timestamp sourced from `ts_column`) as a boundary, then wait
      * for `level`. Same preflight/re-export contract as
      * `flush_arrow_batch_server_stamped_and_wait`: on a post-publication
-     * failure `array` is not re-exported — check `array.release` before
-     * invoking it. Throws on error.
+     * failure `array` is not re-exported. Callers MUST check
+     * `array.release != nullptr` before invoking it on failure. Throws on error.
      */
     void flush_arrow_batch_and_wait(
         table_name_view table,
