@@ -424,7 +424,8 @@ impl ColumnConn {
         // sync. Without this, a durable-ack pooled connection accumulates one
         // entry per distinct table for its entire pooled life.
         let pending = &self.pending_durable_targets;
-        self.durable_watermarks.retain(|t, _| pending.contains_key(t));
+        self.durable_watermarks
+            .retain(|t, _| pending.contains_key(t));
     }
 
     /// Dispatch a parsed QWP response: validate OK sequence, update

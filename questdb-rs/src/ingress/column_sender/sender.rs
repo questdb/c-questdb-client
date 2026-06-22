@@ -295,7 +295,14 @@ impl ColumnSender {
             ColumnSenderBackend::Direct(direct) => {
                 let defer = direct.first_frame_sent;
                 direct
-                    .flush_arrow_batch_inner(table, batch, Some(ts_col_idx), false, overrides, defer)
+                    .flush_arrow_batch_inner(
+                        table,
+                        batch,
+                        Some(ts_col_idx),
+                        false,
+                        overrides,
+                        defer,
+                    )
                     .map_err(classify_flush_error)?;
                 direct.first_frame_sent = true;
                 Ok(())
@@ -530,7 +537,12 @@ impl SfaColumnBackend {
             qwp_ws_check_error_background(&self.state)?;
 
             if !self.sync_timeout.is_zero() && deadline_anchor.elapsed() >= self.sync_timeout {
-                return Err(sfa_sync_timeout(self.sync_timeout, ack_level, boundary, completed));
+                return Err(sfa_sync_timeout(
+                    self.sync_timeout,
+                    ack_level,
+                    boundary,
+                    completed,
+                ));
             }
             thread::sleep(Duration::from_millis(10));
         }

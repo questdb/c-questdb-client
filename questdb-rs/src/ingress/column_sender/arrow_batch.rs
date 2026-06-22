@@ -3878,7 +3878,17 @@ mod tests {
         let rb = single_col_batch(f, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            /* server_stamp = */ true,
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap();
         assert_qwp_header(&out, 1);
         assert_eq!(dict.next_id(), 2);
     }
@@ -4363,7 +4373,17 @@ mod tests {
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            /* server_stamp = */ true,
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap();
         // 4 rows, only 2 unique values → dict has 2 entries.
         assert_eq!(dict.next_id(), 2);
     }
@@ -4380,7 +4400,17 @@ mod tests {
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            /* server_stamp = */ true,
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap();
         assert_eq!(dict.next_id(), 2);
     }
 
@@ -4756,7 +4786,17 @@ mod tests {
         let rb = single_col_batch(field, dict);
         let mut out = Vec::new();
         let mut gd = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut gd, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            /* server_stamp = */ true,
+            &[],
+            &mut gd,
+            false,
+        )
+        .unwrap();
         assert_eq!(gd.next_id(), 2);
     }
 
@@ -4776,7 +4816,17 @@ mod tests {
         let rb = single_col_batch(field, dict);
         let mut out = Vec::new();
         let mut gd = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut gd, false).unwrap();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            /* server_stamp = */ true,
+            &[],
+            &mut gd,
+            false,
+        )
+        .unwrap();
         assert_eq!(gd.next_id(), 1);
     }
 
@@ -5419,8 +5469,17 @@ mod tests {
         let mut out = Vec::from(b"PREFIX");
         let prior_len = out.len();
         let mut dict = SymbolGlobalDict::new();
-        let err = encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false)
-            .unwrap_err();
+        let err = encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            &rb,
+            None,
+            /* server_stamp = */ true,
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
         assert_eq!(
             out.len(),
@@ -5746,7 +5805,16 @@ mod tests {
     ) -> Result<(Vec<u8>, SymbolGlobalDict)> {
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), batch, None, /* server_stamp = */ true, overrides, &mut dict, false)?;
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            batch,
+            None,
+            /* server_stamp = */ true,
+            overrides,
+            &mut dict,
+            false,
+        )?;
         Ok((out, dict))
     }
 
