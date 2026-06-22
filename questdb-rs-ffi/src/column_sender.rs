@@ -1356,10 +1356,7 @@ pub const column_sender_symbol_mode_not_symbol: u32 = 2;
 /// force SYMBOL, `Some(Some(false))` = force VARCHAR. Returns the outer `None`
 /// (after writing `*err_out`) when `value` is out of range.
 #[cfg(feature = "arrow")]
-fn symbol_mode_from_u32(
-    value: u32,
-    err_out: *mut *mut line_sender_error,
-) -> Option<Option<bool>> {
+fn symbol_mode_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Option<Option<bool>> {
     match value {
         0 => Some(None),
         1 => Some(Some(true)),
