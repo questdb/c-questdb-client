@@ -416,6 +416,15 @@ impl ColumnConn {
         let watermarks = &self.durable_watermarks;
         self.pending_durable_targets
             .retain(|t, target| watermarks.get(t).copied().unwrap_or(i64::MIN) < *target);
+        // A watermark is only ever consulted to satisfy a pending target for
+        // the same table; once no live pending target references it, it is
+        // dead weight. Any future write to the table re-establishes both the
+        // pending target (from its OK ack) and the watermark (from its durable
+        // ack), in that wire order, so dropping it here cannot strand a later
+        // sync. Without this, a durable-ack pooled connection accumulates one
+        // entry per distinct table for its entire pooled life.
+        let pending = &self.pending_durable_targets;
+        self.durable_watermarks.retain(|t, _| pending.contains_key(t));
     }
 
     /// Dispatch a parsed QWP response: validate OK sequence, update
@@ -1197,6 +1206,42 @@ mod tests {
         })
         .expect("matching ok must pop");
         assert_eq!(conn.in_flight(), 0);
+    }
+
+    #[test]
+    fn durable_watermarks_are_pruned_once_no_pending_target_references_them() {
+        let mut conn = ColumnConn::for_test(dummy_ws_stream(), true);
+        // Simulate a long-lived pooled durable-ack connection writing to a
+        // growing set of distinct table names. Each table is OK-acked,
+        // durable-acked, then fully satisfied + pruned (mirroring the
+        // prune that `sync_all_acks` runs at its tail).
+        for i in 0..1000u64 {
+            let table = format!("table_{i}");
+            conn.push_pending(i);
+            conn.process_response(QwpResponse::Ok {
+                sequence: i,
+                tables: vec![(table.clone(), 1)],
+            })
+            .expect("ok ack");
+            conn.process_response(QwpResponse::DurableAck {
+                tables: vec![(table, 1)],
+            })
+            .expect("durable ack");
+            conn.drop_satisfied_durable_targets();
+        }
+
+        assert_eq!(
+            conn.pending_durable_targets.len(),
+            0,
+            "satisfied pending targets must be pruned"
+        );
+        // RED before the fix: watermarks accumulate one entry per distinct
+        // table for the connection's entire pooled life.
+        assert_eq!(
+            conn.durable_watermarks.len(),
+            0,
+            "durable watermarks with no live pending target must not accumulate"
+        );
     }
 
     #[test]
