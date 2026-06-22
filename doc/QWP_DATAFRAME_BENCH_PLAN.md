@@ -337,11 +337,24 @@ numbers (pandas/Polars × ingress/egress).
   `decode` (the existing 13.3M rows/s floor) vs `assemble` vs the sum.
 - Emit the §3.2 JSON from both examples.
 
-## 7. Step 4 — Parity table  *[summary]*
+## 7. Step 4 — Parity table  *[IMPLEMENTED]*
 
 Aggregator script consumes all §3.2 JSON (pandas, Polars, + Go/Java anchors run
 on the same box) → one S1 `rows/s` + `GiB/s` table per direction. Single-box,
 single-stream; environment block enforced.
+
+**Implemented:** `doc/bench_parity_aggregate.py` (stdlib-only). Consumes the
+contract JSON from both clients, normalizes per-client path names → canonical
+roles (`ROLE_OF_PATH`), and renders a `rows/s` + `GiB/s` table per direction
+(md/text). GiB/s is derived from `rows/s × canonical on-wire bytes/row`
+(`--ingress-bpr`/`--egress-bpr`, defaults 45.0 / 37.1284) because the per-file
+`wire_bytes` basis differs across clients on egress (py = decoded-Arrow nbytes
+~480 MB, rust = on-wire ~371 MB) — so native `mib_per_s` is not cross-client
+comparable, but `rows/s` is. Enforces single-box via a coarse `(os, arch)` match
+(✅/⚠️) and warns on duplicate `(client, direction)` inputs. Run:
+`python doc/bench_parity_aggregate.py <contract>.json ... [--glob 'dir/*.json']`.
+Go/Java anchors emit their own formats (not the §3.2 contract) → deferred; add a
+per-client normalizer when those JSONs exist.
 
 ## 8. Step 5 — First deepening: S2 wide + DataFrame characterisation  *[summary]*
 
