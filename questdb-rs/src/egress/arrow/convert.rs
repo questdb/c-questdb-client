@@ -69,6 +69,7 @@ pub(crate) struct SymbolBuildScratch {
 
 const SYMBOL_REMAP_UNSET: u32 = u32::MAX;
 
+#[cfg(test)]
 pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
@@ -79,7 +80,7 @@ pub(crate) fn batch_to_record_batch(
     batch_to_record_batch_with(schema_ref, egress_schema, batch, dict, &mut sym_scratch)
 }
 
-/// As [`batch_to_record_batch`], but reuses a caller-owned scratch. The
+/// As `batch_to_record_batch`, but reuses a caller-owned scratch. The
 /// streaming [`crate::egress::Cursor`] threads one across batches.
 pub(crate) fn batch_to_record_batch_with(
     schema_ref: Arc<ArrowSchema>,
@@ -100,7 +101,6 @@ pub(crate) fn batch_to_record_batch_with(
         ));
     }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-    let mut sym_scratch = SymbolBuildScratch::default();
     // Single degenerate-list slack pool shared by every array column in this
     // batch. Threading one budget (rather than re-granting it per column) stops
     // a wide batch of `[huge, 0]` columns from multiplying offset-buffer
@@ -119,7 +119,7 @@ pub(crate) fn batch_to_record_batch_with(
             decoded,
             row_count,
             dict,
-            sym_scratch,
+            &mut *sym_scratch,
             &mut degenerate_node_slack,
         )?);
     }
