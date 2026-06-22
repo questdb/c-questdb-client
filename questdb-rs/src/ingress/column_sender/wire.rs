@@ -124,23 +124,46 @@ pub(crate) fn write_qwp_bitmap_invert(out: &mut Vec<u8>, src: &[u8], bit_len: us
     }
 }
 
-/// Validate a UTF-8 name against the QWP/Java client length cap.
-pub(crate) fn validate_name(kind: &'static str, name: &str) -> crate::Result<()> {
-    if name.is_empty() {
-        return Err(crate::error::fmt!(
-            InvalidName,
-            "{} name must not be empty",
-            kind
-        ));
-    }
+/// Validate a table name for the column-major (chunk / arrow) flush path.
+///
+/// Enforces the QWP/Java client length cap **and** delegates grammar
+/// validation to the canonical [`TableName::new`], so the chunk path
+/// rejects exactly the names the row/arrow API rejects. Keeping a single
+/// source of truth for the grammar prevents the two entrypoints from
+/// drifting apart (e.g. one accepting `bad?name` while the other rejects
+/// it).
+///
+/// [`TableName::new`]: crate::ingress::TableName::new
+pub(crate) fn validate_table_name(name: &str) -> crate::Result<()> {
     if name.len() > MAX_NAME_LEN {
         return Err(crate::error::fmt!(
             InvalidName,
-            "{} name is too long: {} bytes (max {})",
-            kind,
+            "table name is too long: {} bytes (max {})",
             name.len(),
             MAX_NAME_LEN
         ));
     }
+    crate::ingress::TableName::new(name)?;
+    Ok(())
+}
+
+/// Validate a column name for the column-major (chunk / arrow) flush path.
+///
+/// Enforces the QWP/Java client length cap **and** delegates grammar
+/// validation to the canonical [`ColumnName::new`]. The arrow flush path
+/// already validates field names via `ColumnName::new`; routing the chunk
+/// path through the same validator keeps the two entrypoints consistent.
+///
+/// [`ColumnName::new`]: crate::ingress::ColumnName::new
+pub(crate) fn validate_column_name(name: &str) -> crate::Result<()> {
+    if name.len() > MAX_NAME_LEN {
+        return Err(crate::error::fmt!(
+            InvalidName,
+            "column name is too long: {} bytes (max {})",
+            name.len(),
+            MAX_NAME_LEN
+        ));
+    }
+    crate::ingress::ColumnName::new(name)?;
     Ok(())
 }

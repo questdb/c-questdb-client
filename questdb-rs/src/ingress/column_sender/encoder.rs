@@ -43,8 +43,8 @@ use super::chunk::{
 };
 use super::numpy_wire;
 use super::wire::{
-    F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, MAX_NAME_LEN, QWP_FLAG_DEFER_COMMIT,
-    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1, validate_name,
+    F32_NULL, F64_NULL, I8_NULL, I16_NULL, I32_NULL, I64_NULL, QWP_FLAG_DEFER_COMMIT,
+    QWP_FLAG_DELTA_SYMBOL_DICT, QWP_HEADER_LEN, QWP_MAGIC, QWP_VERSION_1, validate_table_name,
     write_qwp_bytes, write_qwp_varint,
 };
 
@@ -146,17 +146,8 @@ fn encode_chunk_into_mode(
              call designated_timestamp_micros or designated_timestamp_nanos before flush."
         ));
     }
-    validate_name("table", &chunk.table)?;
-
+    validate_table_name(&chunk.table)?;
     let table_bytes = chunk.table.as_bytes();
-    if table_bytes.len() > MAX_NAME_LEN {
-        return Err(error::fmt!(
-            InvalidName,
-            "table name is too long: {} bytes (max {})",
-            table_bytes.len(),
-            MAX_NAME_LEN
-        ));
-    }
 
     let designated = chunk
         .designated_ts
@@ -1137,6 +1128,40 @@ mod tests {
         let mut scratch = EncodeScratch::new();
         encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).unwrap();
         out
+    }
+
+    /// The chunk (column-major) flush path must reject exactly the table
+    /// names that the row/arrow API's [`TableName::new`] rejects — same
+    /// grammar, no drift. A divergence here means the same malformed name
+    /// is accepted by one entrypoint and rejected by another.
+    #[test]
+    fn table_name_validation_matches_canonical_validator() {
+        use crate::ingress::TableName;
+        for name in [
+            "ok_table", "a.b", "a-b", "a_b", // accepted by TableName::new
+            "bad?name", "a/b", "a,b", ".lead", "trail.", "a..b", "", // rejected
+        ] {
+            let canonical_rejects = TableName::new(name).is_err();
+
+            // Build a minimal otherwise-valid chunk and encode it — this
+            // is exactly what `ColumnSender::flush` does at flush time.
+            let mut chunk = Chunk::new(name);
+            let ts = [1i64];
+            chunk.designated_timestamp_micros(&ts).unwrap();
+            let col = [10i64];
+            chunk.column_i64("v", &col, None).unwrap();
+            let mut out = Vec::new();
+            let mut dict = SymbolGlobalDict::new();
+            let mut scratch = EncodeScratch::new();
+            let chunk_rejects =
+                encode_chunk_into(&mut out, &chunk, &mut dict, &mut scratch, false).is_err();
+
+            assert_eq!(
+                chunk_rejects, canonical_rejects,
+                "table name {name:?}: chunk flush and TableName::new disagree \
+                 (chunk_rejects={chunk_rejects}, canonical_rejects={canonical_rejects})"
+            );
+        }
     }
 
     #[test]

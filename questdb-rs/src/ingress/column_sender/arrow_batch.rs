@@ -58,7 +58,7 @@ use super::wire::{
     QWP_TYPE_DECIMAL128, QWP_TYPE_DECIMAL256, QWP_TYPE_DOUBLE, QWP_TYPE_DOUBLE_ARRAY,
     QWP_TYPE_FLOAT, QWP_TYPE_GEOHASH, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256,
     QWP_TYPE_SHORT, QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID,
-    QWP_TYPE_VARCHAR, QWP_VERSION_1, validate_name, write_qwp_bytes, write_qwp_varint,
+    QWP_TYPE_VARCHAR, QWP_VERSION_1, validate_table_name, write_qwp_bytes, write_qwp_varint,
 };
 
 use super::MAX_CHUNK_ROWS as MAX_ARROW_INGEST_ROWS;
@@ -3423,7 +3423,7 @@ fn encode_arrow_batch_into_mode(
         ));
     }
     check_batch_data_bounds(batch)?;
-    validate_name("table", table.as_ref())?;
+    validate_table_name(table.as_ref())?;
     let user_col_count = total_cols - if ts_col_idx.is_some() { 1 } else { 0 };
     if user_col_count == 0 {
         return Err(fmt!(

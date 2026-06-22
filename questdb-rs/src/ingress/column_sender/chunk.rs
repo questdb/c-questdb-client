@@ -48,10 +48,10 @@ use super::arrow_batch;
 use super::numpy_wire;
 use super::validity::{Validity, check_row_count};
 use super::wire::{
-    MAX_NAME_LEN, QWP_TYPE_BINARY, QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_DATE, QWP_TYPE_DOUBLE,
+    QWP_TYPE_BINARY, QWP_TYPE_BOOLEAN, QWP_TYPE_BYTE, QWP_TYPE_DATE, QWP_TYPE_DOUBLE,
     QWP_TYPE_FLOAT, QWP_TYPE_INT, QWP_TYPE_IPV4, QWP_TYPE_LONG, QWP_TYPE_LONG256, QWP_TYPE_SHORT,
     QWP_TYPE_SYMBOL, QWP_TYPE_TIMESTAMP, QWP_TYPE_TIMESTAMP_NANOS, QWP_TYPE_UUID, QWP_TYPE_VARCHAR,
-    validate_name,
+    validate_column_name,
 };
 
 // ===========================================================================
@@ -1154,15 +1154,7 @@ impl<'a> Chunk<'a> {
         validity: Option<&Validity<'_>>,
         row_count: usize,
     ) -> Result<&mut Self> {
-        validate_name("column", name)?;
-        if name.len() > MAX_NAME_LEN {
-            return Err(error::fmt!(
-                InvalidName,
-                "column name is too long: {} bytes (max {})",
-                name.len(),
-                MAX_NAME_LEN
-            ));
-        }
+        validate_column_name(name)?;
         self.guard_unique_name(name)?;
         let validity = validity.map(ValidityDescriptor::from_validity);
         self.columns.push(ColumnDescriptor {
@@ -1234,15 +1226,7 @@ impl<'a> Chunk<'a> {
         arrow_kind: arrow_batch::ColumnKind,
         arr: arrow_array::ArrayRef,
     ) -> Result<&mut Self> {
-        validate_name("column", name)?;
-        if name.len() > MAX_NAME_LEN {
-            return Err(error::fmt!(
-                InvalidName,
-                "column name is too long: {} bytes (max {})",
-                name.len(),
-                MAX_NAME_LEN
-            ));
-        }
+        validate_column_name(name)?;
         self.guard_unique_name(name)?;
         let row_count = check_row_count(self.row_count, arr.len(), None)?;
         let has_nulls = arr.null_count() > 0;
@@ -1416,6 +1400,29 @@ mod tests {
         let err = chunk.column_i64("b", &b, None).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("row_count"));
+    }
+
+    /// The chunk (column-major) append path must reject exactly the column
+    /// names that the row/arrow API's [`ColumnName::new`] rejects — same
+    /// grammar, no drift. The arrow flush path already validates field
+    /// names via `ColumnName::new`; the chunk path must match it.
+    #[test]
+    fn column_name_validation_matches_canonical_validator() {
+        use crate::ingress::ColumnName;
+        for name in [
+            "ok_col", "a_b", // accepted by ColumnName::new
+            "bad?col", "a.b", "a,b", "a/b", "a-b", "", // rejected
+        ] {
+            let canonical_rejects = ColumnName::new(name).is_err();
+            let mut chunk = Chunk::new("t");
+            let data = [1i64];
+            let chunk_rejects = chunk.column_i64(name, &data, None).is_err();
+            assert_eq!(
+                chunk_rejects, canonical_rejects,
+                "column name {name:?}: chunk path and ColumnName::new disagree \
+                 (chunk_rejects={chunk_rejects}, canonical_rejects={canonical_rejects})"
+            );
+        }
     }
 
     #[test]
