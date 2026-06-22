@@ -44,7 +44,7 @@ fn build_df() -> DataFrame {
 
 fn ingest(host: &str, port: &str, df: &DataFrame) -> Result<(), Box<dyn Error>> {
     let db = QuestDb::connect(&format!("qwpws::addr={host}:{port};"))?;
-    let mut sender = db.borrow_sender()?;
+    let mut sender = db.borrow_column_sender()?;
     // `&str` table names "just work" via `TryInto<TableName>`; optional knobs
     // (batch size, designated-timestamp column, wire-type overrides) are built
     // with `PolarsIngestOptions`.

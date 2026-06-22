@@ -103,12 +103,12 @@ enum class line_sender_error_code
     /** QWP/WebSocket server rejection or terminal protocol violation. */
     server_rejection = 14,
 
-    /** `column_sender_conn::flush_arrow_batch` was passed a column whose
+    /** `column_sender_conn::flush_arrow_batch_*` was passed a column whose
      *  Arrow type / metadata combination has no QuestDB ingress mapping.
      *  Only raised with the `arrow` feature enabled. */
     arrow_unsupported_column_kind = 15,
 
-    /** `column_sender_conn::flush_arrow_batch` rejected a `RecordBatch` at
+    /** `column_sender_conn::flush_arrow_batch_*` rejected a `RecordBatch` at
      *  the contract layer (invalid format, structural error against the
      *  Arrow C Data Interface). Only raised with the `arrow` feature
      *  enabled. */
@@ -117,7 +117,7 @@ enum class line_sender_error_code
     /** Reconnectable failure on the column-major sender's flush/sync path
      *  (transport error, EOF, closed connection). The operation has not
      *  committed: drop the connection, re-acquire one with
-     *  `pool::borrow_conn_with_retry` (row-aligned reconnect backoff, bounded
+     *  `pool::borrow_column_sender_with_retry` (row-aligned reconnect backoff, bounded
      *  by `reconnect_max_duration`), and re-drive from your source. */
     failover_retry = 17,
 };
@@ -322,7 +322,8 @@ private:
     friend class column_chunk;
     friend class arrow_import;
     friend class pool;
-    friend class borrowed_conn;
+    friend class borrowed_column_sender;
+    friend class borrowed_row_sender;
 
     template <
         typename T,

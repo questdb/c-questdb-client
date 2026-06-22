@@ -415,6 +415,8 @@ pub(crate) struct QwpWsAddrScan {
 /// without re-parsing the connect string.
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) struct QwpWsConnector {
+    host: String,
+    port: String,
     endpoints: std::sync::Arc<[conf::QwpWsEndpoint]>,
     use_tls: bool,
     tls_settings: Option<tls::TlsSettings>,
@@ -429,6 +431,23 @@ impl QwpWsConnector {
     /// tracker to this.
     pub(crate) fn endpoint_count(&self) -> usize {
         self.endpoints.len()
+    }
+
+    pub(crate) fn max_buf_size(&self) -> usize {
+        self.max_buf_size
+    }
+
+    pub(crate) fn request_durable_ack(&self) -> bool {
+        *self.qwp_ws.request_durable_ack
+    }
+
+    /// Per-call request timeout parsed from the connect string. The direct
+    /// column backend arms this as the socket read/write timeout; the
+    /// store-and-forward backend uses it as the no-progress deadline in its
+    /// `sync` poll loop so a silent-but-alive peer cannot block the caller
+    /// forever.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        *self.qwp_ws.request_timeout
     }
 
     /// Reconnect backoff budget parsed from the connect string's
@@ -451,10 +470,34 @@ impl QwpWsConnector {
         &self,
         tracker: &mut sender::qwp_ws::QwpWsHostHealthTracker,
     ) -> Result<RawQwpWsRoundStream> {
+        // Owned-tracker path (eager pool warm-up loop + single-connection
+        // drivers): the caller holds the tracker by value, so there is no
+        // lock to take.
+        self.connect_round_with(tracker)
+    }
+
+    /// Pool path: drive the connect round against the *shared* health tracker
+    /// behind `health`, locking it only per tracker operation. Unlike the
+    /// owned [`Self::connect_round`], the health lock is **never** held across
+    /// the blocking TCP/TLS/WS-upgrade handshake, so concurrent cold-start
+    /// borrows no longer serialize end-to-end and dead-sender returns that
+    /// need the same lock are not stalled behind one slow / black-holed
+    /// connect.
+    pub(crate) fn connect_round_pooled(
+        &self,
+        health: &std::sync::Mutex<sender::qwp_ws::QwpWsHostHealthTracker>,
+    ) -> Result<RawQwpWsRoundStream> {
+        self.connect_round_with(sender::qwp_ws::LockedQwpWsHealth::new(health))
+    }
+
+    fn connect_round_with<A: sender::qwp_ws::QwpWsHealthAccess>(
+        &self,
+        health: A,
+    ) -> Result<RawQwpWsRoundStream> {
         let mut previous_idx = None;
         let connected = sender::qwp_ws::connect_qwp_ws_endpoint_round(
             &self.endpoints,
-            tracker,
+            health,
             &mut previous_idx,
             self.use_tls,
             self.tls_settings.clone(),
@@ -469,6 +512,17 @@ impl QwpWsConnector {
             request_timeout: *self.qwp_ws.request_timeout,
             durable_ack_opt_in: *self.qwp_ws.request_durable_ack,
         })
+    }
+
+    pub(crate) fn connect_sfa_background(&self) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
+        sender::qwp_ws::connect_qwp_ws_background_state(
+            self.host.as_str(),
+            self.port.as_str(),
+            self.use_tls,
+            self.tls_settings.clone(),
+            &self.qwp_ws,
+            self.auth_header.clone(),
+        )
     }
 }
 
@@ -2597,6 +2651,8 @@ impl SenderBuilder {
             &qwp_ws,
         );
         Ok(QwpWsConnector {
+            host: self.host.to_string(),
+            port: self.port.to_string(),
             endpoints,
             use_tls,
             tls_settings,

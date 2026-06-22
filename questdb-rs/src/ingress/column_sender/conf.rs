@@ -25,10 +25,10 @@
 //! Column-sender connect-string parsing.
 //!
 //! Extracts pool-specific keys (`pool_size`, `pool_max`,
-//! `pool_idle_timeout_ms`, `pool_reap`), refuses store-and-forward keys
-//! (`sf_*`, `sender_id`), enforces a QWP/WebSocket schema, and produces a
-//! sanitized conf string that the underlying [`crate::ingress::SenderBuilder`]
-//! can consume to build per-pool-slot connections.
+//! `pool_idle_timeout_ms`, `pool_reap`), detects explicit
+//! store-and-forward opt-in (`sf_dir`), enforces a QWP/WebSocket schema, and
+//! produces a sanitized conf string that the underlying
+//! [`crate::ingress::SenderBuilder`] can consume to build connections.
 
 use std::time::Duration;
 
@@ -79,6 +79,7 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedConf {
     pub(crate) pool: PoolConfig,
+    pub(crate) store_and_forward: bool,
 }
 
 /// Validate and extract pool-specific knobs from a column-sender connect
@@ -87,8 +88,8 @@ pub(crate) struct ParsedConf {
 /// The conf string itself is **not** rewritten — the underlying
 /// `SenderBuilder` silently ignores the pool keys, so a single parse over the
 /// original conf is enough. This function only sanity-checks the schema,
-/// refuses store-and-forward keys, and returns the [`PoolConfig`] the pool
-/// machinery needs.
+/// validates store-and-forward opt-in, and returns the [`PoolConfig`] the
+/// pool machinery needs.
 pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
     let Some((service, params)) = conf.split_once("::") else {
         return Err(error::fmt!(
@@ -109,10 +110,17 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
 
     let mut pool = PoolConfig::default();
     let mut pool_size_specified = false;
+    let mut pool_max_specified = false;
+    let mut sf_dir_specified = false;
+    let mut store_and_forward_key: Option<String> = None;
 
     walk_params(params, |key, value| {
-        if is_refused_key(key) {
-            return Err(refused_key_error(key));
+        if is_store_and_forward_key(key) {
+            if key == "sf_dir" {
+                sf_dir_specified = true;
+            } else if store_and_forward_key.is_none() {
+                store_and_forward_key = Some(key.to_string());
+            }
         }
         match key {
             "request_durable_ack" => {
@@ -140,6 +148,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                     ));
                 }
                 pool.pool_max = value;
+                pool_max_specified = true;
             }
             "pool_idle_timeout_ms" => {
                 let millis: u64 = value.parse().map_err(|_| {
@@ -186,6 +195,37 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         ));
     }
 
+    if !sf_dir_specified && let Some(key) = store_and_forward_key {
+        return Err(error::fmt!(
+            ConfigError,
+            "Column-sender store-and-forward configuration key {:?} requires \
+             explicit \"sf_dir\" opt-in",
+            key
+        ));
+    }
+
+    if sf_dir_specified {
+        if pool_size_specified && pool.pool_size > 1 {
+            return Err(error::fmt!(
+                ConfigError,
+                "Column-sender store-and-forward supports only \"pool_size=1\" \
+                 in v1 (got {})",
+                pool.pool_size
+            ));
+        }
+        if pool_max_specified && pool.pool_max > 1 {
+            return Err(error::fmt!(
+                ConfigError,
+                "Column-sender store-and-forward supports only \"pool_max=1\" \
+                 in v1 (got {})",
+                pool.pool_max
+            ));
+        }
+        if !pool_max_specified {
+            pool.pool_max = 1;
+        }
+    }
+
     if pool.pool_size > pool.pool_max {
         return Err(error::fmt!(
             ConfigError,
@@ -195,7 +235,10 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         ));
     }
 
-    Ok(ParsedConf { pool })
+    Ok(ParsedConf {
+        pool,
+        store_and_forward: sf_dir_specified,
+    })
 }
 
 fn parse_on_off(key: &str, value: &str) -> Result<bool> {
@@ -218,21 +261,8 @@ fn is_qwp_ws_schema(service: &str) -> bool {
         || service.eq_ignore_ascii_case("wss")
 }
 
-fn is_refused_key(key: &str) -> bool {
-    // Store-and-forward (`sf_*`) is unsupported by the column-sender API in v1
-    // — see `doc/COLUMN_SENDER_PLAN.md` §8. The legacy `sender_id` key is part
-    // of the same SF family and is refused alongside the `sf_*` keys.
+fn is_store_and_forward_key(key: &str) -> bool {
     key == "sender_id" || key.starts_with("sf_")
-}
-
-fn refused_key_error(key: &str) -> crate::Error {
-    error::fmt!(
-        ConfigError,
-        "Column-sender does not support store-and-forward configuration \
-         (key {:?} is refused; use the row-major `Sender` API if you need \
-         on-disk durability)",
-        key
-    )
 }
 
 fn parse_pool_usize(key: &str, value: &str) -> Result<usize> {
@@ -324,6 +354,7 @@ mod tests {
         assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX);
         assert_eq!(p.pool.pool_idle_timeout, DEFAULT_POOL_IDLE_TIMEOUT);
         assert_eq!(p.pool.pool_reap, PoolReap::Auto);
+        assert!(!p.store_and_forward);
     }
 
     #[test]
@@ -345,9 +376,26 @@ mod tests {
     }
 
     #[test]
-    fn refuses_sf_keys() {
+    fn sf_dir_selects_store_and_forward_and_caps_pool_max() {
+        let p = parse_ok("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;");
+        assert!(p.store_and_forward);
+        assert_eq!(p.pool.pool_size, 1);
+        assert_eq!(p.pool.pool_max, 1);
+    }
+
+    #[test]
+    fn sf_dir_accepts_explicit_single_slot_pool() {
+        let p = parse_ok(
+            "qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=1;pool_max=1;sender_id=abc;",
+        );
+        assert!(p.store_and_forward);
+        assert_eq!(p.pool.pool_size, 1);
+        assert_eq!(p.pool.pool_max, 1);
+    }
+
+    #[test]
+    fn refuses_sf_keys_without_sf_dir() {
         for key in [
-            "sf_dir",
             "sender_id",
             "sf_max_bytes",
             "sf_max_total_bytes",
@@ -358,12 +406,26 @@ mod tests {
             let err = parse_err(&conf);
             assert_eq!(err.code(), ErrorCode::ConfigError);
             assert!(
-                err.msg().contains("store-and-forward") && err.msg().contains(key),
+                err.msg().contains("sf_dir") && err.msg().contains(key),
                 "{} -> {}",
                 key,
                 err.msg()
             );
         }
+    }
+
+    #[test]
+    fn refuses_multi_slot_store_and_forward_pool_size() {
+        let err = parse_err("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=2;");
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("pool_size") && err.msg().contains("store-and-forward"));
+    }
+
+    #[test]
+    fn refuses_multi_slot_store_and_forward_pool_max() {
+        let err = parse_err("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_max=2;");
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("pool_max") && err.msg().contains("store-and-forward"));
     }
 
     #[test]

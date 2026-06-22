@@ -1,7 +1,7 @@
 """ctypes bindings for the Apache Arrow C Data Interface exports.
 
-Wraps `line_reader_cursor_next_arrow_batch` (egress) and
-`column_sender_flush_arrow_batch[_at_column]` (ingress) from
+Wraps `reader_cursor_next_arrow_batch` (egress) and
+`column_sender_flush_arrow_batch_server_stamped[_at_column]` (ingress) from
 `libquestdb_client`. Layout of `ArrowArray` / `ArrowSchema` mirrors
 the Apache Arrow spec:
 <https://arrow.apache.org/docs/format/CDataInterface.html>.
@@ -32,7 +32,7 @@ class _QuestdbDb(ctypes.Structure):
 
 
 class _QwpwsConn(ctypes.Structure):
-    """Opaque `qwpws_conn*` (borrowed pooled connection)."""
+    """Opaque `column_sender*` (borrowed pooled connection)."""
 
 
 class ArrowSenderError(_SenderError):
@@ -125,8 +125,8 @@ class SenderErrorCode:
 
 
 class ReaderErrorCode:
-    """`line_reader_error_code` discriminants. Pinned in
-    `questdb-rs-ffi/src/egress.rs::line_reader_error_code`."""
+    """`reader_error_code` discriminants. Pinned in
+    `questdb-rs-ffi/src/egress.rs::reader_error_code`."""
     COULD_NOT_RESOLVE_ADDR = 0
     CONFIG_ERROR = 1
     INVALID_API_CALL = 2
@@ -160,7 +160,7 @@ def _setsig(name, restype, *argtypes):
 
 
 _next_arrow_batch = _setsig(
-    "line_reader_cursor_next_arrow_batch",
+    "reader_cursor_next_arrow_batch",
     ctypes.c_int,
     ctypes.POINTER(_LineReaderCursor),
     ctypes.POINTER(ArrowArray),
@@ -186,28 +186,28 @@ _db_close = _setsig(
 )
 
 _db_borrow_conn = _setsig(
-    "questdb_db_borrow_conn",
+    "questdb_db_borrow_column_sender",
     ctypes.POINTER(_QwpwsConn),
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
 _db_return_conn = _setsig(
-    "questdb_db_return_conn",
+    "questdb_db_return_column_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(_QwpwsConn),
 )
 
 _db_drop_conn = _setsig(
-    "questdb_db_drop_conn",
+    "questdb_db_drop_column_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(_QwpwsConn),
 )
 
 _conn_must_close = _setsig(
-    "qwpws_conn_must_close",
+    "column_sender_must_close",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
 )
@@ -223,7 +223,7 @@ class _ColumnSenderArrowOverride(ctypes.Structure):
 
 # Conn-level Arrow batch flush.
 _flush_arrow_batch = _setsig(
-    "column_sender_flush_arrow_batch",
+    "column_sender_flush_arrow_batch_server_stamped",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
     _LineSenderTableName,
@@ -262,7 +262,7 @@ _column_sender_sync = _setsig(
 
 
 def next_arrow_batch(cursor_ptr) -> Tuple[int, ArrowArray, ArrowSchema]:
-    """Drive `line_reader_cursor_next_arrow_batch`. On OK, returns the
+    """Drive `reader_cursor_next_arrow_batch`. On OK, returns the
     populated structs; the caller becomes responsible for invoking the
     `release` callback inside each struct."""
     arr = ArrowArray()
@@ -287,8 +287,8 @@ def conn_flush_arrow_batch(
     schema_ptr,
     ts_column_name: Optional[bytes] = None,
 ) -> None:
-    """Drive `column_sender_flush_arrow_batch` (or its `_at_column`
-    variant when `ts_column_name` is set). Consumes `array_ptr`'s
+    """Drive `column_sender_flush_arrow_batch_server_stamped` (or its
+    `_at_column` variant when `ts_column_name` is set). Consumes `array_ptr`'s
     ownership; `schema_ptr` remains the caller's."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     overrides_ptr = ctypes.POINTER(_ColumnSenderArrowOverride)()
@@ -336,7 +336,7 @@ def db_close(db_ptr) -> None:
 
 
 def db_borrow_conn(db_ptr):
-    """Borrow a pooled `qwpws_conn*`."""
+    """Borrow a pooled `column_sender*`."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     conn = _db_borrow_conn(db_ptr, ctypes.byref(err_ref))
     if not conn:

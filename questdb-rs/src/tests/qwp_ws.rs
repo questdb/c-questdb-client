@@ -176,6 +176,17 @@ pub(crate) fn write_server_binary_frame(
 }
 
 pub(crate) fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<Vec<String>> {
+    perform_server_upgrade_with_version(stream, 1)
+}
+
+/// Like [`perform_server_upgrade`] but advertises an arbitrary
+/// `X-QWP-Version`. The egress reader skips the `SERVER_INFO` read and the
+/// role check when the negotiated version is `0`, which lets a park-only
+/// mock satisfy `Reader::from_conf` without emitting a `SERVER_INFO` frame.
+pub(crate) fn perform_server_upgrade_with_version(
+    stream: &mut TcpStream,
+    version: u8,
+) -> std::io::Result<Vec<String>> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
@@ -195,11 +206,42 @@ pub(crate) fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\
-         X-QWP-Version: 1\r\n\
+         X-QWP-Version: {version}\r\n\
          \r\n"
     );
     stream.write_all(response.as_bytes())?;
     Ok(request_lines)
+}
+
+/// Write a minimal `SERVER_INFO` frame: the first server→client frame an
+/// egress [`crate::egress::Reader`] consumes after the upgrade when the
+/// negotiated version is `>= 1`. Role is `Standalone` with `capabilities=0`
+/// (no zone trailer), which a `target=any` reader accepts. Emitted as an
+/// unmasked WS binary message. Bytes are written by hand (mirroring
+/// `egress::server_event::decode_server_info` + `egress::wire::header`) so
+/// the helper stays self-contained.
+#[cfg(feature = "sync-reader-ws")]
+pub(crate) fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result<()> {
+    // SERVER_INFO payload.
+    let mut payload = Vec::new();
+    payload.push(0x18); // MsgKind::ServerInfo
+    payload.push(0x00); // role = Standalone
+    payload.extend_from_slice(&1u64.to_le_bytes()); // epoch
+    payload.extend_from_slice(&0u32.to_le_bytes()); // capabilities (no CAP_ZONE)
+    payload.extend_from_slice(&0i64.to_le_bytes()); // server_wall_ns
+    payload.extend_from_slice(&0u16.to_le_bytes()); // cluster_id length = 0
+    payload.extend_from_slice(&0u16.to_le_bytes()); // node_id length = 0
+
+    // 12-byte QWP1 frame header wrapping the payload.
+    let mut frame = Vec::with_capacity(12 + payload.len());
+    frame.extend_from_slice(b"QWP1");
+    frame.push(1); // version
+    frame.push(0); // flags
+    frame.extend_from_slice(&0u16.to_le_bytes()); // table_count = 0
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload);
+
+    write_server_frame(stream, 0x2, &frame, false)
 }
 
 fn write_server_frame(

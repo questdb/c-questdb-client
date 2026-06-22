@@ -24,7 +24,6 @@
 
 //! `DecodedBatch` → `arrow_array::RecordBatch` conversion.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aligned_vec::{AVec, ConstAlign};
@@ -59,21 +58,36 @@ const _: fn() = || {
     assert_send_sync_static::<ABytes>();
 };
 
-/// Working buffers reused across SYMBOL columns in one batch. Reuses the
-/// remap HashMap allocation per `batch_to_record_batch` call so a wide
-/// batch with N SYMBOL columns does not pay N independent `HashMap::new()`
-/// costs. The hasher is `std::collections::hash_map::RandomState` —
-/// changing to a u32-tuned hasher is a follow-up.
+/// Reused across SYMBOL columns/batches. `remap[global_code]` is the dense
+/// id assigned this column (a direct index replacing a per-row `HashMap`
+/// probe); `touched` lists set entries so reset is O(distinct codes).
 #[derive(Default)]
-struct SymbolBuildScratch {
-    remap: HashMap<u32, u32>,
+pub(crate) struct SymbolBuildScratch {
+    remap: Vec<u32>,
+    touched: Vec<u32>,
 }
 
+const SYMBOL_REMAP_UNSET: u32 = u32::MAX;
+
+#[cfg(test)]
 pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
     batch: DecodedBatch,
     dict: &SymbolDict,
+) -> Result<RecordBatch> {
+    let mut sym_scratch = SymbolBuildScratch::default();
+    batch_to_record_batch_with(schema_ref, egress_schema, batch, dict, &mut sym_scratch)
+}
+
+/// As `batch_to_record_batch`, but reuses a caller-owned scratch. The
+/// streaming [`crate::egress::Cursor`] threads one across batches.
+pub(crate) fn batch_to_record_batch_with(
+    schema_ref: Arc<ArrowSchema>,
+    egress_schema: &Schema,
+    batch: DecodedBatch,
+    dict: &SymbolDict,
+    sym_scratch: &mut SymbolBuildScratch,
 ) -> Result<RecordBatch> {
     let DecodedBatch {
         row_count, columns, ..
@@ -87,7 +101,12 @@ pub(crate) fn batch_to_record_batch(
         ));
     }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
-    let mut sym_scratch = SymbolBuildScratch::default();
+    // Single degenerate-list slack pool shared by every array column in this
+    // batch. Threading one budget (rather than re-granting it per column) stops
+    // a wide batch of `[huge, 0]` columns from multiplying offset-buffer
+    // allocation by the column count: total degenerate expansion per batch is
+    // capped at ~64 MiB regardless of how many array columns the batch carries.
+    let mut degenerate_node_slack = MAX_DEGENERATE_LIST_NODES;
     for (idx, decoded) in columns.into_iter().enumerate() {
         let field = schema_ref.field(idx);
         let kind = egress_schema
@@ -100,7 +119,8 @@ pub(crate) fn batch_to_record_batch(
             decoded,
             row_count,
             dict,
-            &mut sym_scratch,
+            &mut *sym_scratch,
+            &mut degenerate_node_slack,
         )?);
     }
     RecordBatch::try_new(schema_ref, arrays)
@@ -114,6 +134,7 @@ fn column_to_array(
     row_count: usize,
     dict: &SymbolDict,
     sym_scratch: &mut SymbolBuildScratch,
+    degenerate_node_slack: &mut usize,
 ) -> Result<ArrayRef> {
     Ok(match (kind, decoded) {
         (ColumnKind::Boolean, DecodedColumn::Boolean(buf)) => {
@@ -200,11 +221,15 @@ fn column_to_array(
             let active = local_dict.as_ref().unwrap_or(dict);
             symbol_array(codes, validity, active, row_count, sym_scratch)?
         }
-        (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => {
-            array_column_to_arrow(field, b, row_count, ArrayLeaf::Float64)?
-        }
+        (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => array_column_to_arrow(
+            field,
+            b,
+            row_count,
+            ArrayLeaf::Float64,
+            degenerate_node_slack,
+        )?,
         (ColumnKind::LongArray, DecodedColumn::LongArray(b)) => {
-            array_column_to_arrow(field, b, row_count, ArrayLeaf::Int64)?
+            array_column_to_arrow(field, b, row_count, ArrayLeaf::Int64, degenerate_node_slack)?
         }
         (kind, decoded) => {
             return Err(fmt!(
@@ -295,10 +320,10 @@ fn varlen_string_array(
     row_count: usize,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let off = offsets_i32(&offsets)?;
+    let off = offsets_to_arrow_buffer(offsets)?;
     let data = ArrayDataBuilder::new(DataType::Utf8)
         .len(row_count)
-        .add_buffer(Buffer::from(bytes_from_avec(off)))
+        .add_buffer(off)
         .add_buffer(bytes_to_arrow(data))
         .nulls(nulls)
         .align_buffers(true)
@@ -315,10 +340,10 @@ fn varlen_binary_array(
     row_count: usize,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let off = offsets_i32(&offsets)?;
+    let off = offsets_to_arrow_buffer(offsets)?;
     let data = ArrayDataBuilder::new(DataType::Binary)
         .len(row_count)
-        .add_buffer(Buffer::from(bytes_from_avec(off)))
+        .add_buffer(off)
         .add_buffer(bytes_to_arrow(data))
         .nulls(nulls)
         .align_buffers(true)
@@ -448,83 +473,41 @@ fn symbol_array(
     scratch: &mut SymbolBuildScratch,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    scratch.remap.clear();
-    if scratch.remap.capacity() < codes.len().min(64) {
-        scratch
-            .remap
-            .reserve(codes.len().min(64) - scratch.remap.capacity());
+
+    if scratch.remap.len() < dict.len() {
+        scratch.remap.resize(dict.len(), SYMBOL_REMAP_UNSET);
     }
-    let remap = &mut scratch.remap;
-    let mut union_offsets: Vec<i32> = Vec::with_capacity(codes.len().min(64) + 1);
+    let remap = scratch.remap.as_mut_slice();
+    let touched = &mut scratch.touched;
+
+    let mut union_offsets: Vec<i32> = Vec::with_capacity(dict.len().min(256) + 1);
     union_offsets.push(0);
     let mut union_bytes: ABytes = ABytes::new(64);
     let mut dense = ABytes::with_capacity(64, codes.len() * 4);
     dense.resize(codes.len() * 4, 0);
 
-    fn resolve(
-        code: u32,
-        remap: &mut HashMap<u32, u32>,
-        union_offsets: &mut Vec<i32>,
-        union_bytes: &mut ABytes,
-        dict: &SymbolDict,
-    ) -> Result<u32> {
-        if let Some(&dense_code) = remap.get(&code) {
-            return Ok(dense_code);
-        }
-        let s = dict
-            .get(code)
-            .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
-        union_bytes.extend_from_slice(s.as_bytes());
-        let next_off = i32::try_from(union_bytes.len()).map_err(|_| {
-            fmt!(
-                ProtocolError,
-                "symbol union dictionary exceeds {} bytes",
-                i32::MAX
-            )
-        })?;
-        union_offsets.push(next_off);
-        let assigned = (union_offsets.len() - 2) as u32;
-        remap.insert(code, assigned);
-        Ok(assigned)
-    }
+    let build = build_symbol_dense(
+        &codes,
+        nulls.as_ref(),
+        dict,
+        remap,
+        touched,
+        &mut union_offsets,
+        &mut union_bytes,
+        &mut dense[..],
+    );
 
-    match nulls.as_ref() {
-        None => {
-            for (row, &code) in codes.iter().enumerate() {
-                let dense_code = resolve(
-                    code,
-                    &mut *remap,
-                    &mut union_offsets,
-                    &mut union_bytes,
-                    dict,
-                )?;
-                let base = row * 4;
-                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
-            }
-        }
-        Some(n) => {
-            for row in n.valid_indices() {
-                let code = codes[row];
-                let dense_code = resolve(
-                    code,
-                    &mut *remap,
-                    &mut union_offsets,
-                    &mut union_bytes,
-                    dict,
-                )?;
-                let base = row * 4;
-                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
-            }
-        }
+    // Reset before propagating errors so a reused scratch stays clean.
+    for &code in touched.iter() {
+        remap[code as usize] = SYMBOL_REMAP_UNSET;
     }
+    touched.clear();
+    build?;
 
-    let mut union_offsets_avec = ABytes::with_capacity(64, union_offsets.len() * 4);
-    for off in &union_offsets {
-        union_offsets_avec.extend_from_slice(&off.to_le_bytes());
-    }
+    let dict_len = union_offsets.len() - 1;
     let values_data = ArrayDataBuilder::new(DataType::Utf8)
-        .len(union_offsets.len() - 1)
-        .add_buffer(Buffer::from(bytes_from_avec(union_offsets_avec)))
+        .len(dict_len)
+        .add_buffer(Buffer::from_vec(union_offsets))
         .add_buffer(Buffer::from(bytes_from_avec(union_bytes)))
         .build()
         .map_err(|e| to_arrow_export(e.to_string()))?;
@@ -547,6 +530,73 @@ fn symbol_array(
     )
 }
 
+// Split out so the caller can reset the scratch even when this errors.
+#[allow(clippy::too_many_arguments)]
+fn build_symbol_dense(
+    codes: &[u32],
+    nulls: Option<&NullBuffer>,
+    dict: &SymbolDict,
+    remap: &mut [u32],
+    touched: &mut Vec<u32>,
+    union_offsets: &mut Vec<i32>,
+    union_bytes: &mut ABytes,
+    dense: &mut [u8],
+) -> Result<()> {
+    match nulls {
+        None => {
+            for (row, &code) in codes.iter().enumerate() {
+                let dense_code =
+                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+        Some(n) => {
+            for row in n.valid_indices() {
+                let code = codes[row];
+                let dense_code =
+                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_symbol(
+    code: u32,
+    remap: &mut [u32],
+    touched: &mut Vec<u32>,
+    union_offsets: &mut Vec<i32>,
+    union_bytes: &mut ABytes,
+    dict: &SymbolDict,
+) -> Result<u32> {
+    let slot = remap
+        .get(code as usize)
+        .copied()
+        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+    if slot != SYMBOL_REMAP_UNSET {
+        return Ok(slot);
+    }
+    let s = dict
+        .get(code)
+        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+    union_bytes.extend_from_slice(s.as_bytes());
+    let next_off = i32::try_from(union_bytes.len()).map_err(|_| {
+        fmt!(
+            ProtocolError,
+            "symbol union dictionary exceeds {} bytes",
+            i32::MAX
+        )
+    })?;
+    union_offsets.push(next_off);
+    let assigned = (union_offsets.len() - 2) as u32;
+    remap[code as usize] = assigned;
+    touched.push(code);
+    Ok(assigned)
+}
+
 #[derive(Clone, Copy)]
 enum ArrayLeaf {
     Float64,
@@ -558,6 +608,7 @@ fn array_column_to_arrow(
     b: ArrayBuffers,
     row_count: usize,
     leaf: ArrayLeaf,
+    degenerate_node_slack: &mut usize,
 ) -> Result<ArrayRef> {
     let ArrayBuffers {
         data_offsets,
@@ -603,8 +654,14 @@ fn array_column_to_arrow(
         ArrayLeaf::Float64 => Arc::new(arrow_array::Float64Array::from(leaf_data)),
         ArrayLeaf::Int64 => Arc::new(arrow_array::Int64Array::from(leaf_data)),
     };
-    let per_level_counts =
-        compute_per_level_counts(&shapes, &shape_offsets, ndim, row_count, total_elements)?;
+    let per_level_counts = compute_per_level_counts(
+        &shapes,
+        &shape_offsets,
+        ndim,
+        row_count,
+        total_elements,
+        degenerate_node_slack,
+    )?;
     nest_lists(field, leaf_array, per_level_counts, nulls, ndim)
 }
 
@@ -626,8 +683,15 @@ fn ndim_from_field(field: &Field) -> Result<usize> {
     Ok(d)
 }
 
-/// Slack in the list-node budget so genuinely empty shapes (`[3, 0]`) decode
-/// while a hostile stream of them stays bounded to ~64 MiB of offset buffers.
+/// Initial value of the per-batch list-node *slack* pool, so genuinely empty
+/// shapes (`[3, 0]`) decode. This is not re-granted per column: a single budget
+/// seeded with this value is shared across every array column in a batch (see
+/// `batch_to_record_batch`), so a wide batch of degenerate `[huge, 0]` columns
+/// expands to at most ~64 MiB of offset buffers *in total*, not ~64 MiB *per
+/// column*. The bound is per batch, not stream-global: a consumer that retains
+/// every decoded batch still accumulates memory, which is inherent to holding
+/// unbounded batches and is bounded per batch by the transport's
+/// `MAX_BATCH_WIRE_BYTES` cap.
 const MAX_DEGENERATE_LIST_NODES: usize = 16 * 1024 * 1024;
 
 fn compute_per_level_counts(
@@ -636,15 +700,17 @@ fn compute_per_level_counts(
     ndim: usize,
     row_count: usize,
     leaf_elements: usize,
+    degenerate_node_slack: &mut usize,
 ) -> Result<Vec<Vec<u32>>> {
     // Cap total list-node expansion: a degenerate `[huge, 0]` shape carries a
     // tiny payload yet asks for billions of empty inner lists. Valid dense
-    // data needs at most `ndim * leaf` nodes; the slack covers genuine empty
-    // shapes like `[3, 0]`.
-    let mut node_budget = leaf_elements
-        .saturating_mul(ndim)
-        .saturating_add(row_count)
-        .saturating_add(MAX_DEGENERATE_LIST_NODES);
+    // data needs at most `ndim * leaf + row_count` nodes and is always granted
+    // per column; the *slack* covers genuine empty shapes like `[3, 0]` and is
+    // drawn from `degenerate_node_slack`, a single pool shared across every
+    // column in the batch, so the column count cannot multiply the degenerate
+    // bound.
+    let legit_nodes = leaf_elements.saturating_mul(ndim).saturating_add(row_count);
+    let mut node_budget = legit_nodes.saturating_add(*degenerate_node_slack);
     let mut levels: Vec<Vec<u32>> = vec![Vec::new(); ndim];
     for row in 0..row_count {
         let lo = *shape_offsets
@@ -709,6 +775,12 @@ fn compute_per_level_counts(
             })?;
         }
     }
+    // Debit the shared pool by the slack this column actually spent. Expansion
+    // beyond the legitimate, payload-backed allowance comes out of the slack, so
+    // the remainder `node_budget` is exactly the slack left when this column dug
+    // into it; when it did not, `node_budget >= *degenerate_node_slack` and the
+    // pool is unchanged. `min` captures both cases.
+    *degenerate_node_slack = (*degenerate_node_slack).min(node_budget);
     Ok(levels)
 }
 
@@ -789,15 +861,26 @@ fn counts_to_offsets_i32(counts: &[u32]) -> Result<ABytes> {
     Ok(out)
 }
 
-fn offsets_i32(offsets: &[u32]) -> Result<ABytes> {
-    let mut out = ABytes::with_capacity(64, offsets.len() * 4);
-    for &o in offsets {
-        if o > i32::MAX as u32 {
-            return Err(fmt!(ProtocolError, "varlen offset {} exceeds i32::MAX", o));
-        }
-        out.extend_from_slice(&(o as i32).to_le_bytes());
+/// Adopt the decoder's `u32` varlen offsets as Arrow's `i32` offset buffer
+/// with no copy. Offsets are monotonic, so checking `last` bounds the slice.
+fn offsets_to_arrow_buffer(offsets: Vec<u32>) -> Result<Buffer> {
+    if let Some(&last) = offsets.last()
+        && last > i32::MAX as u32
+    {
+        return Err(fmt!(
+            ProtocolError,
+            "varlen offset {} exceeds i32::MAX",
+            last
+        ));
     }
-    Ok(out)
+    let mut offsets = std::mem::ManuallyDrop::new(offsets);
+    let ptr = offsets.as_mut_ptr() as *mut i32;
+    let len = offsets.len();
+    let cap = offsets.capacity();
+    // SAFETY: `u32`/`i32` share layout and every value is `<= i32::MAX`
+    // (checked); `offsets` is leaked so the allocation has a single owner.
+    let offsets_i32 = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+    Ok(Buffer::from_vec(offsets_i32))
 }
 
 fn buffer_to_arrow(b: &Bytes) -> Buffer {
@@ -862,7 +945,30 @@ mod tests {
     fn per_level_counts_rejects_degenerate_expansion() {
         let shapes = [1u32 << 24, 0, 1u32 << 24, 0];
         let shape_offsets = [0u32, 2, 4];
-        let err = compute_per_level_counts(&shapes, &shape_offsets, 2, 2, 0).unwrap_err();
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let err =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 2, 0, &mut slack).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn per_level_counts_slack_is_shared_across_columns() {
+        // Two array columns in one batch, each a single degenerate `[16M, 0]`
+        // row, sharing one slack pool. The first column drains the pool; the
+        // second is then rejected. This caps per-batch degenerate expansion at
+        // ~64 MiB no matter how many such columns the batch carries (the old
+        // per-column reset allowed ~64 MiB * column_count).
+        let shapes = [1u32 << 24, 0];
+        let shape_offsets = [0u32, 2];
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+
+        let counts =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0, &mut slack).unwrap();
+        assert_eq!(counts[0], vec![1u32 << 24]);
+        assert_eq!(slack, 0, "first degenerate column should drain the pool");
+
+        let err =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0, &mut slack).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -870,7 +976,9 @@ mod tests {
     fn per_level_counts_accepts_genuine_empty_shape() {
         let shapes = [3u32, 0];
         let shape_offsets = [0u32, 2];
-        let counts = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0).unwrap();
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let counts =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0, &mut slack).unwrap();
         assert_eq!(counts[0], vec![3]);
         assert_eq!(counts[1], vec![0, 0, 0]);
     }
@@ -879,8 +987,22 @@ mod tests {
     fn per_level_counts_accepts_dense_shape() {
         let shapes = [2u32, 3];
         let shape_offsets = [0u32, 2];
-        let counts = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6).unwrap();
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let counts =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6, &mut slack).unwrap();
         assert_eq!(counts[0], vec![2]);
         assert_eq!(counts[1], vec![3, 3]);
+    }
+
+    #[test]
+    fn per_level_counts_dense_does_not_drain_slack() {
+        // Legitimate, payload-backed dense data is granted per column and must
+        // not consume the shared degenerate pool, so it never starves sibling
+        // columns in the same batch.
+        let shapes = [2u32, 3];
+        let shape_offsets = [0u32, 2];
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let _ = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6, &mut slack).unwrap();
+        assert_eq!(slack, MAX_DEGENERATE_LIST_NODES);
     }
 }

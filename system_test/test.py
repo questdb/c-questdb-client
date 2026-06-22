@@ -59,6 +59,7 @@ from arrow_ingress_fuzz import (
     TestArrowIngressExtraTypes,
     TestArrowIngressUnsupportedTypes,
     TestArrowIngressMultiBatch,
+    TestArrowIngressSfa,
     TestArrowIngressFuzz,
 )
 from arrow_round_trip_fuzz import (

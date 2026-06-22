@@ -31,27 +31,27 @@ option(
     "Build shared library dependencies instead of static."
     OFF)
 
-# Opt in to the synchronous WebSocket egress reader (`line_reader_*`
+# Opt in to the synchronous WebSocket egress reader (`reader_*`
 # C/C++ surface). Pulls in the `tungstenite` + `zstd` Rust crates as
 # transitive dependencies, so downstreams that only need the line
 # sender can flip this OFF to keep the resulting library minimal.
-# Defaults ON for the in-tree build because the `line_reader_*`
+# Defaults ON for the in-tree build because the `reader_*`
 # examples and tests need it; external consumers who add this
 # project via `add_subdirectory` should set
 # `-DQUESTDB_ENABLE_READER=OFF` if they don't want the surface.
 option(
     QUESTDB_ENABLE_READER
-    "Enable the synchronous WebSocket egress reader (line_reader_* API). Adds tungstenite+zstd."
+    "Enable the synchronous WebSocket egress reader (reader_* API). Adds tungstenite+zstd."
     ON)
 
 # When QUESTDB_TESTS_AND_EXAMPLES is enabled the reader-related
 # examples and tests need the reader API present. Refusing to build
 # in that combination is friendlier than producing a confusing link
-# error from missing `line_reader_*` symbols.
+# error from missing `reader_*` symbols.
 if(QUESTDB_TESTS_AND_EXAMPLES AND NOT QUESTDB_ENABLE_READER)
     message(FATAL_ERROR
         "QUESTDB_TESTS_AND_EXAMPLES=ON requires QUESTDB_ENABLE_READER=ON: "
-        "the line_reader_* examples and tests would fail to link without it.")
+        "the reader_* examples and tests would fail to link without it.")
 endif()
 
 # Compile in the `tls_verify=false` (sender) / `tls_verify=unsafe_off`
@@ -278,26 +278,26 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         line_sender_cpp_example_decimal_binary
         examples/line_sender_cpp_example_decimal_binary.cpp)
     compile_example(
-        line_reader_c_example_from_conf
-        examples/line_reader_c_example_from_conf.c)
+        reader_c_example_from_conf
+        examples/reader_c_example_from_conf.c)
     compile_example(
-        line_reader_cpp_example_from_conf
-        examples/line_reader_cpp_example_from_conf.cpp)
+        reader_cpp_example_from_conf
+        examples/reader_cpp_example_from_conf.cpp)
     compile_example(
-        line_reader_c_example_with_binds
-        examples/line_reader_c_example_with_binds.c)
+        reader_c_example_with_binds
+        examples/reader_c_example_with_binds.c)
     compile_example(
-        line_reader_cpp_example_with_binds
-        examples/line_reader_cpp_example_with_binds.cpp)
+        reader_cpp_example_with_binds
+        examples/reader_cpp_example_with_binds.cpp)
     compile_example(
-        line_reader_cpp_example_columns
-        examples/line_reader_cpp_example_columns.cpp)
+        reader_cpp_example_columns
+        examples/reader_cpp_example_columns.cpp)
     compile_example(
-        line_reader_c_example_columns
-        examples/line_reader_c_example_columns.c)
+        reader_c_example_columns
+        examples/reader_c_example_columns.c)
     compile_example(
-        line_reader_c_example_arrow
-        examples/line_reader_c_example_arrow.c)
+        reader_c_example_arrow
+        examples/reader_c_example_arrow.c)
 
     find_package(Arrow QUIET)
     if(Arrow_FOUND)
@@ -307,10 +307,14 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         target_link_libraries(
             line_sender_cpp_example_arrow Arrow::arrow_shared)
         compile_example(
-            line_reader_cpp_example_arrow
-            examples/line_reader_cpp_example_arrow.cpp)
+            reader_cpp_example_arrow
+            examples/reader_cpp_example_arrow.cpp)
         target_link_libraries(
-            line_reader_cpp_example_arrow Arrow::arrow_shared)
+            reader_cpp_example_arrow Arrow::arrow_shared)
+        # Opts into the internal/test-only standalone reader ctor (see the
+        # foreach in the test section below for the rationale).
+        target_compile_definitions(
+            reader_cpp_example_arrow PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
     else()
         message(STATUS
             "arrow-cpp not found; skipping line_{sender,reader}_cpp_example_arrow.")
@@ -362,10 +366,10 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     # (defaults: localhost:9000), so this test is safe to wire into ctest
     # even on machines without a broker.
     compile_test(
-        test_line_reader
-        cpp_test/test_line_reader.cpp)
+        test_reader
+        cpp_test/test_reader.cpp)
 
-    # Broker-independent smoke test for the line_reader FFI. Targets a
+    # Broker-independent smoke test for the reader FFI. Targets a
     # guaranteed-closed port (127.0.0.1:1) and asserts the FFI surfaces
     # a non-NULL error that can be inspected and freed. Uses standard
     # exit-code semantics so SIGSEGV / SIGABRT correctly fail the test
@@ -373,25 +377,45 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     # pass, and inverted to a failure when QuestDB happened to be running
     # on the developer's machine).
     compile_test(
-        line_reader_c_smoke
-        cpp_test/smoke_line_reader.c)
+        reader_c_smoke
+        cpp_test/smoke_reader.c)
 
-    # Broker-independent C++ tests for the line_reader FFI. Covers the
+    # Broker-independent C++ tests for the reader FFI. Covers the
     # error-handling surface, parser rejection paths, the connect-failure
     # path against a closed port, NULL-idempotent free / close functions,
-    # `from_env`, and the C++ `line_reader_error` exception wrapper.
+    # `from_env`, and the C++ `reader_error` exception wrapper.
     compile_test(
-        test_line_reader_offline
-        cpp_test/test_line_reader_offline.cpp)
+        test_reader_offline
+        cpp_test/test_reader_offline.cpp)
 
-    # Mock-server-driven C++ tests for the line_reader FFI. Drives the
+    # Mock-server-driven C++ tests for the reader FFI. Drives the
     # reader against an in-process WebSocket + QWP1 mock so the
     # column-getter / bind-encoding / server_info / error-code / stats
     # surface that previously needed a live broker now runs in CI.
     compile_test(
-        test_line_reader_mock
+        test_reader_mock
         cpp_test/qwp_mock_server.cpp
-        cpp_test/test_line_reader_mock.cpp)
+        cpp_test/test_reader_mock.cpp)
+
+    # The standalone reader constructors (`reader_from_conf` /
+    # `reader_from_env`, and the C++ `reader(utf8_view)` ctor /
+    # `reader::from_env`) are NOT part of the supported public API: readers
+    # are obtained from the connection pool (`questdb_db_connect_reader` ->
+    # `questdb_db_borrow_reader`, or the C++ `pool::borrow_reader`). They
+    # remain exported in the shared library for the in-tree test-suite and
+    # example programs, which opt in to the header declarations via this
+    # definition. External consumers including the installed headers see the
+    # pool-only surface.
+    foreach(reader_direct_target
+            reader_c_example_from_conf reader_cpp_example_from_conf
+            reader_c_example_with_binds reader_cpp_example_with_binds
+            reader_cpp_example_columns reader_c_example_columns
+            reader_c_example_arrow
+            test_reader reader_c_smoke test_reader_offline test_reader_mock)
+        target_compile_definitions(
+            ${reader_direct_target}
+            PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
+    endforeach()
 
     # Apache Arrow C Data Interface tests. The fatal_error gate above
     # forces QUESTDB_ENABLE_ARROW=ON when tests are enabled, so these
@@ -405,6 +429,11 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_arrow_egress
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_arrow_egress.cpp)
+    # test_arrow_egress drives the egress reader via the standalone
+    # `reader(utf8_view)` constructor, so it must opt into the same
+    # internal-constructor declarations as the other reader tests above.
+    target_compile_definitions(
+        test_arrow_egress PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
     compile_test(
         test_arrow_ingress
         cpp_test/qwp_mock_server.cpp

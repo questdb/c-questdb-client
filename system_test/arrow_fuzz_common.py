@@ -71,8 +71,9 @@ __all__ = [
     "EDGE_GEOHASH_BITS",
     "arrow_cursor",
     "existing_sender",
-    "borrowed_conn",
+    "borrowed_column_sender",
     "temp_sf_dir",
+    "sfa_file_count",
     "wait_for_rows",
     "make_table_name",
     "drop_table_safe",
@@ -86,8 +87,16 @@ __all__ = [
 ]
 
 def get_live_fixture(testcase: unittest.TestCase):
-    from test import QDB_FIXTURE, QuestDbFixture, QuestDbExternalFixture
-    if not isinstance(QDB_FIXTURE, (QuestDbFixture, QuestDbExternalFixture)):
+    from test import (
+        QDB_FIXTURE,
+        QuestDbDockerFixture,
+        QuestDbExternalFixture,
+        QuestDbFixture,
+    )
+    if not isinstance(
+        QDB_FIXTURE,
+        (QuestDbFixture, QuestDbExternalFixture, QuestDbDockerFixture),
+    ):
         testcase.skipTest("requires a live QuestDB fixture")
     return QDB_FIXTURE
 
@@ -105,7 +114,7 @@ def arrow_cursor(fixture, sql: str):
     from test import skip_if_unsupported_qwp_ws_fixture
     conf_utf8 = _utf8(egress_conf(fixture))
     err_ref = ctypes.POINTER(_LineReaderError)()
-    reader = _DLL.line_reader_from_conf(conf_utf8, ctypes.byref(err_ref))
+    reader = _DLL.reader_from_conf(conf_utf8, ctypes.byref(err_ref))
     if not reader:
         err = _take_error(err_ref)
         skip_if_unsupported_qwp_ws_fixture(err, fixture)
@@ -113,15 +122,15 @@ def arrow_cursor(fixture, sql: str):
     try:
         sql_utf8 = _utf8(sql)
         err_ref = ctypes.POINTER(_LineReaderError)()
-        cursor = _DLL.line_reader_execute(reader, sql_utf8, ctypes.byref(err_ref))
+        cursor = _DLL.reader_execute(reader, sql_utf8, ctypes.byref(err_ref))
         if not cursor:
             raise _take_error(err_ref)
         try:
             yield cursor
         finally:
-            _DLL.line_reader_cursor_free(cursor)
+            _DLL.reader_cursor_free(cursor)
     finally:
-        _DLL.line_reader_close(reader)
+        _DLL.reader_close(reader)
 
 @contextlib.contextmanager
 def existing_sender(fixture, *, sender_id: Optional[str] = None,
@@ -152,6 +161,12 @@ def temp_sf_dir(prefix: str = "arrow_"):
         yield d
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+def sfa_file_count(sf_dir: str, sender_id: str) -> int:
+    slot_dir = os.path.join(sf_dir, sender_id)
+    if not os.path.isdir(slot_dir):
+        return 0
+    return sum(1 for name in os.listdir(slot_dir) if name.endswith(".sfa"))
 
 def wait_for_rows(
     fixture, table: str, expected: int, *, timeout: float = 20.0
@@ -201,11 +216,12 @@ def drop_table_safe(fixture, table: str) -> None:
         )
 
 @contextlib.contextmanager
-def borrowed_conn(fixture, **conf_extras: str):
+def borrowed_column_sender(fixture, *, sync_on_exit: bool = True, **conf_extras: str):
     """Open a `questdb_db*` pool from the fixture, borrow one
-    `qwpws_conn*`, and yield the raw conn pointer. Returns the conn
+    `column_sender*`, and yield the raw conn pointer. Returns the conn
     to the pool on exit (or drops it if the conn latched as terminal)
-    and closes the pool."""
+    and closes the pool. Set `sync_on_exit=False` when a test needs to
+    assert the exact `column_sender_sync` error."""
     from test import skip_if_unsupported_qwp_ws_fixture
     conf = ingress_conf(fixture, **conf_extras).encode("utf-8")
     try:
@@ -221,10 +237,11 @@ def borrowed_conn(fixture, **conf_extras: str):
             raise
         try:
             yield conn
-            try:
-                column_sender_sync(conn, 0)
-            except SenderError:
-                pass
+            if sync_on_exit:
+                try:
+                    column_sender_sync(conn, 0)
+                except SenderError:
+                    pass
         finally:
             if conn_must_close(conn):
                 db_drop_conn(db, conn)
@@ -242,10 +259,11 @@ def ingest_via_arrow(
     ts_col: Optional[bytes] = b"ts",
     sender_conf_extras: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Ingest one RecordBatch through `column_sender_flush_arrow_batch`.
-    If `ts_col` is None the server stamps each row on arrival."""
+    """Ingest one RecordBatch through `column_sender_flush_arrow_batch_at_column`
+    (when `ts_col` is set) or `column_sender_flush_arrow_batch_server_stamped`
+    (when `ts_col` is None — the server stamps each row on arrival)."""
     extras = sender_conf_extras or {}
-    with borrowed_conn(fixture, **extras) as conn:
+    with borrowed_column_sender(fixture, **extras) as conn:
         table_name = _c_table_name(table)
         arr, sch = pyarrow_export_record_batch(record_batch)
         try:

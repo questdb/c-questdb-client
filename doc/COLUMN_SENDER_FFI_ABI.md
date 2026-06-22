@@ -140,9 +140,9 @@ inputs.
 ### 2.5 Threading
 
 - A `questdb_db` (the pool) is **thread-safe**. Share it across
-  threads. `questdb_db_borrow_conn` and `questdb_db_return_conn`
+  threads. `questdb_db_borrow_column_sender` and `questdb_db_return_column_sender`
   are safe to call concurrently.
-- A `qwpws_conn` (a borrow) is **not thread-safe**. It belongs to
+- A `column_sender` (a borrow) is **not thread-safe**. It belongs to
   the borrowing thread until returned. Do not pass it across threads.
 - A `column_sender_chunk` is owned by one thread at a time. It is
   *not* tied to a particular conn; chunks can be built without a
@@ -162,7 +162,7 @@ for ensuring valid UTF-8 from Pandas/Polars.
 
 ```c
 typedef struct questdb_db        questdb_db;        /* connection pool */
-typedef struct qwpws_conn        qwpws_conn;        /* borrowed connection */
+typedef struct column_sender        column_sender;        /* borrowed connection */
 typedef struct column_sender_chunk column_sender_chunk;
 ```
 
@@ -186,10 +186,10 @@ multiple connections. The pool absorbs both cases:
                           │   ├─ connection #2 (lazy) │
                           │   └─ ...                  │
                           └──────────┬────────────────┘
-                                     │ borrow_conn / return_conn
+                                     │ borrow_column_sender / return_column_sender
                                      ▼
                           ┌──────────────────────────┐
-                          │  qwpws_conn (borrowed)   │
+                          │  column_sender (borrowed)   │
                           │   ├─ column_sender_chunk │
                           │   ├─ flush / sync        │
                           │   └─ ...                 │
@@ -205,7 +205,7 @@ return per work unit (or per thread).
 | Key                    | Default | Description                                                                                                                                  |
 |------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------|
 | `pool_size`            | 1       | Warm / minimum connections, opened eagerly at `questdb_db_connect`. All N go through the full WS upgrade before `connect` returns. The pool never shrinks below this. |
-| `pool_max`             | 64      | Hard cap on auto-grow. When all current conns are checked out and pool size < `pool_max`, a new connection is opened on demand. When at `pool_max`, `borrow_conn` fails fast (see §4.3).                       |
+| `pool_max`             | 64      | Hard cap on auto-grow. When all current conns are checked out and pool size < `pool_max`, a new connection is opened on demand. When at `pool_max`, `borrow_column_sender` fails fast (see §4.3).                       |
 | `pool_idle_timeout_ms` | 60000   | Connections *above* `pool_size` are closed after this much idle time in the pool's free list. Set to 0 to disable shrink (the pool only grows). |
 | `pool_reap`            | `auto`  | `auto` — pool spawns a background thread that periodically reaps idle connections per `pool_idle_timeout_ms`. `manual` — no background thread; caller invokes `questdb_db_reap_idle` on its own cadence. |
 
@@ -227,6 +227,24 @@ Validity: `pool_size <= pool_max` must hold; otherwise
 `questdb_db_connect` returns `line_sender_error_config_error`.
 
 ### 4.3 Pool functions
+
+> **Borrow kinds:** the pool hands out three handle types from the same
+> `questdb_db`: column-major senders (`column_sender`, via
+> `questdb_db_borrow_column_sender`), row-major senders (`row_sender`, via
+> `questdb_db_borrow_row_sender` — build rows with a `line_sender_buffer`
+> and flush with `row_sender_flush`), and query readers (`reader`, in
+> `questdb/egress/reader.h`). Each has its own `_return_*` / `_drop_*`
+> (readers: `_return_reader` / `reader_close`) lifecycle.
+
+> **Reader-only consumers:** `questdb_db_connect` reports the ingress
+> `line_sender_error`. A read-only path that only borrows readers can
+> instead call `questdb_db_connect_reader` (declared in
+> `questdb/egress/reader.h`), which opens the same pool but reports
+> the egress `reader_error` — so the whole lifecycle
+> (`questdb_db_connect_reader` → `questdb_db_borrow_reader` →
+> `questdb_db_return_reader` → `questdb_db_close`) uses a single error
+> type and never includes this ingress header. `questdb_db_close` is
+> re-declared in the egress header for the same reason.
 
 ```c
 /**
@@ -268,7 +286,7 @@ void questdb_db_close(questdb_db* db);
  * Do not share across threads.
  */
 QUESTDB_CLIENT_API
-qwpws_conn* questdb_db_borrow_conn(
+column_sender* questdb_db_borrow_column_sender(
     questdb_db* db,
     line_sender_error** err_out);
 
@@ -294,14 +312,14 @@ size_t questdb_db_reap_idle(questdb_db* db);
  * conn was borrowed remain valid (chunks are caller-owned, not
  * conn-owned) but cannot be flushed until a conn is borrowed again.
  *
- * If the conn is in a latched-error state (`qwpws_conn_must_close()`
+ * If the conn is in a latched-error state (`column_sender_must_close()`
  * == true), its underlying connection is closed and dropped from the
  * pool instead of returned.
  */
 QUESTDB_CLIENT_API
-void questdb_db_return_conn(
+void questdb_db_return_column_sender(
     questdb_db* db,
-    qwpws_conn* conn);
+    column_sender* conn);
 ```
 
 ### 4.4 Connection state inspection
@@ -313,7 +331,7 @@ void questdb_db_return_conn(
  * the pool, such conns are dropped, not recycled.
  */
 QUESTDB_CLIENT_API
-bool qwpws_conn_must_close(const qwpws_conn* conn);
+bool column_sender_must_close(const column_sender* conn);
 ```
 
 ---
@@ -643,7 +661,8 @@ bool column_sender_chunk_symbol_dict_i32(
 
 Single entry point that consumes one column from an Apache Arrow C
 Data Interface array and routes through the same classifier and
-encoder used by `column_sender_flush_arrow_batch` (§13.1). Coverage is
+encoder used by `column_sender_flush_arrow_batch_server_stamped`
+(§13.1). Coverage is
 the full 43-variant `ColumnKind` matrix — all primitives, timestamps,
 dates, decimals (Decimal32/64/128/256), UUID, LONG256, geohash,
 dictionary-encoded symbols across every key/value combination, and
@@ -786,11 +805,23 @@ bool column_sender_chunk_append_numpy_column(
     size_t name_len,
     column_sender_numpy_dtype dtype,
     const uint8_t* data,
+    size_t data_len_bytes,
     size_t row_count,
     const column_sender_validity* validity,
     const column_sender_numpy_extras* extras,
     line_sender_error** err_out);
 ```
+
+`data_len_bytes` is the byte length of `data`. It is validated against
+`row_count * source-stride(dtype)` (the bytes the deferred encoder reads,
+using the *source* element width, not the wire width). A buffer too small
+for the declared `dtype` + `row_count` is rejected with
+`line_sender_error_invalid_api_call` and nothing is appended — this is the
+only bound on the zero-copy pointer, guarding against a mis-tagged `dtype`
+or an inflated `row_count` reading past the allocation. Pass `arr.nbytes`
+(or `0` when `data == NULL` and `row_count == 0`). It does **not** relax
+the lifetime contract: `data` must stay alive and unmodified until the
+next flush/sync returns.
 
 ### 11.1 Dtype coverage matrix
 
@@ -1019,7 +1050,7 @@ typedef enum column_sender_ack_level
  */
 QUESTDB_CLIENT_API
 bool column_sender_flush(
-    qwpws_conn* conn,
+    column_sender* conn,
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
@@ -1037,18 +1068,31 @@ bool column_sender_flush(
  * conn, or `durable` requested without opt-in), returns false and
  * sets *err_out.
  *
- * Sync blocks until ack or until the underlying connection enters a
- * terminal failure state (`qwpws_conn_must_close()` becomes true).
+ * Sync blocks until ack, until the underlying connection enters a
+ * terminal failure state (`column_sender_must_close()` becomes true), or
+ * until it makes no progress for `request_timeout` (default 30s).
  * Transport errors latch the conn as terminal; return it to the pool
- * and borrow a fresh conn to continue. No separate per-call timeout in
- * v1; if you need one, file a request.
+ * and borrow a fresh conn to continue.
+ *
+ * No-progress timeout: both backends bound how long sync waits while the
+ * server is alive but never advances the ack/durable watermark (e.g. a
+ * back-pressured WAL or a stuck commit). The direct backend arms
+ * `request_timeout` as the socket read timeout; the store-and-forward
+ * backend uses it as a no-progress deadline in its poll loop. The deadline
+ * is reset on every watermark advance, so a slow-but-progressing sync (for
+ * example a `durable` upload under pressure) keeps extending it and is not
+ * cut off. When it does fire, sync returns `line_sender_error_failover_retry`
+ * with a "timed out … no ack progress" message; the queued/unacked frames
+ * are retained, so drop this conn and re-borrow to replay (store-and-forward)
+ * or re-drive from source (direct). There is no separate per-call timeout
+ * knob in v1; raise `request_timeout` to wait longer.
  *
  * The QWP wire `sequence` (FSN) is tracked internally and is not
  * exposed at the FFI.
  */
 QUESTDB_CLIENT_API
 bool column_sender_sync(
-    qwpws_conn* conn,
+    column_sender* conn,
     column_sender_ack_level ack_level,
     line_sender_error** err_out);
 ```
@@ -1060,9 +1104,12 @@ Conn-level 1-copy entry that bypasses the `column_sender_chunk` and
 (`ArrowArray` + `ArrowSchema`) is consumed end-to-end into the
 outgoing QWP frame in a single pass.
 
-- **Designated timestamp**: omitted (`flush_arrow_batch`) → server
-  stamps each row on arrival; or sourced from a named `Timestamp(_)`
-  column (`flush_arrow_batch_at_column`).
+- **Designated timestamp**: either explicitly omitted
+  (`flush_arrow_batch_server_stamped`) → server stamps each row on
+  arrival; or sourced from a named `Timestamp(_)` column
+  (`flush_arrow_batch_at_column`). A batch with no designated timestamp
+  is rejected unless the server-stamp opt-in is used — there is no
+  silent server-stamp default.
 - **Ownership**: on success, the consumer invokes `array->release` /
   `schema->release`; on failure the caller retains ownership.
 - **Deferred-commit semantics**: identical to `column_sender_flush`;
@@ -1072,8 +1119,8 @@ outgoing QWP frame in a single pass.
 ```c
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch(
-    qwpws_conn* conn,
+bool column_sender_flush_arrow_batch_server_stamped(
+    column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
     struct ArrowSchema* schema,
@@ -1081,7 +1128,7 @@ bool column_sender_flush_arrow_batch(
 
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch_at_column(
-    qwpws_conn* conn,
+    column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
     struct ArrowSchema* schema,
@@ -1090,8 +1137,8 @@ bool column_sender_flush_arrow_batch_at_column(
 #endif
 ```
 
-Coverage matches the Rust `ColumnSender::flush_arrow_batch` —
-all 43 classified `ColumnKind` variants from
+Coverage matches the Rust `ColumnSender::flush_arrow_batch_server_stamped`
+— all 43 classified `ColumnKind` variants from
 `column_sender::arrow_batch::classify`. Failure paths surface as
 `line_sender_error_arrow_unsupported_column_kind` (column kind has no
 QWP wire mapping) or `line_sender_error_arrow_ingest` (structural
@@ -1122,10 +1169,10 @@ unit of work, return it when done.
 
 int send_one_chunk(questdb_db* db) {
     line_sender_error* err = NULL;
-    qwpws_conn* conn = NULL;
+    column_sender* conn = NULL;
     column_sender_chunk* chunk = NULL;
 
-    conn = questdb_db_borrow_conn(db, &err);
+    conn = questdb_db_borrow_column_sender(db, &err);
     if (!conn) goto fail;
 
     chunk = column_sender_chunk_new("trades", 6, &err);
@@ -1151,7 +1198,7 @@ int send_one_chunk(questdb_db* db) {
     /* sync returned: server has WAL-committed all flushed chunks */
 
     column_sender_chunk_free(chunk);
-    questdb_db_return_conn(db, conn);
+    questdb_db_return_column_sender(db, conn);
     return 0;
 
 fail:
@@ -1160,7 +1207,7 @@ fail:
         line_sender_error_free(err);
     }
     column_sender_chunk_free(chunk);
-    if (conn) questdb_db_return_conn(db, conn);
+    if (conn) questdb_db_return_column_sender(db, conn);
     return 1;
 }
 
@@ -1207,6 +1254,8 @@ agent.
   does not have a fast path for object dtype — that's a deliberate
   choice. Document this.
 - **Object lifetimes** — keep the source `np.ndarray` / `pa.Array`
-  alive for the duration of the FFI call. Buffers are copied into the
-  chunk during the call, so they can be dropped after the call
-  returns.
+  alive until the chunk is flushed (or freed / cleared). The FFI
+  stores **raw pointers** into the caller's buffers and does **not**
+  copy at append time, so the source must **not** be dropped after the
+  append call returns — it must outlive the next `column_sender_flush`
+  on the chunk. See the buffer lifetime contract in §2.3.

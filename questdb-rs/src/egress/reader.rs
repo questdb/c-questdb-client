@@ -657,7 +657,7 @@ impl Reader {
     }
 
     /// Borrow the shared diagnostic counters. The FFI clones this at
-    /// `line_reader_from_conf` time so its stat getters can read the
+    /// `reader_from_conf` time so its stat getters can read the
     /// counters without touching the `UnsafeCell<Reader>` that holds
     /// this Reader — eliminating the aliasing question of "what
     /// happens when a stat getter synthesises a `&Reader` while a
@@ -1179,6 +1179,8 @@ impl<'r> ReaderQuery<'r> {
             data_delivered: false,
             #[cfg(feature = "arrow")]
             drifted_batch: None,
+            #[cfg(feature = "arrow")]
+            sym_scratch: crate::egress::arrow::SymbolBuildScratch::default(),
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1404,6 +1406,10 @@ pub struct Cursor<'r> {
     /// call so the rows are recoverable rather than dropped.
     #[cfg(feature = "arrow")]
     drifted_batch: Option<DecodedBatch>,
+    /// Reused across batches so the SYMBOL remap allocation is paid once
+    /// per cursor, not per `RESULT_BATCH`.
+    #[cfg(feature = "arrow")]
+    sym_scratch: crate::egress::arrow::SymbolBuildScratch,
     /// Pin `!Send` regardless of whether the callback is installed.
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -1626,7 +1632,7 @@ impl<'r> Cursor<'r> {
         &mut self,
         expected_schema: Option<&arrow_schema::SchemaRef>,
     ) -> Result<Option<arrow_array::RecordBatch>> {
-        use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch, schemas_equal};
+        use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch_with, schemas_equal};
         use std::sync::Arc;
 
         if self.done {
@@ -1689,7 +1695,13 @@ impl<'r> Cursor<'r> {
             self.drifted_batch = Some(decoded);
             return Err(e);
         }
-        match batch_to_record_batch(arrow_schema, &egress_schema, decoded, &self.reader.dict) {
+        match batch_to_record_batch_with(
+            arrow_schema,
+            &egress_schema,
+            decoded,
+            &self.reader.dict,
+            &mut self.sym_scratch,
+        ) {
             Ok(rb) => Ok(Some(rb)),
             Err(e) => {
                 self.stash_arrow_terminal_error(&e);
@@ -2939,7 +2951,7 @@ mod tests {
         assert_eq!(alias.read_ns.load(Ordering::Relaxed), 1_000);
         assert_eq!(alias.decode_ns.load(Ordering::Relaxed), 500);
         // Reset via the inner Reader's API is visible through the
-        // FFI's clone too (the contract of `line_reader_reset_timing`).
+        // FFI's clone too (the contract of `reader_reset_timing`).
         alias.read_ns.store(0, Ordering::Relaxed);
         alias.decode_ns.store(0, Ordering::Relaxed);
         assert_eq!(stats.read_ns.load(Ordering::Relaxed), 0);

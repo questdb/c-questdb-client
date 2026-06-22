@@ -127,7 +127,14 @@ pub mod _bench_internals {
     ) -> crate::egress::error::Result<arrow_array::RecordBatch> {
         use std::sync::Arc;
         let arrow_schema = Arc::new(crate::egress::arrow::batch_arrow_schema(schema, &batch)?);
-        crate::egress::arrow::batch_to_record_batch(arrow_schema, schema, batch, dict)
+        let mut scratch = crate::egress::arrow::SymbolBuildScratch::default();
+        crate::egress::arrow::batch_to_record_batch_with(
+            arrow_schema,
+            schema,
+            batch,
+            dict,
+            &mut scratch,
+        )
     }
 
     /// Full decode→assemble→polars path for the `→ polars DataFrame`

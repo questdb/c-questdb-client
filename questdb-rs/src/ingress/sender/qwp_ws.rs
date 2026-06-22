@@ -61,7 +61,7 @@ use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
-use super::qwp_ws_publisher::QwpWsReplayEncoder;
+use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::OutboundFrame;
 use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
@@ -203,6 +203,7 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     append_deadline: Duration,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -213,6 +214,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     progress: SfaProgressView,
     cold_effects: VecDeque<RunnerColdEffect>,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -221,6 +223,7 @@ struct SyncQwpWsPendingRunnerCore {
     pending_connect: QwpWsPendingConnect,
     progress: SfaProgressView,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -291,9 +294,11 @@ where
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
+        let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -302,6 +307,7 @@ where
                 progress,
                 cold_effects: VecDeque::new(),
                 backpressure: thread_backpressure,
+                ok_completed_upper: thread_ok_completed_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -318,6 +324,7 @@ where
             producer,
             lifecycle,
             backpressure,
+            ok_completed_upper,
             append_deadline,
             stop,
             thread: Some(thread),
@@ -336,9 +343,11 @@ where
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
+        let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -347,6 +356,7 @@ where
                 pending_connect,
                 progress,
                 backpressure: thread_backpressure,
+                ok_completed_upper: thread_ok_completed_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -363,6 +373,7 @@ where
             producer,
             lifecycle,
             backpressure,
+            ok_completed_upper,
             append_deadline,
             stop,
             thread: Some(thread),
@@ -463,6 +474,33 @@ where
         let store = self.lock_shared()?;
         check_store_error(&store)?;
         Ok(store.completed_fsn())
+    }
+
+    fn ok_fsn(&self) -> crate::Result<Option<u64>> {
+        self.check_error()?;
+        let completed_upper = if let Some(producer) = self.producer.as_ref() {
+            producer
+                .completed_fsn()
+                .map_or(0, |fsn| fsn.saturating_add(1))
+        } else {
+            let store = self.lock_shared()?;
+            check_store_error(&store)?;
+            store.completed_fsn().map_or(0, |fsn| fsn.saturating_add(1))
+        };
+        let upper = self
+            .ok_completed_upper
+            .load(Ordering::Acquire)
+            .max(completed_upper);
+        Ok(upper.checked_sub(1))
+    }
+
+    fn poll_sender_error_overlapping(
+        &self,
+        from_fsn: u64,
+        to_fsn: u64,
+    ) -> crate::Result<Option<QwpWsSenderError>> {
+        let mut store = self.lock_shared()?;
+        Ok(store.poll_sender_error_overlapping(from_fsn, to_fsn))
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
@@ -600,6 +638,16 @@ impl BackpressureNotifier {
     }
 }
 
+fn update_atomic_max(cell: &AtomicU64, value: u64) {
+    let mut current = cell.load(Ordering::Acquire);
+    while value > current {
+        match cell.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 impl QwpWsPendingConnect {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -729,6 +777,7 @@ impl SyncQwpWsPendingRunnerCore {
                     progress: self.progress.clone(),
                     cold_effects: VecDeque::new(),
                     backpressure: Arc::clone(&self.backpressure),
+                    ok_completed_upper: Arc::clone(&self.ok_completed_upper),
                     lifecycle: self.lifecycle.clone(),
                 });
                 RunnerStep::Continue
@@ -941,6 +990,9 @@ where
     where
         Q: PublicationLog,
     {
+        if let Some(fsn) = progress.ok_fsn {
+            update_atomic_max(&self.ok_completed_upper, fsn.saturating_add(1));
+        }
         self.enqueue_hot_response_events(progress.events);
         if self.flush_cold_effects(shared) == RunnerStep::Stop {
             return RunnerStep::Stop;
@@ -2248,6 +2300,21 @@ impl QwpWsHostHealthTracker {
         None
     }
 
+    /// Like [`Self::pick_next`] but also marks the chosen endpoint
+    /// `attempted_this_round` before returning. The pool drives the connect
+    /// round through [`QwpWsHealthAccess`], releasing the health lock during
+    /// the blocking `establish_connection`; claiming the endpoint while the
+    /// lock is still held means concurrent borrows rotate to a *different*
+    /// peer instead of piling onto the same slow / black-holed endpoint. The
+    /// real outcome is still recorded by the matching `record_*` call once the
+    /// attempt finishes (those also set `attempted_this_round`, so the early
+    /// claim is idempotent).
+    pub(super) fn pick_next_and_claim(&mut self) -> Option<usize> {
+        let idx = self.pick_next()?;
+        self.attempted_this_round[idx] = true;
+        Some(idx)
+    }
+
     pub(super) fn record_success(&mut self, idx: usize) {
         self.states[idx] = QwpWsHostState::Healthy;
         self.attempted_this_round[idx] = true;
@@ -2278,6 +2345,51 @@ impl QwpWsHostHealthTracker {
     pub(super) fn record_zone(&mut self, _idx: usize, _zone: Option<&str>) {
         // Rust is still client-zone-blind, which matches the spec's zone-unset
         // path: every endpoint remains in the Same tier.
+    }
+}
+
+/// How [`connect_qwp_ws_endpoint_round`] reaches the health tracker.
+///
+/// Every tracker mutation/read goes through [`Self::with_tracker`], so an
+/// implementation backed by a `Mutex` (the connection pool) acquires and
+/// releases the lock *per operation*. The blocking `establish_connection`
+/// between those operations therefore runs with **no** health lock held —
+/// the fix for the pool's head-of-line blocking, where a single slow /
+/// black-holed connect used to stall every other borrow and every dead-sender
+/// return that needed the same lock. Single-connection drivers that own the
+/// tracker by value implement this as a direct in-place mutation with no
+/// locking.
+pub(crate) trait QwpWsHealthAccess {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R;
+}
+
+/// Owned-tracker accessor: the single-connection background / SFA / reconnect
+/// drivers hold the tracker by value, so there is no lock to take.
+impl QwpWsHealthAccess for &mut QwpWsHostHealthTracker {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R {
+        f(self)
+    }
+}
+
+/// Pool accessor: locks the shared tracker for the duration of a single
+/// tracker operation only, never across the blocking connect.
+pub(crate) struct LockedQwpWsHealth<'a> {
+    mutex: &'a Mutex<QwpWsHostHealthTracker>,
+}
+
+impl<'a> LockedQwpWsHealth<'a> {
+    pub(crate) fn new(mutex: &'a Mutex<QwpWsHostHealthTracker>) -> Self {
+        Self { mutex }
+    }
+}
+
+impl QwpWsHealthAccess for LockedQwpWsHealth<'_> {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R {
+        // Poison-tolerant like the pool's other lock helpers: a panic in
+        // another thread's short locked region must not turn every subsequent
+        // borrow/return into a panic.
+        let mut guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut guard)
     }
 }
 
@@ -2441,9 +2553,9 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
-pub(crate) fn connect_qwp_ws_endpoint_round(
+pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     endpoints: &Arc<[QwpWsEndpoint]>,
-    tracker: &mut QwpWsHostHealthTracker,
+    mut health: A,
     previous_idx: &mut Option<usize>,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
@@ -2451,10 +2563,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
     auth_header: Option<&str>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
     if let Some(idx) = previous_idx.take() {
-        tracker.record_mid_stream_failure(idx);
+        health.with_tracker(|t| t.record_mid_stream_failure(idx));
     }
-    if tracker.is_round_exhausted() {
-        tracker.begin_round(true);
+    if health.with_tracker(|t| t.is_round_exhausted()) {
+        health.with_tracker(|t| t.begin_round(true));
     }
 
     let mut last_transport_endpoint_idx = None;
@@ -2463,7 +2575,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
     let mut role_reject_count = 0usize;
     let mut latched_typed_error = None;
 
-    while let Some(idx) = tracker.pick_next() {
+    // Pick + claim under the lock, then drop it for the blocking connect, then
+    // re-acquire only to record the outcome. The lock is never held across
+    // `establish_connection`.
+    while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim()) {
         let endpoint = &endpoints[idx];
         match establish_connection(
             &endpoint.host,
@@ -2474,7 +2589,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
             auth_header,
         ) {
             Ok((stream, handshake_result, leftover)) => {
-                tracker.record_success(idx);
+                health.with_tracker(|t| t.record_success(idx));
                 *previous_idx = Some(idx);
                 return Ok(QwpWsConnectRoundSuccess {
                     endpoint_idx: idx,
@@ -2488,8 +2603,12 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
             Err(err) if is_qwp_ws_role_reject_error(&err) => {
                 role_reject_count += 1;
                 let role_reject = err.qwp_ws_role_reject().cloned();
-                tracker.record_zone(idx, qwp_ws_role_reject_zone(&err));
-                tracker.record_role_reject(idx, qwp_ws_role_reject_is_transient(&err));
+                let zone = qwp_ws_role_reject_zone(&err).map(str::to_string);
+                let transient = qwp_ws_role_reject_is_transient(&err);
+                health.with_tracker(|t| {
+                    t.record_zone(idx, zone.as_deref());
+                    t.record_role_reject(idx, transient);
+                });
                 let mut err = error::fmt!(
                     RoleMismatch,
                     "QWP/WebSocket role mismatch at {}:{}: {}",
@@ -2503,7 +2622,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
                 last_role_mismatch = Some(err);
             }
             Err(err) => {
-                tracker.record_transport_error(idx);
+                health.with_tracker(|t| t.record_transport_error(idx));
                 if err.code() == crate::ErrorCode::ProtocolVersionError {
                     latched_typed_error = Some(err.clone());
                 }
@@ -2555,6 +2674,19 @@ pub(crate) fn connect_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<SyncProtocolHandler> {
+    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
+        connect_qwp_ws_background_state(host, port, use_tls, tls_settings, qwp_ws, auth_header)?,
+    )))
+}
+
+pub(crate) fn connect_qwp_ws_background_state(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<String>,
+) -> crate::Result<SyncQwpWsHandlerState> {
     let orphan_config = OrphanDrainerConfig::new(
         host,
         port,
@@ -2612,15 +2744,13 @@ pub(crate) fn connect_qwp_ws(
         orphan_config,
     );
 
-    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
-        SyncQwpWsHandlerState {
-            encoder,
-            runner,
-            server_max_batch_size,
-            orphan_pool,
-            close_drain_timeout: *qwp_ws.close_flush_timeout,
-        },
-    )))
+    Ok(SyncQwpWsHandlerState {
+        encoder,
+        runner,
+        server_max_batch_size,
+        orphan_pool,
+        close_drain_timeout: *qwp_ws.close_flush_timeout,
+    })
 }
 
 fn orphan_candidates(qwp_ws: &QwpWsConfig) -> Vec<std::path::PathBuf> {
@@ -2848,6 +2978,26 @@ pub(crate) fn flush_qwp_ws(
     })
 }
 
+pub(crate) fn publish_qwp_ws_payload_background(
+    state: &mut SyncQwpWsHandlerState,
+    payload: &[u8],
+    max_buf_size: usize,
+) -> crate::Result<u64> {
+    if payload.is_empty() {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Could not flush buffer: QWP/WebSocket encoded message is empty."
+        ));
+    }
+    if payload.len() > max_buf_size {
+        return Err(qwp_ws_encoded_message_size_error(
+            payload.len(),
+            max_buf_size,
+        ));
+    }
+    state.runner.publish_replay_payload(payload)
+}
+
 pub(crate) fn flush_qwp_ws_manual(
     state: &mut ManualQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,
@@ -2913,6 +3063,20 @@ pub(crate) fn qwp_ws_acked_fsn_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     state.runner.acked_fsn()
+}
+
+pub(crate) fn qwp_ws_ok_fsn_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    state.runner.ok_fsn()
+}
+
+pub(crate) fn qwp_ws_poll_sender_error_in_range_background(
+    state: &SyncQwpWsHandlerState,
+    from_fsn: u64,
+    to_fsn: u64,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    state.runner.poll_sender_error_overlapping(from_fsn, to_fsn)
 }
 
 pub(crate) fn qwp_ws_published_fsn_manual(
@@ -3269,6 +3433,73 @@ mod tests {
         assert_eq!(tracker.states[2], QwpWsHostState::Healthy);
         assert_eq!(tracker.states[3], QwpWsHostState::HealthUnknown);
         assert_eq!(tracker.pick_next(), Some(2));
+    }
+
+    #[test]
+    fn locked_health_access_never_holds_lock_between_operations() {
+        // The pool's head-of-line fix relies on this: the connect round only
+        // touches the shared tracker inside `with_tracker`, and the blocking
+        // `establish_connection` runs *between* those calls. So the lock must
+        // be fully released the instant each `with_tracker` returns — a
+        // returning sender recording a transport failure, or a concurrent
+        // cold-start borrow, must never stall behind one slow / black-holed
+        // connect.
+        let mutex = std::sync::Mutex::new(QwpWsHostHealthTracker::new(2));
+        let mut access = LockedQwpWsHealth::new(&mutex);
+
+        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+        assert!(
+            mutex.try_lock().is_ok(),
+            "health lock must be released after pick+claim, not held across the connect"
+        );
+
+        access.with_tracker(|t| t.record_success(idx));
+        assert!(
+            mutex.try_lock().is_ok(),
+            "health lock must be released after recording the outcome"
+        );
+    }
+
+    #[test]
+    fn locked_health_access_lets_another_thread_lock_between_operations() {
+        // Concrete proof that a second actor (a returning sender / another
+        // borrow) can take `inner.health` while a connect round is mid-flight
+        // between its pick and its record steps.
+        let mutex = Arc::new(std::sync::Mutex::new(QwpWsHostHealthTracker::new(2)));
+        let mut access = LockedQwpWsHealth::new(&mutex);
+
+        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+
+        // Simulates the gap during which `establish_connection` blocks: no
+        // health lock is held here, so another thread grabs it freely.
+        let other = Arc::clone(&mutex);
+        std::thread::spawn(move || {
+            other
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_mid_stream_failure(1);
+        })
+        .join()
+        .unwrap();
+
+        access.with_tracker(|t| t.record_transport_error(idx));
+    }
+
+    #[test]
+    fn pick_next_and_claim_rotates_concurrent_picks_off_the_same_endpoint() {
+        // Claiming the endpoint *while the lock is still held* means a second
+        // borrow that picks before the first has recorded its outcome rotates
+        // to a different peer instead of piling onto the same slow endpoint.
+        let mut tracker = QwpWsHostHealthTracker::new(2);
+        let a = tracker.pick_next_and_claim().unwrap();
+        let b = tracker.pick_next_and_claim().unwrap();
+        assert_ne!(a, b, "concurrent claims must target distinct endpoints");
+        assert!(tracker.is_round_exhausted());
+        assert_eq!(tracker.pick_next_and_claim(), None);
+
+        // A fresh round re-probes from scratch.
+        tracker.begin_round(true);
+        assert!(tracker.pick_next_and_claim().is_some());
     }
 
     #[test]
@@ -3997,6 +4228,7 @@ mod tests {
             progress,
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -4048,6 +4280,7 @@ mod tests {
             progress: progress.clone(),
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -4103,16 +4336,19 @@ mod tests {
         let lifecycle = store.lifecycle();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let mut core = SyncQwpWsRunnerCore {
             send_core,
             progress: progress.clone(),
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::clone(&ok_completed_upper),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
 
         assert_eq!(core.drive_step(&shared, &stop), RunnerStep::Continue);
+        assert_eq!(ok_completed_upper.load(Ordering::Acquire), 1);
         assert_eq!(progress.completed_fsn(), None);
 
         let mut guard = Some(shared.lock().unwrap());
@@ -4133,6 +4369,27 @@ mod tests {
             let _ = step_thread.join();
             panic!("durable ACK progress waited for shared-store mutex");
         });
+    }
+
+    #[test]
+    fn threaded_sfa_ok_fsn_uses_completed_fsn_lower_bound() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"sfa-completed").unwrap();
+        let (store, send_core) = driver.into_parts();
+        let progress = store.progress_view();
+        progress.complete_through_fsn(receipt.fsn).unwrap();
+        let runner =
+            SyncQwpWsRunner::start_with_append_deadline(store, send_core, Duration::from_secs(5));
+
+        assert_eq!(runner.ok_fsn().unwrap(), Some(receipt.fsn));
     }
 
     #[test]

@@ -16,7 +16,7 @@
  *
  ******************************************************************************/
 
-// In-process mock QWP server for the C/C++ line_reader tests. Speaks the
+// In-process mock QWP server for the C/C++ reader tests. Speaks the
 // HTTP-Upgrade + WebSocket + QWP1 binary frame layer well enough to drive
 // the reader through every documented client-visible state without a real
 // QuestDB instance.

@@ -16,13 +16,13 @@
  *
  ******************************************************************************/
 
-// Broker-independent tests for the line_reader FFI.
+// Broker-independent tests for the reader FFI.
 //
 // Covers the error-handling and configuration surface that does not need a
 // running QuestDB instance: parser rejection paths, connect-failure error
-// codes, the C error accessor functions, the C++ `line_reader_error`
+// codes, the C error accessor functions, the C++ `reader_error`
 // wrapper, NULL-idempotency of every `_free` / `_close` entry point, and
-// the `from_env` env-var lookup. Complements `test_line_reader.cpp`, which
+// the `from_env` env-var lookup. Complements `test_reader.cpp`, which
 // covers the live-broker round-trip surface and skips entirely without a
 // broker. CI runs both — together they verify symbol resolution, the error
 // path, and the connect path even when no broker is reachable.
@@ -30,8 +30,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 
-#include <questdb/egress/line_reader.h>
-#include <questdb/egress/line_reader.hpp>
+#include <questdb/egress/reader.h>
+#include <questdb/egress/reader.hpp>
 
 #include <cstdlib>
 #include <cstring>
@@ -73,21 +73,21 @@ TEST_CASE("free / close functions are NULL-idempotent")
 {
     // None of these should crash; a regression that drops the NULL guard
     // would SIGSEGV here and fail the test rather than silently passing.
-    line_reader_error_free(nullptr);
-    line_reader_close(nullptr);
-    line_reader_query_free(nullptr);
-    line_reader_cursor_free(nullptr);
+    reader_error_free(nullptr);
+    reader_close(nullptr);
+    reader_query_free(nullptr);
+    reader_cursor_free(nullptr);
 }
 
 TEST_CASE("error accessors are NULL-safe (M-13)")
 {
     // _get_code on NULL must not crash — returns a sentinel code.
-    const auto code = line_reader_error_get_code(nullptr);
-    CHECK(code == line_reader_error_invalid_api_call);
+    const auto code = reader_error_get_code(nullptr);
+    CHECK(code == reader_error_invalid_api_call);
 
     // _msg on NULL must return a non-NULL empty string and zero out len.
     size_t len = 999;
-    const char* msg = line_reader_error_msg(nullptr, &len);
+    const char* msg = reader_error_msg(nullptr, &len);
     REQUIRE(msg != nullptr);
     CHECK(len == 0);
     CHECK(msg[0] == '\0');
@@ -95,7 +95,7 @@ TEST_CASE("error accessors are NULL-safe (M-13)")
     // _msg with a NULL len_out must also be safe (the function's
     // documented promise is "never returns NULL", and len_out is now
     // optional).
-    msg = line_reader_error_msg(nullptr, nullptr);
+    msg = reader_error_msg(nullptr, nullptr);
     REQUIRE(msg != nullptr);
 }
 
@@ -107,8 +107,8 @@ TEST_CASE("error accessors are NULL-safe (M-13)")
 //   1. "Idempotent on NULL" — the various `_free` / `_close` paths and
 //      the error accessors. Tested above.
 //   2. "Returns a documented sentinel on NULL" — the reader stat getters,
-//      every `line_reader_server_info_*` accessor, and every
-//      `line_reader_failover_event_*` accessor. Their guard is a cheap
+//      every `reader_server_info_*` accessor, and every
+//      `reader_failover_event_*` accessor. Their guard is a cheap
 //      `is_null()` check; a regression that drops the guard would cause
 //      a SIGSEGV here rather than returning the documented sentinel.
 //
@@ -121,67 +121,67 @@ TEST_CASE("error accessors are NULL-safe (M-13)")
 
 TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
 {
-    CHECK(line_reader_bytes_received(nullptr) == 0);
-    CHECK(line_reader_credit_granted_total(nullptr) == 0);
-    CHECK(line_reader_read_ns(nullptr) == 0);
-    CHECK(line_reader_decode_ns(nullptr) == 0);
+    CHECK(reader_bytes_received(nullptr) == 0);
+    CHECK(reader_credit_granted_total(nullptr) == 0);
+    CHECK(reader_read_ns(nullptr) == 0);
+    CHECK(reader_decode_ns(nullptr) == 0);
 
     // Mutating no-op: must not crash, no observable state change.
-    line_reader_reset_timing(nullptr);
+    reader_reset_timing(nullptr);
 
     {
         // _server_version: returns false, populates *err_out when err_out
         // is non-NULL.
-        line_reader_error* err = nullptr;
+        reader_error* err = nullptr;
         uint8_t version = 0xAB;
-        bool ok = line_reader_server_version(nullptr, &version, &err);
+        bool ok = reader_server_version(nullptr, &version, &err);
         CHECK_FALSE(ok);
         REQUIRE(err != nullptr);
-        CHECK(line_reader_error_get_code(err) ==
-              line_reader_error_invalid_api_call);
-        line_reader_error_free(err);
+        CHECK(reader_error_get_code(err) ==
+              reader_error_invalid_api_call);
+        reader_error_free(err);
     }
     {
         // _server_version with err_out itself NULL: must not write
         // through the NULL pointer.
         uint8_t version = 0xAB;
-        bool ok = line_reader_server_version(nullptr, &version, nullptr);
+        bool ok = reader_server_version(nullptr, &version, nullptr);
         CHECK_FALSE(ok);
     }
 
-    CHECK(line_reader_current_server_info(nullptr) == nullptr);
+    CHECK(reader_current_server_info(nullptr) == nullptr);
 
     {
         const char* host_buf = reinterpret_cast<const char*>(0x1);
         size_t host_len = 999;
-        line_reader_current_addr_host(nullptr, &host_buf, &host_len);
+        reader_current_addr_host(nullptr, &host_buf, &host_len);
         CHECK(host_buf == nullptr);
         CHECK(host_len == 0);
     }
 
-    CHECK(line_reader_current_addr_port(nullptr) == 0);
+    CHECK(reader_current_addr_port(nullptr) == 0);
 }
 
 TEST_CASE("server_info accessors return documented sentinels on NULL")
 {
-    CHECK(line_reader_server_info_role(nullptr) ==
-          line_reader_server_role_other);
-    CHECK(line_reader_server_info_role_byte(nullptr) == 0xFF);
-    CHECK(line_reader_server_info_epoch(nullptr) == 0);
-    CHECK(line_reader_server_info_capabilities(nullptr) == 0);
-    CHECK(line_reader_server_info_server_wall_ns(nullptr) == 0);
+    CHECK(reader_server_info_role(nullptr) ==
+          reader_server_role_other);
+    CHECK(reader_server_info_role_byte(nullptr) == 0xFF);
+    CHECK(reader_server_info_epoch(nullptr) == 0);
+    CHECK(reader_server_info_capabilities(nullptr) == 0);
+    CHECK(reader_server_info_server_wall_ns(nullptr) == 0);
 
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        line_reader_server_info_cluster_id(nullptr, &buf, &len);
+        reader_server_info_cluster_id(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        line_reader_server_info_node_id(nullptr, &buf, &len);
+        reader_server_info_node_id(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
@@ -192,41 +192,41 @@ TEST_CASE("failover_event accessors return documented sentinels on NULL")
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        line_reader_failover_event_failed_host(nullptr, &buf, &len);
+        reader_failover_event_failed_host(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
-    CHECK(line_reader_failover_event_failed_port(nullptr) == 0);
+    CHECK(reader_failover_event_failed_port(nullptr) == 0);
 
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        line_reader_failover_event_new_host(nullptr, &buf, &len);
+        reader_failover_event_new_host(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
-    CHECK(line_reader_failover_event_new_port(nullptr) == 0);
-    CHECK(line_reader_failover_event_new_request_id(nullptr) == 0);
-    CHECK(line_reader_failover_event_attempts(nullptr) == 0);
-    CHECK(line_reader_failover_event_elapsed_ns(nullptr) == 0);
+    CHECK(reader_failover_event_new_port(nullptr) == 0);
+    CHECK(reader_failover_event_new_request_id(nullptr) == 0);
+    CHECK(reader_failover_event_attempts(nullptr) == 0);
+    CHECK(reader_failover_event_elapsed_ns(nullptr) == 0);
 
     // _trigger_code mirrors `_error_get_code(NULL)`: same sentinel.
-    CHECK(line_reader_failover_event_trigger_code(nullptr) ==
-          line_reader_error_invalid_api_call);
+    CHECK(reader_failover_event_trigger_code(nullptr) ==
+          reader_error_invalid_api_call);
 
     {
         const char* buf = reinterpret_cast<const char*>(0x1);
         size_t len = 999;
-        line_reader_failover_event_trigger_msg(nullptr, &buf, &len);
+        reader_failover_event_trigger_msg(nullptr, &buf, &len);
         CHECK(buf == nullptr);
         CHECK(len == 0);
     }
 
-    CHECK(line_reader_failover_event_server_info(nullptr) == nullptr);
+    CHECK(reader_failover_event_server_info(nullptr) == nullptr);
 }
 
 // ---------------------------------------------------------------------------
-// `line_reader_from_conf` rejection paths — exercise the ConfigError surface.
+// `reader_from_conf` rejection paths — exercise the ConfigError surface.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("from_conf rejects malformed config strings as ConfigError")
@@ -251,18 +251,18 @@ TEST_CASE("from_conf rejects malformed config strings as ConfigError")
     for (const auto& c : cases)
     {
         CAPTURE(c.what);
-        line_reader_error* err = nullptr;
+        reader_error* err = nullptr;
         line_sender_utf8 conf{strlen(c.conf), c.conf};
-        line_reader* r = line_reader_from_conf(conf, &err);
+        reader* r = reader_from_conf(conf, &err);
         REQUIRE(r == nullptr);
         REQUIRE(err != nullptr);
-        CHECK(line_reader_error_get_code(err) ==
-              line_reader_error_config_error);
+        CHECK(reader_error_get_code(err) ==
+              reader_error_config_error);
         size_t msg_len = 0;
-        const char* msg = line_reader_error_msg(err, &msg_len);
+        const char* msg = reader_error_msg(err, &msg_len);
         CHECK(msg != nullptr);
         CHECK(msg_len > 0);
-        line_reader_error_free(err);
+        reader_error_free(err);
     }
 }
 
@@ -275,60 +275,60 @@ TEST_CASE("from_conf rejects malformed config strings as ConfigError")
 
 TEST_CASE("from_conf surfaces a connect-time error against a closed port")
 {
-    line_reader_error* err = nullptr;
+    reader_error* err = nullptr;
     line_sender_utf8 conf{strlen(CLOSED_PORT_CONF), CLOSED_PORT_CONF};
-    line_reader* r = line_reader_from_conf(conf, &err);
+    reader* r = reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
 
-    const auto code = line_reader_error_get_code(err);
+    const auto code = reader_error_get_code(err);
     const bool is_connect_failure =
-        code == line_reader_error_socket_error ||
-        code == line_reader_error_could_not_resolve_addr ||
-        code == line_reader_error_handshake_error ||
-        code == line_reader_error_tls_error;
+        code == reader_error_socket_error ||
+        code == reader_error_could_not_resolve_addr ||
+        code == reader_error_handshake_error ||
+        code == reader_error_tls_error;
     CHECK(is_connect_failure);
 
     size_t msg_len = 0;
-    const char* msg = line_reader_error_msg(err, &msg_len);
+    const char* msg = reader_error_msg(err, &msg_len);
     REQUIRE(msg != nullptr);
     CHECK(msg_len > 0);
-    line_reader_error_free(err);
+    reader_error_free(err);
 }
 
 // ---------------------------------------------------------------------------
-// `line_reader_from_env` — env var lookup + delegation to from_conf.
+// `reader_from_env` — env var lookup + delegation to from_conf.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("from_env returns ConfigError when QDB_CLIENT_CONF is unset")
 {
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
 
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_env(&err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
-    CHECK(line_reader_error_get_code(err) ==
-          line_reader_error_config_error);
+    CHECK(reader_error_get_code(err) ==
+          reader_error_config_error);
 
     size_t msg_len = 0;
-    const char* msg = line_reader_error_msg(err, &msg_len);
+    const char* msg = reader_error_msg(err, &msg_len);
     REQUIRE(msg != nullptr);
     CHECK(msg_len > 0);
-    line_reader_error_free(err);
+    reader_error_free(err);
 }
 
 TEST_CASE("from_env propagates parser errors when QDB_CLIENT_CONF is malformed")
 {
     REQUIRE(set_env("QDB_CLIENT_CONF", "not_a_valid_config_string") == 0);
 
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_env(&err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
-    CHECK(line_reader_error_get_code(err) ==
-          line_reader_error_config_error);
-    line_reader_error_free(err);
+    CHECK(reader_error_get_code(err) ==
+          reader_error_config_error);
+    reader_error_free(err);
 
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
 }
@@ -343,15 +343,15 @@ TEST_CASE("from_env distinguishes invalid-UTF-8 env value from unset")
     // VarError::NotUnicode path there.
     REQUIRE(setenv("QDB_CLIENT_CONF", "ws::addr=h:1\xC3\x28", 1) == 0);
 
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_env(&err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_env(&err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
     // Previously this collapsed to "not set" (ConfigError); the M-10 fix
     // surfaces the actual cause as InvalidUtf8.
-    CHECK(line_reader_error_get_code(err) ==
-          line_reader_error_invalid_utf8);
-    line_reader_error_free(err);
+    CHECK(reader_error_get_code(err) ==
+          reader_error_invalid_utf8);
+    reader_error_free(err);
 
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
 }
@@ -361,26 +361,26 @@ TEST_CASE("from_env reaches the connect path when QDB_CLIENT_CONF is parseable")
 {
     REQUIRE(set_env("QDB_CLIENT_CONF", CLOSED_PORT_CONF) == 0);
 
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_env(&err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_env(&err);
     CHECK(r == nullptr);
     REQUIRE(err != nullptr);
     // We don't pin the code — connect-failure shape varies — but it must
     // NOT be ConfigError, since the config parsed successfully.
-    CHECK(line_reader_error_get_code(err) !=
-          line_reader_error_config_error);
-    line_reader_error_free(err);
+    CHECK(reader_error_get_code(err) !=
+          reader_error_config_error);
+    reader_error_free(err);
 
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
 }
 
 // ---------------------------------------------------------------------------
-// C++ wrapper: `line_reader_error` exception type.
+// C++ wrapper: `reader_error` exception type.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("C++ wrapper converts C error to thrown line_reader_error")
+TEST_CASE("C++ wrapper converts C error to thrown reader_error")
 {
-    using questdb::egress::line_reader_error;
+    using questdb::egress::reader_error;
     using questdb::egress::reader;
 
     bool threw = false;
@@ -389,10 +389,10 @@ TEST_CASE("C++ wrapper converts C error to thrown line_reader_error")
         reader r{"ws::"_utf8}; // missing addr → ConfigError
         (void)r;
     }
-    catch (const line_reader_error& e)
+    catch (const reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_config_error);
+        CHECK(e.code() == reader_error_config_error);
         CHECK(std::strlen(e.what()) > 0);
         // Must be catchable as the C++ standard exception base too.
         const std::exception& base = e;
@@ -403,7 +403,7 @@ TEST_CASE("C++ wrapper converts C error to thrown line_reader_error")
 
 TEST_CASE("C++ wrapper from_env throws ConfigError when var is unset")
 {
-    using questdb::egress::line_reader_error;
+    using questdb::egress::reader_error;
     using questdb::egress::reader;
 
     REQUIRE(unset_env("QDB_CLIENT_CONF") == 0);
@@ -414,17 +414,17 @@ TEST_CASE("C++ wrapper from_env throws ConfigError when var is unset")
         auto r = reader::from_env();
         (void)r;
     }
-    catch (const line_reader_error& e)
+    catch (const reader_error& e)
     {
         threw = true;
-        CHECK(e.code() == line_reader_error_config_error);
+        CHECK(e.code() == reader_error_config_error);
     }
     CHECK(threw);
 }
 
 TEST_CASE("C++ wrapper from_env throws connect-time error for closed port")
 {
-    using questdb::egress::line_reader_error;
+    using questdb::egress::reader_error;
     using questdb::egress::reader;
 
     REQUIRE(set_env("QDB_CLIENT_CONF", CLOSED_PORT_CONF) == 0);
@@ -435,10 +435,10 @@ TEST_CASE("C++ wrapper from_env throws connect-time error for closed port")
         auto r = reader::from_env();
         (void)r;
     }
-    catch (const line_reader_error& e)
+    catch (const reader_error& e)
     {
         threw = true;
-        CHECK(e.code() != line_reader_error_config_error);
+        CHECK(e.code() != reader_error_config_error);
     }
     CHECK(threw);
 
@@ -449,41 +449,41 @@ TEST_CASE("C++ wrapper from_env throws connect-time error for closed port")
 // Defensive: error accessors against repeated reads.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("line_reader_error_msg is stable across repeated reads")
+TEST_CASE("reader_error_msg is stable across repeated reads")
 {
-    line_reader_error* err = nullptr;
+    reader_error* err = nullptr;
     line_sender_utf8 conf{0, ""};
-    line_reader* r = line_reader_from_conf(conf, &err);
+    reader* r = reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
 
     size_t len_a = 0;
-    const char* msg_a = line_reader_error_msg(err, &len_a);
+    const char* msg_a = reader_error_msg(err, &len_a);
     REQUIRE(msg_a != nullptr);
 
     // Reading the message a second time returns the same pointer and
     // length — borrowed view, not a fresh allocation.
     size_t len_b = 0;
-    const char* msg_b = line_reader_error_msg(err, &len_b);
+    const char* msg_b = reader_error_msg(err, &len_b);
     CHECK(msg_a == msg_b);
     CHECK(len_a == len_b);
 
-    line_reader_error_free(err);
+    reader_error_free(err);
 }
 
-TEST_CASE("line_reader_error_get_code is stable across repeated reads")
+TEST_CASE("reader_error_get_code is stable across repeated reads")
 {
-    line_reader_error* err = nullptr;
+    reader_error* err = nullptr;
     line_sender_utf8 conf{0, ""};
-    line_reader* r = line_reader_from_conf(conf, &err);
+    reader* r = reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
 
-    const auto code_a = line_reader_error_get_code(err);
-    const auto code_b = line_reader_error_get_code(err);
+    const auto code_a = reader_error_get_code(err);
+    const auto code_b = reader_error_get_code(err);
     CHECK(code_a == code_b);
 
-    line_reader_error_free(err);
+    reader_error_free(err);
 }
 
 TEST_CASE("from_conf rejects invalid UTF-8 with InvalidUtf8")
@@ -494,14 +494,14 @@ TEST_CASE("from_conf rejects invalid UTF-8 with InvalidUtf8")
     // InvalidUtf8 error instead of letting upstream walk an invalid &str.
     static const unsigned char bad[] = {'q', 'w', 'p', ':', ':', 0x80, 0x00};
     line_sender_utf8 conf{6, reinterpret_cast<const char*>(bad)};
-    line_reader_error* err = nullptr;
-    line_reader* r = line_reader_from_conf(conf, &err);
+    reader_error* err = nullptr;
+    reader* r = reader_from_conf(conf, &err);
     REQUIRE(r == nullptr);
     REQUIRE(err != nullptr);
-    CHECK(line_reader_error_get_code(err) == line_reader_error_invalid_utf8);
+    CHECK(reader_error_get_code(err) == reader_error_invalid_utf8);
     size_t len = 0;
-    const char* msg = line_reader_error_msg(err, &len);
+    const char* msg = reader_error_msg(err, &len);
     CHECK(len > 0);
     CHECK(msg != nullptr);
-    line_reader_error_free(err);
+    reader_error_free(err);
 }

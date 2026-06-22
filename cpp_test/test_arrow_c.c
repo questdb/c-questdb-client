@@ -1,11 +1,11 @@
 /* C ABI FFI-boundary tests for the conn-level Arrow batch ingest API
- * (`column_sender_flush_arrow_batch[_at_column]`) and the unchanged
+ * (`column_sender_flush_arrow_batch_server_stamped[_at_column]`) and the unchanged
  * egress reader API. Successful round-trip coverage lives in the Rust
  * unit tests under `questdb-rs/src/ingress/column_sender/arrow_batch.rs`
  * and the Python system tests under `system_test/`. */
 
 #include <questdb/ingress/column_sender.h>
-#include <questdb/egress/line_reader.h>
+#include <questdb/egress/reader.h>
 #include <questdb/ingress/line_sender.h>
 
 #include "qwp_mock_c.h"
@@ -71,19 +71,19 @@ static line_sender_column_name make_col(const char* name)
 
 TEST(test_tristate_egress_enum_values)
 {
-    CHECK(line_reader_arrow_batch_ok == 0, "ok = 0");
-    CHECK(line_reader_arrow_batch_end == 1, "end = 1");
-    CHECK(line_reader_arrow_batch_error == 2, "error = 2");
+    CHECK(reader_arrow_batch_ok == 0, "ok = 0");
+    CHECK(reader_arrow_batch_end == 1, "end = 1");
+    CHECK(reader_arrow_batch_error == 2, "error = 2");
 }
 
 TEST(test_appended_reader_error_codes_have_distinct_values)
 {
     CHECK(
-        line_reader_error_schema_drift != line_reader_error_no_schema &&
-        line_reader_error_no_schema != line_reader_error_arrow_export &&
-        line_reader_error_arrow_export != line_reader_error_schema_drift,
+        reader_error_schema_drift != reader_error_no_schema &&
+        reader_error_no_schema != reader_error_arrow_export &&
+        reader_error_arrow_export != reader_error_schema_drift,
         "schema_drift / no_schema / arrow_export distinct");
-    CHECK(line_reader_error_schema_drift > line_reader_error_failover_would_duplicate,
+    CHECK(reader_error_schema_drift > reader_error_failover_would_duplicate,
           "schema_drift appended (not renumbered)");
 }
 
@@ -98,24 +98,24 @@ TEST(test_egress_null_cursor_returns_error_tristate)
 {
     struct ArrowArray arr;
     struct ArrowSchema sch;
-    line_reader_error* err = NULL;
-    line_reader_arrow_batch_result rc =
-        line_reader_cursor_next_arrow_batch(NULL, &arr, &sch, &err);
-    CHECK(rc == line_reader_arrow_batch_error, "NULL cursor → error");
+    reader_error* err = NULL;
+    reader_arrow_batch_result rc =
+        reader_cursor_next_arrow_batch(NULL, &arr, &sch, &err);
+    CHECK(rc == reader_arrow_batch_error, "NULL cursor → error");
     CHECK(err != NULL, "err_out populated");
     if (err)
-        line_reader_error_free(err);
+        reader_error_free(err);
 }
 
 TEST(test_egress_null_out_array_returns_error_tristate)
 {
     struct ArrowSchema sch;
-    line_reader_error* err = NULL;
-    line_reader_arrow_batch_result rc =
-        line_reader_cursor_next_arrow_batch(NULL, NULL, &sch, &err);
-    CHECK(rc == line_reader_arrow_batch_error, "NULL out_array → error");
+    reader_error* err = NULL;
+    reader_arrow_batch_result rc =
+        reader_cursor_next_arrow_batch(NULL, NULL, &sch, &err);
+    CHECK(rc == reader_arrow_batch_error, "NULL out_array → error");
     if (err)
-        line_reader_error_free(err);
+        reader_error_free(err);
 }
 
 TEST(test_ingress_null_conn_returns_false)
@@ -126,7 +126,7 @@ TEST(test_ingress_null_conn_returns_false)
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table("t");
-    bool ok = column_sender_flush_arrow_batch(
+    bool ok = column_sender_flush_arrow_batch_server_stamped(
         NULL, tbl, &arr, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL conn → false");
     CHECK(err != NULL, "err_out populated");
@@ -151,7 +151,7 @@ TEST(test_ingress_null_array_returns_false)
      * checks conn before array. To validate the NULL-array branch we'd
      * need a real conn, which requires a live mock server. Coverage moved
      * to Rust unit tests. */
-    bool ok = column_sender_flush_arrow_batch(
+    bool ok = column_sender_flush_arrow_batch_server_stamped(
         NULL, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array path through NULL-conn short-circuit");
     if (err)
@@ -334,6 +334,7 @@ TEST(test_chunk_append_numpy_column_null_chunk)
         1,
         column_sender_numpy_i64,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         NULL,
@@ -356,6 +357,7 @@ TEST(test_chunk_append_numpy_column_i64_smoke)
         1,
         column_sender_numpy_i64,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         NULL,
@@ -384,6 +386,7 @@ TEST(test_chunk_append_numpy_column_f64_smoke)
         1,
         column_sender_numpy_f64,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         NULL,
@@ -404,7 +407,7 @@ TEST(test_chunk_append_numpy_column_bool_smoke)
     uint8_t bits[] = {1, 0, 1};
     line_sender_error* err = NULL;
     bool ok = column_sender_chunk_append_numpy_column(
-        chunk, "v", 1, column_sender_numpy_bool, bits, 3, NULL, NULL, &err);
+        chunk, "v", 1, column_sender_numpy_bool, bits, sizeof(bits), 3, NULL, NULL, &err);
     CHECK(ok, "bool append → true");
     if (err)
         line_sender_error_free(err);
@@ -426,6 +429,7 @@ TEST(test_chunk_append_numpy_column_decimal_requires_extras)
         1,
         column_sender_numpy_decimal_s8,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         NULL,
@@ -466,6 +470,7 @@ TEST(test_chunk_append_numpy_column_decimal_scale_too_high)
         1,
         column_sender_numpy_decimal_s8,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         &extras,
@@ -492,6 +497,7 @@ TEST(test_chunk_append_numpy_column_decimal_scale_negative)
         1,
         column_sender_numpy_decimal_s8,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         &extras,
@@ -515,6 +521,7 @@ TEST(test_chunk_append_numpy_column_geohash_requires_extras)
         1,
         column_sender_numpy_geohash_i8,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         NULL,
@@ -541,6 +548,7 @@ TEST(test_chunk_append_numpy_column_geohash_bits_zero)
         1,
         column_sender_numpy_geohash_i8,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         &extras,
@@ -567,6 +575,7 @@ TEST(test_chunk_append_numpy_column_geohash_bits_too_high)
         1,
         column_sender_numpy_geohash_i8,
         (const uint8_t*)data,
+        sizeof(data),
         3,
         NULL,
         &extras,
@@ -590,6 +599,7 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_requires_extras)
         1,
         column_sender_numpy_f64_ndarray,
         (const uint8_t*)data,
+        sizeof(data),
         1,
         NULL,
         NULL,
@@ -617,6 +627,7 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_zero)
         1,
         column_sender_numpy_f64_ndarray,
         (const uint8_t*)data,
+        sizeof(data),
         1,
         NULL,
         &extras,
@@ -647,6 +658,7 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_ndim_too_high)
         1,
         column_sender_numpy_f64_ndarray,
         (const uint8_t*)data,
+        sizeof(data),
         1,
         NULL,
         &extras,
@@ -674,6 +686,7 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_null_shape)
         1,
         column_sender_numpy_f64_ndarray,
         (const uint8_t*)data,
+        sizeof(data),
         1,
         NULL,
         &extras,
@@ -702,6 +715,7 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_zero_dim)
         1,
         column_sender_numpy_f64_ndarray,
         (const uint8_t*)data,
+        sizeof(data),
         1,
         NULL,
         &extras,
@@ -731,6 +745,7 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_smoke)
         1,
         column_sender_numpy_f64_ndarray,
         (const uint8_t*)data,
+        sizeof(data),
         2,
         NULL,
         &extras,
@@ -742,13 +757,102 @@ TEST(test_chunk_append_numpy_column_f64_ndarray_smoke)
     column_sender_chunk_free(chunk);
 }
 
+TEST(test_chunk_append_numpy_column_data_len_too_small)
+{
+    column_sender_chunk* chunk = make_chunk_t();
+    CHECK(chunk != NULL, "chunk constructed");
+    if (!chunk)
+        return;
+    /* 3 i64 rows need 24 bytes; claim only 16 → must be rejected. */
+    int64_t data[] = {1, 2, 3};
+    line_sender_error* err = NULL;
+    bool ok = column_sender_chunk_append_numpy_column(
+        chunk,
+        "v",
+        1,
+        column_sender_numpy_i64,
+        (const uint8_t*)data,
+        16,
+        3,
+        NULL,
+        NULL,
+        &err);
+    CHECK(!ok, "undersized data_len_bytes → false");
+    check_invalid_api_call(err, "undersized buffer → invalid_api_call");
+    if (err)
+    {
+        CHECK(
+            err_msg_contains(err, "buffer too small"),
+            "msg mentions buffer too small");
+        line_sender_error_free(err);
+        err = NULL;
+    }
+    CHECK(column_sender_chunk_row_count(chunk, NULL) == 0, "nothing appended");
+    column_sender_chunk_free(chunk);
+}
+
+TEST(test_chunk_append_numpy_column_mistagged_dtype_rejected)
+{
+    column_sender_chunk* chunk = make_chunk_t();
+    CHECK(chunk != NULL, "chunk constructed");
+    if (!chunk)
+        return;
+    /* An int8 buffer (3 bytes) mis-tagged f64 would read 24 bytes; the
+     * honest data_len_bytes = 3 must stop it before the OOB read. */
+    int8_t data[] = {1, 2, 3};
+    line_sender_error* err = NULL;
+    bool ok = column_sender_chunk_append_numpy_column(
+        chunk,
+        "v",
+        1,
+        column_sender_numpy_f64,
+        (const uint8_t*)data,
+        sizeof(data),
+        3,
+        NULL,
+        NULL,
+        &err);
+    CHECK(!ok, "int8 buffer mis-tagged f64 → false");
+    check_invalid_api_call(err, "mis-tagged dtype → invalid_api_call");
+    if (err)
+        line_sender_error_free(err);
+    column_sender_chunk_free(chunk);
+}
+
+TEST(test_chunk_append_numpy_column_data_len_exact_ok)
+{
+    column_sender_chunk* chunk = make_chunk_t();
+    CHECK(chunk != NULL, "chunk constructed");
+    if (!chunk)
+        return;
+    /* Exact fit: 3 i64 rows == 24 bytes is accepted (boundary). */
+    int64_t data[] = {1, 2, 3};
+    line_sender_error* err = NULL;
+    bool ok = column_sender_chunk_append_numpy_column(
+        chunk,
+        "v",
+        1,
+        column_sender_numpy_i64,
+        (const uint8_t*)data,
+        24,
+        3,
+        NULL,
+        NULL,
+        &err);
+    CHECK(ok, "exact data_len_bytes → true");
+    if (err)
+        line_sender_error_free(err);
+    CHECK(column_sender_chunk_row_count(chunk, NULL) == 3, "row_count == 3");
+    column_sender_chunk_free(chunk);
+}
+
 TEST(test_error_codes_survive_ffi_boundary)
 {
     int sender_code = (int)line_sender_error_arrow_unsupported_column_kind;
     int ingest_code = (int)line_sender_error_arrow_ingest;
-    int drift_code = (int)line_reader_error_schema_drift;
-    int no_schema_code = (int)line_reader_error_no_schema;
-    int export_code = (int)line_reader_error_arrow_export;
+    int drift_code = (int)reader_error_schema_drift;
+    int no_schema_code = (int)reader_error_no_schema;
+    int export_code = (int)reader_error_arrow_export;
     CHECK(sender_code != ingest_code, "sender codes distinct");
     CHECK(drift_code != no_schema_code, "reader codes distinct");
     CHECK(no_schema_code != export_code, "reader codes distinct");
@@ -759,7 +863,7 @@ TEST(test_error_codes_survive_ffi_boundary)
  * `line_sender_buffer_append_arrow` C suite. Each test:
  *   1. Builds a single-column ArrowArray + ArrowSchema on the stack.
  *   2. Spins up `qwp_mock_c` (1-slot, accepts one QWP1 binary frame).
- *   3. Opens a `questdb_db` against the mock + borrows a `qwpws_conn`.
+ *   3. Opens a `questdb_db` against the mock + borrows a `column_sender`.
  *   4. Calls `column_sender_flush_arrow_batch[_at_column]`.
  *   5. Accepts either ok=true OR a documented structured error code.
  * Per-column wire correctness is owned by the Rust unit tests under
@@ -909,7 +1013,7 @@ TEST(test_chunk_append_arrow_column_malformed_array_rejected)
 
 /* Open a mock + questdb_db + borrow a conn. Returns NULL on any setup
  * failure; populates *out_db / *out_mock on success. */
-static qwpws_conn* mock_borrow_conn(
+static column_sender* mock_borrow_column_sender(
     qwp_mock_c** out_mock,
     questdb_db** out_db)
 {
@@ -933,7 +1037,7 @@ static qwpws_conn* mock_borrow_conn(
         qwp_mock_c_stop(mock);
         return NULL;
     }
-    qwpws_conn* conn = questdb_db_borrow_conn(db, &err);
+    column_sender* conn = questdb_db_borrow_column_sender(db, &err);
     if (conn == NULL)
     {
         if (err)
@@ -948,10 +1052,10 @@ static qwpws_conn* mock_borrow_conn(
 }
 
 static void mock_return_close(
-    qwp_mock_c* mock, questdb_db* db, qwpws_conn* conn)
+    qwp_mock_c* mock, questdb_db* db, column_sender* conn)
 {
     if (conn != NULL && db != NULL)
-        questdb_db_return_conn(db, conn);
+        questdb_db_return_column_sender(db, conn);
     if (db != NULL)
         questdb_db_close(db);
     if (mock != NULL)
@@ -964,7 +1068,7 @@ static void run_arrow_flush(
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+    column_sender* conn = mock_borrow_column_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
     {
@@ -976,7 +1080,7 @@ static void run_arrow_flush(
     }
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table(table);
-    bool ok = column_sender_flush_arrow_batch(
+    bool ok = column_sender_flush_arrow_batch_server_stamped(
         conn, tbl, arr, sch, NULL, 0, &err);
     if (!ok)
     {
@@ -1006,14 +1110,14 @@ TEST(test_mock_ingress_null_array_via_real_conn)
      * covered above. */
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+    column_sender* conn = mock_borrow_column_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;
     struct ArrowSchema sch;
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
-    bool ok = column_sender_flush_arrow_batch(
+    bool ok = column_sender_flush_arrow_batch_server_stamped(
         conn, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array → false");
     CHECK(err != NULL, "err_out populated");
@@ -1123,8 +1227,8 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
 {
     /* The original test exercised three DesignatedTimestamp kinds
      * (Now / ServerNow / Column). In the new conn-level API the first
-     * two collapse onto `column_sender_flush_arrow_batch` (no per-row
-     * stamp — server stamps on arrival), and Column maps to the
+     * two collapse onto `column_sender_flush_arrow_batch_server_stamped`
+     * (no per-row stamp — server stamps on arrival), and Column maps to the
      * dedicated `column_sender_flush_arrow_batch_at_column`. We cover
      * both surviving variants here. */
 
@@ -1147,7 +1251,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         qwp_mock_c* mock;
         questdb_db* db;
-        qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+        column_sender* conn = mock_borrow_column_sender(&mock, &db);
         CHECK(conn != NULL, "mock conn borrowed");
         if (conn == NULL)
         {
@@ -1181,7 +1285,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
 }
 
 /* Exercises the documented `array->release` ownership contract of
- * `column_sender_flush_arrow_batch` on all three states: pre-import
+ * `column_sender_flush_arrow_batch_server_stamped` on all three states: pre-import
  * failure leaves release intact (caller frees), a malformed nested schema
  * is rejected gracefully (not by aborting the panic=abort FFI crate) with
  * release intact, and a structurally-valid batch that reaches the Arrow
@@ -1190,7 +1294,7 @@ TEST(test_mock_ingress_arrow_release_contract)
 {
     qwp_mock_c* mock;
     questdb_db* db;
-    qwpws_conn* conn = mock_borrow_conn(&mock, &db);
+    column_sender* conn = mock_borrow_column_sender(&mock, &db);
     CHECK(conn != NULL, "mock conn borrowed");
     if (conn == NULL)
         return;
@@ -1202,7 +1306,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = column_sender_flush_arrow_batch(
+        bool ok = column_sender_flush_arrow_batch_server_stamped(
             conn, make_table("rc_a"), &arr, NULL, NULL, 0, &err);
         CHECK(!ok, "NULL schema → false");
         CHECK(
@@ -1224,7 +1328,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "+l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = column_sender_flush_arrow_batch(
+        bool ok = column_sender_flush_arrow_batch_server_stamped(
             conn, make_table("rc_b"), &arr, &sch, NULL, 0, &err);
         CHECK(!ok, "malformed +l schema → false");
         CHECK(err != NULL, "err_out populated on malformed schema");
@@ -1254,7 +1358,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = column_sender_flush_arrow_batch(
+        bool ok = column_sender_flush_arrow_batch_server_stamped(
             conn, make_table("rc_c"), &arr, &sch, NULL, 0, &err);
         (void)ok;
         CHECK(
@@ -1299,6 +1403,9 @@ int main(void)
     RUN(test_chunk_append_numpy_column_f64_ndarray_null_shape);
     RUN(test_chunk_append_numpy_column_f64_ndarray_zero_dim);
     RUN(test_chunk_append_numpy_column_f64_ndarray_smoke);
+    RUN(test_chunk_append_numpy_column_data_len_too_small);
+    RUN(test_chunk_append_numpy_column_mistagged_dtype_rejected);
+    RUN(test_chunk_append_numpy_column_data_len_exact_ok);
     RUN(test_error_codes_survive_ffi_boundary);
     RUN(test_mock_ingress_null_array_via_real_conn);
     RUN(test_mock_ingress_at_column_empty_name_via_real_conn);

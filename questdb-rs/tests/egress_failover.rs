@@ -4175,7 +4175,7 @@ fn reader_migrates_to_worker_thread_with_concurrent_stats_polling() {
     let reader = Reader::from_conf(&conf).expect("connect");
     // Clone the stats Arc on main BEFORE the Reader migrates, so the
     // monitor thread reads counters via its own Arc handle — exactly
-    // what the FFI does (`line_reader` stashes an `Arc<ReaderStats>`
+    // what the FFI does (`reader` stashes an `Arc<ReaderStats>`
     // clone next to the `UnsafeCell<Reader>` for the same reason).
     let stats = std::sync::Arc::clone(reader.stats());
 
@@ -4497,7 +4497,7 @@ fn progress_callback_gave_up_on_single_endpoint_exhaustion() {
 
 // NOTE: the "progress callback alone unlocks replay after data
 // delivered" branch is covered by the C++ mock-driven test in
-// `cpp_test/test_line_reader_mock.cpp`. The reset-callback flavour of
+// `cpp_test/test_reader_mock.cpp`. The reset-callback flavour of
 // replay-after-data — including the schema re-read from the new node's
 // batch 0 — is covered here via `Action::SendBatch` in
 // `failover_after_batch_replays_and_rereads_schema`, and the

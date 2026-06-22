@@ -1,6 +1,8 @@
 //! Polars sub-feature: convert a [`DataFrame`] into Arrow
 //! [`RecordBatch`]es for consumption by
-//! [`ColumnSender::flush_arrow_batch`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch].
+//! [`ColumnSender::flush_arrow_batch_at_column`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_at_column]
+//! (or [`ColumnSender::flush_arrow_batch_server_stamped`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_server_stamped]
+//! when the server should assign timestamps).
 //!
 //! [`dataframe_to_batches`] is the primary entry point. It returns an
 //! iterator that yields slices of at most `max_rows` rows each. Each
@@ -38,17 +40,17 @@
 //!
 //! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
 //!
-//! The one-call shortcut is [`BorrowedSender::flush_polars_dataframe`].
+//! The one-call shortcut is [`BorrowedColumnSender::flush_polars_dataframe`].
 //! For full control over slicing and per-batch retry, drive the
 //! iterator directly:
 //!
 //! ```ignore
 //! for rb in questdb::ingress::polars::dataframe_to_batches(&df, None) {
-//!     sender.flush_arrow_batch(table, &rb?, &[])?;
+//!     sender.flush_arrow_batch_at_column(table, &rb?, "ts".try_into()?, &[])?;
 //! }
 //! ```
 //!
-//! [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
+//! [`BorrowedColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedColumnSender::flush_polars_dataframe
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -316,7 +318,7 @@ impl Iterator for DataFrameBatches<'_> {
 /// ≈64 × `max_rows` rows.
 const CHECKPOINT_BATCHES: usize = 64;
 
-/// Optional knobs for [`BorrowedSender::flush_polars_dataframe`].
+/// Optional knobs for [`BorrowedColumnSender::flush_polars_dataframe`].
 ///
 /// Every field defaults to "off", so `PolarsIngestOptions::default()` (or
 /// [`PolarsIngestOptions::new`]) reproduces the original three-argument
@@ -333,7 +335,7 @@ const CHECKPOINT_BATCHES: usize = 64;
 /// sender.flush_polars_dataframe("trades", &df, &opts)?;
 /// ```
 ///
-/// [`BorrowedSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedSender::flush_polars_dataframe
+/// [`BorrowedColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedColumnSender::flush_polars_dataframe
 #[derive(Clone, Copy, Default)]
 pub struct PolarsIngestOptions<'a> {
     max_rows: Option<NonZeroUsize>,
@@ -368,7 +370,7 @@ impl<'a> PolarsIngestOptions<'a> {
 
     /// Per-column wire-type hints, applied to every batch sliced out of the
     /// frame. Same meaning as the `overrides` argument of
-    /// `ColumnSender::flush_arrow_batch` — the intended path for Polars frames
+    /// `ColumnSender::flush_arrow_batch_server_stamped` — the intended path for Polars frames
     /// built without pyarrow, whose Arrow schema carries no `questdb.*` field
     /// metadata.
     #[must_use]
@@ -381,7 +383,7 @@ impl<'a> PolarsIngestOptions<'a> {
     }
 }
 
-impl crate::ingress::column_sender::BorrowedSender<'_> {
+impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `options.max_rows` rows
     /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
     /// `sync` to commit — re-driving transparently across a connection failure.
@@ -393,7 +395,7 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
     /// `PolarsIngestOptions::default()` preserves the previous behaviour
     /// (server-assigned timestamps, schema-derived wire types).
     ///
-    /// Unlike `ColumnSender::flush` / `ColumnSender::flush_arrow_batch`, which
+    /// Unlike `ColumnSender::flush` / `ColumnSender::flush_arrow_batch_*`, which
     /// leave rows uncommitted until you call `ColumnSender::sync`, this entry
     /// owns the commit (and the failover replay boundary).
     ///
@@ -454,7 +456,7 @@ impl crate::ingress::column_sender::BorrowedSender<'_> {
 /// to the batch count made durable by each successful checkpoint `sync`, so on
 /// a transient error the caller re-drives only the uncommitted tail.
 fn drive_from_checkpoint(
-    sender: &mut crate::ingress::column_sender::BorrowedSender<'_>,
+    sender: &mut crate::ingress::column_sender::BorrowedColumnSender<'_>,
     table: crate::ingress::TableName<'_>,
     df: &DataFrame,
     options: &PolarsIngestOptions<'_>,
@@ -470,7 +472,7 @@ fn drive_from_checkpoint(
         let rb = rb?;
         match options.timestamp_column {
             Some(ts) => sender.flush_arrow_batch_at_column(table, &rb, ts, options.overrides)?,
-            None => sender.flush_arrow_batch(table, &rb, options.overrides)?,
+            None => sender.flush_arrow_batch_server_stamped(table, &rb, options.overrides)?,
         }
         // `idx` is 0-based; checkpoint after a full run of CHECKPOINT_BATCHES
         // (batches 63, 127, …). The sync's ack moves the replay boundary.

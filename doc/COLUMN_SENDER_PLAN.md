@@ -142,7 +142,7 @@ Python repo (separate)                  c-questdb-client (this repo)
   - extract category codes &  │         │   └─ ...     │  publisher,  │
     dict for symbols          │         │              │  SchemaReg,  │
                               │         │              │  SymbolDict  │
-                              │         │   borrow_sender / return    │
+                              │         │   borrow_column_sender / return    │
                               │         │     │                       │
                               │         │     ▼                       │
                               │         │  ColumnSender (borrowed)    │
@@ -192,7 +192,7 @@ impl QuestDb {
     /// it out; else, if pool size < `pool_max`, open a new connection
     /// and hand out a sender bound to it; else return InvalidApiCall
     /// (fail-fast at cap).
-    pub fn borrow_sender(&self) -> Result<BorrowedSender<'_>>;
+    pub fn borrow_column_sender(&self) -> Result<BorrowedColumnSender<'_>>;
 
     /// Manually reap idle connections (closes those above `pool_size`
     /// idle longer than `pool_idle_timeout_ms`). Returns the count
@@ -204,11 +204,11 @@ impl QuestDb {
 
 /// Borrowed sender. Returns to the pool on `Drop`. Not `Send`/`Sync` —
 /// belongs to the borrowing thread.
-pub struct BorrowedSender<'a> { /* borrow handle into QuestDb */ }
+pub struct BorrowedColumnSender<'a> { /* borrow handle into QuestDb */ }
 
-impl<'a> std::ops::Deref     for BorrowedSender<'a> { type Target = ColumnSender; … }
-impl<'a> std::ops::DerefMut  for BorrowedSender<'a> { … }
-impl<'a> Drop                for BorrowedSender<'a> { … }   // returns to pool
+impl<'a> std::ops::Deref     for BorrowedColumnSender<'a> { type Target = ColumnSender; … }
+impl<'a> std::ops::DerefMut  for BorrowedColumnSender<'a> { … }
+impl<'a> Drop                for BorrowedColumnSender<'a> { … }   // returns to pool
 
 /// Thin handle over a borrowed connection.
 pub struct ColumnSender { /* &mut Connection (lifetime-bound) */ }
@@ -359,10 +359,10 @@ land.
   `pool_idle_timeout_ms` (default 60000), `pool_reap`
   (`auto`|`manual`, default `auto`). Reject configs with
   `pool_size > pool_max`.
-- `borrow_sender()` semantics: pull from free list if any; else if
+- `borrow_column_sender()` semantics: pull from free list if any; else if
   pool size < `pool_max`, open a new connection; else return
   `InvalidApiCall` (fail-fast).
-- `BorrowedSender<'_>` returns the connection to the pool on `Drop`
+- `BorrowedColumnSender<'_>` returns the connection to the pool on `Drop`
   with a `last_idle_at = Instant::now()` stamp. If
   `must_close()` is true on return, drop the connection.
 - **Idle reaper.** Under `pool_reap=auto`, the pool spawns one
@@ -476,7 +476,7 @@ land.
 
 - Implement the ABI defined in `COLUMN_SENDER_FFI_ABI.md`. Two FFI
   namespaces:
-  - `questdb_db_*` — pool/borrow (`connect`, `close`, `borrow_sender`,
+  - `questdb_db_*` — pool/borrow (`connect`, `close`, `borrow_column_sender`,
     `return_sender`). Lands once WS-0 lands.
   - `column_sender_chunk_*` + `column_sender_submit` /
     `_await_acked_fsn` — chunk fill and submit. Each column function
@@ -617,7 +617,7 @@ flag a deviation rather than re-litigate silently.
   the existing row-major `Sender` API. Revisit if a real user needs
   both throughput and SF.
 - **Connection layer:** pool (`QuestDb::connect`), borrow/return
-  (`db.borrow_sender()` → drop returns to pool). Defaults:
+  (`db.borrow_column_sender()` → drop returns to pool). Defaults:
   `pool_size=1`, `pool_max=64`, `pool_idle_timeout_ms=60000`. Eager
   open at connect, auto-grow on exhaustion, fail-fast at cap.
 - **Idle shrinking:** Rust-side background reaper per pool

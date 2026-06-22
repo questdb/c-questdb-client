@@ -85,6 +85,40 @@ pub(crate) fn encode_chunk_into(
     scratch: &mut EncodeScratch,
     defer_commit: bool,
 ) -> Result<()> {
+    encode_chunk_into_mode(
+        out,
+        chunk,
+        symbol_dict,
+        scratch,
+        defer_commit,
+        /* replay_symbols = */ false,
+    )
+}
+
+pub(crate) fn encode_chunk_replay_into(
+    out: &mut Vec<u8>,
+    chunk: &Chunk<'_>,
+    symbol_dict: &mut SymbolGlobalDict,
+    scratch: &mut EncodeScratch,
+) -> Result<()> {
+    encode_chunk_into_mode(
+        out,
+        chunk,
+        symbol_dict,
+        scratch,
+        /* defer_commit = */ false,
+        /* replay_symbols = */ true,
+    )
+}
+
+fn encode_chunk_into_mode(
+    out: &mut Vec<u8>,
+    chunk: &Chunk<'_>,
+    symbol_dict: &mut SymbolGlobalDict,
+    scratch: &mut EncodeScratch,
+    defer_commit: bool,
+    replay_symbols: bool,
+) -> Result<()> {
     scratch.reset();
     if chunk.is_empty() {
         emit_header_only_frame(out, defer_commit);
@@ -134,7 +168,7 @@ pub(crate) fn encode_chunk_into(
     // later fails — symbol entries that never hit the wire must not be
     // remembered. ---
     let dict_mark = symbol_dict.mark();
-    let delta_start = match resolve_symbols(
+    let mut delta_start = match resolve_symbols(
         chunk,
         symbol_dict,
         &mut scratch.new_symbols,
@@ -147,6 +181,19 @@ pub(crate) fn encode_chunk_into(
             return Err(e);
         }
     };
+    if replay_symbols {
+        delta_start = match build_replay_symbol_prefix(
+            symbol_dict,
+            &mut scratch.new_symbols,
+            &scratch.per_column,
+        ) {
+            Ok(delta_start) => delta_start,
+            Err(e) => {
+                symbol_dict.rollback(dict_mark);
+                return Err(e);
+            }
+        };
+    }
 
     // --- Schema signature ---
     let column_count = chunk.columns.len() + 1; // +1 for designated timestamp
@@ -178,6 +225,78 @@ pub(crate) fn encode_chunk_into(
             Err(e)
         }
     }
+}
+
+fn build_replay_symbol_prefix(
+    symbol_dict: &SymbolGlobalDict,
+    new_symbols: &mut Vec<Vec<u8>>,
+    per_column: &[Option<ResolvedColumn>],
+) -> Result<u64> {
+    let dense_count = replay_symbol_dense_count(per_column)?;
+    new_symbols.clear();
+    new_symbols.try_reserve(dense_count).map_err(|_| {
+        error::fmt!(
+            InvalidApiCall,
+            "symbol dictionary too large to encode ({} entries)",
+            dense_count
+        )
+    })?;
+    for id in 0..dense_count {
+        let id_u64 = u64::try_from(id).map_err(|_| {
+            error::fmt!(
+                InvalidApiCall,
+                "symbol dictionary too large to encode ({} entries)",
+                dense_count
+            )
+        })?;
+        let entry = symbol_dict.entry(id_u64).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "internal: missing symbol dictionary entry for global id {}",
+                id_u64
+            )
+        })?;
+        new_symbols.push(entry.to_vec());
+    }
+    Ok(0)
+}
+
+fn replay_symbol_dense_count(per_column: &[Option<ResolvedColumn>]) -> Result<usize> {
+    let mut highest: Option<u64> = None;
+    for resolved in per_column.iter().filter_map(Option::as_ref) {
+        match resolved {
+            ResolvedColumn::Row(row) => {
+                for &gid in &row.local_to_global {
+                    if gid != u64::MAX {
+                        highest = Some(highest.map_or(gid, |h| h.max(gid)));
+                    }
+                }
+            }
+            #[cfg(feature = "arrow")]
+            ResolvedColumn::Arrow(arrow) => {
+                for &gid in &arrow.gids {
+                    highest = Some(highest.map_or(gid, |h| h.max(gid)));
+                }
+            }
+        }
+    }
+    let Some(highest) = highest else {
+        return Ok(0);
+    };
+    let count = highest.checked_add(1).ok_or_else(|| {
+        error::fmt!(
+            InvalidApiCall,
+            "symbol dictionary too large to encode (highest id {})",
+            highest
+        )
+    })?;
+    usize::try_from(count).map_err(|_| {
+        error::fmt!(
+            InvalidApiCall,
+            "symbol dictionary too large to encode ({} entries)",
+            count
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1171,6 +1290,42 @@ mod tests {
     }
 
     #[test]
+    fn replay_encode_uses_dense_symbol_prefix_from_zero() {
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        let dict_offsets = [0i32, 5, 9, 14];
+        let dict_bytes = b"alphabetagamma";
+
+        let codes1 = [0i32, 1];
+        let ts1 = [1i64, 2];
+        let mut c1 = Chunk::new("trades");
+        c1.symbol_dict_i32("sym", &codes1, &dict_offsets, dict_bytes, None)
+            .unwrap();
+        c1.designated_timestamp_nanos(&ts1).unwrap();
+        let mut out1 = Vec::new();
+        encode_chunk_into(&mut out1, &c1, &mut dict, &mut scratch, false).unwrap();
+        assert_eq!(dict.next_id(), 2);
+
+        let codes2 = [0i32, 2];
+        let ts2 = [3i64, 4];
+        let mut c2 = Chunk::new("trades");
+        c2.symbol_dict_i32("sym", &codes2, &dict_offsets, dict_bytes, None)
+            .unwrap();
+        c2.designated_timestamp_nanos(&ts2).unwrap();
+
+        let mut replay = Vec::new();
+        encode_chunk_replay_into(&mut replay, &c2, &mut dict, &mut scratch).unwrap();
+        assert_eq!(replay[5] & QWP_FLAG_DEFER_COMMIT, 0);
+
+        let mut pos = QWP_HEADER_LEN;
+        assert_eq!(read_test_varint(&replay, &mut pos), 0);
+        assert_eq!(read_test_varint(&replay, &mut pos), 3);
+        assert_eq!(read_test_bytes(&replay, &mut pos), b"alpha");
+        assert_eq!(read_test_bytes(&replay, &mut pos), b"beta");
+        assert_eq!(read_test_bytes(&replay, &mut pos), b"gamma");
+    }
+
+    #[test]
     fn i64_no_null_round_trip_wire_bytes() {
         let bytes = make_chunk_i64("price", &[10, 20, 30]);
         // Frame contains: header(12) + delta_dict(2) + table_block + schema +
@@ -1179,6 +1334,27 @@ mod tests {
         // patched correctly.
         let payload_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         assert_eq!(12 + payload_len, bytes.len());
+    }
+
+    fn read_test_varint(bytes: &[u8], pos: &mut usize) -> u64 {
+        let mut shift = 0;
+        let mut value = 0u64;
+        loop {
+            let b = bytes[*pos];
+            *pos += 1;
+            value |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    fn read_test_bytes<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a [u8] {
+        let len = read_test_varint(bytes, pos) as usize;
+        let start = *pos;
+        *pos += len;
+        &bytes[start..start + len]
     }
 
     #[cfg(feature = "arrow")]
