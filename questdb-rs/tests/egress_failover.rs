@@ -2266,6 +2266,81 @@ fn decode_error_after_rows_without_callback_refuses_replay() {
 }
 
 #[test]
+fn deterministic_decode_error_does_not_drain_failover_budget() {
+    // M6 regression: a server that *deterministically* re-emits a corrupt /
+    // unknown frame for this query must NOT drag the cursor through a
+    // reconnect -> replay -> re-corrupt loop that drains the entire
+    // per-Execute failover budget (one log line per round). Transient wire
+    // corruption (a truncated frame from a dying endpoint) is cured by a
+    // single reconnect to a fresh connection; a *second* consecutive decode
+    // failure on the replayed query is proof the corruption is deterministic
+    // (server bug, version-mismatched MsgKind, mismatched lengths), so the
+    // cursor must fail fast with the decode error instead of replaying
+    // `failover_max_attempts - 1` times.
+    let bogus_payload = vec![0xEEu8, 0, 0, 0, 0, 0, 0, 0, 0]; // unknown msg_kind.
+    let bogus_frame = framed(1, 0, 0, &bogus_payload);
+    // Both endpoints deterministically corrupt: SERVER_INFO, await the
+    // (replayed) query, emit the identical bogus frame. The mock repeats the
+    // last script once its queue is exhausted, so *every* reconnect lands on
+    // the same corruption no matter how many times the cursor ping-pongs.
+    let corrupt_script = |node: &str| {
+        vec![
+            Action::SendServerInfo {
+                role: ServerRole::Standalone,
+                node_id: node.into(),
+            },
+            Action::AwaitQueryRequest,
+            Action::SendRaw(bogus_frame.clone()),
+        ]
+    };
+    let srv_a = MockServer::start(vec![corrupt_script("a")]);
+    let srv_b = MockServer::start(vec![corrupt_script("b")]);
+    // Large reconnect budget + zero backoff: without a decode-specific cap
+    // the cursor would replay 31 times before the budget drained.
+    let conf = format!(
+        "ws::addr={};failover_max_attempts=32;failover_backoff_initial_ms=0;failover_backoff_max_ms=0",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("deterministic decode corruption must surface an error"),
+    };
+    // The decode error surfaces — not a budget-exhausted SocketError after
+    // dozens of rounds.
+    assert_eq!(
+        err.code(),
+        ErrorCode::ProtocolError,
+        "deterministic decode corruption should surface the decode error, got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    assert!(
+        err.msg().contains("unknown msg_kind"),
+        "expected the decode trigger to surface, got: {}",
+        err.msg()
+    );
+    // Decode-driven replays are capped well below the per-Execute budget
+    // (here 31). One replay rules out a transient blip; further consecutive
+    // decode failures are refused.
+    assert!(
+        cursor.failover_resets() <= 1,
+        "deterministic decode corruption must not drain the failover budget; \
+         got {} replays",
+        cursor.failover_resets()
+    );
+    // Initial connect + at most one decode-driven replay.
+    let total_accepts = srv_a.accepts() + srv_b.accepts();
+    assert!(
+        total_accepts <= 3,
+        "server should be dialed only a couple of times (initial + at most \
+         one replay), got {total_accepts}"
+    );
+}
+
+#[test]
 fn cancel_write_failure_does_not_trigger_failover() {
     // M1 regression guard: when the CANCEL frame write fails synchronously
     // (because the server already RST'd the TCP connection by the time the

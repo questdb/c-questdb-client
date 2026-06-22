@@ -1176,6 +1176,7 @@ impl<'r> ReaderQuery<'r> {
             on_failover_progress: self.on_failover_progress,
             failover_budget,
             failover_resets: 0,
+            decode_failover_rounds: 0,
             data_delivered: false,
             #[cfg(feature = "arrow")]
             drifted_batch: None,
@@ -1219,6 +1220,53 @@ fn patch_request_id(buf: Bytes, new_rid: i64) -> Bytes {
 /// any realistic batch transit and short enough that an unresponsive
 /// peer surfaces a clear error rather than appearing to hang.
 const CANCEL_DRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Dedicated per-Execute cap on failover rounds triggered by a *frame
+/// decode* failure, as opposed to a raw transport (socket / TLS / WS)
+/// read failure.
+///
+/// A decode failure is ambiguous: it can be transient wire corruption
+/// (a truncated WS frame, a malformed varint emitted by a dying
+/// endpoint) — which a single reconnect to a fresh connection cures —
+/// or a *deterministic* protocol violation (unknown `MsgKind`,
+/// mismatched lengths, a version-mismatched frame) that every replay
+/// reproduces byte-for-byte. Both surface as `ProtocolError`, so they
+/// are indistinguishable at the [`ErrorCode`] level.
+///
+/// Routing decode failures through the *full* per-Execute failover
+/// budget lets a deterministically-corrupting server drive a
+/// reconnect -> replay -> re-corrupt loop that drains every reconnect
+/// round (`failover_max_attempts - 1`, up to 1023) — burning the
+/// backoff schedule and emitting one warning per round — before the
+/// identical decode error is finally surfaced. Capping decode-driven
+/// replays at a small constant preserves recovery from a one-off
+/// transient blip (one reconnect rules it out) while failing fast on
+/// deterministic corruption. Raw read failures are unaffected and keep
+/// the full budget.
+const MAX_DECODE_FAILOVER_ROUNDS: u32 = 1;
+
+/// Classifies the origin of a mid-query stream failure routed through
+/// [`Cursor::failover_after_stream_failure`]. Decode failures get a
+/// small dedicated replay cap ([`MAX_DECODE_FAILOVER_ROUNDS`]); raw
+/// transport read failures keep the full per-Execute budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFailureKind {
+    /// A raw transport read failed (socket closed, TLS reset, truncated
+    /// WS frame at the transport layer).
+    Read,
+    /// A complete frame was read but `decode_frame` rejected it.
+    Decode,
+}
+
+impl StreamFailureKind {
+    /// Human-readable context for the failover warning.
+    fn context(self) -> &'static str {
+        match self {
+            StreamFailureKind::Read => "mid-query frame read",
+            StreamFailureKind::Decode => "mid-query frame decode",
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Cursor + BatchView
@@ -1350,6 +1398,13 @@ pub struct Cursor<'r> {
     /// since `execute()`. Useful for tests and for asserting the
     /// query did not silently restart under the user's feet.
     failover_resets: u32,
+    /// Count of failover rounds this cursor has triggered specifically
+    /// from a *frame decode* failure (as opposed to a raw transport
+    /// read failure). Capped at [`MAX_DECODE_FAILOVER_ROUNDS`] so a
+    /// deterministically-corrupting server can't drive a
+    /// reconnect/replay loop that drains the whole per-Execute budget;
+    /// once the cap is hit the decode error is surfaced terminally.
+    decode_failover_rounds: u32,
     /// Sticky: set the first time a `RESULT_BATCH` is yielded to the
     /// caller and never reset. Drives the safety check in
     /// [`Cursor::next_batch`] that refuses mid-query failover when no
@@ -1720,7 +1775,7 @@ impl<'r> Cursor<'r> {
             let (header, payload) = match self.read_frame_raw() {
                 Ok(hp) => hp,
                 Err(e) => {
-                    self.failover_after_stream_failure(e, "mid-query frame read")?;
+                    self.failover_after_stream_failure(e, StreamFailureKind::Read)?;
                     continue;
                 }
             };
@@ -1731,6 +1786,11 @@ impl<'r> Cursor<'r> {
             // failover-eligible errors through the same replay machinery as
             // raw read failures; deterministic codes such as
             // UnsupportedServer remain terminal via `is_failover_eligible`.
+            // Unlike a raw read failure, a decode failure gets only a small
+            // dedicated replay cap (`MAX_DECODE_FAILOVER_ROUNDS`) so a
+            // deterministically-corrupting server can't drive a
+            // reconnect/replay loop that drains the whole per-Execute budget
+            // — see `failover_after_stream_failure`.
             let t1 = std::time::Instant::now();
             let decode_result = decode_frame(
                 header,
@@ -1749,7 +1809,7 @@ impl<'r> Cursor<'r> {
             let event = match decode_result {
                 Ok(ev) => ev,
                 Err(e) => {
-                    self.failover_after_stream_failure(e, "mid-query frame decode")?;
+                    self.failover_after_stream_failure(e, StreamFailureKind::Decode)?;
                     continue;
                 }
             };
@@ -1955,7 +2015,7 @@ impl<'r> Cursor<'r> {
     /// stream. This covers raw transport reads and failover-eligible decode
     /// errors so both surfaces obey the same cancellation, duplicate-delivery,
     /// callback, budget, and endpoint-tracker rules.
-    fn failover_after_stream_failure(&mut self, e: Error, context: &str) -> Result<()> {
+    fn failover_after_stream_failure(&mut self, e: Error, kind: StreamFailureKind) -> Result<()> {
         if self.cancelling || !self.reader.cfg.failover || !is_failover_eligible(e.code()) {
             // Match every other terminal path in this loop: tear down the
             // WS so the cursor's flags stay coherent with the transport
@@ -1989,7 +2049,25 @@ impl<'r> Cursor<'r> {
             self.terminate_with_close();
             return Err(err);
         }
-        warn_on_protocol_error_failover(&e, context);
+        // Decode-driven replays get a small dedicated cap. A decode
+        // failure can be transient wire corruption (one reconnect to a
+        // fresh connection cures it) or a deterministic protocol
+        // violation (every replay reproduces it byte-for-byte). The two
+        // are indistinguishable at the `ErrorCode` level, so we allow a
+        // bounded number of decode-triggered replays to recover the
+        // transient case, then surface the decode error terminally
+        // rather than draining the full per-Execute failover budget
+        // (and emitting one warning per round) against a server that
+        // will just re-corrupt the replayed query forever. Raw transport
+        // read failures are unaffected and keep the full budget.
+        if kind == StreamFailureKind::Decode {
+            if self.decode_failover_rounds >= MAX_DECODE_FAILOVER_ROUNDS {
+                self.terminate_with_close();
+                return Err(e);
+            }
+            self.decode_failover_rounds = self.decode_failover_rounds.saturating_add(1);
+        }
+        warn_on_protocol_error_failover(&e, kind.context());
         self.failover_reconnect_and_replay(e)
     }
 
@@ -2608,12 +2686,19 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
 /// `on_failover_reset` callback is installed. With a callback set,
 /// replay proceeds even for deterministic violations.
 ///
-/// Emit a stderr warning whenever a `ProtocolError` actually triggers
-/// failover so operators can spot masked corruption in logs.
+/// Emit a warning whenever a `ProtocolError` actually triggers failover
+/// so operators can spot masked corruption. Routed through the `log`
+/// facade (level `warn`) rather than unconditional `eprintln!`: with no
+/// logger installed this is a no-op, so a deterministically-corrupting
+/// server can't spam the process's stderr, while operators who want the
+/// signal install a logger and filter by target/level. The
+/// decode-replay cap (`MAX_DECODE_FAILOVER_ROUNDS`) independently bounds
+/// how many times this can fire per Execute for decode-triggered
+/// failover.
 fn warn_on_protocol_error_failover(err: &Error, context: &str) {
     if err.code() == ErrorCode::ProtocolError {
-        eprintln!(
-            "questdb-rs: warning: ProtocolError triggered failover ({}): {} — \
+        log::warn!(
+            "ProtocolError triggered failover ({}): {} — \
              reconnecting may mask transient wire-frame corruption \
              (truncated frames, malformed varints) or a deterministic \
              protocol violation; check server logs if this recurs.",
