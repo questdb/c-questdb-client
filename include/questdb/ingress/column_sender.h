@@ -650,7 +650,7 @@ bool column_sender_chunk_symbol_dict_i32(
  *
  * Single entry point that consumes an Apache Arrow C Data Interface
  * `ArrowArray` + `ArrowSchema` pair and routes to the same encoding
- * infrastructure as `column_sender_flush_arrow_batch`. Supports the
+ * infrastructure as `column_sender_flush_arrow_batch_server_stamped`. Supports the
  * full Arrow type matrix (43 classifications including all primitives,
  * timestamps, dates, decimals, UUID, LONG256, geohash, dictionary-
  * encoded symbols across all key/value variants, and varlen
@@ -781,8 +781,11 @@ typedef enum column_sender_symbol_mode
  * intact. `schema` is borrowed only for the duration of this call.
  *
  * `symbol_mode` selects the SYMBOL-vs-VARCHAR disposition of a string
- * column (see `column_sender_symbol_mode`); it is a no-op for
- * non-string columns.
+ * column; it carries a `column_sender_symbol_mode_*` constant and is a
+ * no-op for non-string columns. The parameter is `uint32_t` rather than
+ * `enum column_sender_symbol_mode` so an out-of-range value returns
+ * `line_sender_error_invalid_api_call` instead of being undefined
+ * behaviour at the language boundary.
  *
  * Returns NULL on error and writes a `line_sender_error*` to
  * `*err_out`. The returned handle (when non-NULL) MUST be freed with
@@ -792,7 +795,7 @@ QUESTDB_CLIENT_API
 column_sender_arrow_import* column_sender_arrow_import_new(
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
-    column_sender_symbol_mode symbol_mode,
+    uint32_t symbol_mode,
     line_sender_error** err_out);
 
 /**
@@ -1037,11 +1040,29 @@ typedef struct column_sender_numpy_extras
 } column_sender_numpy_extras;
 
 /**
+ * Append one column from a contiguous, native-endian NumPy buffer.
+ *
  * `dtype` carries a `column_sender_numpy_*` constant from the enum
  * above. The parameter is `uint32_t` rather than `enum
  * column_sender_numpy_dtype` so an out-of-range value returns
  * `line_sender_error_invalid_api_call` instead of being undefined
  * behaviour at the language boundary.
+ *
+ * ZERO-COPY LIFETIME: this call parks the raw `data` (and
+ * `validity->bits`, if any) pointer and walks it later, at flush time.
+ * The caller MUST keep the backing buffer alive AND unmodified until the
+ * next `column_sender_flush` / `column_sender_sync` on this chunk
+ * returns. Freeing/reallocating/moving it before then is undefined
+ * behaviour.
+ *
+ * `data_len_bytes` is the byte length of the buffer `data` points at. It
+ * is validated against `row_count * source-stride(dtype)`; a buffer too
+ * small for the declared dtype + row_count is rejected with
+ * `line_sender_error_invalid_api_call` and nothing is appended. This is
+ * the only guard against a mis-tagged `dtype` or an inflated `row_count`
+ * reading past the real allocation (host-memory leak onto the wire, or a
+ * crash). Pass `arr.nbytes` for a NumPy array; pass `0` when `data` is
+ * NULL (only legal with `row_count == 0`).
  */
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_numpy_column(
@@ -1050,6 +1071,7 @@ bool column_sender_chunk_append_numpy_column(
     size_t name_len,
     uint32_t dtype,
     const uint8_t* data,
+    size_t data_len_bytes,
     size_t row_count,
     const column_sender_validity* validity,
     const column_sender_numpy_extras* extras,
@@ -1119,6 +1141,15 @@ bool column_sender_chunk_designated_timestamp_seconds(
  * for the sync commit frame. If that reserve would be exhausted, flush returns
  * `line_sender_error_invalid_api_call`; call `column_sender_sync` before
  * flushing more chunks.
+ *
+ * No-progress timeout (both modes): `column_sender_sync` returns
+ * `line_sender_error_failover_retry` if the server stays connected but never
+ * advances the ack/durable watermark for `request_timeout` (default 30s) — a
+ * back-pressured WAL or stuck commit. The deadline resets on every watermark
+ * advance, so a slow-but-progressing sync (e.g. a `durable` upload under
+ * pressure) is not cut off. On this error the unacked frames are retained:
+ * drop the conn and re-borrow to replay (store-and-forward) or re-drive from
+ * source (direct). Raise `request_timeout` to wait longer.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
@@ -1152,8 +1183,9 @@ typedef enum column_sender_arrow_override_kind
 } column_sender_arrow_override_kind;
 
 /**
- * Per-column wire-type hint passed to `column_sender_flush_arrow_batch`
- * (and `_at_column`) to steer encoding without having to attach
+ * Per-column wire-type hint passed to
+ * `column_sender_flush_arrow_batch_server_stamped` (and `_at_column`) to
+ * steer encoding without having to attach
  * `questdb.*` Field metadata to the Arrow schema. Caller owns `column`;
  * the bytes are borrowed for the duration of the call.
  *
@@ -1171,7 +1203,14 @@ typedef struct column_sender_arrow_override
 
 /**
  * Encode an Arrow C Data Interface `RecordBatch` (struct-typed
- * `ArrowArray`) and publish it as one QWP frame.
+ * `ArrowArray`) and publish it as one QWP frame, **without** a per-row
+ * designated timestamp: the server stamps each row on arrival.
+ *
+ * This is an explicit opt-in. If your batch carries a real event-time
+ * column, use `column_sender_flush_arrow_batch_at_column` instead —
+ * reaching for this entry point would discard that column's role as the
+ * designated timestamp and silently substitute server arrival time,
+ * producing wrong partitions/order.
  *
  * Ownership: same contract as `column_sender_chunk_append_arrow_column`
  * — on success `array->release` is consumed (set to NULL); on failure
@@ -1188,7 +1227,7 @@ typedef struct column_sender_arrow_override
  * `1..=60`.
  */
 QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch(
+bool column_sender_flush_arrow_batch_server_stamped(
     column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -1198,10 +1237,10 @@ bool column_sender_flush_arrow_batch(
     line_sender_error** err_out);
 
 /**
- * Same as `column_sender_flush_arrow_batch` but picks the designated
- * timestamp from a named column of the batch instead of from
- * `column_sender_chunk_designated_timestamp_*`. Same ownership and
- * `overrides` contract.
+ * Same as `column_sender_flush_arrow_batch_server_stamped` but picks the
+ * designated timestamp from a named column of the batch instead of
+ * letting the server stamp each row. Same ownership and `overrides`
+ * contract.
  */
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch_at_column(

@@ -627,6 +627,54 @@ fn store_and_forward_sync_reports_drop_and_continue_once() {
 }
 
 #[test]
+fn store_and_forward_sync_times_out_on_silent_but_alive_peer() {
+    // `Park` mode finishes the WS upgrade and keeps the connection alive
+    // (draining frames) but never acks — the back-pressured-WAL / stuck-commit
+    // case. Without a deadline the SFA `sync` poll loop would spin forever;
+    // with one it must surface a `FailoverRetry` so the caller regains control,
+    // matching the direct backend's `request_timeout`-bounded behaviour.
+    let server = MockServer::spawn(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+    sender.set_sfa_sync_timeout_for_test(Duration::from_millis(150));
+
+    let mut chunk = Chunk::new("trades");
+    let qty = [1_i64];
+    let ts = [1_i64];
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+    sender.flush(&mut chunk).unwrap();
+
+    let start = Instant::now();
+    let err = sender
+        .sync(AckLevel::Ok)
+        .expect_err("silent-but-alive peer must not block sync forever");
+    let elapsed = start.elapsed();
+
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{}", err.msg());
+    assert!(
+        err.msg().contains("timed out") && err.msg().contains("no ack progress"),
+        "unexpected timeout message: {}",
+        err.msg()
+    );
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "sync returned before the deadline elapsed: {elapsed:?}"
+    );
+    // Generous upper bound: proves the loop terminated near the deadline
+    // rather than hanging, without being flaky on slow CI.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "sync should bail out near the deadline, took {elapsed:?}"
+    );
+}
+
+#[test]
 fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow() {
     let server = MockServer::spawn(4);
     let dir = TempDir::new().unwrap();

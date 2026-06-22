@@ -2300,6 +2300,21 @@ impl QwpWsHostHealthTracker {
         None
     }
 
+    /// Like [`Self::pick_next`] but also marks the chosen endpoint
+    /// `attempted_this_round` before returning. The pool drives the connect
+    /// round through [`QwpWsHealthAccess`], releasing the health lock during
+    /// the blocking `establish_connection`; claiming the endpoint while the
+    /// lock is still held means concurrent borrows rotate to a *different*
+    /// peer instead of piling onto the same slow / black-holed endpoint. The
+    /// real outcome is still recorded by the matching `record_*` call once the
+    /// attempt finishes (those also set `attempted_this_round`, so the early
+    /// claim is idempotent).
+    pub(super) fn pick_next_and_claim(&mut self) -> Option<usize> {
+        let idx = self.pick_next()?;
+        self.attempted_this_round[idx] = true;
+        Some(idx)
+    }
+
     pub(super) fn record_success(&mut self, idx: usize) {
         self.states[idx] = QwpWsHostState::Healthy;
         self.attempted_this_round[idx] = true;
@@ -2330,6 +2345,51 @@ impl QwpWsHostHealthTracker {
     pub(super) fn record_zone(&mut self, _idx: usize, _zone: Option<&str>) {
         // Rust is still client-zone-blind, which matches the spec's zone-unset
         // path: every endpoint remains in the Same tier.
+    }
+}
+
+/// How [`connect_qwp_ws_endpoint_round`] reaches the health tracker.
+///
+/// Every tracker mutation/read goes through [`Self::with_tracker`], so an
+/// implementation backed by a `Mutex` (the connection pool) acquires and
+/// releases the lock *per operation*. The blocking `establish_connection`
+/// between those operations therefore runs with **no** health lock held —
+/// the fix for the pool's head-of-line blocking, where a single slow /
+/// black-holed connect used to stall every other borrow and every dead-sender
+/// return that needed the same lock. Single-connection drivers that own the
+/// tracker by value implement this as a direct in-place mutation with no
+/// locking.
+pub(crate) trait QwpWsHealthAccess {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R;
+}
+
+/// Owned-tracker accessor: the single-connection background / SFA / reconnect
+/// drivers hold the tracker by value, so there is no lock to take.
+impl QwpWsHealthAccess for &mut QwpWsHostHealthTracker {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R {
+        f(self)
+    }
+}
+
+/// Pool accessor: locks the shared tracker for the duration of a single
+/// tracker operation only, never across the blocking connect.
+pub(crate) struct LockedQwpWsHealth<'a> {
+    mutex: &'a Mutex<QwpWsHostHealthTracker>,
+}
+
+impl<'a> LockedQwpWsHealth<'a> {
+    pub(crate) fn new(mutex: &'a Mutex<QwpWsHostHealthTracker>) -> Self {
+        Self { mutex }
+    }
+}
+
+impl QwpWsHealthAccess for LockedQwpWsHealth<'_> {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R {
+        // Poison-tolerant like the pool's other lock helpers: a panic in
+        // another thread's short locked region must not turn every subsequent
+        // borrow/return into a panic.
+        let mut guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut guard)
     }
 }
 
@@ -2493,9 +2553,9 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
-pub(crate) fn connect_qwp_ws_endpoint_round(
+pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     endpoints: &Arc<[QwpWsEndpoint]>,
-    tracker: &mut QwpWsHostHealthTracker,
+    mut health: A,
     previous_idx: &mut Option<usize>,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
@@ -2503,10 +2563,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
     auth_header: Option<&str>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
     if let Some(idx) = previous_idx.take() {
-        tracker.record_mid_stream_failure(idx);
+        health.with_tracker(|t| t.record_mid_stream_failure(idx));
     }
-    if tracker.is_round_exhausted() {
-        tracker.begin_round(true);
+    if health.with_tracker(|t| t.is_round_exhausted()) {
+        health.with_tracker(|t| t.begin_round(true));
     }
 
     let mut last_transport_endpoint_idx = None;
@@ -2515,7 +2575,10 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
     let mut role_reject_count = 0usize;
     let mut latched_typed_error = None;
 
-    while let Some(idx) = tracker.pick_next() {
+    // Pick + claim under the lock, then drop it for the blocking connect, then
+    // re-acquire only to record the outcome. The lock is never held across
+    // `establish_connection`.
+    while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim()) {
         let endpoint = &endpoints[idx];
         match establish_connection(
             &endpoint.host,
@@ -2526,7 +2589,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
             auth_header,
         ) {
             Ok((stream, handshake_result, leftover)) => {
-                tracker.record_success(idx);
+                health.with_tracker(|t| t.record_success(idx));
                 *previous_idx = Some(idx);
                 return Ok(QwpWsConnectRoundSuccess {
                     endpoint_idx: idx,
@@ -2540,8 +2603,12 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
             Err(err) if is_qwp_ws_role_reject_error(&err) => {
                 role_reject_count += 1;
                 let role_reject = err.qwp_ws_role_reject().cloned();
-                tracker.record_zone(idx, qwp_ws_role_reject_zone(&err));
-                tracker.record_role_reject(idx, qwp_ws_role_reject_is_transient(&err));
+                let zone = qwp_ws_role_reject_zone(&err).map(str::to_string);
+                let transient = qwp_ws_role_reject_is_transient(&err);
+                health.with_tracker(|t| {
+                    t.record_zone(idx, zone.as_deref());
+                    t.record_role_reject(idx, transient);
+                });
                 let mut err = error::fmt!(
                     RoleMismatch,
                     "QWP/WebSocket role mismatch at {}:{}: {}",
@@ -2555,7 +2622,7 @@ pub(crate) fn connect_qwp_ws_endpoint_round(
                 last_role_mismatch = Some(err);
             }
             Err(err) => {
-                tracker.record_transport_error(idx);
+                health.with_tracker(|t| t.record_transport_error(idx));
                 if err.code() == crate::ErrorCode::ProtocolVersionError {
                     latched_typed_error = Some(err.clone());
                 }
@@ -3366,6 +3433,73 @@ mod tests {
         assert_eq!(tracker.states[2], QwpWsHostState::Healthy);
         assert_eq!(tracker.states[3], QwpWsHostState::HealthUnknown);
         assert_eq!(tracker.pick_next(), Some(2));
+    }
+
+    #[test]
+    fn locked_health_access_never_holds_lock_between_operations() {
+        // The pool's head-of-line fix relies on this: the connect round only
+        // touches the shared tracker inside `with_tracker`, and the blocking
+        // `establish_connection` runs *between* those calls. So the lock must
+        // be fully released the instant each `with_tracker` returns — a
+        // returning sender recording a transport failure, or a concurrent
+        // cold-start borrow, must never stall behind one slow / black-holed
+        // connect.
+        let mutex = std::sync::Mutex::new(QwpWsHostHealthTracker::new(2));
+        let mut access = LockedQwpWsHealth::new(&mutex);
+
+        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+        assert!(
+            mutex.try_lock().is_ok(),
+            "health lock must be released after pick+claim, not held across the connect"
+        );
+
+        access.with_tracker(|t| t.record_success(idx));
+        assert!(
+            mutex.try_lock().is_ok(),
+            "health lock must be released after recording the outcome"
+        );
+    }
+
+    #[test]
+    fn locked_health_access_lets_another_thread_lock_between_operations() {
+        // Concrete proof that a second actor (a returning sender / another
+        // borrow) can take `inner.health` while a connect round is mid-flight
+        // between its pick and its record steps.
+        let mutex = Arc::new(std::sync::Mutex::new(QwpWsHostHealthTracker::new(2)));
+        let mut access = LockedQwpWsHealth::new(&mutex);
+
+        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+
+        // Simulates the gap during which `establish_connection` blocks: no
+        // health lock is held here, so another thread grabs it freely.
+        let other = Arc::clone(&mutex);
+        std::thread::spawn(move || {
+            other
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_mid_stream_failure(1);
+        })
+        .join()
+        .unwrap();
+
+        access.with_tracker(|t| t.record_transport_error(idx));
+    }
+
+    #[test]
+    fn pick_next_and_claim_rotates_concurrent_picks_off_the_same_endpoint() {
+        // Claiming the endpoint *while the lock is still held* means a second
+        // borrow that picks before the first has recorded its outcome rotates
+        // to a different peer instead of piling onto the same slow endpoint.
+        let mut tracker = QwpWsHostHealthTracker::new(2);
+        let a = tracker.pick_next_and_claim().unwrap();
+        let b = tracker.pick_next_and_claim().unwrap();
+        assert_ne!(a, b, "concurrent claims must target distinct endpoints");
+        assert!(tracker.is_round_exhausted());
+        assert_eq!(tracker.pick_next_and_claim(), None);
+
+        // A fresh round re-probes from scratch.
+        tracker.begin_round(true);
+        assert!(tracker.pick_next_and_claim().is_some());
     }
 
     #[test]

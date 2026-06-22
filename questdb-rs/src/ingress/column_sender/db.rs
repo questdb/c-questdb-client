@@ -365,6 +365,7 @@ impl QuestDb {
                     state,
                     connector.max_buf_size(),
                     connector.request_durable_ack(),
+                    connector.request_timeout(),
                 ),
                 last_idle_at: now,
             });
@@ -1371,6 +1372,7 @@ fn connect_sfa_pool(inner: &Arc<DbInner>) -> Result<ColumnSender> {
         state,
         inner.connector.max_buf_size(),
         inner.connector.request_durable_ack(),
+        inner.connector.request_timeout(),
     ))
 }
 
@@ -1427,11 +1429,15 @@ fn connect_conn(
     ColumnConn::from_round_stream(raw)
 }
 
-/// Same as [`connect_conn`] but takes the live pool, locking the shared health
-/// tracker for the duration of the connect round.
+/// Same as [`connect_conn`] but takes the live pool. The shared health tracker
+/// is locked only per tracker operation (pick/claim/record), never across the
+/// blocking TCP+TLS+WS-upgrade handshake — so concurrent cold-start borrows do
+/// not serialize end-to-end, and dead-sender returns that also grab
+/// `inner.health` (via [`record_sender_transport_failure`]) are not stalled
+/// behind one slow / black-holed connect.
 fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
-    let mut health = lock_health(&inner.health);
-    connect_conn(&inner.connector, &mut health)
+    let raw: RawQwpWsRoundStream = inner.connector.connect_round_pooled(&inner.health)?;
+    ColumnConn::from_round_stream(raw)
 }
 
 fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {

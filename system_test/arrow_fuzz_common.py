@@ -259,8 +259,9 @@ def ingest_via_arrow(
     ts_col: Optional[bytes] = b"ts",
     sender_conf_extras: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Ingest one RecordBatch through `column_sender_flush_arrow_batch`.
-    If `ts_col` is None the server stamps each row on arrival."""
+    """Ingest one RecordBatch through `column_sender_flush_arrow_batch_at_column`
+    (when `ts_col` is set) or `column_sender_flush_arrow_batch_server_stamped`
+    (when `ts_col` is None — the server stamps each row on arrival)."""
     extras = sender_conf_extras or {}
     with borrowed_column_sender(fixture, **extras) as conn:
         table_name = _c_table_name(table)

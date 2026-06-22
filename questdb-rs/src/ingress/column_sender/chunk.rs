@@ -1177,7 +1177,7 @@ impl<'a> Chunk<'a> {
 
     /// Append an Arrow column to the chunk. The column's QWP wire type
     /// is derived from `field` (Arrow datatype + extension metadata)
-    /// via the same classifier used by [`ColumnSender::flush_arrow_batch`].
+    /// via the same classifier used by [`ColumnSender::flush_arrow_batch_at_column`].
     /// `arr.len()` participates in the chunk's row-count lock; validity
     /// is read from `arr.nulls()` at flush time.
     ///
@@ -1186,7 +1186,7 @@ impl<'a> Chunk<'a> {
     /// schema, regardless of how the upstream Arrow producer named the
     /// column).
     ///
-    /// [`ColumnSender::flush_arrow_batch`]: super::ColumnSender::flush_arrow_batch
+    /// [`ColumnSender::flush_arrow_batch_at_column`]: super::ColumnSender::flush_arrow_batch_at_column
     #[cfg(feature = "arrow")]
     pub fn push_arrow_column(
         &mut self,

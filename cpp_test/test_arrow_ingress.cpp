@@ -34,7 +34,7 @@ TEST_CASE("column_sender_conn::flush_arrow_batch rejects NULL conn")
 
     qdb::column_sender_conn conn{nullptr};
     CHECK_THROWS_AS(
-        conn.flush_arrow_batch("t"_tn, arr, sch),
+        conn.flush_arrow_batch_server_stamped("t"_tn, arr, sch),
         qdb::line_sender_error);
 }
 
@@ -61,7 +61,7 @@ TEST_CASE("column_sender_conn surfaces error_code on NULL-conn failure")
     qdb::column_sender_conn conn{nullptr};
     try
     {
-        conn.flush_arrow_batch("t"_tn, arr, sch);
+        conn.flush_arrow_batch_server_stamped("t"_tn, arr, sch);
         FAIL("expected throw");
     }
     catch (const qdb::line_sender_error& e)
@@ -202,8 +202,9 @@ struct MockConn
     MockConn& operator=(const MockConn&) = delete;
 };
 
-// Validate that `conn.flush_arrow_batch(...)` for a primitive-column
-// schema succeeds. On any throw the test fails with the error message.
+// Validate that `conn.flush_arrow_batch_server_stamped(...)` for a
+// primitive-column schema succeeds. On any throw the test fails with the
+// error message.
 void expect_flush_ok(
     MockConn& mc,
     const char* table,
@@ -213,12 +214,12 @@ void expect_flush_ok(
     qdb::column_sender_conn conn{mc.conn};
     try
     {
-        conn.flush_arrow_batch(
+        conn.flush_arrow_batch_server_stamped(
             qdb::table_name_view{table, std::strlen(table)}, arr, sch);
     }
     catch (const qdb::line_sender_error& e)
     {
-        FAIL("flush_arrow_batch threw: " << e.what());
+        FAIL("flush_arrow_batch_server_stamped threw: " << e.what());
     }
 }
 
@@ -239,7 +240,7 @@ TEST_CASE("flush_arrow_batch: NULL array → invalid_api_call")
     std::memset(&sch, 0, sizeof(sch));
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch(
+    bool ok = column_sender_flush_arrow_batch_server_stamped(
         mc.conn, tbl, nullptr, &sch, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
@@ -254,7 +255,7 @@ TEST_CASE("flush_arrow_batch: NULL schema → invalid_api_call")
     std::memset(&arr, 0, sizeof(arr));
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch(
+    bool ok = column_sender_flush_arrow_batch_server_stamped(
         mc.conn, tbl, &arr, nullptr, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
@@ -555,7 +556,7 @@ TEST_CASE("flush_arrow_batch: Int32 + questdb.geohash_bits → column_geohash")
 // `Column` variant maps to the dedicated `flush_arrow_batch_at_column`.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("flush_arrow_batch: omits per-row timestamp (server stamps on arrival)")
+TEST_CASE("flush_arrow_batch_server_stamped: omits per-row timestamp (server stamps on arrival)")
 {
     MockConn mc;
     auto col = pack_le<int64_t>({10, 20});

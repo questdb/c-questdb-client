@@ -3322,11 +3322,13 @@ fn write_header_placeholder(out: &mut Vec<u8>, table_count: u16, defer_commit: b
     debug_assert_eq!(out.len() - start, QWP_HEADER_LEN);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_arrow_batch_into(
     out: &mut Vec<u8>,
     table: TableName<'_>,
     batch: &RecordBatch,
     ts_col_idx: Option<usize>,
+    server_stamp: bool,
     overrides: &[ArrowColumnOverride<'_>],
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
@@ -3336,6 +3338,7 @@ pub(crate) fn encode_arrow_batch_into(
         table,
         batch,
         ts_col_idx,
+        server_stamp,
         overrides,
         symbol_dict,
         defer_commit,
@@ -3348,6 +3351,7 @@ pub(crate) fn encode_arrow_batch_replay_into(
     table: TableName<'_>,
     batch: &RecordBatch,
     ts_col_idx: Option<usize>,
+    server_stamp: bool,
     overrides: &[ArrowColumnOverride<'_>],
     symbol_dict: &mut SymbolGlobalDict,
 ) -> Result<()> {
@@ -3356,6 +3360,7 @@ pub(crate) fn encode_arrow_batch_replay_into(
         table,
         batch,
         ts_col_idx,
+        server_stamp,
         overrides,
         symbol_dict,
         /* defer_commit = */ false,
@@ -3369,6 +3374,7 @@ fn encode_arrow_batch_into_mode(
     table: TableName<'_>,
     batch: &RecordBatch,
     ts_col_idx: Option<usize>,
+    server_stamp: bool,
     overrides: &[ArrowColumnOverride<'_>],
     symbol_dict: &mut SymbolGlobalDict,
     defer_commit: bool,
@@ -3400,6 +3406,20 @@ fn encode_arrow_batch_into_mode(
             "row count {} exceeds maximum {} for a single flush_arrow_batch call",
             row_count,
             MAX_ARROW_INGEST_ROWS
+        ));
+    }
+    // Server-stamping (no per-row designated timestamp) must be an explicit
+    // opt-in: a caller who simply forgot to designate their event-time column
+    // would otherwise get silent server-assigned timestamps → wrong
+    // partitions/order, discoverable only by querying. Mirror the chunk path,
+    // which hard-errors when no designated timestamp was set.
+    if ts_col_idx.is_none() && !server_stamp {
+        return Err(fmt!(
+            ArrowIngest,
+            "RecordBatch has no designated timestamp; call \
+             flush_arrow_batch_at_column to source it from a Timestamp(_) column, \
+             or flush_arrow_batch_server_stamped to explicitly let the server \
+             stamp each row on arrival."
         ));
     }
     check_batch_data_bounds(batch)?;
@@ -3666,6 +3686,7 @@ mod tests {
             tbl(table_name),
             batch,
             None,
+            /* server_stamp = */ true,
             &[],
             &mut dict,
             false,
@@ -3684,6 +3705,7 @@ mod tests {
             tbl("t"),
             batch,
             Some(ts_idx),
+            /* server_stamp = */ false,
             &[],
             &mut dict,
             false,
@@ -3695,7 +3717,35 @@ mod tests {
     fn encode_err(batch: &RecordBatch) -> Error {
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), batch, None, &[], &mut dict, false).unwrap_err()
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            batch,
+            None,
+            /* server_stamp = */ true,
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap_err()
+    }
+
+    /// Encode `batch` with neither a designated ts column nor the
+    /// server-stamp opt-in, returning the resulting error.
+    fn encode_err_no_ts_no_opt_in(batch: &RecordBatch) -> Error {
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        encode_arrow_batch_into(
+            &mut out,
+            tbl("t"),
+            batch,
+            None,
+            /* server_stamp = */ false,
+            &[],
+            &mut dict,
+            false,
+        )
+        .unwrap_err()
     }
 
     fn encode_err_at_ts(batch: &RecordBatch, ts_idx: usize) -> Error {
@@ -3706,6 +3756,7 @@ mod tests {
             tbl("t"),
             batch,
             Some(ts_idx),
+            /* server_stamp = */ false,
             &[],
             &mut dict,
             false,
@@ -3758,6 +3809,37 @@ mod tests {
     }
 
     #[test]
+    fn no_ts_without_server_stamp_opt_in_rejected() {
+        // A batch with no designated timestamp and no explicit server-stamp
+        // opt-in must hard-error rather than silently server-stamp every row.
+        let mut b = Int64Builder::new();
+        b.append_value(1);
+        b.append_value(2);
+        let rb = single_col_batch(Field::new("c", DataType::Int64, false), b.finish());
+        let err = encode_err_no_ts_no_opt_in(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("no designated timestamp")
+                && err.msg().contains("flush_arrow_batch_at_column")
+                && err.msg().contains("flush_arrow_batch_server_stamped"),
+            "unexpected message: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn no_ts_with_server_stamp_opt_in_encodes() {
+        // The same batch encodes cleanly once server-stamping is opted into.
+        let mut b = Int64Builder::new();
+        b.append_value(1);
+        b.append_value(2);
+        let rb = single_col_batch(Field::new("c", DataType::Int64, false), b.finish());
+        // `encode()` uses the server-stamp opt-in helper.
+        let out = encode(&rb);
+        assert_qwp_header(&out, 1);
+    }
+
+    #[test]
     fn timestamp_at_column_writes_designated_ts() {
         let mut payload = Float64Builder::new();
         payload.append_value(1.0);
@@ -3796,7 +3878,7 @@ mod tests {
         let rb = single_col_batch(f, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false).unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false).unwrap();
         assert_qwp_header(&out, 1);
         assert_eq!(dict.next_id(), 2);
     }
@@ -4281,7 +4363,7 @@ mod tests {
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false).unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false).unwrap();
         // 4 rows, only 2 unique values → dict has 2 entries.
         assert_eq!(dict.next_id(), 2);
     }
@@ -4298,7 +4380,7 @@ mod tests {
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false).unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false).unwrap();
         assert_eq!(dict.next_id(), 2);
     }
 
@@ -4674,7 +4756,7 @@ mod tests {
         let rb = single_col_batch(field, dict);
         let mut out = Vec::new();
         let mut gd = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut gd, false).unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut gd, false).unwrap();
         assert_eq!(gd.next_id(), 2);
     }
 
@@ -4694,7 +4776,7 @@ mod tests {
         let rb = single_col_batch(field, dict);
         let mut out = Vec::new();
         let mut gd = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut gd, false).unwrap();
+        encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut gd, false).unwrap();
         assert_eq!(gd.next_id(), 1);
     }
 
@@ -5337,7 +5419,7 @@ mod tests {
         let mut out = Vec::from(b"PREFIX");
         let prior_len = out.len();
         let mut dict = SymbolGlobalDict::new();
-        let err = encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, &[], &mut dict, false)
+        let err = encode_arrow_batch_into(&mut out, tbl("t"), &rb, None, /* server_stamp = */ true, &[], &mut dict, false)
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrowUnsupportedColumnKind);
         assert_eq!(
@@ -5664,7 +5746,7 @@ mod tests {
     ) -> Result<(Vec<u8>, SymbolGlobalDict)> {
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
-        encode_arrow_batch_into(&mut out, tbl("t"), batch, None, overrides, &mut dict, false)?;
+        encode_arrow_batch_into(&mut out, tbl("t"), batch, None, /* server_stamp = */ true, overrides, &mut dict, false)?;
         Ok((out, dict))
     }
 

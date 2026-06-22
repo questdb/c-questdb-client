@@ -1,7 +1,7 @@
 """ctypes bindings for the Apache Arrow C Data Interface exports.
 
 Wraps `reader_cursor_next_arrow_batch` (egress) and
-`column_sender_flush_arrow_batch[_at_column]` (ingress) from
+`column_sender_flush_arrow_batch_server_stamped[_at_column]` (ingress) from
 `libquestdb_client`. Layout of `ArrowArray` / `ArrowSchema` mirrors
 the Apache Arrow spec:
 <https://arrow.apache.org/docs/format/CDataInterface.html>.
@@ -223,7 +223,7 @@ class _ColumnSenderArrowOverride(ctypes.Structure):
 
 # Conn-level Arrow batch flush.
 _flush_arrow_batch = _setsig(
-    "column_sender_flush_arrow_batch",
+    "column_sender_flush_arrow_batch_server_stamped",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
     _LineSenderTableName,
@@ -287,8 +287,8 @@ def conn_flush_arrow_batch(
     schema_ptr,
     ts_column_name: Optional[bytes] = None,
 ) -> None:
-    """Drive `column_sender_flush_arrow_batch` (or its `_at_column`
-    variant when `ts_column_name` is set). Consumes `array_ptr`'s
+    """Drive `column_sender_flush_arrow_batch_server_stamped` (or its
+    `_at_column` variant when `ts_column_name` is set). Consumes `array_ptr`'s
     ownership; `schema_ptr` remains the caller's."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     overrides_ptr = ctypes.POINTER(_ColumnSenderArrowOverride)()

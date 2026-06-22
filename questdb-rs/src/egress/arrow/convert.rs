@@ -88,6 +88,12 @@ pub(crate) fn batch_to_record_batch(
     }
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     let mut sym_scratch = SymbolBuildScratch::default();
+    // Single degenerate-list slack pool shared by every array column in this
+    // batch. Threading one budget (rather than re-granting it per column) stops
+    // a wide batch of `[huge, 0]` columns from multiplying offset-buffer
+    // allocation by the column count: total degenerate expansion per batch is
+    // capped at ~64 MiB regardless of how many array columns the batch carries.
+    let mut degenerate_node_slack = MAX_DEGENERATE_LIST_NODES;
     for (idx, decoded) in columns.into_iter().enumerate() {
         let field = schema_ref.field(idx);
         let kind = egress_schema
@@ -101,6 +107,7 @@ pub(crate) fn batch_to_record_batch(
             row_count,
             dict,
             &mut sym_scratch,
+            &mut degenerate_node_slack,
         )?);
     }
     RecordBatch::try_new(schema_ref, arrays)
@@ -114,6 +121,7 @@ fn column_to_array(
     row_count: usize,
     dict: &SymbolDict,
     sym_scratch: &mut SymbolBuildScratch,
+    degenerate_node_slack: &mut usize,
 ) -> Result<ArrayRef> {
     Ok(match (kind, decoded) {
         (ColumnKind::Boolean, DecodedColumn::Boolean(buf)) => {
@@ -200,11 +208,15 @@ fn column_to_array(
             let active = local_dict.as_ref().unwrap_or(dict);
             symbol_array(codes, validity, active, row_count, sym_scratch)?
         }
-        (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => {
-            array_column_to_arrow(field, b, row_count, ArrayLeaf::Float64)?
-        }
+        (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => array_column_to_arrow(
+            field,
+            b,
+            row_count,
+            ArrayLeaf::Float64,
+            degenerate_node_slack,
+        )?,
         (ColumnKind::LongArray, DecodedColumn::LongArray(b)) => {
-            array_column_to_arrow(field, b, row_count, ArrayLeaf::Int64)?
+            array_column_to_arrow(field, b, row_count, ArrayLeaf::Int64, degenerate_node_slack)?
         }
         (kind, decoded) => {
             return Err(fmt!(
@@ -558,6 +570,7 @@ fn array_column_to_arrow(
     b: ArrayBuffers,
     row_count: usize,
     leaf: ArrayLeaf,
+    degenerate_node_slack: &mut usize,
 ) -> Result<ArrayRef> {
     let ArrayBuffers {
         data_offsets,
@@ -603,8 +616,14 @@ fn array_column_to_arrow(
         ArrayLeaf::Float64 => Arc::new(arrow_array::Float64Array::from(leaf_data)),
         ArrayLeaf::Int64 => Arc::new(arrow_array::Int64Array::from(leaf_data)),
     };
-    let per_level_counts =
-        compute_per_level_counts(&shapes, &shape_offsets, ndim, row_count, total_elements)?;
+    let per_level_counts = compute_per_level_counts(
+        &shapes,
+        &shape_offsets,
+        ndim,
+        row_count,
+        total_elements,
+        degenerate_node_slack,
+    )?;
     nest_lists(field, leaf_array, per_level_counts, nulls, ndim)
 }
 
@@ -626,8 +645,15 @@ fn ndim_from_field(field: &Field) -> Result<usize> {
     Ok(d)
 }
 
-/// Slack in the list-node budget so genuinely empty shapes (`[3, 0]`) decode
-/// while a hostile stream of them stays bounded to ~64 MiB of offset buffers.
+/// Initial value of the per-batch list-node *slack* pool, so genuinely empty
+/// shapes (`[3, 0]`) decode. This is not re-granted per column: a single budget
+/// seeded with this value is shared across every array column in a batch (see
+/// `batch_to_record_batch`), so a wide batch of degenerate `[huge, 0]` columns
+/// expands to at most ~64 MiB of offset buffers *in total*, not ~64 MiB *per
+/// column*. The bound is per batch, not stream-global: a consumer that retains
+/// every decoded batch still accumulates memory, which is inherent to holding
+/// unbounded batches and is bounded per batch by the transport's
+/// `MAX_BATCH_WIRE_BYTES` cap.
 const MAX_DEGENERATE_LIST_NODES: usize = 16 * 1024 * 1024;
 
 fn compute_per_level_counts(
@@ -636,15 +662,17 @@ fn compute_per_level_counts(
     ndim: usize,
     row_count: usize,
     leaf_elements: usize,
+    degenerate_node_slack: &mut usize,
 ) -> Result<Vec<Vec<u32>>> {
     // Cap total list-node expansion: a degenerate `[huge, 0]` shape carries a
     // tiny payload yet asks for billions of empty inner lists. Valid dense
-    // data needs at most `ndim * leaf` nodes; the slack covers genuine empty
-    // shapes like `[3, 0]`.
-    let mut node_budget = leaf_elements
-        .saturating_mul(ndim)
-        .saturating_add(row_count)
-        .saturating_add(MAX_DEGENERATE_LIST_NODES);
+    // data needs at most `ndim * leaf + row_count` nodes and is always granted
+    // per column; the *slack* covers genuine empty shapes like `[3, 0]` and is
+    // drawn from `degenerate_node_slack`, a single pool shared across every
+    // column in the batch, so the column count cannot multiply the degenerate
+    // bound.
+    let legit_nodes = leaf_elements.saturating_mul(ndim).saturating_add(row_count);
+    let mut node_budget = legit_nodes.saturating_add(*degenerate_node_slack);
     let mut levels: Vec<Vec<u32>> = vec![Vec::new(); ndim];
     for row in 0..row_count {
         let lo = *shape_offsets
@@ -709,6 +737,12 @@ fn compute_per_level_counts(
             })?;
         }
     }
+    // Debit the shared pool by the slack this column actually spent. Expansion
+    // beyond the legitimate, payload-backed allowance comes out of the slack, so
+    // the remainder `node_budget` is exactly the slack left when this column dug
+    // into it; when it did not, `node_budget >= *degenerate_node_slack` and the
+    // pool is unchanged. `min` captures both cases.
+    *degenerate_node_slack = (*degenerate_node_slack).min(node_budget);
     Ok(levels)
 }
 
@@ -862,7 +896,30 @@ mod tests {
     fn per_level_counts_rejects_degenerate_expansion() {
         let shapes = [1u32 << 24, 0, 1u32 << 24, 0];
         let shape_offsets = [0u32, 2, 4];
-        let err = compute_per_level_counts(&shapes, &shape_offsets, 2, 2, 0).unwrap_err();
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let err =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 2, 0, &mut slack).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn per_level_counts_slack_is_shared_across_columns() {
+        // Two array columns in one batch, each a single degenerate `[16M, 0]`
+        // row, sharing one slack pool. The first column drains the pool; the
+        // second is then rejected. This caps per-batch degenerate expansion at
+        // ~64 MiB no matter how many such columns the batch carries (the old
+        // per-column reset allowed ~64 MiB * column_count).
+        let shapes = [1u32 << 24, 0];
+        let shape_offsets = [0u32, 2];
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+
+        let counts =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0, &mut slack).unwrap();
+        assert_eq!(counts[0], vec![1u32 << 24]);
+        assert_eq!(slack, 0, "first degenerate column should drain the pool");
+
+        let err =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0, &mut slack).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -870,7 +927,9 @@ mod tests {
     fn per_level_counts_accepts_genuine_empty_shape() {
         let shapes = [3u32, 0];
         let shape_offsets = [0u32, 2];
-        let counts = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0).unwrap();
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let counts =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 0, &mut slack).unwrap();
         assert_eq!(counts[0], vec![3]);
         assert_eq!(counts[1], vec![0, 0, 0]);
     }
@@ -879,8 +938,22 @@ mod tests {
     fn per_level_counts_accepts_dense_shape() {
         let shapes = [2u32, 3];
         let shape_offsets = [0u32, 2];
-        let counts = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6).unwrap();
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let counts =
+            compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6, &mut slack).unwrap();
         assert_eq!(counts[0], vec![2]);
         assert_eq!(counts[1], vec![3, 3]);
+    }
+
+    #[test]
+    fn per_level_counts_dense_does_not_drain_slack() {
+        // Legitimate, payload-backed dense data is granted per column and must
+        // not consume the shared degenerate pool, so it never starves sibling
+        // columns in the same batch.
+        let shapes = [2u32, 3];
+        let shape_offsets = [0u32, 2];
+        let mut slack = MAX_DEGENERATE_LIST_NODES;
+        let _ = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6, &mut slack).unwrap();
+        assert_eq!(slack, MAX_DEGENERATE_LIST_NODES);
     }
 }

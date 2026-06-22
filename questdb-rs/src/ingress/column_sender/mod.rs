@@ -65,7 +65,7 @@ pub use validity::Validity;
 
 /// Per-flush row-count ceiling shared across every column-sender input
 /// path (`Chunk::column_*`, `Chunk::push_numpy_deferred`,
-/// `Chunk::push_arrow_column`, `flush_arrow_batch`). Bounds:
+/// `Chunk::push_arrow_column`, `flush_arrow_batch_*`). Bounds:
 ///   * upstream allocations sized as `row_count * element_size`
 ///     so they cannot saturate `usize` or panic in `Vec::reserve`,
 ///   * validity bitmap byte-length (`ceil(bit_len / 8)`) to a value

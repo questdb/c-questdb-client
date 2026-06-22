@@ -27,7 +27,7 @@
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::ingress::QwpWsSenderError;
@@ -88,6 +88,13 @@ struct SfaColumnBackend {
     payload: Vec<u8>,
     max_buf_size: usize,
     request_durable_ack: bool,
+    /// No-progress deadline for the `sync` poll loop. Mirrors the direct
+    /// backend's socket `request_timeout`: it bounds how long `sync` waits
+    /// *without the ack/durable watermark advancing*, so a silent-but-alive
+    /// peer (back-pressured WAL, stuck commit) cannot block the caller
+    /// forever. A legitimately slow-but-progressing sync keeps resetting it.
+    /// `Duration::ZERO` disables the deadline (unbounded, legacy behaviour).
+    sync_timeout: Duration,
     last_ok_sync_boundary: Option<u64>,
     last_durable_sync_boundary: Option<u64>,
     drop_on_return: bool,
@@ -145,6 +152,7 @@ impl ColumnSender {
         state: SyncQwpWsHandlerState,
         max_buf_size: usize,
         request_durable_ack: bool,
+        sync_timeout: Duration,
     ) -> Self {
         Self {
             backend: ColumnSenderBackend::StoreAndForward(SfaColumnBackend {
@@ -154,6 +162,7 @@ impl ColumnSender {
                 payload: Vec::new(),
                 max_buf_size,
                 request_durable_ack,
+                sync_timeout,
                 last_ok_sync_boundary: None,
                 last_durable_sync_boundary: None,
                 drop_on_return: false,
@@ -179,6 +188,16 @@ impl ColumnSender {
         match &mut self.backend {
             ColumnSenderBackend::Direct(direct) => direct.conn.mark_must_close(),
             ColumnSenderBackend::StoreAndForward(sfa) => sfa.drop_on_return = true,
+        }
+    }
+
+    /// Override the store-and-forward `sync` no-progress deadline. Tests use
+    /// this to exercise the timeout without waiting for the production default
+    /// (`request_timeout`, 30s). No-op on the direct backend.
+    #[cfg(test)]
+    pub(crate) fn set_sfa_sync_timeout_for_test(&mut self, timeout: Duration) {
+        if let ColumnSenderBackend::StoreAndForward(sfa) = &mut self.backend {
+            sfa.sync_timeout = timeout;
         }
     }
 
@@ -217,8 +236,17 @@ impl ColumnSender {
         }
     }
 
+    /// Encode and publish an Arrow [`RecordBatch`] **without** a per-row
+    /// designated timestamp, explicitly delegating timestamp assignment to the
+    /// server (each row is stamped on arrival).
+    ///
+    /// This is the opt-in counterpart to [`Self::flush_arrow_batch_at_column`].
+    /// If your batch carries a real event-time column, prefer
+    /// `flush_arrow_batch_at_column` — reaching for this method instead would
+    /// discard that column's role as the designated timestamp and silently
+    /// substitute server arrival time, producing wrong partitions/order.
     #[cfg(feature = "arrow")]
-    pub fn flush_arrow_batch<'t, T>(
+    pub fn flush_arrow_batch_server_stamped<'t, T>(
         &mut self,
         table: T,
         batch: &RecordBatch,
@@ -233,17 +261,22 @@ impl ColumnSender {
             ColumnSenderBackend::Direct(direct) => {
                 let defer = direct.first_frame_sent;
                 direct
-                    .flush_arrow_batch_inner(table, batch, None, overrides, defer)
+                    .flush_arrow_batch_inner(table, batch, None, true, overrides, defer)
                     .map_err(classify_flush_error)?;
                 direct.first_frame_sent = true;
                 Ok(())
             }
             ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.flush_arrow_batch(table, batch, None, overrides)
+                sfa.flush_arrow_batch(table, batch, None, true, overrides)
             }
         }
     }
 
+    /// Encode and publish an Arrow [`RecordBatch`], sourcing the per-row
+    /// designated timestamp from the named `Timestamp(_)` column of the batch.
+    ///
+    /// Use [`Self::flush_arrow_batch_server_stamped`] to instead let the server
+    /// stamp each row on arrival.
     #[cfg(feature = "arrow")]
     pub fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
@@ -262,13 +295,13 @@ impl ColumnSender {
             ColumnSenderBackend::Direct(direct) => {
                 let defer = direct.first_frame_sent;
                 direct
-                    .flush_arrow_batch_inner(table, batch, Some(ts_col_idx), overrides, defer)
+                    .flush_arrow_batch_inner(table, batch, Some(ts_col_idx), false, overrides, defer)
                     .map_err(classify_flush_error)?;
                 direct.first_frame_sent = true;
                 Ok(())
             }
             ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.flush_arrow_batch(table, batch, Some(ts_col_idx), overrides)
+                sfa.flush_arrow_batch(table, batch, Some(ts_col_idx), false, overrides)
             }
         }
     }
@@ -332,11 +365,13 @@ impl DirectColumnBackend {
     }
 
     #[cfg(feature = "arrow")]
+    #[allow(clippy::too_many_arguments)]
     fn flush_arrow_batch_inner(
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,
         ts_col_idx: Option<usize>,
+        server_stamp: bool,
         overrides: &[ArrowColumnOverride<'_>],
         defer_commit: bool,
     ) -> Result<()> {
@@ -361,6 +396,7 @@ impl DirectColumnBackend {
                 table,
                 batch,
                 ts_col_idx,
+                server_stamp,
                 overrides,
                 &mut self.symbol_dict,
                 defer_commit,
@@ -411,6 +447,7 @@ impl SfaColumnBackend {
         table: TableName<'_>,
         batch: &RecordBatch,
         ts_col_idx: Option<usize>,
+        server_stamp: bool,
         overrides: &[ArrowColumnOverride<'_>],
     ) -> Result<()> {
         qwp_ws_check_error_background(&self.state)?;
@@ -421,6 +458,7 @@ impl SfaColumnBackend {
             table,
             batch,
             ts_col_idx,
+            server_stamp,
             overrides,
             &mut self.symbol_dict,
         ) {
@@ -458,6 +496,14 @@ impl SfaColumnBackend {
         }
         let from_fsn = last_boundary.map_or(0, |last| last.saturating_add(1));
 
+        // No-progress deadline: reset every time the ack/durable watermark
+        // advances, so this only fires when the peer stays alive yet silent
+        // (never advancing toward `boundary`) for `sync_timeout`. This mirrors
+        // the direct backend, whose blocking read re-arms `request_timeout` on
+        // every received frame and surfaces a timeout when none arrive.
+        let mut deadline_anchor = Instant::now();
+        let mut last_completed: Option<u64> = None;
+
         loop {
             if let Some(sender_error) =
                 qwp_ws_poll_sender_error_in_range_background(&self.state, from_fsn, boundary)?
@@ -476,8 +522,16 @@ impl SfaColumnBackend {
                 }
                 return Ok(());
             }
+            if completed != last_completed {
+                last_completed = completed;
+                deadline_anchor = Instant::now();
+            }
 
             qwp_ws_check_error_background(&self.state)?;
+
+            if !self.sync_timeout.is_zero() && deadline_anchor.elapsed() >= self.sync_timeout {
+                return Err(sfa_sync_timeout(self.sync_timeout, ack_level, boundary, completed));
+            }
             thread::sleep(Duration::from_millis(10));
         }
     }
@@ -490,6 +544,40 @@ impl SfaColumnBackend {
             self.max_buf_size.min(server_max)
         }
     }
+}
+
+/// The store-and-forward `sync` poll loop made no progress toward `boundary`
+/// for `sync_timeout`. The connection is alive but the server is not advancing
+/// the ack/durable watermark (e.g. back-pressured WAL or a stuck commit).
+///
+/// Classified `FailoverRetry` — the local SFA queue still holds every unacked
+/// frame, so the caller can drop this borrow and re-borrow to replay, exactly
+/// as on the direct backend's transport-timeout path. The sync has *not*
+/// committed; the watermark simply has not reached `boundary` yet.
+fn sfa_sync_timeout(
+    sync_timeout: Duration,
+    ack_level: AckLevel,
+    boundary: u64,
+    completed: Option<u64>,
+) -> crate::Error {
+    let level = match ack_level {
+        AckLevel::Ok => "ok",
+        AckLevel::Durable => "durable",
+    };
+    let progress = match completed {
+        Some(fsn) => format!("reached FSN {}", fsn),
+        None => "reached no frame".to_string(),
+    };
+    crate::Error::new(
+        ErrorCode::FailoverRetry,
+        format!(
+            "QWP/WebSocket store-and-forward sync({}) timed out after {:?} \
+             with no ack progress (target FSN {}, {}); the connection is alive \
+             but the server is not advancing the watermark. The queued frames \
+             are retained; drop this sender and re-borrow to replay.",
+            level, sync_timeout, boundary, progress
+        ),
+    )
 }
 
 fn sfa_sender_error(sender_error: QwpWsSenderError) -> crate::Error {

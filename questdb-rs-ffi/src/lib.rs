@@ -274,12 +274,12 @@ pub enum line_sender_error_code {
     /// QWP/WebSocket server rejection or terminal protocol violation.
     line_sender_error_server_rejection = 14,
 
-    /// `column_sender_flush_arrow_batch` was passed a column whose
+    /// `column_sender_flush_arrow_batch_*` was passed a column whose
     /// Arrow / QuestDB kind cannot be persisted to a QuestDB table.
     /// Only emitted with the `arrow` feature enabled.
     line_sender_error_arrow_unsupported_column_kind = 15,
 
-    /// `column_sender_flush_arrow_batch` rejected a `RecordBatch` at
+    /// `column_sender_flush_arrow_batch_*` rejected a `RecordBatch` at
     /// client-side structural validation (column count, name encoding,
     /// FFI struct contract). Only emitted with the `arrow` feature
     /// enabled.
@@ -4314,7 +4314,7 @@ unsafe fn validate_arrow_array_depth(
 ///
 /// Shared by every FFI entry point that consumes a caller-built Arrow
 /// C Data Interface pair (currently
-/// `column_sender_flush_arrow_batch[_at_column]`).
+/// `column_sender_flush_arrow_batch_server_stamped` / `_at_column`).
 #[cfg(feature = "arrow")]
 pub(crate) unsafe fn arrow_ffi_import_record_batch(
     array: *mut arrow::ffi::FFI_ArrowArray,

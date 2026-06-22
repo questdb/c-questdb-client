@@ -661,7 +661,8 @@ bool column_sender_chunk_symbol_dict_i32(
 
 Single entry point that consumes one column from an Apache Arrow C
 Data Interface array and routes through the same classifier and
-encoder used by `column_sender_flush_arrow_batch` (§13.1). Coverage is
+encoder used by `column_sender_flush_arrow_batch_server_stamped`
+(§13.1). Coverage is
 the full 43-variant `ColumnKind` matrix — all primitives, timestamps,
 dates, decimals (Decimal32/64/128/256), UUID, LONG256, geohash,
 dictionary-encoded symbols across every key/value combination, and
@@ -804,11 +805,23 @@ bool column_sender_chunk_append_numpy_column(
     size_t name_len,
     column_sender_numpy_dtype dtype,
     const uint8_t* data,
+    size_t data_len_bytes,
     size_t row_count,
     const column_sender_validity* validity,
     const column_sender_numpy_extras* extras,
     line_sender_error** err_out);
 ```
+
+`data_len_bytes` is the byte length of `data`. It is validated against
+`row_count * source-stride(dtype)` (the bytes the deferred encoder reads,
+using the *source* element width, not the wire width). A buffer too small
+for the declared `dtype` + `row_count` is rejected with
+`line_sender_error_invalid_api_call` and nothing is appended — this is the
+only bound on the zero-copy pointer, guarding against a mis-tagged `dtype`
+or an inflated `row_count` reading past the allocation. Pass `arr.nbytes`
+(or `0` when `data == NULL` and `row_count == 0`). It does **not** relax
+the lifetime contract: `data` must stay alive and unmodified until the
+next flush/sync returns.
 
 ### 11.1 Dtype coverage matrix
 
@@ -1055,11 +1068,24 @@ bool column_sender_flush(
  * conn, or `durable` requested without opt-in), returns false and
  * sets *err_out.
  *
- * Sync blocks until ack or until the underlying connection enters a
- * terminal failure state (`column_sender_must_close()` becomes true).
+ * Sync blocks until ack, until the underlying connection enters a
+ * terminal failure state (`column_sender_must_close()` becomes true), or
+ * until it makes no progress for `request_timeout` (default 30s).
  * Transport errors latch the conn as terminal; return it to the pool
- * and borrow a fresh conn to continue. No separate per-call timeout in
- * v1; if you need one, file a request.
+ * and borrow a fresh conn to continue.
+ *
+ * No-progress timeout: both backends bound how long sync waits while the
+ * server is alive but never advances the ack/durable watermark (e.g. a
+ * back-pressured WAL or a stuck commit). The direct backend arms
+ * `request_timeout` as the socket read timeout; the store-and-forward
+ * backend uses it as a no-progress deadline in its poll loop. The deadline
+ * is reset on every watermark advance, so a slow-but-progressing sync (for
+ * example a `durable` upload under pressure) keeps extending it and is not
+ * cut off. When it does fire, sync returns `line_sender_error_failover_retry`
+ * with a "timed out … no ack progress" message; the queued/unacked frames
+ * are retained, so drop this conn and re-borrow to replay (store-and-forward)
+ * or re-drive from source (direct). There is no separate per-call timeout
+ * knob in v1; raise `request_timeout` to wait longer.
  *
  * The QWP wire `sequence` (FSN) is tracked internally and is not
  * exposed at the FFI.
@@ -1078,9 +1104,12 @@ Conn-level 1-copy entry that bypasses the `column_sender_chunk` and
 (`ArrowArray` + `ArrowSchema`) is consumed end-to-end into the
 outgoing QWP frame in a single pass.
 
-- **Designated timestamp**: omitted (`flush_arrow_batch`) → server
-  stamps each row on arrival; or sourced from a named `Timestamp(_)`
-  column (`flush_arrow_batch_at_column`).
+- **Designated timestamp**: either explicitly omitted
+  (`flush_arrow_batch_server_stamped`) → server stamps each row on
+  arrival; or sourced from a named `Timestamp(_)` column
+  (`flush_arrow_batch_at_column`). A batch with no designated timestamp
+  is rejected unless the server-stamp opt-in is used — there is no
+  silent server-stamp default.
 - **Ownership**: on success, the consumer invokes `array->release` /
   `schema->release`; on failure the caller retains ownership.
 - **Deferred-commit semantics**: identical to `column_sender_flush`;
@@ -1090,7 +1119,7 @@ outgoing QWP frame in a single pass.
 ```c
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch(
+bool column_sender_flush_arrow_batch_server_stamped(
     column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -1108,8 +1137,8 @@ bool column_sender_flush_arrow_batch_at_column(
 #endif
 ```
 
-Coverage matches the Rust `ColumnSender::flush_arrow_batch` —
-all 43 classified `ColumnKind` variants from
+Coverage matches the Rust `ColumnSender::flush_arrow_batch_server_stamped`
+— all 43 classified `ColumnKind` variants from
 `column_sender::arrow_batch::classify`. Failure paths surface as
 `line_sender_error_arrow_unsupported_column_kind` (column kind has no
 QWP wire mapping) or `line_sender_error_arrow_ingest` (structural
@@ -1225,6 +1254,8 @@ agent.
   does not have a fast path for object dtype — that's a deliberate
   choice. Document this.
 - **Object lifetimes** — keep the source `np.ndarray` / `pa.Array`
-  alive for the duration of the FFI call. Buffers are copied into the
-  chunk during the call, so they can be dropped after the call
-  returns.
+  alive until the chunk is flushed (or freed / cleared). The FFI
+  stores **raw pointers** into the caller's buffers and does **not**
+  copy at append time, so the source must **not** be dropped after the
+  append call returns — it must outlive the next `column_sender_flush`
+  on the chunk. See the buffer lifetime contract in §2.3.

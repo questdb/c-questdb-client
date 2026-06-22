@@ -1339,13 +1339,46 @@ symbol_fn!(
 /// `auto`: Dictionary(*, Utf8/LargeUtf8) -> SYMBOL, plain Utf8 -> VARCHAR.
 /// `symbol`: force plain Utf8 -> SYMBOL. `not_symbol`: force Dictionary ->
 /// VARCHAR. Used by `column_sender_arrow_import_new`.
+//
+// The C header exposes named constants (`column_sender_symbol_mode_auto = 0`,
+// `..._symbol = 1`, `..._not_symbol = 2`) but the FFI takes a `u32` (not a
+// `#[repr(u32)]` enum) so an out-of-range value is a recoverable
+// `InvalidApiCall` error instead of immediate Rust UB at the language boundary.
 #[cfg(feature = "arrow")]
-#[repr(u32)]
-#[allow(non_camel_case_types)]
-pub enum column_sender_symbol_mode {
-    column_sender_symbol_mode_auto = 0,
-    column_sender_symbol_mode_symbol = 1,
-    column_sender_symbol_mode_not_symbol = 2,
+pub const column_sender_symbol_mode_auto: u32 = 0;
+#[cfg(feature = "arrow")]
+pub const column_sender_symbol_mode_symbol: u32 = 1;
+#[cfg(feature = "arrow")]
+pub const column_sender_symbol_mode_not_symbol: u32 = 2;
+
+/// Resolve a `column_sender_symbol_mode_*` value into the symbol disposition
+/// consumed by the Arrow importer: `Some(None)` = auto, `Some(Some(true))` =
+/// force SYMBOL, `Some(Some(false))` = force VARCHAR. Returns the outer `None`
+/// (after writing `*err_out`) when `value` is out of range.
+#[cfg(feature = "arrow")]
+fn symbol_mode_from_u32(
+    value: u32,
+    err_out: *mut *mut line_sender_error,
+) -> Option<Option<bool>> {
+    match value {
+        0 => Some(None),
+        1 => Some(Some(true)),
+        2 => Some(Some(false)),
+        other => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "column_sender_arrow_import_new: invalid symbol_mode {other} (expected 0, 1, or 2)"
+                        ),
+                    ),
+                );
+            }
+            None
+        }
+    }
 }
 
 #[cfg(feature = "arrow")]
@@ -1353,13 +1386,12 @@ pub enum column_sender_symbol_mode {
 pub unsafe extern "C" fn column_sender_arrow_import_new(
     array: *mut ArrowArray,
     schema: *const ArrowSchema,
-    symbol_mode: column_sender_symbol_mode,
+    symbol_mode: u32,
     err_out: *mut *mut line_sender_error,
 ) -> *mut column_sender_arrow_import {
-    let symbol = match symbol_mode {
-        column_sender_symbol_mode::column_sender_symbol_mode_symbol => Some(true),
-        column_sender_symbol_mode::column_sender_symbol_mode_not_symbol => Some(false),
-        column_sender_symbol_mode::column_sender_symbol_mode_auto => None,
+    let symbol = match symbol_mode_from_u32(symbol_mode, err_out) {
+        Some(symbol) => symbol,
+        None => return std::ptr::null_mut(),
     };
     let ffi_array = array as *mut arrow::ffi::FFI_ArrowArray;
     let ffi_schema = schema as *const arrow::ffi::FFI_ArrowSchema;
@@ -1478,8 +1510,8 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_import(
 
 /// Append a slice of one column from an Arrow C Data Interface array.
 /// Routes through the same encoding infrastructure as
-/// `column_sender_flush_arrow_batch`; supports the full 43-variant
-/// Arrow type matrix (`arrow_batch::classify`).
+/// `column_sender_flush_arrow_batch_server_stamped`; supports the full
+/// 43-variant Arrow type matrix (`arrow_batch::classify`).
 ///
 /// `row_offset` and `row_count` describe the slice of the array to
 /// append; pass `row_offset=0, row_count=array->length` for the whole
@@ -2006,9 +2038,29 @@ unsafe fn resolve_numpy_dtype(
 
 /// Append one column from a contiguous, native-endian NumPy buffer.
 /// The buffer is walked at flush time straight into the outbound frame;
-/// no per-column copy is taken at append. Caller MUST keep `data` (and
-/// `validity->bits`, if any) alive until the next
-/// `column_sender_flush` / `column_sender_sync` returns.
+/// no per-column copy is taken at append.
+///
+/// # LIFETIME (zero-copy contract) — read this
+///
+/// This call parks the raw `data` (and `validity->bits`, if any) pointer
+/// and walks it later, at flush time. The caller therefore MUST keep the
+/// backing buffer **alive and unmodified** until the next
+/// `column_sender_flush` / `column_sender_sync` on this chunk **returns**.
+/// Freeing, reallocating, or letting a GC move the buffer before then is
+/// undefined behaviour (use-after-free). No length or liveness can be
+/// re-checked at flush time — only at append.
+///
+/// # BUFFER LENGTH
+///
+/// `data_len_bytes` is the size in bytes of the buffer `data` points at.
+/// It is validated here against the bytes the encoder will read
+/// (`row_count * source-stride(dtype)`); if the buffer is too small the
+/// call fails with `invalid_api_call` and nothing is appended. This is
+/// the only guard against a mis-tagged `dtype` (e.g. an `int8` array
+/// tagged `f64`) or an inflated `row_count` walking the pointer off the
+/// end of the real allocation and streaming host memory onto the wire.
+/// For NumPy callers pass `arr.nbytes`. When `data == NULL` (only legal
+/// with `row_count == 0`) pass `0`.
 ///
 /// `dtype` selects from 31 supported NumPy → QuestDB wire mappings (see
 /// the C header for the full coverage matrix). For `decimal_*`,
@@ -2027,6 +2079,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
     name_len: size_t,
     dtype: u32,
     data: *const u8,
+    data_len_bytes: size_t,
     row_count: size_t,
     validity: *const column_sender_validity,
     extras: *const column_sender_numpy_extras,
@@ -2088,6 +2141,46 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
         Some(d) => d,
         None => return false,
     };
+    // Bounds-check the caller-supplied buffer length against the bytes the
+    // deferred encoder will read (`row_count * source-stride`). This is the
+    // only thing standing between a mis-tagged dtype / inflated row_count and
+    // an out-of-bounds read at flush time (host-memory info-leak onto the wire
+    // or a segfault). `dtype` is fully resolved/validated above, so
+    // `source_elem_size` is safe to query here. Guards length, not liveness:
+    // the buffer-lifetime requirement is the caller's per the doc above.
+    let elem = bubble!(err_out, dtype.source_elem_size());
+    match row_count.checked_mul(elem) {
+        Some(required) if required <= data_len_bytes => {}
+        Some(required) => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "numpy column buffer too small: dtype needs {required} bytes \
+                             ({row_count} rows * {elem} bytes/row) but data_len_bytes is {data_len_bytes}"
+                        ),
+                    ),
+                );
+            }
+            return false;
+        }
+        None => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!(
+                            "numpy column size overflows usize: {row_count} rows * {elem} bytes/row"
+                        ),
+                    ),
+                );
+            }
+            return false;
+        }
+    }
     let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(err_out, unsafe {
         inner.push_numpy_deferred(name, dtype, data, row_count, validity.as_ref())
@@ -2303,8 +2396,11 @@ pub unsafe extern "C" fn column_sender_flush(
 /// `schema->name` becomes the column name.
 ///
 /// The per-row designated timestamp is omitted; the server stamps each
-/// row on arrival. Use [`column_sender_flush_arrow_batch_at_column`] to
-/// source the timestamp from a `Timestamp(_)` column inside the batch.
+/// row on arrival. This is an **explicit opt-in**: if your batch carries
+/// a real event-time column, use [`column_sender_flush_arrow_batch_at_column`]
+/// instead to source the timestamp from a `Timestamp(_)` column inside the
+/// batch — reaching for this entry point would discard that column's role
+/// as the designated timestamp and silently substitute server arrival time.
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL)
 /// and the function has invoked it internally. On a **transient**
@@ -2326,7 +2422,7 @@ pub unsafe extern "C" fn column_sender_flush(
 /// `_geohash` — carries `arg` outside `1..=60`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_flush_arrow_batch(
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_server_stamped(
     conn: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -2349,11 +2445,11 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch(
     }
 }
 
-/// Variant of [`column_sender_flush_arrow_batch`] that sources each
-/// row's designated timestamp from a named `Timestamp(_)` column inside
-/// the batch. The column must be `Timestamp(Microsecond | Nanosecond |
-/// Millisecond, _)` with no null rows and no values before the Unix
-/// epoch. Same ownership and `overrides` contract.
+/// Variant of [`column_sender_flush_arrow_batch_server_stamped`] that
+/// sources each row's designated timestamp from a named `Timestamp(_)`
+/// column inside the batch. The column must be `Timestamp(Microsecond |
+/// Nanosecond | Millisecond, _)` with no null rows and no values before
+/// the Unix epoch. Same ownership and `overrides` contract.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
@@ -2395,8 +2491,8 @@ pub enum column_sender_arrow_override_kind {
 /// Per-column wire-type hint that overrides what the encoder would
 /// otherwise derive from the Arrow `Field`'s data type alone. Caller
 /// owns `column`; the bytes are borrowed for the duration of the
-/// `column_sender_flush_arrow_batch[_at_column]` call and must outlive
-/// it.
+/// `column_sender_flush_arrow_batch_server_stamped` / `_at_column` call
+/// and must outlive it.
 #[cfg(feature = "arrow")]
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -2434,7 +2530,7 @@ unsafe fn arrow_overrides_from_c<'a>(
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch: overrides pointer is NULL".to_string(),
+            "column_sender_flush_arrow_batch_*: overrides pointer is NULL".to_string(),
         );
         return None;
     }
@@ -2552,7 +2648,7 @@ unsafe fn arrow_batch_impl(
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch: conn pointer is NULL".to_string(),
+            "column_sender_flush_arrow_batch_*: conn pointer is NULL".to_string(),
         );
         return false;
     }
@@ -2560,7 +2656,7 @@ unsafe fn arrow_batch_impl(
         InUseGuard::acquire(
             conn,
             &raw const (*conn).1,
-            "column_sender_flush_arrow_batch",
+            "column_sender_flush_arrow_batch_*",
             "column_sender",
             err_out,
         )
@@ -2576,7 +2672,7 @@ unsafe fn arrow_batch_impl(
         crate::arrow_ffi_import_record_batch(
             array,
             schema,
-            "column_sender_flush_arrow_batch",
+            "column_sender_flush_arrow_batch_*",
             err_out,
         )
     } {
@@ -2587,7 +2683,7 @@ unsafe fn arrow_batch_impl(
     let sender = unsafe { (*conn).0.get_mut() };
     let result = match ts_column {
         Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name(), &overrides),
-        None => sender.flush_arrow_batch(table_name, &rb, &overrides),
+        None => sender.flush_arrow_batch_server_stamped(table_name, &rb, &overrides),
     };
     match result {
         Ok(()) => true,
@@ -2633,6 +2729,14 @@ unsafe fn reexport_record_batch_into(
 /// `column_sender_ack_level_ok` waits for every in-flight frame's
 /// WAL-commit ack. `column_sender_ack_level_durable` additionally waits
 /// for the server's object-store durability watermarks.
+///
+/// No-progress timeout: if the server stays connected but never advances the
+/// ack/durable watermark for `request_timeout` (default 30s) — a back-pressured
+/// WAL or stuck commit — sync returns `line_sender_error_failover_retry`. The
+/// deadline resets on every watermark advance, so a slow-but-progressing sync
+/// (e.g. a `durable` upload under pressure) is not cut off. The unacked frames
+/// are retained: drop the conn and re-borrow to replay (store-and-forward) or
+/// re-drive from source (direct).
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[unsafe(no_mangle)]
@@ -2998,7 +3102,7 @@ mod tests {
             column_sender_arrow_import_new(
                 &mut array,
                 &schema,
-                column_sender_symbol_mode::column_sender_symbol_mode_auto,
+                column_sender_symbol_mode_auto,
                 &mut err,
             )
         };
@@ -3088,7 +3192,7 @@ mod tests {
             column_sender_arrow_import_new(
                 &mut array,
                 &schema,
-                column_sender_symbol_mode::column_sender_symbol_mode_auto,
+                column_sender_symbol_mode_auto,
                 &mut err,
             )
         };
@@ -3100,7 +3204,7 @@ mod tests {
             column_sender_arrow_import_new(
                 &mut array,
                 &schema,
-                column_sender_symbol_mode::column_sender_symbol_mode_auto,
+                column_sender_symbol_mode_auto,
                 &mut err,
             )
         };
@@ -3153,6 +3257,36 @@ mod tests {
     fn ack_level_rejects_out_of_range() {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         assert_eq!(ack_level_from_u32(99, &mut err), None);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn symbol_mode_constants_map_correctly() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        assert_eq!(
+            symbol_mode_from_u32(column_sender_symbol_mode_auto, &mut err),
+            Some(None)
+        );
+        assert!(err.is_null());
+        assert_eq!(
+            symbol_mode_from_u32(column_sender_symbol_mode_symbol, &mut err),
+            Some(Some(true))
+        );
+        assert!(err.is_null());
+        assert_eq!(
+            symbol_mode_from_u32(column_sender_symbol_mode_not_symbol, &mut err),
+            Some(Some(false))
+        );
+        assert!(err.is_null());
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn symbol_mode_rejects_out_of_range() {
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        assert_eq!(symbol_mode_from_u32(5, &mut err), None);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
     }

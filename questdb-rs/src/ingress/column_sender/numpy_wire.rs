@@ -297,6 +297,77 @@ impl NumpyDtype {
         }
         Ok(())
     }
+
+    /// Source-buffer stride in bytes per row — how many bytes the
+    /// flush-time encoder ([`emit_into_wire`]) reads per row from the
+    /// caller's `data` pointer. This is the *source* element width, which
+    /// is decoupled from the wire width (e.g. `U8WidenToI32` reads 1
+    /// source byte but emits 4): the bounds check must use the read
+    /// stride, never the wire stride.
+    ///
+    /// Callers use this to validate a caller-supplied buffer byte length
+    /// against `row_count` *before* parking the raw pointer for deferred,
+    /// zero-copy encode — without it a mis-tagged dtype or an inflated
+    /// `row_count` would walk the pointer past the real allocation at
+    /// flush time (host-memory info-leak onto the wire, or a segfault).
+    ///
+    /// For [`NumpyDtype::F64Ndarray`] each row is a full tensor, so the
+    /// stride is `prod(shape[..ndim]) * size_of::<f64>()`. The shape is
+    /// already range-bounded by [`Self::validate`] (`prod <=
+    /// MAX_NDARRAY_LEAF_ELEMS`, `ndim <= MAX_ARRAY_DIMS`), so the multiply
+    /// cannot overflow once validated; the `checked_mul` is defensive in
+    /// case this is ever called on an unvalidated value.
+    pub fn source_elem_size(&self) -> Result<usize> {
+        use NumpyDtype as D;
+        let n = match self {
+            D::I8Direct | D::I8WidenToI32 | D::U8WidenToI32 | D::Bool | D::GeohashI8 { .. } => 1,
+            D::I16Direct
+            | D::I16WidenToI32
+            | D::U16WidenToI32
+            | D::F16Widen
+            | D::CharDirect
+            | D::GeohashI16 { .. } => 2,
+            D::I32Direct
+            | D::I32WidenToI64
+            | D::U32WidenToI64
+            | D::F32Direct
+            | D::Ipv4Direct
+            | D::GeohashI32 { .. } => 4,
+            D::I64Direct
+            | D::F64Direct
+            | D::LongDirect
+            | D::DateI64Direct
+            | D::TimestampMicrosDirect
+            | D::TimestampNanosDirect
+            | D::U64WidenToI64
+            | D::DatetimeSecToMicros
+            | D::DatetimeMinuteToMicros
+            | D::DatetimeHourToMicros
+            | D::DatetimeDayToMicros
+            | D::DatetimeWeekToMicros
+            | D::DatetimeMonthToMicros
+            | D::DatetimeYearToMicros
+            | D::GeohashI64 { .. }
+            | D::Decimal64 { .. } => 8,
+            D::UuidDirect | D::Decimal128 { .. } => 16,
+            D::Long256Direct | D::Decimal256 { .. } => 32,
+            D::F64Ndarray { ndim, shape } => {
+                let nd = *ndim as usize;
+                let leaf: usize = shape[..nd]
+                    .iter()
+                    .copied()
+                    .map(|d| d as usize)
+                    .try_fold(1usize, |acc, d| acc.checked_mul(d))
+                    .ok_or_else(|| {
+                        error::fmt!(InvalidApiCall, "F64Ndarray shape product overflows usize")
+                    })?;
+                return leaf.checked_mul(8).ok_or_else(|| {
+                    error::fmt!(InvalidApiCall, "F64Ndarray row size overflows usize")
+                });
+            }
+        };
+        Ok(n)
+    }
 }
 
 /// Encode one numpy column body straight into `out`.
@@ -1261,6 +1332,41 @@ mod tests {
         let err = encode_err(&chunk);
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("MAX_CHUNK_ROWS"), "{}", err.msg());
+    }
+
+    #[test]
+    fn source_elem_size_matches_read_stride() {
+        use NumpyDtype as D;
+        // Source-read stride per row (what emit_into_wire dereferences),
+        // NOT the wire width: widening dtypes read the narrow source.
+        assert_eq!(D::I8Direct.source_elem_size().unwrap(), 1);
+        assert_eq!(D::Bool.source_elem_size().unwrap(), 1);
+        assert_eq!(D::I8WidenToI32.source_elem_size().unwrap(), 1); // 1B src, 4B wire
+        assert_eq!(D::U8WidenToI32.source_elem_size().unwrap(), 1);
+        assert_eq!(D::F16Widen.source_elem_size().unwrap(), 2); // 2B src, 4B wire
+        assert_eq!(D::CharDirect.source_elem_size().unwrap(), 2);
+        assert_eq!(D::I32WidenToI64.source_elem_size().unwrap(), 4); // 4B src, 8B wire
+        assert_eq!(D::Ipv4Direct.source_elem_size().unwrap(), 4);
+        assert_eq!(D::F32Direct.source_elem_size().unwrap(), 4);
+        assert_eq!(D::I64Direct.source_elem_size().unwrap(), 8);
+        assert_eq!(D::U64WidenToI64.source_elem_size().unwrap(), 8);
+        assert_eq!(D::DatetimeSecToMicros.source_elem_size().unwrap(), 8);
+        assert_eq!(D::UuidDirect.source_elem_size().unwrap(), 16);
+        assert_eq!(D::Long256Direct.source_elem_size().unwrap(), 32);
+        assert_eq!(D::Decimal64 { scale: 0 }.source_elem_size().unwrap(), 8);
+        assert_eq!(D::Decimal128 { scale: 0 }.source_elem_size().unwrap(), 16);
+        assert_eq!(D::Decimal256 { scale: 0 }.source_elem_size().unwrap(), 32);
+        // Geohash stride is the source int width (not bits/8).
+        assert_eq!(D::GeohashI8 { bits: 1 }.source_elem_size().unwrap(), 1);
+        assert_eq!(D::GeohashI64 { bits: 1 }.source_elem_size().unwrap(), 8);
+        // Ndarray: prod(shape[..ndim]) * 8 bytes per row.
+        let mut shape = [0u32; MAX_ARRAY_DIMS];
+        shape[0] = 2;
+        shape[1] = 3;
+        assert_eq!(
+            D::F64Ndarray { ndim: 2, shape }.source_elem_size().unwrap(),
+            2 * 3 * 8
+        );
     }
 
     #[test]

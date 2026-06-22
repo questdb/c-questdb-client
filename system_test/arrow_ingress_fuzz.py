@@ -814,7 +814,7 @@ class TestArrowIngressUnsupportedTypes(afc.ArrowFuzzBase):
 
 
 class TestArrowIngressMultiBatch(afc.ArrowFuzzBase):
-    """Multiple `column_sender_flush_arrow_batch` calls on one
+    """Multiple `column_sender_flush_arrow_batch_*` calls on one
     borrowed conn — verifies cross-frame schema-registry / symbol-dict
     reuse against the live server."""
 

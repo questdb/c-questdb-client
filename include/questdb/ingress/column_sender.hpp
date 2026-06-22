@@ -731,6 +731,12 @@ public:
      * sends the commit-triggering frame first. In store-and-forward mode,
      * frames are already non-deferred, so this waits for the published local
      * queue boundary. Throws on error.
+     *
+     * Bounded by `request_timeout` (default 30s): if the server stays
+     * connected but never advances the ack/durable watermark for that long
+     * (back-pressured WAL / stuck commit) this throws `failover_retry`. The
+     * deadline resets on every watermark advance, so a slow-but-progressing
+     * sync is not cut off. The unacked frames are retained for replay.
      */
     void sync(column_sender_ack_level level = column_sender_ack_level::ok)
     {
@@ -743,15 +749,22 @@ public:
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
     /**
      * Encode an Arrow RecordBatch as one QWP/WS frame for `table` and
-     * publish it through the borrowed connection in one pass. The
-     * per-row designated timestamp is omitted; the server stamps each
-     * row on arrival.
+     * publish it through the borrowed connection in one pass, **without**
+     * a per-row designated timestamp: the server stamps each row on
+     * arrival.
+     *
+     * This is an explicit opt-in. If your batch carries a real
+     * event-time column, use the `ts_column` overload of
+     * `flush_arrow_batch` instead — reaching for this entry point would
+     * discard that column's role as the designated timestamp and
+     * silently substitute server arrival time, producing wrong
+     * partitions/order.
      *
      * Ownership: on success `array.release` is consumed (set to NULL);
      * on failure it may also have been consumed — check before
      * invoking. `schema` is borrowed.
      */
-    void flush_arrow_batch(
+    void flush_arrow_batch_server_stamped(
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
@@ -760,7 +773,7 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
-            ::column_sender_flush_arrow_batch,
+            ::column_sender_flush_arrow_batch_server_stamped,
             _raw,
             table_c,
             &array,
@@ -770,9 +783,9 @@ public:
     }
 
     /**
-     * Variant of `flush_arrow_batch` that sources the per-row
-     * designated timestamp from a named `Timestamp(_)` column inside
-     * the batch.
+     * Variant of `flush_arrow_batch_server_stamped` that sources the
+     * per-row designated timestamp from a named `Timestamp(_)` column
+     * inside the batch.
      */
     void flush_arrow_batch(
         table_name_view table,

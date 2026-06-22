@@ -1,6 +1,8 @@
 //! Polars sub-feature: convert a [`DataFrame`] into Arrow
 //! [`RecordBatch`]es for consumption by
-//! [`ColumnSender::flush_arrow_batch`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch].
+//! [`ColumnSender::flush_arrow_batch_at_column`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_at_column]
+//! (or [`ColumnSender::flush_arrow_batch_server_stamped`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_server_stamped]
+//! when the server should assign timestamps).
 //!
 //! [`dataframe_to_batches`] is the primary entry point. It returns an
 //! iterator that yields slices of at most `max_rows` rows each. Each
@@ -44,7 +46,7 @@
 //!
 //! ```ignore
 //! for rb in questdb::ingress::polars::dataframe_to_batches(&df, None) {
-//!     sender.flush_arrow_batch(table, &rb?, &[])?;
+//!     sender.flush_arrow_batch_at_column(table, &rb?, "ts".try_into()?, &[])?;
 //! }
 //! ```
 //!
@@ -368,7 +370,7 @@ impl<'a> PolarsIngestOptions<'a> {
 
     /// Per-column wire-type hints, applied to every batch sliced out of the
     /// frame. Same meaning as the `overrides` argument of
-    /// `ColumnSender::flush_arrow_batch` — the intended path for Polars frames
+    /// `ColumnSender::flush_arrow_batch_server_stamped` — the intended path for Polars frames
     /// built without pyarrow, whose Arrow schema carries no `questdb.*` field
     /// metadata.
     #[must_use]
@@ -393,7 +395,7 @@ impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
     /// `PolarsIngestOptions::default()` preserves the previous behaviour
     /// (server-assigned timestamps, schema-derived wire types).
     ///
-    /// Unlike `ColumnSender::flush` / `ColumnSender::flush_arrow_batch`, which
+    /// Unlike `ColumnSender::flush` / `ColumnSender::flush_arrow_batch_*`, which
     /// leave rows uncommitted until you call `ColumnSender::sync`, this entry
     /// owns the commit (and the failover replay boundary).
     ///
@@ -470,7 +472,7 @@ fn drive_from_checkpoint(
         let rb = rb?;
         match options.timestamp_column {
             Some(ts) => sender.flush_arrow_batch_at_column(table, &rb, ts, options.overrides)?,
-            None => sender.flush_arrow_batch(table, &rb, options.overrides)?,
+            None => sender.flush_arrow_batch_server_stamped(table, &rb, options.overrides)?,
         }
         // `idx` is 0-based; checkpoint after a full run of CHECKPOINT_BATCHES
         // (batches 63, 127, …). The sync's ack moves the replay boundary.
