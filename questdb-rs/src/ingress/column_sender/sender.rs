@@ -89,18 +89,32 @@ pub enum FlushFailure {
     /// untouched; Arrow input may be re-exported for retry.
     NotDelivered(crate::Error),
     /// May have reached the server: the write succeeded, partially succeeded,
-    /// or the post-write ACK wait failed. Manual chunks have been cleared;
-    /// Arrow input must not be re-exported.
+    /// or the post-write ACK wait failed. The current input must not be
+    /// re-exported (Arrow) or blindly replayed (manual chunk).
+    ///
+    /// Manual-chunk state depends on the sub-case, per the publish-only
+    /// clearing rule (`doc/COLUMN_SENDER_ACK_BOUNDARY_FLUSH.md` §7.4): the
+    /// chunk is cleared once publication succeeds (so an ACKing flush whose
+    /// later ACK wait fails leaves it cleared), but a *partial write*
+    /// (`PublishError::DuringWrite`) returns before the chunk is cleared and so
+    /// leaves it populated. Either way delivery is uncertain — chunk state is
+    /// not a "safe to retry" signal here. [`FlushFailure::into_error`] tags the
+    /// wrapped error [`in_doubt`](crate::Error::in_doubt) so publish-only
+    /// callers can detect this without inspecting the error code.
     DeliveryUnknown(crate::Error),
 }
 
 impl FlushFailure {
-    /// The underlying error, discarding the delivery classification. Used by
-    /// the public `Result<()>`-returning API, which never re-exports.
+    /// The underlying error, collapsing the delivery classification into a
+    /// plain [`crate::Error`]. Used by the public `Result<()>`-returning API,
+    /// which never re-exports. The `DeliveryUnknown` arm tags the error
+    /// [`in_doubt`](crate::Error::in_doubt) so publish-only callers retain the
+    /// delivery-unknown signal that the enum carried.
     #[doc(hidden)]
     pub fn into_error(self) -> crate::Error {
         match self {
-            FlushFailure::NotDelivered(e) | FlushFailure::DeliveryUnknown(e) => e,
+            FlushFailure::NotDelivered(e) => e,
+            FlushFailure::DeliveryUnknown(e) => e.with_in_doubt(true),
         }
     }
 
@@ -282,9 +296,15 @@ impl ColumnSender {
     }
 
     /// Encode and publish `chunk` as a QWP/WebSocket frame **without** waiting
-    /// for a server completion boundary. On success `chunk` is cleared; on
-    /// failure it is left untouched. Call [`Self::sync`] (or use
+    /// for a server completion boundary. Call [`Self::sync`] (or use
     /// [`Self::flush_and_wait`]) to wait for the requested [`AckLevel`].
+    ///
+    /// On success `chunk` is cleared. On failure `chunk` is left untouched and
+    /// the data is **not** guaranteed undelivered: a transport error that fails
+    /// mid-frame may already have put bytes on the wire. Such a failure reports
+    /// [`ErrorCode::FailoverRetry`] but tags the error
+    /// [`in_doubt`](crate::Error::in_doubt) — inspect it before re-flushing the
+    /// retained `chunk` on a fresh connection, since replay can duplicate rows.
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
         match &mut self.backend {
             ColumnSenderBackend::Direct(direct) => direct.flush_inner(chunk, WaitForAck::No),

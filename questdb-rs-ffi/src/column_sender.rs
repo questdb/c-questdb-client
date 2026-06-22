@@ -2379,9 +2379,16 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
 /// call fails and the caller must sync before flushing more chunks. In SFA mode
 /// frames are non-deferred and `flush` success means local queue acceptance.
 ///
-/// On success, `chunk` is cleared and the call returns `true`. On
-/// failure, `chunk` is left untouched and `false` is returned (with
-/// `*err_out` set if provided).
+/// On success, `chunk` is cleared and the call returns `true`. On failure,
+/// `chunk` is left untouched and `false` is returned (with `*err_out` set if
+/// provided).
+///
+/// A `false` return does **not** prove the rows were not sent: a transport
+/// error that fails mid-frame may already have put bytes on the wire. Such a
+/// failure reports `line_sender_error_failover_retry`, yet re-flushing the
+/// retained `chunk` on a fresh connection could duplicate rows. Call
+/// [`line_sender_error_in_doubt`](crate::line_sender_error_in_doubt) on
+/// `*err_out` to detect this delivery-unknown case before retrying.
 ///
 /// Call [`column_sender_sync`] after the last flush to drain all
 /// remaining in-flight acks.
@@ -2526,13 +2533,17 @@ pub unsafe extern "C" fn column_sender_flush_and_wait(
 /// as the designated timestamp and silently substitute server arrival time.
 ///
 /// Ownership: on success, `array->release` is consumed (set to NULL)
-/// and the function has invoked it internally. On a **transient**
-/// (`line_sender_error_failover_retry`) failure `array` is left intact
+/// and the function has invoked it internally. On a **transient,
+/// provably-not-delivered** (`line_sender_error_failover_retry` with
+/// `line_sender_error_in_doubt == false`) failure `array` is left intact
 /// (re-exported back into `*array` with a fresh `release`) so the caller
-/// can drop+re-borrow a live conn and retry with the same array. On any
-/// other failure `array->release` may have been consumed if the call
-/// reached the Arrow import step — callers MUST check `array->release != NULL`
-/// before invoking it on the failure path. `schema` is always borrowed.
+/// can drop+re-borrow a live conn and retry with the same array. A
+/// delivery-unknown failure (a partial write that fails mid-frame: also
+/// `line_sender_error_failover_retry` but with `line_sender_error_in_doubt ==
+/// true`) is **not** re-exported, since replaying it could duplicate rows. On
+/// any failure `array->release` may have been consumed if the call reached the
+/// Arrow import step — callers MUST check `array->release != NULL` before
+/// invoking it on the failure path. `schema` is always borrowed.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 ///
@@ -2896,7 +2907,12 @@ unsafe fn arrow_batch_impl(
             // (matching the caller's retained `schema` shape), restoring a
             // valid release. A terminal error consumes the array as before (the
             // data is unusable on any conn).
-            if err.code() == ErrorCode::FailoverRetry {
+            //
+            // `FailoverRetry` alone is not sufficient: a direct-mode partial
+            // write fails mid-frame with `FailoverRetry` yet is delivery-
+            // unknown (`in_doubt`), so re-exporting it would invite a duplicate-
+            // causing retry. Re-export only a provably-not-delivered failure.
+            if err.code() == ErrorCode::FailoverRetry && !err.in_doubt() {
                 unsafe { reexport_record_batch_into(rb, array, schema) };
             }
             unsafe { set_err_out_from_error(err_out, err) };

@@ -537,6 +537,26 @@ pub unsafe extern "C" fn line_sender_error_msg(
     }
 }
 
+/// `true` when the failed operation is *delivery-unknown* ("in doubt"): the
+/// current input's bytes may already have reached the server even though the
+/// call returned an error (e.g. a socket write that failed mid-frame, or a
+/// post-publish ACK wait that failed).
+///
+/// This is independent of `line_sender_error_get_code`: a delivery-unknown
+/// failure typically reports `line_sender_error_failover_retry` (the connection
+/// may be replaced), yet that code alone does NOT mean the input is safe to
+/// resend. When this returns `true`, only replay the same input if table-level
+/// dedup/upsert keys make duplicate rows harmless.
+///
+/// NULL-safe: passing `NULL` returns `false`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_error_in_doubt(error: *const line_sender_error) -> bool {
+    if error.is_null() {
+        return false;
+    }
+    unsafe { (*error).error.in_doubt() }
+}
+
 /// Clean up the error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
@@ -4621,6 +4641,40 @@ mod tests {
 
     fn assert_err_code(actual: line_sender_error_code, expected: line_sender_error_code) {
         assert_eq!(actual as u32, expected as u32);
+    }
+
+    #[test]
+    fn line_sender_error_in_doubt_is_null_safe() {
+        assert!(!unsafe { line_sender_error_in_doubt(ptr::null()) });
+    }
+
+    #[test]
+    fn line_sender_error_in_doubt_round_trips_the_flag() {
+        use questdb::ingress::column_sender::FlushFailure;
+
+        // A plain error is not in doubt.
+        let plain = Box::into_raw(Box::new(line_sender_error {
+            error: Error::new(ErrorCode::SocketError, "boom"),
+            qwp_ws_error: None,
+        }));
+        assert!(!unsafe { line_sender_error_in_doubt(plain) });
+        unsafe { line_sender_error_free(plain) };
+
+        // A delivery-unknown failure surfaces in_doubt even though it reports
+        // FailoverRetry (the publish-only manual-chunk partial-write case).
+        let in_doubt_err =
+            FlushFailure::DeliveryUnknown(Error::new(ErrorCode::FailoverRetry, "mid-frame"))
+                .into_error();
+        let in_doubt = Box::into_raw(Box::new(line_sender_error {
+            error: in_doubt_err,
+            qwp_ws_error: None,
+        }));
+        assert!(unsafe { line_sender_error_in_doubt(in_doubt) });
+        assert_err_code(
+            unsafe { line_sender_error_get_code(in_doubt) },
+            line_sender_error_code::line_sender_error_failover_retry,
+        );
+        unsafe { line_sender_error_free(in_doubt) };
     }
 
     #[test]

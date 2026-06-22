@@ -120,6 +120,7 @@ pub enum ErrorCode {
 pub struct Error {
     code: ErrorCode,
     msg: String,
+    in_doubt: bool,
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
     #[cfg(feature = "_sender-qwp-ws")]
@@ -132,11 +133,40 @@ impl Error {
         Error {
             code,
             msg: msg.into(),
+            in_doubt: false,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_rejection: None,
             #[cfg(feature = "_sender-qwp-ws")]
             qwp_ws_role_reject: None,
         }
+    }
+
+    /// Mark this error as *delivery-unknown* ("in doubt"): the current input's
+    /// bytes may already have reached the server even though the operation
+    /// reported failure (e.g. a socket write that failed mid-frame, or a
+    /// post-publish ACK wait that failed). Surfaced to callers via
+    /// [`Error::in_doubt`]. See `ColumnSender::flush` and the `FlushFailure`
+    /// delivery classification.
+    #[must_use]
+    pub(crate) fn with_in_doubt(mut self, in_doubt: bool) -> Self {
+        self.in_doubt = in_doubt;
+        self
+    }
+
+    /// `true` when the operation that produced this error is *delivery-unknown*
+    /// ("in doubt"): the current input may already have reached the server, so
+    /// blindly replaying it on a fresh connection can duplicate rows.
+    ///
+    /// This is independent of the [`code`](Error::code): a delivery-unknown
+    /// failure typically reports [`ErrorCode::FailoverRetry`] (the connection
+    /// can be replaced), yet `FailoverRetry` alone does **not** mean the input
+    /// is safe to retry. Use `in_doubt() == false` together with a retryable
+    /// code to decide whether re-sending the same input is safe; when
+    /// `in_doubt()` is `true`, only replay if table-level dedup/upsert keys
+    /// make duplicates harmless.
+    #[must_use]
+    pub fn in_doubt(&self) -> bool {
+        self.in_doubt
     }
 
     /// Attach a structured QWP/WebSocket rejection to this error.
@@ -221,3 +251,25 @@ impl From<Infallible> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) use fmt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_are_not_in_doubt_by_default() {
+        let err = Error::new(ErrorCode::SocketError, "boom");
+        assert!(!err.in_doubt());
+    }
+
+    #[test]
+    fn with_in_doubt_sets_and_preserves_code_and_msg() {
+        let err =
+            Error::new(ErrorCode::FailoverRetry, "mid-frame write failed").with_in_doubt(true);
+        assert!(err.in_doubt());
+        assert_eq!(err.code(), ErrorCode::FailoverRetry);
+        assert_eq!(err.msg(), "mid-frame write failed");
+        // The flag is a flat boolean, not a one-way latch.
+        assert!(!err.with_in_doubt(false).in_doubt());
+    }
+}

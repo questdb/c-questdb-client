@@ -378,11 +378,16 @@ Examples:
 If the current frame's bytes may have reached the server — whether the write
 fully succeeded, partially succeeded, or the ACK wait failed afterwards:
 
-- manual chunk is already cleared/consumed;
+- manual chunk is cleared once publication succeeds; a *partial write* that
+  fails mid-frame returns before the chunk is cleared and so leaves it
+  populated (per the publish-only clearing rule, §7.4) — but the data is still
+  delivery-unknown, so chunk state is not a "safe to retry" signal;
 - Arrow array has already been consumed according to the flush contract;
-- delivery is uncertain;
-- C Arrow `_and_wait` functions must not re-export the input `ArrowArray`,
-  even if the failure is reported as `FailoverRetry`;
+- delivery is uncertain; the failure flags the error `in_doubt` (surfaced via
+  `Error::in_doubt` / `line_sender_error_in_doubt`) so publish-only callers can
+  detect it without inspecting the error code;
+- C Arrow functions (both `_and_wait` and publish-only) must not re-export the
+  input `ArrowArray`, even if the failure is reported as `FailoverRetry`;
 - retry can duplicate rows unless table-level dedup/upsert keys make replay
   safe;
 - the borrowed sender should be treated according to the error class

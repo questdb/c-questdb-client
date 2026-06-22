@@ -1527,6 +1527,10 @@ fn deferred_flush_reserves_slot_for_sync_commit() {
         .expect_err("deferred flush must preserve the sync commit slot");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("sync()"), "msg: {}", err.msg());
+    assert!(
+        !err.in_doubt(),
+        "a pre-publication (not-delivered) failure is never in_doubt"
+    );
     assert_eq!(
         chunk.row_count(),
         1,
@@ -1730,6 +1734,11 @@ fn flush_and_wait_ack_wait_failure_after_publish_clears_chunk() {
         .flush_and_wait(&mut chunk, AckLevel::Ok)
         .expect_err("server died during the ACK wait");
     assert_eq!(err.code(), ErrorCode::FailoverRetry, "{}", err.msg());
+    assert!(
+        err.in_doubt(),
+        "a post-publication delivery-unknown failure must be flagged in_doubt \
+         even though it reports FailoverRetry"
+    );
     assert!(
         chunk.is_empty(),
         "the frame was published, so the chunk is cleared even though the ACK wait failed"

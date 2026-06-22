@@ -250,6 +250,21 @@ line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 QUESTDB_CLIENT_API
 const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
 
+/**
+ * Whether the failed operation is *delivery-unknown* ("in doubt"): the current
+ * input's bytes may already have reached the server even though the call
+ * returned an error (e.g. a socket write that failed mid-frame, or a
+ * post-publish ACK wait that failed).
+ *
+ * Independent of `line_sender_error_get_code`: a delivery-unknown failure
+ * typically reports `line_sender_error_failover_retry`, yet that code alone
+ * does NOT mean the input is safe to resend. When this returns `true`, only
+ * replay the same input if table-level dedup/upsert keys make duplicate rows
+ * harmless. NULL-safe: passing NULL returns `false`.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_error_in_doubt(const line_sender_error*);
+
 /** Clean up the error. */
 QUESTDB_CLIENT_API
 void line_sender_error_free(line_sender_error*);
