@@ -1357,6 +1357,7 @@ bool column_sender_flush_arrow_batch_server_stamped_and_wait(
  * `array` (timestamp sourced from `ts_column`) as a boundary, then wait for
  * `ack_level`. Same ACK-validation preflight and phase-aware re-export contract
  * as `column_sender_flush_arrow_batch_server_stamped_and_wait`.
+ * Callers MUST check `array->release != NULL` before invoking it on failure.
  */
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch_at_column_and_wait(

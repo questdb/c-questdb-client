@@ -897,7 +897,9 @@ public:
      * ACKing counterpart of the `ts_column` `flush_arrow_batch`: publish
      * `array` (timestamp sourced from `ts_column`) as a boundary, then wait
      * for `level`. Same preflight/re-export contract as
-     * `flush_arrow_batch_server_stamped_and_wait`. Throws on error.
+     * `flush_arrow_batch_server_stamped_and_wait`: on a post-publication
+     * failure `array` is not re-exported — check `array.release` before
+     * invoking it. Throws on error.
      */
     void flush_arrow_batch_and_wait(
         table_name_view table,
