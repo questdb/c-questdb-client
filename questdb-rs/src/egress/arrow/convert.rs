@@ -58,36 +58,11 @@ const _: fn() = || {
     assert_send_sync_static::<ABytes>();
 };
 
-/// Reused across SYMBOL columns/batches. `remap[global_code]` is the dense
-/// id assigned this column (a direct index replacing a per-row `HashMap`
-/// probe); `touched` lists set entries so reset is O(distinct codes).
-#[derive(Default)]
-pub(crate) struct SymbolBuildScratch {
-    remap: Vec<u32>,
-    touched: Vec<u32>,
-}
-
-const SYMBOL_REMAP_UNSET: u32 = u32::MAX;
-
-#[cfg(test)]
 pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
     batch: DecodedBatch,
     dict: &SymbolDict,
-) -> Result<RecordBatch> {
-    let mut sym_scratch = SymbolBuildScratch::default();
-    batch_to_record_batch_with(schema_ref, egress_schema, batch, dict, &mut sym_scratch)
-}
-
-/// As `batch_to_record_batch`, but reuses a caller-owned scratch. The
-/// streaming [`crate::egress::Cursor`] threads one across batches.
-pub(crate) fn batch_to_record_batch_with(
-    schema_ref: Arc<ArrowSchema>,
-    egress_schema: &Schema,
-    batch: DecodedBatch,
-    dict: &SymbolDict,
-    sym_scratch: &mut SymbolBuildScratch,
 ) -> Result<RecordBatch> {
     let DecodedBatch {
         row_count, columns, ..
@@ -119,7 +94,6 @@ pub(crate) fn batch_to_record_batch_with(
             decoded,
             row_count,
             dict,
-            &mut *sym_scratch,
             &mut degenerate_node_slack,
         )?);
     }
@@ -133,7 +107,6 @@ fn column_to_array(
     decoded: DecodedColumn,
     row_count: usize,
     dict: &SymbolDict,
-    sym_scratch: &mut SymbolBuildScratch,
     degenerate_node_slack: &mut usize,
 ) -> Result<ArrayRef> {
     Ok(match (kind, decoded) {
@@ -219,7 +192,7 @@ fn column_to_array(
             },
         ) => {
             let active = local_dict.as_ref().unwrap_or(dict);
-            symbol_array(codes, validity, active, row_count, sym_scratch)?
+            symbol_array(codes, validity, active, row_count)?
         }
         (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => array_column_to_arrow(
             field,
@@ -321,14 +294,24 @@ fn varlen_string_array(
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
     let off = offsets_to_arrow_buffer(offsets)?;
-    let data = ArrayDataBuilder::new(DataType::Utf8)
-        .len(row_count)
-        .add_buffer(off)
-        .add_buffer(bytes_to_arrow(data))
-        .nulls(nulls)
-        .align_buffers(true)
-        .build()
-        .map_err(|e| to_arrow_export(e.to_string()))?;
+    // `decode_varlen` (utf8 = true) already validated the data buffer as UTF-8
+    // with every offset on a codepoint boundary, so Arrow's `build()` would
+    // re-run an O(data) UTF-8 scan for nothing — skip it with `build_unchecked`.
+    // `align_buffers(true)` is still honored (it is independent of validation).
+    //
+    // SAFETY: per `decoder::decode_varlen`, the offsets are monotonic, start at
+    // 0, end at `data.len()`, and every offset lies on a UTF-8 codepoint
+    // boundary; `bytes_null_buffer` yields a `row_count`-bit null buffer and the
+    // offset buffer has `row_count + 1` entries — exactly the `Utf8` layout.
+    let data = unsafe {
+        ArrayDataBuilder::new(DataType::Utf8)
+            .len(row_count)
+            .add_buffer(off)
+            .add_buffer(bytes_to_arrow(data))
+            .nulls(nulls)
+            .align_buffers(true)
+            .build_unchecked()
+    };
     Ok(Arc::new(StringArray::from(data)) as ArrayRef)
 }
 
@@ -465,54 +448,23 @@ fn widen_zero_extend(
     Ok(Buffer::from(bytes_from_avec(out)))
 }
 
+/// Build a SYMBOL column as `Dictionary(UInt32, Utf8)` by adopting the
+/// decoder's global codes directly as the Arrow keys and the full active dict
+/// as the values — no per-row remap. `decode_symbol` bounds-checks every
+/// non-null code against the active dict size (`= dict.len()`) and leaves null
+/// rows at code `0`, so each key is a valid index into `values` and the null
+/// buffer masks the null rows.
 fn symbol_array(
     codes: Vec<u32>,
     validity: Option<Bytes>,
     dict: &SymbolDict,
     row_count: usize,
-    scratch: &mut SymbolBuildScratch,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-
-    if scratch.remap.len() < dict.len() {
-        scratch.remap.resize(dict.len(), SYMBOL_REMAP_UNSET);
-    }
-    let remap = scratch.remap.as_mut_slice();
-    let touched = &mut scratch.touched;
-
-    let mut union_offsets: Vec<i32> = Vec::with_capacity(dict.len().min(256) + 1);
-    union_offsets.push(0);
-    let mut union_bytes: ABytes = ABytes::new(64);
-    let mut dense = ABytes::with_capacity(64, codes.len() * 4);
-    dense.resize(codes.len() * 4, 0);
-
-    let build = build_symbol_dense(
-        &codes,
-        nulls.as_ref(),
-        dict,
-        remap,
-        touched,
-        &mut union_offsets,
-        &mut union_bytes,
-        &mut dense[..],
-    );
-
-    // Reset before propagating errors so a reused scratch stays clean.
-    for &code in touched.iter() {
-        remap[code as usize] = SYMBOL_REMAP_UNSET;
-    }
-    touched.clear();
-    build?;
-
-    let dict_len = union_offsets.len() - 1;
-    let values_data = ArrayDataBuilder::new(DataType::Utf8)
-        .len(dict_len)
-        .add_buffer(Buffer::from_vec(union_offsets))
-        .add_buffer(Buffer::from(bytes_from_avec(union_bytes)))
-        .build()
-        .map_err(|e| to_arrow_export(e.to_string()))?;
-    let values = arrow_array::StringArray::from(values_data);
-    let keys_buf = Buffer::from(bytes_from_avec(dense));
+    let values = symbol_dict_values(dict)?;
+    // `codes` already holds one `u32` global code per row; adopt its allocation
+    // as the key buffer with no copy.
+    let keys_buf = Buffer::from_vec(codes);
     let dict_data = ArrayDataBuilder::new(DataType::Dictionary(
         Box::new(DataType::UInt32),
         Box::new(DataType::Utf8),
@@ -530,71 +482,36 @@ fn symbol_array(
     )
 }
 
-// Split out so the caller can reset the scratch even when this errors.
-#[allow(clippy::too_many_arguments)]
-fn build_symbol_dense(
-    codes: &[u32],
-    nulls: Option<&NullBuffer>,
-    dict: &SymbolDict,
-    remap: &mut [u32],
-    touched: &mut Vec<u32>,
-    union_offsets: &mut Vec<i32>,
-    union_bytes: &mut ABytes,
-    dense: &mut [u8],
-) -> Result<()> {
-    match nulls {
-        None => {
-            for (row, &code) in codes.iter().enumerate() {
-                let dense_code =
-                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
-                let base = row * 4;
-                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
-            }
-        }
-        Some(n) => {
-            for row in n.valid_indices() {
-                let code = codes[row];
-                let dense_code =
-                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
-                let base = row * 4;
-                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
-            }
-        }
+/// The active dict's strings as a `Utf8` array, one entry per code. The dict's
+/// arena is the entries' UTF-8 bytes back-to-back, so its offsets are the
+/// entry offsets plus the arena length as the final terminator.
+fn symbol_dict_values(dict: &SymbolDict) -> Result<StringArray> {
+    let entries = dict.entries();
+    let arena = dict.arena();
+    let mut offsets: Vec<i32> = Vec::with_capacity(entries.len() + 1);
+    for e in entries {
+        offsets.push(i32::try_from(e.offset).map_err(|_| {
+            fmt!(
+                ProtocolError,
+                "symbol dict offset {} exceeds i32::MAX",
+                e.offset
+            )
+        })?);
     }
-    Ok(())
-}
-
-fn resolve_symbol(
-    code: u32,
-    remap: &mut [u32],
-    touched: &mut Vec<u32>,
-    union_offsets: &mut Vec<i32>,
-    union_bytes: &mut ABytes,
-    dict: &SymbolDict,
-) -> Result<u32> {
-    let slot = remap
-        .get(code as usize)
-        .copied()
-        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
-    if slot != SYMBOL_REMAP_UNSET {
-        return Ok(slot);
-    }
-    let s = dict
-        .get(code)
-        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
-    union_bytes.extend_from_slice(s.as_bytes());
-    let next_off = i32::try_from(union_bytes.len()).map_err(|_| {
+    offsets.push(i32::try_from(arena.len()).map_err(|_| {
         fmt!(
             ProtocolError,
-            "symbol union dictionary exceeds {} bytes",
-            i32::MAX
+            "symbol dict heap is {} bytes, exceeds i32::MAX",
+            arena.len()
         )
-    })?;
-    union_offsets.push(next_off);
-    let assigned = (union_offsets.len() - 2) as u32;
-    remap[code as usize] = assigned;
-    touched.push(code);
-    Ok(assigned)
+    })?);
+    let values_data = ArrayDataBuilder::new(DataType::Utf8)
+        .len(entries.len())
+        .add_buffer(Buffer::from_vec(offsets))
+        .add_buffer(Buffer::from(arena.to_vec()))
+        .build()
+        .map_err(|e| to_arrow_export(e.to_string()))?;
+    Ok(StringArray::from(values_data))
 }
 
 #[derive(Clone, Copy)]

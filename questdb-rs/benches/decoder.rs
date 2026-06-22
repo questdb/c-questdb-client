@@ -402,6 +402,43 @@ fn build_s1_workload(row_count: usize) -> Bytes {
     serialize_batch(&cols, row_count)
 }
 
+/// Add a `decode` arm and a `decode + batch_to_record_batch` arm for a
+/// single-column payload. `convert(col)` = `_to_arrow` − `_decode` isolates
+/// that column's convert.rs cost (align / symbol / varchar / construction).
+#[cfg(feature = "arrow")]
+fn add_col_arrow_probes(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    label: &str,
+    payload: &Bytes,
+    row_count: usize,
+) {
+    group.bench_function(format!("s1_col_{label}_{row_count}_rows_decode"), |b| {
+        b.iter(|| {
+            let mut dict = SymbolDict::new();
+            let mut reg: Option<Schema> = None;
+            let mut scratch = ZstdScratch::new();
+            let batch =
+                decode_result_batch(black_box(payload), 0, &mut dict, &mut reg, &mut scratch)
+                    .expect("decode");
+            black_box(batch);
+        });
+    });
+    group.bench_function(format!("s1_col_{label}_{row_count}_rows_to_arrow"), |b| {
+        b.iter(|| {
+            let mut dict = SymbolDict::new();
+            let mut reg: Option<Schema> = None;
+            let mut scratch = ZstdScratch::new();
+            let batch =
+                decode_result_batch(black_box(payload), 0, &mut dict, &mut reg, &mut scratch)
+                    .expect("decode");
+            let schema = reg.as_ref().expect("schema populated by decode");
+            let rb = bench_batch_to_record_batch(schema, batch, &dict)
+                .expect("decoded batch must assemble into an arrow RecordBatch");
+            black_box(rb);
+        });
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Criterion harness.
 // ---------------------------------------------------------------------------
@@ -532,6 +569,45 @@ fn bench_decoder(c: &mut Criterion) {
                 black_box(rb);
             });
         });
+        add_col_arrow_probes(
+            &mut group,
+            "id",
+            &serialize_batch(
+                &[ColSpec {
+                    name: "id",
+                    kind: ColumnKind::Long,
+                    body: fixed_le_bytes(row_count, |i| (i as i64).to_le_bytes()),
+                }],
+                row_count,
+            ),
+            row_count,
+        );
+        add_col_arrow_probes(
+            &mut group,
+            "sym",
+            &serialize_batch(
+                &[ColSpec {
+                    name: "sym",
+                    kind: ColumnKind::Symbol,
+                    body: symbol_body(row_count, 8, 1),
+                }],
+                row_count,
+            ),
+            row_count,
+        );
+        add_col_arrow_probes(
+            &mut group,
+            "note",
+            &serialize_batch(
+                &[ColSpec {
+                    name: "note",
+                    kind: ColumnKind::Varchar,
+                    body: varchar_body(row_count),
+                }],
+                row_count,
+            ),
+            row_count,
+        );
         #[cfg(feature = "polars")]
         group.bench_function(format!("s1_5col_{}_rows_to_polars", row_count), |b| {
             b.iter(|| {

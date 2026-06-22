@@ -152,6 +152,40 @@ fn varchar_zero_copy_path_under_2gb() {
 }
 
 #[test]
+fn varchar_multibyte_and_nulls_round_trip() {
+    // Guards the `build_unchecked` path: multibyte codepoints (offsets land on
+    // char boundaries) plus a null row must round-trip without Arrow's UTF-8
+    // re-validation. "café" = 5 bytes, "日本" = 6 bytes, "x" = 1 byte.
+    let mut data = Vec::new();
+    for s in ["café", "日本", "x"] {
+        data.extend_from_slice(s.as_bytes());
+    }
+    // 4 rows, row 2 null; the dense null row repeats the previous boundary.
+    let offsets: Vec<u32> = vec![0, 5, 11, 11, 12];
+    let qwp_bitmap = vec![0b0000_0100u8]; // row 2 null
+    let s = schema_of(&[("v", ColumnKind::Varchar)]);
+    let b = decoded_of(
+        4,
+        vec![DecodedColumn::Varchar {
+            offsets,
+            data: Bytes::from(data),
+            validity: Some(Bytes::from(qwp_bitmap)),
+        }],
+    );
+    let arrow_schema = Arc::new(batch_arrow_schema(&s, &b).unwrap());
+    let rb = batch_to_record_batch(arrow_schema, &s, b, &SymbolDict::new()).unwrap();
+    let col = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    assert_eq!(col.value(0), "café");
+    assert_eq!(col.value(1), "日本");
+    assert!(col.is_null(2));
+    assert_eq!(col.value(3), "x");
+}
+
+#[test]
 fn binary_zero_copy_path_under_2gb() {
     let blobs: &[&[u8]] = &[&[1, 2, 3], &[], &[0xFF, 0x00]];
     let mut data = Vec::new();
@@ -207,7 +241,10 @@ fn uuid_field_carries_arrow_uuid_extension() {
 }
 
 #[test]
-fn symbol_built_with_union_dict_per_batch() {
+fn symbol_uses_global_codes_against_full_dict() {
+    // Aggressive build: the Arrow keys are the decoder's global codes verbatim
+    // (no per-batch compaction) and the values are the full active dict in dict
+    // order.
     let mut dict = SymbolDict::new();
     dict.apply_delta(
         0,
@@ -243,24 +280,64 @@ fn symbol_built_with_union_dict_per_batch() {
         .as_any()
         .downcast_ref::<arrow_array::StringArray>()
         .unwrap();
-    assert_eq!(values.len(), 3);
-    let mut decoded: Vec<String> = (0..dict_arr.len())
-        .map(|r| {
-            let key = dict_arr.keys().value(r);
-            values.value(key as usize).to_string()
-        })
+    // Full dict, in dict order — not a first-seen compaction.
+    let dict_strs: Vec<&str> = (0..values.len()).map(|i| values.value(i)).collect();
+    assert_eq!(dict_strs, vec!["AAPL", "MSFT", "GOOG"]);
+    // Keys are the global codes verbatim.
+    let keys: Vec<u32> = dict_arr.keys().values().iter().copied().collect();
+    assert_eq!(keys, vec![0u32, 2, 0, 1]);
+    let resolved: Vec<&str> = (0..dict_arr.len())
+        .map(|r| values.value(dict_arr.keys().value(r) as usize))
         .collect();
-    decoded.sort_by_key(|s| match s.as_str() {
-        "AAPL" => 0,
-        "GOOG" => 1,
-        "MSFT" => 2,
-        _ => 99,
-    });
-    decoded.dedup();
-    let names: Vec<&str> = decoded.iter().map(String::as_str).collect();
-    assert!(names.contains(&"AAPL"));
-    assert!(names.contains(&"GOOG"));
-    assert!(names.contains(&"MSFT"));
+    assert_eq!(resolved, vec!["AAPL", "GOOG", "AAPL", "MSFT"]);
+}
+
+#[test]
+fn symbol_carries_full_dict_with_unused_entries_and_nulls() {
+    // The active dict has more entries than the batch references; the aggressive
+    // build still emits the whole dict as values and indexes it by global code.
+    // A null row holds code 0 in `codes` but is masked by the null buffer.
+    let mut dict = SymbolDict::new();
+    dict.apply_delta(
+        0,
+        [
+            b"zero".as_slice(),
+            b"one".as_slice(),
+            b"two".as_slice(),
+            b"three".as_slice(),
+        ],
+    )
+    .unwrap();
+    // rows: code 3, null, code 1. The decoder leaves the null row's code at 0.
+    let codes: Vec<u32> = vec![3, 0, 1];
+    let qwp_bitmap = vec![0b0000_0010u8]; // row 1 null
+    let s = schema_of(&[("sym", ColumnKind::Symbol)]);
+    let b = decoded_of(
+        3,
+        vec![DecodedColumn::Symbol {
+            codes,
+            validity: Some(Bytes::from(qwp_bitmap)),
+            local_dict: None,
+        }],
+    );
+    let arrow_schema = Arc::new(batch_arrow_schema(&s, &b).unwrap());
+    let rb = batch_to_record_batch(arrow_schema, &s, b, &dict).unwrap();
+    let dict_arr = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
+        .unwrap();
+    let values = dict_arr
+        .values()
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
+    assert_eq!(values.len(), 4); // full dict, including unused "zero"/"two"
+    assert!(dict_arr.is_valid(0));
+    assert!(dict_arr.is_null(1));
+    assert!(dict_arr.is_valid(2));
+    assert_eq!(values.value(dict_arr.keys().value(0) as usize), "three");
+    assert_eq!(values.value(dict_arr.keys().value(2) as usize), "one");
 }
 
 #[test]
