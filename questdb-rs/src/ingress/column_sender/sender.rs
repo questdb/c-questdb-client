@@ -44,7 +44,7 @@ use crate::{Result, error};
 #[cfg(feature = "arrow")]
 use super::arrow_batch::{self, ArrowColumnOverride};
 use super::chunk::Chunk;
-use super::conn::ColumnConn;
+use super::conn::{ColumnConn, PublishError};
 use super::encoder;
 
 #[cfg(feature = "arrow")]
@@ -63,6 +63,65 @@ pub enum AckLevel {
     #[default]
     Ok,
     Durable,
+}
+
+/// Whether a flush also waits for a server completion boundary at the
+/// requested [`AckLevel`] before returning (an "ACKing flush"), or returns as
+/// soon as the frame is published ("publish-only").
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WaitForAck {
+    No,
+    Yes(AckLevel),
+}
+
+/// Delivery certainty of the **current input** when an ACKing flush fails.
+///
+/// Drives the C FFI Arrow re-export decision (see
+/// `doc/COLUMN_SENDER_ACK_BOUNDARY_FLUSH.md` §7.5): `NotDelivered` may
+/// re-export the caller's batch for retry; `DeliveryUnknown` must not. The
+/// distinction is delivery certainty of the current input, *not* the error
+/// code — a direct-mode `write_all`/`flush` error or a post-publish ACK-wait
+/// failure is `DeliveryUnknown` even though it reports `FailoverRetry`.
+#[doc(hidden)]
+pub enum FlushFailure {
+    /// Provably not transmitted (ACK/durable validation, encode, size check,
+    /// or a transport error before any byte was written). Manual chunks remain
+    /// untouched; Arrow input may be re-exported for retry.
+    NotDelivered(crate::Error),
+    /// May have reached the server: the write succeeded, partially succeeded,
+    /// or the post-write ACK wait failed. Manual chunks have been cleared;
+    /// Arrow input must not be re-exported.
+    DeliveryUnknown(crate::Error),
+}
+
+impl FlushFailure {
+    /// The underlying error, discarding the delivery classification. Used by
+    /// the public `Result<()>`-returning API, which never re-exports.
+    #[doc(hidden)]
+    pub fn into_error(self) -> crate::Error {
+        match self {
+            FlushFailure::NotDelivered(e) | FlushFailure::DeliveryUnknown(e) => e,
+        }
+    }
+
+    /// `true` when the current input was provably not transmitted.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_not_delivered(&self) -> bool {
+        matches!(self, FlushFailure::NotDelivered(_))
+    }
+}
+
+/// Direct-backend `NotDelivered`: map a socket error to `FailoverRetry`, the
+/// same way publish-only [`classify_flush_error`] does.
+fn direct_not_delivered(e: crate::Error) -> FlushFailure {
+    FlushFailure::NotDelivered(classify_flush_error(e))
+}
+
+/// Direct-backend `DeliveryUnknown`: same `FailoverRetry` mapping, but the
+/// current input may already be on the wire.
+fn direct_delivery_unknown(e: crate::Error) -> FlushFailure {
+    FlushFailure::DeliveryUnknown(classify_flush_error(e))
 }
 
 pub struct ColumnSender {
@@ -222,18 +281,48 @@ impl ColumnSender {
         }
     }
 
+    /// Encode and publish `chunk` as a QWP/WebSocket frame **without** waiting
+    /// for a server completion boundary. On success `chunk` is cleared; on
+    /// failure it is left untouched. Call [`Self::sync`] (or use
+    /// [`Self::flush_and_wait`]) to wait for the requested [`AckLevel`].
     pub fn flush(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
         match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => {
-                let defer = direct.first_frame_sent;
-                direct
-                    .flush_inner(chunk, defer)
-                    .map_err(classify_flush_error)?;
-                direct.first_frame_sent = true;
-                Ok(())
-            }
-            ColumnSenderBackend::StoreAndForward(sfa) => sfa.flush_chunk(chunk),
+            ColumnSenderBackend::Direct(direct) => direct.flush_inner(chunk, WaitForAck::No),
+            ColumnSenderBackend::StoreAndForward(sfa) => sfa.flush_chunk(chunk, WaitForAck::No),
         }
+        .map_err(FlushFailure::into_error)
+    }
+
+    /// Publish `chunk` as a completion boundary, then wait until every frame
+    /// published before or by this call on this borrowed sender reaches
+    /// `ack_level` (see `doc/COLUMN_SENDER_ACK_BOUNDARY_FLUSH.md`).
+    ///
+    /// The boundary is cumulative: a successful return means all prior no-wait
+    /// flushes plus this one are acknowledged at `ack_level`. An empty `chunk`
+    /// behaves exactly like [`Self::sync`] (it encodes a header-only frame).
+    ///
+    /// `AckLevel::Durable` requires the pool to be opened with
+    /// `request_durable_ack=on`; otherwise the call is rejected up front
+    /// (`InvalidApiCall`) before `chunk` is touched.
+    ///
+    /// Failure contract: the ACK level is validated, then the frame is
+    /// published, then the wait runs. If publication itself fails the `chunk`
+    /// is untouched and retryable. Once publication succeeds `chunk` is cleared
+    /// even if the later ACK wait fails — at which point delivery of the just
+    /// published frame is **unknown** (it may be committed, rejected, or in
+    /// flight) and the borrow should be dropped/reborrowed per the error class.
+    /// There is no internal failover retry; replay is the caller's
+    /// responsibility.
+    pub fn flush_and_wait(&mut self, chunk: &mut Chunk<'_>, ack_level: AckLevel) -> Result<()> {
+        match &mut self.backend {
+            ColumnSenderBackend::Direct(direct) => {
+                direct.flush_inner(chunk, WaitForAck::Yes(ack_level))
+            }
+            ColumnSenderBackend::StoreAndForward(sfa) => {
+                sfa.flush_chunk(chunk, WaitForAck::Yes(ack_level))
+            }
+        }
+        .map_err(FlushFailure::into_error)
     }
 
     /// Encode and publish an Arrow [`RecordBatch`] **without** a per-row
@@ -257,19 +346,35 @@ impl ColumnSender {
         crate::Error: From<T::Error>,
     {
         let table: TableName<'t> = table.try_into()?;
-        match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => {
-                let defer = direct.first_frame_sent;
-                direct
-                    .flush_arrow_batch_inner(table, batch, None, true, overrides, defer)
-                    .map_err(classify_flush_error)?;
-                direct.first_frame_sent = true;
-                Ok(())
-            }
-            ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.flush_arrow_batch(table, batch, None, true, overrides)
-            }
-        }
+        self.flush_arrow_batch_dispatch(table, batch, None, true, overrides, WaitForAck::No)
+            .map_err(FlushFailure::into_error)
+    }
+
+    /// ACKing counterpart of [`Self::flush_arrow_batch_server_stamped`]:
+    /// publish `batch` as a boundary, then wait for `ack_level`. The same
+    /// boundary/durable/failure contract as [`Self::flush_and_wait`] applies.
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch_server_stamped_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        self.flush_arrow_batch_dispatch(
+            table,
+            batch,
+            None,
+            true,
+            overrides,
+            WaitForAck::Yes(ack_level),
+        )
+        .map_err(FlushFailure::into_error)
     }
 
     /// Encode and publish an Arrow [`RecordBatch`], sourcing the per-row
@@ -291,26 +396,129 @@ impl ColumnSender {
     {
         let table: TableName<'t> = table.try_into()?;
         let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        self.flush_arrow_batch_dispatch(
+            table,
+            batch,
+            Some(ts_col_idx),
+            false,
+            overrides,
+            WaitForAck::No,
+        )
+        .map_err(FlushFailure::into_error)
+    }
+
+    /// ACKing counterpart of [`Self::flush_arrow_batch_at_column`]: publish
+    /// `batch` as a boundary, then wait for `ack_level`. The same
+    /// boundary/durable/failure contract as [`Self::flush_and_wait`] applies.
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch_at_column_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        self.flush_arrow_batch_dispatch(
+            table,
+            batch,
+            Some(ts_col_idx),
+            false,
+            overrides,
+            WaitForAck::Yes(ack_level),
+        )
+        .map_err(FlushFailure::into_error)
+    }
+
+    /// Backend dispatch shared by every Arrow flush variant.
+    #[cfg(feature = "arrow")]
+    fn flush_arrow_batch_dispatch(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_col_idx: Option<usize>,
+        server_stamp: bool,
+        overrides: &[ArrowColumnOverride<'_>],
+        wait: WaitForAck,
+    ) -> std::result::Result<(), FlushFailure> {
         match &mut self.backend {
-            ColumnSenderBackend::Direct(direct) => {
-                let defer = direct.first_frame_sent;
-                direct
-                    .flush_arrow_batch_inner(
-                        table,
-                        batch,
-                        Some(ts_col_idx),
-                        false,
-                        overrides,
-                        defer,
-                    )
-                    .map_err(classify_flush_error)?;
-                direct.first_frame_sent = true;
-                Ok(())
-            }
+            ColumnSenderBackend::Direct(direct) => direct.flush_arrow_batch_inner(
+                table,
+                batch,
+                ts_col_idx,
+                server_stamp,
+                overrides,
+                wait,
+            ),
             ColumnSenderBackend::StoreAndForward(sfa) => {
-                sfa.flush_arrow_batch(table, batch, Some(ts_col_idx), false, overrides)
+                sfa.flush_arrow_batch(table, batch, ts_col_idx, server_stamp, overrides, wait)
             }
         }
+    }
+
+    /// Preflight ACK-level validation for the C FFI ACKing-flush entry points.
+    /// Run before the Arrow C Data Interface import consumes `array->release`
+    /// (and before chunk encode), so a rejected `AckLevel::Durable` leaves
+    /// caller-owned input untouched. Dispatches per backend.
+    #[doc(hidden)]
+    pub fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
+        match &self.backend {
+            ColumnSenderBackend::Direct(direct) => direct.conn.validate_ack_level(ack_level),
+            ColumnSenderBackend::StoreAndForward(sfa) => sfa.validate_ack_level(ack_level),
+        }
+    }
+
+    /// FFI-only ACKing Arrow flush (server-stamped) that surfaces the
+    /// [`FlushFailure`] delivery classification so the C layer can decide
+    /// whether to re-export the caller's `ArrowArray`.
+    #[doc(hidden)]
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch_server_stamped_and_wait_ffi(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> std::result::Result<(), FlushFailure> {
+        self.flush_arrow_batch_dispatch(
+            table,
+            batch,
+            None,
+            true,
+            overrides,
+            WaitForAck::Yes(ack_level),
+        )
+    }
+
+    /// FFI-only ACKing Arrow flush (column-stamped) that surfaces the
+    /// [`FlushFailure`] delivery classification. A failure to resolve
+    /// `ts_column` is `NotDelivered` (nothing was published).
+    #[doc(hidden)]
+    #[cfg(feature = "arrow")]
+    pub fn flush_arrow_batch_at_column_and_wait_ffi(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+        overrides: &[ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> std::result::Result<(), FlushFailure> {
+        let ts_col_idx =
+            arrow_batch::resolve_ts_column(batch, ts_column).map_err(FlushFailure::NotDelivered)?;
+        self.flush_arrow_batch_dispatch(
+            table,
+            batch,
+            Some(ts_col_idx),
+            false,
+            overrides,
+            WaitForAck::Yes(ack_level),
+        )
     }
 
     pub fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
@@ -323,28 +531,52 @@ impl ColumnSender {
 
 impl DirectColumnBackend {
     fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
-        self.conn.validate_ack_level(ack_level)?;
+        // An ACKing flush of an empty chunk *is* `sync`: it publishes a
+        // non-deferred header-only commit frame, then drains to the ack level
+        // (`sync_all_acks`). `sync` is not a data flush, so it must leave the
+        // deferral state untouched — the next data flush still chooses defer
+        // from `first_frame_sent` exactly as before.
+        let first_frame_sent = self.first_frame_sent;
         let mut commit_chunk = Chunk::new("");
-        self.flush_inner(&mut commit_chunk, /* defer_commit = */ false)
-            .map_err(classify_flush_error)?;
-        self.conn
-            .sync_all_acks(ack_level)
-            .map_err(classify_flush_error)
+        let result = self.flush_inner(&mut commit_chunk, WaitForAck::Yes(ack_level));
+        self.first_frame_sent = first_frame_sent;
+        result.map_err(FlushFailure::into_error)
     }
 
-    fn flush_inner(&mut self, chunk: &mut Chunk<'_>, defer_commit: bool) -> Result<()> {
-        self.conn.try_drain_acks()?;
+    fn flush_inner(
+        &mut self,
+        chunk: &mut Chunk<'_>,
+        wait: WaitForAck,
+    ) -> std::result::Result<(), FlushFailure> {
+        // ACK validation is a preflight: a bad / durable-without-opt-in level
+        // is rejected before any encode or write touches caller-owned state.
+        // An ACKing flush publishes its data-bearing frame non-deferred and
+        // then drains in-flight to zero, so it neither defers nor needs the
+        // reserved commit slot.
+        let defer_commit = match wait {
+            WaitForAck::No => self.first_frame_sent,
+            WaitForAck::Yes(level) => {
+                self.conn
+                    .validate_ack_level(level)
+                    .map_err(direct_not_delivered)?;
+                false
+            }
+        };
+
+        self.conn.try_drain_acks().map_err(direct_not_delivered)?;
 
         if defer_commit && !self.conn.has_sync_commit_slot() {
-            return Err(error::fmt!(
+            return Err(FlushFailure::NotDelivered(error::fmt!(
                 InvalidApiCall,
                 "column sender deferred flush capacity exhausted; call sync() \
                  before flushing more chunks."
-            ));
+            )));
         }
 
         if self.conn.at_in_flight_cap() {
-            self.conn.drain_one_ack_blocking()?;
+            self.conn
+                .drain_one_ack_blocking()
+                .map_err(direct_not_delivered)?;
         }
 
         let dict_mark = self.symbol_dict.mark();
@@ -358,16 +590,28 @@ impl DirectColumnBackend {
             )
         }) {
             Ok(p) => p,
-            Err(e) => {
+            Err(PublishError::BeforeWrite(e)) => {
                 if e.code() != ErrorCode::SocketError {
                     self.symbol_dict.rollback(dict_mark);
                 }
-                return Err(e);
+                return Err(direct_not_delivered(e));
             }
+            // Bytes may be on the wire: do not roll back the dict, and report
+            // delivery as unknown.
+            Err(PublishError::DuringWrite(e)) => return Err(direct_delivery_unknown(e)),
         };
 
         self.conn.push_pending(published.fsn);
+        // Once published, the chunk is no longer needed for completion/replay
+        // (rule holds even if the later ACK wait fails).
         chunk.clear();
+        self.first_frame_sent = true;
+
+        if let WaitForAck::Yes(level) = wait {
+            self.conn
+                .sync_all_acks(level)
+                .map_err(direct_delivery_unknown)?;
+        }
         Ok(())
     }
 
@@ -380,20 +624,32 @@ impl DirectColumnBackend {
         ts_col_idx: Option<usize>,
         server_stamp: bool,
         overrides: &[ArrowColumnOverride<'_>],
-        defer_commit: bool,
-    ) -> Result<()> {
-        self.conn.try_drain_acks()?;
+        wait: WaitForAck,
+    ) -> std::result::Result<(), FlushFailure> {
+        let defer_commit = match wait {
+            WaitForAck::No => self.first_frame_sent,
+            WaitForAck::Yes(level) => {
+                self.conn
+                    .validate_ack_level(level)
+                    .map_err(direct_not_delivered)?;
+                false
+            }
+        };
+
+        self.conn.try_drain_acks().map_err(direct_not_delivered)?;
 
         if defer_commit && !self.conn.has_sync_commit_slot() {
-            return Err(error::fmt!(
+            return Err(FlushFailure::NotDelivered(error::fmt!(
                 InvalidApiCall,
                 "column sender deferred flush capacity exhausted; call sync() \
                  before flushing more arrow batches."
-            ));
+            )));
         }
 
         if self.conn.at_in_flight_cap() {
-            self.conn.drain_one_ack_blocking()?;
+            self.conn
+                .drain_one_ack_blocking()
+                .map_err(direct_not_delivered)?;
         }
 
         let dict_mark = self.symbol_dict.mark();
@@ -410,22 +666,56 @@ impl DirectColumnBackend {
             )
         }) {
             Ok(p) => p,
-            Err(e) => {
+            Err(PublishError::BeforeWrite(e)) => {
                 if e.code() != ErrorCode::SocketError {
                     self.symbol_dict.rollback(dict_mark);
                 }
-                return Err(e);
+                return Err(direct_not_delivered(e));
             }
+            Err(PublishError::DuringWrite(e)) => return Err(direct_delivery_unknown(e)),
         };
 
         self.conn.push_pending(published.fsn);
+        self.first_frame_sent = true;
+
+        if let WaitForAck::Yes(level) = wait {
+            self.conn
+                .sync_all_acks(level)
+                .map_err(direct_delivery_unknown)?;
+        }
         Ok(())
     }
 }
 
 impl SfaColumnBackend {
-    fn flush_chunk(&mut self, chunk: &mut Chunk<'_>) -> Result<()> {
-        qwp_ws_check_error_background(&self.state)?;
+    /// Lifted out of [`Self::sync`] so an ACKing flush can reject a
+    /// durable-without-opt-in request *before* encode mutates the symbol dict
+    /// or the Arrow import consumes the caller's array.
+    fn validate_ack_level(&self, ack_level: AckLevel) -> Result<()> {
+        if ack_level == AckLevel::Durable && !self.request_durable_ack {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "AckLevel::Durable requires the pool to be opened with \
+                 `request_durable_ack=on` in the connect string."
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush_chunk(
+        &mut self,
+        chunk: &mut Chunk<'_>,
+        wait: WaitForAck,
+    ) -> std::result::Result<(), FlushFailure> {
+        // Preflight: durable opt-in is validated before encode/append, so a
+        // rejected level leaves the chunk and queue untouched.
+        if let WaitForAck::Yes(level) = wait {
+            self.validate_ack_level(level)
+                .map_err(FlushFailure::NotDelivered)?;
+        }
+        if let Err(e) = qwp_ws_check_error_background(&self.state) {
+            return Err(FlushFailure::NotDelivered(e));
+        }
         self.payload.clear();
         let dict_mark = self.symbol_dict.mark();
         if let Err(e) = encoder::encode_chunk_replay_into(
@@ -435,16 +725,25 @@ impl SfaColumnBackend {
             &mut self.scratch,
         ) {
             self.symbol_dict.rollback(dict_mark);
-            return Err(e);
+            return Err(FlushFailure::NotDelivered(e));
         }
         let max_buf_size = self.effective_max_buf_size();
-        if let Err(e) =
-            publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size)
-        {
-            self.symbol_dict.rollback(dict_mark);
-            return Err(e);
-        }
+        // Local append is atomic: a failed append did not accept the frame
+        // (`NotDelivered`); the returned FSN is the boundary to wait for.
+        let boundary =
+            match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
+                Ok(fsn) => fsn,
+                Err(e) => {
+                    self.symbol_dict.rollback(dict_mark);
+                    return Err(FlushFailure::NotDelivered(e));
+                }
+            };
         chunk.clear();
+        if let WaitForAck::Yes(level) = wait {
+            // The frame is in the local queue; a wait failure is delivery-unknown.
+            self.wait_for_boundary(level, boundary)
+                .map_err(FlushFailure::DeliveryUnknown)?;
+        }
         Ok(())
     }
 
@@ -456,8 +755,15 @@ impl SfaColumnBackend {
         ts_col_idx: Option<usize>,
         server_stamp: bool,
         overrides: &[ArrowColumnOverride<'_>],
-    ) -> Result<()> {
-        qwp_ws_check_error_background(&self.state)?;
+        wait: WaitForAck,
+    ) -> std::result::Result<(), FlushFailure> {
+        if let WaitForAck::Yes(level) = wait {
+            self.validate_ack_level(level)
+                .map_err(FlushFailure::NotDelivered)?;
+        }
+        if let Err(e) = qwp_ws_check_error_background(&self.state) {
+            return Err(FlushFailure::NotDelivered(e));
+        }
         self.payload.clear();
         let dict_mark = self.symbol_dict.mark();
         if let Err(e) = arrow_batch::encode_arrow_batch_replay_into(
@@ -470,30 +776,37 @@ impl SfaColumnBackend {
             &mut self.symbol_dict,
         ) {
             self.symbol_dict.rollback(dict_mark);
-            return Err(e);
+            return Err(FlushFailure::NotDelivered(e));
         }
         let max_buf_size = self.effective_max_buf_size();
-        if let Err(e) =
-            publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size)
-        {
-            self.symbol_dict.rollback(dict_mark);
-            return Err(e);
+        let boundary =
+            match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
+                Ok(fsn) => fsn,
+                Err(e) => {
+                    self.symbol_dict.rollback(dict_mark);
+                    return Err(FlushFailure::NotDelivered(e));
+                }
+            };
+        if let WaitForAck::Yes(level) = wait {
+            self.wait_for_boundary(level, boundary)
+                .map_err(FlushFailure::DeliveryUnknown)?;
         }
         Ok(())
     }
 
     fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
-        if ack_level == AckLevel::Durable && !self.request_durable_ack {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "AckLevel::Durable requires the pool to be opened with \
-                 `request_durable_ack=on` in the connect string."
-            ));
-        }
-
+        self.validate_ack_level(ack_level)?;
         let Some(boundary) = qwp_ws_published_fsn_background(&self.state)? else {
             return Ok(());
         };
+        self.wait_for_boundary(ack_level, boundary)
+    }
+
+    /// Block until the OK/durable watermark reaches `boundary`, then record it
+    /// as the satisfied watermark (so a trailing `sync(level)`/`flush_and_wait`
+    /// on the same boundary short-circuits). Short-circuits immediately when the
+    /// cached watermark already covers `boundary`.
+    fn wait_for_boundary(&mut self, ack_level: AckLevel, boundary: u64) -> Result<()> {
         let last_boundary = match ack_level {
             AckLevel::Ok => self.last_ok_sync_boundary,
             AckLevel::Durable => self.last_durable_sync_boundary,

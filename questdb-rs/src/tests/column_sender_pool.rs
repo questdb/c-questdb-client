@@ -75,6 +75,12 @@ enum MockMode {
     /// EOF and surfaces a transient (`FailoverRetry`) failure.
     #[cfg(feature = "polars")]
     AckThenClose(usize),
+    /// Read (consume) the first `n` binary frames — so the client's writes
+    /// provably succeed — then close **without** acking. Models a peer that
+    /// ingests a published frame and then dies before acknowledging it: the
+    /// client's ACK-wait read hits EOF, a *post-publication* delivery-unknown
+    /// failure.
+    ReadThenClose(usize),
 }
 
 /// Spawn a mock server that performs the WS upgrade for up to `max_accepts`
@@ -119,6 +125,10 @@ impl MockServer {
 
     fn spawn_upgrade_then_close(max_accepts: usize) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::UpgradeThenClose)
+    }
+
+    fn spawn_read_then_close(max_accepts: usize, frames: usize) -> Self {
+        Self::spawn_with_mode(max_accepts, MockMode::ReadThenClose(frames))
     }
 
     #[cfg(feature = "polars")]
@@ -263,6 +273,7 @@ fn run_mock_server_accept_loop(
                             }
                             #[cfg(feature = "polars")]
                             MockMode::AckThenClose(n) => ack_then_close(&mut stream, &stop, n),
+                            MockMode::ReadThenClose(n) => read_then_close(&mut stream, &stop, n),
                         }
                     }
                 });
@@ -484,6 +495,35 @@ fn ack_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize)
         }
     }
     // Returning drops the stream: the client's next read sees EOF.
+}
+
+/// Read (consume) the first `n` binary frames the client sends — so its
+/// `write_all`s provably succeed — then close without ever acking. The client's
+/// subsequent ACK-wait read hits EOF.
+fn read_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut read = 0usize;
+    while !stop.load(Ordering::SeqCst) && read < n {
+        match read_frame(stream) {
+            Ok((_fin, opcode, _payload)) => {
+                if opcode == 0x8 {
+                    break;
+                }
+                if opcode != 0x2 {
+                    continue;
+                }
+                read += 1;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    // Returning drops the stream: the client's ACK-wait read sees EOF.
 }
 
 fn conf_for(port: u16, extras: &str) -> String {
@@ -759,6 +799,129 @@ fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk() {
         read_symbol_prefix(&third_payload),
         vec![b"alpha".to_vec(), b"gamma".to_vec()],
         "failed bravo publish must not remain in the replay symbol dictionary"
+    );
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_waits_for_ok_boundary() {
+    let server = MockServer::spawn_acking(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+
+    let mut chunk = Chunk::new("trades");
+    let qty = [1_i64];
+    let ts = [1_i64];
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("SFA ACKing flush must wait for the local boundary to reach OK");
+    assert!(
+        chunk.is_empty(),
+        "successful SFA ACKing flush clears the chunk"
+    );
+
+    // A trailing sync on the satisfied boundary is a cheap re-check (the
+    // watermark cache was written back by the ACKing flush).
+    sender
+        .sync(AckLevel::Ok)
+        .expect("trailing sync on the satisfied boundary must succeed");
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_durable_without_opt_in_keeps_chunk() {
+    let server = MockServer::spawn(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+
+    let mut chunk = Chunk::new("trades");
+    let qty = [1_i64];
+    let ts = [1_i64];
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+    let err = sender
+        .flush_and_wait(&mut chunk, AckLevel::Durable)
+        .expect_err("durable without opt-in must be rejected up front");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("request_durable_ack"),
+        "msg: {}",
+        err.msg()
+    );
+    assert!(
+        !chunk.is_empty(),
+        "pre-append rejection must leave the chunk replayable"
+    );
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_timeout_after_append_clears_chunk() {
+    // Park mode finishes the upgrade and drains frames but never acks. The
+    // local append succeeds (the frame is queued and replayable), then the
+    // boundary wait times out: a `FailoverRetry` whose delivery is unknown.
+    let server = MockServer::spawn(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+    sender.set_sfa_sync_timeout_for_test(Duration::from_millis(150));
+
+    let mut chunk = Chunk::new("trades");
+    let qty = [1_i64];
+    let ts = [1_i64];
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+    let err = sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect_err("silent-but-alive peer must time out the boundary wait");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{}", err.msg());
+    assert!(
+        err.msg().contains("timed out") && err.msg().contains("no ack progress"),
+        "unexpected timeout message: {}",
+        err.msg()
+    );
+    assert!(
+        chunk.is_empty(),
+        "the frame was appended to the local queue, so the chunk is cleared"
+    );
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_surfaces_server_rejection() {
+    let server = MockServer::spawn_erroring(1, QWP_STATUS_SCHEMA_MISMATCH);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+
+    let mut chunk = Chunk::new("trades");
+    let qty = [1_i64];
+    let ts = [1_i64];
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+    let err = sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect_err("server rejection inside the waited range must surface");
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        err.qwp_ws_rejection().and_then(|error| error.status),
+        Some(QWP_STATUS_SCHEMA_MISMATCH)
     );
 }
 
@@ -1381,6 +1544,200 @@ fn flush_clears_chunk_for_reuse_and_can_repeat() {
         sender.flush(&mut chunk).unwrap();
         sender.sync(AckLevel::Ok).expect("repeated empty flush");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Direct-mode ACKing flush (`flush_and_wait`)
+// ---------------------------------------------------------------------------
+
+/// Build a one-row `i64` chunk for `table` at `ts` nanos.
+fn one_i64_row<'a>(table: &'a str, val: &'a [i64; 1], ts: &'a [i64; 1]) -> Chunk<'a> {
+    let mut chunk = Chunk::new(table);
+    chunk.column_i64("qty", val, None).unwrap();
+    chunk.designated_timestamp_nanos(ts).unwrap();
+    chunk
+}
+
+#[test]
+fn flush_and_wait_publishes_and_waits_for_ok() {
+    let server = MockServer::spawn_acking(2);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_column_sender().expect("borrow");
+
+    let val = [42_i64];
+    let ts = [1_700_000_000_000_000_000_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("ACKing flush must publish then return after the OK ack");
+    assert!(chunk.is_empty(), "successful ACKing flush clears the chunk");
+}
+
+#[test]
+fn flush_and_wait_empty_chunk_behaves_like_sync() {
+    let server = MockServer::spawn_acking(2);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut chunk = Chunk::new("trades");
+    assert_eq!(chunk.row_count(), 0);
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("empty-chunk ACKing flush collapses to sync()");
+    assert_eq!(chunk.row_count(), 0);
+}
+
+#[test]
+fn flush_and_wait_durable_without_opt_in_leaves_chunk_untouched() {
+    // Mirror `durable_ack_without_opt_in_does_not_publish_commit_frame` but for
+    // the ACKing flush of a *data* chunk: the durable opt-in is a preflight, so
+    // no frame is published and the chunk is retained.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+    let port = listener.local_addr().expect("local_addr").port();
+    let (tx, rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        perform_server_upgrade(&mut stream).expect("upgrade");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let frame = match read_frame(&mut stream) {
+            Ok((_fin, opcode, _payload)) => Some(opcode),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                None
+            }
+            Err(e) => panic!("unexpected server read error: {e}"),
+        };
+        tx.send(frame).expect("send frame observation");
+    });
+
+    let db = QuestDb::connect(&conf_for(port, "")).unwrap();
+    let mut sender = db.borrow_column_sender().expect("borrow");
+    let val = [7_i64];
+    let ts = [1_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    let err = sender
+        .flush_and_wait(&mut chunk, AckLevel::Durable)
+        .expect_err("durable without opt-in must fail before publish");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("request_durable_ack"),
+        "msg: {}",
+        err.msg()
+    );
+    assert_eq!(
+        chunk.row_count(),
+        1,
+        "pre-publication rejection must leave the chunk untouched"
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("server observation"),
+        None,
+        "ACKing flush must reject durable ACK before publishing any frame"
+    );
+
+    drop(sender);
+    drop(db);
+    handle.join().expect("server thread");
+}
+
+#[test]
+fn flush_and_wait_boundary_covers_prior_flush() {
+    // `flush(A)` (publish-only) then `flush_and_wait(B, Ok)` — the boundary
+    // covers both frames, so the server must ack two frames before the call
+    // returns.
+    let server = MockServer::spawn_acking(2);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_column_sender().expect("borrow");
+
+    let a_val = [1_i64];
+    let a_ts = [1_i64];
+    let mut a = one_i64_row("trades", &a_val, &a_ts);
+    sender.flush(&mut a).expect("publish-only flush of A");
+    assert!(a.is_empty());
+
+    let b_val = [2_i64];
+    let b_ts = [2_i64];
+    let mut b = one_i64_row("trades", &b_val, &b_ts);
+    sender
+        .flush_and_wait(&mut b, AckLevel::Ok)
+        .expect("ACKing flush of B must drain A and B");
+    assert!(b.is_empty());
+    assert_eq!(
+        sender.in_flight(),
+        0,
+        "a successful ACKing flush drains all in-flight frames to zero"
+    );
+}
+
+#[test]
+fn flush_and_wait_skips_the_deferred_reserve_guard() {
+    // Fill in-flight to the deferred reserve (a 128th *deferred* flush would
+    // trip the slot guard), then prove an ACKing flush still publishes — it
+    // goes out non-deferred, so it never consults the reserve guard, and
+    // `sync_all_acks` drains everything to zero.
+    let (server, release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_column_sender().expect("borrow");
+
+    let mut filler = Chunk::new("trades");
+    for _ in 0..127 {
+        sender
+            .flush(&mut filler)
+            .expect("deferred flush below the reserve");
+    }
+    assert_eq!(sender.in_flight(), 127, "filled to the deferred reserve");
+
+    // Unblock the held acks shortly after, so the ACKing flush's `sync` drains.
+    let releaser = {
+        let release = Arc::clone(&release);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            release.store(true, Ordering::SeqCst);
+        })
+    };
+
+    let val = [9_i64];
+    let ts = [9_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("ACKing flush must not trip the deferred-reserve guard");
+    assert!(chunk.is_empty());
+    assert_eq!(sender.in_flight(), 0);
+    releaser.join().expect("releaser thread");
+}
+
+#[test]
+fn flush_and_wait_ack_wait_failure_after_publish_clears_chunk() {
+    // The server reads (consumes) the published frame — so the write provably
+    // succeeds and the chunk is cleared (design §7.4) — then closes without
+    // acking. The subsequent `sync_all_acks` read hits EOF: a post-publication
+    // transport death whose delivery is *unknown*, surfaced as `FailoverRetry`
+    // with the conn latched `must_close`.
+    let server = MockServer::spawn_read_then_close(1, 1);
+    let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
+    let mut sender = db.borrow_column_sender().expect("borrow");
+
+    let val = [5_i64];
+    let ts = [5_i64];
+    let mut chunk = one_i64_row("trades", &val, &ts);
+    let err = sender
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect_err("server died during the ACK wait");
+    assert_eq!(err.code(), ErrorCode::FailoverRetry, "{}", err.msg());
+    assert!(
+        chunk.is_empty(),
+        "the frame was published, so the chunk is cleared even though the ACK wait failed"
+    );
+    assert!(
+        sender.must_close(),
+        "a delivery-unknown failure must latch the conn for pool discard"
+    );
 }
 
 #[test]

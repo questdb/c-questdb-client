@@ -781,6 +781,27 @@ public:
             static_cast<uint32_t>(level));
     }
 
+    /**
+     * Publish `chunk` as a completion boundary, then wait until every frame
+     * published before or by this call reaches `level` (see `sync`). The
+     * boundary is cumulative: success acknowledges all prior `flush`es plus
+     * this one; an empty `chunk` behaves like `sync`.
+     *
+     * `level` has no default (unlike `sync`) so the blocking behaviour stays
+     * explicit at every call site. `column_sender_ack_level::durable` requires
+     * `request_durable_ack=on`. Throws on error. Once the frame is published
+     * `chunk` is cleared even if the ACK wait then fails — delivery of that
+     * frame is then unknown; drop and re-borrow per the error.
+     */
+    void flush_and_wait(column_chunk& chunk, column_sender_ack_level level)
+    {
+        line_sender_error::wrapped_call(
+            ::column_sender_flush_and_wait,
+            _raw,
+            chunk.c_ptr(),
+            static_cast<uint32_t>(level));
+    }
+
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
     /**
      * Encode an Arrow RecordBatch as one QWP/WS frame for `table` and
@@ -818,6 +839,35 @@ public:
     }
 
     /**
+     * ACKing counterpart of `flush_arrow_batch_server_stamped`: publish
+     * `array` as a boundary, then wait for `level`. `level` is validated
+     * before the Arrow import consumes `array.release`. On a pre-publication
+     * failure `array` is re-exported for retry; on a post-publication failure
+     * (delivery unknown) it is not — check `array.release` before invoking it.
+     * `level` is positioned before the optional `overrides` (which keep their
+     * defaults) and has no default of its own. Throws on error.
+     */
+    void flush_arrow_batch_server_stamped_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_sender_ack_level level,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        ::line_sender_table_name table_c{table.size(), table.data()};
+        line_sender_error::wrapped_call(
+            ::column_sender_flush_arrow_batch_server_stamped_and_wait,
+            _raw,
+            table_c,
+            &array,
+            &schema,
+            overrides,
+            overrides_len,
+            static_cast<uint32_t>(level));
+    }
+
+    /**
      * Variant of `flush_arrow_batch_server_stamped` that sources the
      * per-row designated timestamp from a named `Timestamp(_)` column
      * inside the batch.
@@ -841,6 +891,35 @@ public:
             ts_c,
             overrides,
             overrides_len);
+    }
+
+    /**
+     * ACKing counterpart of the `ts_column` `flush_arrow_batch`: publish
+     * `array` (timestamp sourced from `ts_column`) as a boundary, then wait
+     * for `level`. Same preflight/re-export contract as
+     * `flush_arrow_batch_server_stamped_and_wait`. Throws on error.
+     */
+    void flush_arrow_batch_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        column_sender_ack_level level,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        ::line_sender_table_name table_c{table.size(), table.data()};
+        ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
+        line_sender_error::wrapped_call(
+            ::column_sender_flush_arrow_batch_at_column_and_wait,
+            _raw,
+            table_c,
+            &array,
+            &schema,
+            ts_c,
+            overrides,
+            overrides_len,
+            static_cast<uint32_t>(level));
     }
 #endif
 

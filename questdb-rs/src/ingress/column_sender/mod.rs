@@ -84,6 +84,13 @@ const _: () = assert!(
 #[doc(hidden)]
 pub use db::{OwnedColumnSender, OwnedRowSender};
 
+/// Delivery classification surfaced to the C FFI so the Arrow `_and_wait`
+/// entry points can decide whether to re-export the caller's batch. Not part
+/// of the public Rust API surface (the public `*_and_wait` methods return
+/// `Result<()>`).
+#[doc(hidden)]
+pub use sender::FlushFailure;
+
 #[cfg(feature = "_egress")]
 #[doc(hidden)]
 pub use db::{OwnedReader, ReaderPoolHandle};

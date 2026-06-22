@@ -234,16 +234,25 @@ impl ColumnConn {
     ///
     /// On any socket or protocol failure the connection is latched as
     /// `must_close` and the original error is returned.
-    pub(crate) fn publish_qwp<F>(&mut self, encode: F) -> Result<PublishedFrame>
+    ///
+    /// The error half of the result distinguishes whether any byte of the
+    /// frame could have reached the wire ([`PublishError::DuringWrite`]) from a
+    /// failure proven to precede transmission ([`PublishError::BeforeWrite`]).
+    /// Publish-only callers treat both alike; the ACKing flush path uses the
+    /// distinction to classify delivery certainty (see `FlushFailure`).
+    pub(crate) fn publish_qwp<F>(
+        &mut self,
+        encode: F,
+    ) -> std::result::Result<PublishedFrame, PublishError>
     where
         F: FnOnce(&mut Vec<u8>) -> Result<()>,
     {
         if self.must_close {
-            return Err(error::fmt!(
+            return Err(PublishError::BeforeWrite(error::fmt!(
                 SocketError,
                 "QWP/WebSocket connection latched as terminal; \
                  return the sender to the pool and acquire a fresh one."
-            ));
+            )));
         }
 
         // Set up the buffer: 14 zero bytes that the WS header will
@@ -252,26 +261,34 @@ impl ColumnConn {
         self.write_buf.resize(WS_HEADER_RESERVE, 0);
 
         // Caller writes the QWP frame body.
-        encode(&mut self.write_buf).inspect_err(|_| {
+        if let Err(e) = encode(&mut self.write_buf) {
             // Encode failure leaves the connection usable — the bytes
             // never hit the wire — but the buffer state needs resetting
             // so the next publish starts clean.
             self.write_buf.clear();
-        })?;
+            return Err(PublishError::BeforeWrite(e));
+        }
 
         let payload_len = self.write_buf.len() - WS_HEADER_RESERVE;
         if payload_len > self.max_buf_size {
-            return Err(error::fmt!(
+            return Err(PublishError::BeforeWrite(error::fmt!(
                 InvalidApiCall,
                 "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
                 payload_len,
                 self.max_buf_size
-            ));
+            )));
         }
 
-        let mask_key = self.mask_keys.next_key().map_err(|e| {
-            self.latch(error::fmt!(SocketError, "mask key entropy failed: {}", e.0))
-        })?;
+        let mask_key = match self.mask_keys.next_key() {
+            Ok(k) => k,
+            Err(e) => {
+                return Err(PublishError::BeforeWrite(self.latch(error::fmt!(
+                    SocketError,
+                    "mask key entropy failed: {}",
+                    e.0
+                ))));
+            }
+        };
 
         // Apply the mask to the QWP frame body in place.
         apply_mask(&mut self.write_buf[WS_HEADER_RESERVE..], mask_key, 0);
@@ -285,23 +302,24 @@ impl ColumnConn {
             mask_key,
         );
 
-        self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
-        self.stream
-            .write_all(&self.write_buf[header_offset..])
-            .map_err(|e| {
-                self.latch(error::fmt!(
-                    SocketError,
-                    "QWP/WebSocket socket write failed: {}",
-                    e
-                ))
-            })?;
-        self.stream.flush().map_err(|e| {
-            self.latch(error::fmt!(
+        // Arming the write timeout still precedes any byte hitting the wire.
+        if let Err(e) = self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout)) {
+            return Err(PublishError::BeforeWrite(e));
+        }
+        if let Err(e) = self.stream.write_all(&self.write_buf[header_offset..]) {
+            return Err(PublishError::DuringWrite(self.latch(error::fmt!(
+                SocketError,
+                "QWP/WebSocket socket write failed: {}",
+                e
+            ))));
+        }
+        if let Err(e) = self.stream.flush() {
+            return Err(PublishError::DuringWrite(self.latch(error::fmt!(
                 SocketError,
                 "QWP/WebSocket socket flush failed: {}",
                 e
-            ))
-        })?;
+            ))));
+        }
 
         let fsn = self.next_fsn;
         self.next_fsn = self.next_fsn.wrapping_add(1);
@@ -836,6 +854,19 @@ impl Drop for ColumnConn {
 /// Outcome of a successful publish call.
 pub(crate) struct PublishedFrame {
     pub(crate) fsn: u64,
+}
+
+/// Failure of [`ColumnConn::publish_qwp`], carrying whether the current frame
+/// could already be on the wire.
+pub(crate) enum PublishError {
+    /// No byte of the frame was transmitted: the connection was already
+    /// latched, encode failed, the frame was oversized, mask-key entropy
+    /// failed, or arming the socket timeout failed. The frame is provably
+    /// un-sent.
+    BeforeWrite(crate::Error),
+    /// `write_all`/`flush` failed after the write began — bytes may already be
+    /// on the wire. The connection has been latched `must_close`.
+    DuringWrite(crate::Error),
 }
 
 #[derive(Debug)]

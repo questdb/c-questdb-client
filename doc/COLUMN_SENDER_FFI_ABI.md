@@ -1167,6 +1167,95 @@ Coverage matches the Rust `ColumnSender::flush_arrow_batch_server_stamped`
 QWP wire mapping) or `line_sender_error_arrow_ingest` (structural
 validation failed: bad offsets, null in designated TS, etc.).
 
+### 13.2 ACKing flush — publish a boundary then wait (`*_and_wait`)
+
+Each publish-only flush has an **ACKing** (boundary) counterpart with an
+`_and_wait` suffix that publishes the input *and* waits for a server
+completion boundary at a requested `ack_level` in one call — the common
+"send this batch and return when it is committed" shape, without a
+separate `column_sender_sync`. `ack_level` is a `uint32_t` (a
+`column_sender_ack_level_*` constant) rather than the enum, so an
+out-of-range value returns `line_sender_error_invalid_api_call` instead of
+being undefined behaviour at the language boundary — matching
+`column_sender_sync`.
+
+```c
+QUESTDB_CLIENT_API
+bool column_sender_flush_and_wait(
+    column_sender* conn,
+    column_sender_chunk* chunk,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_server_stamped_and_wait(
+    column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_at_column_and_wait(
+    column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+#endif
+```
+
+- **Boundary scope** — the wait is cumulative: a successful ACKing flush
+  acknowledges every frame published before or by the call on the same
+  borrowed conn, plus the current input, at `ack_level`. It does not
+  promise a per-frame guarantee.
+- **Empty chunk** — `column_sender_flush_and_wait(empty_chunk, level)`
+  behaves exactly like `column_sender_sync(level)`; the header-only frame
+  it encodes is the same one `sync` sends.
+- **No extra commit frame** — in direct mode the data-bearing frame is
+  published non-deferred and the call then drains all in-flight ACKs to
+  zero, so it neither defers nor consumes the reserved sync-commit slot.
+  In store-and-forward mode the frame is appended to the local queue and
+  the call waits until the OK/durable watermark reaches that frame's
+  boundary, then caches it so a trailing `column_sender_sync` short-circuits.
+- **ACK validation is a preflight** — the `uint32_t` level is parsed and
+  the durable opt-in is checked *before* the Arrow C Data Interface import
+  consumes `array->release` and before chunk/batch encode. A rejected level
+  is therefore always pre-publication: no frame is sent, the chunk is
+  untouched, and `array` ownership stays with the caller exactly as on
+  entry (`line_sender_error_invalid_api_call`).
+
+**Failure contract.** An ACKing flush has two phases — publish, then wait
+— and the contract distinguishes them by *delivery certainty of the
+current input*, not by the error code:
+
+- *Not delivered* (provably pre-transmission: validation, encode, size
+  check, or a transport error before any byte was written) — the manual
+  chunk is left untouched; the Arrow `array` is re-exported back into
+  `*array` with a fresh `release` so the caller can drop+re-borrow a live
+  conn and retry.
+- *Delivery unknown* (the write succeeded, partially succeeded, or the
+  post-publish ACK wait failed — including an ACK-wait or store-and-forward
+  no-progress timeout reported as `line_sender_error_failover_retry`) — the
+  manual chunk has already been cleared; the Arrow `array` is **not**
+  re-exported (`array->release` stays NULL). Retrying a delivery-unknown
+  input can duplicate rows unless table-level dedup/upsert keys make replay
+  safe. Callers MUST check `array->release != NULL` before invoking it on
+  the failure path.
+
+A delivery-unknown failure leaves the conn latched
+(`column_sender_must_close()` true / in-flight non-zero) so pool return and
+reborrow discard it rather than recycle a half-committed conn. There is no
+internal failover retry; replay is the caller's responsibility.
+
 ---
 
 ## 14. Versioning

@@ -163,6 +163,46 @@ TEST_CASE("flush rejects oversized table name")
     conn.drop_on_return();
 }
 
+TEST_CASE("flush_and_wait rejects NULL conn")
+{
+    qdb::column_chunk chunk{"trades"};
+    int64_t v[] = {1};
+    int64_t t[] = {1};
+    chunk.column_i64("v", v, 1).designated_timestamp_nanos(t, 1);
+
+    qdb::column_sender_conn conn{nullptr};
+    CHECK_THROWS_AS(
+        conn.flush_and_wait(chunk, qdb::column_sender_ack_level::ok),
+        qdb::line_sender_error);
+}
+
+TEST_CASE("flush_and_wait rejects durable ACK without opt-in and keeps the chunk")
+{
+    auto mock = spawn_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto conn = db.borrow_column_sender();
+
+    qdb::column_chunk chunk{"trades"};
+    int64_t qty[] = {10};
+    int64_t ts[] = {1'700'000'000'000'000'000LL};
+    chunk.column_i64("qty", qty, 1).designated_timestamp_nanos(ts, 1);
+
+    // Durable opt-in is a preflight: this is rejected before any frame is
+    // published, so the chunk is left intact and the exception preserves the
+    // underlying `invalid_api_call` code.
+    try
+    {
+        conn->flush_and_wait(chunk, qdb::column_sender_ack_level::durable);
+        FAIL("durable without opt-in must throw");
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        CHECK(e.code() == qdb::line_sender_error_code::invalid_api_call);
+    }
+    CHECK(chunk.row_count() == 1);
+    conn.drop_on_return();
+}
+
 TEST_CASE("drop_on_return drops the conn instead of recycling it")
 {
     auto mock = spawn_mock(2);

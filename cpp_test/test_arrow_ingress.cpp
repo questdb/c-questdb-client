@@ -51,6 +51,34 @@ TEST_CASE("column_sender_conn::flush_arrow_batch at_column rejects NULL conn")
         qdb::line_sender_error);
 }
 
+TEST_CASE("flush_arrow_batch_server_stamped_and_wait rejects NULL conn")
+{
+    ArrowArray arr;
+    ArrowSchema sch;
+    std::memset(&arr, 0, sizeof(arr));
+    std::memset(&sch, 0, sizeof(sch));
+
+    qdb::column_sender_conn conn{nullptr};
+    CHECK_THROWS_AS(
+        conn.flush_arrow_batch_server_stamped_and_wait(
+            "t"_tn, arr, sch, qdb::column_sender_ack_level::ok),
+        qdb::line_sender_error);
+}
+
+TEST_CASE("flush_arrow_batch_and_wait rejects NULL conn")
+{
+    ArrowArray arr;
+    ArrowSchema sch;
+    std::memset(&arr, 0, sizeof(arr));
+    std::memset(&sch, 0, sizeof(sch));
+
+    qdb::column_sender_conn conn{nullptr};
+    CHECK_THROWS_AS(
+        conn.flush_arrow_batch_and_wait(
+            "t"_tn, arr, sch, "ts"_cn, qdb::column_sender_ack_level::ok),
+        qdb::line_sender_error);
+}
+
 TEST_CASE("column_sender_conn surfaces error_code on NULL-conn failure")
 {
     ArrowArray arr;
@@ -261,6 +289,60 @@ TEST_CASE("flush_arrow_batch: NULL schema → invalid_api_call")
     REQUIRE(err != nullptr);
     CHECK(line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
     line_sender_error_free(err);
+}
+
+// ---------------------------------------------------------------------------
+// ACKing Arrow flush (`*_and_wait`): the ACK level is validated BEFORE the
+// Arrow C Data Interface import consumes `array->release`, so a rejected level
+// leaves the caller's array intact for retry (design §6.2 / §10.3).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("flush_arrow_batch_*_and_wait: invalid ACK level rejected before import")
+{
+    MockConn mc;
+    auto data = pack_le<int64_t>({1, 2, 3});
+    ArrowArray arr = make_array(3, 0, {nullptr, data});
+    ArrowSchema sch = make_schema("l", "qty");
+    line_sender_error* err = nullptr;
+    line_sender_table_name tbl{1, "t"};
+    bool ok = column_sender_flush_arrow_batch_server_stamped_and_wait(
+        mc.conn, tbl, &arr, &sch, nullptr, 0, /*ack_level=*/99, &err);
+    CHECK_FALSE(ok);
+    REQUIRE(err != nullptr);
+    CHECK(line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
+    line_sender_error_free(err);
+    // The import never ran, so the caller still owns the array.
+    const bool array_retained = arr.release != nullptr;
+    CHECK(array_retained);
+    if (arr.release)
+        arr.release(&arr);
+}
+
+TEST_CASE("flush_arrow_batch_*_and_wait: durable without opt-in rejected before import")
+{
+    MockConn mc;
+    auto data = pack_le<int64_t>({1, 2, 3});
+    ArrowArray arr = make_array(3, 0, {nullptr, data});
+    ArrowSchema sch = make_schema("l", "qty");
+    line_sender_error* err = nullptr;
+    line_sender_table_name tbl{1, "t"};
+    bool ok = column_sender_flush_arrow_batch_server_stamped_and_wait(
+        mc.conn,
+        tbl,
+        &arr,
+        &sch,
+        nullptr,
+        0,
+        column_sender_ack_level_durable,
+        &err);
+    CHECK_FALSE(ok);
+    REQUIRE(err != nullptr);
+    CHECK(line_sender_error_get_code(err) == line_sender_error_invalid_api_call);
+    line_sender_error_free(err);
+    const bool array_retained = arr.release != nullptr;
+    CHECK(array_retained);
+    if (arr.release)
+        arr.release(&arr);
 }
 
 TEST_CASE("flush_arrow_batch_at_column: empty ts_column_name throws invalid_name")

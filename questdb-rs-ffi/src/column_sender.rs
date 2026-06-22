@@ -2436,6 +2436,80 @@ pub unsafe extern "C" fn column_sender_flush(
     true
 }
 
+/// Publish `chunk` as a completion boundary, then **wait** until every frame
+/// published before or by this call reaches `ack_level` (see
+/// `column_sender_sync` for the level meanings and the no-progress timeout).
+///
+/// `ack_level` carries a `column_sender_ack_level_*` constant; an out-of-range
+/// value, or `column_sender_ack_level_durable` without `request_durable_ack=on`,
+/// returns `line_sender_error_invalid_api_call` **before** `chunk` is touched.
+///
+/// Boundary: a successful return acknowledges all prior no-wait flushes plus
+/// this one. An empty `chunk` behaves like `column_sender_sync`.
+///
+/// Failure contract: if the call fails before publication, `chunk` is left
+/// untouched and retryable. Once the frame is published `chunk` is cleared even
+/// if the ACK wait then fails — delivery of that frame is **unknown** and the
+/// conn should be dropped/re-borrowed per the error class. There is no internal
+/// failover retry.
+///
+/// Returns `true` on success, `false` on error (with `*err_out` set).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_and_wait(
+    conn: *mut column_sender,
+    chunk: *mut column_sender_chunk,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let ack_level = match ack_level_from_u32(ack_level, err_out) {
+        Some(l) => l,
+        None => return false,
+    };
+    if conn.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "column_sender_flush_and_wait: conn pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return false;
+    }
+    let _conn_guard = match unsafe {
+        InUseGuard::acquire(
+            conn,
+            &raw const (*conn).1,
+            "column_sender_flush_and_wait",
+            "column_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _chunk_guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_flush_and_wait",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let sender = unsafe { (*conn).0.get_mut() };
+    let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, sender.flush_and_wait(chunk_inner, ack_level));
+    true
+}
+
 /// Encode an Apache Arrow `RecordBatch` (Arrow C Data Interface) as a
 /// single QWP/WebSocket frame for `table` and publish it through `conn`
 /// in one pass — no intermediate buffer staging, no per-column copy.
@@ -2520,6 +2594,84 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
             Some(ts_column),
             overrides,
             overrides_len,
+            err_out,
+        )
+    }
+}
+
+/// ACKing counterpart of `column_sender_flush_arrow_batch_server_stamped`:
+/// publish `array` as a boundary, then wait for `ack_level`.
+///
+/// `ack_level` carries a `column_sender_ack_level_*` constant. It is validated
+/// **before** the Arrow C Data Interface import consumes `array->release`, so a
+/// rejected level (out-of-range, or `durable` without `request_durable_ack=on`)
+/// returns `line_sender_error_invalid_api_call` and leaves `array` untouched.
+///
+/// Ownership differs from the publish-only flush on the failure path. On a
+/// failure that is provably **pre-publication** (validation, encode, size, or a
+/// transport error before any byte was written) the batch is re-exported back
+/// into `*array` with a fresh `release` so the caller can drop+re-borrow and
+/// retry. On any **post-publication** failure — including an ACK-wait or SFA
+/// no-progress timeout reported as `line_sender_error_failover_retry` — the
+/// batch is **not** re-exported (`array->release` stays NULL): delivery is
+/// unknown and a blind replay could duplicate rows. Callers MUST check
+/// `array->release != NULL` before invoking it on the failure path.
+///
+/// Returns `true` on success, `false` on error (with `*err_out` set).
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_server_stamped_and_wait(
+    conn: *mut column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl_and_wait(
+            conn,
+            table,
+            array,
+            schema,
+            None,
+            overrides,
+            overrides_len,
+            ack_level,
+            err_out,
+        )
+    }
+}
+
+/// ACKing counterpart of `column_sender_flush_arrow_batch_at_column`: publish
+/// `array` (timestamp sourced from `ts_column`) as a boundary, then wait for
+/// `ack_level`. Same ACK-validation preflight and phase-aware re-export
+/// contract as `column_sender_flush_arrow_batch_server_stamped_and_wait`.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_and_wait(
+    conn: *mut column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: line_sender_column_name,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl_and_wait(
+            conn,
+            table,
+            array,
+            schema,
+            Some(ts_column),
+            overrides,
+            overrides_len,
+            ack_level,
             err_out,
         )
     }
@@ -2740,11 +2892,12 @@ unsafe fn arrow_batch_impl(
             // A transient (reconnectable) failure must leave the caller's
             // `array` intact so it can drop+re-borrow a live conn and retry
             // with the same data. The import already consumed `array->release`,
-            // so we re-export the still-live `RecordBatch` back into `*array`,
-            // restoring a valid release. A terminal error consumes the array
-            // as before (the data is unusable on any conn).
+            // so we re-export the still-live `RecordBatch` back into `*array`
+            // (matching the caller's retained `schema` shape), restoring a
+            // valid release. A terminal error consumes the array as before (the
+            // data is unusable on any conn).
             if err.code() == ErrorCode::FailoverRetry {
-                unsafe { reexport_record_batch_into(rb, array) };
+                unsafe { reexport_record_batch_into(rb, array, schema) };
             }
             unsafe { set_err_out_from_error(err_out, err) };
             false
@@ -2752,19 +2905,140 @@ unsafe fn arrow_batch_impl(
     }
 }
 
-/// Re-export `rb` back into the caller's `*array` (a Struct array, one child
-/// per column — the shape `arrow_ffi_import_record_batch` accepts on retry),
-/// restoring `array->release` consumed during import. Best-effort: an export
-/// failure leaves `array->release == NULL`, which the caller already must
-/// tolerate per the documented ownership contract.
+/// ACKing variant of [`arrow_batch_impl`]. Validates `ack_level` **before** the
+/// Arrow import consumes `array->release`, then publishes and waits.
+///
+/// The re-export decision is driven by the [`FlushFailure`] delivery
+/// classification, **not** by the error code: re-export only when the flush
+/// primitive reports `NotDelivered` (the batch was provably not transmitted),
+/// never on `DeliveryUnknown` (write succeeded/partial, or the post-publish ACK
+/// wait failed) — even when that surfaces as `FailoverRetry`.
+#[cfg(feature = "arrow")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn arrow_batch_impl_and_wait(
+    conn: *mut column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: Option<line_sender_column_name>,
+    overrides_ptr: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    // ACK-level parse preflight: precedes the guard, the import, and any
+    // caller-owned input being consumed.
+    let ack_level = match ack_level_from_u32(ack_level, err_out) {
+        Some(l) => l,
+        None => return false,
+    };
+    if conn.is_null() {
+        crate::arrow_err_to_c_box(
+            err_out,
+            ErrorCode::InvalidApiCall,
+            "column_sender_flush_arrow_batch_*_and_wait: conn pointer is NULL".to_string(),
+        );
+        return false;
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            conn,
+            &raw const (*conn).1,
+            "column_sender_flush_arrow_batch_*_and_wait",
+            "column_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let sender = unsafe { (*conn).0.get_mut() };
+    // Durable opt-in preflight: reject before the import consumes
+    // `array->release`, so a rejected level leaves the caller's array intact.
+    if let Err(err) = sender.validate_ack_level(ack_level) {
+        unsafe { set_err_out_from_error(err_out, err) };
+        return false;
+    }
+    let rb = match unsafe {
+        crate::arrow_ffi_import_record_batch(
+            array,
+            schema,
+            "column_sender_flush_arrow_batch_*_and_wait",
+            err_out,
+        )
+    } {
+        Some(rb) => rb,
+        None => return false,
+    };
+    let table_name = unsafe { table.as_name() };
+    let result = match ts_column {
+        Some(ts) => sender.flush_arrow_batch_at_column_and_wait_ffi(
+            table_name,
+            &rb,
+            ts.as_name(),
+            &overrides,
+            ack_level,
+        ),
+        None => sender
+            .flush_arrow_batch_server_stamped_and_wait_ffi(table_name, &rb, &overrides, ack_level),
+    };
+    match result {
+        Ok(()) => true,
+        Err(flush_failure) => {
+            // Phase-aware re-export: `NotDelivered` is safe to retry on a fresh
+            // conn, so restore the caller's array; `DeliveryUnknown` is not.
+            let reexport = flush_failure.is_not_delivered();
+            let err = flush_failure.into_error();
+            if reexport {
+                unsafe { reexport_record_batch_into(rb, array, schema) };
+            }
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
+/// Re-export `rb` back into the caller's `*array`, restoring the `release`
+/// consumed during import so the caller can retry on a fresh conn. The shape
+/// must match the caller's **retained** `schema` (which is borrowed and never
+/// consumed): a Struct schema → a Struct array (one child per column); a bare
+/// single-column non-Struct schema → that one column's array directly.
+///
+/// This shape match is load-bearing: `arrow_ffi_import_record_batch` wraps a
+/// bare single-column input into a one-column `RecordBatch`, so re-exporting it
+/// unconditionally as a Struct array would yield an array whose child count (1)
+/// disagrees with the still-primitive schema (0 children) and the retry would
+/// be rejected by `validate_arrow_array_depth`.
+///
+/// Best-effort: an export failure leaves `array->release == NULL`, which the
+/// caller already must tolerate per the documented ownership contract.
 #[cfg(feature = "arrow")]
 unsafe fn reexport_record_batch_into(
     rb: arrow_array::RecordBatch,
     array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
 ) {
+    use arrow::datatypes::DataType;
     use arrow_array::{Array, StructArray};
-    let struct_array = StructArray::from(rb);
-    let array_data = struct_array.into_data();
+
+    // A non-Struct top-level schema means the caller passed a bare
+    // single-column array; mirror that shape so the re-exported array pairs
+    // with the retained schema. Default to the Struct shape if the schema
+    // can't be read (it validated during import, so this should not happen).
+    let top_is_struct = unsafe { DataType::try_from(&*schema) }
+        .map(|dt| matches!(dt, DataType::Struct(_)))
+        .unwrap_or(true);
+
+    let array_data = if !top_is_struct && rb.num_columns() == 1 {
+        rb.column(0).to_data()
+    } else {
+        StructArray::from(rb).into_data()
+    };
+
     if let Ok((ffi_array, _ffi_schema)) = arrow::ffi::to_ffi(&array_data) {
         unsafe { std::ptr::write(array, ffi_array) };
     }
@@ -3392,5 +3666,91 @@ mod tests {
         assert_eq!(symbol_mode_from_u32(5, &mut err), None);
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    /// Regression: a bare single-column (non-Struct) Arrow input must re-export
+    /// in the same primitive shape so the re-exported array still pairs with
+    /// the caller's retained (primitive) schema. The import wraps such input
+    /// into a one-column RecordBatch; before the shape-aware fix the re-export
+    /// produced a one-child Struct array that disagreed with the zero-child
+    /// schema, and the retry was rejected by `validate_arrow_array_depth`.
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn reexport_bare_single_column_round_trips_for_retry() {
+        use arrow_array::{Array, Int64Array};
+
+        let col = Int64Array::from(vec![1_i64, 2, 3]);
+        let (mut ffi_array, ffi_schema) =
+            arrow::ffi::to_ffi(&col.to_data()).expect("to_ffi primitive");
+
+        // Import consumes the array's release and wraps the bare column into a
+        // one-column RecordBatch — exactly what a flush does.
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let rb = unsafe {
+            crate::arrow_ffi_import_record_batch(
+                &mut ffi_array,
+                &ffi_schema,
+                "reexport-test",
+                &mut err,
+            )
+        }
+        .expect("import");
+        assert!(err.is_null());
+        assert_eq!(rb.num_columns(), 1);
+
+        // Re-export into the consumed slot using the retained schema's shape.
+        unsafe { reexport_record_batch_into(rb, &mut ffi_array, &ffi_schema) };
+
+        // The retry re-imports the re-exported array with the ORIGINAL
+        // primitive schema; the pair must be valid again.
+        let mut err2: *mut line_sender_error = std::ptr::null_mut();
+        let retried = unsafe {
+            crate::arrow_ffi_import_record_batch(
+                &mut ffi_array,
+                &ffi_schema,
+                "reexport-retry",
+                &mut err2,
+            )
+        };
+        assert!(err2.is_null(), "re-exported pair must re-import on retry");
+        let retried = retried.expect("retry import");
+        assert_eq!(retried.num_columns(), 1);
+        assert_eq!(retried.num_rows(), 3);
+    }
+
+    /// The Struct (standard RecordBatch) re-export path is unchanged by the
+    /// shape-aware fix and still round-trips for retry.
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn reexport_struct_round_trips_for_retry() {
+        use arrow::datatypes::{DataType, Field};
+        use arrow_array::{Array, ArrayRef, Int64Array, StructArray};
+        use std::sync::Arc;
+
+        let col = Arc::new(Int64Array::from(vec![10_i64, 20])) as ArrayRef;
+        let struct_arr = StructArray::from(vec![(
+            Arc::new(Field::new("qty", DataType::Int64, false)),
+            col,
+        )]);
+        let (mut ffi_array, ffi_schema) =
+            arrow::ffi::to_ffi(&struct_arr.to_data()).expect("to_ffi struct");
+
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let rb = unsafe {
+            crate::arrow_ffi_import_record_batch(&mut ffi_array, &ffi_schema, "s", &mut err)
+        }
+        .expect("import struct");
+        assert!(err.is_null());
+
+        unsafe { reexport_record_batch_into(rb, &mut ffi_array, &ffi_schema) };
+
+        let mut err2: *mut line_sender_error = std::ptr::null_mut();
+        let retried = unsafe {
+            crate::arrow_ffi_import_record_batch(&mut ffi_array, &ffi_schema, "s2", &mut err2)
+        };
+        assert!(err2.is_null(), "struct re-export must re-import on retry");
+        let retried = retried.expect("retry import struct");
+        assert_eq!(retried.num_columns(), 1);
+        assert_eq!(retried.num_rows(), 2);
     }
 }

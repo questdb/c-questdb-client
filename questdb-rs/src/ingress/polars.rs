@@ -451,10 +451,13 @@ impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
 }
 
 /// Single forward pass over `df`, skipping the first `*committed` batches (the
-/// tail already durable from an earlier attempt), flushing each remaining
-/// batch and `sync`ing every [`CHECKPOINT_BATCHES`]. `*committed` is advanced
-/// to the batch count made durable by each successful checkpoint `sync`, so on
-/// a transient error the caller re-drives only the uncommitted tail.
+/// tail already durable from an earlier attempt). Non-checkpoint batches are
+/// published with a no-wait flush; every [`CHECKPOINT_BATCHES`]th batch is
+/// flushed with an ACKing boundary flush (`flush_arrow_batch_*_and_wait`),
+/// which folds the periodic `sync(Ok)` into the flush — one fewer empty commit
+/// frame per checkpoint. `*committed` is advanced to the batch count made
+/// durable by each successful checkpoint, so on a transient error the caller
+/// re-drives only the uncommitted tail.
 fn drive_from_checkpoint(
     sender: &mut crate::ingress::column_sender::BorrowedColumnSender<'_>,
     table: crate::ingress::TableName<'_>,
@@ -465,23 +468,51 @@ fn drive_from_checkpoint(
     use crate::ingress::column_sender::AckLevel;
 
     let skip = *committed;
+    let mut last_was_checkpoint = false;
     for (idx, rb) in dataframe_to_batches(df, options.max_rows).enumerate() {
         if idx < skip {
             continue;
         }
         let rb = rb?;
-        match options.timestamp_column {
-            Some(ts) => sender.flush_arrow_batch_at_column(table, &rb, ts, options.overrides)?,
-            None => sender.flush_arrow_batch_server_stamped(table, &rb, options.overrides)?,
-        }
         // `idx` is 0-based; checkpoint after a full run of CHECKPOINT_BATCHES
-        // (batches 63, 127, …). The sync's ack moves the replay boundary.
-        if (idx + 1) % CHECKPOINT_BATCHES == 0 {
-            sender.sync(AckLevel::Ok)?;
+        // (batches 63, 127, …). The checkpoint boundary's ack moves the replay
+        // marker.
+        let checkpoint = (idx + 1) % CHECKPOINT_BATCHES == 0;
+        match (options.timestamp_column, checkpoint) {
+            (Some(ts), false) => {
+                sender.flush_arrow_batch_at_column(table, &rb, ts, options.overrides)?
+            }
+            (None, false) => {
+                sender.flush_arrow_batch_server_stamped(table, &rb, options.overrides)?
+            }
+            (Some(ts), true) => sender.flush_arrow_batch_at_column_and_wait(
+                table,
+                &rb,
+                ts,
+                options.overrides,
+                AckLevel::Ok,
+            )?,
+            (None, true) => sender.flush_arrow_batch_server_stamped_and_wait(
+                table,
+                &rb,
+                options.overrides,
+                AckLevel::Ok,
+            )?,
+        }
+        if checkpoint {
+            // The ACKing flush committed the boundary covering every batch up
+            // to and including this one.
             *committed = idx + 1;
         }
+        last_was_checkpoint = checkpoint;
     }
-    sender.sync(AckLevel::Ok)
+    // If the final batch already was an ACKing checkpoint, the boundary is
+    // committed; otherwise drain the trailing tail. This also covers the
+    // empty-/no-batch case, where `sync` is the only completion wait.
+    if !last_was_checkpoint {
+        sender.sync(AckLevel::Ok)?;
+    }
+    Ok(())
 }
 
 fn ffi_polars_to_arrow_rs(

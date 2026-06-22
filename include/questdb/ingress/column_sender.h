@@ -1208,6 +1208,30 @@ QUESTDB_CLIENT_API
 bool column_sender_sync(
     column_sender* conn, uint32_t ack_level, line_sender_error** err_out);
 
+/**
+ * Publish `chunk` as a completion boundary, then wait until every frame
+ * published before or by this call reaches `ack_level` (see
+ * `column_sender_sync` for the level meanings and the no-progress timeout).
+ *
+ * `ack_level` carries a `column_sender_ack_level_*` constant. An out-of-range
+ * value, or `column_sender_ack_level_durable` without `request_durable_ack=on`,
+ * returns `line_sender_error_invalid_api_call` before `chunk` is touched.
+ *
+ * Boundary: success acknowledges all prior no-wait flushes plus this one. An
+ * empty `chunk` behaves like `column_sender_sync`.
+ *
+ * Failure contract: on a pre-publication failure `chunk` is left untouched and
+ * retryable. Once the frame is published `chunk` is cleared even if the ACK
+ * wait then fails — delivery of that frame is then unknown, and the conn should
+ * be dropped and re-borrowed per the error class. No internal failover retry.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_and_wait(
+    column_sender* conn,
+    column_sender_chunk* chunk,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 
 /**
@@ -1298,6 +1322,52 @@ bool column_sender_flush_arrow_batch_at_column(
     line_sender_column_name ts_column,
     const column_sender_arrow_override* overrides,
     size_t overrides_len,
+    line_sender_error** err_out);
+
+/**
+ * ACKing counterpart of `column_sender_flush_arrow_batch_server_stamped`:
+ * publish `array` as a boundary, then wait for `ack_level`.
+ *
+ * `ack_level` is validated before the Arrow C Data Interface import consumes
+ * `array->release`, so a rejected level (out-of-range, or
+ * `column_sender_ack_level_durable` without `request_durable_ack=on`) returns
+ * `line_sender_error_invalid_api_call` and leaves `array` untouched.
+ *
+ * Ownership differs from the publish-only flush on the failure path. On a
+ * provably pre-publication failure the batch is re-exported into `*array` (a
+ * fresh `release`) so the caller can drop+re-borrow and retry. On any
+ * post-publication failure — including an ACK-wait / store-and-forward
+ * no-progress timeout reported as `line_sender_error_failover_retry` — the
+ * batch is NOT re-exported (`array->release` stays NULL): delivery is unknown.
+ * Callers MUST check `array->release != NULL` before invoking it on failure.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_server_stamped_and_wait(
+    column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+
+/**
+ * ACKing counterpart of `column_sender_flush_arrow_batch_at_column`: publish
+ * `array` (timestamp sourced from `ts_column`) as a boundary, then wait for
+ * `ack_level`. Same ACK-validation preflight and phase-aware re-export contract
+ * as `column_sender_flush_arrow_batch_server_stamped_and_wait`.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_at_column_and_wait(
+    column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    uint32_t ack_level,
     line_sender_error** err_out);
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
