@@ -24,7 +24,6 @@
 
 //! `DecodedBatch` → `arrow_array::RecordBatch` conversion.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use aligned_vec::{AVec, ConstAlign};
@@ -59,21 +58,35 @@ const _: fn() = || {
     assert_send_sync_static::<ABytes>();
 };
 
-/// Working buffers reused across SYMBOL columns in one batch. Reuses the
-/// remap HashMap allocation per `batch_to_record_batch` call so a wide
-/// batch with N SYMBOL columns does not pay N independent `HashMap::new()`
-/// costs. The hasher is `std::collections::hash_map::RandomState` —
-/// changing to a u32-tuned hasher is a follow-up.
+/// Reused across SYMBOL columns/batches. `remap[global_code]` is the dense
+/// id assigned this column (a direct index replacing a per-row `HashMap`
+/// probe); `touched` lists set entries so reset is O(distinct codes).
 #[derive(Default)]
-struct SymbolBuildScratch {
-    remap: HashMap<u32, u32>,
+pub(crate) struct SymbolBuildScratch {
+    remap: Vec<u32>,
+    touched: Vec<u32>,
 }
+
+const SYMBOL_REMAP_UNSET: u32 = u32::MAX;
 
 pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
     batch: DecodedBatch,
     dict: &SymbolDict,
+) -> Result<RecordBatch> {
+    let mut sym_scratch = SymbolBuildScratch::default();
+    batch_to_record_batch_with(schema_ref, egress_schema, batch, dict, &mut sym_scratch)
+}
+
+/// As [`batch_to_record_batch`], but reuses a caller-owned scratch. The
+/// streaming [`crate::egress::Cursor`] threads one across batches.
+pub(crate) fn batch_to_record_batch_with(
+    schema_ref: Arc<ArrowSchema>,
+    egress_schema: &Schema,
+    batch: DecodedBatch,
+    dict: &SymbolDict,
+    sym_scratch: &mut SymbolBuildScratch,
 ) -> Result<RecordBatch> {
     let DecodedBatch {
         row_count, columns, ..
@@ -106,7 +119,7 @@ pub(crate) fn batch_to_record_batch(
             decoded,
             row_count,
             dict,
-            &mut sym_scratch,
+            sym_scratch,
             &mut degenerate_node_slack,
         )?);
     }
@@ -307,10 +320,10 @@ fn varlen_string_array(
     row_count: usize,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let off = offsets_i32(&offsets)?;
+    let off = offsets_to_arrow_buffer(offsets)?;
     let data = ArrayDataBuilder::new(DataType::Utf8)
         .len(row_count)
-        .add_buffer(Buffer::from(bytes_from_avec(off)))
+        .add_buffer(off)
         .add_buffer(bytes_to_arrow(data))
         .nulls(nulls)
         .align_buffers(true)
@@ -327,10 +340,10 @@ fn varlen_binary_array(
     row_count: usize,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let off = offsets_i32(&offsets)?;
+    let off = offsets_to_arrow_buffer(offsets)?;
     let data = ArrayDataBuilder::new(DataType::Binary)
         .len(row_count)
-        .add_buffer(Buffer::from(bytes_from_avec(off)))
+        .add_buffer(off)
         .add_buffer(bytes_to_arrow(data))
         .nulls(nulls)
         .align_buffers(true)
@@ -460,83 +473,41 @@ fn symbol_array(
     scratch: &mut SymbolBuildScratch,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    scratch.remap.clear();
-    if scratch.remap.capacity() < codes.len().min(64) {
-        scratch
-            .remap
-            .reserve(codes.len().min(64) - scratch.remap.capacity());
+
+    if scratch.remap.len() < dict.len() {
+        scratch.remap.resize(dict.len(), SYMBOL_REMAP_UNSET);
     }
-    let remap = &mut scratch.remap;
-    let mut union_offsets: Vec<i32> = Vec::with_capacity(codes.len().min(64) + 1);
+    let remap = scratch.remap.as_mut_slice();
+    let touched = &mut scratch.touched;
+
+    let mut union_offsets: Vec<i32> = Vec::with_capacity(dict.len().min(256) + 1);
     union_offsets.push(0);
     let mut union_bytes: ABytes = ABytes::new(64);
     let mut dense = ABytes::with_capacity(64, codes.len() * 4);
     dense.resize(codes.len() * 4, 0);
 
-    fn resolve(
-        code: u32,
-        remap: &mut HashMap<u32, u32>,
-        union_offsets: &mut Vec<i32>,
-        union_bytes: &mut ABytes,
-        dict: &SymbolDict,
-    ) -> Result<u32> {
-        if let Some(&dense_code) = remap.get(&code) {
-            return Ok(dense_code);
-        }
-        let s = dict
-            .get(code)
-            .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
-        union_bytes.extend_from_slice(s.as_bytes());
-        let next_off = i32::try_from(union_bytes.len()).map_err(|_| {
-            fmt!(
-                ProtocolError,
-                "symbol union dictionary exceeds {} bytes",
-                i32::MAX
-            )
-        })?;
-        union_offsets.push(next_off);
-        let assigned = (union_offsets.len() - 2) as u32;
-        remap.insert(code, assigned);
-        Ok(assigned)
-    }
+    let build = build_symbol_dense(
+        &codes,
+        nulls.as_ref(),
+        dict,
+        remap,
+        touched,
+        &mut union_offsets,
+        &mut union_bytes,
+        &mut dense[..],
+    );
 
-    match nulls.as_ref() {
-        None => {
-            for (row, &code) in codes.iter().enumerate() {
-                let dense_code = resolve(
-                    code,
-                    &mut *remap,
-                    &mut union_offsets,
-                    &mut union_bytes,
-                    dict,
-                )?;
-                let base = row * 4;
-                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
-            }
-        }
-        Some(n) => {
-            for row in n.valid_indices() {
-                let code = codes[row];
-                let dense_code = resolve(
-                    code,
-                    &mut *remap,
-                    &mut union_offsets,
-                    &mut union_bytes,
-                    dict,
-                )?;
-                let base = row * 4;
-                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
-            }
-        }
+    // Reset before propagating errors so a reused scratch stays clean.
+    for &code in touched.iter() {
+        remap[code as usize] = SYMBOL_REMAP_UNSET;
     }
+    touched.clear();
+    build?;
 
-    let mut union_offsets_avec = ABytes::with_capacity(64, union_offsets.len() * 4);
-    for off in &union_offsets {
-        union_offsets_avec.extend_from_slice(&off.to_le_bytes());
-    }
+    let dict_len = union_offsets.len() - 1;
     let values_data = ArrayDataBuilder::new(DataType::Utf8)
-        .len(union_offsets.len() - 1)
-        .add_buffer(Buffer::from(bytes_from_avec(union_offsets_avec)))
+        .len(dict_len)
+        .add_buffer(Buffer::from_vec(union_offsets))
         .add_buffer(Buffer::from(bytes_from_avec(union_bytes)))
         .build()
         .map_err(|e| to_arrow_export(e.to_string()))?;
@@ -557,6 +528,73 @@ fn symbol_array(
             dict_data,
         )) as ArrayRef,
     )
+}
+
+// Split out so the caller can reset the scratch even when this errors.
+#[allow(clippy::too_many_arguments)]
+fn build_symbol_dense(
+    codes: &[u32],
+    nulls: Option<&NullBuffer>,
+    dict: &SymbolDict,
+    remap: &mut [u32],
+    touched: &mut Vec<u32>,
+    union_offsets: &mut Vec<i32>,
+    union_bytes: &mut ABytes,
+    dense: &mut [u8],
+) -> Result<()> {
+    match nulls {
+        None => {
+            for (row, &code) in codes.iter().enumerate() {
+                let dense_code =
+                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+        Some(n) => {
+            for row in n.valid_indices() {
+                let code = codes[row];
+                let dense_code =
+                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_symbol(
+    code: u32,
+    remap: &mut [u32],
+    touched: &mut Vec<u32>,
+    union_offsets: &mut Vec<i32>,
+    union_bytes: &mut ABytes,
+    dict: &SymbolDict,
+) -> Result<u32> {
+    let slot = remap
+        .get(code as usize)
+        .copied()
+        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+    if slot != SYMBOL_REMAP_UNSET {
+        return Ok(slot);
+    }
+    let s = dict
+        .get(code)
+        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+    union_bytes.extend_from_slice(s.as_bytes());
+    let next_off = i32::try_from(union_bytes.len()).map_err(|_| {
+        fmt!(
+            ProtocolError,
+            "symbol union dictionary exceeds {} bytes",
+            i32::MAX
+        )
+    })?;
+    union_offsets.push(next_off);
+    let assigned = (union_offsets.len() - 2) as u32;
+    remap[code as usize] = assigned;
+    touched.push(code);
+    Ok(assigned)
 }
 
 #[derive(Clone, Copy)]
@@ -823,15 +861,26 @@ fn counts_to_offsets_i32(counts: &[u32]) -> Result<ABytes> {
     Ok(out)
 }
 
-fn offsets_i32(offsets: &[u32]) -> Result<ABytes> {
-    let mut out = ABytes::with_capacity(64, offsets.len() * 4);
-    for &o in offsets {
-        if o > i32::MAX as u32 {
-            return Err(fmt!(ProtocolError, "varlen offset {} exceeds i32::MAX", o));
-        }
-        out.extend_from_slice(&(o as i32).to_le_bytes());
+/// Adopt the decoder's `u32` varlen offsets as Arrow's `i32` offset buffer
+/// with no copy. Offsets are monotonic, so checking `last` bounds the slice.
+fn offsets_to_arrow_buffer(offsets: Vec<u32>) -> Result<Buffer> {
+    if let Some(&last) = offsets.last()
+        && last > i32::MAX as u32
+    {
+        return Err(fmt!(
+            ProtocolError,
+            "varlen offset {} exceeds i32::MAX",
+            last
+        ));
     }
-    Ok(out)
+    let mut offsets = std::mem::ManuallyDrop::new(offsets);
+    let ptr = offsets.as_mut_ptr() as *mut i32;
+    let len = offsets.len();
+    let cap = offsets.capacity();
+    // SAFETY: `u32`/`i32` share layout and every value is `<= i32::MAX`
+    // (checked); `offsets` is leaked so the allocation has a single owner.
+    let offsets_i32 = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+    Ok(Buffer::from_vec(offsets_i32))
 }
 
 fn buffer_to_arrow(b: &Bytes) -> Buffer {
