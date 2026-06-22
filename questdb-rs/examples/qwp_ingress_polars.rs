@@ -1,7 +1,7 @@
 //! Step 3 (QWP_DATAFRAME_BENCH_PLAN.md §6) — Rust **Polars ingress**
 //! parity for the S1 narrow schema.
 //!
-//! Measures `BorrowedSender::flush_polars_dataframe()` end-to-end on the
+//! Measures `BorrowedColumnSender::flush_polars_dataframe()` end-to-end on the
 //! shared S1 schema (the same 5 columns the pandas harness ingests), and
 //! separately the column-sender **encode floor**
 //! (`bench_encode_chunk_into`, the same path `benches/column_sender.rs`
@@ -263,7 +263,7 @@ fn measure_e2e(
     warmups: usize,
 ) -> Result<(Vec<u64>, Vec<u64>), Box<dyn Error>> {
     let mut run = || -> Result<(), Box<dyn Error>> {
-        let mut sender = db.borrow_sender()?;
+        let mut sender = db.borrow_column_sender()?;
         sender.flush_polars_dataframe(TABLE, df, opts)?;
         Ok(())
     };
