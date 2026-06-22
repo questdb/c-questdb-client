@@ -17,11 +17,11 @@ const MIB: f64 = 1024.0 * 1024.0;
 
 // ---------------------------------------------------------------------------
 // Process CPU time (the Python harness reports process_cpu via
-// time.process_time_ns()). `libc::getrusage` is the portable equivalent;
-// `libc` is a non-optional dependency of the crate.
+// time.process_time_ns()).
 // ---------------------------------------------------------------------------
 
 /// User+system CPU nanoseconds consumed by this process so far.
+#[cfg(unix)]
 pub fn process_cpu_ns() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
@@ -31,6 +31,46 @@ pub fn process_cpu_ns() -> u64 {
     let tv_ns =
         |tv: &libc::timeval| (tv.tv_sec as u64) * 1_000_000_000 + (tv.tv_usec as u64) * 1_000;
     tv_ns(&usage.ru_utime) + tv_ns(&usage.ru_stime)
+}
+
+/// User+system CPU nanoseconds consumed by this process so far.
+#[cfg(windows)]
+pub fn process_cpu_ns() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    fn filetime_100ns(ft: FILETIME) -> u64 {
+        ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+    }
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return 0;
+    }
+    filetime_100ns(kernel)
+        .saturating_add(filetime_100ns(user))
+        .saturating_mul(100)
+}
+
+/// User+system CPU nanoseconds consumed by this process so far.
+#[cfg(not(any(unix, windows)))]
+pub fn process_cpu_ns() -> u64 {
+    0
 }
 
 // ---------------------------------------------------------------------------
