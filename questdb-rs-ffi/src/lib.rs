@@ -4109,6 +4109,37 @@ fn arrow_min_n_buffers(dt: &arrow::datatypes::DataType) -> i64 {
     }
 }
 
+// Reject the parsed Arrow `DataType`s whose declared size arrow-rs's
+// `from_ffi` feeds straight into an unchecked `as usize` multiply in
+// `arrow_array::ffi::bit_width`:
+//
+//     FixedSizeBinary(w)  -> w as usize * 8
+//     FixedSizeList(_, n) -> child_bits * (n as usize)
+//
+// A negative `w`/`n` casts to a near-`usize::MAX` factor and overflows the
+// product. Under `panic = "abort"` + overflow-checks (dev/test) that aborts
+// the host before `validate_full` runs; in release it wraps to a bogus
+// buffer length. These two arms are the *only* places `bit_width` casts a
+// schema-controlled signed integer to `usize` (every other arm uses a
+// constant width or `primitive_width()`), so guarding both closes the whole
+// class. The caller runs this at every schema node, so a negative size
+// nested inside a container is rejected when the walk reaches that node,
+// always before `from_ffi` is invoked. Keep in sync with `bit_width` on
+// arrow upgrades.
+#[cfg(feature = "arrow")]
+fn reject_overflowing_fixed_size(dt: &arrow::datatypes::DataType) -> questdb::Result<()> {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::FixedSizeBinary(width) if *width < 0 => Err(arrow_ingest_err(format!(
+            "Arrow FixedSizeBinary width {width} is negative"
+        ))),
+        DataType::FixedSizeList(_, size) if *size < 0 => Err(arrow_ingest_err(format!(
+            "Arrow FixedSizeList size {size} is negative"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 // Cross-walk schema + array in lockstep. arrow-rs's `from_ffi` asserts on
 // mismatches between the two trees (`n_children` agreement for Struct /
 // Union, `n_buffers` consistency, etc.); under `panic = "abort"` that
@@ -4211,25 +4242,23 @@ unsafe fn validate_arrow_array_depth(
             }
             // arrow-rs's `from_ffi` dereferences the buffer array and reads
             // every buffer slot the data type's layout requires *before*
-            // `validate_full` runs. A NULL buffer pointer, fewer buffers
+            // `validate_full` runs. A NULL buffer pointer or fewer buffers
             // than the layout demands (a view type with `< 3` buffers
-            // underflows `num_buffers - (2 + null_mask)`), or a negative
-            // `FixedSizeBinary` width (panics in `layout`) each abort the
-            // host under `panic = "abort"`. Reject them here.
+            // underflows `num_buffers - (2 + null_mask)`) each abort the
+            // host under `panic = "abort"`. Reject them here; negative
+            // fixed-size widths/sizes are handled by
+            // `reject_overflowing_fixed_size` below.
             if (*a).n_buffers > 0 && (*a).buffers.is_null() {
                 return Err(arrow_ingest_err(
                     "Arrow array declares buffers but the buffer pointer is NULL",
                 ));
             }
             if let Ok(dt) = arrow::datatypes::DataType::try_from(&*s) {
-                if let arrow::datatypes::DataType::FixedSizeBinary(width) = &dt
-                    && *width < 0
-                {
-                    return Err(arrow_ingest_err(format!(
-                        "Arrow FixedSizeBinary width {} is negative",
-                        width
-                    )));
-                }
+                // Reject negative fixed-size widths/sizes that would overflow
+                // arrow-rs's `bit_width`. Runs at every schema node, so a
+                // negative size nested inside a container is caught when the
+                // walk reaches that node, always before `from_ffi` runs.
+                reject_overflowing_fixed_size(&dt)?;
                 let min_buffers = arrow_min_n_buffers(&dt);
                 if (*a).n_buffers < min_buffers {
                     return Err(arrow_ingest_err(format!(
@@ -5561,6 +5590,119 @@ mod tests {
                 assert!(
                     err.msg().contains("negative"),
                     "expected negative-width error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_negative_fixed_size_list_size_rejected() {
+            unsafe {
+                // Child schema Int32 ("i"): DataType::try_from("+w:-1") calls
+                // child(0)/Field::try_from, so the parent needs a valid child.
+                let child_fmt = CString::new("i").unwrap();
+                let cs_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let cs_raw = std::alloc::alloc_zeroed(cs_layout) as *mut FFI_ArrowSchema;
+                (*cs_raw).format = child_fmt.as_ptr();
+
+                // Parent schema: FixedSizeList with negative list size.
+                let format = CString::new("+w:-1").unwrap();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = format.as_ptr();
+                (*s_raw).n_children = 1;
+                let mut s_children: [*mut FFI_ArrowSchema; 1] = [cs_raw];
+                (*s_raw).children = s_children.as_mut_ptr();
+
+                // Array: n_buffers = 2 (>= the FixedSizeList floor of 1) with a
+                // non-NULL buffers array, so the only defect is the negative
+                // size. Without a guard, arrow-rs `from_ffi` would compute
+                // `child_bits * (size as usize)` with `size == -1`, overflowing
+                // and aborting under `panic = "abort"` + overflow-checks.
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*a_raw).n_children = 1;
+                let b0: u8 = 0;
+                let b1: u8 = 0;
+                let mut slots: [*const std::ffi::c_void; 2] = [
+                    &b0 as *const u8 as *const std::ffi::c_void,
+                    &b1 as *const u8 as *const std::ffi::c_void,
+                ];
+                (*a_raw).n_buffers = 2;
+                (*a_raw).buffers = slots.as_mut_ptr();
+
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                (*a_raw).buffers = std::ptr::null_mut();
+                (*s_raw).children = std::ptr::null_mut();
+                std::alloc::dealloc(cs_raw as *mut u8, cs_layout);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("negative"),
+                    "expected negative FixedSizeList size error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_nested_negative_fixed_size_list_size_rejected() {
+            // FixedSizeList(FixedSizeList(Int32, -1), 3). arrow-rs would
+            // overflow while sizing the *outer* list's buffer (its `bit_width`
+            // recurses into the inner type inline). The validator's per-node
+            // walk reaches the inner node and `reject_overflowing_fixed_size`
+            // rejects it before `from_ffi` is ever called.
+            unsafe {
+                let leaf_fmt = CString::new("i").unwrap();
+                let inner_fmt = CString::new("+w:-1").unwrap();
+                let outer_fmt = CString::new("+w:3").unwrap();
+
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let leaf_s = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*leaf_s).format = leaf_fmt.as_ptr();
+                let inner_s = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*inner_s).format = inner_fmt.as_ptr();
+                (*inner_s).n_children = 1;
+                let mut inner_s_children: [*mut FFI_ArrowSchema; 1] = [leaf_s];
+                (*inner_s).children = inner_s_children.as_mut_ptr();
+                let outer_s = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*outer_s).format = outer_fmt.as_ptr();
+                (*outer_s).n_children = 1;
+                let mut outer_s_children: [*mut FFI_ArrowSchema; 1] = [inner_s];
+                (*outer_s).children = outer_s_children.as_mut_ptr();
+
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                // Inner array: only n_children must agree (1); it is rejected
+                // before its buffers/children are ever read.
+                let inner_a = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*inner_a).n_children = 1;
+                let outer_a = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                (*outer_a).n_children = 1;
+                let b: u8 = 0;
+                let mut outer_slots: [*const std::ffi::c_void; 1] =
+                    [&b as *const u8 as *const std::ffi::c_void];
+                (*outer_a).n_buffers = 1; // FixedSizeList floor
+                (*outer_a).buffers = outer_slots.as_mut_ptr();
+                let mut outer_a_children: [*mut FFI_ArrowArray; 1] = [inner_a];
+                (*outer_a).children = outer_a_children.as_mut_ptr();
+
+                let res = validate_arrow_array_depth(outer_a, outer_s);
+
+                (*outer_a).buffers = std::ptr::null_mut();
+                (*outer_a).children = std::ptr::null_mut();
+                (*outer_s).children = std::ptr::null_mut();
+                (*inner_s).children = std::ptr::null_mut();
+                std::alloc::dealloc(leaf_s as *mut u8, s_layout);
+                std::alloc::dealloc(inner_s as *mut u8, s_layout);
+                std::alloc::dealloc(outer_s as *mut u8, s_layout);
+                std::alloc::dealloc(inner_a as *mut u8, a_layout);
+                std::alloc::dealloc(outer_a as *mut u8, a_layout);
+
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("FixedSizeList size -1 is negative"),
+                    "expected nested negative FixedSizeList rejection, got: {}",
                     err.msg()
                 );
             }
