@@ -2825,8 +2825,10 @@ TEST_CASE("line_sender_error c++ can carry qwpws diagnostic")
     questdb::ingress::line_sender_error error{
         questdb::ingress::line_sender_error_code::socket_error,
         "sender halted",
+        false,
         diagnostic};
 
+    CHECK_FALSE(error.in_doubt());
     REQUIRE(error.qwp_ws_diagnostic().has_value());
     CHECK(
         error.qwp_ws_diagnostic()->category ==
