@@ -356,6 +356,38 @@ mod tests {
         assert_eq!(df.width(), 1);
     }
 
+    /// Every QuestDB table carries a designated TIMESTAMP, which the
+    /// egress decoder maps to the tz-aware Arrow `Timestamp(Microsecond,
+    /// Some("UTC"))`. Materialising that into a polars `DataFrame`
+    /// requires the `dtype-datetime` + `timezones` polars features; this
+    /// test guards that feature set (without them `Series::from_arrow`
+    /// fails at runtime, which `fetch_all_polars` on any real result set
+    /// would hit). See the `polars` feature in `Cargo.toml`.
+    #[test]
+    fn record_batch_to_dataframe_preserves_tz_timestamp() {
+        use arrow_array::TimestampMicrosecondArray;
+        let ts: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![1_700_000_000_000_000i64, 1_700_000_000_000_001])
+                .with_timezone("UTC"),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "ts",
+            ts.data_type().clone(),
+            false,
+        )]));
+        let rb = RecordBatch::try_new(schema, vec![ts]).unwrap();
+        let df = record_batch_to_dataframe(rb).unwrap();
+        assert_eq!(df.height(), 2);
+        assert_eq!(df.width(), 1);
+        // The column must round-trip as a polars Datetime, not error out.
+        let series = df.columns()[0].as_materialized_series();
+        assert!(
+            matches!(series.dtype(), polars::prelude::DataType::Datetime(_, _)),
+            "expected polars Datetime, got {:?}",
+            series.dtype()
+        );
+    }
+
     #[test]
     fn record_batch_to_dataframe_symbol_dictionary_to_categorical() {
         use arrow_array::types::UInt32Type;
