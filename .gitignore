@@ -1,6 +1,7 @@
 target
 build
 build_CXX20
+build_sanitize
 cmake-build-debug
 cmake-build-release
 .vs
