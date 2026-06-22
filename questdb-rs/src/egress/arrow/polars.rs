@@ -1,9 +1,14 @@
 //! Polars sub-feature: `RecordBatch ↔ DataFrame` via Arrow C Data Interface.
 
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::SchemaRef;
+use arrow_array::types::UInt32Type;
+use arrow_array::{Array, ArrayRef, DictionaryArray, RecordBatch};
+use arrow_data::ArrayData;
+use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use polars::frame::DataFrame;
-use polars::prelude::{Column, IntoColumn, PlSmallStr, Series};
+use polars::prelude::{
+    CategoricalPhysical, Categories, Column, DataType as PlDataType, IDX_DTYPE, IdxCa, IntoColumn,
+    PlSmallStr, Series,
+};
 
 use crate::egress::Cursor;
 use crate::egress::arrow::has_tentative_array;
@@ -19,7 +24,7 @@ impl Cursor<'_> {
     /// detect mid-stream Arrow schema drift; if a later batch's
     /// schema differs from earlier ones the resulting DataFrames will
     /// simply disagree on columns. Use
-    /// [`Cursor::iter_polars`](crate::egress::Cursor::iter_polars)
+    /// [`Cursor::iter_polars`](Cursor::iter_polars)
     /// for a drift-checked iterator, or
     /// [`Cursor::fetch_all_polars`] / [`Cursor::as_arrow_reader`]
     /// for higher-level adapters that pin the schema on first batch.
@@ -180,52 +185,86 @@ impl Iterator for CursorPolarsIter<'_, '_> {
     }
 }
 
-/// [`RecordBatch`] → Polars [`DataFrame`] via Arrow C Data Interface.
-/// Zero-copy for primitive/string/binary. [`ErrorCode::ArrowExport`] on
-/// handoff failure.
+/// [`RecordBatch`] → Polars [`DataFrame`] via the Arrow C Data Interface.
+/// Zero-copy for primitive/string/binary; SYMBOL columns become a polars
+/// `Categorical` (see [`dictionary_to_categorical`]).
+/// [`ErrorCode::ArrowExport`] on handoff failure.
 pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
     let schema = rb.schema();
     let row_count = rb.num_rows();
     let mut columns: Vec<Column> = Vec::with_capacity(rb.num_columns());
     for (col, field) in rb.columns().iter().zip(schema.fields().iter()) {
-        let array_data = col.to_data();
-        let (rs_array, rs_schema) = arrow::ffi::to_ffi(&array_data).map_err(|e| {
-            fmt!(
-                ArrowExport,
-                "to_ffi failed for column '{}': {}",
-                field.name(),
-                e
-            )
-        })?;
-        let pa_schema = unsafe { crate::ingress::polars::rs_schema_into_pa(rs_schema) };
-        let pa_array = unsafe { crate::ingress::polars::rs_array_into_pa(rs_array) };
-        let pa_field =
-            unsafe { polars_arrow::ffi::import_field_from_c(&pa_schema) }.map_err(|e| {
-                fmt!(
-                    ArrowExport,
-                    "import_field_from_c('{}'): {}",
-                    field.name(),
-                    e
-                )
-            })?;
-        let pa_array_box =
-            unsafe { polars_arrow::ffi::import_array_from_c(pa_array, pa_field.dtype) }.map_err(
-                |e| {
-                    fmt!(
-                        ArrowExport,
-                        "import_array_from_c('{}'): {}",
-                        field.name(),
-                        e
-                    )
-                },
-            )?;
-        let name: PlSmallStr = field.name().as_str().into();
-        let series = Series::from_arrow(name, pa_array_box)
-            .map_err(|e| fmt!(ArrowExport, "Series::from_arrow('{}'): {}", field.name(), e))?;
+        let name = field.name().as_str();
+        let series = if matches!(col.data_type(), ArrowDataType::Dictionary(_, _)) {
+            dictionary_to_categorical(name, col)?
+        } else {
+            import_polars_series(name, &col.to_data())?
+        };
         columns.push(series.into_column());
     }
     DataFrame::new(row_count, columns)
         .map_err(|e| fmt!(ArrowExport, "DataFrame::new failed: {}", e))
+}
+
+fn import_polars_series(name: &str, array_data: &ArrayData) -> Result<Series> {
+    let (rs_array, rs_schema) = arrow::ffi::to_ffi(array_data)
+        .map_err(|e| fmt!(ArrowExport, "to_ffi failed for column '{}': {}", name, e))?;
+    let pa_schema = unsafe { crate::ingress::polars::rs_schema_into_pa(rs_schema) };
+    let pa_array = unsafe { crate::ingress::polars::rs_array_into_pa(rs_array) };
+    let pa_field = unsafe { polars_arrow::ffi::import_field_from_c(&pa_schema) }
+        .map_err(|e| fmt!(ArrowExport, "import_field_from_c('{}'): {}", name, e))?;
+    let pa_array_box = unsafe { polars_arrow::ffi::import_array_from_c(pa_array, pa_field.dtype) }
+        .map_err(|e| fmt!(ArrowExport, "import_array_from_c('{}'): {}", name, e))?;
+    Series::from_arrow(name.into(), pa_array_box)
+        .map_err(|e| fmt!(ArrowExport, "Series::from_arrow('{}'): {}", name, e))
+}
+
+/// Build a SYMBOL column's polars `Categorical` from its codes + dictionary
+/// (cast the small dictionary, then `take` by code), avoiding
+/// `Series::from_arrow`'s per-row remap. `Categories` exists since polars 0.50.
+fn dictionary_to_categorical(name: &str, col: &ArrayRef) -> Result<Series> {
+    let dict = col
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .ok_or_else(|| {
+            fmt!(
+                ArrowExport,
+                "SYMBOL '{}' is not Dictionary(UInt32, _)",
+                name
+            )
+        })?;
+
+    let values = import_polars_series(name, &dict.values().to_data())?;
+    let cats = Categories::random(PlSmallStr::from("questdb"), CategoricalPhysical::U32);
+    let mapping = cats.mapping();
+    let cat_dict = values
+        .cast(&PlDataType::Categorical(cats, mapping))
+        .map_err(|e| {
+            fmt!(
+                ArrowExport,
+                "cast SYMBOL '{}' dict to Categorical: {}",
+                name,
+                e
+            )
+        })?;
+
+    let keys = import_polars_series(name, &dict.keys().to_data())?;
+    let idx: IdxCa = keys
+        .cast(&IDX_DTYPE)
+        .map_err(|e| fmt!(ArrowExport, "cast SYMBOL '{}' codes to index: {}", name, e))?
+        .idx()
+        .map_err(|e| {
+            fmt!(
+                ArrowExport,
+                "SYMBOL '{}' codes not an index dtype: {}",
+                name,
+                e
+            )
+        })?
+        .clone();
+    cat_dict
+        .take(&idx)
+        .map_err(|e| fmt!(ArrowExport, "gather SYMBOL '{}' codes: {}", name, e))
 }
 
 #[cfg(test)]
@@ -315,5 +354,41 @@ mod tests {
         let df = record_batch_to_dataframe(rb).unwrap();
         assert_eq!(df.height(), 0);
         assert_eq!(df.width(), 1);
+    }
+
+    #[test]
+    fn record_batch_to_dataframe_symbol_dictionary_to_categorical() {
+        use arrow_array::types::UInt32Type;
+        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "z"]));
+        let keys = UInt32Array::from(vec![Some(2u32), Some(0), None, Some(1)]);
+        let dict = DictionaryArray::<UInt32Type>::new(keys, values);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "sym",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let rb = RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap();
+
+        let df = record_batch_to_dataframe(rb).unwrap();
+        assert_eq!(df.width(), 1);
+        assert_eq!(df.height(), 4);
+        let col = &df.columns()[0];
+        assert_eq!(col.name().as_str(), "sym");
+        assert!(
+            matches!(col.dtype(), PlDataType::Categorical(_, _)),
+            "expected Categorical, got {:?}",
+            col.dtype()
+        );
+        let as_str = col
+            .as_materialized_series()
+            .cast(&PlDataType::String)
+            .unwrap();
+        let s = as_str.str().unwrap();
+        assert_eq!(s.get(0), Some("z"));
+        assert_eq!(s.get(1), Some("x"));
+        assert_eq!(s.get(2), None);
+        assert_eq!(s.get(3), Some("y"));
     }
 }
