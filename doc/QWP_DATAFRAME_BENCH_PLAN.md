@@ -360,9 +360,18 @@ per-client normalizer when those JSONs exist.
 
 Only after the 4 headline numbers exist.
 
-- **S2 — `wide` (15 col):** 1 TIMESTAMP + 7 fixed (bool, short, int, long, long,
-  float, double) + 1 VARCHAR + 5 SYMBOL (card 10k–100k). The "QWP wins on wide
-  rows" claim + symbol-dict stress. Add to both harnesses + Rust examples.
+- **S2 — `wide` (15 col)** *[IMPLEMENTED, both clients]*: S1-narrow + 5 DOUBLE
+  (`d1..d5`) + 5 high-cardinality SYMBOL (`s1..s5`, default card 100k — the Go
+  `qwp-egress-read-wide` anchor, so the wide number lines up; pass a 10k–100k
+  spread for dict-scale characterisation). The "QWP wins on wide rows" claim +
+  symbol-dict stress. **Python:** `make_s2_wide` / `--schema s2-wide` in
+  `benchmark_pandas_columnar.py` + the egress harness. **Rust:** `SCHEMA=s2-wide`
+  in `examples/qwp_{ingress,egress}_polars.rs`, sharing one parity contract
+  (column layout, DDL, value generators) via `examples/bench_schema/mod.rs` so
+  both clients put byte-identical column data on the wire. The high-card delta-dict
+  overflows the 1m default — run the server with `http.receive.buffer.size=16M`.
+  Headline 10M parity numbers feed the existing §7 aggregator (`schema` field
+  already carried per-path).
 - **DataFrame-specific knobs (cheap):** output-backend matrix (numpy / pyarrow /
   numpy_nullable / `__arrow_c_stream__`); chunk layout (rechunked vs multi-chunk);
   no-null vs nullable per type (memcpy vs invert+gather — expect the ~57 ns→289 ns
