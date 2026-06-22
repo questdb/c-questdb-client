@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import math
 import struct
+import time
 from typing import Any, List, Optional, Tuple
 
 import numpy as np  # used to render FLOAT in the short f32 form /exec uses
@@ -278,6 +279,28 @@ class ReaderError(RuntimeError):
         super().__init__(f"reader error (code={code}): {message}")
         self.code = code
         self.message = message
+
+
+# Substrings QuestDB uses for the *transient*, retryable "the cached query
+# plan no longer matches the table's metadata version" condition. The server
+# raises this when an `ALTER TABLE ... ALTER COLUMN TYPE` (applied
+# asynchronously by the table writer) bumps the table's metadata version
+# between a SELECT's compilation and its execution. The very next execution
+# recompiles against the new metadata and succeeds, which is exactly what
+# QuestDB's own clients (PGWire, REST /exec) do under the hood. We match on
+# the message text rather than the error code because the reader maps this to
+# the generic `reader_error_server_internal_error` (code 16) catch-all.
+_STALE_PLAN_PATTERNS = (
+    "cached query plan cannot be used",
+    "table schema has changed",
+)
+
+
+def _is_stale_plan_error(exc: "ReaderError") -> bool:
+    """True if `exc` is the transient stale-cached-plan error that should be
+    retried on a fresh execution."""
+    msg = (exc.message or "").lower()
+    return any(p in msg for p in _STALE_PLAN_PATTERNS)
 
 
 def _take_error(err_ptr) -> ReaderError:
@@ -1002,10 +1025,33 @@ _DISPATCH = {
 }
 
 
-def query_table_sorted(conf: str, table_name: str) -> Tuple[List[dict], List[list]]:
+def query_table_sorted(
+    conf: str,
+    table_name: str,
+    *,
+    max_attempts: int = 5,
+    retry_delay_s: float = 0.1,
+) -> Tuple[List[dict], List[list]]:
     """Convenience: open reader, run `SELECT * FROM '<t>' ORDER BY timestamp`,
     close. Returns the same `(columns, rows)` shape `_query_table_sorted` used
-    to return from /exec."""
+    to return from /exec.
+
+    Retries the transient "cached query plan cannot be used because table
+    schema has changed" error (see `_is_stale_plan_error`): an async
+    `ALTER COLUMN TYPE` can bump the table's metadata version between this
+    SELECT's compilation and execution, and the next execution recompiles
+    cleanly. Each attempt opens a fresh reader so the recompile happens
+    server-side, mirroring how QuestDB's PGWire / REST clients self-heal.
+    """
     sql = f"SELECT * FROM '{table_name}' ORDER BY timestamp"
-    with QwpEgressReader(conf) as r:
-        return r.select(sql)
+    for attempt in range(max_attempts):
+        try:
+            with QwpEgressReader(conf) as r:
+                return r.select(sql)
+        except ReaderError as e:
+            if _is_stale_plan_error(e) and attempt < max_attempts - 1:
+                time.sleep(retry_delay_s)
+                continue
+            raise
+    # Unreachable: the loop either returns or re-raises on the final attempt.
+    raise AssertionError("query_table_sorted retry loop exited unexpectedly")
