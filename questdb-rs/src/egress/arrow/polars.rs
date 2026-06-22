@@ -6,8 +6,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use polars::frame::DataFrame;
 use polars::prelude::{
-    CategoricalPhysical, Categories, Column, DataType as PlDataType, IDX_DTYPE, IdxCa, IntoColumn,
-    PlSmallStr, Series,
+    Categories, Column, DataType as PlDataType, IDX_DTYPE, IdxCa, IntoColumn, Series,
 };
 
 use crate::egress::Cursor;
@@ -235,7 +234,25 @@ fn dictionary_to_categorical(name: &str, col: &ArrayRef) -> Result<Series> {
         })?;
 
     let values = import_polars_series(name, &dict.values().to_data())?;
-    let cats = Categories::random(PlSmallStr::from("questdb"), CategoricalPhysical::U32);
+    // Every RESULT_BATCH frame of one query must build its SYMBOL Categorical
+    // against the SAME `Categories`: polars vstack/concat — used by
+    // `fetch_all_polars` / `iter_polars` to stitch the per-batch frames — only
+    // accepts Categoricals that share one `Categories` identity, otherwise it
+    // errors "Categories name mismatch".
+    //
+    // Use the process-global `Categories`. This is exactly what the
+    // pre-optimization path produced: SYMBOL columns used to flow through
+    // `Series::from_arrow`, and polars maps a metadata-less Utf8 dictionary to
+    // `Categories::global()` (polars `DataType::from_arrow`), so every batch and
+    // every symbol column already shared one Categories. The faster
+    // cast-and-take path that replaced it switched to `Categories::random()` — a
+    // fresh UUID-named instance per call — which silently broke vstack for any
+    // SYMBOL result spanning >1 batch (>~16k rows). `global()` restores the
+    // shared identity so later batches' codes intern into one mapping and stack
+    // cleanly. (A per-stream Categories would bound the mapping's lifetime to a
+    // single query, but at the cost of cross-compatibility with the caller's own
+    // global Categoricals — left as a possible future optimization.)
+    let cats = Categories::global();
     let mapping = cats.mapping();
     let cat_dict = values
         .cast(&PlDataType::Categorical(cats, mapping))
@@ -422,5 +439,124 @@ mod tests {
         assert_eq!(s.get(1), Some("x"));
         assert_eq!(s.get(2), None);
         assert_eq!(s.get(3), Some("y"));
+    }
+
+    #[test]
+    fn symbol_categoricals_vstack_across_batches() {
+        // Regression guard: a SYMBOL column from one query arrives across
+        // many QWP RESULT_BATCH frames (~16k rows each), and
+        // `fetch_all_polars` vstacks the per-batch DataFrames. polars only
+        // vstacks Categoricals that share one `Categories` identity, so every
+        // batch must build against the same one. Building each batch against a
+        // fresh `Categories::random()` broke this: vstack failed with
+        // "Categories name mismatch" the moment a result spanned >1 batch.
+        use arrow_array::types::UInt32Type;
+        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+
+        fn sym_batch(values: &[&str], keys: &[Option<u32>]) -> RecordBatch {
+            let values: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
+            let keys = UInt32Array::from(keys.to_vec());
+            let dict = DictionaryArray::<UInt32Type>::new(keys, values);
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "sym",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap()
+        }
+
+        // Two batches with *different* per-batch dictionaries (the second
+        // introduces a new symbol), mirroring QWP's growing delta dictionary.
+        let b1 = sym_batch(&["a", "b"], &[Some(0), Some(1), Some(0)]); // a, b, a
+        let b2 = sym_batch(&["b", "c"], &[Some(0), Some(1)]); // b, c
+
+        let mut df = record_batch_to_dataframe(b1).unwrap();
+        let df2 = record_batch_to_dataframe(b2).unwrap();
+        df.vstack_mut_owned(df2)
+            .expect("SYMBOL Categoricals from different batches must vstack");
+
+        assert_eq!(df.height(), 5);
+        let as_str = df.columns()[0]
+            .as_materialized_series()
+            .cast(&PlDataType::String)
+            .unwrap();
+        let s = as_str.str().unwrap();
+        let got: Vec<Option<&str>> = (0..df.height()).map(|i| s.get(i)).collect();
+        assert_eq!(
+            got,
+            vec![Some("a"), Some("b"), Some("a"), Some("b"), Some("c")]
+        );
+    }
+
+    #[test]
+    fn symbol_categoricals_multi_column_and_interleaved_streams() {
+        // All SYMBOL columns process-wide share `Categories::global()`, so prove
+        // the two cases that make a shared mapping suspicious stay correct:
+        // (1) several SYMBOL columns in one DataFrame, and (2) independent
+        // cursors converting interleaved. Strings are deliberately reused across
+        // columns and streams ("x", "p") to show the shared string<->id mapping
+        // never crosswires them.
+        use arrow_array::types::UInt32Type;
+        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+
+        fn sym(vals: &[&str], keys: &[Option<u32>]) -> ArrayRef {
+            let values: ArrayRef = Arc::new(StringArray::from(vals.to_vec()));
+            Arc::new(DictionaryArray::<UInt32Type>::new(
+                UInt32Array::from(keys.to_vec()),
+                values,
+            )) as ArrayRef
+        }
+        fn batch(fields: &[&str], cols: Vec<ArrayRef>) -> RecordBatch {
+            let dict_ty =
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8));
+            let schema = Arc::new(ArrowSchema::new(
+                fields
+                    .iter()
+                    .map(|n| Field::new(*n, dict_ty.clone(), true))
+                    .collect::<Vec<_>>(),
+            ));
+            RecordBatch::try_new(schema, cols).unwrap()
+        }
+        fn vals(df: &DataFrame, i: usize) -> Vec<Option<String>> {
+            let s = df.columns()[i]
+                .as_materialized_series()
+                .cast(&PlDataType::String)
+                .unwrap();
+            let s = s.str().unwrap();
+            (0..df.height())
+                .map(|r| s.get(r).map(str::to_owned))
+                .collect()
+        }
+        let some = |xs: &[&str]| xs.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+
+        // Stream 1: two SYMBOL columns "a","b". Stream 2: one column "a".
+        let s1b1 = batch(
+            &["a", "b"],
+            vec![
+                sym(&["x", "y"], &[Some(0), Some(1)]),
+                sym(&["m"], &[Some(0), Some(0)]),
+            ],
+        );
+        let s2b1 = batch(&["a"], vec![sym(&["x", "p"], &[Some(1), Some(0)])]);
+        let s1b2 = batch(
+            &["a", "b"],
+            vec![
+                sym(&["y", "z"], &[Some(0), Some(1)]),
+                sym(&["m", "x"], &[Some(1), Some(0)]),
+            ],
+        );
+        let s2b2 = batch(&["a"], vec![sym(&["p", "q"], &[Some(0), Some(1)])]);
+
+        // Convert interleaved (mimics two concurrent cursors), then vstack per stream.
+        let mut s1 = record_batch_to_dataframe(s1b1).unwrap();
+        let mut s2 = record_batch_to_dataframe(s2b1).unwrap();
+        s1.vstack_mut_owned(record_batch_to_dataframe(s1b2).unwrap())
+            .unwrap();
+        s2.vstack_mut_owned(record_batch_to_dataframe(s2b2).unwrap())
+            .unwrap();
+
+        assert_eq!(vals(&s1, 0), some(&["x", "y", "y", "z"])); // multi-column, col a
+        assert_eq!(vals(&s1, 1), some(&["m", "m", "x", "m"])); // col b reuses "x","m"
+        assert_eq!(vals(&s2, 0), some(&["p", "x", "p", "q"])); // other cursor, shares "x","p"
     }
 }
