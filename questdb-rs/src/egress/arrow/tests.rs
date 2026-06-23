@@ -341,6 +341,57 @@ fn symbol_carries_full_dict_with_unused_entries_and_nulls() {
 }
 
 #[test]
+fn symbol_values_cache_reuses_then_rebuilds_on_growth() {
+    use arrow_array::types::UInt32Type;
+    use arrow_array::{DictionaryArray, RecordBatch, StringArray};
+
+    fn resolve(rb: &RecordBatch) -> Vec<String> {
+        let d = rb
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .unwrap();
+        let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+        (0..d.len())
+            .map(|i| v.value(d.keys().value(i) as usize).to_owned())
+            .collect()
+    }
+    fn sym_batch(codes: Vec<u32>) -> DecodedBatch {
+        let n = codes.len();
+        decoded_of(
+            n,
+            vec![DecodedColumn::Symbol {
+                codes,
+                validity: None,
+                local_dict: None,
+            }],
+        )
+    }
+
+    let s = schema_of(&[("sym", ColumnKind::Symbol)]);
+    let mut dict = SymbolDict::new();
+    dict.apply_delta(0, [b"a".as_slice(), b"b".as_slice()])
+        .unwrap();
+    let mut cache = SymbolValuesCache::default();
+
+    let b1 = sym_batch(vec![0, 1]);
+    let sch = Arc::new(batch_arrow_schema(&s, &b1).unwrap());
+    let rb1 = batch_to_record_batch_with(sch.clone(), &s, b1, &dict, &mut cache).unwrap();
+    assert_eq!(resolve(&rb1), vec!["a", "b"]);
+
+    // Same dict → cached values reused; still correct.
+    let rb2 = batch_to_record_batch_with(sch.clone(), &s, sym_batch(vec![1, 0]), &dict, &mut cache)
+        .unwrap();
+    assert_eq!(resolve(&rb2), vec!["b", "a"]);
+
+    // Dict grows → cache rebuilds; the new code resolves.
+    dict.apply_delta(2, [b"c".as_slice()]).unwrap();
+    let rb3 =
+        batch_to_record_batch_with(sch, &s, sym_batch(vec![2, 0]), &dict, &mut cache).unwrap();
+    assert_eq!(resolve(&rb3), vec!["c", "a"]);
+}
+
+#[test]
 fn geohash_widens_to_target_arrow_width() {
     let raw = vec![0xABu8, 0xCD, 0x12, 0x34];
     let s = schema_of(&[("g", ColumnKind::Geohash)]);

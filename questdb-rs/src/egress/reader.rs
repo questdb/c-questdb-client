@@ -1180,6 +1180,8 @@ impl<'r> ReaderQuery<'r> {
             data_delivered: false,
             #[cfg(feature = "arrow")]
             drifted_batch: None,
+            #[cfg(feature = "arrow")]
+            sym_values: crate::egress::arrow::SymbolValuesCache::default(),
             #[cfg(feature = "polars")]
             symbol_registry: None,
             #[cfg(feature = "polars")]
@@ -1463,6 +1465,10 @@ pub struct Cursor<'r> {
     /// call so the rows are recoverable rather than dropped.
     #[cfg(feature = "arrow")]
     drifted_batch: Option<DecodedBatch>,
+    /// Connection-dict SYMBOL values array, interned once per cursor and reused
+    /// across batches until the dict grows (see [`SymbolValuesCache`]).
+    #[cfg(feature = "arrow")]
+    sym_values: crate::egress::arrow::SymbolValuesCache,
     /// Per-cursor SYMBOL → polars `Categories`, interned once and grown
     /// incrementally across batches (see [`SymbolRegistry`]).
     #[cfg(feature = "polars")]
@@ -1693,7 +1699,7 @@ impl<'r> Cursor<'r> {
         &mut self,
         expected_schema: Option<&arrow_schema::SchemaRef>,
     ) -> Result<Option<arrow_array::RecordBatch>> {
-        use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch, schemas_equal};
+        use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch_with, schemas_equal};
         use std::sync::Arc;
 
         if self.done {
@@ -1770,7 +1776,13 @@ impl<'r> Cursor<'r> {
                     )
                 }));
         }
-        match batch_to_record_batch(arrow_schema, &egress_schema, decoded, &self.reader.dict) {
+        match batch_to_record_batch_with(
+            arrow_schema,
+            &egress_schema,
+            decoded,
+            &self.reader.dict,
+            &mut self.sym_values,
+        ) {
             Ok(rb) => Ok(Some(rb)),
             Err(e) => {
                 self.stash_arrow_terminal_error(&e);
@@ -1965,7 +1977,21 @@ impl<'r> Cursor<'r> {
                     self.done = true;
                     return Err(map_server_status(status, message));
                 }
-                ServerEvent::CacheReset { .. } | ServerEvent::ServerInfo(_) => {
+                ServerEvent::CacheReset { .. } => {
+                    // `decode_frame` already cleared the connection dict; drop the
+                    // per-cursor SYMBOL caches keyed on it so a re-grown dict
+                    // cannot alias stale values/codes.
+                    #[cfg(feature = "arrow")]
+                    {
+                        self.sym_values = crate::egress::arrow::SymbolValuesCache::default();
+                    }
+                    #[cfg(feature = "polars")]
+                    {
+                        self.symbol_registry = None;
+                    }
+                    continue;
+                }
+                ServerEvent::ServerInfo(_) => {
                     // State already mutated by decode_frame; keep reading.
                     continue;
                 }

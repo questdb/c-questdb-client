@@ -14,7 +14,7 @@ pub use convert::external_arrow_error;
 pub use polars::CursorPolarsIter;
 pub use reader::{CursorRecordBatchReader, has_tentative_array, try_downcast_questdb};
 
-pub(crate) use convert::batch_to_record_batch;
+pub(crate) use convert::{SymbolValuesCache, batch_to_record_batch, batch_to_record_batch_with};
 pub(crate) use schema::{batch_arrow_schema, schemas_equal};
 
 /// Field-metadata keys this client writes into the `Arc<Field>` of

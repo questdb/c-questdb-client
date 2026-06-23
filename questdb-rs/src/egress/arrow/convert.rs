@@ -58,11 +58,33 @@ const _: fn() = || {
     assert_send_sync_static::<ABytes>();
 };
 
+/// Per-cursor cache of the connection dict's `Utf8` values array, keyed on dict
+/// length: the dict is append-only and shared by every delta-mode SYMBOL column,
+/// so the array is interned once and reused (cheap `Arc` clone) until it grows.
+#[derive(Default)]
+pub(crate) struct SymbolValuesCache {
+    len: usize,
+    values: Option<StringArray>,
+}
+
 pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
     batch: DecodedBatch,
     dict: &SymbolDict,
+) -> Result<RecordBatch> {
+    let mut sym_values = SymbolValuesCache::default();
+    batch_to_record_batch_with(schema_ref, egress_schema, batch, dict, &mut sym_values)
+}
+
+/// As [`batch_to_record_batch`] but reuses a caller-owned [`SymbolValuesCache`]
+/// so a streaming cursor interns the connection dict once across batches.
+pub(crate) fn batch_to_record_batch_with(
+    schema_ref: Arc<ArrowSchema>,
+    egress_schema: &Schema,
+    batch: DecodedBatch,
+    dict: &SymbolDict,
+    sym_values: &mut SymbolValuesCache,
 ) -> Result<RecordBatch> {
     let DecodedBatch {
         row_count, columns, ..
@@ -94,6 +116,7 @@ pub(crate) fn batch_to_record_batch(
             decoded,
             row_count,
             dict,
+            sym_values,
             &mut degenerate_node_slack,
         )?);
     }
@@ -107,6 +130,7 @@ fn column_to_array(
     decoded: DecodedColumn,
     row_count: usize,
     dict: &SymbolDict,
+    sym_values: &mut SymbolValuesCache,
     degenerate_node_slack: &mut usize,
 ) -> Result<ArrayRef> {
     Ok(match (kind, decoded) {
@@ -191,8 +215,12 @@ fn column_to_array(
                 local_dict,
             },
         ) => {
-            let active = local_dict.as_ref().unwrap_or(dict);
-            symbol_array(codes, validity, active, row_count)?
+            // Delta columns share the connection dict → one cached values array.
+            // A column-local dict is per-batch, so it builds fresh (uncached).
+            match local_dict.as_ref() {
+                None => symbol_array(codes, validity, dict, row_count, Some(sym_values))?,
+                Some(local) => symbol_array(codes, validity, local, row_count, None)?,
+            }
         }
         (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => array_column_to_arrow(
             field,
@@ -453,15 +481,26 @@ fn widen_zero_extend(
 /// as the values — no per-row remap. `decode_symbol` bounds-checks every
 /// non-null code against the active dict size (`= dict.len()`) and leaves null
 /// rows at code `0`, so each key is a valid index into `values` and the null
-/// buffer masks the null rows.
+/// buffer masks the null rows. With `cache`, the values array is reused across
+/// columns/batches and only rebuilt when the dict grows.
 fn symbol_array(
     codes: Vec<u32>,
     validity: Option<Bytes>,
     dict: &SymbolDict,
     row_count: usize,
+    cache: Option<&mut SymbolValuesCache>,
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
-    let values = symbol_dict_values(dict)?;
+    let values = match cache {
+        Some(c) if c.len == dict.len() && c.values.is_some() => c.values.clone().unwrap(),
+        Some(c) => {
+            let v = symbol_dict_values(dict)?;
+            c.len = dict.len();
+            c.values = Some(v.clone());
+            v
+        }
+        None => symbol_dict_values(dict)?,
+    };
     // `codes` already holds one `u32` global code per row; adopt its allocation
     // as the key buffer with no copy.
     let keys_buf = Buffer::from_vec(codes);

@@ -206,6 +206,42 @@ fn measure_decode_only(
     Ok((wall, cpu))
 }
 
+/// Split point: build the Arrow `RecordBatch` per batch (decode + `convert.rs`)
+/// but do not convert to polars. `to-arrow − decode-only` isolates the Arrow
+/// build; `to-polars − to-arrow` isolates the Arrow→polars conversion.
+fn measure_to_arrow(
+    host: &str,
+    port: u16,
+    select: &str,
+    rows: u64,
+    iterations: usize,
+    warmups: usize,
+) -> Result<Samples, Box<dyn Error>> {
+    let conf = format!("ws::addr={host}:{port};compression=raw;");
+    let mut run = || -> Result<u64, Box<dyn Error>> {
+        let mut reader = Reader::from_conf(&conf)?;
+        let mut cursor = reader.prepare(select).execute()?;
+        let mut seen: u64 = 0;
+        while let Some(rb) = cursor.next_arrow_batch()? {
+            seen += rb.num_rows() as u64;
+            std::hint::black_box(&rb);
+        }
+        Ok(seen)
+    };
+    for _ in 0..warmups {
+        assert_rows(run()?, rows)?;
+    }
+    let mut wall = Vec::with_capacity(iterations);
+    let mut cpu = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let (w, c, r) = timed(&mut run);
+        assert_rows(r?, rows)?;
+        wall.push(w);
+        cpu.push(c);
+    }
+    Ok((wall, cpu))
+}
+
 /// Headline: `fetch_all_polars()` — decode + assemble into one polars
 /// DataFrame. Returns the timings and the per-query on-wire byte count
 /// (the `Reader`'s observed `bytes_received` delta).
@@ -472,6 +508,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         PathSummary::new(
             &dec_wall,
             &dec_cpu,
+            rows,
+            columns,
+            "floor",
+            warmups > 0,
+            Some(wire_bytes),
+        ),
+    );
+
+    // --- to-arrow split (decode + Arrow RecordBatch build, no polars). ---
+    eprintln!("[qwp_egress_polars] measuring to-arrow ...");
+    let (ta_wall, ta_cpu) =
+        measure_to_arrow(&host, port, select, rows as u64, iterations, warmups)?;
+    report.add_path(
+        "to-arrow",
+        PathSummary::new(
+            &ta_wall,
+            &ta_cpu,
             rows,
             columns,
             "floor",
