@@ -1180,6 +1180,10 @@ impl<'r> ReaderQuery<'r> {
             data_delivered: false,
             #[cfg(feature = "arrow")]
             drifted_batch: None,
+            #[cfg(feature = "polars")]
+            symbol_registry: None,
+            #[cfg(feature = "polars")]
+            symbol_delta_modes: Vec::new(),
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1459,6 +1463,14 @@ pub struct Cursor<'r> {
     /// call so the rows are recoverable rather than dropped.
     #[cfg(feature = "arrow")]
     drifted_batch: Option<DecodedBatch>,
+    /// Per-cursor SYMBOL → polars `Categories`, interned once and grown
+    /// incrementally across batches (see [`SymbolRegistry`]).
+    #[cfg(feature = "polars")]
+    symbol_registry: Option<crate::egress::arrow::polars::SymbolRegistry>,
+    /// `[i]` = column `i` is a delta-mode SYMBOL, captured per batch from the
+    /// `DecodedBatch` before it is assembled.
+    #[cfg(feature = "polars")]
+    symbol_delta_modes: Vec<bool>,
     /// Pin `!Send` regardless of whether the callback is installed.
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -1744,6 +1756,20 @@ impl<'r> Cursor<'r> {
             self.drifted_batch = Some(decoded);
             return Err(e);
         }
+        #[cfg(feature = "polars")]
+        {
+            self.symbol_delta_modes.clear();
+            self.symbol_delta_modes
+                .extend(decoded.columns.iter().map(|c| {
+                    matches!(
+                        c,
+                        crate::egress::decoder::DecodedColumn::Symbol {
+                            local_dict: None,
+                            ..
+                        }
+                    )
+                }));
+        }
         match batch_to_record_batch(arrow_schema, &egress_schema, decoded, &self.reader.dict) {
             Ok(rb) => Ok(Some(rb)),
             Err(e) => {
@@ -1751,6 +1777,22 @@ impl<'r> Cursor<'r> {
                 Err(e)
             }
         }
+    }
+
+    #[cfg(feature = "polars")]
+    pub(crate) fn symbol_registry_synced(
+        &mut self,
+    ) -> Result<&crate::egress::arrow::polars::SymbolRegistry> {
+        let reg = self
+            .symbol_registry
+            .get_or_insert_with(crate::egress::arrow::polars::SymbolRegistry::new);
+        reg.sync(&self.reader.dict)?;
+        Ok(reg)
+    }
+
+    #[cfg(feature = "polars")]
+    pub(crate) fn symbol_delta_modes(&self) -> &[bool] {
+        &self.symbol_delta_modes
     }
 
     // Replay-contract stash for fatal errors that bypass `next_batch_inner`

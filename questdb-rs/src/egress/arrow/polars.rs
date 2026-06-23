@@ -1,17 +1,21 @@
 //! Polars sub-feature: `RecordBatch ↔ DataFrame` via Arrow C Data Interface.
 
+use std::sync::Arc;
+
 use arrow_array::types::UInt32Type;
 use arrow_array::{Array, ArrayRef, DictionaryArray, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use polars::frame::DataFrame;
 use polars::prelude::{
-    Categories, Column, DataType as PlDataType, IDX_DTYPE, IdxCa, IntoColumn, Series,
+    Categorical32Type, CategoricalChunked, CategoricalMapping, CategoricalPhysical, Categories,
+    Column, DataType as PlDataType, IDX_DTYPE, IdxCa, IntoColumn, IntoSeries, PlSmallStr, Series,
 };
 
 use crate::egress::Cursor;
 use crate::egress::arrow::has_tentative_array;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
+use crate::egress::symbol_dict::SymbolDict;
 
 // FFI cross-crate helpers in `crate::ingress::polars`.
 
@@ -30,8 +34,17 @@ impl Cursor<'_> {
     pub fn next_polars(&mut self) -> Result<Option<DataFrame>> {
         match self.next_arrow_batch_inner(None)? {
             None => Ok(None),
-            Some(rb) => Ok(Some(record_batch_to_dataframe(rb)?)),
+            Some(rb) => Ok(Some(self.batch_to_dataframe(rb)?)),
         }
+    }
+
+    /// Per-batch `RecordBatch → DataFrame` via the cursor's persistent
+    /// [`SymbolRegistry`], instead of rebuilding the categorical mapping every
+    /// batch (the high-cardinality collapse).
+    fn batch_to_dataframe(&mut self, rb: RecordBatch) -> Result<DataFrame> {
+        let modes = self.symbol_delta_modes().to_vec();
+        let registry = self.symbol_registry_synced()?;
+        build_dataframe(rb, &modes, registry)
     }
 
     /// Eagerly drain into one chunked Polars [`DataFrame`]. A stream
@@ -176,7 +189,7 @@ impl Iterator for CursorPolarsIter<'_, '_> {
                 }
             }
         };
-        let df = record_batch_to_dataframe(rb);
+        let df = self.cursor.batch_to_dataframe(rb);
         if df.is_err() {
             self.poisoned = true;
         }
@@ -282,6 +295,108 @@ fn dictionary_to_categorical(name: &str, col: &ArrayRef) -> Result<Series> {
     cat_dict
         .take(&idx)
         .map_err(|e| fmt!(ArrowExport, "gather SYMBOL '{}' codes: {}", name, e))
+}
+
+/// Per-cursor registry that interns a query's connection SYMBOL dictionary into
+/// one persistent polars `Categories` in QWP code order — so a global QWP code
+/// is its own physical categorical code and keys wrap straight into a
+/// Categorical, with no per-batch cast or gather.
+pub(crate) struct SymbolRegistry {
+    dtype: PlDataType,
+    mapping: Arc<CategoricalMapping>,
+    registered: usize,
+}
+
+impl SymbolRegistry {
+    pub(crate) fn new() -> Self {
+        let cats = Categories::random(PlSmallStr::from("questdb_symbol"), CategoricalPhysical::U32);
+        let mapping = cats.mapping();
+        let dtype = PlDataType::Categorical(cats, mapping.clone());
+        Self {
+            dtype,
+            mapping,
+            registered: 0,
+        }
+    }
+
+    pub(crate) fn sync(&mut self, dict: &SymbolDict) -> Result<()> {
+        // A CACHE_RESET clears the connection dict; the shrink restarts us.
+        if dict.len() < self.registered {
+            *self = Self::new();
+        }
+        for code in self.registered..dict.len() {
+            let s = dict.get(code as u32).ok_or_else(|| {
+                fmt!(
+                    ArrowExport,
+                    "symbol code {} missing from dict during registry sync",
+                    code
+                )
+            })?;
+            // `insert_cat` appends in call order, so the assigned id == `code`.
+            self.mapping
+                .insert_cat(s)
+                .map_err(|e| fmt!(ArrowExport, "register SYMBOL '{}': {}", s, e))?;
+        }
+        self.registered = dict.len();
+        Ok(())
+    }
+
+    fn categorical_from_keys(&self, name: &str, col: &ArrayRef) -> Result<Series> {
+        let dict = col
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .ok_or_else(|| {
+                fmt!(
+                    ArrowExport,
+                    "SYMBOL '{}' is not Dictionary(UInt32, _)",
+                    name
+                )
+            })?;
+        let keys = import_polars_series(name, &dict.keys().to_data())?;
+        let phys = keys
+            .u32()
+            .map_err(|e| fmt!(ArrowExport, "SYMBOL '{}' keys not u32: {}", name, e))?
+            .clone();
+        // SAFETY: `sync` registered every dict entry in code order, so each key is
+        // a valid physical code; the decoder bounds-checks every non-null key
+        // against `dict.len()`, and null rows (key 0) are masked by the imported
+        // key buffer's null bitmap.
+        let cat = unsafe {
+            CategoricalChunked::<Categorical32Type>::from_cats_and_dtype_unchecked(
+                phys,
+                self.dtype.clone(),
+            )
+        };
+        Ok(cat.into_series())
+    }
+}
+
+/// `RecordBatch → DataFrame` for the cursor-driven polars paths. Delta-mode
+/// SYMBOL columns (`delta_modes[i]`) resolve through the persistent `registry`;
+/// column-local SYMBOL columns fall back to [`dictionary_to_categorical`].
+fn build_dataframe(
+    rb: RecordBatch,
+    delta_modes: &[bool],
+    registry: &SymbolRegistry,
+) -> Result<DataFrame> {
+    let schema = rb.schema();
+    let row_count = rb.num_rows();
+    let mut columns: Vec<Column> = Vec::with_capacity(rb.num_columns());
+    for (i, (col, field)) in rb.columns().iter().zip(schema.fields().iter()).enumerate() {
+        let name = field.name().as_str();
+        let series = if matches!(col.data_type(), ArrowDataType::Dictionary(_, _)) {
+            if delta_modes.get(i).copied().unwrap_or(false) {
+                registry.categorical_from_keys(name, col)?
+            } else {
+                dictionary_to_categorical(name, col)?
+            }
+        } else {
+            import_polars_series(name, &col.to_data())?
+        };
+        columns.push(series.into_column());
+    }
+    DataFrame::new(row_count, columns)
+        .map_err(|e| fmt!(ArrowExport, "DataFrame::new failed: {}", e))
 }
 
 #[cfg(test)]
@@ -558,5 +673,110 @@ mod tests {
         assert_eq!(vals(&s1, 0), some(&["x", "y", "y", "z"])); // multi-column, col a
         assert_eq!(vals(&s1, 1), some(&["m", "m", "x", "m"])); // col b reuses "x","m"
         assert_eq!(vals(&s2, 0), some(&["p", "x", "p", "q"])); // other cursor, shares "x","p"
+    }
+
+    fn sym_batch(values: &[&str], keys: &[Option<u32>]) -> RecordBatch {
+        use arrow_array::types::UInt32Type;
+        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+        let values: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
+        let dict = DictionaryArray::<UInt32Type>::new(UInt32Array::from(keys.to_vec()), values);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "sym",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(dict) as ArrayRef]).unwrap()
+    }
+
+    fn cat_strings(df: &DataFrame) -> Vec<Option<String>> {
+        let s = df.columns()[0]
+            .as_materialized_series()
+            .cast(&PlDataType::String)
+            .unwrap();
+        let s = s.str().unwrap();
+        (0..df.height())
+            .map(|i| s.get(i).map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn delta_symbol_registry_interns_once_and_vstacks_across_batches() {
+        // The connection dict grows; the registry registers only the new tail
+        // each batch and keys (global codes) wrap straight into a Categorical.
+        // Both batches share the registry's `Categories`, so they vstack.
+        let mut dict = SymbolDict::new();
+        dict.apply_delta(0, [b"a".as_slice(), b"b".as_slice()])
+            .unwrap();
+        let mut reg = SymbolRegistry::new();
+        reg.sync(&dict).unwrap();
+        let df1 = build_dataframe(
+            sym_batch(&["a", "b"], &[Some(0), Some(1), Some(0)]),
+            &[true],
+            &reg,
+        )
+        .unwrap();
+
+        dict.apply_delta(2, [b"c".as_slice()]).unwrap();
+        reg.sync(&dict).unwrap();
+        let df2 = build_dataframe(
+            sym_batch(&["a", "b", "c"], &[Some(2), None, Some(1)]),
+            &[true],
+            &reg,
+        )
+        .unwrap();
+
+        let mut df = df1;
+        df.vstack_mut_owned(df2)
+            .expect("registry Categoricals from different batches must vstack");
+        assert!(matches!(
+            df.columns()[0].dtype(),
+            PlDataType::Categorical(_, _)
+        ));
+        assert_eq!(
+            cat_strings(&df),
+            vec![
+                Some("a".into()),
+                Some("b".into()),
+                Some("a".into()),
+                Some("c".into()),
+                None,
+                Some("b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_symbol_registry_rebuilds_on_dict_reset() {
+        let mut dict = SymbolDict::new();
+        dict.apply_delta(0, [b"x".as_slice(), b"y".as_slice(), b"z".as_slice()])
+            .unwrap();
+        let mut reg = SymbolRegistry::new();
+        reg.sync(&dict).unwrap();
+
+        // CACHE_RESET: dict cleared then re-grown; code 0 must now be "p".
+        dict.reset();
+        dict.apply_delta(0, [b"p".as_slice()]).unwrap();
+        reg.sync(&dict).unwrap();
+
+        let df = build_dataframe(sym_batch(&["p"], &[Some(0)]), &[true], &reg).unwrap();
+        assert_eq!(cat_strings(&df), vec![Some("p".into())]);
+    }
+
+    #[test]
+    fn column_local_symbol_still_builds_via_fallback() {
+        // delta_modes = false → the column-local path (cast + take), not the
+        // registry, so a non-prefix per-batch dict is still correct.
+        let reg = SymbolRegistry::new();
+        let df = build_dataframe(
+            sym_batch(&["L0", "L1"], &[Some(1), Some(0)]),
+            &[false],
+            &reg,
+        )
+        .unwrap();
+        assert!(matches!(
+            df.columns()[0].dtype(),
+            PlDataType::Categorical(_, _)
+        ));
+        assert_eq!(cat_strings(&df), vec![Some("L1".into()), Some("L0".into())]);
     }
 }
