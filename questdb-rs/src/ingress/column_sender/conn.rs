@@ -832,21 +832,24 @@ impl ColumnConn {
 
 impl Drop for ColumnConn {
     fn drop(&mut self) {
-        let _ = self
+        // Skip the Close frame unless the write timeout pins — a hung peer
+        // would otherwise block deallocation for the OS default.
+        if self
             .stream
-            .set_timeouts(Some(CLOSE_TIMEOUT), Some(CLOSE_TIMEOUT));
-        let Ok(mask_key) = self.mask_keys.next_key() else {
-            return;
-        };
-        self.write_buf.clear();
-        encode_client_frame(
-            &mut self.write_buf,
-            Opcode::Close,
-            mask_key,
-            &WS_CLOSE_STATUS_NORMAL,
-        );
-        let _ = self.stream.write_all(&self.write_buf);
-        let _ = self.stream.flush();
+            .set_timeouts(Some(CLOSE_TIMEOUT), Some(CLOSE_TIMEOUT))
+            .is_ok()
+            && let Ok(mask_key) = self.mask_keys.next_key()
+        {
+            self.write_buf.clear();
+            encode_client_frame(
+                &mut self.write_buf,
+                Opcode::Close,
+                mask_key,
+                &WS_CLOSE_STATUS_NORMAL,
+            );
+            let _ = self.stream.write_all(&self.write_buf);
+            let _ = self.stream.flush();
+        }
         self.stream.shutdown_tls();
     }
 }

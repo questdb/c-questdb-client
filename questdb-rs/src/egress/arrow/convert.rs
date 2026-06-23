@@ -961,4 +961,25 @@ mod tests {
         let _ = compute_per_level_counts(&shapes, &shape_offsets, 2, 1, 6, &mut slack).unwrap();
         assert_eq!(slack, MAX_DEGENERATE_LIST_NODES);
     }
+
+    #[test]
+    fn counts_to_offsets_rejects_child_count_above_i32_max() {
+        let err = counts_to_offsets_i32(&[i32::MAX as u32 + 1]).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(err.msg().contains("exceeds i32::MAX"), "got: {}", err.msg());
+    }
+
+    #[test]
+    fn counts_to_offsets_rejects_cumulative_i32_overflow() {
+        let err = counts_to_offsets_i32(&[i32::MAX as u32, 1]).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(err.msg().contains("overflows i32"), "got: {}", err.msg());
+    }
+
+    #[test]
+    fn offsets_to_arrow_buffer_rejects_offset_above_i32_max() {
+        let err = offsets_to_arrow_buffer(vec![0, i32::MAX as u32 + 1]).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(err.msg().contains("varlen offset"), "got: {}", err.msg());
+    }
 }

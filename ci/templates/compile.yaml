@@ -17,10 +17,11 @@ steps:
     condition: ne(variables['toolchain'], '')
     displayName: "Update and set Rust toolchain"
   - script: |
-      brew install numpy
+      brew install numpy apache-arrow
       python3 -m pip install --break-system-packages pyarrow polars
+      echo "##vso[task.setvariable variable=CMAKE_PREFIX_PATH]$(brew --prefix)"
     condition: eq(variables['imageName'], 'macos-latest')
-    displayName: "Install numpy + pyarrow + polars on macOS"
+    displayName: "Install numpy + pyarrow + polars + apache-arrow on macOS"
   - script: |
       python -m pip install --upgrade pip
       pip install numpy pyarrow polars tzdata

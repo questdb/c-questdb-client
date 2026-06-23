@@ -2245,6 +2245,55 @@ fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
         .count()
 }
 
+// Decode the single i64 column of every captured QWP data frame so a re-drive
+// is checked for the exact rows it lands, not just the frame count. Layout:
+// 12-byte header, delta-dict prefix, table, row/col counts, signature, then
+// the column body `flag(0) + row_count * i64_le`.
+#[cfg(feature = "polars")]
+fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
+    fn varint(f: &[u8], pos: &mut usize) -> u64 {
+        let (mut shift, mut value) = (0u32, 0u64);
+        loop {
+            let byte = f[*pos];
+            *pos += 1;
+            value |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+    fn skip_lp(f: &[u8], pos: &mut usize) {
+        let len = varint(f, pos) as usize;
+        *pos += len;
+    }
+    let mut rows = Vec::new();
+    for f in frames.try_iter() {
+        if f.len() < 12 || &f[..4] != b"QWP1" || u16::from_le_bytes([f[6], f[7]]) < 1 {
+            continue;
+        }
+        let mut pos = 12;
+        let _delta_start = varint(&f, &mut pos);
+        let new_syms = varint(&f, &mut pos);
+        for _ in 0..new_syms {
+            skip_lp(&f, &mut pos);
+        }
+        skip_lp(&f, &mut pos);
+        let row_count = varint(&f, &mut pos) as usize;
+        let col_count = varint(&f, &mut pos);
+        assert_eq!(col_count, 1, "expected a single-column df frame");
+        skip_lp(&f, &mut pos);
+        pos += 1;
+        assert_eq!(f[pos], 0, "i64 column must not set the bitmap flag");
+        pos += 1;
+        for _ in 0..row_count {
+            rows.push(i64::from_le_bytes(f[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+    }
+    rows
+}
+
 #[cfg(feature = "polars")]
 #[test]
 fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
@@ -2278,12 +2327,15 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
         .expect("failover must re-drive the df onto the live endpoint");
     drop(sender);
 
-    // 6 rows / 2 rows-per-batch = 3 data frames, all re-driven onto the live
-    // endpoint (the whole df: the primary died before any checkpoint committed).
+    // The whole df (the primary died before any checkpoint committed) is
+    // re-driven onto the live endpoint: every row exactly once, none dropped
+    // or duplicated, in order.
+    let mut got = redriven_i64_rows(&frames);
+    got.sort_unstable();
     assert_eq!(
-        data_frame_count(&frames),
-        3,
-        "the live endpoint must receive every batch of the re-driven df"
+        got,
+        vec![1, 2, 3, 4, 5, 6],
+        "the live endpoint must receive every row of the re-driven df exactly once"
     );
     assert_eq!(
         primary.accepted(),
@@ -2329,11 +2381,14 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     drop(sender);
 
     // 66 batches − 64 committed on the primary (one CHECKPOINT_BATCHES run) = 2
-    // re-driven onto the live endpoint; the committed prefix is not re-sent.
+    // re-driven; the committed prefix (rows 1..=64) is not re-sent, so only the
+    // uncommitted tail rows 65 and 66 reach the live endpoint, exactly once.
+    let mut got = redriven_i64_rows(&frames);
+    got.sort_unstable();
     assert_eq!(
-        data_frame_count(&frames),
-        2,
-        "only the uncommitted tail must reach the live endpoint"
+        got,
+        vec![65, 66],
+        "only the uncommitted tail rows must reach the live endpoint, exactly once"
     );
     assert_eq!(
         primary.accepted(),

@@ -1736,22 +1736,28 @@ fn write_array_double_payload(out: &mut Vec<u8>, arr: &dyn Array, ndim: usize) -
             start = level_start;
             end = level_end;
         }
-        let local_start = start.checked_sub(leaf_offset).ok_or_else(|| {
-            fmt!(
-                ArrowIngest,
-                "ARRAY leaf index {} below leaf array offset {}",
-                start,
-                leaf_offset
-            )
-        })?;
-        let local_end = end.checked_sub(leaf_offset).ok_or_else(|| {
-            fmt!(
-                ArrowIngest,
-                "ARRAY leaf index {} below leaf array offset {}",
-                end,
-                leaf_offset
-            )
-        })?;
+        // An empty leaf range has no position to rebase against `leaf_offset`.
+        let (local_start, local_end) = if end == start {
+            (0, 0)
+        } else {
+            let local_start = start.checked_sub(leaf_offset).ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "ARRAY leaf index {} below leaf array offset {}",
+                    start,
+                    leaf_offset
+                )
+            })?;
+            let local_end = end.checked_sub(leaf_offset).ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "ARRAY leaf index {} below leaf array offset {}",
+                    end,
+                    leaf_offset
+                )
+            })?;
+            (local_start, local_end)
+        };
         if local_end > leaf_values_all.len() {
             return Err(fmt!(
                 ArrowIngest,
@@ -6014,6 +6020,28 @@ mod tests {
         {
             let mid = outer.values();
             mid.values().append_value(5.0);
+            mid.append(true);
+        }
+        outer.append(true);
+        let arr = outer.finish();
+        let inner_field = Arc::new(Field::new(
+            "item",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        ));
+        let field = Field::new("a", DataType::List(inner_field), true);
+        let rb = single_col_batch(field, arr);
+        assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn array_double_2d_with_empty_row_encodes() {
+        let mut outer = ListBuilder::new(ListBuilder::new(Float64Builder::new()));
+        outer.append(true);
+        {
+            let mid = outer.values();
+            mid.values().append_value(1.0);
+            mid.values().append_value(2.0);
             mid.append(true);
         }
         outer.append(true);

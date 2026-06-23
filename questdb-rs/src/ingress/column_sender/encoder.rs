@@ -188,7 +188,7 @@ fn encode_chunk_into_mode(
 
     // --- Schema signature ---
     let column_count = chunk.columns.len() + 1; // +1 for designated timestamp
-    scratch.signature.reserve(column_count * 8);
+    scratch.signature.reserve(column_count.saturating_mul(8));
     for col in &chunk.columns {
         write_qwp_bytes(&mut scratch.signature, col.name.as_bytes());
         scratch.signature.push(col.wire_type);
