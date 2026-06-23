@@ -957,6 +957,26 @@ fn borrow_and_return_reuses_connection() {
 }
 
 #[test]
+fn owned_column_sender_observes_pool_close_and_drops_after_close() {
+    let server = MockServer::spawn(2);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+    ))
+    .unwrap();
+    let owned = db
+        .borrow_column_sender_owned()
+        .expect("borrow owned column sender");
+    assert_eq!(db.free_count(), 0);
+    assert_eq!(db.in_use_count(), 1);
+    assert!(!owned.pool_closed());
+
+    db.close();
+    assert!(owned.pool_closed());
+    drop(owned);
+}
+
+#[test]
 fn auto_grow_opens_new_connection_until_pool_max() {
     let server = MockServer::spawn(4);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
@@ -1114,6 +1134,28 @@ fn row_sender_owned_mark_must_close_drops_not_recycles() {
     assert_eq!(db.row_sender_in_use_count(), 0);
     assert_eq!(db.row_sender_free_count(), 0);
     drop(db);
+}
+
+#[test]
+fn owned_row_sender_observes_pool_close_and_drops_after_close() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+    ))
+    .unwrap();
+
+    let owned = db
+        .borrow_row_sender_owned()
+        .expect("borrow owned row sender");
+    assert_eq!(db.row_sender_in_use_count(), 1);
+    assert!(!owned.pool_closed());
+    assert!(!owned.must_close());
+
+    db.close();
+    assert!(owned.pool_closed());
+    assert!(owned.must_close());
+    drop(owned);
 }
 
 #[test]

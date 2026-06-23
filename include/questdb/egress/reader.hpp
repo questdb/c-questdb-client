@@ -834,7 +834,8 @@ private:
     /// Borrow a pooled reader from a `questdb_db` pool. Backs
     /// `questdb::ingress::pool::borrow_reader`. The returned reader is
     /// equivalent to a standalone one; on destruction `reader_close`
-    /// returns it to the pool (or drops it if marked must-close).
+    /// returns it to the pool (or drops it if marked must-close or the
+    /// pool has been closed). Preparing a new query after pool close fails.
     static reader borrow_from_pool(::questdb_db* db)
     {
         return reader{

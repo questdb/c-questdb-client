@@ -742,8 +742,9 @@ public:
     const ::column_sender* c_ptr() const noexcept { return _raw; }
 
     /**
-     * `true` if the conn has latched into terminal must-close. Pool
-     * return will drop the slot instead of recycling.
+     * `true` if the conn has latched into terminal must-close, or if the
+     * pool has been closed. Pool return will drop the slot instead of
+     * recycling.
      */
     bool must_close() const noexcept
     {
@@ -934,7 +935,8 @@ class pool;
 
 /**
  * RAII guard for a borrowed connection. On destruction the conn is
- * returned to the pool (or dropped if it has latched must-close).
+ * returned to the pool (or dropped if it has latched must-close, or if the
+ * pool has been closed).
  *
  * Constructed only via `pool::borrow_column_sender()`.
  */
@@ -1013,7 +1015,7 @@ private:
 /**
  * RAII guard for a borrowed row-major sender. On destruction the sender is
  * returned to the pool (or dropped if `drop_on_return()` was called, or a
- * flush left it must-close). Build rows with a
+ * flush left it must-close, or the pool has been closed). Build rows with a
  * `questdb::ingress::line_sender_buffer` and send them via `flush()` /
  * `flush_and_keep()`.
  *
@@ -1078,7 +1080,8 @@ public:
 
     /**
      * `true` if this sender will be dropped rather than recycled on return
-     * (force-marked, or a flush left the connection unusable).
+     * (force-marked, a flush left the connection unusable, or the pool has
+     * been closed).
      */
     bool must_close() const noexcept
     {
@@ -1124,6 +1127,12 @@ private:
  * `conf` is a `qwpws::` / `qwpwss::` connect string; see
  * `column_sender.h` for pool-specific keys (`pool_size`, `pool_max`,
  * `pool_idle_timeout_ms`, `pool_reap`).
+ *
+ * Borrow/return operations are thread-safe while this owner remains alive.
+ * Destruction is the final owner release: do not destroy the pool while
+ * another thread may still call methods on this object. Borrowed guards that
+ * outlive the pool remain safe to destroy; after pool close they are dropped
+ * instead of recycled, and new operations on them fail.
  */
 class pool
 {
@@ -1216,8 +1225,9 @@ public:
      * connection opens on first borrow). The returned `reader` is
      * equivalent to a standalone one and returns itself to the pool on
      * destruction — unless `reader::mark_must_close()` was called, in which
-     * case it is dropped. Throws `reader_error` on cap exhaustion or
-     * transport failure.
+     * case it is dropped. If the pool has already been closed by the time the
+     * reader is destroyed, it is closed instead of recycled. Throws
+     * `reader_error` on cap exhaustion or transport failure.
      *
      * DEFINED in `questdb/egress/reader.hpp` (the reader-pool entry
      * points live alongside the `reader` type, matching the C headers).

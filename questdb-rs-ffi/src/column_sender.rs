@@ -56,7 +56,9 @@ use crate::{
 // Opaque handles
 // ===========================================================================
 
-/// Connection pool. Thread-safe; share across threads.
+/// Connection pool. Thread-safe for borrow/return/reap operations while the
+/// owning handle remains open. `questdb_db_close` is the final owner release
+/// and must not race with other operations on the same `db`.
 pub struct questdb_db(pub(crate) QuestDb);
 
 /// Borrowed QWP/WS connection. Owns a pool slot until
@@ -203,6 +205,27 @@ unsafe fn finalize_or_defer<T: FfiHandle>(handle: *mut T, state: *const AtomicU3
             T::on_deferred_close(handle, LATCH_CLOSED | extra);
             drop(Box::from_raw(handle));
         }
+    }
+}
+
+unsafe fn reject_closed_pool_column_sender(
+    conn: *const column_sender,
+    fn_name: &str,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if unsafe { (*conn).0.pool_closed() } {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: QuestDb pool is closed"),
+                ),
+            );
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -466,11 +489,14 @@ pub unsafe extern "C" fn questdb_db_connect(
     }
 }
 
-/// Close the pool and all its connections. Accepts NULL and no-ops.
+/// Close the pool. Accepts NULL and no-ops.
 ///
-/// Outstanding `column_sender` handles remain valid (they hold an
-/// internal reference to the pool's state) and return themselves on
-/// `questdb_db_return_column_sender`.
+/// Final owner release: callers must ensure no other thread is concurrently
+/// using `db` for borrow/reap/config operations. This invalidates the
+/// `questdb_db*` for new borrows and closes idle connections.
+/// Outstanding `column_sender` handles are independent leases:
+/// return/drop remains safe after close, but new operations on them fail with
+/// `InvalidApiCall`. A handle returned after close is closed, not recycled.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
     if !db.is_null() {
@@ -559,7 +585,8 @@ pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb
 }
 
 /// Return a borrowed conn to the pool. Invalidates `conn`. Accepts NULL
-/// and no-ops. `db` is ignored — kept in the ABI for symmetry.
+/// and no-ops. `db` is ignored — kept in the ABI for symmetry. If the pool
+/// has been closed, the conn is closed instead of recycled.
 ///
 /// A racing in-flight call on the same handle defers the drop: the
 /// in-flight call's exit path performs the actual `Box::from_raw`, so
@@ -615,6 +642,7 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
 ///   * the conn was already closed / dropped,
 ///   * the conn is in a permanently-unusable state (e.g. a flush left
 ///     it with uncommitted in-flight frames),
+///   * the originating pool has been closed,
 ///   * another FFI call on the same handle is currently in flight on
 ///     another thread (single-handle contract violation).
 ///
@@ -644,7 +672,7 @@ pub unsafe extern "C" fn column_sender_must_close(conn: *const column_sender) ->
         }
         return true;
     }
-    let result = unsafe { (*conn).0.get().must_close() };
+    let result = unsafe { (*conn).0.pool_closed() || (*conn).0.get().must_close() };
     drop(guard);
     result
 }
@@ -2422,6 +2450,9 @@ pub unsafe extern "C" fn column_sender_flush(
         Some(g) => g,
         None => return false,
     };
+    if unsafe { reject_closed_pool_column_sender(conn, "column_sender_flush", err_out) } {
+        return false;
+    }
     if chunk.is_null() {
         return reject_null_chunk(err_out);
     }
@@ -2496,6 +2527,9 @@ pub unsafe extern "C" fn column_sender_flush_and_wait(
         Some(g) => g,
         None => return false,
     };
+    if unsafe { reject_closed_pool_column_sender(conn, "column_sender_flush_and_wait", err_out) } {
+        return false;
+    }
     if chunk.is_null() {
         return reject_null_chunk(err_out);
     }
@@ -2876,6 +2910,11 @@ unsafe fn arrow_batch_impl(
         Some(g) => g,
         None => return false,
     };
+    if unsafe {
+        reject_closed_pool_column_sender(conn, "column_sender_flush_arrow_batch_*", err_out)
+    } {
+        return false;
+    }
     let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
         Some(v) => v,
         None => return false,
@@ -2968,6 +3007,15 @@ unsafe fn arrow_batch_impl_and_wait(
         Some(g) => g,
         None => return false,
     };
+    if unsafe {
+        reject_closed_pool_column_sender(
+            conn,
+            "column_sender_flush_arrow_batch_*_and_wait",
+            err_out,
+        )
+    } {
+        return false;
+    }
     let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
         Some(v) => v,
         None => return false,
@@ -3112,6 +3160,9 @@ pub unsafe extern "C" fn column_sender_sync(
         Some(g) => g,
         None => return false,
     };
+    if unsafe { reject_closed_pool_column_sender(conn, "column_sender_sync", err_out) } {
+        return false;
+    }
     let sender = unsafe { (*conn).0.get_mut() };
     bubble!(err_out, sender.sync(ack_level));
     true

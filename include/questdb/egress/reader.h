@@ -426,12 +426,19 @@ struct questdb_db* questdb_db_connect_reader(
     reader_error** err_out);
 
 /**
- * Close the pool and all its connections. Accepts NULL and no-ops.
+ * Close the pool. Accepts NULL and no-ops.
  * Same entry point as the one declared in
  * `questdb/ingress/column_sender.h` (re-declared here so a reader-only
  * consumer needs only this header); takes no error parameter.
- * Outstanding borrowed `reader*` handles remain valid and return
- * themselves on `questdb_db_return_reader` / `reader_close`.
+ *
+ * Final owner release: callers must ensure no other thread is concurrently
+ * using `db` for borrow/reap/config operations. This invalidates `db` for
+ * new borrows and closes idle connections.
+ * Outstanding `reader*` handles are independent leases: closing them after
+ * pool close is safe, and already-created cursors may continue streaming,
+ * but preparing a new query on a pooled reader after close fails with
+ * `reader_error_invalid_api_call`. A reader returned after close is closed,
+ * not recycled.
  */
 QUESTDB_CLIENT_API
 void questdb_db_close(struct questdb_db* db);
@@ -443,7 +450,7 @@ void questdb_db_close(struct questdb_db* db);
  * The returned `reader*` is equivalent to one constructed via
  * `reader_from_conf`. On `reader_close` the reader is
  * returned to the pool (or dropped if `reader_mark_must_close`
- * was called first).
+ * was called first, or if the pool has been closed).
  */
 QUESTDB_CLIENT_API
 reader* questdb_db_borrow_reader(

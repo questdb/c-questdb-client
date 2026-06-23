@@ -3671,9 +3671,31 @@ pub unsafe extern "C" fn line_sender_flush(
 /// A row-major QWP/WS sender borrowed from a `questdb_db` pool. Opaque and
 /// not thread-safe: it belongs to the borrowing thread until returned with
 /// `questdb_db_return_row_sender` (recycle) or `questdb_db_drop_row_sender`
-/// (force-close). Build rows with a `line_sender_buffer` and send them with
-/// `row_sender_flush` / `row_sender_flush_and_keep`.
+/// (force-close). If the pool has been closed, return closes the sender
+/// instead of recycling it. Build rows with a `line_sender_buffer` and send
+/// them with `row_sender_flush` / `row_sender_flush_and_keep`.
 pub struct row_sender(OwnedRowSender);
+
+unsafe fn reject_closed_pool_row_sender(
+    sender: *const row_sender,
+    fn_name: &str,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if unsafe { (*sender).0.pool_closed() } {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: QuestDb pool is closed"),
+                ),
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
 
 /// Borrow a row-major sender from the pool. Returns NULL on failure and sets
 /// `*err_out` if provided. The row-sender pool is lazy and independently
@@ -3743,7 +3765,8 @@ pub unsafe extern "C" fn questdb_db_borrow_row_sender_with_retry(
 
 /// Return a borrowed row sender to the pool. Invalidates `sender`. Accepts
 /// NULL and no-ops. `db` is ignored (the sender carries its own pool
-/// back-reference) but kept in the ABI for symmetry with the borrow call.
+/// back-reference) but kept in the ABI for symmetry with the borrow call. If
+/// the pool has been closed, the sender is closed instead of recycled.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_return_row_sender(
     _db: *mut questdb_db,
@@ -3770,8 +3793,9 @@ pub unsafe extern "C" fn questdb_db_drop_row_sender(_db: *mut questdb_db, sender
 }
 
 /// `true` if the row sender will be dropped rather than recycled on return
-/// (force-marked, or a flush left the connection unusable), or if `sender`
-/// is NULL. `false` only when it is safely reusable.
+/// (force-marked, a flush left the connection unusable, or the originating
+/// pool has been closed), or if `sender` is NULL. `false` only when it is
+/// safely reusable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn row_sender_must_close(sender: *const row_sender) -> bool {
     if sender.is_null() {
@@ -3789,6 +3813,21 @@ pub unsafe extern "C" fn row_sender_flush(
     buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "row_sender_flush: sender pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return false;
+    }
+    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_flush", err_out) } {
+        return false;
+    }
     unsafe {
         let s = (*sender).0.get_mut();
         let buffer = unwrap_buffer_mut(buffer);
@@ -3811,6 +3850,21 @@ pub unsafe extern "C" fn row_sender_flush_and_keep(
     buffer: *const line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "row_sender_flush_and_keep: sender pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return false;
+    }
+    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_flush_and_keep", err_out) } {
+        return false;
+    }
     unsafe {
         let s = (*sender).0.get_mut();
         let buffer = unwrap_buffer(buffer);
@@ -4625,7 +4679,10 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
     use std::thread;
 
     const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -4982,7 +5039,7 @@ mod tests {
         base64_encode(&sha1(combined.as_bytes()))
     }
 
-    fn upgrade_mock_stream(stream: &mut TcpStream) {
+    fn upgrade_mock_stream_with_request(stream: &mut TcpStream) -> std::io::Result<String> {
         let req_bytes = read_request_until_blank(stream).unwrap();
         let req = String::from_utf8_lossy(&req_bytes);
         let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
@@ -4995,7 +5052,12 @@ mod tests {
              X-QWP-Version: 1\r\n\
              \r\n"
         );
-        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(response.as_bytes())?;
+        Ok(req.into_owned())
+    }
+
+    fn upgrade_mock_stream(stream: &mut TcpStream) {
+        upgrade_mock_stream_with_request(stream).unwrap();
     }
 
     fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
@@ -5059,6 +5121,159 @@ mod tests {
         write_server_binary_frame(stream, &payload)
     }
 
+    #[cfg(feature = "sync-reader-ws")]
+    fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result<()> {
+        let mut payload = Vec::new();
+        payload.push(0x18); // SERVER_INFO
+        payload.push(0x00); // role = standalone
+        payload.extend_from_slice(&1u64.to_le_bytes()); // epoch
+        payload.extend_from_slice(&0u32.to_le_bytes()); // capabilities
+        payload.extend_from_slice(&0i64.to_le_bytes()); // server_wall_ns
+        payload.extend_from_slice(&0u16.to_le_bytes()); // cluster_id len
+        payload.extend_from_slice(&0u16.to_le_bytes()); // node_id len
+
+        let mut frame = Vec::with_capacity(12 + payload.len());
+        frame.extend_from_slice(b"QWP1");
+        frame.push(1); // version
+        frame.push(0); // flags
+        frame.extend_from_slice(&0u16.to_le_bytes()); // table_count
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        write_server_binary_frame(stream, &frame)
+    }
+
+    struct PooledQwpMock {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl PooledQwpMock {
+        fn spawn(max_accepts: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_c = Arc::clone(&stop);
+
+            let join = thread::spawn(move || {
+                let mut accepted = 0;
+                let mut handlers = Vec::new();
+                while accepted < max_accepts && !stop_c.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            accepted += 1;
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(50)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            let stop_h = Arc::clone(&stop_c);
+                            handlers.push(thread::spawn(move || {
+                                let _request = match upgrade_mock_stream_with_request(&mut stream) {
+                                    Ok(request) => request,
+                                    Err(_) => return,
+                                };
+                                #[cfg(feature = "sync-reader-ws")]
+                                if _request.starts_with("GET /read/v1 ") {
+                                    let _ = write_server_info_frame(&mut stream);
+                                }
+                                let mut buf = [0u8; 256];
+                                while !stop_h.load(Ordering::SeqCst) {
+                                    match stream.read(&mut buf) {
+                                        Ok(0) => break,
+                                        Ok(_) => {}
+                                        Err(err)
+                                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                                || err.kind() == std::io::ErrorKind::TimedOut => {}
+                                        Err(_) => break,
+                                    }
+                                }
+                            }));
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for handler in handlers {
+                    let _ = handler.join();
+                }
+            });
+
+            Self {
+                port,
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn conf(&self) -> String {
+            format!(
+                "qwpws::addr=127.0.0.1:{};pool_size=1;pool_max=2;close_flush_timeout_millis=50;",
+                self.port
+            )
+        }
+    }
+
+    impl Drop for PooledQwpMock {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    fn connect_pool(conf: &str, err: &mut *mut line_sender_error) -> *mut questdb_db {
+        let db = unsafe { questdb_db_connect(conf.as_ptr() as *const c_char, conf.len(), err) };
+        assert!(!db.is_null(), "pool connect failed");
+        assert!(err.is_null(), "pool connect set unexpected error");
+        db
+    }
+
+    fn assert_line_error_contains(
+        err: &mut *mut line_sender_error,
+        code: line_sender_error_code,
+        needle: &str,
+    ) {
+        assert!(!err.is_null(), "expected line_sender_error");
+        assert_err_code(unsafe { line_sender_error_get_code(*err) }, code);
+        let message = read_error_message(*err);
+        assert!(
+            message.contains(needle),
+            "expected error message to contain {needle:?}, got: {message}"
+        );
+        free_err(err);
+    }
+
+    #[cfg(feature = "sync-reader-ws")]
+    fn assert_reader_error_contains(
+        err: &mut *mut egress::reader_error,
+        code: egress::reader_error_code,
+        needle: &str,
+    ) {
+        assert!(!err.is_null(), "expected reader_error");
+        assert_eq!(
+            unsafe { egress::reader_error_get_code(*err) } as u32,
+            code as u32
+        );
+        let message = unsafe {
+            let mut len = 0;
+            let ptr = egress::reader_error_msg(*err, &mut len);
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        assert!(
+            message.contains(needle),
+            "expected reader error message to contain {needle:?}, got: {message}"
+        );
+        unsafe { egress::reader_error_free(*err) };
+        *err = ptr::null_mut();
+    }
+
     fn new_qwpudp_sender(err: &mut *mut line_sender_error) -> *mut line_sender {
         unsafe {
             let opts = line_sender_opts_new(
@@ -5072,6 +5287,100 @@ mod tests {
             assert!(!sender.is_null());
             assert!(err.is_null());
             sender
+        }
+    }
+
+    #[test]
+    fn pooled_column_sender_rejects_flush_after_db_close_and_returns_safely() {
+        let server = PooledQwpMock::spawn(1);
+        unsafe {
+            let mut err = ptr::null_mut();
+            let conf = server.conf();
+            let db = connect_pool(&conf, &mut err);
+
+            let sender = questdb_db_borrow_column_sender(db, &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            let table = b"trades";
+            let chunk =
+                column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err);
+            assert!(!chunk.is_null());
+            assert!(err.is_null());
+
+            questdb_db_close(db);
+
+            assert!(!column_sender_flush(sender, chunk, &mut err));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "QuestDb pool is closed",
+            );
+
+            questdb_db_return_column_sender(ptr::null_mut(), sender);
+            column_sender_chunk_free(chunk);
+        }
+    }
+
+    #[test]
+    fn pooled_row_sender_rejects_flush_after_db_close_and_returns_safely() {
+        let server = PooledQwpMock::spawn(2);
+        unsafe {
+            let mut err = ptr::null_mut();
+            let conf = server.conf();
+            let db = connect_pool(&conf, &mut err);
+
+            let sender = questdb_db_borrow_row_sender(db, &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            let buffer = line_sender_buffer_new_qwp();
+            assert!(!buffer.is_null());
+
+            questdb_db_close(db);
+
+            assert!(!row_sender_flush(sender, buffer, &mut err));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "QuestDb pool is closed",
+            );
+
+            questdb_db_return_row_sender(ptr::null_mut(), sender);
+            line_sender_buffer_free(buffer);
+        }
+    }
+
+    #[cfg(feature = "sync-reader-ws")]
+    #[test]
+    fn pooled_reader_rejects_prepare_after_db_close_and_closes_safely() {
+        let server = PooledQwpMock::spawn(2);
+        unsafe {
+            let mut err = ptr::null_mut();
+            let conf = server.conf();
+            let db = egress::questdb_db_connect_reader(
+                conf.as_ptr() as *const c_char,
+                conf.len(),
+                &mut err,
+            );
+            assert!(!db.is_null());
+            assert!(err.is_null());
+
+            let reader = egress::questdb_db_borrow_reader(db, &mut err);
+            assert!(!reader.is_null());
+            assert!(err.is_null());
+
+            questdb_db_close(db);
+
+            let query = egress::reader_prepare(reader, utf8(b"select 1"), &mut err);
+            assert!(query.is_null());
+            assert_reader_error_contains(
+                &mut err,
+                egress::reader_error_code::reader_error_invalid_api_call,
+                "QuestDb pool is closed",
+            );
+
+            egress::reader_close(reader);
         }
     }
 

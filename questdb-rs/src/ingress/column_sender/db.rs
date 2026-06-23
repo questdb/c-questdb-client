@@ -456,8 +456,9 @@ impl QuestDb {
     /// FFI escape hatch: like [`Self::borrow_column_sender`] but the returned
     /// handle is not lifetime-bound to `&self`. Carries an `Arc<DbInner>`
     /// internally so it can outlive the user-facing `QuestDb` pointer
-    /// (the pool's free list and reaper stay alive as long as any
-    /// borrow is outstanding).
+    /// (the pool's return path stays alive as long as any borrow is
+    /// outstanding; after pool close, returned handles are dropped instead of
+    /// recycled).
     ///
     /// Hidden from the Rust API because Rust callers should prefer the
     /// lifetime-bound `borrow_column_sender`, which catches use-after-close at
@@ -547,6 +548,12 @@ impl QuestDb {
 
     fn pick_row_sender(&self) -> Result<Sender> {
         let mut state = lock_row_sender_state(&self.inner.row_sender_state);
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QuestDb pool is closed; cannot borrow row sender"
+            ));
+        }
         if let Some(entry) = state.free.pop() {
             state.in_use += 1;
             drop(state);
@@ -576,6 +583,12 @@ impl QuestDb {
     }
 
     fn pick_replacement_sender(&self) -> Result<ColumnSender> {
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QuestDb pool is closed; cannot replace column sender"
+            ));
+        }
         if self.inner.sfa_mode {
             return Err(error::fmt!(
                 InvalidApiCall,
@@ -612,8 +625,12 @@ impl QuestDb {
         reap_idle_inner(&self.inner)
     }
 
-    /// Close the pool: stop the reaper (if any), drop all idle connections,
-    /// and consume `self`.
+    /// Close the pool: stop the reaper (if any), reject future borrows, drop
+    /// all idle connections, and consume `self`.
+    ///
+    /// FFI-owned outstanding handles remain return/drop-safe through their
+    /// internal pool reference, but return after close drops the connection
+    /// instead of recycling it.
     ///
     /// Drop has the same effect; `close` exists for parity with the C ABI
     /// (where `Drop` is not available) and to give callers a place to handle
@@ -725,6 +742,12 @@ impl QuestDb {
     fn pick_reader(&self) -> crate::egress::error::Result<Reader> {
         use crate::egress::error::{Error as EgressError, ErrorCode as EgressErrorCode};
         let mut state = lock_reader_state(&self.inner.reader_state);
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return Err(EgressError::new(
+                EgressErrorCode::InvalidApiCall,
+                "QuestDb pool is closed; cannot borrow reader",
+            ));
+        }
         if let Some(entry) = state.free.pop() {
             state.in_use += 1;
             drop(state);
@@ -794,7 +817,9 @@ impl Drop for QuestDb {
         if let Some(handle) = self.reaper.take() {
             let _ = handle.join();
         }
-        // Remaining free senders are dropped when `inner` (Arc) hits 0.
+        // Close idle resources now. Outstanding borrows hold their own Arc and
+        // will be dropped instead of recycled when they return after shutdown.
+        drain_idle_inner(&self.inner);
     }
 }
 
@@ -941,10 +966,10 @@ impl Drop for BorrowedColumnSender<'_> {
 
 /// Owned (lifetime-free) variant of [`BorrowedColumnSender`] used by the C FFI.
 ///
-/// Holds an `Arc<DbInner>` so the pool's state outlives the user-facing
-/// `QuestDb` pointer — the C ABI can free its `questdb_db*` before
-/// dropping outstanding `column_sender*` handles without invalidating the
-/// free list / mutex.
+/// Holds an `Arc<DbInner>` so the pool's return path outlives the
+/// user-facing `QuestDb` pointer — the C ABI can free its `questdb_db*`
+/// before dropping outstanding `column_sender*` handles. After pool close,
+/// returned handles are dropped instead of recycled.
 #[doc(hidden)]
 pub struct OwnedColumnSender {
     inner: Arc<DbInner>,
@@ -965,6 +990,13 @@ impl OwnedColumnSender {
         self.sender
             .as_ref()
             .expect("OwnedColumnSender already returned to the pool")
+    }
+
+    /// `true` after the originating pool has been closed. FFI callers use
+    /// this to reject new work on checked-out handles while still allowing
+    /// return/drop to clean up safely.
+    pub fn pool_closed(&self) -> bool {
+        self.inner.shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -1052,7 +1084,7 @@ fn return_row_sender_to_pool(inner: &Arc<DbInner>, sender: Sender, must_close: b
     let must_close = must_close || sender.must_close();
     let mut state = lock_row_sender_state(&inner.row_sender_state);
     state.in_use = state.in_use.saturating_sub(1);
-    if !must_close {
+    if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
         state.free.push(RowSenderPoolEntry {
             sender,
             last_idle_at: Instant::now(),
@@ -1064,12 +1096,12 @@ fn return_row_sender_to_pool(inner: &Arc<DbInner>, sender: Sender, must_close: b
 /// Owned, non-lifetime-bound row-major [`Sender`] borrowed from a [`QuestDb`]
 /// pool — the row-sender analogue of [`OwnedColumnSender`].
 ///
-/// Holds an `Arc<DbInner>` so the pool's state outlives the user-facing
-/// `QuestDb` pointer: the C ABI can free its `questdb_db*` before dropping
-/// outstanding `row_sender*` handles without invalidating the free list /
-/// mutex. On `Drop` the sender is returned to the row-sender pool unless it
-/// (or the caller, via [`Self::mark_must_close`]) marked it must-close, in
-/// which case it is dropped and the next borrow opens a fresh one.
+/// Holds an `Arc<DbInner>` so the pool's return path outlives the
+/// user-facing `QuestDb` pointer: the C ABI can free its `questdb_db*`
+/// before dropping outstanding `row_sender*` handles. On `Drop` the sender
+/// is returned to the row-sender pool unless it (or the caller, via
+/// [`Self::mark_must_close`]) marked it must-close, or the pool has been
+/// closed, in which case it is dropped and the next borrow opens a fresh one.
 #[doc(hidden)]
 pub struct OwnedRowSender {
     inner: Arc<DbInner>,
@@ -1100,9 +1132,17 @@ impl OwnedRowSender {
     }
 
     /// `true` if this sender will be dropped rather than recycled on return —
-    /// either marked explicitly or its connection latched must-close.
+    /// either marked explicitly, its connection latched must-close, or the
+    /// originating pool has been closed.
     pub fn must_close(&self) -> bool {
-        self.must_close || self.sender.as_ref().is_some_and(|s| s.must_close())
+        self.must_close
+            || self.inner.shutdown.load(Ordering::SeqCst)
+            || self.sender.as_ref().is_some_and(|s| s.must_close())
+    }
+
+    /// `true` after the originating pool has been closed.
+    pub fn pool_closed(&self) -> bool {
+        self.inner.shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -1196,10 +1236,12 @@ impl Drop for BorrowedReader<'_> {
 ///
 /// Holds an `Arc<DbInner>` for the same reason [`OwnedColumnSender`] does: the
 /// C ABI can free its `questdb_db*` pointer before dropping outstanding
-/// reader handles without invalidating the free list / mutex.
+/// reader handles. After pool close, returned readers are dropped instead of
+/// recycled.
 ///
 /// `must_close` short-circuits the return path: when set, the reader is
-/// dropped instead of being returned to the pool. The egress-side
+/// dropped instead of being returned to the pool. Pool shutdown has the same
+/// effect. The egress-side
 /// cursor lifecycle uses this to force-close readers whose underlying
 /// transport has been torn down by a mid-stream cursor drop.
 #[cfg(feature = "_egress")]
@@ -1275,6 +1317,11 @@ impl ReaderPoolHandle {
         return_reader_to_pool(&self.inner, reader, must_close);
     }
 
+    /// `true` after the originating pool has been closed.
+    pub fn pool_closed(&self) -> bool {
+        self.inner.shutdown.load(Ordering::SeqCst)
+    }
+
     /// Release the `in_use` slot that was reserved when this reader
     /// was borrowed, without returning the `Reader` itself. Used by
     /// the FFI leak-on-active path: when a `reader_close` arrives
@@ -1293,7 +1340,7 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
     let must_close = must_close || reader.transport_torn_down();
     let mut state = lock_reader_state(&inner.reader_state);
     state.in_use = state.in_use.saturating_sub(1);
-    if !must_close {
+    if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
         state.free.push(ReaderPoolEntry {
             reader,
             last_idle_at: Instant::now(),
@@ -1307,6 +1354,12 @@ fn return_reader_to_pool(inner: &Arc<DbInner>, reader: Reader, must_close: bool)
 fn pick_column_sender_inner(inner: &Arc<DbInner>) -> Result<ColumnSender> {
     let slot = {
         let mut state = lock_state(&inner.state);
+        if inner.shutdown.load(Ordering::SeqCst) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QuestDb pool is closed; cannot borrow column sender"
+            ));
+        }
         if let Some(entry) = state.free.pop() {
             state.in_use += 1;
             drop(state);
@@ -1449,7 +1502,7 @@ fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {
     record_sender_transport_failure(inner, &sender);
     let mut state = lock_state(&inner.state);
     state.in_use = state.in_use.saturating_sub(1);
-    if !must_close {
+    if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
         state.free.push(PoolEntry {
             sender,
             last_idle_at: Instant::now(),
@@ -1462,7 +1515,7 @@ fn finish_replaced_sender(inner: &Arc<DbInner>, sender: ColumnSender) {
     let must_close = sender.must_close();
     record_sender_transport_failure(inner, &sender);
     let mut state = lock_state(&inner.state);
-    if !must_close && state.total() < inner.pool_max {
+    if !must_close && !inner.shutdown.load(Ordering::SeqCst) && state.total() < inner.pool_max {
         state.free.push(PoolEntry {
             sender,
             last_idle_at: Instant::now(),
@@ -1525,6 +1578,47 @@ fn reap_idle_inner(inner: &DbInner) -> usize {
     {
         dropped += reap_idle_readers(inner);
     }
+    dropped
+}
+
+fn drain_idle_inner(inner: &DbInner) -> usize {
+    let mut dropped = drain_idle_senders(inner);
+    dropped += drain_idle_row_senders(inner);
+    #[cfg(feature = "_egress")]
+    {
+        dropped += drain_idle_readers(inner);
+    }
+    dropped
+}
+
+fn drain_idle_senders(inner: &DbInner) -> usize {
+    let to_drop: Vec<ColumnSender> = {
+        let mut state = lock_state(&inner.state);
+        state.free.drain(..).map(|entry| entry.sender).collect()
+    };
+    let dropped = to_drop.len();
+    drop(to_drop);
+    dropped
+}
+
+fn drain_idle_row_senders(inner: &DbInner) -> usize {
+    let to_drop: Vec<Sender> = {
+        let mut state = lock_row_sender_state(&inner.row_sender_state);
+        state.free.drain(..).map(|entry| entry.sender).collect()
+    };
+    let dropped = to_drop.len();
+    drop(to_drop);
+    dropped
+}
+
+#[cfg(feature = "_egress")]
+fn drain_idle_readers(inner: &DbInner) -> usize {
+    let to_drop: Vec<Reader> = {
+        let mut state = lock_reader_state(&inner.reader_state);
+        state.free.drain(..).map(|entry| entry.reader).collect()
+    };
+    let dropped = to_drop.len();
+    drop(to_drop);
     dropped
 }
 

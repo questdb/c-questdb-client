@@ -562,12 +562,19 @@ enum ReaderOwnership {
     /// Closed via `reader_close` — the inner `Reader` is dropped.
     Standalone,
     /// Borrowed from a `questdb_db` pool via `questdb_db_borrow_reader`.
-    /// On close, returned to the pool unless `must_close` is set, in
-    /// which case it is dropped.
+    /// On close, returned to the pool unless `must_close` is set or the
+    /// pool has been closed, in which case it is dropped.
     Pooled {
         handle: questdb::ingress::column_sender::ReaderPoolHandle,
         must_close: AtomicBool,
     },
+}
+
+unsafe fn pooled_reader_pool_closed(reader: *const reader) -> bool {
+    match unsafe { &(*reader).ownership } {
+        ReaderOwnership::Standalone => false,
+        ReaderOwnership::Pooled { handle, .. } => handle.pool_closed(),
+    }
 }
 
 /// Construct a reader from a QuestDB config string.
@@ -1822,6 +1829,14 @@ pub unsafe extern "C" fn reader_prepare(
                 err_out,
                 ErrorCode::InvalidApiCall,
                 "reader_prepare: NULL reader handle",
+            );
+            return ptr::null_mut();
+        }
+        if pooled_reader_pool_closed(reader) {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "reader_prepare: QuestDb pool is closed",
             );
             return ptr::null_mut();
         }
@@ -4198,7 +4213,7 @@ pub unsafe extern "C" fn questdb_db_connect_reader(
 /// `reader_from_conf`: cursor lifecycle, stat getters, and
 /// failover all work the same. On `reader_close` the reader is
 /// returned to the pool (or dropped if it was marked must-close via
-/// `reader_mark_must_close`).
+/// `reader_mark_must_close`, or if the pool has been closed).
 #[cfg(feature = "sync-reader-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_borrow_reader(

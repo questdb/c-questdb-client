@@ -63,7 +63,9 @@ extern "C" {
  * Opaque handles
  * ------------------------------------------------------------------------- */
 
-/** Connection pool. Thread-safe; share across threads. */
+/** Connection pool. Thread-safe for borrow/return/reap operations while the
+ *  owning handle remains open. `questdb_db_close` is the final owner release:
+ *  do not call it concurrently with other operations on the same `db`. */
 typedef struct questdb_db questdb_db;
 
 /** Borrowed QWP/WS connection. Not thread-safe; belongs to the borrowing
@@ -150,10 +152,15 @@ questdb_db* questdb_db_connect(
     line_sender_error** err_out);
 
 /**
- * Close the pool and all its connections. Accepts NULL and no-ops.
- * Outstanding `column_sender` handles remain valid and return their
- * connections on `questdb_db_return_column_sender` — the pool's state is
- * reference-counted internally.
+ * Close the pool. Accepts NULL and no-ops.
+ *
+ * Final owner release: callers must ensure no other thread is concurrently
+ * using `db` for borrow/reap/config operations. This invalidates `db` for
+ * new borrows and closes idle connections.
+ * Outstanding `column_sender` handles are independent leases: returning or
+ * dropping them after close is safe, but new operations on them fail with
+ * `line_sender_error_invalid_api_call`. A handle returned after close is
+ * closed, not recycled.
  */
 QUESTDB_CLIENT_API
 void questdb_db_close(questdb_db* db);
@@ -201,6 +208,7 @@ uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);
 /**
  * Return a conn to the pool. Accepts NULL `conn` and no-ops.
  * Invalidates the `conn` pointer; do not use it after this call.
+ * If the pool has been closed, the conn is closed instead of recycled.
  *
  * `db` is currently ignored — the conn carries its own reference to
  * the pool — but accepted for symmetry with the borrow call.
@@ -252,8 +260,9 @@ size_t questdb_db_reap_idle(questdb_db* db);
 
 /**
  * `true` if the connection is in a permanently-unusable state (latched
- * by any writer that hits a transport or protocol error). On return to
- * the pool such conns are dropped, not recycled.
+ * by any writer that hits a transport or protocol error), or if the
+ * originating pool has been closed. On return to the pool such conns are
+ * dropped, not recycled.
  */
 QUESTDB_CLIENT_API
 bool column_sender_must_close(const column_sender* conn);
@@ -320,8 +329,9 @@ void questdb_db_drop_row_sender(
 
 /**
  * `true` if the row sender will be dropped rather than recycled on return
- * (it was force-marked, or a flush left the connection unusable), or if
- * `sender` is NULL. `false` only when it is safely reusable.
+ * (it was force-marked, a flush left the connection unusable, or the
+ * originating pool has been closed), or if `sender` is NULL. `false` only
+ * when it is safely reusable.
  */
 QUESTDB_CLIENT_API
 bool row_sender_must_close(const row_sender* sender);

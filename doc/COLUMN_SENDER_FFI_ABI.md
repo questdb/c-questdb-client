@@ -141,7 +141,10 @@ inputs.
 
 - A `questdb_db` (the pool) is **thread-safe**. Share it across
   threads. `questdb_db_borrow_column_sender` and `questdb_db_return_column_sender`
-  are safe to call concurrently.
+  are safe to call concurrently while the owner handle remains open.
+  `questdb_db_close` is the final owner release, not a concurrent pool
+  operation: callers must quiesce all db-level borrow/reap/config calls on
+  that `questdb_db*` before closing it.
 - A `column_sender` (a borrow) is **not thread-safe**. It belongs to
   the borrowing thread until returned. Do not pass it across threads.
 - A `column_sender_chunk` is owned by one thread at a time. It is
@@ -261,10 +264,14 @@ questdb_db* questdb_db_connect(
     line_sender_error** err_out);
 
 /**
- * Close the pool and all its connections. Accepts NULL and no-ops.
- * Senders still checked out are invalidated; calls on them return
- * line_sender_error_invalid_api_call. Callers must not call close()
- * while any thread is mid-flush or mid-sync on a borrowed sender.
+ * Close the pool. Accepts NULL and no-ops.
+ * Final owner release: callers must ensure no other thread is concurrently
+ * using db for borrow/reap/config operations. This invalidates db for new
+ * borrows and closes idle connections.
+ * Senders still checked out are independent leases: return/drop is
+ * safe after pool close, but new operations on them return
+ * line_sender_error_invalid_api_call. A sender returned after close is
+ * closed, not recycled. Calls already inside flush/sync may finish.
  */
 QUESTDB_CLIENT_API
 void questdb_db_close(questdb_db* db);
@@ -314,7 +321,8 @@ size_t questdb_db_reap_idle(questdb_db* db);
  *
  * If the conn is in a latched-error state (`column_sender_must_close()`
  * == true), its underlying connection is closed and dropped from the
- * pool instead of returned.
+ * pool instead of returned. If the pool has been closed, the connection
+ * is closed rather than recycled.
  */
 QUESTDB_CLIENT_API
 void questdb_db_return_column_sender(
