@@ -170,9 +170,9 @@ stages:
       #
       # Scope note: the nightly image is Linux/amd64 only, so the
       # mac/windows fuzz legs stay from-source, as does any run that must
-      # test a specific commit not yet in nightly. QWP UDP is not
-      # exercised here (it is gated on `--repo` in test.py); that
-      # coverage still runs in the from-source jobs.
+      # test a specific commit not yet in nightly. QWP/UDP runs here too:
+      # the matrix enables the server's qwp.udp receiver (qwp_udp=True in
+      # test.py), and the from-source jobs cover it as well.
       - job: TestVsQuestDBNightly
         displayName: "Vs QuestDB nightly (docker)"
         pool:

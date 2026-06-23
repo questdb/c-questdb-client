@@ -108,10 +108,6 @@ SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 SUITE_QWP_WS_FUZZ = 'qwp_ws_fuzz'
 QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
-# The first QuestDB version that supports array types.
-FIRST_ARRAYS_RELEASE = (8, 3, 3)
-DECIMAL_RELEASE = (9, 2, 0)
-QWP_MIN_RELEASE = (9, 4, 3)
 QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
     "57896044618658097711785492504343953926634992332820282019728792003956564819968")
 QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
@@ -436,14 +432,7 @@ class TestSender(unittest.TestCase):
         if QDB_FIXTURE.protocol_version is None:
             if not QDB_FIXTURE.http:
                 return qls.ProtocolVersion.V1
-
-            if QDB_FIXTURE.version >= FIRST_ARRAYS_RELEASE:
-                return qls.ProtocolVersion.V2
-
-            if QDB_FIXTURE.version >= DECIMAL_RELEASE:
-                return qls.ProtocolVersion.V3
-
-            return qls.ProtocolVersion.V1
+            return qls.ProtocolVersion.V2
 
         return QDB_FIXTURE.protocol_version
 
@@ -864,8 +853,6 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_decimal_column(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
         if self.expected_protocol_version < qls.ProtocolVersion.V3:
             self.skipTest('communicating over old protocol which does not support decimals')
 
@@ -902,8 +889,6 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_decimal_invalid_characters(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
         if self.expected_protocol_version < qls.ProtocolVersion.V3:
             self.skipTest('communicating over old protocol which does not support decimals')
 
@@ -914,20 +899,6 @@ class TestSender(unittest.TestCase):
                     (sender
                     .table(table_name)
                     .column_dec_str('dec', "12.34abc")
-                    .at_now())
-
-    def test_decimal_not_available(self):
-        if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
-            self.skipTest('Decimal support is available in this version of QuestDB.')
-        if self.expected_protocol_version >= qls.ProtocolVersion.V3:
-            self.skipTest('communicating over new protocol which supports decimals')
-        table_name = uuid.uuid4().hex
-        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
-            with self._mk_linesender() as sender:
-                with self.assertRaisesRegex(qls.SenderError, r'.*does not support the decimal datatype*'):
-                    (sender
-                    .table(table_name)
-                    .column('dec', Decimal("12.34"))
                     .at_now())
 
     def test_f64_arr_column(self):
@@ -1186,9 +1157,6 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_c_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -1196,9 +1164,6 @@ class TestSender(unittest.TestCase):
             f'c_trades{suffix}')
 
     def test_cpp_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -1206,18 +1171,12 @@ class TestSender(unittest.TestCase):
             f'cpp_trades{suffix}')
 
     def test_c_tls_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         self._test_example(
             'line_sender_c_example_tls_ca',
             'c_trades_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         self._test_example(
             'line_sender_cpp_example_tls_ca',
             'cpp_trades_tls_ca',
@@ -1521,14 +1480,6 @@ class QwpWsTestSupport:
     TS_STEP_US = 1_000
 
     @staticmethod
-    def _require_qwp_ws_protocol():
-        if QDB_FIXTURE.version < QWP_MIN_RELEASE:
-            raise unittest.SkipTest(
-                f'Server version {".".join(map(str, QDB_FIXTURE.version))} does not '
-                'support the QWP protocol version we can test. Minimum version we need: '
-                f'(QuestDB >= {".".join(map(str, QWP_MIN_RELEASE))})')
-
-    @staticmethod
     def _create_qwp_ws_table(table_name):
         sql_query(
             f'CREATE TABLE "{table_name}" '
@@ -1676,8 +1627,7 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
     def _require_smoke_fixture(self):
-        self._require_qwp_ws_protocol()
-        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+        if not isinstance(QDB_FIXTURE, (QuestDbFixture, QuestDbDockerFixture)):
             self.skipTest('QWP/WebSocket smoke tests require a managed QuestDB fixture')
         if QDB_FIXTURE.auth:
             self.skipTest('QWP/WebSocket smoke tests use HTTP auth, not line TCP auth')
@@ -1801,8 +1751,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
     def _require_protocol_fixture(self):
-        self._require_qwp_ws_protocol()
-        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+        if not isinstance(QDB_FIXTURE, (QuestDbFixture, QuestDbDockerFixture)):
             self.skipTest('QWP/WebSocket protocol tests require a managed QuestDB fixture')
         if QDB_FIXTURE.auth:
             self.skipTest('QWP/WebSocket protocol tests run without line TCP auth')
@@ -1996,17 +1945,8 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
     def _require_restart_fixture(self):
-        self._require_qwp_ws_protocol()
         if not isinstance(QDB_FIXTURE, QuestDbFixture):
             self.skipTest('QWP/WebSocket restart tests require a managed QuestDB fixture')
-        root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-        # QWP/WebSocket restart coverage currently requires a repo-built
-        # QuestDB because the fixed release matrix still uses 9.2.0, which
-        # does not expose the QWP/WebSocket endpoint. After QWP/WebSocket
-        # server support is released, replace this repo-only guard with a
-        # capability or version gate so release fixtures run these tests too.
-        if root_dir is not None and root_dir.name != 'repo':
-            self.skipTest('QWP/WebSocket restart tests require a QuestDB repo fixture')
         if QDB_FIXTURE.auth:
             self.skipTest('QWP/WebSocket restart tests run without auth')
         if getattr(QDB_FIXTURE, 'http_auth', False):
@@ -2368,13 +2308,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                 f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {self.id()}')
 
     def _require_fuzz_fixture(self):
-        self._require_qwp_ws_protocol()
         if isinstance(QDB_FIXTURE, QuestDbFixture):
-            # Same repo-only gate as TestQwpWsRestart: the release-matrix server
-            # builds on the fixed version list do not expose QWP/WebSocket.
-            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
-            if root_dir is not None and root_dir.name != 'repo':
-                self.skipTest('QWP/WebSocket fuzz tests require a QuestDB repo fixture')
             if QDB_FIXTURE.http:
                 self.skipTest('QWP/WebSocket fuzz tests run outside the HTTP ILP matrix')
         elif not isinstance(QDB_FIXTURE, QuestDbExternalFixture):
@@ -3200,10 +3134,8 @@ class TestQwpUdpSender(unittest.TestCase):
         return f'{base}.{remaining_ns:09d}Z'
 
     def _require_qwp_udp_system_test(self):
-        # TODO: Remove this repo-only gate once QWP/UDP receiver support is
-        # available in released QuestDB builds.
         if not getattr(QDB_FIXTURE, 'qwp_udp', False):
-            self.skipTest('QWP/UDP system test requires repo-backed QWP receiver support')
+            self.skipTest('QWP/UDP system test requires a fixture with the QWP/UDP receiver enabled')
         if QDB_FIXTURE.http:
             self.skipTest('QWP/UDP test only runs in the non-HTTP pass')
         if QDB_FIXTURE.auth:
@@ -3385,9 +3317,6 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_f64_array_columns_round_trip_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < FIRST_ARRAYS_RELEASE:
-            self.skipTest('No array support in this version of QuestDB.')
-
         table_name = 'qwp_arr_' + uuid.uuid4().hex[:8]
         array1 = np.array(
             [
@@ -3423,9 +3352,6 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_decimal_columns_round_trip_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         table_name = 'qwp_dec_' + uuid.uuid4().hex[:8]
         sql_query(
             f"CREATE TABLE '{table_name}' ("
@@ -3466,9 +3392,6 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_decimal_signed_overflow_is_rejected_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         table_name = 'qwp_dec_over_' + uuid.uuid4().hex[:8]
         with self._mk_qwpudp_sender() as sender:
             (sender
@@ -3480,9 +3403,6 @@ class TestQwpUdpSender(unittest.TestCase):
 
     def test_decimal_signed_rescale_overflow_is_rejected_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
-        if QDB_FIXTURE.version < DECIMAL_RELEASE:
-            self.skipTest('No decimal support in this version of QuestDB.')
-
         table_name = 'qwp_dec_scale_' + uuid.uuid4().hex[:8]
         with self._mk_qwpudp_sender() as sender:
             (sender
@@ -4283,7 +4203,7 @@ def run_with_fixtures(args):
                     questdb_dir,
                     is_docker,
                     auth=auth,
-                    qwp_udp=bool(getattr(args, 'repo', None)))
+                    qwp_udp=True)
                 TLS_PROXY_FIXTURE = None
                 try:
                     sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')

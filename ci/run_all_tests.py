@@ -77,10 +77,13 @@ def main():
     run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
     for _, path in test_paths:
         run_cmd(str(path))
-    # Test against QuestDB master (QWP/Arrow not yet in a release). Switch back
-    # to the `--versions` lines below once a release ships it.
+    # Test against a from-source build of QuestDB master (--repo): master is
+    # ahead of the latest release, so this catches server-side regressions
+    # before they ship. QWP/Arrow is released as of 9.4.3, so the `--versions`
+    # alternative below now exercises the same features against a fixed
+    # release; swap to it to test a release instead of master.
     run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
-    # qdb_v = '9.4.1'
+    # qdb_v = '9.4.3'  # first release shipping QWP/Arrow; QWP/WS needs >= this
     # run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
 
 
