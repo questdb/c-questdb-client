@@ -1069,7 +1069,13 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
         # `docker stop` sends SIGTERM (graceful: the JVM runs shutdown
         # hooks), then SIGKILLs after the grace period. Equivalent to
         # QuestDbFixture.stop()'s terminate()-then-kill().
-        self._remove_container(['stop', '-t', str(wait_timeout_sec)])
+        #
+        # docker's `-t` takes integer seconds; bounce callers pass a float
+        # budget (e.g. 120.0), which docker rejects ("invalid argument") —
+        # coerce to int so the graceful grace period is honoured rather
+        # than silently skipped, leaving only the immediate `rm -f`.
+        self._remove_container(
+            ['stop', '-t', str(int(wait_timeout_sec))])
 
     def kill(self):
         # `docker kill` sends SIGKILL: an ungraceful crash with no
