@@ -2302,6 +2302,24 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     POLL_INTERVAL_SEC = 0.05
     DRAIN_TIMEOUT_SEC = 120
 
+    # A bounce makes the server unavailable for a whole stop() + start()
+    # cycle. BOUNCE_RESTART_TIMEOUT_SEC caps only the start (restart) leg;
+    # the stop leg is capped separately by the load's bounce_stop_timeout_s.
+    # A leg that overruns its cap raises inside the bounce thread, failing
+    # the run with a correctly-attributed infra error (server too slow to
+    # stop / restart). Keep the restart cap well above a healthy restart
+    # (~6-40s on CI) so only a genuinely stuck boot trips it.
+    #
+    # The client-side budgets that must survive a bounce — close_drain and
+    # reconnect — are sized at runtime to exceed the whole stop+restart
+    # down-window (see _producer_loop, and the bounce wind-down in
+    # _run_fuzz). A healthy-but-slow bounce therefore can never strand a
+    # producer mid-drain: only a leg that overruns its own cap (attributed
+    # in the bounce thread) or a real client-side failure trips those
+    # budgets. That keeps a slow bounce from resurfacing as a misleading
+    # client close_drain timeout.
+    BOUNCE_RESTART_TIMEOUT_SEC = 90
+
     def setUp(self):
         self._require_fuzz_fixture()
         seed = qwp_ws_fuzz.derive_master_seed()
@@ -2509,6 +2527,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     min_interval_s=fuzz.min_bounce_interval_s,
                     max_interval_s=fuzz.max_bounce_interval_s,
                     stop_timeout_s=fuzz.bounce_stop_timeout_s,
+                    restart_timeout_s=self.BOUNCE_RESTART_TIMEOUT_SEC,
                     writers_done=producers_done,
                     stop_event=stop_event,
                     record_failure=record_failure,
@@ -2529,12 +2548,27 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     alter_thread.join(timeout=30)
 
             if bounce_thread is not None:
-                # Bounces are inherently slower (process restart + HTTP-up
-                # wait), so give the thread a generous wind-down budget.
-                bounce_thread.join(timeout=60)
+                # Once producers_done is set the thread starts no new bounce,
+                # but it finishes any in-flight one first. Size the wind-down
+                # to a whole cycle — stop() (≤ bounce_stop_timeout_s) +
+                # start() (≤ BOUNCE_RESTART_TIMEOUT_SEC), with headroom — so a
+                # healthy-but-slow last bounce completes before verification.
+                # join() returns the instant the thread exits, so this ceiling
+                # is only ever reached by a genuinely stuck lifecycle.
+                wind_down_sec = (
+                    fuzz.bounce_stop_timeout_s
+                    + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
+                stop_event.set()
+                bounce_thread.join(timeout=wind_down_sec)
                 if bounce_thread.is_alive():
-                    stop_event.set()
-                    bounce_thread.join(timeout=60)
+                    # A thread still mutating the fixture here would race the
+                    # verification queries and teardown on shared _proc/_log
+                    # state. Attribute it as the stuck lifecycle it is rather
+                    # than let it resurface as a downstream query failure.
+                    record_failure(
+                        f'fuzz bounce: thread still alive '
+                        f'{wind_down_sec:.0f}s after producers finished; '
+                        f'server lifecycle is stuck')
                 if bounce_thread.bounces_performed > 0:
                     self._log(
                         f'fuzz bounce summary: '
@@ -2567,11 +2601,19 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
-        # `reconnect_max_duration_millis` is the explicit knob; the
-        # library auto-promotes `initial_connect_retry` to `sync` when
-        # any `reconnect_*` key is set, so a producer that races a
-        # bounce reuses the same 120s budget on its very first connect
-        # instead of getting one shot.
+        # Reconnect and close_drain share one budget, sized to outlast the
+        # worst-case single-bounce down-window: a full graceful stop()
+        # (bounded by the load's bounce_stop_timeout_s) plus a restart
+        # (bounded by BOUNCE_RESTART_TIMEOUT_SEC), with headroom. A
+        # healthy-but-slow bounce therefore never strands a producer
+        # mid-drain; a stop or restart that overruns its own cap fails in
+        # the bounce thread (correctly attributed), and only a real
+        # client-side failure trips this budget. The two knobs are kept
+        # equal on purpose: a reconnect that gave up earlier than the drain
+        # would fail the drain mid-window even though it had budget left.
+        client_budget_millis = int(
+            (fuzz.bounce_stop_timeout_s + self.BOUNCE_RESTART_TIMEOUT_SEC + 30)
+            * 1000)
         conf = self._sender_conf(
             sender_id,
             sf_root,
@@ -2580,8 +2622,12 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # connect, the producer that races the bounce fails fast with
             # an upgrade-response read error. `sync` makes the constructor
             # wait through the bounce up to reconnect_max_duration_millis.
+            # (The library auto-promotes initial_connect_retry to `sync`
+            # when any reconnect_* key is set, so the racing producer reuses
+            # this same budget on its very first connect instead of getting
+            # one shot.)
             initial_connect_retry='sync',
-            reconnect_max_duration_millis=120000,
+            reconnect_max_duration_millis=client_budget_millis,
             # The bounce tests restart the server faster than the reconnect
             # backoff cap can track, so the client keeps backing off and
             # misses the brief windows the server is up between restarts —
@@ -2590,10 +2636,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # the non-bounce tests, which never reconnect, so the backoff
             # never engages.)
             reconnect_max_backoff_millis=250,
-            # 2 min on close_drain — bounce-test variants need a long
-            # enough budget for SFA to replay queued frames into a
-            # freshly-restarted server.
-            close_flush_timeout_millis=120000)
+            close_flush_timeout_millis=client_budget_millis)
         try:
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
