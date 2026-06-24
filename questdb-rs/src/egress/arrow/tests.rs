@@ -376,19 +376,67 @@ fn symbol_values_cache_reuses_then_rebuilds_on_growth() {
 
     let b1 = sym_batch(vec![0, 1]);
     let sch = Arc::new(batch_arrow_schema(&s, &b1).unwrap());
-    let rb1 = batch_to_record_batch_with(sch.clone(), &s, b1, &dict, &mut cache).unwrap();
+    let rb1 = batch_to_record_batch_with(sch.clone(), &s, b1, &dict, &mut cache, None).unwrap();
     assert_eq!(resolve(&rb1), vec!["a", "b"]);
 
     // Same dict → cached values reused; still correct.
-    let rb2 = batch_to_record_batch_with(sch.clone(), &s, sym_batch(vec![1, 0]), &dict, &mut cache)
-        .unwrap();
+    let rb2 = batch_to_record_batch_with(
+        sch.clone(),
+        &s,
+        sym_batch(vec![1, 0]),
+        &dict,
+        &mut cache,
+        None,
+    )
+    .unwrap();
     assert_eq!(resolve(&rb2), vec!["b", "a"]);
 
     // Dict grows → cache rebuilds; the new code resolves.
     dict.apply_delta(2, [b"c".as_slice()]).unwrap();
-    let rb3 =
-        batch_to_record_batch_with(sch, &s, sym_batch(vec![2, 0]), &dict, &mut cache).unwrap();
+    let rb3 = batch_to_record_batch_with(sch, &s, sym_batch(vec![2, 0]), &dict, &mut cache, None)
+        .unwrap();
     assert_eq!(resolve(&rb3), vec!["c", "a"]);
+}
+
+#[test]
+fn symbol_compact_keeps_only_referenced_values() {
+    use arrow_array::types::UInt32Type;
+    use arrow_array::{DictionaryArray, StringArray};
+
+    let s = schema_of(&[("sym", ColumnKind::Symbol)]);
+    let mut dict = SymbolDict::new();
+    dict.apply_delta(0, [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()])
+        .unwrap();
+    let batch = decoded_of(
+        3,
+        vec![DecodedColumn::Symbol {
+            codes: vec![2, 0, 2],
+            validity: None,
+            local_dict: None,
+        }],
+    );
+    let sch = Arc::new(batch_arrow_schema(&s, &batch).unwrap());
+    let mut scratch = SymbolBuildScratch::default();
+    let rb = batch_to_record_batch_with(
+        sch,
+        &s,
+        batch,
+        &dict,
+        &mut SymbolValuesCache::default(),
+        Some(&mut scratch),
+    )
+    .unwrap();
+    let d = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    let v = d.values().as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(v.len(), 2);
+    let decoded: Vec<&str> = (0..d.len())
+        .map(|i| v.value(d.keys().value(i) as usize))
+        .collect();
+    assert_eq!(decoded, vec!["c", "a", "c"]);
 }
 
 #[test]

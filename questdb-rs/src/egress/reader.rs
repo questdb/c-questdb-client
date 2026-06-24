@@ -1182,6 +1182,8 @@ impl<'r> ReaderQuery<'r> {
             drifted_batch: None,
             #[cfg(feature = "arrow")]
             sym_values: crate::egress::arrow::SymbolValuesCache::default(),
+            #[cfg(feature = "arrow")]
+            sym_scratch: crate::egress::arrow::SymbolBuildScratch::default(),
             #[cfg(feature = "polars")]
             symbol_registry: None,
             #[cfg(feature = "polars")]
@@ -1469,6 +1471,8 @@ pub struct Cursor<'r> {
     /// across batches until the dict grows (see [`SymbolValuesCache`]).
     #[cfg(feature = "arrow")]
     sym_values: crate::egress::arrow::SymbolValuesCache,
+    #[cfg(feature = "arrow")]
+    sym_scratch: crate::egress::arrow::SymbolBuildScratch,
     /// Per-cursor SYMBOL → polars `Categories`, interned once and grown
     /// incrementally across batches (see [`SymbolRegistry`]).
     #[cfg(feature = "polars")]
@@ -1690,7 +1694,7 @@ impl<'r> Cursor<'r> {
     /// [`Cursor::as_arrow_reader`] for that.
     #[cfg(feature = "arrow")]
     pub fn next_arrow_batch(&mut self) -> Result<Option<arrow_array::RecordBatch>> {
-        self.next_arrow_batch_inner(None)
+        self.next_arrow_batch_inner(None, false)
     }
 
     #[cfg(feature = "arrow")]
@@ -1698,6 +1702,7 @@ impl<'r> Cursor<'r> {
     pub fn next_arrow_batch_inner(
         &mut self,
         expected_schema: Option<&arrow_schema::SchemaRef>,
+        compact: bool,
     ) -> Result<Option<arrow_array::RecordBatch>> {
         use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch_with, schemas_equal};
         use std::sync::Arc;
@@ -1782,6 +1787,11 @@ impl<'r> Cursor<'r> {
             decoded,
             &self.reader.dict,
             &mut self.sym_values,
+            if compact {
+                Some(&mut self.sym_scratch)
+            } else {
+                None
+            },
         ) {
             Ok(rb) => Ok(Some(rb)),
             Err(e) => {
@@ -1984,6 +1994,7 @@ impl<'r> Cursor<'r> {
                     #[cfg(feature = "arrow")]
                     {
                         self.sym_values = crate::egress::arrow::SymbolValuesCache::default();
+                        self.sym_scratch = crate::egress::arrow::SymbolBuildScratch::default();
                     }
                     #[cfg(feature = "polars")]
                     {

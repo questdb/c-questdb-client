@@ -32,7 +32,7 @@ impl Cursor<'_> {
     /// [`Cursor::fetch_all_polars`] / [`Cursor::as_arrow_reader`]
     /// for higher-level adapters that pin the schema on first batch.
     pub fn next_polars(&mut self) -> Result<Option<DataFrame>> {
-        match self.next_arrow_batch_inner(None)? {
+        match self.next_arrow_batch_inner(None, false)? {
             None => Ok(None),
             Some(rb) => Ok(Some(self.batch_to_dataframe(rb)?)),
         }
@@ -112,7 +112,7 @@ pub struct CursorPolarsIter<'r, 'c> {
 
 impl<'r, 'c> CursorPolarsIter<'r, 'c> {
     pub(crate) fn new(cursor: &'c mut Cursor<'r>) -> Result<Self> {
-        let first = cursor.next_arrow_batch_inner(None)?.ok_or_else(|| {
+        let first = cursor.next_arrow_batch_inner(None, false)?.ok_or_else(|| {
             Error::new(
                 ErrorCode::NoSchema,
                 "no batch produced; nothing to snapshot",
@@ -163,7 +163,7 @@ impl Iterator for CursorPolarsIter<'_, '_> {
             } else {
                 None
             };
-            match self.cursor.next_arrow_batch_inner(drift_check) {
+            match self.cursor.next_arrow_batch_inner(drift_check, false) {
                 Ok(Some(rb)) => {
                     if self.cursor.failover_resets() != self.resets_at_pin {
                         self.schema = rb.schema();

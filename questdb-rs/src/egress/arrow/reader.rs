@@ -51,7 +51,7 @@ pub struct CursorRecordBatchReader<'r, 'c> {
 
 impl<'r, 'c> CursorRecordBatchReader<'r, 'c> {
     pub(crate) fn new(cursor: &'c mut Cursor<'r>) -> Result<Self, Error> {
-        let first = cursor.next_arrow_batch_inner(None)?.ok_or_else(|| {
+        let first = cursor.next_arrow_batch_inner(None, false)?.ok_or_else(|| {
             Error::new(
                 ErrorCode::NoSchema,
                 "no batch produced; nothing to snapshot",
@@ -103,7 +103,7 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
         } else {
             None
         };
-        match self.cursor.next_arrow_batch_inner(drift_check) {
+        match self.cursor.next_arrow_batch_inner(drift_check, false) {
             Ok(Some(rb)) => {
                 if self.cursor.failover_resets() != self.resets_at_pin {
                     self.schema = rb.schema();

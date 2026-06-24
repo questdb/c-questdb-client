@@ -1981,6 +1981,17 @@ reader_arrow_batch_result reader_cursor_next_arrow_batch(
     struct ArrowArray* out_array,
     struct ArrowSchema* out_schema,
     reader_error** err_out);
+
+/**
+ * As `reader_cursor_next_arrow_batch` but emits each SYMBOL column compact:
+ * only the values it references, with batch-local codes.
+ */
+QUESTDB_CLIENT_API
+reader_arrow_batch_result reader_cursor_next_arrow_batch_compact(
+    reader_cursor* cursor,
+    struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema,
+    reader_error** err_out);
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus

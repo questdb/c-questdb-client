@@ -4032,6 +4032,30 @@ pub unsafe extern "C" fn reader_cursor_next_arrow_batch(
     out_schema: *mut arrow::ffi::FFI_ArrowSchema,
     err_out: *mut *mut reader_error,
 ) -> reader_arrow_batch_result {
+    unsafe { reader_cursor_next_arrow_batch_export(cursor, out_array, out_schema, err_out, false) }
+}
+
+/// As [`reader_cursor_next_arrow_batch`] but emits SYMBOL columns compact:
+/// only referenced values, with batch-local codes.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reader_cursor_next_arrow_batch_compact(
+    cursor: *mut reader_cursor,
+    out_array: *mut arrow::ffi::FFI_ArrowArray,
+    out_schema: *mut arrow::ffi::FFI_ArrowSchema,
+    err_out: *mut *mut reader_error,
+) -> reader_arrow_batch_result {
+    unsafe { reader_cursor_next_arrow_batch_export(cursor, out_array, out_schema, err_out, true) }
+}
+
+#[cfg(feature = "arrow")]
+unsafe fn reader_cursor_next_arrow_batch_export(
+    cursor: *mut reader_cursor,
+    out_array: *mut arrow::ffi::FFI_ArrowArray,
+    out_schema: *mut arrow::ffi::FFI_ArrowSchema,
+    err_out: *mut *mut reader_error,
+    compact: bool,
+) -> reader_arrow_batch_result {
     use arrow_array::{Array, StructArray};
     unsafe {
         if cursor.is_null() {
@@ -4063,7 +4087,7 @@ pub unsafe extern "C" fn reader_cursor_next_arrow_batch(
         let pinned = c.arrow_schema_pin.clone();
         let inner: &mut Cursor<'static> = c.cursor_for_mut();
         let outcome = panic_guard(|| -> NextArrow {
-            let rb = match inner.next_arrow_batch_inner(pinned.as_ref()) {
+            let rb = match inner.next_arrow_batch_inner(pinned.as_ref(), compact) {
                 Ok(Some(rb)) => rb,
                 Ok(None) => return NextArrow::End,
                 Err(e) => return NextArrow::Err(e, None),

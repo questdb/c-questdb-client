@@ -67,6 +67,14 @@ pub(crate) struct SymbolValuesCache {
     values: Option<StringArray>,
 }
 
+const SYMBOL_REMAP_UNSET: u32 = u32::MAX;
+
+#[derive(Default)]
+pub(crate) struct SymbolBuildScratch {
+    remap: Vec<u32>,
+    touched: Vec<u32>,
+}
+
 pub(crate) fn batch_to_record_batch(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
@@ -74,17 +82,26 @@ pub(crate) fn batch_to_record_batch(
     dict: &SymbolDict,
 ) -> Result<RecordBatch> {
     let mut sym_values = SymbolValuesCache::default();
-    batch_to_record_batch_with(schema_ref, egress_schema, batch, dict, &mut sym_values)
+    batch_to_record_batch_with(
+        schema_ref,
+        egress_schema,
+        batch,
+        dict,
+        &mut sym_values,
+        None,
+    )
 }
 
 /// As [`batch_to_record_batch`] but reuses a caller-owned [`SymbolValuesCache`]
 /// so a streaming cursor interns the connection dict once across batches.
+/// A `Some` `sym_scratch` switches SYMBOL columns to the compact builder.
 pub(crate) fn batch_to_record_batch_with(
     schema_ref: Arc<ArrowSchema>,
     egress_schema: &Schema,
     batch: DecodedBatch,
     dict: &SymbolDict,
     sym_values: &mut SymbolValuesCache,
+    mut sym_scratch: Option<&mut SymbolBuildScratch>,
 ) -> Result<RecordBatch> {
     let DecodedBatch {
         row_count, columns, ..
@@ -117,6 +134,7 @@ pub(crate) fn batch_to_record_batch_with(
             row_count,
             dict,
             sym_values,
+            sym_scratch.as_deref_mut(),
             &mut degenerate_node_slack,
         )?);
     }
@@ -124,6 +142,7 @@ pub(crate) fn batch_to_record_batch_with(
         .map_err(|e| fmt!(ProtocolError, "failed to assemble record batch: {}", e))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn column_to_array(
     field: &Field,
     kind: ColumnKind,
@@ -131,6 +150,7 @@ fn column_to_array(
     row_count: usize,
     dict: &SymbolDict,
     sym_values: &mut SymbolValuesCache,
+    sym_scratch: Option<&mut SymbolBuildScratch>,
     degenerate_node_slack: &mut usize,
 ) -> Result<ArrayRef> {
     Ok(match (kind, decoded) {
@@ -214,14 +234,13 @@ fn column_to_array(
                 validity,
                 local_dict,
             },
-        ) => {
-            // Delta columns share the connection dict → one cached values array.
-            // A column-local dict is per-batch, so it builds fresh (uncached).
-            match local_dict.as_ref() {
-                None => symbol_array(codes, validity, dict, row_count, Some(sym_values))?,
-                Some(local) => symbol_array(codes, validity, local, row_count, None)?,
+        ) => match (local_dict.as_ref(), sym_scratch) {
+            (Some(local), _) => symbol_array(codes, validity, local, row_count, None)?,
+            (None, Some(scratch)) => {
+                symbol_array_compact(codes, validity, dict, row_count, scratch)?
             }
-        }
+            (None, None) => symbol_array(codes, validity, dict, row_count, Some(sym_values))?,
+        },
         (ColumnKind::DoubleArray, DecodedColumn::DoubleArray(b)) => array_column_to_arrow(
             field,
             b,
@@ -519,6 +538,129 @@ fn symbol_array(
             dict_data,
         )) as ArrayRef,
     )
+}
+
+fn symbol_array_compact(
+    codes: Vec<u32>,
+    validity: Option<Bytes>,
+    dict: &SymbolDict,
+    row_count: usize,
+    scratch: &mut SymbolBuildScratch,
+) -> Result<ArrayRef> {
+    let nulls = bytes_null_buffer(&validity, row_count)?;
+    if scratch.remap.len() < dict.len() {
+        scratch.remap.resize(dict.len(), SYMBOL_REMAP_UNSET);
+    }
+    let remap = scratch.remap.as_mut_slice();
+    let touched = &mut scratch.touched;
+    let mut union_offsets: Vec<i32> = Vec::with_capacity(dict.len().min(256) + 1);
+    union_offsets.push(0);
+    let mut union_bytes: ABytes = ABytes::new(64);
+    let mut dense = ABytes::with_capacity(64, codes.len() * 4);
+    dense.resize(codes.len() * 4, 0);
+    let build = build_symbol_dense(
+        &codes,
+        nulls.as_ref(),
+        dict,
+        remap,
+        touched,
+        &mut union_offsets,
+        &mut union_bytes,
+        &mut dense[..],
+    );
+    for &code in touched.iter() {
+        remap[code as usize] = SYMBOL_REMAP_UNSET;
+    }
+    touched.clear();
+    build?;
+    let values_data = ArrayDataBuilder::new(DataType::Utf8)
+        .len(union_offsets.len() - 1)
+        .add_buffer(Buffer::from_vec(union_offsets))
+        .add_buffer(Buffer::from(bytes_from_avec(union_bytes)))
+        .build()
+        .map_err(|e| to_arrow_export(e.to_string()))?;
+    let values = StringArray::from(values_data);
+    let dict_data = ArrayDataBuilder::new(DataType::Dictionary(
+        Box::new(DataType::UInt32),
+        Box::new(DataType::Utf8),
+    ))
+    .len(row_count)
+    .add_buffer(Buffer::from(bytes_from_avec(dense)))
+    .add_child_data(values.into_data())
+    .nulls(nulls)
+    .build()
+    .map_err(|e| to_arrow_export(e.to_string()))?;
+    Ok(
+        Arc::new(DictionaryArray::<arrow_array::types::UInt32Type>::from(
+            dict_data,
+        )) as ArrayRef,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_symbol_dense(
+    codes: &[u32],
+    nulls: Option<&NullBuffer>,
+    dict: &SymbolDict,
+    remap: &mut [u32],
+    touched: &mut Vec<u32>,
+    union_offsets: &mut Vec<i32>,
+    union_bytes: &mut ABytes,
+    dense: &mut [u8],
+) -> Result<()> {
+    match nulls {
+        None => {
+            for (row, &code) in codes.iter().enumerate() {
+                let dense_code =
+                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+        Some(n) => {
+            for row in n.valid_indices() {
+                let code = codes[row];
+                let dense_code =
+                    resolve_symbol(code, remap, touched, union_offsets, union_bytes, dict)?;
+                let base = row * 4;
+                dense[base..base + 4].copy_from_slice(&dense_code.to_le_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_symbol(
+    code: u32,
+    remap: &mut [u32],
+    touched: &mut Vec<u32>,
+    union_offsets: &mut Vec<i32>,
+    union_bytes: &mut ABytes,
+    dict: &SymbolDict,
+) -> Result<u32> {
+    let slot = remap
+        .get(code as usize)
+        .copied()
+        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+    if slot != SYMBOL_REMAP_UNSET {
+        return Ok(slot);
+    }
+    let s = dict
+        .get(code)
+        .ok_or_else(|| fmt!(ProtocolError, "symbol code {} not in dict", code))?;
+    union_bytes.extend_from_slice(s.as_bytes());
+    let next_off = i32::try_from(union_bytes.len()).map_err(|_| {
+        fmt!(
+            ProtocolError,
+            "symbol union dictionary exceeds {} bytes",
+            i32::MAX
+        )
+    })?;
+    union_offsets.push(next_off);
+    let assigned = (union_offsets.len() - 2) as u32;
+    remap[code as usize] = assigned;
+    touched.push(code);
+    Ok(assigned)
 }
 
 /// The active dict's strings as a `Utf8` array, one entry per code. The dict's
