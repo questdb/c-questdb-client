@@ -238,10 +238,7 @@ unsafe fn write_err_box(err_out: *mut *mut reader_error, err: Error) {
 /// `reader` opaque so the rest of the egress FFI can treat
 /// it identically to a standalone reader.
 #[cfg(feature = "sync-reader-ws")]
-fn wrap_pooled_reader(
-    reader: Reader,
-    pool: questdb::ingress::column_sender::ReaderPoolHandle,
-) -> *mut reader {
+fn wrap_pooled_reader(reader: Reader, pool: questdb::ffi_support::ReaderPoolHandle) -> *mut reader {
     let stats = Arc::clone(reader.stats());
     Box::into_raw(Box::new(reader {
         reader_cell: UnsafeCell::new(reader),
@@ -565,7 +562,7 @@ enum ReaderOwnership {
     /// On close, returned to the pool unless `must_close` is set or the
     /// pool has been closed, in which case it is dropped.
     Pooled {
-        handle: questdb::ingress::column_sender::ReaderPoolHandle,
+        handle: questdb::ffi_support::ReaderPoolHandle,
         must_close: AtomicBool,
     },
 }
@@ -3609,6 +3606,194 @@ unsafe fn column_view_or_err<'a>(
 // `Cursor`, decoder dispatch, and the failover trampoline requires a live
 // QuestDB or a wire-protocol fixture and lives outside this crate.
 // ---------------------------------------------------------------------------
+
+// ===========================================================================
+// Reader pool FFI
+//
+// These thin wrappers route between the `questdb_db` pool (in the
+// column-sender crate / FFI module) and the `reader` opaque
+// owned here. Living next to the `reader` type keeps the
+// wrap/unwrap discipline local: a borrow constructs a pooled
+// `reader` via `wrap_pooled_reader`; a return is just
+// `reader_close`, which the ownership tag dispatches.
+// ===========================================================================
+
+#[cfg(feature = "sync-reader-ws")]
+use crate::column_sender::questdb_db;
+#[cfg(feature = "sync-reader-ws")]
+use questdb::QuestDb;
+
+/// Open a connection pool, reporting connect-time failures through the
+/// egress `reader_error` type.
+///
+/// This is the reader-only counterpart to `questdb_db_connect` (declared
+/// in `<questdb/ingress/column_sender.h>`, which reports the ingress
+/// `line_sender_error`). It opens the **same** unified pool and returns
+/// the **same** `questdb_db*`; the only difference is the error channel.
+/// A read-only C consumer can therefore drive the entire pool lifecycle
+///
+/// ```text
+/// questdb_db_connect_reader  ->  questdb_db_borrow_reader
+///                            ->  reader_prepare / _query_* / _cursor_*
+///                            ->  questdb_db_return_reader
+///                            ->  questdb_db_close
+/// ```
+///
+/// using only `<questdb/egress/reader.h>` and only the
+/// `reader_error` type — without taking a source or physical
+/// dependency on the ingress (`line_sender_error`) surface.
+///
+/// `conf` is a UTF-8 `qwpws::` / `qwpwss::` connect string of `conf_len`
+/// bytes (the same string `questdb_db_connect` accepts). Returns NULL on
+/// failure; when `err_out != NULL` the error is placed in `*err_out` and
+/// ownership transfers to the caller (release with
+/// `reader_error_free`).
+///
+/// NOTE: the pool is unified. Like `questdb_db_connect`, this eagerly
+/// opens `pool_size` (default 1) **writer** connections during the call;
+/// the reader pool itself stays lazy, opening a reader socket only on the
+/// first `questdb_db_borrow_reader`. Connect-time errors are mapped from
+/// the ingress error category onto the closest `reader_error_code`
+/// (the diagnostic message is preserved verbatim).
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_connect_reader(
+    conf: *const c_char,
+    conf_len: size_t,
+    err_out: *mut *mut reader_error,
+) -> *mut questdb_db {
+    if conf.is_null() && conf_len != 0 {
+        unsafe {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "questdb_db_connect_reader: conf pointer is NULL with non-zero length",
+            );
+        }
+        return ptr::null_mut();
+    }
+    let slice: &[u8] = if conf_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(conf as *const u8, conf_len) }
+    };
+    let conf = match std::str::from_utf8(slice) {
+        Ok(s) => s,
+        Err(_) => {
+            unsafe {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidUtf8,
+                    "questdb_db_connect_reader: conf is not valid UTF-8",
+                );
+            }
+            return ptr::null_mut();
+        }
+    };
+    match QuestDb::connect(conf) {
+        Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
+        Err(err) => {
+            // Map the ingress connect error onto the egress error type so a
+            // reader-only consumer only ever sees `reader_error`.
+            unsafe { write_err_box(err_out, Error::from(err)) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Borrow a reader from the egress pool. Returns NULL and sets
+/// `*err_out` on failure (pool exhausted, transport failure, etc.).
+///
+/// Reader connections are pooled separately from writer connections
+/// but share the same `pool_size` / `pool_max` /
+/// `pool_idle_timeout_ms` budget. The reader pool is lazy: a
+/// connection is opened on first borrow, not at `questdb_db_connect`
+/// time, so callers that never use egress don't pay any handshake
+/// cost.
+///
+/// The returned `reader*` is equivalent to one constructed via
+/// `reader_from_conf`: cursor lifecycle, stat getters, and
+/// failover all work the same. On `reader_close` the reader is
+/// returned to the pool (or dropped if it was marked must-close via
+/// `reader_mark_must_close`, or if the pool has been closed).
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_borrow_reader(
+    db: *mut questdb_db,
+    err_out: *mut *mut reader_error,
+) -> *mut reader {
+    if db.is_null() {
+        unsafe {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "questdb_db_borrow_reader: db pointer is NULL",
+            );
+        }
+        return ptr::null_mut();
+    }
+    let db_ref = unsafe { &*db };
+    match questdb::ffi_support::borrow_reader_owned(&db_ref.0) {
+        Ok(owned) => {
+            let handle = questdb::ffi_support::reader_pool_handle(&db_ref.0);
+            // Take the reader out of the OwnedReader so its Drop
+            // doesn't ALSO return it to the pool. The reader
+            // wrapper now owns the reader-return semantics via its
+            // `ReaderOwnership::Pooled` variant.
+            let reader = owned
+                .take()
+                .expect("borrow_reader_owned returned an empty OwnedReader");
+            wrap_pooled_reader(reader, handle)
+        }
+        Err(err) => {
+            unsafe { write_err_box(err_out, err) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Return a borrowed reader to the pool. Invalidates `reader`.
+/// Accepts NULL `reader` and no-ops. `db` is ignored — the reader
+/// carries its own pool back-reference via its `ReaderOwnership::Pooled`
+/// variant — but kept in the ABI for symmetry with the borrow call.
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_return_reader(_db: *mut questdb_db, reader: *mut reader) {
+    if reader.is_null() {
+        return;
+    }
+    // Return path == close path for pooled readers. `reader_close`
+    // matches on the ownership tag and dispatches to
+    // `ReaderPoolHandle::return_reader`.
+    unsafe { reader_close(reader) };
+}
+
+/// Snapshot the number of currently-idle (cached) readers in the
+/// reader pool. Returns 0 for a NULL `db`. Diagnostics / test-only;
+/// not part of the supported API surface.
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_dbg_reader_free_count(db: *mut questdb_db) -> usize {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    questdb::ffi_support::reader_free_count(&db_ref.0)
+}
+
+/// Snapshot the number of currently-borrowed (in-use) readers.
+/// Returns 0 for a NULL `db`. Diagnostics / test-only; not part of
+/// the supported API surface.
+#[cfg(feature = "sync-reader-ws")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn questdb_db_dbg_reader_in_use_count(db: *mut questdb_db) -> usize {
+    if db.is_null() {
+        return 0;
+    }
+    let db_ref = unsafe { &*db };
+    questdb::ffi_support::reader_in_use_count(&db_ref.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4127,191 +4312,4 @@ unsafe fn reader_cursor_next_arrow_batch_export(
             }
         }
     }
-}
-
-// ===========================================================================
-// Reader pool FFI
-//
-// These thin wrappers route between the `questdb_db` pool (in the
-// column-sender crate / FFI module) and the `reader` opaque
-// owned here. Living next to the `reader` type keeps the
-// wrap/unwrap discipline local: a borrow constructs a pooled
-// `reader` via `wrap_pooled_reader`; a return is just
-// `reader_close`, which the ownership tag dispatches.
-// ===========================================================================
-
-#[cfg(feature = "sync-reader-ws")]
-use crate::column_sender::questdb_db;
-#[cfg(feature = "sync-reader-ws")]
-use questdb::QuestDb;
-
-/// Open a connection pool, reporting connect-time failures through the
-/// egress `reader_error` type.
-///
-/// This is the reader-only counterpart to `questdb_db_connect` (declared
-/// in `<questdb/ingress/column_sender.h>`, which reports the ingress
-/// `line_sender_error`). It opens the **same** unified pool and returns
-/// the **same** `questdb_db*`; the only difference is the error channel.
-/// A read-only C consumer can therefore drive the entire pool lifecycle
-///
-/// ```text
-/// questdb_db_connect_reader  ->  questdb_db_borrow_reader
-///                            ->  reader_prepare / _query_* / _cursor_*
-///                            ->  questdb_db_return_reader
-///                            ->  questdb_db_close
-/// ```
-///
-/// using only `<questdb/egress/reader.h>` and only the
-/// `reader_error` type — without taking a source or physical
-/// dependency on the ingress (`line_sender_error`) surface.
-///
-/// `conf` is a UTF-8 `qwpws::` / `qwpwss::` connect string of `conf_len`
-/// bytes (the same string `questdb_db_connect` accepts). Returns NULL on
-/// failure; when `err_out != NULL` the error is placed in `*err_out` and
-/// ownership transfers to the caller (release with
-/// `reader_error_free`).
-///
-/// NOTE: the pool is unified. Like `questdb_db_connect`, this eagerly
-/// opens `pool_size` (default 1) **writer** connections during the call;
-/// the reader pool itself stays lazy, opening a reader socket only on the
-/// first `questdb_db_borrow_reader`. Connect-time errors are mapped from
-/// the ingress error category onto the closest `reader_error_code`
-/// (the diagnostic message is preserved verbatim).
-#[cfg(feature = "sync-reader-ws")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_connect_reader(
-    conf: *const c_char,
-    conf_len: size_t,
-    err_out: *mut *mut reader_error,
-) -> *mut questdb_db {
-    if conf.is_null() && conf_len != 0 {
-        unsafe {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "questdb_db_connect_reader: conf pointer is NULL with non-zero length",
-            );
-        }
-        return ptr::null_mut();
-    }
-    let slice: &[u8] = if conf_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(conf as *const u8, conf_len) }
-    };
-    let conf = match std::str::from_utf8(slice) {
-        Ok(s) => s,
-        Err(_) => {
-            unsafe {
-                set_reader_err(
-                    err_out,
-                    ErrorCode::InvalidUtf8,
-                    "questdb_db_connect_reader: conf is not valid UTF-8",
-                );
-            }
-            return ptr::null_mut();
-        }
-    };
-    match QuestDb::connect(conf) {
-        Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
-        Err(err) => {
-            // Map the ingress connect error onto the egress error type so a
-            // reader-only consumer only ever sees `reader_error`.
-            unsafe { write_err_box(err_out, Error::from(err)) };
-            ptr::null_mut()
-        }
-    }
-}
-
-/// Borrow a reader from the egress pool. Returns NULL and sets
-/// `*err_out` on failure (pool exhausted, transport failure, etc.).
-///
-/// Reader connections are pooled separately from writer connections
-/// but share the same `pool_size` / `pool_max` /
-/// `pool_idle_timeout_ms` budget. The reader pool is lazy: a
-/// connection is opened on first borrow, not at `questdb_db_connect`
-/// time, so callers that never use egress don't pay any handshake
-/// cost.
-///
-/// The returned `reader*` is equivalent to one constructed via
-/// `reader_from_conf`: cursor lifecycle, stat getters, and
-/// failover all work the same. On `reader_close` the reader is
-/// returned to the pool (or dropped if it was marked must-close via
-/// `reader_mark_must_close`, or if the pool has been closed).
-#[cfg(feature = "sync-reader-ws")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_reader(
-    db: *mut questdb_db,
-    err_out: *mut *mut reader_error,
-) -> *mut reader {
-    if db.is_null() {
-        unsafe {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "questdb_db_borrow_reader: db pointer is NULL",
-            );
-        }
-        return ptr::null_mut();
-    }
-    let db_ref = unsafe { &*db };
-    match db_ref.0.borrow_reader_owned() {
-        Ok(owned) => {
-            let handle = db_ref.0.reader_pool_handle();
-            // Take the reader out of the OwnedReader so its Drop
-            // doesn't ALSO return it to the pool. The reader
-            // wrapper now owns the reader-return semantics via its
-            // `ReaderOwnership::Pooled` variant.
-            let reader = owned
-                .take()
-                .expect("borrow_reader_owned returned an empty OwnedReader");
-            wrap_pooled_reader(reader, handle)
-        }
-        Err(err) => {
-            unsafe { write_err_box(err_out, err) };
-            ptr::null_mut()
-        }
-    }
-}
-
-/// Return a borrowed reader to the pool. Invalidates `reader`.
-/// Accepts NULL `reader` and no-ops. `db` is ignored — the reader
-/// carries its own pool back-reference via its `ReaderOwnership::Pooled`
-/// variant — but kept in the ABI for symmetry with the borrow call.
-#[cfg(feature = "sync-reader-ws")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_return_reader(_db: *mut questdb_db, reader: *mut reader) {
-    if reader.is_null() {
-        return;
-    }
-    // Return path == close path for pooled readers. `reader_close`
-    // matches on the ownership tag and dispatches to
-    // `ReaderPoolHandle::return_reader`.
-    unsafe { reader_close(reader) };
-}
-
-/// Snapshot the number of currently-idle (cached) readers in the
-/// reader pool. Returns 0 for a NULL `db`. Diagnostics / test-only;
-/// not part of the supported API surface.
-#[cfg(feature = "sync-reader-ws")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_dbg_reader_free_count(db: *mut questdb_db) -> usize {
-    if db.is_null() {
-        return 0;
-    }
-    let db_ref = unsafe { &*db };
-    db_ref.0.reader_free_count()
-}
-
-/// Snapshot the number of currently-borrowed (in-use) readers.
-/// Returns 0 for a NULL `db`. Diagnostics / test-only; not part of
-/// the supported API surface.
-#[cfg(feature = "sync-reader-ws")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_dbg_reader_in_use_count(db: *mut questdb_db) -> usize {
-    if db.is_null() {
-        return 0;
-    }
-    let db_ref = unsafe { &*db };
-    db_ref.0.reader_in_use_count()
 }

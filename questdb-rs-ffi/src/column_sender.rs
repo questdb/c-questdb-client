@@ -37,9 +37,8 @@ use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use questdb::ingress::column_sender::{
-    AckLevel, Chunk, NumpyDtype, OwnedColumnSender, QuestDb, Validity,
-};
+use questdb::ffi_support::OwnedColumnSender;
+use questdb::ingress::column_sender::{AckLevel, Chunk, NumpyDtype, QuestDb, Validity};
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
 use questdb::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
@@ -525,7 +524,7 @@ pub unsafe extern "C" fn questdb_db_borrow_column_sender(
         return std::ptr::null_mut();
     }
     let db_ref = unsafe { &*db };
-    match db_ref.0.borrow_column_sender_owned() {
+    match questdb::ffi_support::borrow_column_sender_owned(&db_ref.0) {
         Ok(owned) => Box::into_raw(Box::new(column_sender(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
@@ -560,10 +559,10 @@ pub unsafe extern "C" fn questdb_db_borrow_column_sender_with_retry(
         return std::ptr::null_mut();
     }
     let db_ref = unsafe { &*db };
-    match db_ref
-        .0
-        .borrow_column_sender_owned_with_retry(std::time::Duration::from_millis(budget_ms))
-    {
+    match questdb::ffi_support::borrow_column_sender_owned_with_retry(
+        &db_ref.0,
+        std::time::Duration::from_millis(budget_ms),
+    ) {
         Ok(owned) => Box::into_raw(Box::new(column_sender(owned, AtomicU32::new(0)))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
@@ -581,7 +580,7 @@ pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb
         return 0;
     }
     let db_ref = unsafe { &*db };
-    db_ref.0.reconnect_max_duration().as_millis() as u64
+    questdb::ffi_support::reconnect_max_duration(&db_ref.0).as_millis() as u64
 }
 
 /// Return a borrowed conn to the pool. Invalidates `conn`. Accepts NULL

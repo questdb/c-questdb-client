@@ -22,6 +22,10 @@ features = [
     "tls-webpki-certs",
     "tls-native-certs",
     "sync-sender",
+    # Owned (lifetime-free) pool handles + their borrow entry points. C / Python
+    # cannot express Rust lifetimes, so the C ABI hands out owned handles via
+    # `questdb::ffi_support` instead of the lifetime-bound `Borrowed*` handles.
+    "ffi-support",
 ]
 
 [features]

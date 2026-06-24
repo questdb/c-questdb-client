@@ -956,6 +956,7 @@ fn borrow_and_return_reuses_connection() {
     drop(db);
 }
 
+#[cfg(feature = "ffi-support")]
 #[test]
 fn owned_column_sender_observes_pool_close_and_drops_after_close() {
     let server = MockServer::spawn(2);
@@ -1075,6 +1076,7 @@ fn row_sender_pool_flush_round_trip() {
     drop(db);
 }
 
+#[cfg(feature = "ffi-support")]
 #[test]
 fn row_sender_owned_borrow_flushes_and_recycles() {
     let server = MockServer::spawn_acking(8);
@@ -1120,6 +1122,7 @@ fn row_sender_owned_borrow_flushes_and_recycles() {
     drop(db);
 }
 
+#[cfg(feature = "ffi-support")]
 #[test]
 fn row_sender_owned_mark_must_close_drops_not_recycles() {
     let server = MockServer::spawn_acking(8);
@@ -1136,6 +1139,7 @@ fn row_sender_owned_mark_must_close_drops_not_recycles() {
     drop(db);
 }
 
+#[cfg(feature = "ffi-support")]
 #[test]
 fn owned_row_sender_observes_pool_close_and_drops_after_close() {
     let server = MockServer::spawn_acking(8);

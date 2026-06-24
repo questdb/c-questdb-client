@@ -93,19 +93,24 @@ const _: () = assert!(
      QuestDB QWP wire encoding is little-endian."
 );
 
-#[doc(hidden)]
-pub use db::{OwnedColumnSender, OwnedRowSender};
-
 /// Delivery classification surfaced to the C FFI so the Arrow `_and_wait`
 /// entry points can decide whether to re-export the caller's batch. Not part
 /// of the public Rust API surface (the public `*_and_wait` methods return
-/// `Result<()>`).
+/// `Result<()>`). Unlike the owned pool handles, this is a sender-result type,
+/// so it stays on the `column_sender` surface rather than moving to
+/// [`ffi_support`].
 #[doc(hidden)]
 pub use sender::FlushFailure;
 
-#[cfg(feature = "_egress")]
+/// FFI escape-hatch surface: owned (lifetime-free) pool handles and the entry
+/// points that mint them, for the `questdb-rs-ffi` C-ABI crate. Hidden,
+/// feature-gated, and not part of the public Rust API — normal Rust users
+/// borrow lifetime-bound handles via [`QuestDb::borrow_column_sender`] /
+/// [`QuestDb::borrow_row_sender`] (and, with egress, `QuestDb::borrow_reader`).
+/// Only `questdb-rs-ffi` enables the `ffi-support` feature.
+#[cfg(feature = "ffi-support")]
 #[doc(hidden)]
-pub use db::{OwnedReader, ReaderPoolHandle};
+pub mod ffi_support;
 
 /// Internals exposed for criterion benchmarks under
 /// `questdb-rs/benches/`. Not part of the public API; bumped freely
@@ -120,7 +125,7 @@ pub mod _bench_internals {
 
     /// Opaque holder for the connection-scoped state the encoder needs.
     /// Lets benches reuse the encoder across iterations without promoting
-    /// [`SymbolGlobalDict`] to the public API.
+    /// `SymbolGlobalDict` to the public API.
     pub struct BenchEncoderState {
         symbol_dict: SymbolGlobalDict,
         scratch: EncodeScratch,
@@ -141,7 +146,7 @@ pub mod _bench_internals {
         }
     }
 
-    /// Encode `chunk` into `out`. Mirrors [`encode_chunk_into`] but hides
+    /// Encode `chunk` into `out`. Mirrors `encode_chunk_into` but hides
     /// the internal-state types so the bench module never has to touch
     /// them.
     pub fn bench_encode_chunk_into(

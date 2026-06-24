@@ -125,7 +125,7 @@ pub enum NumpyDtype {
         bits: u8,
     },
 
-    /// f64 ndarray: rectangular tensor of shape (row_count, dim[0], dim[1], …).
+    /// f64 ndarray: rectangular tensor of shape `(row_count, dim[0], dim[1], …)`.
     /// `ndim` is `1..=MAX_ARRAY_DIMS`; only the first `ndim` entries of
     /// `shape` are meaningful — trailing entries are zero. All rows share
     /// this shape (numpy ndarrays are rectangular).
@@ -299,7 +299,7 @@ impl NumpyDtype {
     }
 
     /// Source-buffer stride in bytes per row — how many bytes the
-    /// flush-time encoder ([`emit_into_wire`]) reads per row from the
+    /// flush-time encoder (`emit_into_wire`) reads per row from the
     /// caller's `data` pointer. This is the *source* element width, which
     /// is decoupled from the wire width (e.g. `U8WidenToI32` reads 1
     /// source byte but emits 4): the bounds check must use the read

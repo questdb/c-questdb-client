@@ -781,7 +781,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Same wire output as [`column_varchar`], but accepts Arrow
+    /// Same wire output as [`Self::column_varchar`], but accepts Arrow
     /// LargeUtf8 input where offsets are `int64` instead of `int32`. The
     /// encoder narrows each offset to `u32` at encode time with an
     /// overflow check (QWP's offset table is uint32 LE on the wire), so
@@ -821,7 +821,7 @@ impl<'a> Chunk<'a> {
     }
 
     /// Append a BINARY column. Same offsets + bytes layout as
-    /// [`column_varchar`]; the encoder writes the column with wire type
+    /// [`Self::column_varchar`]; the encoder writes the column with wire type
     /// `QWP_TYPE_BINARY` instead of `QWP_TYPE_VARCHAR`. No UTF-8
     /// validation is performed.
     pub fn column_binary(

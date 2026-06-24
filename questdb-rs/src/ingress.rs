@@ -451,8 +451,15 @@ impl QwpWsConnector {
     }
 
     /// Reconnect backoff budget parsed from the connect string's
-    /// `reconnect_*` keys.
+    /// `reconnect_*` keys. Only the retry-capable borrow paths consume it
+    /// (the polars `reborrow_with_retry` and the FFI owned `*_with_retry`
+    /// entry points); keep it compiled (so the `ReconnectPolicy` re-export it
+    /// returns stays live) but quiet the dead-code lint when neither is built.
     #[cfg(feature = "sync-sender-qwp-ws")]
+    #[cfg_attr(
+        not(any(feature = "polars", feature = "ffi-support")),
+        allow(dead_code)
+    )]
     pub(crate) fn reconnect_policy(&self) -> sender::ReconnectPolicy {
         sender::ReconnectPolicy::bounded(
             *self.qwp_ws.reconnect_max_duration,

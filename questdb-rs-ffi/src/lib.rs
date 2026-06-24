@@ -23,6 +23,14 @@
  ******************************************************************************/
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
+// The C-ABI surface documents parameters with doxygen `@param[in]` /
+// `@param[out]` annotations, which `cbindgen` (`documentation_style = "doxy"`)
+// propagates verbatim into the generated C/C++ headers. rustdoc misreads the
+// `[in]` / `[out]` as intra-doc links and warns, but this crate is a
+// `publish = false` cdylib whose rustdoc is never built or shipped — and
+// escaping the brackets would corrupt the doxygen in the real C/C++ headers.
+// Suppress the false positive rather than break the headers.
+#![allow(rustdoc::broken_intra_doc_links)]
 
 // ----------------------------------------------------------------------------
 // Panic policy
@@ -70,7 +78,7 @@ use questdb::{
 };
 use std::time::Duration;
 
-use questdb::ingress::column_sender::OwnedRowSender;
+use questdb::ffi_support::OwnedRowSender;
 
 mod ndarr;
 use ndarr::StrideArrayView;
@@ -3719,7 +3727,7 @@ pub unsafe extern "C" fn questdb_db_borrow_row_sender(
         return ptr::null_mut();
     }
     let db_ref = unsafe { &*db };
-    match db_ref.0.borrow_row_sender_owned() {
+    match questdb::ffi_support::borrow_row_sender_owned(&db_ref.0) {
         Ok(owned) => Box::into_raw(Box::new(row_sender(owned))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };
@@ -3751,10 +3759,10 @@ pub unsafe extern "C" fn questdb_db_borrow_row_sender_with_retry(
         return ptr::null_mut();
     }
     let db_ref = unsafe { &*db };
-    match db_ref
-        .0
-        .borrow_row_sender_owned_with_retry(Duration::from_millis(budget_ms))
-    {
+    match questdb::ffi_support::borrow_row_sender_owned_with_retry(
+        &db_ref.0,
+        Duration::from_millis(budget_ms),
+    ) {
         Ok(owned) => Box::into_raw(Box::new(row_sender(owned))),
         Err(err) => {
             unsafe { set_err_out_from_error(err_out, err) };

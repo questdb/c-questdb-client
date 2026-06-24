@@ -374,8 +374,13 @@ land.
   `db.reap_idle()` runs the same scan on demand and is exposed on
   the FFI.
 - Thread-safety: the pool's internal state (free list, total count,
-  per-connection idle stamp) is guarded by a `Mutex`. Borrow/return/
-  reap/close are all safe concurrent.
+  per-connection idle stamp) is guarded by a `Mutex`. Borrow/return/reap
+  are safe to call concurrently while the owning handle stays alive.
+  `close` (and `Drop`) is the final owner release, not a concurrent pool
+  operation: callers must quiesce all db-level borrow/reap/config calls on
+  that handle before closing. Outstanding owned handles still return/drop
+  safely after close; new operations on them then fail with
+  `InvalidApiCall`.
 - Owner: 1 engineer.
 - Done when:
   - multi-thread test borrows and returns N senders concurrently

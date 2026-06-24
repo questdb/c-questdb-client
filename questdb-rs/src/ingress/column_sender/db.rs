@@ -55,10 +55,18 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "_egress")]
 use crate::egress::Reader;
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
-use crate::ingress::{
-    QwpWsConnector, RawQwpWsRoundStream, reconnect_backoff_step, reconnect_error_is_terminal,
-};
+use crate::ingress::{QwpWsConnector, RawQwpWsRoundStream};
 use crate::ingress::{Sender, SenderBuilder};
+// The reconnect backoff helpers are only consumed by the retry-capable borrow
+// paths: the row-major polars `reborrow_with_retry` and the FFI owned
+// `*_with_retry` entry points. Keep the import unconditional (so the shared
+// re-export chain that feeds it stays live) but quiet the unused-import lint in
+// the plain library build that compiles neither retry path.
+#[cfg_attr(
+    not(any(feature = "polars", feature = "ffi-support")),
+    allow(unused_imports)
+)]
+use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
 use crate::{Result, error};
 
 use super::conf::{self, PoolReap};
@@ -463,8 +471,8 @@ impl QuestDb {
     /// Hidden from the Rust API because Rust callers should prefer the
     /// lifetime-bound `borrow_column_sender`, which catches use-after-close at
     /// compile time. C callers reach this through `questdb_db_borrow_column_sender`.
-    #[doc(hidden)]
-    pub fn borrow_column_sender_owned(&self) -> Result<OwnedColumnSender> {
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn borrow_column_sender_owned(&self) -> Result<OwnedColumnSender> {
         let cs = self.pick_column_sender()?;
         Ok(OwnedColumnSender {
             inner: Arc::clone(&self.inner),
@@ -477,8 +485,8 @@ impl QuestDb {
     /// primary). Backs the C ABI's `questdb_db_borrow_column_sender_with_retry`, so
     /// C / C++ / Python callers fail over with the same backoff and budget as
     /// the row sender.
-    #[doc(hidden)]
-    pub fn borrow_column_sender_owned_with_retry(
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn borrow_column_sender_owned_with_retry(
         &self,
         budget: Duration,
     ) -> Result<OwnedColumnSender> {
@@ -494,8 +502,8 @@ impl QuestDb {
     /// so it can outlive the user-facing `QuestDb` pointer). Backs the C ABI's
     /// `questdb_db_borrow_row_sender`. See [`Self::borrow_column_sender_owned`]
     /// for the owned-handle rationale.
-    #[doc(hidden)]
-    pub fn borrow_row_sender_owned(&self) -> Result<OwnedRowSender> {
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn borrow_row_sender_owned(&self) -> Result<OwnedRowSender> {
         let sender = self.pick_row_sender()?;
         Ok(OwnedRowSender {
             inner: Arc::clone(&self.inner),
@@ -509,8 +517,11 @@ impl QuestDb {
     /// a primary; `AuthError` / protocol-version errors are terminal). Backs
     /// the C ABI's `questdb_db_borrow_row_sender_with_retry`. `budget`
     /// `Duration::ZERO` makes a single attempt.
-    #[doc(hidden)]
-    pub fn borrow_row_sender_owned_with_retry(&self, budget: Duration) -> Result<OwnedRowSender> {
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn borrow_row_sender_owned_with_retry(
+        &self,
+        budget: Duration,
+    ) -> Result<OwnedRowSender> {
         let deadline = Instant::now().checked_add(budget);
         let policy = self.inner.connector.reconnect_policy();
         let mut backoff = policy.initial_backoff();
@@ -648,36 +659,35 @@ impl QuestDb {
 
     /// The pool's failover budget (`reconnect_max_duration`, default 300s).
     /// Exposed so the C ABI can let callers bound an overall failover deadline.
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    #[doc(hidden)]
-    pub fn reconnect_max_duration(&self) -> Duration {
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn reconnect_max_duration(&self) -> Duration {
         self.inner.connector.reconnect_policy().max_duration()
     }
 
     /// Snapshot the number of idle (free) connections currently in the pool.
-    #[doc(hidden)]
-    pub fn free_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn free_count(&self) -> usize {
         lock_state(&self.inner.state).free.len()
     }
 
     /// Snapshot the number of currently-borrowed (or in-flight-being-built)
     /// connections.
-    #[doc(hidden)]
-    pub fn in_use_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn in_use_count(&self) -> usize {
         lock_state(&self.inner.state).in_use
     }
 
     /// Snapshot the number of idle (free) row senders currently in the pool.
-    #[doc(hidden)]
-    pub fn row_sender_free_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn row_sender_free_count(&self) -> usize {
         lock_row_sender_state(&self.inner.row_sender_state)
             .free
             .len()
     }
 
     /// Snapshot the number of currently-borrowed row senders.
-    #[doc(hidden)]
-    pub fn row_sender_in_use_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn row_sender_in_use_count(&self) -> usize {
         lock_row_sender_state(&self.inner.row_sender_state).in_use
     }
 
@@ -716,9 +726,8 @@ impl QuestDb {
     /// free list is empty and total < `pool_max`). Returned via
     /// [`OwnedReader`]'s Drop: see the sender variant for the same
     /// pattern.
-    #[cfg(feature = "_egress")]
-    #[doc(hidden)]
-    pub fn borrow_reader_owned(&self) -> crate::egress::error::Result<OwnedReader> {
+    #[cfg(all(feature = "_egress", feature = "ffi-support"))]
+    pub(crate) fn borrow_reader_owned(&self) -> crate::egress::error::Result<OwnedReader> {
         let reader = self.pick_reader()?;
         Ok(OwnedReader {
             inner: Arc::clone(&self.inner),
@@ -730,9 +739,8 @@ impl QuestDb {
     /// Construct an opaque pool reference that downstream code (the
     /// FFI's `reader` wrapper, in particular) can hold to return
     /// readers without having to expose [`DbInner`].
-    #[cfg(feature = "_egress")]
-    #[doc(hidden)]
-    pub fn reader_pool_handle(&self) -> ReaderPoolHandle {
+    #[cfg(all(feature = "_egress", feature = "ffi-support"))]
+    pub(crate) fn reader_pool_handle(&self) -> ReaderPoolHandle {
         ReaderPoolHandle {
             inner: Arc::clone(&self.inner),
         }
@@ -778,16 +786,14 @@ impl QuestDb {
     }
 
     /// Snapshot the number of idle (free) readers currently in the pool.
-    #[cfg(feature = "_egress")]
-    #[doc(hidden)]
-    pub fn reader_free_count(&self) -> usize {
+    #[cfg(all(feature = "_egress", any(test, feature = "ffi-support")))]
+    pub(crate) fn reader_free_count(&self) -> usize {
         lock_reader_state(&self.inner.reader_state).free.len()
     }
 
     /// Snapshot the number of currently-borrowed readers.
-    #[cfg(feature = "_egress")]
-    #[doc(hidden)]
-    pub fn reader_in_use_count(&self) -> usize {
+    #[cfg(all(feature = "_egress", any(test, feature = "ffi-support")))]
+    pub(crate) fn reader_in_use_count(&self) -> usize {
         lock_reader_state(&self.inner.reader_state).in_use
     }
 }
@@ -970,12 +976,13 @@ impl Drop for BorrowedColumnSender<'_> {
 /// user-facing `QuestDb` pointer — the C ABI can free its `questdb_db*`
 /// before dropping outstanding `column_sender*` handles. After pool close,
 /// returned handles are dropped instead of recycled.
-#[doc(hidden)]
+#[cfg(feature = "ffi-support")]
 pub struct OwnedColumnSender {
     inner: Arc<DbInner>,
     sender: Option<ColumnSender>,
 }
 
+#[cfg(feature = "ffi-support")]
 impl OwnedColumnSender {
     /// Borrow the underlying [`ColumnSender`] mutably. Always returns a
     /// live reference until `Drop` runs.
@@ -1000,6 +1007,7 @@ impl OwnedColumnSender {
     }
 }
 
+#[cfg(feature = "ffi-support")]
 impl Drop for OwnedColumnSender {
     fn drop(&mut self) {
         if let Some(mut sender) = self.sender.take() {
@@ -1102,13 +1110,14 @@ fn return_row_sender_to_pool(inner: &Arc<DbInner>, sender: Sender, must_close: b
 /// is returned to the row-sender pool unless it (or the caller, via
 /// [`Self::mark_must_close`]) marked it must-close, or the pool has been
 /// closed, in which case it is dropped and the next borrow opens a fresh one.
-#[doc(hidden)]
+#[cfg(feature = "ffi-support")]
 pub struct OwnedRowSender {
     inner: Arc<DbInner>,
     sender: Option<Sender>,
     must_close: bool,
 }
 
+#[cfg(feature = "ffi-support")]
 impl OwnedRowSender {
     /// Borrow the underlying [`Sender`] mutably. Always returns a live
     /// reference until `Drop` runs.
@@ -1146,6 +1155,7 @@ impl OwnedRowSender {
     }
 }
 
+#[cfg(feature = "ffi-support")]
 impl Drop for OwnedRowSender {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
@@ -1244,15 +1254,14 @@ impl Drop for BorrowedReader<'_> {
 /// effect. The egress-side
 /// cursor lifecycle uses this to force-close readers whose underlying
 /// transport has been torn down by a mid-stream cursor drop.
-#[cfg(feature = "_egress")]
-#[doc(hidden)]
+#[cfg(all(feature = "_egress", feature = "ffi-support"))]
 pub struct OwnedReader {
     inner: Arc<DbInner>,
     reader: Option<Reader>,
     must_close: bool,
 }
 
-#[cfg(feature = "_egress")]
+#[cfg(all(feature = "_egress", feature = "ffi-support"))]
 impl OwnedReader {
     /// Inspect the wrapped reader without taking ownership.
     pub fn get(&self) -> &Reader {
@@ -1289,7 +1298,7 @@ impl OwnedReader {
     }
 }
 
-#[cfg(feature = "_egress")]
+#[cfg(all(feature = "_egress", feature = "ffi-support"))]
 impl Drop for OwnedReader {
     fn drop(&mut self) {
         if let Some(reader) = self.reader.take() {
@@ -1301,14 +1310,13 @@ impl Drop for OwnedReader {
 /// Opaque handle to a [`QuestDb`] pool, used by the FFI's
 /// `reader` wrapper to return readers without exposing
 /// `DbInner`. Cheap to clone (just bumps the inner `Arc`).
-#[cfg(feature = "_egress")]
-#[doc(hidden)]
+#[cfg(all(feature = "_egress", feature = "ffi-support"))]
 #[derive(Clone)]
 pub struct ReaderPoolHandle {
     inner: Arc<DbInner>,
 }
 
-#[cfg(feature = "_egress")]
+#[cfg(all(feature = "_egress", feature = "ffi-support"))]
 impl ReaderPoolHandle {
     /// Return a [`Reader`] to the pool it came from. If `must_close`
     /// is set the reader is dropped instead of recycled — matching
@@ -1434,6 +1442,7 @@ fn connect_sfa_pool(inner: &Arc<DbInner>) -> Result<ColumnSender> {
 /// cluster elects a primary, or a transient transport error) backs off and
 /// retries; `AuthError` / `ProtocolVersionError` and deadline exhaustion are
 /// terminal.
+#[cfg(feature = "ffi-support")]
 fn reconnect_pick(inner: &Arc<DbInner>, deadline: Option<Instant>) -> Result<ColumnSender> {
     let policy = inner.connector.reconnect_policy();
     let mut backoff = policy.initial_backoff();
@@ -1457,10 +1466,12 @@ fn reconnect_pick(inner: &Arc<DbInner>, deadline: Option<Instant>) -> Result<Col
     }
 }
 
+#[cfg(any(feature = "polars", feature = "ffi-support"))]
 fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
+#[cfg(any(feature = "polars", feature = "ffi-support"))]
 fn sleep_until_deadline(sleep_for: Duration, deadline: Option<Instant>) {
     let d = match deadline {
         Some(dl) => sleep_for.min(dl.saturating_duration_since(Instant::now())),
@@ -1707,9 +1718,12 @@ fn reap_idle_readers(inner: &DbInner) -> usize {
 
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    fn assert_send<T: Send>() {}
     assert_send_sync::<QuestDb>();
-    assert_send::<OwnedColumnSender>();
+    #[cfg(feature = "ffi-support")]
+    {
+        fn assert_send<T: Send>() {}
+        assert_send::<OwnedColumnSender>();
+    }
 };
 
 const _: fn() = || {

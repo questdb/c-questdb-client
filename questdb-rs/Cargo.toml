@@ -225,6 +225,15 @@ live-server-tests = [
     "sync-sender-qwp-ws",
 ]
 
+## FFI escape-hatch surface, consumed only by the `questdb-rs-ffi` C-ABI
+## crate. Exposes the hidden `questdb::ffi_support` module: owned
+## (lifetime-free) pool handles and the entry points that mint them, which
+## C / Python cannot express as Rust lifetimes. NOT for normal Rust users —
+## they get the lifetime-bound `QuestDb::borrow_column_sender` /
+## `borrow_row_sender` / `borrow_reader`. Hidden from docs and exempt from
+## semver; do not depend on it from regular Rust code.
+ffi-support = ["sync-sender-qwp-ws"]
+
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
 _sender-http = []

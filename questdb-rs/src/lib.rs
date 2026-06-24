@@ -66,6 +66,15 @@ pub use ingress::column_sender::{BorrowedColumnSender, BorrowedRowSender, QuestD
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
 pub use ingress::column_sender::BorrowedReader;
 
+// FFI escape-hatch surface. Hidden and not semver-stable: it exists so the
+// `questdb-rs-ffi` C-ABI crate can borrow owned (lifetime-free) pool handles
+// that C / Python cannot express as Rust lifetimes. Normal Rust users borrow
+// the lifetime-bound handles re-exported above. The `ffi-support` feature
+// implies `sync-sender-qwp-ws`, so the module is always available when enabled.
+#[cfg(feature = "ffi-support")]
+#[doc(hidden)]
+pub use ingress::column_sender::ffi_support;
+
 #[cfg(test)]
 mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};
