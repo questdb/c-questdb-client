@@ -504,6 +504,11 @@ class QuestDbFixture(QuestDbFixtureBase):
         self.line_tcp_port = None
         self.qwp_udp_port = None
         self.pg_port = None
+        # Dedicated min-HTTP health port. The min server runs on its own
+        # worker pool, so the readiness probe can't be starved by QWP
+        # ingest saturating the shared-network pool that serves the main
+        # HTTP server (where /ping lives).
+        self.http_min_port = None
 
         self.wrap_tls = wrap_tls
         self._tls_proxy = None
@@ -529,14 +534,14 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write('\n\n')
 
     def start(self, start_timeout_sec=300):
-        # start_timeout_sec bounds the wait for the HTTP service to answer
-        # /ping. The generous default flags only a genuinely stuck boot; the
-        # bounce fuzz thread passes a tighter, drain-budget-aware value so a
-        # pathologically slow restart fails as an infra error rather than
-        # starving the producers' close_drain.
+        # start_timeout_sec bounds the wait for the min-HTTP health endpoint
+        # to answer. The generous default flags only a genuinely stuck boot;
+        # the bounce fuzz thread passes a tighter, drain-budget-aware value
+        # so a pathologically slow restart fails as an infra error rather
+        # than starving the producers' close_drain.
         if self.http_server_port is None:
-            ports = discover_avail_ports(3)
-            self.http_server_port, self.line_tcp_port, self.pg_port = ports
+            (self.http_server_port, self.line_tcp_port,
+             self.pg_port, self.http_min_port) = discover_avail_ports(4)
         if self.qwp_udp and self.qwp_udp_port is None:
             self.qwp_udp_port = discover_avail_udp_port()
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
@@ -557,7 +562,9 @@ class QuestDbFixture(QuestDbFixtureBase):
                 http.bind.to=0.0.0.0:{self.http_server_port}
                 line.tcp.net.bind.to=0.0.0.0:{self.line_tcp_port}
                 pg.net.bind.to=0.0.0.0:{self.pg_port}
-                http.min.enabled=false
+                http.min.enabled=true
+                http.min.net.bind.to=0.0.0.0:{self.http_min_port}
+                http.min.worker.count=1
                 line.udp.enabled=false
                 qwp.udp.enabled={qwp_udp_enabled}
                 {qwp_udp_bind}
@@ -628,13 +635,18 @@ class QuestDbFixture(QuestDbFixtureBase):
             def check_http_up():
                 if self._proc.poll() is not None:
                     raise RuntimeError('QuestDB died during startup.')
+                # Probe the dedicated min-HTTP health endpoint, not the main
+                # HTTP /ping: the min server runs on its own worker, so a
+                # heavy QWP ingest load on the shared-network pool can't
+                # starve the readiness check. HealthCheckProcessor answers
+                # any path with 200 "Status: Healthy".
                 req = urllib.request.Request(
-                    f'http://127.0.0.1:{self.http_server_port}/ping',
+                    f'http://127.0.0.1:{self.http_min_port}/status',
                     headers=self.http_headers(),
                     method='GET')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
-                    if resp.status == 204:
+                    if 200 <= resp.status < 300:
                         return True
                 except socket.timeout:
                     pass
@@ -662,8 +674,8 @@ class QuestDbFixture(QuestDbFixtureBase):
         # doesn't change across restarts, and a bounce restart must stay
         # clear of SQL — right after it the reconnecting fuzz producers
         # can keep the network workers busy past the 5s query timeout,
-        # failing the bounce even though /ping already vouched for
-        # liveness.
+        # failing the bounce even though the min-HTTP health endpoint
+        # already vouched for liveness.
         if not self._version_queried:
             self.version = self.query_version()
             self._version_queried = True
@@ -843,6 +855,7 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
         self.line_tcp_port = None
         self.qwp_udp_port = None
         self.pg_port = None
+        self.http_min_port = None  # see QuestDbFixture.__init__
 
         self.wrap_tls = wrap_tls
         self._tls_proxy = None
@@ -863,7 +876,9 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
             'QDB_HTTP_BIND_TO': f'0.0.0.0:{self.http_server_port}',
             'QDB_LINE_TCP_NET_BIND_TO': f'0.0.0.0:{self.line_tcp_port}',
             'QDB_PG_NET_BIND_TO': f'0.0.0.0:{self.pg_port}',
-            'QDB_HTTP_MIN_ENABLED': 'false',
+            'QDB_HTTP_MIN_ENABLED': 'true',
+            'QDB_HTTP_MIN_NET_BIND_TO': f'0.0.0.0:{self.http_min_port}',
+            'QDB_HTTP_MIN_WORKER_COUNT': '1',
             'QDB_LINE_UDP_ENABLED': 'false',
             'QDB_QWP_UDP_ENABLED': 'true' if self.qwp_udp else 'false',
             'QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL': '100',
@@ -893,8 +908,8 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
     def start(self, start_timeout_sec=300):
         # start_timeout_sec: see QuestDbFixture.start.
         if self.http_server_port is None:
-            ports = discover_avail_ports(3)
-            self.http_server_port, self.line_tcp_port, self.pg_port = ports
+            (self.http_server_port, self.line_tcp_port,
+             self.pg_port, self.http_min_port) = discover_avail_ports(4)
         if self.qwp_udp and self.qwp_udp_port is None:
             self.qwp_udp_port = discover_avail_udp_port()
 
@@ -902,7 +917,8 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
         self._container = cmd[3]
         for key, value in self._env_config().items():
             cmd += ['-e', f'{key}={value}']
-        for port in (self.http_server_port, self.line_tcp_port, self.pg_port):
+        for port in (self.http_server_port, self.line_tcp_port,
+                     self.pg_port, self.http_min_port):
             cmd += ['-p', f'127.0.0.1:{port}:{port}']
         if self.qwp_udp:
             cmd += ['-p', f'127.0.0.1:{self.qwp_udp_port}:{self.qwp_udp_port}/udp']
@@ -961,13 +977,16 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
     def _check_http_up(self):
         if not self._is_running():
             raise RuntimeError('QuestDB container died during startup.')
+        # Probe the dedicated min-HTTP health endpoint (see
+        # QuestDbFixture.start): isolated from the shared-network pool that
+        # serves the main HTTP server and QWP ingest.
         req = urllib.request.Request(
-            f'http://{self.host}:{self.http_server_port}/ping',
+            f'http://{self.host}:{self.http_min_port}/status',
             headers=self.http_headers(),
             method='GET')
         try:
             resp = urllib.request.urlopen(req, timeout=1)
-            if resp.status == 204:
+            if 200 <= resp.status < 300:
                 return True
         except urllib.error.URLError:
             pass
