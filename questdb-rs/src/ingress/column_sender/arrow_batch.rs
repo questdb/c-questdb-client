@@ -4662,6 +4662,24 @@ mod tests {
     }
 
     #[test]
+    fn uint8_widens_to_int_classifier() {
+        let field = Field::new("v", DataType::UInt8, true);
+        let arr = arrow_array::UInt8Array::from(vec![0u8, 1, u8::MAX]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::U8WidenToI32));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
+    }
+
+    #[test]
+    fn uint16_widens_to_int_classifier() {
+        let field = Field::new("v", DataType::UInt16, true);
+        let arr = arrow_array::UInt16Array::from(vec![0u16, 1, u16::MAX]);
+        let kind = classify(&field, &arr).unwrap();
+        assert!(matches!(kind, ColumnKind::U16WidenToI32));
+        assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
+    }
+
+    #[test]
     fn int8_widens_to_int_classifier() {
         let field = Field::new("v", DataType::Int8, true);
         let arr = arrow_array::Int8Array::from(vec![0i8, -1, 127]);
