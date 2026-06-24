@@ -1494,7 +1494,15 @@ class BounceThread(threading.Thread):
                 # to replay, so a timeout here is the trustworthy,
                 # correctly-attributed signal (server too slow to restart)
                 # rather than a downstream client close_drain timeout.
-                self._fixture.start(start_timeout_sec=self._restart_timeout_s)
+                #
+                # Gate on the min-HTTP pool, not main /ping: the producers
+                # are reconnecting and saturating the shared-network pool
+                # that serves main HTTP, so a main-HTTP probe here would be
+                # starved and time out even on a healthy restart. The
+                # restart issues no SQL, so main-HTTP readiness isn't needed.
+                self._fixture.start(
+                    start_timeout_sec=self._restart_timeout_s,
+                    probe_min_http=True)
                 self.bounces_performed += 1
                 self._log(f'fuzz bounce #{idx}: server back up')
             except Exception as e:  # noqa: BLE001 — any lifecycle failure fails the run
@@ -1514,13 +1522,19 @@ class BounceThread(threading.Thread):
                 # has a chance to surface the underlying assertion failure
                 # rather than a query timeout. stop() first: if start()
                 # failed partway it may have left a process behind, and we
-                # must not launch a second one next to it.
+                # must not launch a second one next to it. Reuse the bounded
+                # restart timeout and the min-HTTP probe: producers may still
+                # be reconnecting, so a main-HTTP probe would be starved, and
+                # an unbounded wait would let this daemon thread outlive the
+                # test's join budget.
                 try:
                     self._fixture.stop(wait_timeout_sec=self._stop_timeout_s)
                 except Exception:
                     pass
                 try:
-                    self._fixture.start()
+                    self._fixture.start(
+                        start_timeout_sec=self._restart_timeout_s,
+                        probe_min_http=True)
                 except Exception:
                     pass
                 return

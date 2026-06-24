@@ -378,20 +378,34 @@ class QuestDbFixtureBase:
         override it.
         """
 
-    def _check_http_up(self):
-        # Probe the dedicated min-HTTP health endpoint, not the main HTTP
-        # server: the min server runs on its own worker pool, so a heavy QWP
+    def _check_main_http_up(self):
+        # Probe the main HTTP server's /ping. The initial start gates on
+        # this: query_version() and every test SQL query run against the main
+        # HTTP server, so it must be accepting before start() returns. There
+        # is no QWP ingest at initial-start time, so /ping can't be starved
+        # by the shared-network pool that serves it.
+        return self._probe_http(
+            self.http_server_port, '/ping', lambda status: status == 204)
+
+    def _check_min_http_up(self):
+        # Probe the dedicated min-HTTP health endpoint. A bounce restart gates
+        # on this: the min server runs on its own worker pool, so a heavy QWP
         # ingest load on the shared-network pool (which serves the main HTTP
         # server) can't starve the readiness check. HealthCheckProcessor
-        # answers any path with 200 "Status: Healthy".
+        # answers any path with 200 "Status: Healthy". The bounce path issues
+        # no SQL after the probe, so main-HTTP readiness isn't required there.
+        return self._probe_http(
+            self.http_min_port, '/status', lambda status: 200 <= status < 300)
+
+    def _probe_http(self, port, path, status_ok):
         self._assert_server_alive()
         req = urllib.request.Request(
-            f'http://{self.host}:{self.http_min_port}/status',
+            f'http://{self.host}:{port}{path}',
             headers=self.http_headers(),
             method='GET')
         try:
             resp = urllib.request.urlopen(req, timeout=1)
-            if 200 <= resp.status < 300:
+            if status_ok(resp.status):
                 return True
         except OSError:
             # The server isn't accepting yet. A not-yet-ready local process
@@ -571,12 +585,21 @@ class QuestDbFixture(QuestDbFixtureBase):
         if self._proc.poll() is not None:
             raise RuntimeError('QuestDB died during startup.')
 
-    def start(self, start_timeout_sec=300):
-        # start_timeout_sec bounds the wait for the min-HTTP health endpoint
-        # to answer. The generous default flags only a genuinely stuck boot;
-        # the bounce fuzz thread passes a tighter, drain-budget-aware value
-        # so a pathologically slow restart fails as an infra error rather
-        # than starving the producers' close_drain.
+    def start(self, start_timeout_sec=300, probe_min_http=False):
+        # start_timeout_sec bounds the wait for the readiness probe to pass.
+        # The generous default flags only a genuinely stuck boot; the bounce
+        # fuzz thread passes a tighter, drain-budget-aware value so a
+        # pathologically slow restart fails as an infra error rather than
+        # starving the producers' close_drain.
+        #
+        # probe_min_http selects which server gates readiness. The initial
+        # start probes the main HTTP server (/ping): query_version() and all
+        # test SQL hit it, so it must be accepting before start() returns,
+        # and there is no ingest yet to starve it. A bounce restart sets
+        # probe_min_http=True to gate on the dedicated min-HTTP pool instead,
+        # which reconnecting producers on the shared-network pool can't
+        # starve; that path issues no SQL, so main-HTTP readiness isn't
+        # needed.
         if self.http_server_port is None:
             (self.http_server_port, self.line_tcp_port,
              self.pg_port, self.http_min_port) = discover_avail_ports(4)
@@ -671,8 +694,11 @@ class QuestDbFixture(QuestDbFixtureBase):
                 creationflags=creationflags)
 
             sys.stderr.write('Waiting until HTTP service is up.\n')
+            check_up = (
+                self._check_min_http_up if probe_min_http
+                else self._check_main_http_up)
             retry(
-                self._check_http_up,
+                check_up,
                 timeout_sec=start_timeout_sec,
                 msg=f'Timed out waiting for HTTP service to come up '
                     f'within {start_timeout_sec}s.')
@@ -921,8 +947,8 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
             env['QDB_LINE_TCP_AUTH_DB_PATH'] = 'conf/auth.txt'
         return env
 
-    def start(self, start_timeout_sec=300):
-        # start_timeout_sec: see QuestDbFixture.start.
+    def start(self, start_timeout_sec=300, probe_min_http=False):
+        # start_timeout_sec / probe_min_http: see QuestDbFixture.start.
         if self.http_server_port is None:
             (self.http_server_port, self.line_tcp_port,
              self.pg_port, self.http_min_port) = discover_avail_ports(4)
@@ -961,8 +987,11 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
 
         try:
             sys.stderr.write('Waiting until HTTP service is up.\n')
+            check_up = (
+                self._check_min_http_up if probe_min_http
+                else self._check_main_http_up)
             retry(
-                self._check_http_up,
+                check_up,
                 timeout_sec=start_timeout_sec,
                 msg=f'Timed out waiting for HTTP service to come up '
                     f'within {start_timeout_sec}s.')
