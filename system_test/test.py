@@ -2302,6 +2302,20 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
     POLL_INTERVAL_SEC = 0.05
     DRAIN_TIMEOUT_SEC = 120
 
+    # Producers cap close_drain() at CLOSE_FLUSH_TIMEOUT_SEC: the wall-clock
+    # budget for the client to reconnect after a bounce and replay every
+    # queued frame into the restarted server. A bounce restart must finish
+    # well inside that budget, or the producers never get a window to drain
+    # and time out — surfacing a server-too-slow event as a misleading
+    # client-side close_drain timeout. So the bounce thread caps each
+    # restart at BOUNCE_RESTART_TIMEOUT_SEC and fails the run with a
+    # correctly-attributed infra error when it's exceeded. Keep it well
+    # above a healthy restart (~6-40s on CI) and below
+    # CLOSE_FLUSH_TIMEOUT_SEC so the restart cap, not the drain, is what
+    # trips first.
+    CLOSE_FLUSH_TIMEOUT_SEC = 120
+    BOUNCE_RESTART_TIMEOUT_SEC = 90
+
     def setUp(self):
         self._require_fuzz_fixture()
         seed = qwp_ws_fuzz.derive_master_seed()
@@ -2509,6 +2523,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
                     min_interval_s=fuzz.min_bounce_interval_s,
                     max_interval_s=fuzz.max_bounce_interval_s,
                     stop_timeout_s=fuzz.bounce_stop_timeout_s,
+                    restart_timeout_s=self.BOUNCE_RESTART_TIMEOUT_SEC,
                     writers_done=producers_done,
                     stop_event=stop_event,
                     record_failure=record_failure,
@@ -2590,10 +2605,12 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # the non-bounce tests, which never reconnect, so the backoff
             # never engages.)
             reconnect_max_backoff_millis=250,
-            # 2 min on close_drain — bounce-test variants need a long
-            # enough budget for SFA to replay queued frames into a
-            # freshly-restarted server.
-            close_flush_timeout_millis=120000)
+            # close_drain budget: long enough for SFA to replay queued
+            # frames into a freshly-restarted server. A bounce restart is
+            # capped below this (BOUNCE_RESTART_TIMEOUT_SEC) so a slow
+            # restart fails as an infra error instead of starving this
+            # drain.
+            close_flush_timeout_millis=self.CLOSE_FLUSH_TIMEOUT_SEC * 1000)
         try:
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001

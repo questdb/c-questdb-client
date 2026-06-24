@@ -528,7 +528,12 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write(textwrap.indent(log, '    '))
         sys.stderr.write('\n\n')
 
-    def start(self):
+    def start(self, start_timeout_sec=300):
+        # start_timeout_sec bounds the wait for the HTTP service to answer
+        # /ping. The generous default flags only a genuinely stuck boot; the
+        # bounce fuzz thread passes a tighter, drain-budget-aware value so a
+        # pathologically slow restart fails as an infra error rather than
+        # starving the producers' close_drain.
         if self.http_server_port is None:
             ports = discover_avail_ports(3)
             self.http_server_port, self.line_tcp_port, self.pg_port = ports
@@ -640,8 +645,9 @@ class QuestDbFixture(QuestDbFixtureBase):
             sys.stderr.write('Waiting until HTTP service is up.\n')
             retry(
                 check_http_up,
-                timeout_sec=300,
-                msg='Timed out waiting for HTTP service to come up.')
+                timeout_sec=start_timeout_sec,
+                msg=f'Timed out waiting for HTTP service to come up '
+                    f'within {start_timeout_sec}s.')
         except:
             sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
             self.print_log()
@@ -884,7 +890,8 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
             env['QDB_LINE_TCP_AUTH_DB_PATH'] = 'conf/auth.txt'
         return env
 
-    def start(self):
+    def start(self, start_timeout_sec=300):
+        # start_timeout_sec: see QuestDbFixture.start.
         if self.http_server_port is None:
             ports = discover_avail_ports(3)
             self.http_server_port, self.line_tcp_port, self.pg_port = ports
@@ -924,8 +931,9 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
             sys.stderr.write('Waiting until HTTP service is up.\n')
             retry(
                 self._check_http_up,
-                timeout_sec=300,
-                msg='Timed out waiting for HTTP service to come up.')
+                timeout_sec=start_timeout_sec,
+                msg=f'Timed out waiting for HTTP service to come up '
+                    f'within {start_timeout_sec}s.')
         except:
             sys.stderr.write('QuestDB container log:\n')
             self.print_log()

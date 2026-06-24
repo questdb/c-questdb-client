@@ -1419,10 +1419,11 @@ class BounceThread(threading.Thread):
     * the bounce budget is exhausted (``bounces_performed >= max_bounces``);
     * the producers signal completion via ``writers_done.set()``;
     * ``stop_event`` is set; or
-    * a previous bounce raised, in which case ``failure_counter`` gets
-      bumped and the thread tries one defensive ``stop()`` + ``start()``
-      before exiting so the rest of the test still has a server to talk
-      to (and no half-started instance is left behind).
+    * a bounce raised — e.g. the server overran ``stop_timeout_s`` on the
+      way down or ``restart_timeout_s`` on the way back up — in which case
+      ``failure_counter`` gets bumped and the thread tries one defensive
+      ``stop()`` + ``start()`` before exiting so the rest of the test still
+      has a server to talk to (and no half-started instance is left behind).
 
     Each bounce is atomic from the caller's perspective: once the loop
     enters a bounce cycle it completes ``stop()`` + ``start()`` before
@@ -1439,6 +1440,7 @@ class BounceThread(threading.Thread):
             min_interval_s: float,
             max_interval_s: float,
             stop_timeout_s: float,
+            restart_timeout_s: float,
             writers_done: threading.Event,
             stop_event: threading.Event,
             record_failure,
@@ -1452,6 +1454,7 @@ class BounceThread(threading.Thread):
         self._min_interval_s = min_interval_s
         self._max_interval_s = max(max_interval_s, min_interval_s)
         self._stop_timeout_s = stop_timeout_s
+        self._restart_timeout_s = restart_timeout_s
         self._writers_done = writers_done
         self._stop_event = stop_event
         self._record_failure = record_failure
@@ -1486,16 +1489,25 @@ class BounceThread(threading.Thread):
                 # before start() rebinds them.
                 time.sleep(0.02 + self._rnd.next_int(200) / 1000.0)
                 self._log(f'fuzz bounce #{idx}: starting QDB')
-                self._fixture.start()
+                # Cap the restart wait below the producers' close_drain
+                # budget: a restart slower than this leaves them no window
+                # to replay, so a timeout here is the trustworthy,
+                # correctly-attributed signal (server too slow to restart)
+                # rather than a downstream client close_drain timeout.
+                self._fixture.start(start_timeout_sec=self._restart_timeout_s)
                 self.bounces_performed += 1
                 self._log(f'fuzz bounce #{idx}: server back up')
             except Exception as e:  # noqa: BLE001 — any lifecycle failure fails the run
                 # A raise here is a real failure, not noise: stop() raises
                 # when the server won't shut down within its timeout, and
-                # start() raises when it won't come back up. Either way we
-                # record it so the end-of-run assertion fails.
+                # start() raises when it won't come back up within
+                # restart_timeout_s. Both bounds are sized so only a stuck
+                # or pathologically slow server trips them; a restart that
+                # slow starves the producers' close_drain, so we attribute
+                # it here instead of letting it resurface as a misleading
+                # client timeout.
                 self._record_failure(
-                    f'fuzz bounce: unexpected failure at attempt '
+                    f'fuzz bounce: server lifecycle failed at attempt '
                     f'{self.bounces_performed + 1}: '
                     f'{type(e).__name__}: {e}')
                 # One defensive recovery attempt so the rest of the test
