@@ -41,6 +41,16 @@ pub fn has_zone(capabilities: u32) -> bool {
     capabilities & CAP_ZONE != 0
 }
 
+/// Server parses the optional `query_flags: varint` trailer appended to
+/// `QUERY_REQUEST` after the bind section. Clients append the trailer only
+/// when this bit is set, so a server without it sees the baseline layout.
+pub const CAP_QUERY_FLAGS: u32 = 0x0000_0002;
+
+/// True if the server parses the `QUERY_REQUEST` `query_flags` trailer.
+pub fn has_query_flags(capabilities: u32) -> bool {
+    capabilities & CAP_QUERY_FLAGS != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

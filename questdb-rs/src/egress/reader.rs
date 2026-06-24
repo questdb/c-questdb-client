@@ -52,12 +52,15 @@ use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::decoder::ZstdScratch;
 use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
-use crate::egress::query_request::{QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET};
+use crate::egress::query_request::{
+    QUERY_FLAG_RESET_DICT, QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET,
+};
 use crate::egress::schema::Schema;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::tracker::HostHealthTracker;
 use crate::egress::transport::{CLOSE_TIMEOUT, WRITE_TIMEOUT, WsTransport};
+use crate::egress::wire::capabilities::has_query_flags;
 use crate::egress::wire::header::HEADER_LEN;
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
@@ -691,6 +694,7 @@ impl Reader {
         ReaderQuery {
             reader: self,
             builder: QueryRequest::builder(sql),
+            reset_symbol_dict: false,
             on_failover_reset: None,
             on_failover_progress: None,
             _not_send: std::marker::PhantomData,
@@ -866,6 +870,10 @@ type FailoverProgressCallback<'r> = Box<dyn FnMut(&FailoverProgressEvent) + 'r>;
 pub struct ReaderQuery<'r> {
     reader: &'r mut Reader,
     builder: QueryRequestBuilder,
+    /// Request a query-scoped SYMBOL dict reset; translated to a
+    /// `query_flags` trailer at [`Self::execute`] iff the server advertised
+    /// `CAP_QUERY_FLAGS`.
+    reset_symbol_dict: bool,
     /// Optional handler called every time the cursor reconnects after a
     /// transport-level failure (see [`FailoverEvent`]).
     on_failover_reset: Option<FailoverResetCallback<'r>>,
@@ -891,6 +899,15 @@ impl<'r> ReaderQuery<'r> {
     /// Override the `initial_credit` (bytes; `0` = unbounded).
     pub fn initial_credit(mut self, credit: u64) -> Self {
         self.builder = self.builder.initial_credit(credit);
+        self
+    }
+
+    /// Request a query-scoped SYMBOL dict: the server resets the connection
+    /// dict before streaming this query so it never inherits symbols from
+    /// earlier queries on the same connection. Silently no-op against a server
+    /// that does not advertise `CAP_QUERY_FLAGS`.
+    pub fn reset_symbol_dict(mut self, reset: bool) -> Self {
+        self.reset_symbol_dict = reset;
         self
     }
 
@@ -1107,7 +1124,24 @@ impl<'r> ReaderQuery<'r> {
         // query; clear any schema left from the prior query so a stray
         // continuation batch can't bind rows to a stale schema.
         self.reader.query_schema = None;
-        let req = self.builder.request_id(request_id).build()?;
+        // Cap-gate the query_flags trailer: only emit it when the server
+        // advertised CAP_QUERY_FLAGS, so an older server sees the baseline
+        // QUERY_REQUEST layout and the reset request silently degrades.
+        let server_supports_query_flags = self
+            .reader
+            .server_info()
+            .map(|info| has_query_flags(info.capabilities))
+            .unwrap_or(false);
+        let query_flags = if self.reset_symbol_dict && server_supports_query_flags {
+            QUERY_FLAG_RESET_DICT
+        } else {
+            0
+        };
+        let req = self
+            .builder
+            .request_id(request_id)
+            .query_flags(query_flags)
+            .build()?;
         let credit_enabled = req.initial_credit() > 0;
         // Encode the QUERY_REQUEST once and stash the bytes on the
         // cursor. Mid-query failover replays the query by patching

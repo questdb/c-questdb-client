@@ -3040,6 +3040,14 @@ pub unsafe extern "C" fn reader_query_initial_credit(query: *mut reader_query, c
     unsafe { mutate_query(query, |q| q.initial_credit(credit)) }
 }
 
+/// Request a query-scoped SYMBOL dict reset on the in-progress query.
+/// Mirrors `ReaderQuery::reset_symbol_dict`. No-op against a server that
+/// does not advertise `CAP_QUERY_FLAGS`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reader_query_set_reset_symbol_dict(query: *mut reader_query, reset: bool) {
+    unsafe { mutate_query(query, |q| q.reset_symbol_dict(reset)) }
+}
+
 /// Report a NULL out-param contract violation through `err_out`.
 #[inline]
 unsafe fn null_out_param_err(err_out: *mut *mut reader_error, fn_name: &str) {

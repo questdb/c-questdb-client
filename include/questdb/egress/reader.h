@@ -1170,6 +1170,14 @@ QUESTDB_CLIENT_API void reader_query_initial_credit(
     reader_query*, uint64_t credit);
 
 /**
+ * Request a query-scoped SYMBOL dict: the server resets the connection dict
+ * before streaming this query. No-op against a server that does not advertise
+ * `CAP_QUERY_FLAGS`. Mirrors `ReaderQuery::reset_symbol_dict`.
+ */
+QUESTDB_CLIENT_API void reader_query_set_reset_symbol_dict(
+    reader_query*, bool reset);
+
+/**
  * Install a failover-reset callback on the query. Replaces any previously
  * installed callback. `user_data` is opaque to the library; pass NULL if
  * not needed. The callback fires on the thread driving
