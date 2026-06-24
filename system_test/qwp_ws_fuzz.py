@@ -1489,11 +1489,14 @@ class BounceThread(threading.Thread):
                 # before start() rebinds them.
                 time.sleep(0.02 + self._rnd.next_int(200) / 1000.0)
                 self._log(f'fuzz bounce #{idx}: starting QDB')
-                # Cap the restart wait below the producers' close_drain
-                # budget: a restart slower than this leaves them no window
-                # to replay, so a timeout here is the trustworthy,
-                # correctly-attributed signal (server too slow to restart)
-                # rather than a downstream client close_drain timeout.
+                # Cap the restart wait at restart_timeout_s: a restart that
+                # overruns it is a stuck boot, and failing here gives the
+                # trustworthy, correctly-attributed signal (server too slow
+                # to restart). The producers' reconnect/close_drain budgets
+                # are sized above a full stop()+start() down-window (see
+                # TestQwpWsFuzz._producer_loop), so a restart inside this cap
+                # never strands them — only one that trips the cap does, and
+                # that surfaces here, not as a downstream client timeout.
                 #
                 # Gate on the min-HTTP pool, not main /ping: the producers
                 # are reconnecting and saturating the shared-network pool
@@ -1510,10 +1513,10 @@ class BounceThread(threading.Thread):
                 # when the server won't shut down within its timeout, and
                 # start() raises when it won't come back up within
                 # restart_timeout_s. Both bounds are sized so only a stuck
-                # or pathologically slow server trips them; a restart that
-                # slow starves the producers' close_drain, so we attribute
-                # it here instead of letting it resurface as a misleading
-                # client timeout.
+                # or pathologically slow server trips them, and a server that
+                # slow is exactly what the producers' down-window budget is
+                # sized to outlast — so attributing it here, rather than as a
+                # downstream client timeout, is the correct call.
                 self._record_failure(
                     f'fuzz bounce: server lifecycle failed at attempt '
                     f'{self.bounces_performed + 1}: '
@@ -1525,8 +1528,11 @@ class BounceThread(threading.Thread):
                 # must not launch a second one next to it. Reuse the bounded
                 # restart timeout and the min-HTTP probe: producers may still
                 # be reconnecting, so a main-HTTP probe would be starved, and
-                # an unbounded wait would let this daemon thread outlive the
-                # test's join budget.
+                # the bound keeps this recovery from running unbounded. The
+                # failure is already recorded, so even if recovery overruns
+                # the test's bounce wind-down the run still fails with correct
+                # attribution; the wind-down's is_alive check flags a thread
+                # still stuck here.
                 try:
                     self._fixture.stop(wait_timeout_sec=self._stop_timeout_s)
                 except Exception:
