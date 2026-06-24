@@ -369,6 +369,40 @@ class QuestDbFixtureBase:
             raise QueryError(data['error'])
         return data
 
+    def _assert_server_alive(self):
+        """Raise if the server died during startup.
+
+        The readiness probe calls this before each attempt so a crashed
+        server fails fast instead of looping until the timeout. The base
+        fixture has no process to inspect; the managed and docker fixtures
+        override it.
+        """
+
+    def _check_http_up(self):
+        # Probe the dedicated min-HTTP health endpoint, not the main HTTP
+        # server: the min server runs on its own worker pool, so a heavy QWP
+        # ingest load on the shared-network pool (which serves the main HTTP
+        # server) can't starve the readiness check. HealthCheckProcessor
+        # answers any path with 200 "Status: Healthy".
+        self._assert_server_alive()
+        req = urllib.request.Request(
+            f'http://{self.host}:{self.http_min_port}/status',
+            headers=self.http_headers(),
+            method='GET')
+        try:
+            resp = urllib.request.urlopen(req, timeout=1)
+            if 200 <= resp.status < 300:
+                return True
+        except OSError:
+            # The server isn't accepting yet. A not-yet-ready local process
+            # refuses the connection (urllib.error.URLError); docker
+            # publishes the host port before QuestDB binds, so an early probe
+            # can connect and then be reset (RemoteDisconnected /
+            # ConnectionResetError). URLError and socket.timeout are both
+            # OSError subclasses, so one handler covers every case.
+            pass
+        return False
+
     def query_version(self):
         try:
             res = self.http_sql_query('select build')
@@ -533,6 +567,10 @@ class QuestDbFixture(QuestDbFixtureBase):
         sys.stderr.write(textwrap.indent(log, '    '))
         sys.stderr.write('\n\n')
 
+    def _assert_server_alive(self):
+        if self._proc.poll() is not None:
+            raise RuntimeError('QuestDB died during startup.')
+
     def start(self, start_timeout_sec=300):
         # start_timeout_sec bounds the wait for the min-HTTP health endpoint
         # to answer. The generous default flags only a genuinely stuck boot;
@@ -632,31 +670,9 @@ class QuestDbFixture(QuestDbFixtureBase):
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags)
 
-            def check_http_up():
-                if self._proc.poll() is not None:
-                    raise RuntimeError('QuestDB died during startup.')
-                # Probe the dedicated min-HTTP health endpoint, not the main
-                # HTTP /ping: the min server runs on its own worker, so a
-                # heavy QWP ingest load on the shared-network pool can't
-                # starve the readiness check. HealthCheckProcessor answers
-                # any path with 200 "Status: Healthy".
-                req = urllib.request.Request(
-                    f'http://127.0.0.1:{self.http_min_port}/status',
-                    headers=self.http_headers(),
-                    method='GET')
-                try:
-                    resp = urllib.request.urlopen(req, timeout=1)
-                    if 200 <= resp.status < 300:
-                        return True
-                except socket.timeout:
-                    pass
-                except urllib.error.URLError:
-                    pass
-                return False
-
             sys.stderr.write('Waiting until HTTP service is up.\n')
             retry(
-                check_http_up,
+                self._check_http_up,
                 timeout_sec=start_timeout_sec,
                 msg=f'Timed out waiting for HTTP service to come up '
                     f'within {start_timeout_sec}s.')
@@ -974,31 +990,9 @@ class QuestDbDockerFixture(QuestDbFixtureBase):
             check=False, capture=True)
         return res.returncode == 0 and res.stdout.strip() == b'true'
 
-    def _check_http_up(self):
+    def _assert_server_alive(self):
         if not self._is_running():
             raise RuntimeError('QuestDB container died during startup.')
-        # Probe the dedicated min-HTTP health endpoint (see
-        # QuestDbFixture.start): isolated from the shared-network pool that
-        # serves the main HTTP server and QWP ingest.
-        req = urllib.request.Request(
-            f'http://{self.host}:{self.http_min_port}/status',
-            headers=self.http_headers(),
-            method='GET')
-        try:
-            resp = urllib.request.urlopen(req, timeout=1)
-            if 200 <= resp.status < 300:
-                return True
-        except urllib.error.URLError:
-            pass
-        except OSError:
-            # Docker publishes the host port before QuestDB is ready, so an
-            # early probe can connect and then be reset
-            # (http.client.RemoteDisconnected, a ConnectionResetError /
-            # OSError). The local-process fixture only sees connection-refused
-            # (URLError) because its port opens with the app. socket.timeout
-            # is an OSError too.
-            pass
-        return False
 
     def __enter__(self):
         self.start()
