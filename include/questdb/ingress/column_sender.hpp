@@ -939,6 +939,14 @@ class pool;
  * pool has been closed).
  *
  * Constructed only via `pool::borrow_column_sender()`.
+ *
+ * @warning The destructor returns/drops the conn but does NOT sync. If the
+ * conn has flushed but not yet synced, destruction silently discards every
+ * deferred (non-first) flush since the last sync — in direct mode those
+ * source chunks were already cleared, so the data is unrecoverable. Call
+ * `sync()` (or `flush_and_wait()` on the final chunk) before this guard goes
+ * out of scope. The destructor is deliberately left non-syncing: a
+ * destructor must not throw or block, so an automatic sync is not safe.
  */
 class borrowed_column_sender
 {

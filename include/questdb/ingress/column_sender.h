@@ -213,6 +213,14 @@ uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);
  * `db` is currently ignored — the conn carries its own reference to
  * the pool — but accepted for symmetry with the borrow call.
  *
+ * @warning Returning a conn that has flushed but not yet
+ * `column_sender_sync`'d silently discards every deferred (non-first) flush
+ * since the last sync: in direct mode those flushes were sent with the
+ * deferred-commit flag and their source chunks were already cleared, so the
+ * data is unrecoverable. Call `column_sender_sync` (or
+ * `column_sender_flush_and_wait` on the final chunk) before returning to
+ * avoid data loss.
+ *
  * Mutually exclusive with `questdb_db_drop_column_sender` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
  */
@@ -232,6 +240,14 @@ void questdb_db_return_column_sender(
  * store-and-forward mode this removes the current backend from the pool and
  * releases the slot lock; unresolved frames remain in `sf_dir` for the next
  * owner to replay.
+ *
+ * @warning Dropping a conn that has flushed but not yet `column_sender_sync`'d
+ * silently discards every deferred (non-first) flush since the last sync: in
+ * direct mode those flushes were sent with the deferred-commit flag and their
+ * source chunks were already cleared, so the data is unrecoverable (it is not
+ * persisted in `sf_dir` for replay either). If those flushes must not be lost,
+ * call `column_sender_sync` (or `column_sender_flush_and_wait` on the final
+ * chunk) before dropping.
  *
  * Mutually exclusive with `questdb_db_return_column_sender` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
@@ -455,6 +471,14 @@ size_t column_sender_chunk_row_count(
  * contiguous, full-length typed array with one slot per row (including
  * null rows — their slot value is ignored). `validity` is optional;
  * pass NULL when the column has no nulls.
+ *
+ * `name` / `name_len` are taken raw and checked ONLY for UTF-8 here; the
+ * column-name grammar (illegal characters, dot placement, length cap) is
+ * validated LAZILY at the next `column_sender_flush*`, so a bad name
+ * surfaces as a flush error rather than at the append call. This differs
+ * from the row API's `line_sender_column_name`, which is grammar-checked
+ * eagerly at `line_sender_column_name_init`. There is intentionally no
+ * pre-validated column-name overload on the column-sender surface.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
@@ -745,10 +769,12 @@ bool column_sender_chunk_symbol_dict_i32(
  * struct returns an error rather than aborting. It is NOT possible to
  * validate the *sizes* of the producer's buffers — the Arrow C Data
  * Interface carries no buffer byte-length. A producer that declares a
- * `length`/offsets inconsistent with its actual buffer allocations
- * causes out-of-bounds reads (undefined behavior). The caller is
- * responsible for passing arrays whose buffers match their declared
- * length. First-party producers (pyarrow, polars) always satisfy this.
+ * `length`/offsets inconsistent with its actual buffer allocations, or a
+ * `metadata` blob whose internal key/value lengths run past its
+ * allocation, causes out-of-bounds reads (undefined behavior) inside
+ * arrow-rs that no consumer can pre-detect. The caller is responsible for
+ * passing arrays whose buffers and metadata match their declared sizes.
+ * First-party producers (pyarrow, polars) always satisfy this.
  * ------------------------------------------------------------------------- */
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
@@ -891,9 +917,10 @@ QUESTDB_CLIENT_API
 void column_sender_arrow_import_free(column_sender_arrow_import* imported);
 
 /**
- * Number of rows in an imported Arrow column. Returns 0 for a NULL
- * `imported`, for a logically-empty column, and for a handle that has
- * been freed or is held by a concurrent call.
+ * Number of rows in an imported Arrow column. Returns `(size_t)-1`
+ * (a.k.a. `SIZE_MAX`) if `imported` is NULL, has been freed, or is held
+ * by a concurrent call; `0` is reserved for a logically-empty (0-row)
+ * column.
  */
 QUESTDB_CLIENT_API
 size_t column_sender_arrow_import_len(const column_sender_arrow_import* imported);

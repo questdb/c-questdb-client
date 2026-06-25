@@ -205,10 +205,21 @@ pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
     let schema = rb.schema();
     let row_count = rb.num_rows();
     let mut columns: Vec<Column> = Vec::with_capacity(rb.num_columns());
+    // This standalone entry point has no per-cursor state to scope a
+    // `Categories` to, so SYMBOL strings intern into the process-global
+    // `Categories::global()` and are retained for the process lifetime. The
+    // cursor-driven paths (`next_polars` / `iter_polars` / `fetch_all_polars`)
+    // instead route through `build_dataframe`, which scopes interning to the
+    // cursor's `SymbolRegistry` (reset on CACHE_RESET). Using `global()` here
+    // also keeps the result's Categoricals compatible with any global
+    // Categoricals the caller already holds.
+    let cats = Categories::global();
+    let mapping = cats.mapping();
+    let cat_dtype = PlDataType::Categorical(cats, mapping);
     for (col, field) in rb.columns().iter().zip(schema.fields().iter()) {
         let name = field.name().as_str();
         let series = if matches!(col.data_type(), ArrowDataType::Dictionary(_, _)) {
-            dictionary_to_categorical(name, col)?
+            dictionary_to_categorical(name, col, &cat_dtype)?
         } else {
             import_polars_series(name, &col.to_data())?
         };
@@ -234,7 +245,17 @@ fn import_polars_series(name: &str, array_data: &ArrayData) -> Result<Series> {
 /// Build a SYMBOL column's polars `Categorical` from its codes + dictionary
 /// (cast the small dictionary, then `take` by code), avoiding
 /// `Series::from_arrow`'s per-row remap. `Categories` exists since polars 0.50.
-fn dictionary_to_categorical(name: &str, col: &ArrayRef) -> Result<Series> {
+///
+/// `cat_dtype` is the `Categorical` dtype to intern the dictionary strings into.
+/// All RESULT_BATCH frames of one query must pass the SAME dtype: polars
+/// vstack/concat — used by `fetch_all_polars` / `iter_polars` to stitch the
+/// per-batch frames — only accepts Categoricals that share one `Categories`
+/// identity, otherwise it errors "Categories name mismatch".
+fn dictionary_to_categorical(
+    name: &str,
+    col: &ArrayRef,
+    cat_dtype: &PlDataType,
+) -> Result<Series> {
     let dict = col
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
@@ -247,28 +268,8 @@ fn dictionary_to_categorical(name: &str, col: &ArrayRef) -> Result<Series> {
         })?;
 
     let values = import_polars_series(name, &dict.values().to_data())?;
-    // Every RESULT_BATCH frame of one query must build its SYMBOL Categorical
-    // against the SAME `Categories`: polars vstack/concat — used by
-    // `fetch_all_polars` / `iter_polars` to stitch the per-batch frames — only
-    // accepts Categoricals that share one `Categories` identity, otherwise it
-    // errors "Categories name mismatch".
-    //
-    // Use the process-global `Categories`. This is exactly what the
-    // pre-optimization path produced: SYMBOL columns used to flow through
-    // `Series::from_arrow`, and polars maps a metadata-less Utf8 dictionary to
-    // `Categories::global()` (polars `DataType::from_arrow`), so every batch and
-    // every symbol column already shared one Categories. The faster
-    // cast-and-take path that replaced it switched to `Categories::random()` — a
-    // fresh UUID-named instance per call — which silently broke vstack for any
-    // SYMBOL result spanning >1 batch (>~16k rows). `global()` restores the
-    // shared identity so later batches' codes intern into one mapping and stack
-    // cleanly. (A per-stream Categories would bound the mapping's lifetime to a
-    // single query, but at the cost of cross-compatibility with the caller's own
-    // global Categoricals — left as a possible future optimization.)
-    let cats = Categories::global();
-    let mapping = cats.mapping();
     let cat_dict = values
-        .cast(&PlDataType::Categorical(cats, mapping))
+        .cast(cat_dtype)
         .map_err(|e| {
             fmt!(
                 ArrowExport,
@@ -305,6 +306,16 @@ pub(crate) struct SymbolRegistry {
     dtype: PlDataType,
     mapping: Arc<CategoricalMapping>,
     registered: usize,
+    /// Separate `Categories` for column-local (non-delta) SYMBOL columns routed
+    /// through the fallback. It must NOT share `mapping`: that one's physical id
+    /// == QWP global code by construction (`sync` interns in code order), and
+    /// interning arbitrary column-local strings into it would break that
+    /// alignment. A dedicated per-cursor `Categories` keeps the fallback's
+    /// retention scoped to the cursor (reset on CACHE_RESET with the rest of the
+    /// registry) instead of leaking into `Categories::global()` for the whole
+    /// process, while still sharing one identity across a stream's batches so
+    /// `fetch_all_polars` / `iter_polars` can vstack them.
+    fallback_dtype: PlDataType,
 }
 
 impl SymbolRegistry {
@@ -312,11 +323,22 @@ impl SymbolRegistry {
         let cats = Categories::random(PlSmallStr::from("questdb_symbol"), CategoricalPhysical::U32);
         let mapping = cats.mapping();
         let dtype = PlDataType::Categorical(cats, mapping.clone());
+        let fallback_cats = Categories::random(
+            PlSmallStr::from("questdb_symbol_local"),
+            CategoricalPhysical::U32,
+        );
+        let fallback_mapping = fallback_cats.mapping();
+        let fallback_dtype = PlDataType::Categorical(fallback_cats, fallback_mapping);
         Self {
             dtype,
             mapping,
             registered: 0,
+            fallback_dtype,
         }
+    }
+
+    fn local_dict_to_categorical(&self, name: &str, col: &ArrayRef) -> Result<Series> {
+        dictionary_to_categorical(name, col, &self.fallback_dtype)
     }
 
     pub(crate) fn sync(&mut self, dict: &SymbolDict) -> Result<()> {
@@ -373,7 +395,9 @@ impl SymbolRegistry {
 
 /// `RecordBatch → DataFrame` for the cursor-driven polars paths. Delta-mode
 /// SYMBOL columns (`delta_modes[i]`) resolve through the persistent `registry`;
-/// column-local SYMBOL columns fall back to [`dictionary_to_categorical`].
+/// column-local SYMBOL columns fall back to
+/// [`SymbolRegistry::local_dict_to_categorical`], which scopes interning to the
+/// cursor's own `Categories` rather than the process-global one.
 fn build_dataframe(
     rb: RecordBatch,
     delta_modes: &[bool],
@@ -388,7 +412,7 @@ fn build_dataframe(
             if delta_modes.get(i).copied().unwrap_or(false) {
                 registry.categorical_from_keys(name, col)?
             } else {
-                dictionary_to_categorical(name, col)?
+                registry.local_dict_to_categorical(name, col)?
             }
         } else {
             import_polars_series(name, &col.to_data())?
@@ -778,5 +802,66 @@ mod tests {
             PlDataType::Categorical(_, _)
         ));
         assert_eq!(cat_strings(&df), vec![Some("L1".into()), Some("L0".into())]);
+    }
+
+    #[test]
+    fn column_local_symbol_fallback_vstacks_across_batches() {
+        // The fallback interns into the registry's per-cursor `Categories`, so
+        // two column-local batches of one stream share one identity and vstack.
+        // A regression to a fresh-per-call `Categories` would fail vstack here.
+        let reg = SymbolRegistry::new();
+        let mut df = build_dataframe(sym_batch(&["a", "b"], &[Some(0), Some(1)]), &[false], &reg)
+            .unwrap();
+        let df2 =
+            build_dataframe(sym_batch(&["b", "c"], &[Some(0), Some(1)]), &[false], &reg).unwrap();
+        df.vstack_mut_owned(df2)
+            .expect("fallback Categoricals from different batches must vstack");
+        assert_eq!(
+            cat_strings(&df),
+            vec![Some("a".into()), Some("b".into()), Some("b".into()), Some("c".into())]
+        );
+    }
+
+    #[test]
+    fn delta_and_fallback_use_independent_categories() {
+        // A single stream mixing a delta column (code == QWP code) and a
+        // column-local fallback column must not crosswire: the fallback's
+        // interning must not disturb the delta mapping's code alignment.
+        let mut dict = SymbolDict::new();
+        dict.apply_delta(0, [b"d0".as_slice(), b"d1".as_slice()])
+            .unwrap();
+        let mut reg = SymbolRegistry::new();
+        reg.sync(&dict).unwrap();
+
+        let dict_ty = DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("delta", dict_ty.clone(), true),
+            Field::new("local", dict_ty, true),
+        ]));
+        use arrow_array::types::UInt32Type;
+        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+        let delta_col: ArrayRef = Arc::new(DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![Some(1u32), Some(0)]),
+            Arc::new(StringArray::from(vec!["d0", "d1"])) as ArrayRef,
+        ));
+        let local_col: ArrayRef = Arc::new(DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![Some(0u32), Some(1)]),
+            Arc::new(StringArray::from(vec!["d0", "L1"])) as ArrayRef,
+        ));
+        let rb = RecordBatch::try_new(schema, vec![delta_col, local_col]).unwrap();
+        let df = build_dataframe(rb, &[true, false], &reg).unwrap();
+
+        let delta = df.columns()[0]
+            .as_materialized_series()
+            .cast(&PlDataType::String)
+            .unwrap();
+        let local = df.columns()[1]
+            .as_materialized_series()
+            .cast(&PlDataType::String)
+            .unwrap();
+        assert_eq!(delta.str().unwrap().get(0), Some("d1"));
+        assert_eq!(delta.str().unwrap().get(1), Some("d0"));
+        assert_eq!(local.str().unwrap().get(0), Some("d0"));
+        assert_eq!(local.str().unwrap().get(1), Some("L1"));
     }
 }

@@ -529,8 +529,12 @@ fn ffi_polars_to_arrow_rs(
     let pa_array = polars_arrow::ffi::export_array_to_c(pa_array_box);
     let rs_schema = unsafe { pa_schema_into_rs(pa_schema) };
     let rs_array = unsafe { pa_array_into_rs(pa_array) };
-    unsafe { arrow::ffi::from_ffi(rs_array, &rs_schema) }
-        .map_err(|e| fmt!(ArrowIngest, "from_ffi('{}'): {}", col_name, e))
+    let array_data = unsafe { arrow::ffi::from_ffi(rs_array, &rs_schema) }
+        .map_err(|e| fmt!(ArrowIngest, "from_ffi('{}'): {}", col_name, e))?;
+    array_data
+        .validate_full()
+        .map_err(|e| fmt!(ArrowIngest, "Arrow array validation failed('{}'): {}", col_name, e))?;
+    Ok(array_data)
 }
 
 #[cfg(test)]
@@ -589,6 +593,8 @@ mod tests {
         let rs_schema = unsafe { pa_schema_into_rs(exported_schema) };
         let data = unsafe { arrow::ffi::from_ffi(rs_array, &rs_schema) }
             .expect("from_ffi after polars-arrow → arrow-rs bridge");
+        data.validate_full()
+            .expect("valid polars export passes full validation");
 
         let arr = arrow_array::make_array(data);
         let int_arr = arr.as_primitive::<Int64Type>();

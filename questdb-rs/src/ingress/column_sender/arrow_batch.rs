@@ -1539,36 +1539,73 @@ fn write_decimal256_payload(
     }
 }
 
-// ----- Time / Duration → i64 -----
+// ----- Time / Duration → i64 nanoseconds -----
+//
+// QuestDB has no Time/Duration column type, so these map to LONG. Values
+// are normalized to nanoseconds so the stored integer is unit-independent:
+// without it a `Duration(ms)` of 1000 and a `Duration(us)` of 1000 would
+// both land as `1000`, silently dropping the source unit.
+
+fn nanos_per_unit(unit: TimeUnit) -> i64 {
+    match unit {
+        TimeUnit::Second => 1_000_000_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Nanosecond => 1,
+    }
+}
+
+fn write_scaled_to_nanos(
+    out: &mut Vec<u8>,
+    arr: &dyn Array,
+    unit: TimeUnit,
+    label: &str,
+    mut get: impl FnMut(usize) -> i64,
+) -> Result<()> {
+    let factor = nanos_per_unit(unit);
+    try_full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| {
+        let v = get(row);
+        v.checked_mul(factor).map(i64::to_le_bytes).ok_or_else(|| {
+            fmt!(
+                ArrowIngest,
+                "{} value {} ({:?}) overflows i64 nanoseconds at row {}",
+                label,
+                v,
+                unit,
+                row
+            )
+        })
+    })
+}
 
 fn write_time_as_long_payload(out: &mut Vec<u8>, arr: &dyn Array, unit: TimeUnit) -> Result<()> {
-    full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| match unit {
+    match unit {
         TimeUnit::Second => {
             let a = arr.as_any().downcast_ref::<Time32SecondArray>().unwrap();
-            (a.value(row) as i64).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Time", |row| a.value(row) as i64)
         }
         TimeUnit::Millisecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Time32MillisecondArray>()
                 .unwrap();
-            (a.value(row) as i64).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Time", |row| a.value(row) as i64)
         }
         TimeUnit::Microsecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Time64MicrosecondArray>()
                 .unwrap();
-            a.value(row).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Time", |row| a.value(row))
         }
         TimeUnit::Nanosecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Time64NanosecondArray>()
                 .unwrap();
-            a.value(row).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Time", |row| a.value(row))
         }
-    })
+    }
 }
 
 fn write_duration_as_long_payload(
@@ -1576,33 +1613,33 @@ fn write_duration_as_long_payload(
     arr: &dyn Array,
     unit: TimeUnit,
 ) -> Result<()> {
-    full_with_sentinel::<8>(out, arr, i64::MIN.to_le_bytes(), |row| match unit {
+    match unit {
         TimeUnit::Second => {
             let a = arr.as_any().downcast_ref::<DurationSecondArray>().unwrap();
-            a.value(row).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Duration", |row| a.value(row))
         }
         TimeUnit::Millisecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<DurationMillisecondArray>()
                 .unwrap();
-            a.value(row).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Duration", |row| a.value(row))
         }
         TimeUnit::Microsecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<DurationMicrosecondArray>()
                 .unwrap();
-            a.value(row).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Duration", |row| a.value(row))
         }
         TimeUnit::Nanosecond => {
             let a = arr
                 .as_any()
                 .downcast_ref::<DurationNanosecondArray>()
                 .unwrap();
-            a.value(row).to_le_bytes()
+            write_scaled_to_nanos(out, arr, unit, "Duration", |row| a.value(row))
         }
-    })
+    }
 }
 
 fn geohash_bytes_per_value(bits: u8) -> usize {
@@ -2935,8 +2972,6 @@ pub(crate) fn write_arrow_column_body(
         }
         ColumnKind::TimestampSecondToMicros => {
             let a = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-            ensure_timestamp_no_nulls(arr, "timestamp field column")?;
-            ensure_timestamp_values_non_negative(arr, a.values(), "timestamp field column")?;
             try_non_null_le::<8>(out, arr, |row| {
                 let v = a.value(row);
                 let widened = v.checked_mul(1_000_000).ok_or_else(|| {
@@ -2955,8 +2990,6 @@ pub(crate) fn write_arrow_column_body(
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap();
-            ensure_timestamp_no_nulls(arr, "timestamp field column")?;
-            ensure_timestamp_values_non_negative(arr, a.values(), "timestamp field column")?;
             if !use_bitmap && cfg!(target_endian = "little") {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
             } else {
@@ -2968,8 +3001,6 @@ pub(crate) fn write_arrow_column_body(
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
                 .unwrap();
-            ensure_timestamp_no_nulls(arr, "timestamp field column")?;
-            ensure_timestamp_values_non_negative(arr, a.values(), "timestamp field column")?;
             if !use_bitmap && cfg!(target_endian = "little") {
                 extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(a.values()) })
             } else {
@@ -4490,28 +4521,61 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_arrow_negative_values_are_rejected() {
+    fn designated_timestamp_arrow_negative_values_are_rejected() {
         let mut ts = TimestampMicrosecondBuilder::new();
         ts.append_value(-1);
         let rb = single_col_batch(
             Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), false),
             ts.finish(),
         );
-        let err = encode_err(&rb);
+        let err = encode_err_at_ts(&rb, 0);
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
     }
 
     #[test]
-    fn timestamp_field_nulls_are_rejected() {
+    fn timestamp_field_negative_values_are_encoded() {
         let mut ts = TimestampMicrosecondBuilder::new();
-        ts.append_value(1);
+        ts.append_value(-1);
+        ts.append_value(-1_000_000);
+        let rb = single_col_batch(
+            Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            ts.finish(),
+        );
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 2);
+        assert_eq!(ty, QWP_TYPE_TIMESTAMP);
+        assert_eq!(body[0], 0, "no nulls → no bitmap");
+        let vals: Vec<i64> = (0..rows)
+            .map(|i| i64::from_le_bytes(body[1 + i * 8..1 + i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(vals, vec![-1, -1_000_000]);
+    }
+
+    #[test]
+    fn timestamp_field_null_rows_are_encoded_with_bitmap() {
+        let mut ts = TimestampMicrosecondBuilder::new();
+        ts.append_value(10);
         ts.append_null();
+        ts.append_value(-30);
         let rb = single_col_batch(
             Field::new("t", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             ts.finish(),
         );
-        let err = encode_err(&rb);
-        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        let out = encode(&rb);
+        let (rows, ty, body) = decode_single_column(&out);
+        assert_eq!(rows, 3);
+        assert_eq!(ty, QWP_TYPE_TIMESTAMP);
+        assert_eq!(body[0], 1, "null present → bitmap flag set");
+        let bitmap_bytes = rows.div_ceil(8);
+        assert_eq!(
+            decode_qwp_nulls(&body[1..1 + bitmap_bytes], rows),
+            vec![false, true, false]
+        );
+        let vals = &body[1 + bitmap_bytes..];
+        let v0 = i64::from_le_bytes(vals[0..8].try_into().unwrap());
+        let v1 = i64::from_le_bytes(vals[8..16].try_into().unwrap());
+        assert_eq!((v0, v1), (10, -30), "dense non-null values, nulls skipped");
     }
 
     #[test]
@@ -5156,6 +5220,44 @@ mod tests {
             d.finish(),
         );
         assert_ok_with_table_count(&rb, 1);
+    }
+
+    #[test]
+    fn duration_units_normalize_to_distinct_nanoseconds() {
+        use arrow_array::builder::{DurationMicrosecondBuilder, DurationMillisecondBuilder};
+        let mut ms = DurationMillisecondBuilder::new();
+        ms.append_value(1);
+        let ms_rb = single_col_batch(
+            Field::new("d", DataType::Duration(TimeUnit::Millisecond), false),
+            ms.finish(),
+        );
+        let mut us = DurationMicrosecondBuilder::new();
+        us.append_value(1);
+        let us_rb = single_col_batch(
+            Field::new("d", DataType::Duration(TimeUnit::Microsecond), false),
+            us.finish(),
+        );
+        let ms_out = encode(&ms_rb);
+        let us_out = encode(&us_rb);
+        let (_, _, ms_body) = decode_single_column(&ms_out);
+        let (_, _, us_body) = decode_single_column(&us_out);
+        let ms_ns = i64::from_le_bytes(ms_body[1..9].try_into().unwrap());
+        let us_ns = i64::from_le_bytes(us_body[1..9].try_into().unwrap());
+        assert_eq!(ms_ns, 1_000_000);
+        assert_eq!(us_ns, 1_000);
+    }
+
+    #[test]
+    fn duration_seconds_overflowing_nanos_are_rejected() {
+        use arrow_array::builder::DurationSecondBuilder;
+        let mut d = DurationSecondBuilder::new();
+        d.append_value(i64::MAX / 1_000_000_000 + 1);
+        let rb = single_col_batch(
+            Field::new("d", DataType::Duration(TimeUnit::Second), false),
+            d.finish(),
+        );
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
     }
 
     // -----------------------------------------------------------------

@@ -71,7 +71,12 @@ pub struct questdb_db(pub(crate) QuestDb);
 /// instead of a data race. When `questdb_db_return_column_sender` is observed
 /// to interleave with an in-flight call (the latch sees `IN_USE` when
 /// the free arrives), the box's drop is deferred to the in-flight
-/// call's exit path, preventing UAF for that ordering.
+/// call's exit path. This deferral only protects the concurrent
+/// in-flight-call-vs-free race; it does NOT make a free idempotent.
+/// Calling a free/return/drop entry point twice on the same handle (or
+/// return-then-drop) is undefined behavior — the second call performs a
+/// use-after-free atomic op on the freed box before the latch's CLOSED
+/// guard can be evaluated.
 ///
 /// Callers must still ensure happens-before ordering between the last
 /// FFI call on `conn` and `questdb_db_return_column_sender(conn)` — e.g. by
@@ -91,11 +96,14 @@ pub struct column_sender(OwnedColumnSender, AtomicU32);
 /// is enforced by the caller, not the borrow checker.
 ///
 /// **Not thread-safe.** Single-threaded by contract; the latch in the
-/// second tuple field detects in-thread reentrance and out-of-order
-/// free/use sequences, deferring a free observed mid-call until the
-/// active call exits. The same caveat as [`column_sender`] applies: the
-/// caller must establish happens-before between the last column call
-/// on `chunk` and `column_sender_chunk_free(chunk)`.
+/// second tuple field detects in-thread reentrance and defers a free
+/// observed concurrently with an in-flight call until that call exits.
+/// This protects only the concurrent in-flight-call-vs-free race; it
+/// does not make a free idempotent — calling `column_sender_chunk_free`
+/// twice on the same handle is undefined behavior. The same caveat as
+/// [`column_sender`] applies: the caller must establish happens-before
+/// between the last column call on `chunk` and
+/// `column_sender_chunk_free(chunk)`.
 pub struct column_sender_chunk(Chunk<'static>, AtomicU32);
 
 /// Imported Arrow column for repeated chunk appends.
@@ -580,16 +588,20 @@ pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb
         return 0;
     }
     let db_ref = unsafe { &*db };
-    questdb::ffi_support::reconnect_max_duration(&db_ref.0).as_millis() as u64
+    u64::try_from(questdb::ffi_support::reconnect_max_duration(&db_ref.0).as_millis())
+        .unwrap_or(u64::MAX)
 }
 
 /// Return a borrowed conn to the pool. Invalidates `conn`. Accepts NULL
 /// and no-ops. `db` is ignored — kept in the ABI for symmetry. If the pool
 /// has been closed, the conn is closed instead of recycled.
 ///
-/// A racing in-flight call on the same handle defers the drop: the
-/// in-flight call's exit path performs the actual `Box::from_raw`, so
-/// the caller never sees UAF.
+/// A racing in-flight call on the same handle defers the drop to that
+/// call's exit path, which performs the actual `Box::from_raw`. This
+/// covers only the concurrent in-flight-call-vs-free race. It is NOT a
+/// double-free guard: mutually exclusive with `questdb_db_drop_column_sender`
+/// on the same `conn` — call exactly one of the two. Calling both (or
+/// either twice) is UB.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_return_column_sender(
     _db: *mut questdb_db,
@@ -607,7 +619,9 @@ pub unsafe extern "C" fn questdb_db_return_column_sender(
 /// removed from the pool. In store-and-forward mode unresolved frames remain in
 /// the SFA slot for replay by the next owner. Accepts NULL and no-ops. As with
 /// `questdb_db_return_column_sender`, a racing in-flight call defers the drop to that
-/// call's exit path.
+/// call's exit path; this covers only the concurrent in-flight-call-vs-free
+/// race. Mutually exclusive with `questdb_db_return_column_sender` on the same
+/// `conn` — call exactly one of the two. Calling both (or either twice) is UB.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_drop_column_sender(
     _db: *mut questdb_db,
@@ -1501,17 +1515,18 @@ pub unsafe extern "C" fn column_sender_arrow_import_free(
     unsafe { finalize_or_defer(imported, state, 0) };
 }
 
-/// Number of rows in an imported Arrow column. Returns 0 for a NULL
-/// `imported`, for a logically-empty column, and for a handle that has
-/// been freed or is in use by a concurrent call. Cheap accessor; the
-/// length is stored alongside the buffers.
+/// Number of rows in an imported Arrow column. Returns `(size_t)-1`
+/// (a.k.a. `SIZE_MAX`) for a NULL `imported`, a handle that has been
+/// freed, or one in use by a concurrent call; `0` is reserved for a
+/// genuinely empty (0-row) import. Cheap accessor; the length is stored
+/// alongside the buffers.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_arrow_import_len(
     imported: *const column_sender_arrow_import,
 ) -> size_t {
     if imported.is_null() {
-        return 0;
+        return usize::MAX;
     }
     let imported_mut = imported as *mut column_sender_arrow_import;
     let guard = unsafe {
@@ -1524,7 +1539,7 @@ pub unsafe extern "C" fn column_sender_arrow_import_len(
         )
     };
     if guard.is_none() {
-        return 0;
+        return usize::MAX;
     }
     unsafe { (*imported).0.len() }
 }

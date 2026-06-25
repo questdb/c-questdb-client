@@ -71,6 +71,7 @@ impl EncodeScratch {
         self.signature.clear();
         self.new_symbols.clear();
         self.per_column.clear();
+        self.referenced.clear();
     }
 }
 
@@ -523,6 +524,11 @@ fn resolve_symbols(
                         continue;
                     }
                     let slot = unsafe { codes.read_i64(i) } as usize;
+                    debug_assert!(
+                        slot < referenced_scratch.len(),
+                        "symbol code {slot} out of range (dict_len {dict_len}); \
+                         range_check_codes should have rejected it at append"
+                    );
                     referenced_scratch[slot] = 1;
                     non_null_count += 1;
                 }

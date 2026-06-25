@@ -686,32 +686,25 @@ public:
     }
 
     /**
-     * Move-assign. Closes the previously-held reader before adopting
-     * `other`'s impl.
+     * Move-assign. Tears down the previously-held reader (same cleanup as
+     * the destructor) before adopting `other`'s impl. Self-move is a no-op.
      *
-     * @throws reader_error with `invalid_api_call` if a `query` or
-     *         `cursor` produced by this reader is still live. Replacing
-     *         the impl in that state would force `reader_close` down
-     *         its defense-in-depth branch and silently leak the underlying
-     *         reader (so the live cursor's internal `&mut Reader` stays
-     *         valid rather than dangling). Surfacing it here as an
-     *         exception keeps the leak visible to the application; close
-     *         the outstanding cursor / query first.
+     * This is `noexcept`: a throwing move special-member breaks STL
+     * containers (a `std::vector<reader>` reallocation could call
+     * `std::terminate`) and would be undefined behaviour if it unwound
+     * across a C frame.
+     *
+     * If a `query` or `cursor` produced by the destination reader is still
+     * live, `reader_close` cannot free the underlying reader without
+     * dangling the cursor's internal reference, so it follows its
+     * defense-in-depth branch: it prints a diagnostic to stderr and leaks
+     * the reader (finite and safe) rather than corrupting memory. Close the
+     * outstanding cursor / query before move-assigning to avoid that leak.
      */
-    reader& operator=(reader&& other) noexcept(false)
+    reader& operator=(reader&& other) noexcept
     {
         if (this != &other)
         {
-            if (_impl && ::reader_has_active_query(_impl))
-            {
-                throw reader_error{
-                    error_code::invalid_api_call,
-                    "reader::operator=(reader&&): a query or cursor is "
-                    "still live on the destination reader. Move-assigning "
-                    "now would leak the underlying reader (see "
-                    "reader_close). Destroy the outstanding cursor / "
-                    "query first."};
-            }
             ::reader_close(_impl);
             _impl = other._impl;
             other._impl = nullptr;
