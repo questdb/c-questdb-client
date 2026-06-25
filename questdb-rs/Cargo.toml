@@ -82,8 +82,15 @@ aligned-vec = { version = "0.6", optional = true }
 # real result set into a polars `DataFrame` (`fetch_all_polars` /
 # `next_polars` / `iter_polars`) fails at runtime on the timestamp
 # column. `dtype-date` covers QuestDB DATE columns symmetrically.
-polars = { version = ">=0.50, <1.0", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "timezones"] }
-polars-arrow = { version = ">=0.50, <1.0", optional = true, default-features = false, features = ["compute"] }
+#
+# Exact-pinned (in lockstep with polars-arrow): polars makes breaking API
+# changes at every 0.x minor, and `questdb-rs/Cargo.lock` is gitignored —
+# a version range would let an unrelated build float onto an incompatible
+# polars. The source targets this release's APIs (`DataFrame::new_with_height`,
+# `DataFrame::get_columns`, the `Categories` categorical surface); bump in
+# lockstep with the call sites.
+polars = { version = "=0.52.0", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "timezones"] }
+polars-arrow = { version = "=0.52.0", optional = true, default-features = false, features = ["compute"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

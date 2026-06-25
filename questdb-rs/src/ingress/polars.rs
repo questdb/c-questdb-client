@@ -131,7 +131,7 @@ pub fn dataframe_to_batches(
     let max_rows = max_rows.map_or(DEFAULT_MAX_BATCH_ROWS, NonZeroUsize::get);
     let compat = CompatLevel::newest();
     let cursors: Vec<ColumnCursor<'_>> = df
-        .columns()
+        .get_columns()
         .iter()
         .map(|c| ColumnCursor::new(c, compat))
         .collect();
@@ -558,7 +558,7 @@ mod tests {
         let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3]).into_column();
         let f = Series::new(PlSmallStr::from("f"), &[1.5f64, 2.5, 3.5]).into_column();
         let s = Series::new(PlSmallStr::from("s"), &["a", "b", "c"]).into_column();
-        DataFrame::new(3, vec![i, f, s]).unwrap()
+        DataFrame::new_with_height(3, vec![i, f, s]).unwrap()
     }
 
     fn collect_ok(it: DataFrameBatches<'_>) -> Vec<RecordBatch> {
@@ -616,7 +616,7 @@ mod tests {
         let df = make_df();
         let rb = one_batch(&df);
         let back = crate::egress::arrow::polars::record_batch_to_dataframe(rb).unwrap();
-        let series = back.columns()[0].as_materialized_series();
+        let series = back.get_columns()[0].as_materialized_series();
         let i64s = series.i64().unwrap();
         assert_eq!(i64s.get(0), Some(1));
         assert_eq!(i64s.get(1), Some(2));
@@ -628,7 +628,7 @@ mod tests {
         let df = make_df();
         let rb = one_batch(&df);
         let back = crate::egress::arrow::polars::record_batch_to_dataframe(rb).unwrap();
-        let series = back.columns()[2].as_materialized_series();
+        let series = back.get_columns()[2].as_materialized_series();
         let s = series.str().unwrap();
         assert_eq!(s.get(0), Some("a"));
         assert_eq!(s.get(1), Some("b"));
@@ -662,21 +662,21 @@ mod tests {
 
     #[test]
     fn dataframe_to_batches_chunk_aligned_is_zero_copy() {
-        let mut left = DataFrame::new(
+        let mut left = DataFrame::new_with_height(
             2,
             vec![Series::new(PlSmallStr::from("i"), &[10i64, 20]).into_column()],
         )
         .unwrap();
-        let right = DataFrame::new(
+        let right = DataFrame::new_with_height(
             2,
             vec![Series::new(PlSmallStr::from("i"), &[30i64, 40]).into_column()],
         )
         .unwrap();
         left.vstack_mut(&right).unwrap();
-        assert_eq!(left.columns()[0].n_chunks(), 2);
+        assert_eq!(left.get_columns()[0].n_chunks(), 2);
 
         let polars_chunks: Vec<*const i64> = {
-            let s = left.columns()[0].as_materialized_series();
+            let s = left.get_columns()[0].as_materialized_series();
             (0..s.n_chunks())
                 .map(|i| {
                     let arr = &s.chunks()[i];
@@ -698,12 +698,12 @@ mod tests {
 
     #[test]
     fn dataframe_to_batches_chunk_aligned_splits_within_chunk() {
-        let mut left = DataFrame::new(
+        let mut left = DataFrame::new_with_height(
             3,
             vec![Series::new(PlSmallStr::from("i"), &[1i64, 2, 3]).into_column()],
         )
         .unwrap();
-        let right = DataFrame::new(
+        let right = DataFrame::new_with_height(
             3,
             vec![Series::new(PlSmallStr::from("i"), &[4i64, 5, 6]).into_column()],
         )
@@ -721,23 +721,26 @@ mod tests {
         let a2 = Series::new(PlSmallStr::from("a"), &[3i64, 4]);
         let b = Series::new(PlSmallStr::from("b"), &[10i64, 20, 30, 40]);
         let mut left =
-            DataFrame::new(2, vec![a1.into_column(), b.slice(0, 2).into_column()]).unwrap();
-        let right = DataFrame::new(2, vec![a2.into_column(), b.slice(2, 2).into_column()]).unwrap();
+            DataFrame::new_with_height(2, vec![a1.into_column(), b.slice(0, 2).into_column()])
+                .unwrap();
+        let right =
+            DataFrame::new_with_height(2, vec![a2.into_column(), b.slice(2, 2).into_column()])
+                .unwrap();
         left.vstack_mut(&right).unwrap();
         left.with_column(b.into_column()).unwrap();
         assert_ne!(
-            left.columns()[0]
+            left.get_columns()[0]
                 .as_materialized_series()
                 .chunk_lengths()
                 .collect::<Vec<_>>(),
-            left.columns()[1]
+            left.get_columns()[1]
                 .as_materialized_series()
                 .chunk_lengths()
                 .collect::<Vec<_>>(),
         );
 
         let b_chunk_ptr = {
-            let s = left.columns()[1].as_materialized_series();
+            let s = left.get_columns()[1].as_materialized_series();
             let arr = &s.chunks()[0];
             let prim: &polars_arrow::array::PrimitiveArray<i64> =
                 arr.as_any().downcast_ref().unwrap();
@@ -763,7 +766,7 @@ mod tests {
         use polars::prelude::Scalar;
         let values = Series::new(PlSmallStr::from("v"), &[1i64, 2, 3, 4]);
         let scalar = Column::new_scalar(PlSmallStr::from("k"), Scalar::from(7i64), 4);
-        let df = DataFrame::new(4, vec![values.into_column(), scalar]).unwrap();
+        let df = DataFrame::new_with_height(4, vec![values.into_column(), scalar]).unwrap();
 
         let batches = collect_ok(dataframe_to_batches(&df, Some(TWO)));
         assert_eq!(batches.len(), 2);
@@ -774,7 +777,7 @@ mod tests {
         }
 
         let materialised_ptr = {
-            let s = df.columns()[1].as_materialized_series();
+            let s = df.get_columns()[1].as_materialized_series();
             let arr = &s.chunks()[0];
             let prim: &polars_arrow::array::PrimitiveArray<i64> =
                 arr.as_any().downcast_ref().unwrap();
@@ -808,7 +811,7 @@ mod tests {
         let cat_series = strings.cast(&dtype).unwrap();
         assert!(matches!(cat_series.dtype(), PlDataType::Categorical(_, _)));
 
-        let df = DataFrame::new(4, vec![cat_series.into_column()]).unwrap();
+        let df = DataFrame::new_with_height(4, vec![cat_series.into_column()]).unwrap();
         let batches = collect_ok(dataframe_to_batches(&df, None));
         assert_eq!(batches.len(), 1);
         let rb = &batches[0];

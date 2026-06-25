@@ -28,7 +28,7 @@ fn build_df() -> DataFrame {
         PlSmallStr::from("amount"),
         &[0.00044, 0.0012, 0.00050, 0.0008],
     );
-    DataFrame::new(
+    DataFrame::new_with_height(
         4,
         vec![
             symbol.into_column(),
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("shape:  {:?} (rows × cols)", back.shape());
     println!("schema: {:?}", back.schema());
     println!("n_chunks per column:");
-    for col in back.columns() {
+    for col in back.get_columns() {
         println!("  {:>8} → {} chunk(s)", col.name(), col.n_chunks());
     }
     println!("{back}");

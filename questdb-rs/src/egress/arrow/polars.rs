@@ -225,7 +225,7 @@ pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
         };
         columns.push(series.into_column());
     }
-    DataFrame::new(row_count, columns)
+    DataFrame::new_with_height(row_count, columns)
         .map_err(|e| fmt!(ArrowExport, "DataFrame::new failed: {}", e))
 }
 
@@ -413,7 +413,7 @@ fn build_dataframe(
         };
         columns.push(series.into_column());
     }
-    DataFrame::new(row_count, columns)
+    DataFrame::new_with_height(row_count, columns)
         .map_err(|e| fmt!(ArrowExport, "DataFrame::new failed: {}", e))
 }
 
@@ -461,7 +461,7 @@ mod tests {
         let df = record_batch_to_dataframe(rb).unwrap();
         assert_eq!(df.width(), 3);
         assert_eq!(df.height(), 3);
-        let cols = df.columns();
+        let cols = df.get_columns();
         assert_eq!(cols[0].name().as_str(), "i");
         assert_eq!(cols[1].name().as_str(), "f");
         assert_eq!(cols[2].name().as_str(), "s");
@@ -471,7 +471,7 @@ mod tests {
     fn record_batch_to_dataframe_preserves_int_values() {
         let rb = rb_mixed();
         let df = record_batch_to_dataframe(rb).unwrap();
-        let col = &df.columns()[0];
+        let col = &df.get_columns()[0];
         let series = col.as_materialized_series();
         let i64s = series.i64().unwrap();
         assert_eq!(i64s.get(0), Some(1));
@@ -483,7 +483,7 @@ mod tests {
     fn record_batch_to_dataframe_preserves_string_values() {
         let rb = rb_mixed();
         let df = record_batch_to_dataframe(rb).unwrap();
-        let col = &df.columns()[2];
+        let col = &df.get_columns()[2];
         let series = col.as_materialized_series();
         let s = series.str().unwrap();
         assert_eq!(s.get(0), Some("a"));
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(df.height(), 2);
         assert_eq!(df.width(), 1);
         // The column must round-trip as a polars Datetime, not error out.
-        let series = df.columns()[0].as_materialized_series();
+        let series = df.get_columns()[0].as_materialized_series();
         assert!(
             matches!(series.dtype(), polars::prelude::DataType::Datetime(_, _)),
             "expected polars Datetime, got {:?}",
@@ -556,7 +556,7 @@ mod tests {
         let df = record_batch_to_dataframe(rb).unwrap();
         assert_eq!(df.width(), 1);
         assert_eq!(df.height(), 4);
-        let col = &df.columns()[0];
+        let col = &df.get_columns()[0];
         assert_eq!(col.name().as_str(), "sym");
         assert!(
             matches!(col.dtype(), PlDataType::Categorical(_, _)),
@@ -609,7 +609,7 @@ mod tests {
             .expect("SYMBOL Categoricals from different batches must vstack");
 
         assert_eq!(df.height(), 5);
-        let as_str = df.columns()[0]
+        let as_str = df.get_columns()[0]
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();
@@ -651,7 +651,7 @@ mod tests {
             RecordBatch::try_new(schema, cols).unwrap()
         }
         fn vals(df: &DataFrame, i: usize) -> Vec<Option<String>> {
-            let s = df.columns()[i]
+            let s = df.get_columns()[i]
                 .as_materialized_series()
                 .cast(&PlDataType::String)
                 .unwrap();
@@ -707,7 +707,7 @@ mod tests {
     }
 
     fn cat_strings(df: &DataFrame) -> Vec<Option<String>> {
-        let s = df.columns()[0]
+        let s = df.get_columns()[0]
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();
@@ -747,7 +747,7 @@ mod tests {
         df.vstack_mut_owned(df2)
             .expect("registry Categoricals from different batches must vstack");
         assert!(matches!(
-            df.columns()[0].dtype(),
+            df.get_columns()[0].dtype(),
             PlDataType::Categorical(_, _)
         ));
         assert_eq!(
@@ -792,7 +792,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            df.columns()[0].dtype(),
+            df.get_columns()[0].dtype(),
             PlDataType::Categorical(_, _)
         ));
         assert_eq!(cat_strings(&df), vec![Some("L1".into()), Some("L0".into())]);
@@ -850,11 +850,11 @@ mod tests {
         let rb = RecordBatch::try_new(schema, vec![delta_col, local_col]).unwrap();
         let df = build_dataframe(rb, &[true, false], &reg).unwrap();
 
-        let delta = df.columns()[0]
+        let delta = df.get_columns()[0]
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();
-        let local = df.columns()[1]
+        let local = df.get_columns()[1]
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();

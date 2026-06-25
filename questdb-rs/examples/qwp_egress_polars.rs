@@ -150,7 +150,7 @@ fn build_dataframe(
             );
         }
     }
-    Ok(DataFrame::new(rows, columns)?)
+    Ok(DataFrame::new_with_height(rows, columns)?)
 }
 
 // ---------------------------------------------------------------------------

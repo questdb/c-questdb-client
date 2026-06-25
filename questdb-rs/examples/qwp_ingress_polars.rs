@@ -230,7 +230,7 @@ fn build_dataframe(kind: SchemaKind, data: &BenchData) -> Result<DataFrame, Box<
             columns.push(symbol_series(S_NAMES[i], sc)?.into_column());
         }
     }
-    Ok(DataFrame::new(data.rows, columns)?)
+    Ok(DataFrame::new_with_height(data.rows, columns)?)
 }
 
 /// Build the matching column-sender [`Chunk`] for the encode floor. Same

@@ -2405,7 +2405,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     );
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4, 5, 6]).into_column();
-    let df = DataFrame::new(6, vec![i]).unwrap();
+    let df = DataFrame::new_with_height(6, vec![i]).unwrap();
 
     let mut sender = db.borrow_column_sender().expect("borrow");
     sender
@@ -2458,7 +2458,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
 
     let vals: Vec<i64> = (1..=66).collect();
     let i = Series::new(PlSmallStr::from("i"), vals.as_slice()).into_column();
-    let df = DataFrame::new(66, vec![i]).unwrap();
+    let df = DataFrame::new_with_height(66, vec![i]).unwrap();
 
     let mut sender = db.borrow_column_sender().expect("borrow");
     sender
@@ -2513,7 +2513,7 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     );
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2]).into_column();
-    let df = DataFrame::new(2, vec![i]).unwrap();
+    let df = DataFrame::new_with_height(2, vec![i]).unwrap();
 
     let mut sender = db.borrow_column_sender().expect("borrow");
     sender
@@ -2537,7 +2537,7 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
-    let df = DataFrame::new(4, vec![i]).unwrap();
+    let df = DataFrame::new_with_height(4, vec![i]).unwrap();
 
     let mut sender = db.borrow_column_sender().expect("borrow");
     sender
@@ -2573,7 +2573,7 @@ fn flush_polars_dataframe_applies_column_overrides() {
 
     let s = Series::new(PlSmallStr::from("s"), &["a", "b", "c", "d"]).into_column();
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
-    let df = DataFrame::new(4, vec![s, i]).unwrap();
+    let df = DataFrame::new_with_height(4, vec![s, i]).unwrap();
 
     let overrides = [ArrowColumnOverride::Symbol { column: "s" }];
     let mut sender = db.borrow_column_sender().expect("borrow");
