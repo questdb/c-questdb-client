@@ -251,11 +251,7 @@ fn import_polars_series(name: &str, array_data: &ArrayData) -> Result<Series> {
 /// vstack/concat — used by `fetch_all_polars` / `iter_polars` to stitch the
 /// per-batch frames — only accepts Categoricals that share one `Categories`
 /// identity, otherwise it errors "Categories name mismatch".
-fn dictionary_to_categorical(
-    name: &str,
-    col: &ArrayRef,
-    cat_dtype: &PlDataType,
-) -> Result<Series> {
+fn dictionary_to_categorical(name: &str, col: &ArrayRef, cat_dtype: &PlDataType) -> Result<Series> {
     let dict = col
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
@@ -268,16 +264,14 @@ fn dictionary_to_categorical(
         })?;
 
     let values = import_polars_series(name, &dict.values().to_data())?;
-    let cat_dict = values
-        .cast(cat_dtype)
-        .map_err(|e| {
-            fmt!(
-                ArrowExport,
-                "cast SYMBOL '{}' dict to Categorical: {}",
-                name,
-                e
-            )
-        })?;
+    let cat_dict = values.cast(cat_dtype).map_err(|e| {
+        fmt!(
+            ArrowExport,
+            "cast SYMBOL '{}' dict to Categorical: {}",
+            name,
+            e
+        )
+    })?;
 
     let keys = import_polars_series(name, &dict.keys().to_data())?;
     let idx: IdxCa = keys
@@ -810,15 +804,20 @@ mod tests {
         // two column-local batches of one stream share one identity and vstack.
         // A regression to a fresh-per-call `Categories` would fail vstack here.
         let reg = SymbolRegistry::new();
-        let mut df = build_dataframe(sym_batch(&["a", "b"], &[Some(0), Some(1)]), &[false], &reg)
-            .unwrap();
+        let mut df =
+            build_dataframe(sym_batch(&["a", "b"], &[Some(0), Some(1)]), &[false], &reg).unwrap();
         let df2 =
             build_dataframe(sym_batch(&["b", "c"], &[Some(0), Some(1)]), &[false], &reg).unwrap();
         df.vstack_mut_owned(df2)
             .expect("fallback Categoricals from different batches must vstack");
         assert_eq!(
             cat_strings(&df),
-            vec![Some("a".into()), Some("b".into()), Some("b".into()), Some("c".into())]
+            vec![
+                Some("a".into()),
+                Some("b".into()),
+                Some("b".into()),
+                Some("c".into())
+            ]
         );
     }
 

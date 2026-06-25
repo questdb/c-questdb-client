@@ -2801,12 +2801,14 @@ TEST_CASE("mock: ActionSendRaw delivers a hand-built SERVER_INFO frame")
     CHECK_FALSE(cur.next_batch());
 }
 
-// Move-assigning over a reader that still owns a live cursor would
-// drive `reader_close` down its defense-in-depth leak branch
-// (cursor holds a laundered `&mut Reader`; freeing would dangle). The
-// C++ wrapper must surface that as an exception rather than letting
-// the leak happen silently.
-TEST_CASE("mock: reader move-assign with live cursor throws")
+// Move-assigning over a reader that still owns a live cursor drives
+// `reader_close` down its defense-in-depth leak branch (the cursor holds a
+// laundered `&mut Reader`; freeing would dangle). `operator=(reader&&)` is
+// `noexcept` — a throwing move special-member breaks STL containers and is
+// UB across a C frame — so it leaks the old reader (with a stderr
+// diagnostic) and adopts the source, rather than throwing or freeing under
+// the cursor. The cursor stays valid against the leaked reader.
+TEST_CASE("mock: reader move-assign over a live cursor leaks safely without throwing")
 {
     qm::Script s_a = {
         qm::ActionSendServerInfo{},
@@ -2825,31 +2827,17 @@ TEST_CASE("mock: reader move-assign with live cursor throws")
     // Take a cursor on `reader_a`. While `cur` is alive, the underlying
     // C reader's active flag is set.
     auto cur = reader_a.execute("select 1"_utf8);
-    CHECK(::reader_has_active_query(
-              reinterpret_cast<const ::reader*>(0)) == 0);
 
-    bool threw = false;
-    try
-    {
-        reader_a = std::move(reader_b);
-    }
-    catch (const questdb::egress::reader_error& e)
-    {
-        threw = true;
-        CHECK(e.code() == reader_error_invalid_api_call);
-        // Pin the wording so a future error-message refactor can't
-        // quietly drop the "leak" / "live" diagnostic that the user
-        // needs to debug the contract violation.
-        const std::string m = std::string(e.what());
-        CHECK(m.find("live") != std::string::npos);
-        CHECK(m.find("leak") != std::string::npos);
-    }
-    CHECK(threw);
+    // `noexcept`: leaks reader_a's still-live reader and adopts reader_b.
+    reader_a = std::move(reader_b);
 
-    // The destination reader is unchanged: `cur` still works and drains
-    // to its terminal. No use-after-free, no observable leak.
+    // `cur` still points at the leaked (not freed) original reader, so it
+    // drains to its terminal — no use-after-free.
     CHECK_FALSE(cur.next_batch());
     CHECK(cur.terminal_kind() == reader_terminal_kind_end);
+
+    // The destination adopted reader_b's handshake.
+    CHECK(reader_a.server_version() == 1);
 }
 
 // Once the cursor is destroyed the active flag clears and the same
