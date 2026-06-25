@@ -114,9 +114,10 @@ pub enum reader_error_code {
     /// re-execute the query from scratch.
     reader_error_failover_would_duplicate = 19,
     /// Streaming Arrow adapter saw a mid-stream schema change. The cursor
-    /// is still usable; re-wrap with `reader_cursor_next_arrow_batch`
-    /// after dropping any partial state to snapshot the new schema. Only
-    /// emitted with the `arrow` feature enabled.
+    /// is still usable; the next `reader_cursor_next_arrow_batch` call
+    /// snapshots the new schema and re-delivers the batch that triggered
+    /// the drift (it is preserved, not discarded). Only emitted with the
+    /// `arrow` feature enabled.
     reader_error_schema_drift = 20,
     /// `reader_cursor_next_arrow_batch` was called on a stream that
     /// terminated before any batch was produced — no schema to snapshot.
@@ -3135,11 +3136,16 @@ pub struct reader_symbol_dict {
 
 // `reader_batch_symbol_dict` hands out `questdb-rs`'s `SymbolEntry`
 // slice reinterpreted as `reader_symbol_entry`; both are `#[repr(C)]`
-// `{ u32, u32 }`, but assert it so a layout change upstream fails the
-// build instead of silently corrupting the offset table.
+// `{ u32, u32 }`, but assert size, align, AND field offsets so a layout
+// change upstream (including a field-order swap that preserves size/align)
+// fails the build instead of silently corrupting the offset table.
 const _: () = assert!(
     std::mem::size_of::<reader_symbol_entry>() == std::mem::size_of::<SymbolEntry>()
         && std::mem::align_of::<reader_symbol_entry>() == std::mem::align_of::<SymbolEntry>()
+        && std::mem::offset_of!(reader_symbol_entry, offset)
+            == std::mem::offset_of!(SymbolEntry, offset)
+        && std::mem::offset_of!(reader_symbol_entry, length)
+            == std::mem::offset_of!(SymbolEntry, len)
 );
 
 #[inline]

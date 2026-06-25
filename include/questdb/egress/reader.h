@@ -193,8 +193,9 @@ typedef enum reader_error_code
      *  by this error, so the next
      *  `reader_cursor_next_arrow_batch` call snapshots the new
      *  schema and resumes streaming. The batch that triggered the
-     *  drift is discarded — re-issue the query if you need it. Only
-     *  emitted when the `arrow` feature is enabled. */
+     *  drift is preserved and re-delivered (under the new schema) by
+     *  that next call, not discarded. Only emitted when the `arrow`
+     *  feature is enabled. */
     reader_error_schema_drift = 20,
     /** A higher-level streaming Arrow adapter (Rust `as_arrow_reader` /
      *  `iter_polars`) was asked for a schema on a stream that terminated
@@ -379,8 +380,8 @@ void reader_mark_must_close(reader* reader);
 
 /* Reader pool (provided by `questdb/ingress/column_sender.h`'s
  * `questdb_db` opaque). Same FFI surface as the writer-side
- * `questdb_db_borrow_column_sender` / `_return_conn`, but for `reader`
- * handles. Lives here because it wraps the `reader` type.
+ * `questdb_db_borrow_column_sender` / `questdb_db_return_column_sender`,
+ * but for `reader` handles. Lives here because it wraps the `reader` type.
  *
  * A reader-only consumer can open, use, and close the pool through
  * this header alone, using only the `reader_error` type:
@@ -1972,7 +1973,7 @@ typedef enum reader_arrow_batch_result
  * untouched.
  *
  * Mid-stream schema drift (the underlying QuestDB table altered between
- * batches) surfaces as `reader_error_schema_drift` (= 22) on the
+ * batches) surfaces as `reader_error_schema_drift` (= 20) on the
  * call that detects it; the cursor's pinned schema snapshot is then
  * cleared so the next call re-snapshots the new schema and resumes. The
  * batch that triggered the drift is preserved and re-delivered (under the

@@ -649,6 +649,16 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
     let dst = &mut out[dst_start..dst_start + total_bytes];
     if arrow_offset.is_multiple_of(8) {
         let src_off = arrow_offset / 8;
+        // The aligned fast path indexes `src` directly (unlike the unaligned
+        // branch's `lo_idx < src_len` guards). `from_ffi`'s `validate_full`
+        // and arrow-rs's safe builders both guarantee this length; assert it
+        // so any future unchecked producer trips in test/CI builds.
+        debug_assert!(
+            src.len() >= src_off + total_bytes,
+            "arrow validity buffer too short: {} bytes, need {}",
+            src.len(),
+            src_off + total_bytes
+        );
         let src_slice = &src[src_off..src_off + full_bytes];
         let dst_slice = &mut dst[..full_bytes];
         let word_bytes = (full_bytes / 8) * 8;

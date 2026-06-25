@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ingress::RawQwpWsRoundStream;
 use crate::ingress::sender::qwp_ws::WsStream;
@@ -370,20 +370,31 @@ impl ColumnConn {
         }
     }
 
-    /// Block until at least one OK ack arrives. Used when
-    /// `in_flight == MAX_IN_FLIGHT` to free a slot.
+    /// Block until the in-flight count drops by at least one, freeing a
+    /// publish slot. Used when `in_flight == MAX_IN_FLIGHT`.
+    ///
+    /// "Saw an OK frame" is not the same as "freed a slot": a cumulative OK
+    /// that advances no pending frame (handled as a no-op by `process_response`)
+    /// frees nothing, so the loop waits for `in_flight` to actually fall rather
+    /// than for the first OK. A no-progress deadline bounds the wait so a peer
+    /// that stays alive yet never advances cannot block the caller forever.
     pub(crate) fn drain_one_ack_blocking(&mut self) -> Result<()> {
         self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
+        let target = self.in_flight;
+        let deadline_anchor = Instant::now();
         loop {
             let response = self.recv_qwp_response()?;
-            match &response {
-                QwpResponse::Ok { .. } => {
-                    self.process_response(response)?;
-                    return Ok(());
-                }
-                _ => {
-                    self.process_response(response)?;
-                }
+            self.process_response(response)?;
+            if self.in_flight < target {
+                return Ok(());
+            }
+            if !self.request_timeout.is_zero() && deadline_anchor.elapsed() >= self.request_timeout
+            {
+                return Err(self.latch(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket connection received no slot-freeing ack within {:?}",
+                    self.request_timeout
+                )));
             }
         }
     }
@@ -405,15 +416,50 @@ impl ColumnConn {
         // preceding publish must not block forever on a dead peer.
         self.set_timeouts(Some(self.request_timeout), Some(self.request_timeout))?;
 
+        // No-progress deadline. The per-read `request_timeout` only bounds
+        // waiting for *any* frame; a peer that keeps the socket live with
+        // non-advancing OK/durable frames would never trip it and the loop
+        // would spin forever. Reset the anchor on every real advance (in-flight
+        // drops, or a durable watermark moves) and fail over once neither moves
+        // for one `request_timeout` window. `request_timeout == 0` (no socket
+        // timeout configured) preserves the legacy unbounded behaviour.
+        let bounded = !self.request_timeout.is_zero();
+
+        let mut deadline_anchor = Instant::now();
+        let mut last_in_flight = self.in_flight;
         while self.in_flight > 0 {
             let response = self.recv_qwp_response()?;
             self.process_response(response)?;
+            if self.in_flight < last_in_flight {
+                last_in_flight = self.in_flight;
+                deadline_anchor = Instant::now();
+            } else if bounded && deadline_anchor.elapsed() >= self.request_timeout {
+                return Err(self.latch(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket sync stalled: {} frame(s) unacked with no progress for {:?}",
+                    self.in_flight,
+                    self.request_timeout
+                )));
+            }
         }
 
         if ack_level == AckLevel::Durable {
+            let mut deadline_anchor = Instant::now();
+            let mut last_mark = self.durable_progress_mark();
             while !self.durability_satisfied() {
                 let response = self.recv_qwp_response()?;
                 self.process_response(response)?;
+                let mark = self.durable_progress_mark();
+                if mark != last_mark {
+                    last_mark = mark;
+                    deadline_anchor = Instant::now();
+                } else if bounded && deadline_anchor.elapsed() >= self.request_timeout {
+                    return Err(self.latch(error::fmt!(
+                        SocketError,
+                        "QWP/WebSocket durable sync stalled: no watermark progress for {:?}",
+                        self.request_timeout
+                    )));
+                }
             }
         }
 
@@ -428,6 +474,15 @@ impl ColumnConn {
         self.pending_durable_targets.iter().all(|(t, target)| {
             self.durable_watermarks.get(t).copied().unwrap_or(i64::MIN) >= *target
         })
+    }
+
+    /// Fingerprint of durable progress: table count plus the sum of per-table
+    /// watermarks. Durable acks only ever add tables or raise watermarks, so
+    /// any genuine advance changes this, letting the sync loop distinguish a
+    /// peer that is progressing from one that is idle-chattering.
+    fn durable_progress_mark(&self) -> (usize, i128) {
+        let sum: i128 = self.durable_watermarks.values().map(|&v| v as i128).sum();
+        (self.durable_watermarks.len(), sum)
     }
 
     fn drop_satisfied_durable_targets(&mut self) {
@@ -452,6 +507,25 @@ impl ColumnConn {
     fn process_response(&mut self, response: QwpResponse) -> Result<()> {
         match response {
             QwpResponse::Ok { sequence, tables } => {
+                // Absorb durable targets before the non-advancing-OK early
+                // return below: a redundant cumulative OK can still carry a
+                // table's seq_txn that a later `sync(Durable)` must wait on, so
+                // dropping it here would risk understating the durable target.
+                // Only meaningful with the opt-in; otherwise `Durable` is
+                // rejected up front and the map is never pruned, so accumulating
+                // would leak one entry per table for the connection's life.
+                if self.durable_ack_opt_in {
+                    for (t, seq_txn) in tables {
+                        self.pending_durable_targets
+                            .entry(t)
+                            .and_modify(|w| {
+                                if seq_txn > *w {
+                                    *w = seq_txn;
+                                }
+                            })
+                            .or_insert(seq_txn);
+                    }
+                }
                 let mut popped = 0u32;
                 while let Some(front) = self.pending_acks.front() {
                     if front.fsn > sequence {
@@ -480,23 +554,6 @@ impl ColumnConn {
                         self.in_flight
                     )
                 })?;
-                // Only meaningful when durable acks are enabled: a later
-                // `sync(Durable)` waits on these targets. Without the
-                // opt-in, `Durable` is rejected up front and the map is
-                // never pruned, so accumulating here would leak one entry
-                // per distinct table for the life of a pooled connection.
-                if self.durable_ack_opt_in {
-                    for (t, seq_txn) in tables {
-                        self.pending_durable_targets
-                            .entry(t)
-                            .and_modify(|w| {
-                                if seq_txn > *w {
-                                    *w = seq_txn;
-                                }
-                            })
-                            .or_insert(seq_txn);
-                    }
-                }
                 Ok(())
             }
             QwpResponse::DurableAck { tables } => {
@@ -935,7 +992,19 @@ fn parse_table_entries(
             .unwrap(),
     ) as usize;
     let mut pos = table_count_end;
-    let mut entries = Vec::with_capacity(table_count);
+    // Reserve fallibly, bounded by what the payload can actually hold (every
+    // entry is at least 2 name-len + 1 name + 8 seq_txn bytes), so a lying
+    // `table_count` can neither abort on OOM nor over-allocate.
+    let max_entries = payload.len().saturating_sub(table_count_end) / 11;
+    let mut entries: Vec<(String, i64)> = Vec::new();
+    if entries.try_reserve(table_count.min(max_entries)).is_err() {
+        return Err(error::fmt!(
+            SocketError,
+            "{} could not allocate {} table entries",
+            context,
+            table_count
+        ));
+    }
     for _ in 0..table_count {
         let name_len_end = pos
             .checked_add(2)
@@ -1241,6 +1310,65 @@ mod tests {
         })
         .expect("matching ok must pop");
         assert_eq!(conn.in_flight(), 0);
+    }
+
+    #[test]
+    fn sync_all_acks_fails_fast_on_non_advancing_peer() {
+        use crate::ws::nosigpipe::NoSigpipeTcp;
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        // The peer floods non-advancing OK frames (sequence 0) while the conn
+        // waits for fsn 5: in_flight never drops and reads never time out, so
+        // only the no-progress deadline can end the wait. Without it,
+        // sync_all_acks spins forever.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
+        let flood = thread::spawn(move || {
+            let mut server = server;
+            let mut payload = vec![QWP_STATUS_OK];
+            payload.extend_from_slice(&0u64.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+            let mut ws_frame = vec![0x82u8, payload.len() as u8];
+            ws_frame.extend_from_slice(&payload);
+            while !stop_writer.load(Ordering::Relaxed) {
+                if server.write_all(&ws_frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut conn = ColumnConn::for_test(
+            WsStream::Plain(NoSigpipeTcp::new(client).expect("nosigpipe")),
+            false,
+        );
+        conn.request_timeout = Duration::from_millis(150);
+        conn.push_pending(5);
+
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let code = conn.sync_all_acks(AckLevel::Ok).err().map(|e| e.code());
+            let _ = tx.send(code);
+        });
+
+        let outcome = rx.recv_timeout(Duration::from_secs(5));
+        stop.store(true, Ordering::Relaxed);
+        let _ = worker.join();
+        let _ = flood.join();
+
+        match outcome {
+            Ok(Some(code)) => assert_eq!(code, crate::ErrorCode::SocketError),
+            Ok(None) => panic!("sync_all_acks unexpectedly succeeded against a non-advancing peer"),
+            Err(_) => panic!("sync_all_acks hung: the no-progress deadline did not fire"),
+        }
     }
 
     #[test]

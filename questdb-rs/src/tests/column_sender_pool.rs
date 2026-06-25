@@ -1444,6 +1444,45 @@ fn manual_reap_closes_excess_idle_connections() {
 }
 
 #[test]
+fn manual_reap_keeps_warm_floor_with_borrows_outstanding() {
+    let server = MockServer::spawn(5);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=3;pool_max=5;pool_idle_timeout_ms=50;pool_reap=manual;",
+    ))
+    .unwrap();
+    let b1 = db.borrow_column_sender().expect("b1");
+    let b2 = db.borrow_column_sender().expect("b2");
+    let b3 = db.borrow_column_sender().expect("b3 (grow)");
+    let b4 = db.borrow_column_sender().expect("b4 (grow)");
+    // Two stay borrowed; two return to the free list. total()=4, in_use=2.
+    drop(b3);
+    drop(b4);
+    assert_eq!(db.in_use_count(), 2);
+    assert_eq!(db.free_count(), 2);
+
+    // Reap while b1/b2 are still in use. total()=4 exceeds pool_size=3 by one,
+    // so exactly one idle slot is reaped and the other is kept warm to hold
+    // total() at the pool_size floor — the warm floor under `in_use < pool_size`.
+    thread::sleep(Duration::from_millis(120));
+    let closed = db.reap_idle();
+    assert_eq!(
+        closed, 1,
+        "only the slot above the pool_size floor may be reaped"
+    );
+    assert_eq!(db.free_count(), 1, "one idle slot stays warm at the floor");
+    assert_eq!(
+        db.in_use_count(),
+        2,
+        "borrowed senders are untouched by the reaper"
+    );
+
+    drop(b1);
+    drop(b2);
+    drop(db);
+}
+
+#[test]
 fn auto_reaper_closes_excess_idle_connections() {
     let server = MockServer::spawn(4);
     // tick = max(5s, timeout/12); use a long-enough timeout that timeout/12

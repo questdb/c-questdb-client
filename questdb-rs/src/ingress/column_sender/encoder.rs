@@ -635,7 +635,7 @@ unsafe fn encode_column(
                 bytes_len,
                 row_count,
                 validity,
-            );
+            )?;
         },
         ColumnKind::VarcharLarge {
             offsets,
@@ -651,7 +651,7 @@ unsafe fn encode_column(
                 bytes_len,
                 row_count,
                 validity,
-            );
+            )?;
         },
         ColumnKind::Binary {
             offsets,
@@ -667,7 +667,7 @@ unsafe fn encode_column(
                 bytes_len,
                 row_count,
                 validity,
-            );
+            )?;
         },
         ColumnKind::Symbol { codes, .. } => {
             let resolved = match per_column[col_idx].as_ref() {
@@ -878,7 +878,7 @@ unsafe fn encode_varchar(
     bytes_len: usize,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
-) {
+) -> Result<()> {
     let offsets_slice = unsafe { slice::from_raw_parts(offsets, offsets_len) };
     let bytes_slice = unsafe { slice::from_raw_parts(bytes, bytes_len) };
 
@@ -931,7 +931,12 @@ unsafe fn encode_varchar(
                 let end = offsets_slice[i + 1] as usize;
                 let len = end - start;
                 out.extend_from_slice(&bytes_slice[start..end]);
-                cumulative = cumulative.saturating_add(len as u32);
+                cumulative = cumulative.checked_add(len as u32).ok_or_else(|| {
+                    error::fmt!(
+                        InvalidApiCall,
+                        "VARCHAR/BINARY column: cumulative offset exceeds u32::MAX"
+                    )
+                })?;
                 let off = offsets_start + 4 * next_offset_idx;
                 out[off..off + 4].copy_from_slice(&cumulative.to_le_bytes());
                 next_offset_idx += 1;
@@ -940,6 +945,7 @@ unsafe fn encode_varchar(
             debug_assert_eq!(out.len() - bytes_anchor, cumulative as usize);
         }
     }
+    Ok(())
 }
 
 /// Same wire output as [`encode_varchar`], but reads `int64` offsets
@@ -956,7 +962,7 @@ unsafe fn encode_varchar_large(
     bytes_len: usize,
     row_count: usize,
     validity: Option<&ValidityDescriptor>,
-) {
+) -> Result<()> {
     let offsets_slice = unsafe { slice::from_raw_parts(offsets, offsets_len) };
     let bytes_slice = unsafe { slice::from_raw_parts(bytes, bytes_len) };
 
@@ -991,7 +997,12 @@ unsafe fn encode_varchar_large(
                 let end = offsets_slice[i + 1] as usize;
                 let len = end - start;
                 out.extend_from_slice(&bytes_slice[start..end]);
-                cumulative = cumulative.saturating_add(len as u32);
+                cumulative = cumulative.checked_add(len as u32).ok_or_else(|| {
+                    error::fmt!(
+                        InvalidApiCall,
+                        "VARCHAR/BINARY column: cumulative offset exceeds u32::MAX"
+                    )
+                })?;
                 let off = offsets_start + 4 * next_offset_idx;
                 out[off..off + 4].copy_from_slice(&cumulative.to_le_bytes());
                 next_offset_idx += 1;
@@ -1000,6 +1011,7 @@ unsafe fn encode_varchar_large(
             debug_assert_eq!(out.len() - bytes_anchor, cumulative as usize);
         }
     }
+    Ok(())
 }
 
 unsafe fn encode_symbol(

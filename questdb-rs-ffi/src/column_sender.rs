@@ -27,8 +27,8 @@
 //! Mirrors `doc/COLUMN_SENDER_FFI_ABI.md`. The ABI re-uses
 //! `line_sender_error*` for fallible-call error reporting; opaque types
 //! (`questdb_db`, `column_sender`, `column_sender_chunk`) are heap-allocated
-//! and freed through their dedicated `_close` / `_free` / `_return_conn`
-//! entry points.
+//! and freed through their dedicated `_close` / `_free` /
+//! `_return_column_sender` entry points.
 
 #![allow(non_upper_case_globals)]
 

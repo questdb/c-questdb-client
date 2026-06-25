@@ -118,6 +118,7 @@ enum BatchColumn {
     /// mode (`FLAG_DELTA_SYMBOL_DICT`). `dict` is the full delta the
     /// batch appends starting at conn-id 0 (so each connection rebuilds
     /// its dict from scratch); `codes` are the per-row ids that index it.
+    #[cfg_attr(not(feature = "arrow"), allow(dead_code))]
     Symbol { dict: Vec<String>, codes: Vec<u32> },
 }
 

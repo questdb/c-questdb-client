@@ -511,7 +511,20 @@ fn symbol_array(
 ) -> Result<ArrayRef> {
     let nulls = bytes_null_buffer(&validity, row_count)?;
     let values = match cache {
-        Some(c) if c.len == dict.len() && c.values.is_some() => c.values.clone().unwrap(),
+        Some(c) if c.len == dict.len() && c.values.is_some() => {
+            let cached = c.values.clone().unwrap();
+            // A cache hit must reflect the current dict: every dict
+            // replacement is required to run through `reset_symbol_caches`,
+            // which clears this. Pin that invariant so a future replacement
+            // path that forgets the reset trips here in test/CI builds rather
+            // than silently serving stale symbol strings.
+            debug_assert_eq!(
+                cached.len(),
+                dict.len(),
+                "stale SymbolValuesCache: dict replaced without reset_symbol_caches"
+            );
+            cached
+        }
         Some(c) => {
             let v = symbol_dict_values(dict)?;
             c.len = dict.len();

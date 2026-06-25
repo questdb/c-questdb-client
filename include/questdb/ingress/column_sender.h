@@ -219,7 +219,10 @@ uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);
  * deferred-commit flag and their source chunks were already cleared, so the
  * data is unrecoverable. Call `column_sender_sync` (or
  * `column_sender_flush_and_wait` on the final chunk) before returning to
- * avoid data loss.
+ * avoid data loss. This differs from the row sender, where every
+ * `row_sender_flush` commits on its own — the column sender pipelines deferred
+ * flushes for throughput and relies on an explicit sync to commit them, so the
+ * trailing sync is mandatory, not optional.
  *
  * Mutually exclusive with `questdb_db_drop_column_sender` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
