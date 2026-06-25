@@ -50,11 +50,12 @@ use polars::prelude::{
     CategoricalPhysical, Categories, Column, DataFrame, DataType as PlDataType, IntoColumn,
     NamedFrom, PlSmallStr, Series, TimeUnit,
 };
+use questdb::QuestDb;
 use questdb::ingress::ColumnName;
 use questdb::ingress::column_sender::_bench_internals::{
     BenchEncoderState, bench_encode_chunk_into,
 };
-use questdb::ingress::column_sender::{Chunk, QuestDb};
+use questdb::ingress::column_sender::Chunk;
 use questdb::ingress::polars::PolarsIngestOptions;
 
 mod bench_json;

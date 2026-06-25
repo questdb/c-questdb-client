@@ -35,7 +35,7 @@ use std::time::Duration;
 use crate::{Result, error};
 
 /// Default number of warm connections opened eagerly at
-/// [`super::QuestDb::connect`].
+/// [`crate::QuestDb::connect`].
 pub(crate) const DEFAULT_POOL_SIZE: usize = 1;
 /// Default hard cap on auto-grow.
 pub(crate) const DEFAULT_POOL_MAX: usize = 64;
@@ -44,7 +44,7 @@ pub(crate) const DEFAULT_POOL_MAX: usize = 64;
 pub(crate) const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Hard cap on parsed `pool_size` / `pool_max`. Bounds the eager
-/// `Vec::with_capacity` allocation in [`super::QuestDb::connect`] so a
+/// `Vec::with_capacity` allocation in [`crate::QuestDb::connect`] so a
 /// malformed conf string cannot abort the host via allocator OOM.
 pub(crate) const MAX_POOL_SIZE: usize = 65_536;
 /// Hard cap on parsed `pool_idle_timeout_ms` (one year). Keeps `Duration`

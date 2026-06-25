@@ -49,10 +49,10 @@ use std::time::Duration;
 use super::QuestDb;
 use crate::Result;
 
-pub use super::db::{OwnedColumnSender, OwnedRowSender};
+pub use super::{OwnedColumnSender, OwnedRowSender};
 
 #[cfg(feature = "_egress")]
-pub use super::db::{OwnedReader, ReaderPoolHandle};
+pub use super::{OwnedReader, ReaderPoolHandle};
 
 /// Borrow a column-major sender as an owned, lifetime-free handle.
 ///

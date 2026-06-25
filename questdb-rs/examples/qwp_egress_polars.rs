@@ -55,9 +55,9 @@ use polars::prelude::{
     CategoricalPhysical, Categories, Column, DataFrame, DataType as PlDataType, IntoColumn,
     NamedFrom, PlSmallStr, Series, TimeUnit,
 };
+use questdb::QuestDb;
 use questdb::egress::Reader;
 use questdb::ingress::ColumnName;
-use questdb::ingress::column_sender::QuestDb;
 use questdb::ingress::polars::PolarsIngestOptions;
 
 mod bench_json;

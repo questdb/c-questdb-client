@@ -172,9 +172,11 @@ Layering rules:
 ## 4. Rust API (public surface)
 
 New module: `questdb-rs/src/ingress/column_sender/` with submodules
-`db.rs`, `sender.rs`, `chunk.rs`, `validity.rs`, `encoder.rs`,
-`error.rs`. Re-exported under
-`questdb::ingress::column_sender::{QuestDb, ColumnSender, Chunk, Validity}`.
+`sender.rs`, `chunk.rs`, `validity.rs`, `encoder.rs`, `error.rs`. The
+`QuestDb` pool handle lives in the top-level `questdb-rs/src/db.rs` module
+(a peer of `ingress`/`egress`), re-exported as `questdb::QuestDb`; the
+column types are re-exported under
+`questdb::ingress::column_sender::{ColumnSender, Chunk, Validity}`.
 
 ```rust
 /// Connection pool. Shareable across threads. One `QuestDb` per

@@ -53,18 +53,19 @@ pub use error::*;
 //
 // `QuestDb` is the connection/pool handle for a QuestDB instance. It spans
 // both directions — it hands out column-major and row-major senders (write)
-// *and* query readers (read) — so it lives at the crate root rather than
-// inside `ingress` or `egress`. Those modules remain the home of the
-// specialised, direction-specific types (`Chunk`, `AckLevel`, `ColumnView`,
-// `Cursor`, `Bind`, …); the common path is just `use questdb::QuestDb`.
-//
-// These are re-exports: the original `ingress::column_sender::*` paths keep
-// working, so this is purely additive.
+// *and* query readers (read) — so it lives in its own top-level `db` module,
+// a peer of `ingress` and `egress` rather than a child of either. Those
+// modules remain the home of the specialised, direction-specific types
+// (`Chunk`, `AckLevel`, `ColumnView`, `Cursor`, `Bind`, …); the common entry
+// path is `use questdb::QuestDb`.
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub use ingress::column_sender::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
+mod db;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub use db::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
-pub use ingress::column_sender::BorrowedReader;
+pub use db::BorrowedReader;
 
 // FFI escape-hatch surface. Hidden and not semver-stable: it exists so the
 // `questdb-rs-ffi` C-ABI crate can borrow owned (lifetime-free) pool handles
@@ -73,7 +74,7 @@ pub use ingress::column_sender::BorrowedReader;
 // implies `sync-sender-qwp-ws`, so the module is always available when enabled.
 #[cfg(feature = "ffi-support")]
 #[doc(hidden)]
-pub use ingress::column_sender::ffi_support;
+pub use db::ffi_support;
 
 #[cfg(test)]
 mod alloc_counter {

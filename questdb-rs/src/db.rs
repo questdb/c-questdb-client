@@ -69,9 +69,19 @@ use crate::ingress::{Sender, SenderBuilder};
 use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
 use crate::{Result, error};
 
-use super::conf::{self, PoolReap};
-use super::conn::ColumnConn;
-use super::sender::ColumnSender;
+use crate::ingress::column_sender::ColumnSender;
+use crate::ingress::column_sender::conf::{self, PoolReap};
+use crate::ingress::column_sender::conn::ColumnConn;
+
+/// FFI escape-hatch surface: owned (lifetime-free) pool handles and the entry
+/// points that mint them, for the `questdb-rs-ffi` C-ABI crate. Hidden,
+/// feature-gated, and not part of the public Rust API — normal Rust users
+/// borrow lifetime-bound handles via [`QuestDb::borrow_column_sender`] /
+/// [`QuestDb::borrow_row_sender`] (and, with egress, `QuestDb::borrow_reader`).
+/// Only `questdb-rs-ffi` enables the `ffi-support` feature.
+#[cfg(feature = "ffi-support")]
+#[doc(hidden)]
+pub mod ffi_support;
 
 /// Lower bound on the reaper's wake interval.
 const REAPER_MIN_TICK: Duration = Duration::from_secs(5);
@@ -393,8 +403,8 @@ impl QuestDb {
                 free.push(PoolEntry {
                     sender: ColumnSender::new_direct(
                         conn,
-                        crate::ingress::buffer::SymbolGlobalDict::new(),
-                        super::encoder::EncodeScratch::new(),
+                        crate::ingress::SymbolGlobalDict::new(),
+                        crate::ingress::column_sender::encoder::EncodeScratch::new(),
                         false,
                     ),
                     last_idle_at: now,
@@ -616,8 +626,8 @@ impl QuestDb {
         let conn = connect_conn_pool(&self.inner)?;
         Ok(ColumnSender::new(
             conn,
-            crate::ingress::buffer::SymbolGlobalDict::new(),
-            super::encoder::EncodeScratch::new(),
+            crate::ingress::SymbolGlobalDict::new(),
+            crate::ingress::column_sender::encoder::EncodeScratch::new(),
             false,
         ))
     }
@@ -1426,8 +1436,8 @@ fn pick_column_sender_inner(inner: &Arc<DbInner>) -> Result<ColumnSender> {
     slot.commit();
     Ok(ColumnSender::new_direct(
         conn,
-        crate::ingress::buffer::SymbolGlobalDict::new(),
-        super::encoder::EncodeScratch::new(),
+        crate::ingress::SymbolGlobalDict::new(),
+        crate::ingress::column_sender::encoder::EncodeScratch::new(),
         false,
     ))
 }

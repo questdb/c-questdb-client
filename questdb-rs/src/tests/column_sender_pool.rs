@@ -45,7 +45,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
-use crate::ingress::column_sender::{AckLevel, Chunk, QuestDb};
+use crate::QuestDb;
+use crate::ingress::column_sender::{AckLevel, Chunk};
 use crate::tests::qwp_ws::{
     perform_server_upgrade, read_frame, write_qwp_error_response, write_qwp_ok_response,
 };
@@ -2593,7 +2594,7 @@ fn flush_polars_dataframe_applies_column_overrides() {
 }
 
 /// Reader-pool (egress) ergonomic API tests: [`QuestDb::borrow_reader`] /
-/// [`crate::ingress::column_sender::BorrowedReader`].
+/// [`crate::BorrowedReader`].
 ///
 /// Gated on `sync-reader-ws` (which provides `Reader` and implies `_egress`).
 /// The mock endpoint completes the WS upgrade (QWP version 1), emits one

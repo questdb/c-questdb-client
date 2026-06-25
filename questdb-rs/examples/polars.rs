@@ -11,10 +11,7 @@
 use std::error::Error;
 
 use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
-use questdb::{
-    egress::Reader,
-    ingress::{column_sender::QuestDb, polars::PolarsIngestOptions},
-};
+use questdb::{QuestDb, egress::Reader, ingress::polars::PolarsIngestOptions};
 
 const TABLE: &str = "trades_polars_demo";
 

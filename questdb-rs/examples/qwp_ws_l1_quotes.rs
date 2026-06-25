@@ -64,7 +64,8 @@
 
 use std::time::Instant;
 
-use questdb::ingress::column_sender::{AckLevel, Chunk, QuestDb};
+use questdb::QuestDb;
+use questdb::ingress::column_sender::{AckLevel, Chunk};
 
 const DEFAULT_TOTAL_ROWS: usize = 5_000_000;
 /// 25 000 rows × ~60 bytes/row ≈ 1.5 MB. Stays under the QuestDB server's

@@ -50,7 +50,7 @@
 //! }
 //! ```
 //!
-//! [`BorrowedColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedColumnSender::flush_polars_dataframe
+//! [`BorrowedColumnSender::flush_polars_dataframe`]: crate::db::BorrowedColumnSender::flush_polars_dataframe
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -336,7 +336,7 @@ const CHECKPOINT_BATCHES: usize = 64;
 /// sender.flush_polars_dataframe("trades", &df, &opts)?;
 /// ```
 ///
-/// [`BorrowedColumnSender::flush_polars_dataframe`]: crate::ingress::column_sender::BorrowedColumnSender::flush_polars_dataframe
+/// [`BorrowedColumnSender::flush_polars_dataframe`]: crate::db::BorrowedColumnSender::flush_polars_dataframe
 #[derive(Clone, Copy, Default)]
 pub struct PolarsIngestOptions<'a> {
     max_rows: Option<NonZeroUsize>,
@@ -384,7 +384,7 @@ impl<'a> PolarsIngestOptions<'a> {
     }
 }
 
-impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
+impl crate::db::BorrowedColumnSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `options.max_rows` rows
     /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
     /// commit at checkpoint boundaries — re-driving transparently across a
@@ -464,7 +464,7 @@ impl crate::ingress::column_sender::BorrowedColumnSender<'_> {
 /// durable by each successful checkpoint, so on a transient error the caller
 /// re-drives only the uncommitted tail.
 fn drive_from_checkpoint(
-    sender: &mut crate::ingress::column_sender::BorrowedColumnSender<'_>,
+    sender: &mut crate::db::BorrowedColumnSender<'_>,
     table: crate::ingress::TableName<'_>,
     df: &DataFrame,
     options: &PolarsIngestOptions<'_>,

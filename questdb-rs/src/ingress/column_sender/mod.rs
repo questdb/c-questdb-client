@@ -31,8 +31,8 @@
 //!
 //! The user model is `DataFrame → Table`:
 //!
-//! - Open a connection pool with [`QuestDb::connect`].
-//! - Borrow a sender with [`QuestDb::borrow_column_sender`].
+//! - Open a connection pool with [`crate::QuestDb::connect`].
+//! - Borrow a sender with [`crate::QuestDb::borrow_column_sender`].
 //! - Build a [`Chunk`] of column buffers for one table, then pin a
 //!   designated timestamp on it.
 //! - Publish a batch and wait for the server to commit it in one call with
@@ -40,7 +40,7 @@
 //!   and return when it is committed"). To pipeline many batches for
 //!   throughput instead, publish each with [`ColumnSender::flush`] and drain
 //!   once at the end with [`ColumnSender::sync`] at the requested [`AckLevel`].
-//! - Drop the [`BorrowedColumnSender`] to return its connection to the pool.
+//! - Drop the [`crate::BorrowedColumnSender`] to return its connection to the pool.
 //!
 //! ```ignore
 //! let mut sender = db.borrow_column_sender()?;
@@ -54,10 +54,9 @@
 #[cfg(feature = "arrow")]
 mod arrow_batch;
 mod chunk;
-mod conf;
-mod conn;
-mod db;
-mod encoder;
+pub(crate) mod conf;
+pub(crate) mod conn;
+pub(crate) mod encoder;
 mod numpy_wire;
 mod sender;
 mod validity;
@@ -68,9 +67,6 @@ pub use arrow_batch::ArrowColumnOverride;
 pub use chunk::Chunk;
 #[cfg(feature = "arrow")]
 pub use chunk::ImportedArrowColumn;
-#[cfg(feature = "_egress")]
-pub use db::BorrowedReader;
-pub use db::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
 pub use numpy_wire::NumpyDtype;
 pub use sender::{AckLevel, ColumnSender};
 pub use validity::Validity;
@@ -98,19 +94,9 @@ const _: () = assert!(
 /// of the public Rust API surface (the public `*_and_wait` methods return
 /// `Result<()>`). Unlike the owned pool handles, this is a sender-result type,
 /// so it stays on the `column_sender` surface rather than moving to
-/// [`ffi_support`].
+/// [`crate::ffi_support`].
 #[doc(hidden)]
 pub use sender::FlushFailure;
-
-/// FFI escape-hatch surface: owned (lifetime-free) pool handles and the entry
-/// points that mint them, for the `questdb-rs-ffi` C-ABI crate. Hidden,
-/// feature-gated, and not part of the public Rust API — normal Rust users
-/// borrow lifetime-bound handles via [`QuestDb::borrow_column_sender`] /
-/// [`QuestDb::borrow_row_sender`] (and, with egress, `QuestDb::borrow_reader`).
-/// Only `questdb-rs-ffi` enables the `ffi-support` feature.
-#[cfg(feature = "ffi-support")]
-#[doc(hidden)]
-pub mod ffi_support;
 
 /// Internals exposed for criterion benchmarks under
 /// `questdb-rs/benches/`. Not part of the public API; bumped freely

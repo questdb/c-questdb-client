@@ -37,8 +37,9 @@ use std::slice;
 use std::str;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use questdb::QuestDb;
 use questdb::ffi_support::OwnedColumnSender;
-use questdb::ingress::column_sender::{AckLevel, Chunk, NumpyDtype, QuestDb, Validity};
+use questdb::ingress::column_sender::{AckLevel, Chunk, NumpyDtype, Validity};
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
 use questdb::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
