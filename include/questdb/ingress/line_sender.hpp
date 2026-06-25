@@ -1990,7 +1990,13 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2 = this->new_buffer(0);
+            // Mirror flush_and_get_fsn's may_init path; new_buffer() rejects
+            // WebSocket senders.
+            line_sender_buffer buffer2{
+                this->protocol_version(),
+                0,
+                ::line_sender_get_max_name_len(_impl)};
+            buffer2.may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_qwpws_flush_and_keep_and_get_fsn,
                 _impl,

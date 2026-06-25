@@ -87,8 +87,6 @@ enum class error_code : int
     protocol_error         = ::reader_error_protocol_error,
     invalid_utf8           = ::reader_error_invalid_utf8,
     invalid_bind           = ::reader_error_invalid_bind,
-    // Values 12 and 13 are reserved (formerly invalid_timestamp /
-    // invalid_decimal — removed; see reader.h).
     server_schema_mismatch = ::reader_error_server_schema_mismatch,
     server_parse_error     = ::reader_error_server_parse_error,
     server_internal_error  = ::reader_error_server_internal_error,

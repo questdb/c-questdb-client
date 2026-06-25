@@ -775,24 +775,17 @@ fn decode_decimal_wide(
 ) -> Result<(i8, ColumnBuffer)> {
     let validity = decode_validity(r, parent, row_count)?;
     let scale = r.read_u8()? as i8;
-    if !(0..=crate::egress::binds::MAX_DECIMAL_SCALE).contains(&scale) {
-        return Err(fmt!(
-            ProtocolError,
-            "decimal scale {} outside 0..={}",
-            scale,
-            crate::egress::binds::MAX_DECIMAL_SCALE
-        ));
-    }
+    // Per-width scale bound, matching the server's
+    // `Decimal{64,128,256}.MAX_SCALE` (18 / 38 / 76).
     let per_width_max: i8 = match width {
         8 => 18,
         16 => 38,
-        32 => crate::egress::binds::MAX_DECIMAL_SCALE,
-        _ => crate::egress::binds::MAX_DECIMAL_SCALE,
+        _ => 76,
     };
-    if scale > per_width_max {
+    if !(0..=per_width_max).contains(&scale) {
         return Err(fmt!(
             ProtocolError,
-            "DECIMAL{} scale {} exceeds per-width maximum {}",
+            "DECIMAL{} scale {} outside 0..={}",
             width * 8,
             scale,
             per_width_max
@@ -2750,7 +2743,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
             assert!(
-                err.msg().contains("decimal scale"),
+                err.msg().contains("scale"),
                 "expected scale error msg, got: {}",
                 err.msg()
             );
@@ -2759,7 +2752,7 @@ mod tests {
 
     #[test]
     fn decode_decimal_rejects_scale_above_max() {
-        // 39 = MAX_DECIMAL_SCALE + 1.
+        // 39 is above DECIMAL64's per-width cap of 18.
         let mut data = vec![0x00u8, 39u8];
         data.extend(std::iter::repeat_n(0u8, 8));
         let (flags_byte, payload) = BatchBuilder::new(1)
@@ -2776,6 +2769,57 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+    }
+
+    fn decimal_col_data(scale: u8, width: usize) -> Vec<u8> {
+        let mut data = vec![0x00u8, scale]; // null_flag=0, scale
+        data.extend(std::iter::repeat_n(0u8, width)); // 1 non-null row
+        data
+    }
+
+    fn decode_decimal_one_row(kind: ColumnKind, scale: u8, width: usize) -> Result<()> {
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("p", kind, decimal_col_data(scale, width))
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut schema: Option<Schema> = None;
+        decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut schema,
+            &mut ZstdScratch::new(),
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn decode_decimal64_per_width_scale_boundary() {
+        // DECIMAL64 (width 8) caps scale at 18 (server Decimal64.MAX_SCALE).
+        assert!(decode_decimal_one_row(ColumnKind::Decimal64, 18, 8).is_ok());
+        let err = decode_decimal_one_row(ColumnKind::Decimal64, 19, 8).unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
+    }
+
+    #[test]
+    fn decode_decimal128_per_width_scale_boundary() {
+        // DECIMAL128 (width 16) caps scale at 38 (server Decimal128.MAX_SCALE).
+        assert!(decode_decimal_one_row(ColumnKind::Decimal128, 38, 16).is_ok());
+        let err = decode_decimal_one_row(ColumnKind::Decimal128, 39, 16).unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
+    }
+
+    #[test]
+    fn decode_decimal256_per_width_scale_boundary() {
+        // DECIMAL256 (width 32) caps scale at 76 (server Decimal256.MAX_SCALE).
+        // Scales between DECIMAL128's 38 and 76 must be accepted, not rejected.
+        assert!(decode_decimal_one_row(ColumnKind::Decimal256, 39, 32).is_ok());
+        assert!(decode_decimal_one_row(ColumnKind::Decimal256, 76, 32).is_ok());
+        let err = decode_decimal_one_row(ColumnKind::Decimal256, 77, 32).unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+        assert!(err.msg().contains("DECIMAL"), "{}", err.msg());
     }
 
     #[test]

@@ -162,26 +162,21 @@ typedef enum reader_error_code
      *  decimal / geohash range failures too — every reachable
      *  client-side validation flows through bind encoding. */
     reader_error_invalid_bind = 11,
-    /* Values 12 and 13 are intentionally reserved (formerly
-     * `invalid_timestamp` / `invalid_decimal`, removed before
-     * release because no egress path ever emitted them). Do not
-     * reuse without ABI co-ordination — Cython / external consumers
-     * may have cached the prior numbering. */
     /** Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`). */
-    reader_error_server_schema_mismatch = 14,
+    reader_error_server_schema_mismatch = 12,
     /** Server-reported QWP `PARSE_ERROR` (status `0x05`). */
-    reader_error_server_parse_error = 15,
+    reader_error_server_parse_error = 13,
     /** Server-reported QWP `INTERNAL_ERROR` (status `0x06`). */
-    reader_error_server_internal_error = 16,
+    reader_error_server_internal_error = 14,
     /** Server-reported QWP `SECURITY_ERROR` (status `0x08`). */
-    reader_error_server_security_error = 17,
+    reader_error_server_security_error = 15,
     /** Client-side limit hit (e.g. an array row exceeds the configured
      *  per-row element cap). */
-    reader_error_limit_exceeded = 18,
+    reader_error_limit_exceeded = 16,
     /** Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`). */
-    reader_error_server_limit_exceeded = 19,
+    reader_error_server_limit_exceeded = 17,
     /** Query was cancelled (locally or via server `CANCELLED` status `0x0A`). */
-    reader_error_cancelled = 20,
+    reader_error_cancelled = 18,
     /** Mid-query failover was eligible but at least one batch had
      *  already been delivered to the caller and no
      *  `on_failover_reset` callback was installed; replay would
@@ -192,7 +187,7 @@ typedef enum reader_error_code
      *  the query from scratch when this code surfaces. Initial-
      *  connect failover (before any batch is yielded) is unaffected
      *  and remains transparent. */
-    reader_error_failover_would_duplicate = 21,
+    reader_error_failover_would_duplicate = 19,
     /** Streaming Arrow adapter saw a mid-stream schema change. The
      *  cursor remains usable; its pinned schema snapshot is cleared
      *  by this error, so the next
@@ -200,19 +195,19 @@ typedef enum reader_error_code
      *  schema and resumes streaming. The batch that triggered the
      *  drift is discarded — re-issue the query if you need it. Only
      *  emitted when the `arrow` feature is enabled. */
-    reader_error_schema_drift = 22,
+    reader_error_schema_drift = 20,
     /** A higher-level streaming Arrow adapter (Rust `as_arrow_reader` /
      *  `iter_polars`) was asked for a schema on a stream that terminated
      *  before any batch was produced. `reader_cursor_next_arrow_batch`
      *  itself reports an empty stream as `reader_arrow_batch_end`, so
      *  pure-C callers do not observe this code. Only present when the
      *  `arrow` feature is enabled. */
-    reader_error_no_schema = 23,
+    reader_error_no_schema = 21,
     /** Arrow C Data Interface export failed (arrow-rs rejected the
      *  produced `ArrayData`'s invariants). Indicates a client bug —
      *  not user-recoverable. Only emitted when the `arrow` feature
      *  is enabled. */
-    reader_error_arrow_export = 24,
+    reader_error_arrow_export = 22,
 } reader_error_code;
 
 /**

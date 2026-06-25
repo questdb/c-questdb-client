@@ -3394,6 +3394,410 @@ mod tests {
     }
 
     #[test]
+    fn column_bool_round_trip_on_pure_data_path() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        // 5 rows: true, false, true, true, false -> LSB-first bits 0,2,3 set.
+        let name = b"flag";
+        let data: [u8; 1] = [0b0000_1101];
+        let row_count: usize = 5;
+        let ok = unsafe {
+            column_sender_chunk_column_bool(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                data.as_ptr(),
+                row_count,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(ok, "column_bool should succeed");
+        assert!(err.is_null());
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            row_count
+        );
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_bool_with_validity_nulls() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        // 4 rows of bool data, with rows 1 and 3 marked NULL via the
+        // validity bitmap (LSB-first; bit = 1 means valid).
+        let name = b"flag";
+        let data: [u8; 1] = [0b0000_0101];
+        let valid_bits: [u8; 1] = [0b0000_0101];
+        let row_count: usize = 4;
+        let validity = column_sender_validity {
+            bits: valid_bits.as_ptr(),
+            bit_len: row_count,
+        };
+        let ok = unsafe {
+            column_sender_chunk_column_bool(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                data.as_ptr(),
+                row_count,
+                &validity,
+                &mut err,
+            )
+        };
+        assert!(ok, "column_bool with validity should succeed");
+        assert!(err.is_null());
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            row_count
+        );
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_bool_rejects_row_count_mismatch() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        // Lock the chunk row_count to 3 via an i64 column.
+        let name_a = b"a";
+        let data_a: [i64; 3] = [1, 2, 3];
+        assert!(unsafe {
+            column_sender_chunk_column_i64(
+                chunk,
+                name_a.as_ptr() as *const c_char,
+                name_a.len(),
+                data_a.as_ptr(),
+                data_a.len(),
+                std::ptr::null(),
+                &mut err,
+            )
+        });
+
+        // A bool column claiming 2 rows must be rejected.
+        let name_b = b"flag";
+        let data_b: [u8; 1] = [0b0000_0001];
+        let ok = unsafe {
+            column_sender_chunk_column_bool(
+                chunk,
+                name_b.as_ptr() as *const c_char,
+                name_b.len(),
+                data_b.as_ptr(),
+                2,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_bool_rejects_null_data_with_rows() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        // NULL data pointer with non-zero row_count must be rejected by the
+        // bounded-slice guard.
+        let name = b"flag";
+        let ok = unsafe {
+            column_sender_chunk_column_bool(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                std::ptr::null(),
+                3,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_binary_round_trip_on_pure_data_path() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        // 3 rows: "ab" (2 bytes), "" (empty segment), "xyz" (3 bytes).
+        // offsets has row_count + 1 == 4 entries, monotonically
+        // non-decreasing; bytes is the concatenated buffer.
+        let name = b"payload";
+        let offsets: [i32; 4] = [0, 2, 2, 5];
+        let bytes: [u8; 5] = [b'a', b'b', b'x', b'y', b'z'];
+        let row_count: usize = 3;
+        let ok = unsafe {
+            column_sender_chunk_column_binary(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                offsets.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                row_count,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(ok, "column_binary should succeed");
+        assert!(err.is_null());
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            row_count
+        );
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_binary_rejects_row_count_mismatch() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        // Lock the chunk row_count to 3.
+        let name_a = b"a";
+        let data_a: [i64; 3] = [1, 2, 3];
+        assert!(unsafe {
+            column_sender_chunk_column_i64(
+                chunk,
+                name_a.as_ptr() as *const c_char,
+                name_a.len(),
+                data_a.as_ptr(),
+                data_a.len(),
+                std::ptr::null(),
+                &mut err,
+            )
+        });
+
+        // A binary column with 2 rows (offsets len 3) must be rejected.
+        let name_b = b"payload";
+        let offsets: [i32; 3] = [0, 1, 2];
+        let bytes: [u8; 2] = [b'a', b'b'];
+        let ok = unsafe {
+            column_sender_chunk_column_binary(
+                chunk,
+                name_b.as_ptr() as *const c_char,
+                name_b.len(),
+                offsets.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                2,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_binary_rejects_offset_out_of_bounds() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        // Last offset (5) exceeds the 2-byte bytes buffer.
+        let name = b"payload";
+        let offsets: [i32; 2] = [0, 5];
+        let bytes: [u8; 2] = [b'a', b'b'];
+        let ok = unsafe {
+            column_sender_chunk_column_binary(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                offsets.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                1,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_varchar_round_trip_on_pure_data_path() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        assert!(!chunk.is_null());
+
+        // 3 rows: "hi" (ascii), "" (empty string), "héllo" (multi-byte:
+        // 'é' is 2 UTF-8 bytes -> "héllo" is 6 bytes).
+        let name = b"text";
+        let bytes: Vec<u8> = {
+            let mut v = Vec::new();
+            v.extend_from_slice("hi".as_bytes());
+            v.extend_from_slice("héllo".as_bytes());
+            v
+        };
+        let split = "hi".len() as i32;
+        let total = bytes.len() as i32;
+        let offsets: [i32; 4] = [0, split, split, total];
+        let row_count: usize = 3;
+        let ok = unsafe {
+            column_sender_chunk_column_varchar(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                offsets.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                row_count,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(ok, "column_varchar should succeed");
+        assert!(err.is_null());
+        assert_eq!(
+            unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
+            row_count
+        );
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_varchar_rejects_row_count_mismatch() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        // Lock the chunk row_count to 3.
+        let name_a = b"a";
+        let data_a: [i64; 3] = [1, 2, 3];
+        assert!(unsafe {
+            column_sender_chunk_column_i64(
+                chunk,
+                name_a.as_ptr() as *const c_char,
+                name_a.len(),
+                data_a.as_ptr(),
+                data_a.len(),
+                std::ptr::null(),
+                &mut err,
+            )
+        });
+
+        // A varchar column with 2 rows (offsets len 3) must be rejected.
+        let name_b = b"text";
+        let offsets: [i32; 3] = [0, 2, 4];
+        let bytes: [u8; 4] = [b'a', b'b', b'c', b'd'];
+        let ok = unsafe {
+            column_sender_chunk_column_varchar(
+                chunk,
+                name_b.as_ptr() as *const c_char,
+                name_b.len(),
+                offsets.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                2,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_varchar_rejects_offset_out_of_bounds() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        // Last offset (9) exceeds the 4-byte bytes buffer.
+        let name = b"text";
+        let offsets: [i32; 2] = [0, 9];
+        let bytes: [u8; 4] = [b'a', b'b', b'c', b'd'];
+        let ok = unsafe {
+            column_sender_chunk_column_varchar(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                offsets.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                1,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
+    fn column_varchar_rejects_invalid_utf8() {
+        let table = b"trades";
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let chunk = unsafe {
+            column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err)
+        };
+        // 0xFF is not valid UTF-8; varchar validates the referenced bytes
+        // while binary does not.
+        let name = b"text";
+        let offsets: [i32; 2] = [0, 1];
+        let bytes: [u8; 1] = [0xFF];
+        let ok = unsafe {
+            column_sender_chunk_column_varchar(
+                chunk,
+                name.as_ptr() as *const c_char,
+                name.len(),
+                offsets.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                1,
+                std::ptr::null(),
+                &mut err,
+            )
+        };
+        assert!(!ok);
+        assert!(!err.is_null());
+        unsafe { line_sender_error_free(err) };
+        unsafe { column_sender_chunk_free(chunk) };
+    }
+
+    #[test]
     fn validity_null_bits_with_nonzero_len_errors() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();

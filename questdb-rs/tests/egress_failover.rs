@@ -114,6 +114,11 @@ enum BatchColumn {
     Long(Vec<i64>),
     /// DOUBLE column named `d`.
     Double(Vec<f64>),
+    /// SYMBOL column named `s`, carried in connection-scoped delta-dict
+    /// mode (`FLAG_DELTA_SYMBOL_DICT`). `dict` is the full delta the
+    /// batch appends starting at conn-id 0 (so each connection rebuilds
+    /// its dict from scratch); `codes` are the per-row ids that index it.
+    Symbol { dict: Vec<String>, codes: Vec<u32> },
 }
 
 /// Single-table `RESULT_BATCH` frame carrying one non-null column. The
@@ -124,15 +129,35 @@ fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> 
     // Egress wire type codes (`ColumnKind::as_u8`).
     const KIND_LONG: u8 = 0x05;
     const KIND_DOUBLE: u8 = 0x07;
+    const KIND_SYMBOL: u8 = 0x09;
     const NULL_FLAG_NONE: u8 = 0x00;
+    // Frame header flag: SYMBOL columns ride the connection-scoped dict,
+    // so the batch carries the delta-dict section (`flags::DELTA_SYMBOL_DICT`).
+    const FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
     let (name, kind, row_count) = match column {
         BatchColumn::Long(v) => ("v", KIND_LONG, v.len()),
         BatchColumn::Double(v) => ("d", KIND_DOUBLE, v.len()),
+        BatchColumn::Symbol { codes, .. } => ("s", KIND_SYMBOL, codes.len()),
+    };
+    let flags = match column {
+        BatchColumn::Symbol { .. } => FLAG_DELTA_SYMBOL_DICT,
+        _ => 0,
     };
     let mut payload = Vec::new();
     payload.push(MSG_RESULT_BATCH);
     payload.extend_from_slice(&request_id.to_le_bytes());
     encode_varint_u64(batch_seq, &mut payload);
+    // Delta-dict section rides immediately after `batch_seq` when
+    // FLAG_DELTA_SYMBOL_DICT is set: `delta_start, delta_count, [len+bytes]...`.
+    // Each connection rebuilds its dict from id 0, so delta_start is 0.
+    if let BatchColumn::Symbol { dict, .. } = column {
+        encode_varint_u64(0, &mut payload); // delta_start
+        encode_varint_u64(dict.len() as u64, &mut payload); // delta_count
+        for entry in dict {
+            encode_varint_u64(entry.len() as u64, &mut payload);
+            payload.extend_from_slice(entry.as_bytes());
+        }
+    }
     encode_varint_u64(0, &mut payload); // empty table name
     encode_varint_u64(row_count as u64, &mut payload);
     if batch_seq == 0 {
@@ -153,8 +178,13 @@ fn result_batch_frame(request_id: i64, batch_seq: u64, column: &BatchColumn) -> 
                 payload.extend_from_slice(&v.to_le_bytes());
             }
         }
+        BatchColumn::Symbol { codes, .. } => {
+            for code in codes {
+                encode_varint_u64(*code as u64, &mut payload);
+            }
+        }
     }
-    framed(1, 0, 1, &payload)
+    framed(1, flags, 1, &payload)
 }
 
 /// `QUERY_ERROR` frame: `[0x13, request_id i64 LE, status u8, msg_len u16 LE, msg_bytes...]`.
@@ -4866,5 +4896,129 @@ fn fetch_all_arrow_failover_after_batch_yields_complete_result() {
     assert_eq!(
         total_rows, 3,
         "A's partial batch must be discarded; only B's rows remain"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: per-cursor SYMBOL cache must be reset on failover replay.
+//
+// The streaming Arrow path threads a persistent `SymbolValuesCache` across
+// batches, keyed only on the connection dict's length. On mid-query
+// failover the connection dict is rebuilt empty against the new node, but
+// the per-cursor cache used to survive. If the new node's dict re-grew to
+// the SAME length, `symbol_array` saw `cache.len == dict.len()` and reused
+// the OLD node's interned strings — pairing the new node's row codes with
+// the dead node's symbol values (silent wrong values, no error).
+// ---------------------------------------------------------------------------
+
+/// Pull every distinct symbol string out of a single-column SYMBOL
+/// `RecordBatch`, in row order. The column is a
+/// `Dictionary<UInt32, Utf8>`; the value at row `i` is
+/// `values[keys[i]]`.
+#[cfg(feature = "arrow")]
+fn symbol_rows(rb: &arrow_array::RecordBatch) -> Vec<String> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt32Type;
+    let dict = rb.column(0).as_dictionary::<UInt32Type>();
+    let values = dict.values().as_string::<i32>();
+    dict.keys()
+        .iter()
+        .map(|k| {
+            values
+                .value(k.expect("non-null symbol") as usize)
+                .to_string()
+        })
+        .collect()
+}
+
+/// `&str` view over a `Vec<String>` so the assertions can compare against
+/// `vec!["a", ...]` literals directly.
+#[cfg(feature = "arrow")]
+fn as_str_vec(v: &[String]) -> Vec<&str> {
+    v.iter().map(String::as_str).collect()
+}
+
+/// Node A streams a SYMBOL batch that grows the connection dict to length 3
+/// (`["a","b","c"]`), then drops mid-stream. Node B replays with its own
+/// dict that reaches the *same length 3* but holds different strings
+/// (`["x","y","z"]`). With the per-cursor SYMBOL cache reset on failover,
+/// the replayed batch must read back B's real values; without the reset it
+/// silently surfaced A's cached strings (matching dict length → cache hit).
+#[test]
+#[cfg(feature = "arrow")]
+fn failover_replay_resets_symbol_cache_to_new_node_values() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Symbol {
+                dict: vec!["a".into(), "b".into(), "c".into()],
+                codes: vec![0, 1, 2],
+            },
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Symbol {
+                // Same length as A's dict (3) so a length-keyed cache hits,
+                // but completely different strings.
+                dict: vec!["x".into(), "y".into(), "z".into()],
+                codes: vec![0, 1, 2],
+            },
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // A replay-aware callback opts the streaming cursor into replay after a
+    // batch has already been delivered (otherwise the silent-duplicate guard
+    // returns `FailoverWouldDuplicate` before any reconnect).
+    let mut cursor = reader
+        .prepare("select s from t")
+        .on_failover_reset(|_ev: &FailoverEvent| {})
+        .execute()
+        .expect("execute");
+
+    // Batch from A: primes the per-cursor SYMBOL values cache with A's dict
+    // (length 3 → strings a/b/c).
+    let a_batch = cursor
+        .next_arrow_batch()
+        .expect("A batch ok")
+        .expect("A batch present");
+    assert_eq!(as_str_vec(&symbol_rows(&a_batch)), vec!["a", "b", "c"]);
+
+    // A drops; the cursor fails over to B and replays. B's dict reaches the
+    // same length 3, so a stale length-keyed cache would resurface A's
+    // strings. The fix resets the cache so B's real values are read.
+    let b_batch = cursor
+        .next_arrow_batch()
+        .expect("B batch after failover ok")
+        .expect("B batch present");
+    assert_eq!(cursor.failover_resets(), 1, "exactly one reset to B");
+    assert_eq!(
+        as_str_vec(&symbol_rows(&b_batch)),
+        vec!["x", "y", "z"],
+        "post-failover SYMBOL values must be the new node's, not the cached \
+         old-node strings paired with the new node's codes"
+    );
+
+    assert!(
+        cursor.next_arrow_batch().expect("terminal").is_none(),
+        "B's RESULT_END must terminate the cursor"
     );
 }

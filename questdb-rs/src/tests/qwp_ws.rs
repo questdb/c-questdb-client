@@ -521,12 +521,14 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
         let (mut stream, _) = listener.accept().unwrap();
         let request_lines = perform_server_upgrade(&mut stream).unwrap();
 
+        // Tolerate a client that closes after the handshake without sending a
+        // frame (locally-rejected flush, teardown on drop): a hangup is a clean
+        // end-of-client, not a reason to panic this detached thread.
         let mut received_frames = Vec::new();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        received_frames.push(payload);
-
-        // Reply: OK status, sequence=0, table_count=0
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            received_frames.push(payload);
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+        }
 
         let _ = tx.send(MockResult {
             request_lines,
@@ -549,9 +551,10 @@ fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<
         let request_lines = perform_server_upgrade(&mut stream).unwrap();
 
         let mut received_frames = Vec::new();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        received_frames.push(payload);
-        write_mock_qwp_response(&mut stream, response).unwrap();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            received_frames.push(payload);
+            let _ = write_mock_qwp_response(&mut stream, response);
+        }
 
         let _ = tx.send(MockResult {
             request_lines,
@@ -602,13 +605,14 @@ fn spawn_two_response_server(
         let request_lines = perform_server_upgrade(&mut stream).unwrap();
 
         let mut received_frames = Vec::new();
-        let (_fin, _opcode, first) = read_frame(&mut stream).unwrap();
-        received_frames.push(first);
-        write_mock_qwp_response(&mut stream, first_response).unwrap();
-
-        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
-        received_frames.push(second);
-        write_mock_qwp_response(&mut stream, second_response).unwrap();
+        if let Ok((_fin, _opcode, first)) = read_frame(&mut stream) {
+            received_frames.push(first);
+            let _ = write_mock_qwp_response(&mut stream, first_response);
+            if let Ok((_fin, _opcode, second)) = read_frame(&mut stream) {
+                received_frames.push(second);
+                let _ = write_mock_qwp_response(&mut stream, second_response);
+            }
+        }
 
         let _ = tx.send(MockResult {
             request_lines,
@@ -4321,9 +4325,10 @@ fn spawn_max_batch_size_server(max_batch_size: Option<usize>) -> (u16, mpsc::Rec
         let (mut stream, _) = listener.accept().unwrap();
         let request_lines = upgrade_mock_stream_with_max_batch_size(&mut stream, max_batch_size);
         let mut received_frames = Vec::new();
-        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
-        received_frames.push(payload);
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        if let Ok((_fin, _opcode, payload)) = read_frame(&mut stream) {
+            received_frames.push(payload);
+            let _ = write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE);
+        }
         let _ = tx.send(MockResult {
             request_lines,
             received_frames,

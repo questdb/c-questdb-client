@@ -417,9 +417,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
             PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
     endforeach()
 
-    # Apache Arrow C Data Interface tests. The fatal_error gate above
-    # forces QUESTDB_ENABLE_ARROW=ON when tests are enabled, so these
-    # always build alongside the rest of the suite.
+    # Apache Arrow C Data Interface tests. QUESTDB_ENABLE_ARROW is
+    # auto-enabled when QUESTDB_TESTS_AND_EXAMPLES=ON (see above), so
+    # these always build alongside the rest of the suite.
     compile_test(
         test_arrow_c
         cpp_test/qwp_mock_server.cpp

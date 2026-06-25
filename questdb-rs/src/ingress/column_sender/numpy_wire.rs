@@ -295,6 +295,22 @@ impl NumpyDtype {
                 bits
             ));
         }
+        let decimal_scale = match self {
+            NumpyDtype::Decimal64 { scale } => Some((*scale, 18u8)),
+            NumpyDtype::Decimal128 { scale } => Some((*scale, 38u8)),
+            NumpyDtype::Decimal256 { scale } => Some((*scale, 76u8)),
+            _ => None,
+        };
+        if let Some((scale, max_scale)) = decimal_scale
+            && scale > max_scale
+        {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "decimal scale must be <= {}, got {}",
+                max_scale,
+                scale
+            ));
+        }
         Ok(())
     }
 
@@ -1376,6 +1392,43 @@ mod tests {
         assert!(NumpyDtype::GeohashI64 { bits: 61 }.validate().is_err());
         assert!(NumpyDtype::GeohashI8 { bits: 8 }.validate().is_ok());
         assert!(NumpyDtype::GeohashI64 { bits: 60 }.validate().is_ok());
+    }
+
+    #[test]
+    fn decimal_dtype_rejects_scale_above_width_max() {
+        assert!(NumpyDtype::Decimal64 { scale: 18 }.validate().is_ok());
+        assert!(NumpyDtype::Decimal128 { scale: 38 }.validate().is_ok());
+        assert!(NumpyDtype::Decimal256 { scale: 76 }.validate().is_ok());
+
+        for dtype in [
+            NumpyDtype::Decimal64 { scale: 19 },
+            NumpyDtype::Decimal128 { scale: 39 },
+            NumpyDtype::Decimal256 { scale: 77 },
+        ] {
+            let err = dtype.validate().unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+            assert!(err.msg().contains("decimal scale"), "{}", err.msg());
+        }
+    }
+
+    #[test]
+    fn f16_bits_to_f32_matches_half_crate_for_all_bit_patterns() {
+        // The hand-written `f16_bits_to_f32` must agree bit-for-bit with
+        // `half::f16::to_f32` (used by the Arrow path) on every finite,
+        // zero, subnormal and infinity bit pattern. NaN payloads are not
+        // guaranteed identical (`half` forces the quiet bit; this impl
+        // preserves the raw mantissa), so for NaN we only require both to
+        // report `is_nan()`.
+        for bits in 0u32..=0xFFFFu32 {
+            let bits = bits as u16;
+            let local = f16_bits_to_f32(bits);
+            let reference = half::f16::from_bits(bits).to_f32();
+            if reference.is_nan() {
+                assert!(local.is_nan(), "bits={:#06x}", bits);
+            } else {
+                assert_eq!(local.to_bits(), reference.to_bits(), "bits={:#06x}", bits);
+            }
+        }
     }
 
     #[test]

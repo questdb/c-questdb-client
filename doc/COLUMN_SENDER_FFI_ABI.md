@@ -732,8 +732,12 @@ have to mutate the schema struct.
   holds the array's buffer lifetime via an internal `Arc` until the
   next `column_sender_flush` returns; the caller may free the
   `ArrowArray` struct shell immediately after this call.
-- On failure, `array->release` is left intact and the caller retains
-  ownership.
+- On failure, `array->release` **may already have been consumed** (set
+  to NULL): the import takes ownership of the array buffers before
+  classification can fail, so a post-import failure has already freed
+  them. Callers MUST check `array->release != NULL` before invoking it;
+  only a still-non-NULL release (failure during pre-import validation)
+  means the caller still owns the buffers.
 - `schema` is borrowed in all cases; the caller always retains
   `schema->release`.
 
@@ -1141,8 +1145,11 @@ outgoing QWP frame in a single pass.
   (`flush_arrow_batch_at_column`). A batch with no designated timestamp
   is rejected unless the server-stamp opt-in is used — there is no
   silent server-stamp default.
-- **Ownership**: on success, the consumer invokes `array->release` /
-  `schema->release`; on failure the caller retains ownership.
+- **Ownership**: `schema` is borrowed in all cases — the caller always
+  retains `schema->release`. On success `array->release` is consumed
+  (set to NULL) and must not be invoked by the caller. On failure
+  `array->release` may already have been consumed; callers MUST check
+  `array->release != NULL` before invoking it (see §10).
 - **Deferred-commit semantics**: identical to `column_sender_flush`;
   the first frame after a sync is sent as an immediate commit,
   later frames defer. Call `column_sender_sync` to drain.

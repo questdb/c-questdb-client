@@ -181,6 +181,13 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
                     }
                 };
             }
+            other if other.starts_with("pool_") => {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "Unknown column-sender pool config key {:?}",
+                    other
+                ));
+            }
             _ => {
                 // Unknown / passthrough — leave the SenderBuilder to handle it.
             }

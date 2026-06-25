@@ -964,6 +964,12 @@ impl Drop for BorrowedColumnSender<'_> {
         // attributed to whatever table the new borrower targets.
         // Latch must_close so the connection is discarded instead.
         if sender.in_flight() > 0 {
+            log::warn!(
+                "column sender dropped with {} un-sync'd deferred frame(s); \
+                 their data is discarded. Call sync() (or flush_and_wait() on \
+                 the final chunk) before the borrow goes out of scope.",
+                sender.in_flight()
+            );
             sender.mark_must_close();
         }
         return_to_pool(&self.db.inner, sender);
@@ -1012,6 +1018,13 @@ impl Drop for OwnedColumnSender {
     fn drop(&mut self) {
         if let Some(mut sender) = self.sender.take() {
             if sender.in_flight() > 0 {
+                log::warn!(
+                    "column sender dropped with {} un-sync'd deferred \
+                     frame(s); their data is discarded. Call sync() (or \
+                     flush_and_wait() on the final chunk) before dropping \
+                     the handle.",
+                    sender.in_flight()
+                );
                 sender.mark_must_close();
             }
             return_to_pool(&self.inner, sender);

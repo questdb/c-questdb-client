@@ -2022,18 +2022,8 @@ impl<'r> Cursor<'r> {
                     return Err(map_server_status(status, message));
                 }
                 ServerEvent::CacheReset { .. } => {
-                    // `decode_frame` already cleared the connection dict; drop the
-                    // per-cursor SYMBOL caches keyed on it so a re-grown dict
-                    // cannot alias stale values/codes.
-                    #[cfg(feature = "arrow")]
-                    {
-                        self.sym_values = crate::egress::arrow::SymbolValuesCache::default();
-                        self.sym_scratch = crate::egress::arrow::SymbolBuildScratch::default();
-                    }
-                    #[cfg(feature = "polars")]
-                    {
-                        self.symbol_registry = None;
-                    }
+                    // `decode_frame` already cleared the connection dict.
+                    self.reset_symbol_caches();
                     continue;
                 }
                 ServerEvent::ServerInfo(_) => {
@@ -2184,6 +2174,21 @@ impl<'r> Cursor<'r> {
         self.failover_reconnect_and_replay(e)
     }
 
+    /// Drop the per-cursor SYMBOL caches keyed on the connection dict.
+    /// Must be called whenever `self.dict` is replaced, otherwise a
+    /// re-grown dict can alias stale interned values/codes.
+    fn reset_symbol_caches(&mut self) {
+        #[cfg(feature = "arrow")]
+        {
+            self.sym_values = crate::egress::arrow::SymbolValuesCache::default();
+            self.sym_scratch = crate::egress::arrow::SymbolBuildScratch::default();
+        }
+        #[cfg(feature = "polars")]
+        {
+            self.symbol_registry = None;
+        }
+    }
+
     /// Mid-query failover: the underlying connection just died with
     /// `trigger`. Walk the address list (skipping the failed endpoint
     /// first), with exponential backoff, until a fresh connection is
@@ -2303,6 +2308,9 @@ impl<'r> Cursor<'r> {
             {
                 self.drifted_batch = None;
             }
+            // The new connection installed a fresh empty dict; the SYMBOL
+            // caches keyed on the old one would otherwise alias stale values.
+            self.reset_symbol_caches();
             // Allocate a fresh request_id and re-issue the same
             // QUERY_REQUEST bytes. The cursor stashed the encoded
             // payload at `execute()` time; here we patch the 8-byte

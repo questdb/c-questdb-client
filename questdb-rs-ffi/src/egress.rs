@@ -92,45 +92,40 @@ pub enum reader_error_code {
     /// (covers timestamp / decimal / geohash range failures too —
     /// see `ErrorCode::InvalidBind` on the Rust side).
     reader_error_invalid_bind = 11,
-    // Values 12 and 13 are intentionally reserved (formerly
-    // `invalid_timestamp` / `invalid_decimal`, removed before
-    // release because no egress path ever emitted them). Do not
-    // reuse without ABI co-ordination — Cython / external consumers
-    // may have cached the prior numbering.
     /// Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`).
-    reader_error_server_schema_mismatch = 14,
+    reader_error_server_schema_mismatch = 12,
     /// Server-reported QWP `PARSE_ERROR` (status `0x05`).
-    reader_error_server_parse_error = 15,
+    reader_error_server_parse_error = 13,
     /// Server-reported QWP `INTERNAL_ERROR` (status `0x06`).
-    reader_error_server_internal_error = 16,
+    reader_error_server_internal_error = 14,
     /// Server-reported QWP `SECURITY_ERROR` (status `0x08`).
-    reader_error_server_security_error = 17,
+    reader_error_server_security_error = 15,
     /// Client-side limit hit (e.g. an array row exceeds the configured cap).
-    reader_error_limit_exceeded = 18,
+    reader_error_limit_exceeded = 16,
     /// Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`).
-    reader_error_server_limit_exceeded = 19,
+    reader_error_server_limit_exceeded = 17,
     /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
-    reader_error_cancelled = 20,
+    reader_error_cancelled = 18,
     /// Mid-query failover was eligible but at least one batch had already
     /// been delivered to the caller and no `on_failover_reset` callback
     /// was installed; replay would silently double-deliver rows already
     /// consumed, so the cursor was terminated instead. Install
     /// `reader_query_on_failover_reset` to opt in to replays, or
     /// re-execute the query from scratch.
-    reader_error_failover_would_duplicate = 21,
+    reader_error_failover_would_duplicate = 19,
     /// Streaming Arrow adapter saw a mid-stream schema change. The cursor
     /// is still usable; re-wrap with `reader_cursor_next_arrow_batch`
     /// after dropping any partial state to snapshot the new schema. Only
     /// emitted with the `arrow` feature enabled.
-    reader_error_schema_drift = 22,
+    reader_error_schema_drift = 20,
     /// `reader_cursor_next_arrow_batch` was called on a stream that
     /// terminated before any batch was produced — no schema to snapshot.
     /// Only emitted with the `arrow` feature enabled.
-    reader_error_no_schema = 23,
+    reader_error_no_schema = 21,
     /// Arrow C Data Interface export failed (arrow-rs rejected the
     /// produced `ArrayData`'s invariants). Indicates a client bug — not
     /// user-recoverable. Only emitted with the `arrow` feature enabled.
-    reader_error_arrow_export = 24,
+    reader_error_arrow_export = 22,
 }
 
 impl From<ErrorCode> for reader_error_code {
@@ -3985,10 +3980,10 @@ mod tests {
     #[test]
     fn reader_error_code_arrow_discriminants_are_abi_stable() {
         // Pin numeric values for the Arrow-related variants exposed to C/FFI
-        // consumers. Append-only past the existing tail at 21.
-        assert_eq!(reader_error_code::reader_error_schema_drift as u32, 22);
-        assert_eq!(reader_error_code::reader_error_no_schema as u32, 23);
-        assert_eq!(reader_error_code::reader_error_arrow_export as u32, 24);
+        // consumers. Append-only past the existing tail at 19.
+        assert_eq!(reader_error_code::reader_error_schema_drift as u32, 20);
+        assert_eq!(reader_error_code::reader_error_no_schema as u32, 21);
+        assert_eq!(reader_error_code::reader_error_arrow_export as u32, 22);
     }
 
     #[test]

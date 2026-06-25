@@ -1337,6 +1337,20 @@ mod tests {
     }
 
     #[test]
+    fn qwpws_scheme_alias_is_plain_ws() {
+        let c = ReaderConfig::from_conf("qwpws::addr=localhost:9000").unwrap();
+        assert!(!c.tls);
+        assert_eq!(c.url(), "ws://localhost:9000/read/v1");
+    }
+
+    #[test]
+    fn qwpwss_scheme_alias_is_tls_wss() {
+        let c = ReaderConfig::from_conf("qwpwss::addr=h:8443").unwrap();
+        assert!(c.tls);
+        assert_eq!(c.url(), "wss://h:8443/read/v1");
+    }
+
+    #[test]
     fn unknown_scheme_rejected() {
         let err = ReaderConfig::from_conf("http::addr=h:1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
