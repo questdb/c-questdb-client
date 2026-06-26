@@ -687,16 +687,18 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
     if arrow_offset.is_multiple_of(8) {
         let src_off = arrow_offset / 8;
         // The aligned fast path indexes `src` directly (unlike the unaligned
-        // branch's `lo_idx < src_len` guards). The null buffer's byte length is
-        // a structural invariant that `from_ffi`'s `validate()` and arrow-rs's
-        // safe builders both guarantee; assert it so any future unchecked
-        // producer trips in test/CI builds.
-        debug_assert!(
-            src.len() >= src_off + total_bytes,
-            "arrow validity buffer too short: {} bytes, need {}",
-            src.len(),
-            src_off + total_bytes
-        );
+        // branch's `lo_idx < src_len` guards). `validate()` already guarantees
+        // the null buffer is long enough; re-check at runtime so a caller that
+        // skips validation gets an error rather than an OOB read on the
+        // `panic = "abort"` FFI.
+        if src.len() < src_off + total_bytes {
+            return Err(fmt!(
+                ArrowIngest,
+                "arrow validity buffer too short: {} bytes, need {}",
+                src.len(),
+                src_off + total_bytes
+            ));
+        }
         let src_slice = &src[src_off..src_off + full_bytes];
         let dst_slice = &mut dst[..full_bytes];
         let word_bytes = (full_bytes / 8) * 8;
@@ -1180,6 +1182,18 @@ where
         if arr.is_null(row) {
             continue;
         }
+        // The offset table is sized from the array's declared `null_count`, but
+        // the loop is driven by the live validity bitmap. A producer whose
+        // `null_count` over-reports nulls would drive more emits than the table
+        // holds and back-patch past it — an OOB write that aborts under the
+        // `panic = "abort"` FFI. Reject the disagreement instead.
+        if next_offset_idx > non_null {
+            return Err(fmt!(
+                ArrowIngest,
+                "{}: validity bitmap exposes more non-null rows than the declared null_count permits",
+                label
+            ));
+        }
         let written = emit_row(out, row)?;
         let next = cumulative.checked_add(written).ok_or_else(|| {
             fmt!(
@@ -1194,7 +1208,15 @@ where
         out[pos..pos + 4].copy_from_slice(&cumulative.to_le_bytes());
         next_offset_idx += 1;
     }
-    debug_assert_eq!(next_offset_idx - 1, non_null);
+    if next_offset_idx - 1 != non_null {
+        return Err(fmt!(
+            ArrowIngest,
+            "{}: validity bitmap exposes {} non-null rows but the declared null_count implies {}",
+            label,
+            next_offset_idx - 1,
+            non_null
+        ));
+    }
     debug_assert_eq!(out.len() - bytes_anchor, cumulative as usize);
     Ok(())
 }
@@ -3798,6 +3820,51 @@ mod tests {
         let err = write_string_payload(&mut out, &arr, true).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
         assert!(err.msg().contains("out of range"), "{}", err.msg());
+    }
+
+    fn utf8_with_lying_null_count(
+        len: usize,
+        offsets: Vec<i32>,
+        values: &[u8],
+        validity: u8,
+        null_count: usize,
+    ) -> StringArray {
+        use arrow_buffer::Buffer;
+        use arrow_data::ArrayDataBuilder;
+        let data = unsafe {
+            ArrayDataBuilder::new(DataType::Utf8)
+                .len(len)
+                .null_count(null_count)
+                .null_bit_buffer(Some(Buffer::from_vec(vec![validity])))
+                .add_buffer(Buffer::from_vec(offsets))
+                .add_buffer(Buffer::from_vec(values.to_vec()))
+                .build_unchecked()
+        };
+        StringArray::from(data)
+    }
+
+    #[test]
+    fn varlen_null_count_over_reported_rejected_not_oob() {
+        // 1 valid empty-string row, but `null_count` claims 1 null. The offset
+        // table is sized for zero non-null rows while the live bitmap drives one
+        // emit — the back-patch would write past the table (OOB abort under
+        // `panic = "abort"`). The writer must reject it instead.
+        let arr = utf8_with_lying_null_count(1, vec![0i32, 0], b"", 0x01, 1);
+        let err = write_string_payload(&mut Vec::new(), &arr, true).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("more non-null rows"), "{}", err.msg());
+    }
+
+    #[test]
+    fn varlen_null_count_under_reported_rejected_not_corrupt() {
+        // 3 rows, rows 1 and 2 actually null (bitmap `0b001`), but `null_count`
+        // claims a single null. The table is over-sized for the emitted rows and
+        // the byte region would misalign — silent corruption. The post-loop
+        // reconciliation must reject it.
+        let arr = utf8_with_lying_null_count(3, vec![0i32, 1, 1, 1], b"a", 0x01, 1);
+        let err = write_string_payload(&mut Vec::new(), &arr, true).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("non-null rows"), "{}", err.msg());
     }
 
     fn arrow_schema_with(field: Field) -> Arc<ArrowSchema> {

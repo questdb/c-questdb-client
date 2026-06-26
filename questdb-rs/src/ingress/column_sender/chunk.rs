@@ -100,12 +100,14 @@ impl ImportedArrowColumn {
         }
         let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }
             .map_err(|err| error::fmt!(ArrowIngest, "from_ffi failed: {}", err))?;
-        // Structural validation only (buffer sizes, null counts) — the O(data)
-        // `validate_full` offset/UTF-8 scan is deliberately skipped. The encoder
-        // reads every varlen cell through bounds-checked accessors (no unchecked
-        // offset deref, no `from_utf8_unchecked`), so a malformed producer array
-        // surfaces as an `ArrowIngest` error at emit time, never an OOB read on
-        // the `panic = "abort"` FFI.
+        // Structural validation only (buffer sizes) — the O(data) `validate_full`
+        // offset/UTF-8/null-count scan is deliberately skipped. The encoder reads
+        // every varlen cell through bounds-checked accessors (no unchecked offset
+        // deref, no `from_utf8_unchecked`) and reconciles the declared
+        // `null_count` against the live validity bitmap while emitting, so a
+        // malformed producer array — including one whose `null_count` disagrees
+        // with its bitmap — surfaces as an `ArrowIngest` error at emit time,
+        // never an OOB read on the `panic = "abort"` FFI.
         array_data
             .validate()
             .map_err(|err| error::fmt!(ArrowIngest, "Arrow array validation failed: {}", err))?;

@@ -2641,6 +2641,14 @@ impl SenderBuilder {
         let mut qwp_ws = qwp_ws.clone();
         qwp_ws.apply_reconnect_implies_initial_retry();
         reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
+        if *qwp_ws.progress == QwpWsProgress::Manual
+            && *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async
+        {
+            return Err(error::fmt!(
+                ConfigError,
+                "initial_connect_retry=async requires QWP/WebSocket background progress; use qwp_ws_progress=background or initial_connect_retry=sync"
+            ));
+        }
 
         let use_tls = matches!(self.protocol, Protocol::QwpWss);
         Ok((use_tls, tls_settings, qwp_ws, auth_header))

@@ -425,19 +425,32 @@ impl crate::db::BorrowedColumnSender<'_> {
         crate::Error: From<T::Error>,
     {
         let table: crate::ingress::TableName<'t> = table.try_into()?;
-        let started = std::time::Instant::now();
-        let deadline = started.checked_add(self.reconnect_policy().max_duration());
+        let mut deadline =
+            std::time::Instant::now().checked_add(self.reconnect_policy().max_duration());
         // Batches confirmed by the last successful checkpoint; a transient
         // failure re-drives only the tail past this.
         let mut committed = 0usize;
 
         loop {
+            let committed_before = committed;
             match drive_from_checkpoint(self, table, df, options, &mut committed) {
                 Ok(()) => return Ok(()),
                 Err(err) if err.code() != crate::ErrorCode::FailoverRetry => return Err(err),
-                // Re-borrow onto a live primary (retrying the connect within the
-                // budget per the row API's backoff), then re-drive the tail.
-                Err(_) => self.reborrow_with_retry(deadline)?,
+                Err(err) => {
+                    // `reborrow_with_retry` returns as soon as a replacement
+                    // connection opens, so a server that accepts connections but
+                    // never advances acks would otherwise re-drive the tail
+                    // forever (unbounded duplicate writes). Bound the retries by
+                    // the reconnect budget, refreshed whenever a checkpoint makes
+                    // progress so a steadily-advancing ingest is never cut short.
+                    if committed > committed_before {
+                        deadline = std::time::Instant::now()
+                            .checked_add(self.reconnect_policy().max_duration());
+                    } else if crate::db::reconnect_deadline_expired(deadline) {
+                        return Err(err);
+                    }
+                    self.reborrow_with_retry(deadline)?;
+                }
             }
         }
     }

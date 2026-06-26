@@ -413,7 +413,14 @@ fn estimate_frame_size(
                 .saturating_add(bytes_len),
             ColumnKind::Symbol { .. } => row_count.saturating_mul(5),
             #[cfg(feature = "arrow-ingress")]
-            ColumnKind::ArrowDeferred { ref arr, .. } => arr.get_buffer_memory_size(),
+            // A deferred Arrow column resolved to symbols emits one varint per
+            // non-null row (up to 5 bytes), which `get_buffer_memory_size`
+            // undercounts for a dictionary/string key buffer. Add the symbol
+            // worst case so the up-front `try_reserve` stays an upper bound and
+            // per-column writes never fall back to an infallible realloc.
+            ColumnKind::ArrowDeferred { ref arr, .. } => arr
+                .get_buffer_memory_size()
+                .saturating_add(row_count.saturating_mul(5)),
             ColumnKind::NumpyDeferred { dtype, .. } => {
                 dtype.bytes_per_row().saturating_mul(row_count)
             }

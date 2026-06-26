@@ -1483,7 +1483,7 @@ fn reconnect_pick(inner: &Arc<DbInner>, deadline: Option<Instant>) -> Result<Col
     feature = "polars-egress",
     feature = "ffi-support"
 ))]
-fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
+pub(crate) fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
