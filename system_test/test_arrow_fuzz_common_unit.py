@@ -2,10 +2,26 @@ from __future__ import annotations
 
 import math
 import unittest
+import uuid
 
 import pyarrow as pa
 
 import arrow_fuzz_common as afc
+
+
+def _norm_cell(v):
+    """Normalise a scalar `as_py()` value to a representation-agnostic form.
+
+    The `arrow.uuid` kind is a plain `FixedSizeBinary(16)` carrying the
+    `ARROW:extension:name` field metadata. A source array surfaces it as
+    `bytes`, but once it crosses the Arrow C Data Interface pyarrow
+    recognises the canonical extension and materialises `uuid.UUID`. Both
+    encode the same 16 bytes, so collapse UUID to its big-endian bytes
+    before comparing values across an FFI round-trip.
+    """
+    if isinstance(v, uuid.UUID):
+        return v.bytes
+    return v
 
 
 class TestKindRegistryCompleteness(unittest.TestCase):
@@ -194,7 +210,8 @@ class TestSlicedRecordBatchOffsets(unittest.TestCase):
             name = sl.schema.field(c).name
             for r in range(length):
                 self.assertEqual(
-                    rt.column(c)[r].as_py(), sl.column(c)[r].as_py(),
+                    _norm_cell(rt.column(c)[r].as_py()),
+                    _norm_cell(sl.column(c)[r].as_py()),
                     f"FFI round-trip mismatch col={name} row={r}",
                 )
 
