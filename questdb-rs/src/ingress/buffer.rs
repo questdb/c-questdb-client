@@ -45,9 +45,13 @@ pub(crate) use self::qwp::QwpBuffer;
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use self::qwp::{
-    MAX_CONN_SYMBOL_DICT_SIZE, QwpWsColumnarBuffer, QwpWsEncodeScratch, QwpWsSymbolHasher,
-    SymbolGlobalDict,
+    MAX_CONN_SYMBOL_DICT_SIZE, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
 };
+// `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
+// `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
+// build without `arrow` would otherwise carry an unused import.
+#[cfg(feature = "arrow")]
+pub(crate) use self::qwp::QwpWsSymbolHasher;
 
 static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
