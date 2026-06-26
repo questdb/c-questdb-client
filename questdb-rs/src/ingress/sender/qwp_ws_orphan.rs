@@ -55,6 +55,8 @@ use super::qwp_ws_sfa_slot::SfaSlotQueue;
 
 pub(crate) const FAILED_SENTINEL_NAME: &str = ".failed";
 #[cfg(feature = "sync-sender-qwp-ws")]
+const LAST_ERROR_NAME: &str = ".last_error";
+#[cfg(feature = "sync-sender-qwp-ws")]
 const ORPHAN_IDLE_PARK: Duration = Duration::from_millis(50);
 #[cfg(feature = "sync-sender-qwp-ws")]
 const ORPHAN_POOL_GRACEFUL_DRAIN: Duration = Duration::from_millis(2500);
@@ -284,11 +286,14 @@ impl ManualOrphanDrainers {
                 true
             }
             OrphanOpenOutcome::AlreadyDrained
-            | OrphanOpenOutcome::FailedMarked
             | OrphanOpenOutcome::FailedSentinel
             | OrphanOpenOutcome::Locked
             | OrphanOpenOutcome::Stopped => true,
-            OrphanOpenOutcome::Failed(reason) => {
+            OrphanOpenOutcome::RetryLater(reason) => {
+                let _ = record_last_error(&slot_dir, &reason);
+                true
+            }
+            OrphanOpenOutcome::Unrecoverable(reason) => {
                 let _ = mark_failed(&slot_dir, &reason);
                 true
             }
@@ -307,13 +312,14 @@ impl ManualOrphanDrainers {
                 OrphanDriveOutcome::Idle => {}
                 OrphanDriveOutcome::Progress => return true,
                 OrphanDriveOutcome::Drained => {
-                    self.active.remove(index);
+                    let drainer = self.active.remove(index);
+                    drainer.clear_last_error();
                     self.normalize_next_active();
                     return true;
                 }
-                OrphanDriveOutcome::Failed(reason) => {
+                OrphanDriveOutcome::RetryLater(reason) => {
                     let drainer = self.active.remove(index);
-                    drainer.mark_failed(&reason);
+                    drainer.record_last_error(&reason);
                     self.normalize_next_active();
                     return true;
                 }
@@ -343,11 +349,11 @@ struct OrphanDrainer {
 enum OrphanOpenOutcome {
     Drainer(Box<OrphanDrainer>),
     AlreadyDrained,
-    FailedMarked,
     FailedSentinel,
     Locked,
+    RetryLater(String),
     Stopped,
-    Failed(String),
+    Unrecoverable(String),
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -356,7 +362,7 @@ enum OrphanDriveOutcome {
     Progress,
     Drained,
     Stopped,
-    Failed(String),
+    RetryLater(String),
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -386,12 +392,15 @@ impl OrphanDrainer {
         }
         let options = match config.queue_options(slot_dir.clone()) {
             Ok(options) => options,
-            Err(err) => return OrphanOpenOutcome::Failed(err),
+            Err(err) => return OrphanOpenOutcome::RetryLater(err),
         };
         let mut queue = match SfaSlotQueue::open_replay_only_existing(options) {
             Ok(queue) => queue,
             Err(SfaQueueError::SlotInUse { .. }) => return OrphanOpenOutcome::Locked,
-            Err(err) => return OrphanOpenOutcome::Failed(format!("{err:?}")),
+            Err(err @ SfaQueueError::CorruptSegments { .. }) => {
+                return OrphanOpenOutcome::Unrecoverable(format!("{err:?}"));
+            }
+            Err(err) => return OrphanOpenOutcome::RetryLater(format!("{err:?}")),
         };
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
@@ -402,8 +411,9 @@ impl OrphanDrainer {
         if orphan_queue_drained(&queue) {
             if let Err(err) = queue.close() {
                 let reason = format!("{err:?}");
-                return mark_open_failed(&slot_dir, &reason, stop);
+                return retry_open_later(reason, stop);
             }
+            let _ = clear_last_error(&slot_dir);
             return OrphanOpenOutcome::AlreadyDrained;
         }
         let transport = match BlockingQwpWsTransport::connect(
@@ -416,10 +426,7 @@ impl OrphanDrainer {
             Arc::new(AtomicUsize::new(0)),
         ) {
             Ok(transport) => transport,
-            Err(err) => {
-                let reason = err.to_string();
-                return mark_open_failed(&slot_dir, &reason, stop);
-            }
+            Err(err) => return retry_open_later(err.to_string(), stop),
         };
         if orphan_stop_requested(stop) {
             return OrphanOpenOutcome::Stopped;
@@ -448,7 +455,9 @@ impl OrphanDrainer {
     fn drive_once(&mut self) -> OrphanDriveOutcome {
         match self.send_core.close_drain_ready_step(&mut self.store) {
             Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => OrphanDriveOutcome::Failed(self.terminal_message()),
+            Ok(CloseStepOutcome::Terminal) => {
+                OrphanDriveOutcome::RetryLater(self.terminal_message())
+            }
             Ok(CloseStepOutcome::Waiting {
                 sleep_for,
                 deadline,
@@ -458,7 +467,7 @@ impl OrphanDrainer {
             }
             Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
             Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
-            Err(err) => OrphanDriveOutcome::Failed(driver_error_message(err)),
+            Err(err) => OrphanDriveOutcome::RetryLater(driver_error_message(err)),
         }
     }
 
@@ -468,7 +477,9 @@ impl OrphanDrainer {
         }
         match self.send_core.close_drain_ready_step(&mut self.store) {
             Ok(CloseStepOutcome::Drained) => OrphanDriveOutcome::Drained,
-            Ok(CloseStepOutcome::Terminal) => OrphanDriveOutcome::Failed(self.terminal_message()),
+            Ok(CloseStepOutcome::Terminal) => {
+                OrphanDriveOutcome::RetryLater(self.terminal_message())
+            }
             Ok(CloseStepOutcome::Waiting {
                 sleep_for,
                 deadline,
@@ -483,18 +494,16 @@ impl OrphanDrainer {
             }
             Ok(CloseStepOutcome::Progress) => OrphanDriveOutcome::Progress,
             Ok(CloseStepOutcome::Idle) => OrphanDriveOutcome::Idle,
-            Err(err) => OrphanDriveOutcome::Failed(driver_error_message(err)),
+            Err(err) => OrphanDriveOutcome::RetryLater(driver_error_message(err)),
         }
     }
 
-    fn mark_failed(&self, reason: &str) {
-        let _ = mark_failed(&self.slot_dir, reason);
+    fn record_last_error(&self, reason: &str) {
+        let _ = record_last_error(&self.slot_dir, reason);
     }
 
-    fn mark_failed_unless_stopped(&self, reason: &str, stop: &AtomicBool) {
-        if !stop.load(Ordering::Acquire) {
-            self.mark_failed(reason);
-        }
+    fn clear_last_error(&self) {
+        let _ = clear_last_error(&self.slot_dir);
     }
 
     fn terminal_message(&self) -> String {
@@ -554,20 +563,28 @@ fn drain_orphan_to_completion(slot_dir: PathBuf, config: &OrphanDrainerConfig, s
     let mut drainer = match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop) {
         OrphanOpenOutcome::Drainer(drainer) => drainer,
         OrphanOpenOutcome::AlreadyDrained
-        | OrphanOpenOutcome::FailedMarked
         | OrphanOpenOutcome::FailedSentinel
         | OrphanOpenOutcome::Locked
         | OrphanOpenOutcome::Stopped => return,
-        OrphanOpenOutcome::Failed(reason) => {
+        OrphanOpenOutcome::RetryLater(reason) => {
+            record_last_error_unless_stopped(&slot_dir, &reason, stop);
+            return;
+        }
+        OrphanOpenOutcome::Unrecoverable(reason) => {
             mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
             return;
         }
     };
     while !stop.load(Ordering::Acquire) {
         match drainer.drive_once_with_stop(stop) {
-            OrphanDriveOutcome::Drained => return,
-            OrphanDriveOutcome::Failed(reason) => {
-                drainer.mark_failed_unless_stopped(&reason, stop);
+            OrphanDriveOutcome::Drained => {
+                drainer.clear_last_error();
+                return;
+            }
+            OrphanDriveOutcome::RetryLater(reason) => {
+                if !stop.load(Ordering::Acquire) {
+                    drainer.record_last_error(&reason);
+                }
                 return;
             }
             OrphanDriveOutcome::Stopped => return,
@@ -590,12 +607,32 @@ fn mark_orphan_failed_unless_stopped(slot_dir: &Path, reason: &str, stop: &Atomi
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-fn mark_open_failed(slot_dir: &Path, reason: &str, stop: Option<&AtomicBool>) -> OrphanOpenOutcome {
+fn record_last_error(slot_dir: &Path, reason: &str) -> io::Result<()> {
+    fs::write(slot_dir.join(LAST_ERROR_NAME), reason)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn clear_last_error(slot_dir: &Path) -> io::Result<()> {
+    match fs::remove_file(slot_dir.join(LAST_ERROR_NAME)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn record_last_error_unless_stopped(slot_dir: &Path, reason: &str, stop: &AtomicBool) {
+    if !stop.load(Ordering::Acquire) {
+        let _ = record_last_error(slot_dir, reason);
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn retry_open_later(reason: String, stop: Option<&AtomicBool>) -> OrphanOpenOutcome {
     if orphan_stop_requested(stop) {
         OrphanOpenOutcome::Stopped
     } else {
-        let _ = mark_failed(slot_dir, reason);
-        OrphanOpenOutcome::FailedMarked
+        OrphanOpenOutcome::RetryLater(reason)
     }
 }
 
@@ -630,6 +667,8 @@ mod tests {
     use crate::ingress::sender::qwp_ws_sfa_segment::initial_segment_path;
     #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
     use crate::ingress::sender::qwp_ws_sfa_slot::SfaSlotOptions;
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    use std::net::TcpListener;
 
     #[test]
     fn scan_returns_no_orphans_for_missing_root() {
@@ -831,6 +870,39 @@ mod tests {
         assert!(drainers.drive_once());
         assert!(!has_failed_sentinel(&slot_dir));
         assert!(!drainers.drive_once());
+    }
+
+    #[cfg(all(feature = "sync-sender-qwp-ws", any(unix, windows)))]
+    #[test]
+    fn manual_drainer_does_not_poison_orphan_after_connect_failure() {
+        let temp = TempDir::new().unwrap();
+        let sf_dir = temp.path().join("sf-root");
+        let slot_dir = sf_dir.join("orphan");
+        {
+            let mut queue = SfaSlotQueue::open(slot_options(&sf_dir, "orphan")).unwrap();
+            PublicationLog::try_publish(&mut queue, b"orphaned frame").unwrap();
+            queue.close().unwrap();
+        }
+        assert_eq!(
+            scan_orphan_slots(&sf_dir, "primary"),
+            vec![slot_dir.clone()]
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut config = test_config();
+        config.port = port.to_string();
+        let mut drainers = ManualOrphanDrainers::new(vec![slot_dir.clone()], 1, config).unwrap();
+
+        assert!(drainers.drive_once());
+
+        assert!(
+            !has_failed_sentinel(&slot_dir),
+            "transient connect failure must leave orphan slot recoverable"
+        );
+        assert!(slot_dir.join(LAST_ERROR_NAME).exists());
+        assert_eq!(scan_orphan_slots(&sf_dir, "primary"), vec![slot_dir]);
     }
 
     #[cfg(all(feature = "sync-sender-qwp-ws", unix))]

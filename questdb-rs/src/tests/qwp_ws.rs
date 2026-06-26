@@ -915,6 +915,27 @@ fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
     (port, rx)
 }
 
+fn spawn_manual_orphan_reject_server(status: u8) -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        write_qwp_error_response(&mut orphan, status, FIRST_WIRE_SEQUENCE, b"bad orphan").unwrap();
+        tx.send(payload).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
 fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>)
 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2093,6 +2114,48 @@ fn qwp_ws_manual_orphan_drainer_role_reject_tries_next_endpoint() {
     );
     assert_eq!(reject_handle.join().unwrap(), 2);
     assert!(!sf_dir.path().join("orphan").join(".failed").exists());
+}
+
+#[test]
+fn qwp_ws_manual_orphan_drainer_terminal_reject_leaves_slot_recoverable() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    seed_orphan_slot(sf_dir.path());
+
+    let (port, rx) = spawn_manual_orphan_reject_server(QWP_STATUS_PARSE_ERROR);
+    let drain_conf = format!(
+        "qwpws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let orphan_slot = sf_dir.path().join("orphan");
+    let mut orphan_payload = None;
+    for _ in 0..20 {
+        let _ = sender.drive_once().unwrap();
+        if orphan_payload.is_none()
+            && let Ok(payload) = rx.try_recv()
+        {
+            orphan_payload = Some(payload);
+        }
+        if orphan_payload.is_some() && orphan_slot.join(".last_error").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        !orphan_payload
+            .expect("orphan payload was not replayed")
+            .is_empty()
+    );
+    assert!(!orphan_slot.join(".failed").exists());
+    assert!(orphan_slot.join(".last_error").exists());
+    assert!(slot_has_sfa_file(&orphan_slot));
 }
 
 #[test]
