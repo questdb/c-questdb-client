@@ -6820,7 +6820,10 @@ fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn cell_value_is_null(value: ValueRef) -> bool {
-    matches!(value, ValueRef::DecimalNull)
+    matches!(
+        value,
+        ValueRef::DecimalNull | ValueRef::Decimal64Null | ValueRef::Decimal128Null
+    )
 }
 
 fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
@@ -11642,6 +11645,43 @@ mod tests {
             })
             .collect();
         assert_eq!(strs, vec!["0.00", "1.25", "-1.25", "92233720368547.75"]);
+    }
+
+    #[test]
+    fn qwp_column_dec64_nan_roundtrip_preserves_following_column() {
+        let mut buf = crate::ingress::Buffer::new_qwp();
+        buf.table("trades")
+            .unwrap()
+            .column_dec64("price", "NaN")
+            .unwrap()
+            .column_i64("qty", 10)
+            .unwrap();
+        buf.at_now().unwrap();
+        buf.table("trades")
+            .unwrap()
+            .column_dec64("price", "1.25")
+            .unwrap()
+            .column_i64("qty", 20)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let datagrams = buf.as_qwp().unwrap().encode_datagrams(64 * 1024).unwrap();
+        assert_eq!(datagrams.len(), 1);
+
+        let decoded = decode_datagram(&datagrams[0])
+            .expect("DECIMAL64 NaN followed by another column must produce a valid datagram");
+        let table = first_table(&decoded);
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_DECIMAL64);
+        assert!(table.columns[0].nullable);
+        assert_eq!(table.rows[0][0], DecodedValue::Null);
+        match &table.rows[1][0] {
+            DecodedValue::Decimal { scale, unscaled_be } => {
+                assert_eq!(decimal_to_string(*scale, unscaled_be), "1.25");
+            }
+            other => panic!("unexpected DECIMAL64 value {:?}", other),
+        }
+        assert_eq!(table.rows[0][1], DecodedValue::I64(10));
+        assert_eq!(table.rows[1][1], DecodedValue::I64(20));
     }
 
     #[test]
