@@ -2240,9 +2240,7 @@ impl QwpSendScratch {
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
-struct QwpWsMarker {
-    snapshot_idx: u32,
-}
+struct QwpWsMarker;
 
 #[cfg(feature = "_sender-qwp-ws")]
 type QwpWsSymbolHashMap<V> =
@@ -2623,7 +2621,7 @@ pub(crate) struct QwpWsColumnarBuffer {
     state: BufferState,
     bookmark_meta: BufferBookmarkMeta,
     bookmark: StoredBookmark<QwpWsMarker>,
-    snapshots: Vec<QwpWsSnapshot>,
+    snapshot: Option<QwpWsSnapshot>,
     max_name_len: usize,
 }
 
@@ -2640,7 +2638,7 @@ impl Clone for QwpWsColumnarBuffer {
             // bookmarks from the source buffer fail on the clone.
             bookmark_meta: BufferBookmarkMeta::new(),
             bookmark: self.bookmark,
-            snapshots: self.snapshots.clone(),
+            snapshot: self.snapshot.clone(),
             max_name_len: self.max_name_len,
         }
     }
@@ -2656,7 +2654,7 @@ impl QwpWsColumnarBuffer {
             state: BufferState::new(),
             bookmark_meta: BufferBookmarkMeta::new(),
             bookmark: StoredBookmark::new(),
-            snapshots: Vec::new(),
+            snapshot: None,
             max_name_len,
         }
     }
@@ -2752,8 +2750,12 @@ impl QwpWsColumnarBuffer {
     }
 
     pub(crate) fn clear_bookmark(&mut self, bookmark: Bookmark) {
-        self.bookmark
-            .clear_if_matches(self.bookmark_meta.origin(), bookmark);
+        if self
+            .bookmark
+            .clear_if_matches(self.bookmark_meta.origin(), bookmark)
+        {
+            self.snapshot = None;
+        }
     }
 
     pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
@@ -2766,6 +2768,7 @@ impl QwpWsColumnarBuffer {
 
     pub(crate) fn clear_marker(&mut self) {
         self.bookmark.clear();
+        self.snapshot = None;
     }
 
     pub(crate) fn clear(&mut self) {
@@ -2775,24 +2778,23 @@ impl QwpWsColumnarBuffer {
         self.current_table_idx = None;
         self.state = BufferState::new();
         self.bookmark.clear();
+        self.snapshot = None;
     }
 
     fn capture_snapshot(&mut self) -> crate::Result<QwpWsMarker> {
-        let snapshot_idx = checked_qwp_push_index(self.snapshots.len(), "QWP/WS snapshot count")?;
-        self.snapshots.push(QwpWsSnapshot {
+        self.snapshot = Some(QwpWsSnapshot {
             tables: self.tables.clone(),
             table_lookup: self.table_lookup.clone(),
             current_table_idx: self.current_table_idx,
             state: self.state,
         });
-        Ok(QwpWsMarker { snapshot_idx })
+        Ok(QwpWsMarker)
     }
 
-    fn restore_snapshot(&mut self, marker: QwpWsMarker) -> crate::Result<()> {
+    fn restore_snapshot(&mut self, _marker: QwpWsMarker) -> crate::Result<()> {
         let snapshot = self
-            .snapshots
-            .get(marker.snapshot_idx as usize)
-            .cloned()
+            .snapshot
+            .take()
             .ok_or_else(|| error::fmt!(InvalidApiCall, "Can't rewind to stale QWP/WS marker."))?;
         self.tables = snapshot.tables;
         self.table_lookup = snapshot.table_lookup;
@@ -9233,6 +9235,102 @@ mod tests {
             entries,
             vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
             "a frame referencing id 2 must carry the dense 0..=2 prefix"
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_replacing_rewind_point_drops_previous_snapshot() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.set_marker().unwrap();
+        assert!(buf.snapshot.is_some());
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.set_marker().unwrap();
+        assert!(
+            buf.snapshot.is_some(),
+            "capturing a new rewind point must keep exactly one active QWP/WS snapshot"
+        );
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "SOL-USD")
+            .unwrap()
+            .column_i64("qty", 3)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(
+            buf.row_count(),
+            2,
+            "rewind must restore the replacement marker, not the older snapshot"
+        );
+        assert!(
+            buf.snapshot.is_none(),
+            "successful rewind must release the consumed QWP/WS snapshot"
+        );
+
+        buf.set_marker().unwrap();
+        assert!(buf.snapshot.is_some());
+        buf.clear_marker();
+        assert!(
+            buf.snapshot.is_none(),
+            "clearing the rewind point must release the QWP/WS snapshot"
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_clear_bookmark_drops_only_current_snapshot() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let stale = buf.bookmark().unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let current = buf.bookmark().unwrap();
+
+        buf.clear_bookmark(stale);
+        assert!(
+            buf.snapshot.is_some(),
+            "clearing a stale bookmark must not release the current QWP/WS snapshot"
+        );
+
+        buf.clear_bookmark(current);
+        assert!(
+            buf.snapshot.is_none(),
+            "clearing the current bookmark must release the QWP/WS snapshot"
         );
     }
 

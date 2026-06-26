@@ -158,9 +158,9 @@ impl<S: Copy> StoredBookmark<S> {
         }
     }
 
-    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) {
+    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) -> bool {
         if bookmark.origin() == 0 {
-            return;
+            return false;
         }
         if bookmark.origin() != origin {
             // `clear_bookmark()` is intentionally a no-op in release builds so
@@ -171,11 +171,13 @@ impl<S: Copy> StoredBookmark<S> {
                 origin,
                 "attempted to clear a bookmark from a different buffer"
             );
-            return;
+            return false;
         }
         if self.state.is_some() && self.generation == bookmark.generation() {
             self.state = None;
+            return true;
         }
+        false
     }
 
     pub(super) fn clear(&mut self) {
