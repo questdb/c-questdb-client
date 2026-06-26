@@ -4366,10 +4366,20 @@ impl QwpWsColumnValues {
                 lookup.clear();
                 data.clear();
             }
-            Self::Decimal { cells, .. }
-            | Self::Decimal64 { cells, .. }
-            | Self::Decimal128 { cells, .. } => {
+            Self::Decimal {
+                cells,
+                decimal_scale,
+            }
+            | Self::Decimal64 {
+                cells,
+                decimal_scale,
+            }
+            | Self::Decimal128 {
+                cells,
+                decimal_scale,
+            } => {
                 cells.clear();
+                *decimal_scale = QWP_DECIMAL_SCALE_UNSET;
             }
         }
     }
@@ -4494,15 +4504,11 @@ impl QwpWsColumnValues {
                     return false;
                 };
                 if cell.value.is_some() {
-                    if cells.is_empty() {
-                        *decimal_scale = 0;
-                    } else {
-                        *decimal_scale = cells
-                            .iter()
-                            .filter_map(|cell| cell.value.map(|value| value.scale))
-                            .max()
-                            .unwrap_or(0);
-                    }
+                    *decimal_scale = cells
+                        .iter()
+                        .filter_map(|cell| cell.value.map(|value| value.scale))
+                        .max()
+                        .unwrap_or(QWP_DECIMAL_SCALE_UNSET);
                     true
                 } else {
                     false
@@ -9332,6 +9338,65 @@ mod tests {
             buf.snapshot.is_none(),
             "clearing the current bookmark must release the QWP/WS snapshot"
         );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_clear_resets_decimal_scale_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.2")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        buf.clear();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.23")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("clear() must let the next batch repin the decimal scale");
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rollback_last_decimal_resets_scale_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "NaN")
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.2")
+            .unwrap();
+        let err = buf.column_i64("price", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.23")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("rollback must let the next value repin the decimal scale");
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
