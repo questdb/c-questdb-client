@@ -42,9 +42,11 @@
  *    particular sender; chunks can be built on any thread and flushed
  *    through any sender borrowed from the same `questdb_db`. A single
  *    handle (chunk, conn) must not be used from more than one thread at
- *    a time — concurrent calls on the same handle are detected via a
+ *    a time: the caller must establish a happens-before ordering between
+ *    calls on it. An *ordered* concurrent call is detected via a
  *    CAS-checked in-use latch and rejected with
- *    `line_sender_error_invalid_api_call`.
+ *    `line_sender_error_invalid_api_call`; a truly unordered call (or a
+ *    free racing a call) is undefined behaviour.
  */
 
 #pragma once

@@ -4121,6 +4121,10 @@ unsafe fn validate_arrow_schema_depth(
             }
             validate_format_str(s)?;
             validate_name_str(s)?;
+            // Bounds the metadata entry *count* (a tiny header could otherwise
+            // drive a huge `HashMap::with_capacity` in `metadata()`). Per-entry
+            // key/value lengths are intentionally left to the producer-trust
+            // contract, like the producer-declared buffer byte-lengths.
             let metadata = (*s).metadata;
             if !metadata.is_null() {
                 let header = std::slice::from_raw_parts(metadata as *const u8, 4);
@@ -4215,28 +4219,42 @@ fn arrow_min_n_buffers(dt: &arrow::datatypes::DataType) -> i64 {
 //     FixedSizeBinary(w)  -> w as usize * 8
 //     FixedSizeList(_, n) -> child_bits * (n as usize)
 //
-// A negative `w`/`n` casts to a near-`usize::MAX` factor and overflows the
-// product. Under `panic = "abort"` + overflow-checks (dev/test) that aborts
-// the host before `validate_full` runs; in release it wraps to a bogus
-// buffer length. These two arms are the *only* places `bit_width` casts a
-// schema-controlled signed integer to `usize` (every other arm uses a
-// constant width or `primitive_width()`), so guarding both closes the whole
-// class. The caller runs this at every schema node, so a negative size
-// nested inside a container is rejected when the walk reaches that node,
-// always before `from_ffi` is invoked. Keep in sync with `bit_width` on
-// arrow upgrades.
+// A negative size casts to a near-`usize::MAX` factor; a *positive* size nested
+// inside another FixedSize* overflows the cumulative product (e.g. two nested
+// `FixedSizeList(2^31)` over an Int64 leaf is 2^68). Under `panic = "abort"` +
+// overflow-checks (dev/test) either aborts the host before `validate_full`
+// runs; in release it wraps to a bogus buffer length. Recompute the cumulative
+// bit-width with checked i64 arithmetic — using the widest fixed-width leaf
+// (256 bits) as an upper bound — and reject anything that overflows. The caller
+// runs this at every schema node, always before `from_ffi`. Keep in sync with
+// `bit_width` on arrow upgrades.
 #[cfg(feature = "arrow")]
 fn reject_overflowing_fixed_size(dt: &arrow::datatypes::DataType) -> questdb::Result<()> {
     use arrow::datatypes::DataType;
-    match dt {
-        DataType::FixedSizeBinary(width) if *width < 0 => Err(arrow_ingest_err(format!(
-            "Arrow FixedSizeBinary width {width} is negative"
-        ))),
-        DataType::FixedSizeList(_, size) if *size < 0 => Err(arrow_ingest_err(format!(
-            "Arrow FixedSizeList size {size} is negative"
-        ))),
-        _ => Ok(()),
+    fn cumulative_bit_width_upper(dt: &DataType) -> questdb::Result<i64> {
+        match dt {
+            DataType::FixedSizeBinary(width) => {
+                if *width < 0 {
+                    return Err(arrow_ingest_err(format!(
+                        "Arrow FixedSizeBinary width {width} is negative"
+                    )));
+                }
+                (*width as i64).checked_mul(8)
+            }
+            DataType::FixedSizeList(field, size) => {
+                if *size < 0 {
+                    return Err(arrow_ingest_err(format!(
+                        "Arrow FixedSizeList size {size} is negative"
+                    )));
+                }
+                cumulative_bit_width_upper(field.data_type())?.checked_mul(*size as i64)
+            }
+            _ => Some(256),
+        }
+        .ok_or_else(|| arrow_ingest_err("Arrow FixedSize element bit-width overflows".to_string()))
     }
+    cumulative_bit_width_upper(dt)?;
+    Ok(())
 }
 
 // Cross-walk schema + array in lockstep. arrow-rs's `from_ffi` asserts on

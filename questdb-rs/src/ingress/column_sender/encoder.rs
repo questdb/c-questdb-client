@@ -418,9 +418,15 @@ fn estimate_frame_size(
                 dtype.bytes_per_row().saturating_mul(row_count)
             }
         };
+        // Per-column metadata slack covering fixed prefix bytes some encoders
+        // emit beyond null_flag + payload (e.g. the decimal scale / geohash
+        // bits byte on numpy decimal/geohash columns). Keeps the up-front
+        // `try_reserve` an upper bound so per-column writes never fall back to
+        // an infallible (process-aborting) realloc.
         total = total
             .saturating_add(null_overhead)
-            .saturating_add(payload_size);
+            .saturating_add(payload_size)
+            .saturating_add(8);
     }
     total = total
         .saturating_add(1)
@@ -729,28 +735,34 @@ unsafe fn encode_sentinel_le<T, const N: usize>(
 {
     out.push(0); // null_flag = 0x00 (sentinel encoding)
     out.reserve(N * row_count);
-    match validity {
-        None => {
-            if cfg!(target_endian = "little") {
-                let bytes = unsafe { slice::from_raw_parts(data as *const u8, row_count * N) };
-                out.extend_from_slice(bytes);
-            } else {
-                for i in 0..row_count {
-                    let value = unsafe { *data.add(i) };
-                    out.extend_from_slice(&to_le(value));
-                }
-            }
+    let data_start = out.len();
+    if cfg!(target_endian = "little") {
+        let bytes = unsafe { slice::from_raw_parts(data as *const u8, row_count * N) };
+        out.extend_from_slice(bytes);
+    } else {
+        for i in 0..row_count {
+            out.extend_from_slice(&to_le(unsafe { *data.add(i) }));
         }
-        Some(v) => {
-            for i in 0..row_count {
-                let value = if unsafe { v.is_valid(i) } {
-                    unsafe { *data.add(i) }
-                } else {
-                    null_value
-                };
-                out.extend_from_slice(&to_le(value));
-            }
+    }
+    // memcpy the whole slab above, then overwrite only the null slots with the
+    // sentinel — skipping all-valid (0xFF) bitmap bytes 8 rows at a time.
+    let Some(v) = validity.filter(|v| v.has_nulls()) else {
+        return;
+    };
+    let null_le = to_le(null_value);
+    let mut i = 0usize;
+    while i < row_count {
+        let byte_idx = i / 8;
+        let bit_off = i % 8;
+        if bit_off == 0 && i + 8 <= row_count && unsafe { *v.bits.add(byte_idx) } == 0xFF {
+            i += 8;
+            continue;
         }
+        if !unsafe { v.is_valid(i) } {
+            let off = data_start + i * N;
+            out[off..off + N].copy_from_slice(&null_le);
+        }
+        i += 1;
     }
 }
 

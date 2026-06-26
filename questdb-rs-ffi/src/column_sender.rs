@@ -436,6 +436,21 @@ unsafe fn typed_offsets_slice<'a, T>(
     unsafe { typed_slice_bounded(data, len, max, "MAX_CHUNK_ROWS+1", err_out, what) }
 }
 
+/// Offsets length bound for a symbol/categorical dictionary, whose entry count
+/// is independent of the chunk row count (a `Categorical` can have many more
+/// distinct values than rows). Bounded by the symbol-dictionary ceiling, not
+/// `MAX_CHUNK_ROWS`.
+unsafe fn typed_dict_offsets_slice<'a, T>(
+    data: *const T,
+    len: size_t,
+    err_out: *mut *mut line_sender_error,
+    what: &'static str,
+) -> Option<&'a [T]> {
+    use questdb::ingress::column_sender::MAX_SYMBOL_DICT_ENTRIES;
+    let max = MAX_SYMBOL_DICT_ENTRIES + 1;
+    unsafe { typed_slice_bounded(data, len, max, "MAX_SYMBOL_DICT_ENTRIES+1", err_out, what) }
+}
+
 unsafe fn typed_bytes_slice<'a>(
     data: *const u8,
     len: size_t,
@@ -1365,7 +1380,7 @@ macro_rules! symbol_fn {
                 None => return false,
             };
             let dict_offsets = match unsafe {
-                typed_offsets_slice(
+                typed_dict_offsets_slice(
                     dict_offsets,
                     dict_offsets_len,
                     err_out,

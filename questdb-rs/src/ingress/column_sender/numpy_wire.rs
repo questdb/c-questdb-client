@@ -224,7 +224,9 @@ impl NumpyDtype {
             D::GeohashI64 { .. } => 8,
             D::F64Ndarray { ndim, shape } => {
                 // Per-row: ndim u8 + (dim u32) × ndim + (value f64) × prod(dims).
-                let nd = *ndim as usize;
+                // `nd` is clamped so an unvalidated out-of-range ndim can't
+                // index past the fixed-size `shape`; `validate` rejects it.
+                let nd = (*ndim as usize).min(shape.len());
                 let mut leaf: usize = 1;
                 for &d in &shape[..nd] {
                     leaf = leaf.saturating_mul(d as usize);
@@ -369,6 +371,14 @@ impl NumpyDtype {
             D::Long256Direct | D::Decimal256 { .. } => 32,
             D::F64Ndarray { ndim, shape } => {
                 let nd = *ndim as usize;
+                if nd == 0 || nd > MAX_ARRAY_DIMS {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "F64Ndarray ndim must be in 1..={}, got {}",
+                        MAX_ARRAY_DIMS,
+                        nd
+                    ));
+                }
                 let leaf: usize = shape[..nd]
                     .iter()
                     .copied()
@@ -625,30 +635,35 @@ unsafe fn emit_sentinel_le<T, const N: usize>(
     out.push(0);
     out.reserve(N * row_count);
     let typed = data as *const T;
-    match validity {
-        None => {
-            if cfg!(target_endian = "little") {
-                if row_count > 0 {
-                    let bytes = unsafe { slice::from_raw_parts(data, row_count * N) };
-                    out.extend_from_slice(bytes);
-                }
-            } else {
-                for i in 0..row_count {
-                    let value = unsafe { typed.add(i).read_unaligned() };
-                    out.extend_from_slice(&to_le(value));
-                }
-            }
+    let data_start = out.len();
+    if cfg!(target_endian = "little") {
+        if row_count > 0 {
+            let bytes = unsafe { slice::from_raw_parts(data, row_count * N) };
+            out.extend_from_slice(bytes);
         }
-        Some(v) => {
-            for i in 0..row_count {
-                if unsafe { v.is_valid(i) } {
-                    let value = unsafe { typed.add(i).read_unaligned() };
-                    out.extend_from_slice(&to_le(value));
-                } else {
-                    out.extend_from_slice(&sentinel);
-                }
-            }
+    } else {
+        for i in 0..row_count {
+            out.extend_from_slice(&to_le(unsafe { typed.add(i).read_unaligned() }));
         }
+    }
+    // memcpy the whole slab above, then overwrite only the null slots with the
+    // sentinel — skipping all-valid (0xFF) bitmap bytes 8 rows at a time.
+    let Some(v) = validity.filter(|v| v.has_nulls()) else {
+        return;
+    };
+    let mut i = 0usize;
+    while i < row_count {
+        let byte_idx = i / 8;
+        let bit_off = i % 8;
+        if bit_off == 0 && i + 8 <= row_count && unsafe { *v.bits.add(byte_idx) } == 0xFF {
+            i += 8;
+            continue;
+        }
+        if !unsafe { v.is_valid(i) } {
+            let off = data_start + i * N;
+            out[off..off + N].copy_from_slice(&sentinel);
+        }
+        i += 1;
     }
 }
 

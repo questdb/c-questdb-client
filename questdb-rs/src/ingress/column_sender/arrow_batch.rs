@@ -50,7 +50,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode};
-use crate::ingress::buffer::SymbolGlobalDict;
+use crate::ingress::buffer::{QwpWsSymbolHasher, SymbolGlobalDict};
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, fmt};
 
@@ -125,21 +125,62 @@ pub(crate) fn apply_overrides(
     }
 
     for ov in overrides {
-        if !schema.fields().iter().any(|f| f.name() == ov.column()) {
+        let Some(field) = schema.fields().iter().find(|f| f.name() == ov.column()) else {
             return Err(fmt!(
                 ArrowIngest,
                 "override targets unknown column '{}'",
                 ov.column()
             ));
-        }
-        if let ArrowColumnOverride::Geohash { bits, column } = *ov
-            && (bits == 0 || bits > 60)
-        {
+        };
+        // Reject an override whose target wire type `classify` will not honour
+        // on this column's Arrow type, instead of silently dropping it and
+        // shipping the column under its default mapping.
+        let dt = field.data_type();
+        let (kind, applicable) = match ov {
+            ArrowColumnOverride::Symbol { .. } | ArrowColumnOverride::NotSymbol { .. } => {
+                let kind = if matches!(ov, ArrowColumnOverride::Symbol { .. }) {
+                    "symbol"
+                } else {
+                    "not_symbol"
+                };
+                (
+                    kind,
+                    matches!(
+                        dt,
+                        DataType::Utf8
+                            | DataType::LargeUtf8
+                            | DataType::Utf8View
+                            | DataType::Dictionary(_, _)
+                    ),
+                )
+            }
+            ArrowColumnOverride::Ipv4 { .. } => ("ipv4", matches!(dt, DataType::UInt32)),
+            ArrowColumnOverride::Char { .. } => ("char", matches!(dt, DataType::UInt16)),
+            ArrowColumnOverride::Geohash { bits, .. } => {
+                if *bits == 0 || *bits > 60 {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "override for column '{}' has invalid geohash bits {} (must be 1..=60)",
+                        ov.column(),
+                        bits
+                    ));
+                }
+                (
+                    "geohash",
+                    matches!(
+                        dt,
+                        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                    ),
+                )
+            }
+        };
+        if !applicable {
             return Err(fmt!(
                 ArrowIngest,
-                "override for column '{}' has invalid geohash bits {} (must be 1..=60)",
-                column,
-                bits
+                "override '{}' is not applicable to column '{}' of Arrow type {:?}",
+                kind,
+                ov.column(),
+                dt
             ));
         }
     }
@@ -1094,7 +1135,7 @@ fn write_varlen_u32_offsets_no_null(
         out.extend_from_slice(bytes);
     } else {
         for &off in &arr_offsets[..row_count + 1] {
-            let normalized = (off - base) as u32;
+            let normalized = off.wrapping_sub(base) as u32;
             out.extend_from_slice(&normalized.to_le_bytes());
         }
     }
@@ -1396,7 +1437,7 @@ fn write_varlen_large_offsets_no_null(
     })?;
     try_reserve_bytes(out, offsets_bytes + used, "VARCHAR column")?;
     for &off in &arr_offsets[..row_count + 1] {
-        let normalized = u32::try_from(off - base).map_err(|_| {
+        let normalized = u32::try_from(off.wrapping_sub(base)).map_err(|_| {
             fmt!(
                 ArrowIngest,
                 "VARCHAR column: cumulative offset exceeds u32::MAX at row >={}",
@@ -2379,13 +2420,14 @@ fn resolve_symbol_strings<S: VarlenSource>(
     new_symbols: &mut Vec<Vec<u8>>,
 ) -> Result<ArrowResolvedSymbolColumn> {
     use std::collections::HashMap;
+    use std::hash::BuildHasherDefault;
     let row_count = arr.len();
     let non_null = non_null_count(arr, "SYMBOL column")?;
     let mut gids = Vec::with_capacity(non_null);
     // Dedup within the column so the global dict is hit once per distinct
     // value rather than once per row — matching the dictionary path and the
-    // row API's bulk-intern.
-    let mut seen: HashMap<&[u8], u64> = HashMap::new();
+    // row API's bulk-intern. Uses the dict's fast non-DoS hasher, not SipHash.
+    let mut seen: HashMap<&[u8], u64, BuildHasherDefault<QwpWsSymbolHasher>> = HashMap::default();
     for row in 0..row_count {
         if arr.is_null(row) {
             continue;
@@ -2447,7 +2489,8 @@ fn resolve_symbol_dict(
             .iter()
             .map(|b| (b.as_ptr() as usize, b.len()))
             .collect();
-        let (memo_idx, mut slot_to_gid) = symbol_dict.take_arrow_dict_memo(&identity, dict_len);
+        let (memo_idx, mut slot_to_gid) =
+            symbol_dict.take_arrow_dict_memo(&identity, &values_data, dict_len);
 
         let resolved = (|| -> Result<Vec<u64>> {
             let mut gids = Vec::with_capacity(non_null);
@@ -3500,9 +3543,18 @@ fn encode_arrow_batch_into_mode(
         .map_err(|_| fmt!(ArrowIngest, "row count {} exceeds u32::MAX", row_count))?;
 
     let mut classified: Vec<ClassifiedColumn<'_>> = Vec::with_capacity(user_col_count);
+    let mut seen_names: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(user_col_count);
     for (idx, field) in schema.fields().iter().enumerate() {
         if Some(idx) == ts_col_idx {
             continue;
+        }
+        if !seen_names.insert(field.name().as_str()) {
+            return Err(fmt!(
+                ArrowIngest,
+                "duplicate column name in arrow batch: {:?}",
+                field.name()
+            ));
         }
         let col_name =
             ColumnName::new(field.name()).map_err(|e| decorate_column(e, field.name()))?;
@@ -3991,6 +4043,38 @@ mod tests {
         let f = Field::new("c", DataType::Null, true);
         let rb = RecordBatch::try_new(arrow_schema_with(f), vec![arr]).unwrap();
         assert_classify_rejects(&rb);
+    }
+
+    #[test]
+    fn apply_overrides_rejects_type_incompatible_override() {
+        // Ipv4/Char on a type `classify` won't honour: previously the override
+        // was silently dropped and the column shipped under its default wire
+        // type. It must now error.
+        let int64_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![Field::new(
+            "c",
+            DataType::Int64,
+            true,
+        )]));
+        let err = apply_overrides(&int64_schema, &[ArrowColumnOverride::Ipv4 { column: "c" }])
+            .unwrap_err();
+        assert!(err.msg().contains("not applicable"), "{}", err.msg());
+        assert!(
+            apply_overrides(&int64_schema, &[ArrowColumnOverride::Char { column: "c" }]).is_err()
+        );
+
+        // Applicable overrides still pass.
+        let u32_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![Field::new(
+            "c",
+            DataType::UInt32,
+            true,
+        )]));
+        assert!(apply_overrides(&u32_schema, &[ArrowColumnOverride::Ipv4 { column: "c" }]).is_ok());
+        let u16_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![Field::new(
+            "c",
+            DataType::UInt16,
+            true,
+        )]));
+        assert!(apply_overrides(&u16_schema, &[ArrowColumnOverride::Char { column: "c" }]).is_ok());
     }
 
     // -----------------------------------------------------------------

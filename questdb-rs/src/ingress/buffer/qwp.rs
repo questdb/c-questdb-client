@@ -2270,7 +2270,7 @@ fn qwp_ws_symbol_hash_with_seed(mut hash: u64, bytes: &[u8]) -> u64 {
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Debug)]
-struct QwpWsSymbolHasher(u64);
+pub(crate) struct QwpWsSymbolHasher(u64);
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl Default for QwpWsSymbolHasher {
@@ -5084,6 +5084,9 @@ pub(crate) struct SymbolGlobalDict {
 #[derive(Debug)]
 struct ArrowDictSlotMemo {
     identity: Vec<(usize, usize)>,
+    /// Pins the values buffers so their addresses (the `identity` key) cannot be
+    /// freed and reused by a different dictionary between flushes (ABA).
+    _pin: arrow_data::ArrayData,
     slot_to_gid: Vec<u64>,
 }
 
@@ -5170,6 +5173,7 @@ impl SymbolGlobalDict {
     pub(crate) fn take_arrow_dict_memo(
         &mut self,
         identity: &[(usize, usize)],
+        values_data: &arrow_data::ArrayData,
         dict_len: usize,
     ) -> (usize, Vec<u64>) {
         const MEMO_CAP: usize = 32;
@@ -5190,6 +5194,7 @@ impl SymbolGlobalDict {
         }
         self.arrow_dict_memo.push(ArrowDictSlotMemo {
             identity: identity.to_vec(),
+            _pin: values_data.clone(),
             slot_to_gid: Vec::new(),
         });
         (self.arrow_dict_memo.len() - 1, vec![u64::MAX; dict_len])
@@ -9165,27 +9170,30 @@ mod tests {
         let mut dict = SymbolGlobalDict::new();
         let mark = dict.mark();
         let identity = [(0x1000usize, 8usize), (0x2000usize, 24usize)];
+        // The memo pins the values `ArrayData`; this test exercises only the
+        // take/restore/rollback bookkeeping, so a placeholder array suffices.
+        let pin = arrow_data::ArrayData::new_empty(&arrow_schema::DataType::Null);
 
-        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, 3);
+        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, &pin, 3);
         assert_eq!(table, vec![u64::MAX; 3]);
         table[0] = 5;
         table[2] = 7;
         dict.restore_arrow_dict_memo(idx, table);
 
         // Same identity → cache hit: the stored table comes back verbatim.
-        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, 3);
+        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, &pin, 3);
         assert_eq!(idx2, idx);
         assert_eq!(table2, vec![5, u64::MAX, 7]);
         dict.restore_arrow_dict_memo(idx2, table2);
 
         // A different values array → miss → fresh table.
         let other = [(0x9000usize, 8usize), (0x2000usize, 24usize)];
-        let (_, fresh) = dict.take_arrow_dict_memo(&other, 2);
+        let (_, fresh) = dict.take_arrow_dict_memo(&other, &pin, 2);
         assert_eq!(fresh, vec![u64::MAX; 2]);
 
         // Rollback drops every memoised id.
         dict.rollback(mark);
-        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, 3);
+        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, &pin, 3);
         assert_eq!(after_rollback, vec![u64::MAX; 3]);
     }
 

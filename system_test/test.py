@@ -79,6 +79,7 @@ from test_arrow_fuzz_common_unit import (
     TestCompareSemantics,
     TestRngDeterminism,
     TestBuildRecordBatch,
+    TestSlicedRecordBatchOffsets,
     TestEdgeCorpora,
 )
 from fixture import (

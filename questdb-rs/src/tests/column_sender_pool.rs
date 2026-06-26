@@ -716,6 +716,37 @@ fn store_and_forward_sync_times_out_on_silent_but_alive_peer() {
 }
 
 #[test]
+fn drop_with_in_flight_best_effort_commits_and_recycles() {
+    // A borrow dropped with un-sync'd deferred frames must best-effort sync
+    // (committing the tail) and recycle the clean connection — not silently
+    // discard the frames and latch the connection must_close.
+    let server = MockServer::spawn_acking(1);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+    {
+        let mut sender = db.borrow_column_sender().unwrap();
+        let qty = [1_i64];
+        let ts = [1_i64];
+        let mut c1 = Chunk::new("trades");
+        c1.column_i64("qty", &qty, None).unwrap();
+        c1.designated_timestamp_nanos(&ts).unwrap();
+        sender.flush(&mut c1).unwrap(); // first frame: committed inline
+
+        let mut c2 = Chunk::new("trades");
+        c2.column_i64("qty", &qty, None).unwrap();
+        c2.designated_timestamp_nanos(&ts).unwrap();
+        sender.flush(&mut c2).unwrap(); // deferred: published but uncommitted
+        assert!(sender.in_flight() > 0, "deferred flush must be in-flight");
+    }
+    assert_eq!(
+        db.free_count(),
+        1,
+        "healthy connection must be recycled after drop best-effort sync"
+    );
+    assert_eq!(db.in_use_count(), 0);
+}
+
+#[test]
 fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow() {
     let server = MockServer::spawn(4);
     let dir = TempDir::new().unwrap();

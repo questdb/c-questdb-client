@@ -83,6 +83,13 @@ pub use validity::Validity;
 /// constant, so raising it here raises both in lockstep.
 pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 
+/// Per-column ceiling on a categorical / symbol dictionary's distinct-entry
+/// count, mirroring the connection-scoped symbol-dictionary cap. Independent of
+/// [`MAX_CHUNK_ROWS`] (which bounds row counts): a dictionary holds distinct
+/// values, of which there can be far more than a chunk has rows. The FFI
+/// `dict_offsets` length bound is derived from this (`entries + 1`).
+pub const MAX_SYMBOL_DICT_ENTRIES: usize = crate::ingress::buffer::MAX_CONN_SYMBOL_DICT_SIZE;
+
 const _: () = assert!(
     cfg!(target_endian = "little"),
     "column_sender bulk-copy fast paths assume a little-endian host; \

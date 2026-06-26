@@ -44,7 +44,10 @@ pub(crate) use self::qwp::QwpBuffer;
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) use self::qwp::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+pub(crate) use self::qwp::{
+    MAX_CONN_SYMBOL_DICT_SIZE, QwpWsColumnarBuffer, QwpWsEncodeScratch, QwpWsSymbolHasher,
+    SymbolGlobalDict,
+};
 
 static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
 

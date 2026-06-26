@@ -489,16 +489,12 @@ impl ColumnConn {
         let watermarks = &self.durable_watermarks;
         self.pending_durable_targets
             .retain(|t, target| watermarks.get(t).copied().unwrap_or(i64::MIN) < *target);
-        // A watermark is only ever consulted to satisfy a pending target for
-        // the same table; once no live pending target references it, it is
-        // dead weight. Any future write to the table re-establishes both the
-        // pending target (from its OK ack) and the watermark (from its durable
-        // ack), in that wire order, so dropping it here cannot strand a later
-        // sync. Without this, a durable-ack pooled connection accumulates one
-        // entry per distinct table for its entire pooled life.
-        let pending = &self.pending_durable_targets;
-        self.durable_watermarks
-            .retain(|t, _| pending.contains_key(t));
+        // `durable_watermarks` is deliberately NOT pruned here. A watermark must
+        // outlive its satisfied pending target: a later redundant OK that
+        // re-reports an already-durable table would otherwise re-insert a
+        // pending target with no matching watermark and strand `sync(Durable)`
+        // forever. The map grows by at most one entry per distinct table over
+        // the connection's life, matching the row sender's `DurableAckTracker`.
     }
 
     /// Dispatch a parsed QWP response: validate OK sequence, update
@@ -507,13 +503,30 @@ impl ColumnConn {
     fn process_response(&mut self, response: QwpResponse) -> Result<()> {
         match response {
             QwpResponse::Ok { sequence, tables } => {
-                // Absorb durable targets before the non-advancing-OK early
-                // return below: a redundant cumulative OK can still carry a
-                // table's seq_txn that a later `sync(Durable)` must wait on, so
-                // dropping it here would risk understating the durable target.
-                // Only meaningful with the opt-in; otherwise `Durable` is
-                // rejected up front and the map is never pruned, so accumulating
-                // would leak one entry per table for the connection's life.
+                let mut popped = 0u32;
+                while let Some(front) = self.pending_acks.front() {
+                    if front.fsn > sequence {
+                        break;
+                    }
+                    self.pending_acks.pop_front();
+                    popped += 1;
+                }
+                if popped == 0 {
+                    // QWP OK acks are cumulative ("completed through
+                    // `sequence`"). An OK that advances no pending frame is a
+                    // redundant/non-advancing progress ack the server may emit;
+                    // tolerate it as a no-op (matching the row API) rather than
+                    // tearing down the connection. It must NOT contribute a
+                    // durable target: it only re-reports already-acked tables,
+                    // so re-inserting one whose watermark was already satisfied
+                    // would strand a later `sync(Durable)` forever.
+                    return Ok(());
+                }
+                // Only a progress-advancing OK contributes durable targets — it
+                // is the wire event paired with a following DurableAck. Opt-in
+                // only; otherwise `Durable` is rejected up front and the targets
+                // map is never pruned, so accumulating would leak one entry per
+                // table for the connection's life.
                 if self.durable_ack_opt_in {
                     for (t, seq_txn) in tables {
                         self.pending_durable_targets
@@ -525,22 +538,6 @@ impl ColumnConn {
                             })
                             .or_insert(seq_txn);
                     }
-                }
-                let mut popped = 0u32;
-                while let Some(front) = self.pending_acks.front() {
-                    if front.fsn > sequence {
-                        break;
-                    }
-                    self.pending_acks.pop_front();
-                    popped += 1;
-                }
-                if popped == 0 {
-                    // QWP OK acks are cumulative ("completed through
-                    // `sequence`"). An OK that advances no pending frame is
-                    // a redundant/non-advancing progress ack the server may
-                    // emit; the row API tolerates it as a no-op rather than
-                    // tearing down the connection. Match that here.
-                    return Ok(());
                 }
                 // Invariant: `pending_acks.len() + popped == in_flight_before`.
                 // A future refactor that desynchronises the two would
@@ -1372,38 +1369,48 @@ mod tests {
     }
 
     #[test]
-    fn durable_watermarks_are_pruned_once_no_pending_target_references_them() {
+    fn redundant_ok_after_durable_prune_does_not_strand_sync() {
         let mut conn = ColumnConn::for_test(dummy_ws_stream(), true);
-        // Simulate a long-lived pooled durable-ack connection writing to a
-        // growing set of distinct table names. Each table is OK-acked,
-        // durable-acked, then fully satisfied + pruned (mirroring the
-        // prune that `sync_all_acks` runs at its tail).
-        for i in 0..1000u64 {
-            let table = format!("table_{i}");
-            conn.push_pending(i);
-            conn.process_response(QwpResponse::Ok {
-                sequence: i,
-                tables: vec![(table.clone(), 1)],
-            })
-            .expect("ok ack");
-            conn.process_response(QwpResponse::DurableAck {
-                tables: vec![(table, 1)],
-            })
-            .expect("durable ack");
-            conn.drop_satisfied_durable_targets();
-        }
-
+        // Table `t` runs the full OK -> DurableAck -> satisfied cycle; its
+        // satisfied pending target is pruned (the prune `sync_all_acks` runs).
+        conn.push_pending(0);
+        conn.process_response(QwpResponse::Ok {
+            sequence: 0,
+            tables: vec![("t".to_string(), 7)],
+        })
+        .expect("ok ack");
+        conn.process_response(QwpResponse::DurableAck {
+            tables: vec![("t".to_string(), 7)],
+        })
+        .expect("durable ack");
+        conn.drop_satisfied_durable_targets();
         assert_eq!(
             conn.pending_durable_targets.len(),
             0,
             "satisfied pending targets must be pruned"
         );
-        // RED before the fix: watermarks accumulate one entry per distinct
-        // table for the connection's entire pooled life.
+
+        // A later redundant OK advances no pending frame but re-reports `t`.
+        // It must stay a no-op for durable tracking: re-inserting a pending
+        // target whose watermark was pruned would strand `sync(Durable)`.
+        conn.process_response(QwpResponse::Ok {
+            sequence: 0,
+            tables: vec![("t".to_string(), 7)],
+        })
+        .expect("redundant ok");
         assert_eq!(
-            conn.durable_watermarks.len(),
+            conn.pending_durable_targets.len(),
             0,
-            "durable watermarks with no live pending target must not accumulate"
+            "a redundant OK must not resurrect a satisfied durable target"
+        );
+        assert_eq!(
+            conn.durable_watermarks.get("t").copied(),
+            Some(7),
+            "durable watermarks must outlive their satisfied pending target"
+        );
+        assert!(
+            conn.durability_satisfied(),
+            "no pending targets => durability is trivially satisfied"
         );
     }
 

@@ -69,9 +69,9 @@ use crate::ingress::{Sender, SenderBuilder};
 use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
 use crate::{Result, error};
 
-use crate::ingress::column_sender::ColumnSender;
 use crate::ingress::column_sender::conf::{self, PoolReap};
 use crate::ingress::column_sender::conn::ColumnConn;
+use crate::ingress::column_sender::{AckLevel, ColumnSender};
 
 /// FFI escape-hatch surface: owned (lifetime-free) pool handles and the entry
 /// points that mint them, for the `questdb-rs-ffi` C-ABI crate. Hidden,
@@ -894,6 +894,12 @@ impl<'a> BorrowedColumnSender<'a> {
             if sender.is_store_and_forward() {
                 return Ok(());
             }
+            // reborrow is a failover path, not a forced rotate. A healthy,
+            // fully-sync'd connection needs no replacement; replacing it would
+            // open a fresh connection and recycle this one, growing the pool.
+            if sender.in_flight() == 0 && !sender.must_close() && !sender.transport_dead() {
+                return Ok(());
+            }
             if sender.in_flight() > 0 {
                 sender.mark_must_close();
             }
@@ -969,19 +975,7 @@ impl Drop for BorrowedColumnSender<'_> {
         let Some(mut sender) = self.sender.take() else {
             return;
         };
-        // A drop with un-sync'd deferred frames would let the next
-        // borrower's first flush commit the previous borrower's data
-        // attributed to whatever table the new borrower targets.
-        // Latch must_close so the connection is discarded instead.
-        if sender.in_flight() > 0 {
-            log::warn!(
-                "column sender dropped with {} un-sync'd deferred frame(s); \
-                 their data is discarded. Call sync() (or flush_and_wait() on \
-                 the final chunk) before the borrow goes out of scope.",
-                sender.in_flight()
-            );
-            sender.mark_must_close();
-        }
+        commit_in_flight_on_drop(&mut sender);
         return_to_pool(&self.db.inner, sender);
     }
 }
@@ -1027,16 +1021,7 @@ impl OwnedColumnSender {
 impl Drop for OwnedColumnSender {
     fn drop(&mut self) {
         if let Some(mut sender) = self.sender.take() {
-            if sender.in_flight() > 0 {
-                log::warn!(
-                    "column sender dropped with {} un-sync'd deferred \
-                     frame(s); their data is discarded. Call sync() (or \
-                     flush_and_wait() on the final chunk) before dropping \
-                     the handle.",
-                    sender.in_flight()
-                );
-                sender.mark_must_close();
-            }
+            commit_in_flight_on_drop(&mut sender);
             return_to_pool(&self.inner, sender);
         }
     }
@@ -1525,6 +1510,26 @@ fn connect_conn(
 fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
     let raw: RawQwpWsRoundStream = inner.connector.connect_round_pooled(&inner.health)?;
     ColumnConn::from_round_stream(raw)
+}
+
+/// Best-effort commit of un-sync'd deferred frames on drop, so the natural
+/// `flush()`-loop-then-drop path doesn't silently lose data. On failure the
+/// connection is latched `must_close` so the next borrower can't commit these
+/// frames under a foreign table.
+fn commit_in_flight_on_drop(sender: &mut ColumnSender) {
+    if sender.in_flight() == 0 {
+        return;
+    }
+    let committed =
+        !sender.must_close() && !sender.transport_dead() && sender.sync(AckLevel::Ok).is_ok();
+    if !committed {
+        log::warn!(
+            "column sender dropped with un-sync'd deferred frame(s) that could \
+             not be committed; their data is discarded. Call sync() (or \
+             flush_and_wait() on the final chunk) before the handle is dropped."
+        );
+        sender.mark_must_close();
+    }
 }
 
 fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender) {

@@ -83,6 +83,7 @@ pub(crate) enum WaitForAck {
 /// code — a direct-mode `write_all`/`flush` error or a post-publish ACK-wait
 /// failure is `DeliveryUnknown` even though it reports `FailoverRetry`.
 #[doc(hidden)]
+#[non_exhaustive]
 pub enum FlushFailure {
     /// Provably not transmitted (ACK/durable validation, encode, size check,
     /// or a transport error before any byte was written). Manual chunks remain
