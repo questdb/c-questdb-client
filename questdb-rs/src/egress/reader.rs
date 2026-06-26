@@ -581,18 +581,24 @@ impl Reader {
     }
 
     /// Mutable access to the live transport. Returns `SocketError`
-    /// when the transport is `None`, which happens after a mid-query
-    /// failover exhausted its retry budget — the Reader is left in
-    /// a "poisoned" state and the user must open a fresh Reader to
-    /// recover. Inside `reconnect_with_failover` the transport is
-    /// only briefly absent (between dropping the dead one and
-    /// splicing in a new one); that path uses `self.transport`
-    /// directly and never goes through this accessor.
+    /// when the transport is `None`, which happens after the connection
+    /// was torn down: either a cursor was dropped before being fully
+    /// read (drop closes the WebSocket — see [`Cursor`]'s docs), or a
+    /// mid-query failover exhausted its retry budget. Either way the
+    /// Reader is "poisoned"; the fix is to drain cursors (`next_batch()`
+    /// until `None`) or `Cursor::cancel()` before dropping them, or to
+    /// open a fresh Reader. Inside `reconnect_with_failover` the transport
+    /// is only briefly absent (between dropping the dead one and splicing
+    /// in a new one); that path uses `self.transport` directly and never
+    /// goes through this accessor.
     fn transport_mut(&mut self) -> Result<&mut WsTransport> {
         self.transport.as_mut().ok_or_else(|| {
             fmt!(
                 SocketError,
-                "Reader transport is closed after a failed mid-query failover; open a fresh Reader to recover"
+                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
+                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
+                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
+                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
             )
         })
     }
@@ -602,7 +608,10 @@ impl Reader {
         self.transport.as_ref().ok_or_else(|| {
             fmt!(
                 SocketError,
-                "Reader transport is closed after a failed mid-query failover; open a fresh Reader to recover"
+                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
+                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
+                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
+                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
             )
         })
     }

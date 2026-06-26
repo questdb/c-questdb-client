@@ -3075,23 +3075,28 @@ fn dropping_live_cursor_closes_connection() {
 
     // The WS is now closed. A new query must surface a transport
     // error — either when QUERY_REQUEST is written or when the first
-    // frame is read — and must never yield a usable batch.
-    match reader.prepare("select 2 as v").execute() {
-        Err(e) => assert_eq!(
+    // frame is read — and must never yield a usable batch. The error
+    // must also explain the *cause* (a cursor dropped before being
+    // fully read) and the fix, rather than the misleading
+    // "failed mid-query failover" wording.
+    let assert_closed = |e: &questdb::egress::Error| {
+        assert_eq!(
             e.code(),
             questdb::egress::ErrorCode::SocketError,
             "expected SocketError after WS close, got {:?}: {}",
             e.code(),
             e.msg()
-        ),
+        );
+        assert!(
+            e.msg().contains("dropped before being fully read"),
+            "error should explain the dropped-cursor cause and the fix; got: {}",
+            e.msg()
+        );
+    };
+    match reader.prepare("select 2 as v").execute() {
+        Err(e) => assert_closed(&e),
         Ok(mut cur2) => match cur2.next_batch() {
-            Err(e) => assert_eq!(
-                e.code(),
-                questdb::egress::ErrorCode::SocketError,
-                "expected SocketError after WS close, got {:?}: {}",
-                e.code(),
-                e.msg()
-            ),
+            Err(e) => assert_closed(&e),
             other => panic!(
                 "next_batch on a closed connection unexpectedly yielded {:?}",
                 other.map(|o| o.map(|_| "Some(batch)"))
