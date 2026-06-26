@@ -11649,7 +11649,7 @@ mod tests {
 
     #[test]
     fn qwp_column_dec64_nan_roundtrip_preserves_following_column() {
-        let mut buf = crate::ingress::Buffer::new_qwp();
+        let mut buf = QwpBuffer::new(127);
         buf.table("trades")
             .unwrap()
             .column_dec64("price", "NaN")
@@ -11665,7 +11665,7 @@ mod tests {
             .unwrap();
         buf.at_now().unwrap();
 
-        let datagrams = buf.as_qwp().unwrap().encode_datagrams(64 * 1024).unwrap();
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
         assert_eq!(datagrams.len(), 1);
 
         let decoded = decode_datagram(&datagrams[0])
