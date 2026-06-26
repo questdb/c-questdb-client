@@ -531,14 +531,7 @@ fn ffi_polars_to_arrow_rs(
     let rs_array = unsafe { pa_array_into_rs(pa_array) };
     let array_data = unsafe { arrow::ffi::from_ffi(rs_array, &rs_schema) }
         .map_err(|e| fmt!(ArrowIngest, "from_ffi('{}'): {}", col_name, e))?;
-    array_data.validate_full().map_err(|e| {
-        fmt!(
-            ArrowIngest,
-            "Arrow array validation failed('{}'): {}",
-            col_name,
-            e
-        )
-    })?;
+    // Trusted in-process polars output; no `validate_full()` re-scan.
     Ok(array_data)
 }
 

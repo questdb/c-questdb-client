@@ -100,8 +100,10 @@ impl ImportedArrowColumn {
         }
         let array_data = unsafe { arrow::ffi::from_ffi(imported_array, schema) }
             .map_err(|err| error::fmt!(ArrowIngest, "from_ffi failed: {}", err))?;
+        // Structural `validate()` only; producer owns variable-length value
+        // validity, matching the C Data Interface buffer-length trust.
         array_data
-            .validate_full()
+            .validate()
             .map_err(|err| error::fmt!(ArrowIngest, "Arrow array validation failed: {}", err))?;
 
         let array = make_array(array_data);
