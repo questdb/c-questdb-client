@@ -29,7 +29,7 @@
 //! spins up one or more mocks, points the Reader at the address list,
 //! and verifies the cursor's reconnect/replay behaviour.
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

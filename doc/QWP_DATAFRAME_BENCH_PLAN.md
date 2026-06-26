@@ -382,7 +382,7 @@ Only after the 4 headline numbers exist.
 
 ## 9. Step 6 — Secondary axes  *[summary]*
 
-Each gated on a prior number implicating it: zstd (raw vs `compression-zstd`);
+Each gated on a prior number implicating it: zstd (raw vs `sync-reader-zstd`);
 TLS (`wss`); ack-level (`Ok` vs `Durable`, Enterprise); pooled-vs-per-call;
 **concurrency** — N pooled senders / one frame in flight each
 (`COLUMN_SENDER_PLAN.md` parallelism model; the Go "single-stream is

@@ -102,21 +102,9 @@ unsafe fn pa_schema_into_rs(pa: polars_arrow::ffi::ArrowSchema) -> arrow::ffi::F
     }
 }
 
-#[inline]
-pub(crate) unsafe fn rs_array_into_pa(
-    rs: arrow::ffi::FFI_ArrowArray,
-) -> polars_arrow::ffi::ArrowArray {
-    unsafe { std::mem::transmute::<arrow::ffi::FFI_ArrowArray, polars_arrow::ffi::ArrowArray>(rs) }
-}
-
-#[inline]
-pub(crate) unsafe fn rs_schema_into_pa(
-    rs: arrow::ffi::FFI_ArrowSchema,
-) -> polars_arrow::ffi::ArrowSchema {
-    unsafe {
-        std::mem::transmute::<arrow::ffi::FFI_ArrowSchema, polars_arrow::ffi::ArrowSchema>(rs)
-    }
-}
+// `rs_array_into_pa` / `rs_schema_into_pa` moved to the transport-neutral
+// `crate::polars_ffi` so the egress polars path can share them without
+// reaching into this ingress module.
 
 /// Yield [`RecordBatch`] slices of `df`, each capped at `max_rows`
 /// rows. `None` uses [`DEFAULT_MAX_BATCH_ROWS`]. Every emitted slice
@@ -604,6 +592,7 @@ mod tests {
         assert_eq!(int_arr.value(4), 50);
     }
 
+    #[cfg(feature = "polars-egress")]
     #[test]
     fn dataframe_round_trip_int_values_match() {
         let df = make_df();
@@ -616,6 +605,7 @@ mod tests {
         assert_eq!(i64s.get(2), Some(3));
     }
 
+    #[cfg(feature = "polars-egress")]
     #[test]
     fn dataframe_round_trip_string_values_match() {
         let df = make_df();

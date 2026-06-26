@@ -63,7 +63,7 @@ use crate::ingress::{Sender, SenderBuilder};
 // re-export chain that feeds it stays live) but quiet the unused-import lint in
 // the plain library build that compiles neither retry path.
 #[cfg_attr(
-    not(any(feature = "polars", feature = "ffi-support")),
+    not(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support")),
     allow(unused_imports)
 )]
 use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
@@ -662,7 +662,7 @@ impl QuestDb {
 
     /// The pool's reconnect backoff budget, parsed from the connect string's
     /// `reconnect_*` keys.
-    #[cfg(feature = "polars")]
+    #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
     pub(crate) fn reconnect_policy(&self) -> crate::ingress::ReconnectPolicy {
         self.inner.connector.reconnect_policy()
     }
@@ -865,7 +865,7 @@ impl<'a> BorrowedColumnSender<'a> {
     }
 
     /// The pool's reconnect backoff budget; see [`QuestDb::reconnect_policy`].
-    #[cfg(feature = "polars")]
+    #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
     pub(crate) fn reconnect_policy(&self) -> crate::ingress::ReconnectPolicy {
         self.db.reconnect_policy()
     }
@@ -917,7 +917,7 @@ impl<'a> BorrowedColumnSender<'a> {
     /// `ProtocolVersionError` terminal). On terminal failure or budget
     /// exhaustion the handle stays populated (per [`reborrow_from_pool`]), so a
     /// later call reports a typed error rather than panicking.
-    #[cfg(feature = "polars")]
+    #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
     pub(crate) fn reborrow_with_retry(&mut self, deadline: Option<Instant>) -> Result<()> {
         let policy = self.reconnect_policy();
         let mut backoff = policy.initial_backoff();
@@ -1474,12 +1474,12 @@ fn reconnect_pick(inner: &Arc<DbInner>, deadline: Option<Instant>) -> Result<Col
     }
 }
 
-#[cfg(any(feature = "polars", feature = "ffi-support"))]
+#[cfg(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support"))]
 fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
-#[cfg(any(feature = "polars", feature = "ffi-support"))]
+#[cfg(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support"))]
 fn sleep_until_deadline(sleep_for: Duration, deadline: Option<Instant>) {
     let d = match deadline {
         Some(dl) => sleep_for.min(dl.saturating_duration_since(Instant::now())),

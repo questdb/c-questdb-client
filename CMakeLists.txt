@@ -81,7 +81,7 @@ option(
 add_subdirectory(corrosion)
 set(QUESTDB_CARGO_FEATURES "")
 if(QUESTDB_ENABLE_READER)
-    list(APPEND QUESTDB_CARGO_FEATURES sync-reader-ws)
+    list(APPEND QUESTDB_CARGO_FEATURES sync-reader-qwp-ws)
 endif()
 if(QUESTDB_ENABLE_INSECURE_SKIP_VERIFY)
     list(APPEND QUESTDB_CARGO_FEATURES insecure-skip-verify)

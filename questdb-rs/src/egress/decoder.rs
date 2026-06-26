@@ -53,7 +53,7 @@
 //!   type-specific values
 //! ```
 //!
-//! `FLAG_ZSTD` payloads are decoded via the optional `compression-zstd`
+//! `FLAG_ZSTD` payloads are decoded via the optional `sync-reader-zstd`
 //! crate feature; an unfeatured build rejects them with
 //! `ErrorCode::UnsupportedServer`. Gorilla-encoded timestamps/dates
 //! (per-column discriminator `0x01`) are handled by the
@@ -383,16 +383,16 @@ pub fn decode_result_batch(
     // freshly-owned Bytes wrapping the decompressed Vec.
     let _ = &zstd_scratch;
     let body: Bytes = if flags_byte & flags::ZSTD != 0 {
-        #[cfg(feature = "compression-zstd")]
+        #[cfg(feature = "sync-reader-zstd")]
         {
             zstd_decompress_body(r.remaining(), zstd_scratch)?
         }
-        #[cfg(not(feature = "compression-zstd"))]
+        #[cfg(not(feature = "sync-reader-zstd"))]
         {
             return Err(fmt!(
                 UnsupportedServer,
                 "server sent FLAG_ZSTD batch but client was built without the \
-                 `compression-zstd` feature"
+                 `sync-reader-zstd` feature"
             ));
         }
     } else {
@@ -1458,7 +1458,7 @@ fn decode_decimal64(
 /// Maximum zstd-decompressed `RESULT_BATCH` body size we accept. Matches
 /// the per-batch wire cap from the spec (16 MiB) with a 4x safety margin
 /// so legitimate frames never trip the cap.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 const MAX_ZSTD_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
 /// Max recyclable buffers held by [`ZstdBufferPool`]. Two is the
@@ -1467,7 +1467,7 @@ const MAX_ZSTD_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 /// Anything beyond that means the consumer is hoarding `Bytes` clones
 /// — in which case dropping the extra allocations rather than caching
 /// them is the right choice (lets the global allocator reclaim).
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 const ZSTD_POOL_CAPACITY: usize = 2;
 
 /// Per-connection recycle pool of decompressed-body `Vec<u8>`s. Each
@@ -1484,7 +1484,7 @@ const ZSTD_POOL_CAPACITY: usize = 2;
 /// thread-safe pool handle. Lock-uncontended overhead is ~tens of ns
 /// per decompress, negligible against the savings from skipping a
 /// multi-MB allocation.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 #[derive(Default)]
 struct ZstdBufferPool {
     buffers: std::sync::Mutex<Vec<Vec<u8>>>,
@@ -1494,13 +1494,13 @@ struct ZstdBufferPool {
 /// backing `Vec` is returned to the pool on drop instead of being
 /// freed. `AsRef<[u8]>` exposes the full payload; `Bytes` slicing on
 /// top of this is zero-copy by ref-count.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 struct PooledZstdBuffer {
     buf: Vec<u8>,
     pool: std::sync::Arc<ZstdBufferPool>,
 }
 
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 impl AsRef<[u8]> for PooledZstdBuffer {
     #[inline]
     fn as_ref(&self) -> &[u8] {
@@ -1508,7 +1508,7 @@ impl AsRef<[u8]> for PooledZstdBuffer {
     }
 }
 
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 impl Drop for PooledZstdBuffer {
     fn drop(&mut self) {
         // Best-effort pool return. A poisoned mutex (would only happen
@@ -1540,12 +1540,12 @@ impl Drop for PooledZstdBuffer {
 /// when the downstream batch (and any column views borrowing into it)
 /// is dropped. Always exists so the decode API doesn't need
 /// feature-gated signatures; the fields inside are only populated when
-/// `compression-zstd` is on.
+/// `sync-reader-zstd` is on.
 #[derive(Default)]
 pub struct ZstdScratch {
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     decompressor: Option<zstd::bulk::Decompressor<'static>>,
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     pool: std::sync::Arc<ZstdBufferPool>,
 }
 
@@ -1560,7 +1560,7 @@ impl ZstdScratch {
 /// (`ZSTD_c_contentSizeFlag` is on by default in the server encoder);
 /// rejecting "unknown" content size keeps decode-bomb amplification
 /// closed.
-#[cfg(feature = "compression-zstd")]
+#[cfg(feature = "sync-reader-zstd")]
 fn zstd_decompress_body(compressed: &[u8], scratch: &mut ZstdScratch) -> Result<Bytes> {
     let size = match zstd::zstd_safe::get_frame_content_size(compressed) {
         Ok(Some(n)) => n,
@@ -1765,15 +1765,15 @@ mod tests {
     }
 
     /// FLAG_ZSTD rejection path: when the client was built WITHOUT the
-    /// `compression-zstd` feature, the decoder must surface
+    /// `sync-reader-zstd` feature, the decoder must surface
     /// `ErrorCode::UnsupportedServer` rather than silently mis-
     /// interpret the compressed body as raw wire bytes. The arm is
     /// uncovered in default test runs because `almost-all-features`
     /// turns the feature on; this test only compiles when the
     /// feature is off, so a build configuration `cargo test
-    /// --features sync-reader-ws --no-default-features` (or any CI
-    /// lane that excludes `compression-zstd`) exercises it.
-    #[cfg(not(feature = "compression-zstd"))]
+    /// --features sync-reader-qwp-ws --no-default-features` (or any CI
+    /// lane that excludes `sync-reader-zstd`) exercises it.
+    #[cfg(not(feature = "sync-reader-zstd"))]
     #[test]
     fn zstd_flag_rejected_without_feature() {
         // Minimal RESULT_BATCH prefix the decoder consumes before
@@ -1794,12 +1794,12 @@ mod tests {
             &mut schema,
             &mut ZstdScratch::new(),
         )
-        .expect_err("decoder must reject FLAG_ZSTD when built without compression-zstd");
+        .expect_err("decoder must reject FLAG_ZSTD when built without sync-reader-zstd");
         assert_eq!(err.code(), ErrorCode::UnsupportedServer);
         // Pin the diagnostic so a future error-message refactor can't
         // drop the feature-name hint that an operator needs to act on.
         assert!(
-            err.msg().contains("compression-zstd"),
+            err.msg().contains("sync-reader-zstd"),
             "rejection message should name the missing feature: {}",
             err.msg()
         );
@@ -2863,7 +2863,7 @@ mod tests {
         assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_round_trips_simple_long_batch() {
         // Build a raw RESULT_BATCH, then re-pack the body bytes (after
@@ -2917,7 +2917,7 @@ mod tests {
     /// `Drop for PooledZstdBuffer`, the pool would always be empty
     /// and steady-state throughput would pay one full-body
     /// allocation+memcpy per batch.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_scratch_pool_recycles_buffer_across_batches() {
         fn build_zstd_payload(seed: i64) -> Bytes {
@@ -3032,7 +3032,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_invalid_frame_is_protocol_error() {
         // Build a payload with a valid prefix + bogus zstd body bytes.
@@ -3062,7 +3062,7 @@ mod tests {
 
     /// Splice a custom zstd body onto a 0-row RESULT_BATCH prefix.
     /// Returns the full FLAG_ZSTD payload ready for `decode_result_batch`.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     fn zstd_payload_with_body(body: &[u8]) -> Bytes {
         let (_, raw) = BatchBuilder::new(0).build();
         let prefix_len = {
@@ -3082,7 +3082,7 @@ mod tests {
     /// frame body is a single empty raw "last" block — enough for
     /// `get_frame_content_size` to parse but cheap enough that we
     /// never actually have to decompress 64+ MiB.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     fn forged_fcs_zstd_frame(forged: u64) -> Vec<u8> {
         let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD]; // magic
         // FHD: FCS_flag=3 (8-byte FCS), Single_Segment_flag=1, no
@@ -3100,7 +3100,7 @@ mod tests {
     /// `zstd::stream::write::Encoder` does not write FCS unless the
     /// caller invokes `set_pledged_src_size`, so this exercises the
     /// `Ok(None)` arm of `get_frame_content_size`.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_frame_without_content_size_is_protocol_error() {
         use std::io::Write;
@@ -3141,7 +3141,7 @@ mod tests {
     /// FLAG_ZSTD body whose frame header advertises a content size
     /// just above the 64 MiB cap. The decoder must reject before
     /// allocating any decompression buffer.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_frame_exceeding_cap_is_limit_exceeded() {
         let oversized = MAX_ZSTD_DECOMPRESSED + 1;
@@ -3178,7 +3178,7 @@ mod tests {
     /// `ProtocolError`. Pins coverage of the post-decompress failure
     /// arm so a future refactor that drops zstd's internal check is
     /// still caught by *some* layer.
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn zstd_frame_with_size_mismatch_is_protocol_error() {
         use std::io::Write;

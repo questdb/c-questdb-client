@@ -37,17 +37,17 @@ use crate::ingress::sender::qwp_ws::{
     qwp_ws_check_error_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_in_range_background, qwp_ws_published_fsn_background,
 };
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 use crate::ingress::{ColumnName, TableName};
 use crate::{Result, error};
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 use super::arrow_batch::{self, ArrowColumnOverride};
 use super::chunk::Chunk;
 use super::conn::{ColumnConn, PublishError};
 use super::encoder;
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 use arrow_array::RecordBatch;
 
 fn classify_flush_error(err: crate::Error) -> crate::Error {
@@ -355,7 +355,7 @@ impl ColumnSender {
     /// `flush_arrow_batch_at_column` — reaching for this method instead would
     /// discard that column's role as the designated timestamp and silently
     /// substitute server arrival time, producing wrong partitions/order.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_server_stamped<'t, T>(
         &mut self,
         table: T,
@@ -374,7 +374,7 @@ impl ColumnSender {
     /// ACKing counterpart of [`Self::flush_arrow_batch_server_stamped`]:
     /// publish `batch` as a boundary, then wait for `ack_level`. The same
     /// boundary/durable/failure contract as [`Self::flush_and_wait`] applies.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_server_stamped_and_wait<'t, T>(
         &mut self,
         table: T,
@@ -403,7 +403,7 @@ impl ColumnSender {
     ///
     /// Use [`Self::flush_arrow_batch_server_stamped`] to instead let the server
     /// stamp each row on arrival.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
         table: T,
@@ -431,7 +431,7 @@ impl ColumnSender {
     /// ACKing counterpart of [`Self::flush_arrow_batch_at_column`]: publish
     /// `batch` as a boundary, then wait for `ack_level`. The same
     /// boundary/durable/failure contract as [`Self::flush_and_wait`] applies.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_at_column_and_wait<'t, T>(
         &mut self,
         table: T,
@@ -458,7 +458,7 @@ impl ColumnSender {
     }
 
     /// Backend dispatch shared by every Arrow flush variant.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     fn flush_arrow_batch_dispatch(
         &mut self,
         table: TableName<'_>,
@@ -499,7 +499,7 @@ impl ColumnSender {
     /// [`FlushFailure`] delivery classification so the C layer can decide
     /// whether to re-export the caller's `ArrowArray`.
     #[doc(hidden)]
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_server_stamped_and_wait_ffi(
         &mut self,
         table: TableName<'_>,
@@ -521,7 +521,7 @@ impl ColumnSender {
     /// [`FlushFailure`] delivery classification. A failure to resolve
     /// `ts_column` is `NotDelivered` (nothing was published).
     #[doc(hidden)]
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_at_column_and_wait_ffi(
         &mut self,
         table: TableName<'_>,
@@ -636,7 +636,7 @@ impl DirectColumnBackend {
         Ok(())
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     #[allow(clippy::too_many_arguments)]
     fn flush_arrow_batch_inner(
         &mut self,
@@ -768,7 +768,7 @@ impl SfaColumnBackend {
         Ok(())
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     fn flush_arrow_batch(
         &mut self,
         table: TableName<'_>,

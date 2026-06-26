@@ -220,7 +220,7 @@ pub(crate) fn perform_server_upgrade_with_version(
 /// unmasked WS binary message. Bytes are written by hand (mirroring
 /// `egress::server_event::decode_server_info` + `egress::wire::header`) so
 /// the helper stays self-contained.
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result<()> {
     // SERVER_INFO payload.
     let mut payload = Vec::new();

@@ -63,7 +63,7 @@ pub use buffer::*;
 pub(crate) mod sender;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use sender::QwpWsRoleReject;
-#[cfg(feature = "polars")]
+#[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
 pub(crate) use sender::ReconnectPolicy;
 pub use sender::*;
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -75,7 +75,7 @@ pub use decimal::DecimalView;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub mod column_sender;
 
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 pub mod polars;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
@@ -457,7 +457,7 @@ impl QwpWsConnector {
     /// returns stays live) but quiet the dead-code lint when neither is built.
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[cfg_attr(
-        not(any(feature = "polars", feature = "ffi-support")),
+        not(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support")),
         allow(dead_code)
     )]
     pub(crate) fn reconnect_policy(&self) -> sender::ReconnectPolicy {

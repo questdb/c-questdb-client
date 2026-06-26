@@ -38,7 +38,7 @@
 //! | `addr`             | required; `host:port` or `host`                          |
 //! | `path`             | endpoint path (`/read/v1`)                               |
 //! | `max_version`      | QWP version to advertise (`1`)                           |
-//! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
+//! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `sync-reader-zstd` feature (`raw`) |
 //! | `compression_level`| `zstd` level advertised in `X-QWP-Accept-Encoding` as `zstd;level=N`; `[1,22]`, default `1` (server clamps to `[1,9]`); ignored when `compression=raw` |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
 //! | `client_id`        | optional; sent only when set                             |
@@ -100,7 +100,7 @@ const DEFAULT_TLS_PORT: &str = "9000";
 /// frames are tagged with `FLAG_ZSTD` (or not) accordingly.
 ///
 /// All three variants are usable end-to-end when the client is built
-/// with the `compression-zstd` feature (which `almost-all-features`
+/// with the `sync-reader-zstd` feature (which `almost-all-features`
 /// turns on by default). Without that feature, `Zstd` / `Auto` still
 /// compile but the decoder rejects any `FLAG_ZSTD` batch the server
 /// sends back with [`ErrorCode::UnsupportedServer`] — surface the
@@ -113,15 +113,15 @@ const DEFAULT_TLS_PORT: &str = "9000";
 pub enum Compression {
     /// Advertise `raw` only — every `RESULT_BATCH` body is
     /// uncompressed wire bytes. Works on every client build (no
-    /// `compression-zstd` dependency).
+    /// `sync-reader-zstd` dependency).
     Raw,
     /// Advertise `zstd` only — the server must send compressed
     /// batches and the client must be built with the
-    /// `compression-zstd` feature to decode them.
+    /// `sync-reader-zstd` feature to decode them.
     Zstd,
     /// Advertise both `zstd,raw` — the server picks. The decoder
     /// handles either path. If the client was built without the
-    /// `compression-zstd` feature and the server still selects
+    /// `sync-reader-zstd` feature and the server still selects
     /// `zstd`, the decoder rejects the first `FLAG_ZSTD` batch with
     /// `UnsupportedServer`; the operator's recovery is to enable the
     /// feature or pin `Compression::Raw`.
@@ -935,8 +935,8 @@ impl ReaderConfig {
             }
         }
 
-        // zstd / auto require the compression-zstd feature.
-        #[cfg(not(feature = "compression-zstd"))]
+        // zstd / auto require the sync-reader-zstd feature.
+        #[cfg(not(feature = "sync-reader-zstd"))]
         {
             if !matches!(compression, Compression::Raw) {
                 let user_token = match compression {
@@ -946,7 +946,7 @@ impl ReaderConfig {
                 };
                 return Err(fmt!(
                     ConfigError,
-                    "\"compression={}\" requires the `compression-zstd` crate feature; \
+                    "\"compression={}\" requires the `sync-reader-zstd` crate feature; \
                      either enable it or use \"raw\"",
                     user_token
                 ));
@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
-    #[cfg(not(feature = "compression-zstd"))]
+    #[cfg(not(feature = "sync-reader-zstd"))]
     #[test]
     fn compression_zstd_rejected_without_feature() {
         let err = ReaderConfig::from_conf("ws::addr=h:1;compression=zstd").unwrap_err();
@@ -1399,7 +1399,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn compression_zstd_accepted_with_feature() {
         let c = ReaderConfig::from_conf("ws::addr=h:1;compression=zstd").unwrap();
@@ -1421,7 +1421,7 @@ mod tests {
         assert_eq!(c.compression_level, 1);
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn compression_level_parses_and_is_emitted() {
         let c =
@@ -1435,7 +1435,7 @@ mod tests {
         assert_eq!(accept.1, "zstd;level=9");
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn compression_level_emitted_for_auto() {
         let c =

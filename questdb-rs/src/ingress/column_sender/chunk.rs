@@ -43,7 +43,7 @@ use std::slice;
 
 use crate::{Result, error};
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 use super::arrow_batch;
 use super::numpy_wire;
 use super::validity::{Validity, check_row_count};
@@ -58,14 +58,14 @@ use super::wire::{
 // Descriptors
 // ===========================================================================
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 pub struct ImportedArrowColumn {
     field: arrow_schema::Field,
     array: arrow_array::ArrayRef,
     kind: arrow_batch::ColumnKind,
 }
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 impl ImportedArrowColumn {
     /// Import an Arrow column from the Arrow C Data Interface.
     ///
@@ -93,7 +93,7 @@ impl ImportedArrowColumn {
         if let Some(want_symbol) = symbol {
             let mut metadata = field.metadata().clone();
             metadata.insert(
-                crate::egress::arrow::metadata::SYMBOL.to_string(),
+                crate::arrow_meta::SYMBOL.to_string(),
                 if want_symbol { "true" } else { "false" }.to_string(),
             );
             field = field.with_metadata(metadata);
@@ -298,7 +298,7 @@ pub(crate) enum ColumnKind {
     /// holds the buffers via Arc; the enclosing
     /// [`ColumnDescriptor::validity`] is always `None` for this
     /// variant (validity lives inside the array's `NullBuffer`).
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     ArrowDeferred {
         arrow_kind: arrow_batch::ColumnKind,
         arr: arrow_array::ArrayRef,
@@ -1185,7 +1185,7 @@ impl<'a> Chunk<'a> {
     /// column).
     ///
     /// [`ColumnSender::flush_arrow_batch_at_column`]: super::ColumnSender::flush_arrow_batch_at_column
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn push_arrow_column(
         &mut self,
         name: &str,
@@ -1205,7 +1205,7 @@ impl<'a> Chunk<'a> {
         self.push_arrow_deferred(name, kind, arr)
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub fn push_imported_arrow_slice(
         &mut self,
         name: &str,
@@ -1225,7 +1225,7 @@ impl<'a> Chunk<'a> {
     /// Used by `column_sender_chunk_append_arrow_column` (FFI) after
     /// the caller's `ArrowArray` / `ArrowSchema` has been imported into
     /// an `arrow_array::ArrayRef` and classified.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub(crate) fn push_arrow_deferred(
         &mut self,
         name: &str,

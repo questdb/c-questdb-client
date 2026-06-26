@@ -13,7 +13,7 @@
 //!
 //! Run:
 //!     cargo run --release --example qwp_egress_read \
-//!         --features sync-reader-ws,sync-sender-http
+//!         --features sync-reader-qwp-ws,sync-sender-http
 //!
 //! Env tuning:
 //!     ROW_COUNT=10000000  (default 10M)

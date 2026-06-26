@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-#[cfg(feature = "json_tests")]
+#[cfg(feature = "json-tests")]
 pub mod json_tests {
     use indoc::indoc;
     use serde::{Deserialize, Serialize};
@@ -344,7 +344,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but both are enabled."
     );
 
-    #[cfg(feature = "json_tests")]
+    #[cfg(feature = "json-tests")]
     {
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rerun-if-changed=Cargo.lock");

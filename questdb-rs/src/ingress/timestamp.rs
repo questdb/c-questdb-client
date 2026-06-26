@@ -25,7 +25,7 @@
 use crate::error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "chrono_timestamp")]
+#[cfg(feature = "chrono-timestamp")]
 use chrono::{DateTime, TimeZone};
 
 /// Convert a `SystemTime` to a `Duration` to/from the UNIX epoch.
@@ -106,7 +106,7 @@ fn extract_current_timestamp(extract_fn: impl FnOnce(Duration) -> u128) -> crate
 /// use questdb::ingress::TimestampMicros;
 ///
 /// # fn main() -> Result<()> {
-/// #[cfg(feature = "chrono_timestamp")]
+/// #[cfg(feature = "chrono-timestamp")]
 /// let ts = TimestampMicros::from_datetime(chrono::Utc::now());
 /// # Ok(())
 /// # }
@@ -126,7 +126,7 @@ impl TimestampMicros {
         Self(micros)
     }
 
-    #[cfg(feature = "chrono_timestamp")]
+    #[cfg(feature = "chrono-timestamp")]
     pub fn from_datetime<T: TimeZone>(dt: DateTime<T>) -> Self {
         Self::new(dt.timestamp_micros())
     }
@@ -186,7 +186,7 @@ impl TimestampMicros {
 /// use questdb::ingress::TimestampNanos;
 ///
 /// # fn main() -> Result<()> {
-/// # #[cfg(feature = "chrono_timestamp")]
+/// # #[cfg(feature = "chrono-timestamp")]
 /// let ts = TimestampNanos::from_datetime(chrono::Utc::now());
 /// # Ok(())
 /// # }
@@ -207,7 +207,7 @@ impl TimestampNanos {
         Self(nanos)
     }
 
-    #[cfg(feature = "chrono_timestamp")]
+    #[cfg(feature = "chrono-timestamp")]
     pub fn from_datetime<T: TimeZone>(dt: DateTime<T>) -> crate::Result<Self> {
         match dt.timestamp_nanos_opt() {
             Some(nanos) => Ok(Self::new(nanos)),

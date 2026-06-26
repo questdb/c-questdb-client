@@ -29,7 +29,7 @@ publish = false
 polars = ["questdb-rs/polars", "dep:polars"]
 
 [dependencies]
-questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-ws", "sync-sender-qwp-ws", "arrow"] }
+questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-qwp-ws", "sync-sender-qwp-ws", "arrow"] }
 # Construct Arrow RecordBatches for qwp_column_sidecar's `SEND ... arrow` path.
 # Same major as questdb-rs's `arrow` dep so the RecordBatch type unifies.
 arrow-array = "58"

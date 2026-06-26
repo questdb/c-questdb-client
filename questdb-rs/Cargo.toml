@@ -128,11 +128,12 @@ criterion = { version = "0.5", default-features = false }
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 
-## Sync senders: ILP/TCP + ILP/HTTP + QWP/UDP + QWP/WS
+## Reliable, connection-oriented senders: ILP/TCP + ILP/HTTP + QWP/WS.
+## QWP/UDP is intentionally excluded: it is best-effort (no acks, no auth,
+## no TLS) and must be opted into explicitly via `sync-sender-qwp-udp`.
 sync-sender = [
     "sync-sender-tcp",
     "sync-sender-http",
-    "sync-sender-qwp-udp",
     "sync-sender-qwp-ws",
 ]
 
@@ -148,7 +149,9 @@ sync-sender-http = [
     "dep:rand",
 ]
 
-## Sync QWP/UDP
+## Sync QWP/UDP — best-effort datagram ingest: no acknowledgements, no
+## authentication, no TLS; datagrams may be dropped. Standalone and opt-in,
+## deliberately NOT pulled in by `sync-sender` or the default build.
 sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
 
 ## Sync QWP/WebSocket
@@ -184,10 +187,13 @@ insecure-skip-verify = []
 tls-key-log = []
 
 ## Enable code-generation in `build.rs` for additional tests.
-json_tests = ["bigdecimal"]
+json-tests = ["bigdecimal"]
 
 ## Enable methods to create timestamp objects from chrono::DateTime objects.
-chrono_timestamp = ["chrono"]
+chrono-timestamp = ["dep:chrono"]
+
+## Enable n-dimensional array columns from `ndarray::ArrayView` / `Array`.
+ndarray = ["dep:ndarray"]
 
 ## Enable serialization of rust_decimal::Decimal in ILP
 rust_decimal = ["dep:rust_decimal"]
@@ -196,38 +202,38 @@ rust_decimal = ["dep:rust_decimal"]
 bigdecimal = ["dep:bigdecimal"]
 
 ## Sync QWP egress reader over WebSocket (plain `ws://`). Does NOT
-## pull in `compression-zstd`: zstd is opt-in. Without it, the decoder
+## pull in `sync-reader-zstd`: zstd is opt-in. Without it, the decoder
 ## still compiles but rejects `FLAG_ZSTD` batches at runtime with an
 ## `UnsupportedServer` error.
-sync-reader-ws = ["_egress", "_keystore-roots"]
+sync-reader-qwp-ws = ["_egress", "_keystore-roots"]
 
 ## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
-compression-zstd = ["_egress", "dep:zstd"]
+sync-reader-zstd = ["_egress", "dep:zstd"]
 
-## Arrow integration: streaming Cursor → RecordBatchReader (egress) and
-## RecordBatch → Buffer (ingress). Both directions ride QWP/WS.
+## Apache Arrow integration, split by direction so single-direction builds
+## stay lean; `arrow` is the convenience umbrella over both. Each direction
+## pulls only its own transport (`arrow-ingress` the QWP/WS sender,
+## `arrow-egress` the QWP/WS reader); the shared Arrow deps live in `_arrow`.
+##   arrow-egress : streaming Cursor → RecordBatchReader (read path)
+##   arrow-ingress: RecordBatch → Buffer (write path)
 ## See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
-arrow = [
-    "sync-reader-ws",
-    "sync-sender-qwp-ws",
-    "dep:arrow",
-    "dep:arrow-array",
-    "dep:arrow-schema",
-    "dep:arrow-buffer",
-    "dep:arrow-data",
-    "dep:aligned-vec",
-    "dep:bytes",
-]
+arrow-egress = ["_arrow", "sync-reader-qwp-ws"]
+arrow-ingress = ["_arrow", "sync-sender-qwp-ws"]
+arrow = ["arrow-ingress", "arrow-egress"]
 
-## Polars sub-feature. ~30 lines of wrappers on top of `arrow`.
-polars = ["arrow", "sync-sender-qwp-ws", "sync-reader-ws", "dep:polars", "dep:polars-arrow"]
+## Polars integration, split by direction; `polars` is the umbrella.
+##   polars-egress : Cursor → polars DataFrame
+##   polars-ingress: polars DataFrame → Buffer
+polars-egress = ["_polars", "arrow-egress"]
+polars-ingress = ["_polars", "arrow-ingress"]
+polars = ["polars-ingress", "polars-egress"]
 
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
 ## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
 live-server-tests = [
-    "sync-reader-ws",
-    "compression-zstd",
+    "sync-reader-qwp-ws",
+    "sync-reader-zstd",
     "sync-sender-http",
     "sync-sender-qwp-ws",
 ]
@@ -249,6 +255,24 @@ _sender-qwp-ws = []
 _sync-sender = []
 _egress = ["dep:bytes"]
 _keystore-roots = ["dep:jks", "dep:p12-keystore"]
+# Shared Arrow / Polars dependency bundles, enabled by both directional
+# features. Don't use directly.
+_arrow = ["dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer", "dep:arrow-data", "dep:aligned-vec", "dep:bytes"]
+_polars = ["dep:polars", "dep:polars-arrow"]
+
+# -----------------------------------------------------------------------------
+# DEPRECATED back-compat aliases. These map the pre-rename feature names onto
+# their replacements so existing `Cargo.toml`s keep building. Slated for
+# removal in the next major; migrate to the new names:
+#   sync-reader-ws   -> sync-reader-qwp-ws
+#   compression-zstd -> sync-reader-zstd
+#   chrono_timestamp -> chrono-timestamp
+#   json_tests       -> json-tests
+# -----------------------------------------------------------------------------
+sync-reader-ws = ["sync-reader-qwp-ws"]
+compression-zstd = ["sync-reader-zstd"]
+chrono_timestamp = ["chrono-timestamp"]
+json_tests = ["json-tests"]
 
 ## Enable all cross-compatible features.
 ## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
@@ -260,14 +284,15 @@ _keystore-roots = ["dep:jks", "dep:p12-keystore"]
 ## via `cargo test --features almost-all-features,arrow,polars`.
 almost-all-features = [
     "sync-sender",
-    "sync-reader-ws",
-    "compression-zstd",
+    "sync-sender-qwp-udp",
+    "sync-reader-qwp-ws",
+    "sync-reader-zstd",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",
     "insecure-skip-verify",
-    "json_tests",
-    "chrono_timestamp",
+    "json-tests",
+    "chrono-timestamp",
     "ndarray",
     "rust_decimal",
     "bigdecimal",
@@ -275,15 +300,15 @@ almost-all-features = [
 
 [[example]]
 name = "basic"
-required-features = ["chrono_timestamp", "ndarray"]
+required-features = ["chrono-timestamp", "ndarray"]
 
 [[example]]
 name = "auth"
-required-features = ["chrono_timestamp"]
+required-features = ["chrono-timestamp"]
 
 [[example]]
 name = "auth_tls"
-required-features = ["chrono_timestamp"]
+required-features = ["chrono-timestamp"]
 
 [[example]]
 name = "http"
@@ -295,23 +320,23 @@ required-features = ["sync-sender-http", "ndarray", "bigdecimal"]
 
 [[example]]
 name = "qwp_egress_latency"
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
 
 [[example]]
 name = "qwp_egress_failover"
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
 
 [[example]]
 name = "qwp_egress_read"
-required-features = ["sync-reader-ws", "sync-sender-http"]
+required-features = ["sync-reader-qwp-ws", "sync-sender-http"]
 
 [[example]]
 name = "qwp_egress_read_wide"
-required-features = ["sync-reader-ws", "sync-sender-http"]
+required-features = ["sync-reader-qwp-ws", "sync-sender-http"]
 
 [[example]]
 name = "qwp_egress_hits"
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
 
 [[example]]
 name = "qwp_ws_unified_sfa_bench"
@@ -345,16 +370,16 @@ required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
 # (direction="egress"). Run with:
 #
 #   cargo run --release --example qwp_egress_polars \
-#       --features polars,sync-reader-ws,sync-sender-http
+#       --features polars,sync-reader-qwp-ws,sync-sender-http
 [[example]]
 name = "qwp_egress_polars"
-required-features = ["polars", "sync-reader-ws", "sync-sender-http"]
+required-features = ["polars", "sync-reader-qwp-ws", "sync-sender-http"]
 
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR
 # decode hot paths). Run with:
 #
-#   cargo bench --features sync-reader-ws --bench decoder
+#   cargo bench --features sync-reader-qwp-ws --bench decoder
 #
 # The default row count (configurable via `QUESTDB_BENCH_ROWS`) is
 # below the per-batch wire cap so the bench iterates fast on CI; set
@@ -363,7 +388,7 @@ required-features = ["polars", "sync-reader-ws", "sync-sender-http"]
 [[bench]]
 name = "decoder"
 harness = false
-required-features = ["sync-reader-ws"]
+required-features = ["sync-reader-qwp-ws"]
 
 # Column-major sender hot-path bench. Anchors the perf claims from
 # `doc/COLUMN_SENDER_PLAN.md` §2 (memcpy-bound no-null path,

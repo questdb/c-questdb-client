@@ -232,8 +232,8 @@ pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
 fn import_polars_series(name: &str, array_data: &ArrayData) -> Result<Series> {
     let (rs_array, rs_schema) = arrow::ffi::to_ffi(array_data)
         .map_err(|e| fmt!(ArrowExport, "to_ffi failed for column '{}': {}", name, e))?;
-    let pa_schema = unsafe { crate::ingress::polars::rs_schema_into_pa(rs_schema) };
-    let pa_array = unsafe { crate::ingress::polars::rs_array_into_pa(rs_array) };
+    let pa_schema = unsafe { crate::polars_ffi::rs_schema_into_pa(rs_schema) };
+    let pa_array = unsafe { crate::polars_ffi::rs_array_into_pa(rs_array) };
     let pa_field = unsafe { polars_arrow::ffi::import_field_from_c(&pa_schema) }
         .map_err(|e| fmt!(ArrowExport, "import_field_from_c('{}'): {}", name, e))?;
     let pa_array_box = unsafe { polars_arrow::ffi::import_array_from_c(pa_array, pa_field.dtype) }

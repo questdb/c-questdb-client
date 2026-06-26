@@ -5070,7 +5070,7 @@ pub(crate) struct SymbolGlobalDict {
     entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
     cap: usize,
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     arrow_dict_memo: Vec<ArrowDictSlotMemo>,
 }
 
@@ -5080,7 +5080,7 @@ pub(crate) struct SymbolGlobalDict {
 /// per-string `intern` runs once per chunk instead of once per batch. The
 /// stored ids are only valid against the current dict contents, so
 /// [`SymbolGlobalDict::rollback`] drops the whole memo.
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 #[derive(Debug)]
 struct ArrowDictSlotMemo {
     identity: Vec<(usize, usize)>,
@@ -5120,7 +5120,7 @@ impl SymbolGlobalDict {
             entries: Vec::new(),
             next_id: 0,
             cap: MAX_CONN_SYMBOL_DICT_SIZE,
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-ingress")]
             arrow_dict_memo: Vec::new(),
         }
     }
@@ -5159,7 +5159,7 @@ impl SymbolGlobalDict {
             }
         }
         self.next_id = mark.next_id;
-        #[cfg(feature = "arrow")]
+        #[cfg(feature = "arrow-ingress")]
         self.arrow_dict_memo.clear();
     }
 
@@ -5169,7 +5169,7 @@ impl SymbolGlobalDict {
     /// yields a fresh `u64::MAX`-filled table. The caller fills any `u64::MAX`
     /// slot via [`intern`](Self::intern) and must hand the table back with
     /// [`restore_arrow_dict_memo`](Self::restore_arrow_dict_memo).
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub(crate) fn take_arrow_dict_memo(
         &mut self,
         identity: &[(usize, usize)],
@@ -5200,7 +5200,7 @@ impl SymbolGlobalDict {
         (self.arrow_dict_memo.len() - 1, vec![u64::MAX; dict_len])
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     pub(crate) fn restore_arrow_dict_memo(&mut self, idx: usize, slot_to_gid: Vec<u64>) {
         if let Some(memo) = self.arrow_dict_memo.get_mut(idx) {
             memo.slot_to_gid = slot_to_gid;
@@ -9164,7 +9164,7 @@ mod tests {
         assert_eq!(dict.len(), 2);
     }
 
-    #[cfg(all(feature = "_sender-qwp-ws", feature = "arrow"))]
+    #[cfg(all(feature = "_sender-qwp-ws", feature = "arrow-ingress"))]
     #[test]
     fn arrow_dict_memo_reuses_table_and_clears_on_rollback() {
         let mut dict = SymbolGlobalDict::new();

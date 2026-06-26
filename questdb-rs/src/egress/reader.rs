@@ -34,7 +34,7 @@
 //! returns `None`) before drop if you want to keep the existing
 //! connection alive.
 //!
-//! The `sync-reader-ws` feature gate is applied at the module
+//! The `sync-reader-qwp-ws` feature gate is applied at the module
 //! declaration in `egress/mod.rs`; an inner `#![cfg(...)]` here would
 //! duplicate that gate (clippy::duplicated_attributes) without
 //! changing what's compiled.
@@ -215,9 +215,9 @@ const _: fn() = || {
         let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
     }
     assert_not_send::<crate::egress::Cursor<'_>>();
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     assert_not_send::<crate::egress::arrow::CursorRecordBatchReader<'_, '_>>();
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-egress")]
     assert_not_send::<crate::egress::arrow::polars::CursorPolarsIter<'_, '_>>();
 };
 
@@ -1221,15 +1221,15 @@ impl<'r> ReaderQuery<'r> {
             failover_resets: 0,
             decode_failover_rounds: 0,
             data_delivered: false,
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-egress")]
             drifted_batch: None,
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-egress")]
             sym_values: crate::egress::arrow::SymbolValuesCache::default(),
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-egress")]
             sym_scratch: crate::egress::arrow::SymbolBuildScratch::default(),
-            #[cfg(feature = "polars")]
+            #[cfg(feature = "polars-egress")]
             symbol_registry: None,
-            #[cfg(feature = "polars")]
+            #[cfg(feature = "polars-egress")]
             symbol_delta_modes: Vec::new(),
             _not_send: std::marker::PhantomData,
         })
@@ -1508,21 +1508,21 @@ pub struct Cursor<'r> {
     /// A batch decoded but not handed out because its Arrow schema drifted
     /// from the pinned one, parked for replay on the next `next_arrow_batch*`
     /// call so the rows are recoverable rather than dropped.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     drifted_batch: Option<DecodedBatch>,
     /// Connection-dict SYMBOL values array, interned once per cursor and reused
     /// across batches until the dict grows (see [`SymbolValuesCache`]).
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     sym_values: crate::egress::arrow::SymbolValuesCache,
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     sym_scratch: crate::egress::arrow::SymbolBuildScratch,
     /// Per-cursor SYMBOL → polars `Categories`, interned once and grown
     /// incrementally across batches (see [`SymbolRegistry`]).
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-egress")]
     symbol_registry: Option<crate::egress::arrow::polars::SymbolRegistry>,
     /// `[i]` = column `i` is a delta-mode SYMBOL, captured per batch from the
     /// `DecodedBatch` before it is assembled.
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-egress")]
     symbol_delta_modes: Vec<bool>,
     /// Pin `!Send` regardless of whether the callback is installed.
     _not_send: std::marker::PhantomData<*const ()>,
@@ -1671,7 +1671,7 @@ impl<'r> Cursor<'r> {
     ///
     /// [`RecordBatchReader`]: arrow_array::RecordBatchReader
     /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     pub fn as_arrow_reader<'c>(
         &'c mut self,
     ) -> Result<crate::egress::arrow::CursorRecordBatchReader<'r, 'c>> {
@@ -1687,7 +1687,7 @@ impl<'r> Cursor<'r> {
     ///
     /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
     /// [`ErrorCode::SchemaDrift`]: crate::egress::ErrorCode::SchemaDrift
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     pub fn fetch_all_arrow(
         &mut self,
     ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>)> {
@@ -1726,7 +1726,7 @@ impl<'r> Cursor<'r> {
     ///
     /// Use this in preference to a `while let Some(df) = cursor.next_polars()?`
     /// loop when you care about schema consistency mid-stream.
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-egress")]
     pub fn iter_polars<'c>(&'c mut self) -> Result<crate::egress::arrow::CursorPolarsIter<'r, 'c>> {
         crate::egress::arrow::CursorPolarsIter::new(self)
     }
@@ -1735,12 +1735,12 @@ impl<'r> Cursor<'r> {
     /// `Ok(None)` on stream end; replays terminal errors like
     /// [`Cursor::next_batch`]. No drift check — use
     /// [`Cursor::as_arrow_reader`] for that.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     pub fn next_arrow_batch(&mut self) -> Result<Option<arrow_array::RecordBatch>> {
         self.next_arrow_batch_inner(None, false)
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     #[doc(hidden)]
     pub fn next_arrow_batch_inner(
         &mut self,
@@ -1810,7 +1810,7 @@ impl<'r> Cursor<'r> {
             self.drifted_batch = Some(decoded);
             return Err(e);
         }
-        #[cfg(feature = "polars")]
+        #[cfg(feature = "polars-egress")]
         {
             self.symbol_delta_modes.clear();
             self.symbol_delta_modes
@@ -1844,7 +1844,7 @@ impl<'r> Cursor<'r> {
         }
     }
 
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-egress")]
     pub(crate) fn symbol_registry_synced(
         &mut self,
     ) -> Result<&crate::egress::arrow::polars::SymbolRegistry> {
@@ -1855,7 +1855,7 @@ impl<'r> Cursor<'r> {
         Ok(reg)
     }
 
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-egress")]
     pub(crate) fn symbol_delta_modes(&self) -> &[bool] {
         &self.symbol_delta_modes
     }
@@ -1867,7 +1867,7 @@ impl<'r> Cursor<'r> {
     // live and parks the drifted batch in `drifted_batch` so the caller can
     // re-snapshot and retrieve those rows on the next call (see
     // `next_arrow_batch_inner`).
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     fn stash_arrow_terminal_error(&mut self, err: &Error) {
         self.done = true;
         if self.terminal_error.is_none() {
@@ -2064,7 +2064,7 @@ impl<'r> Cursor<'r> {
     ///
     /// Leaves a user-installed callback in place: if the caller already
     /// opted into replays, that contract wins.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     pub(crate) fn enable_internal_replay(&mut self) {
         if self.on_failover_reset.is_none() && self.on_failover_progress.is_none() {
             self.on_failover_reset = Some(Box::new(|_: &FailoverEvent| {}));
@@ -2187,12 +2187,12 @@ impl<'r> Cursor<'r> {
     /// Must be called whenever `self.dict` is replaced, otherwise a
     /// re-grown dict can alias stale interned values/codes.
     fn reset_symbol_caches(&mut self) {
-        #[cfg(feature = "arrow")]
+        #[cfg(feature = "arrow-egress")]
         {
             self.sym_values = crate::egress::arrow::SymbolValuesCache::default();
             self.sym_scratch = crate::egress::arrow::SymbolBuildScratch::default();
         }
-        #[cfg(feature = "polars")]
+        #[cfg(feature = "polars-egress")]
         {
             self.symbol_registry = None;
         }
@@ -2313,7 +2313,7 @@ impl<'r> Cursor<'r> {
             // don't accidentally surface a stale view.
             self.last_batch = None;
             // The parked drift-replay batch belongs to the old stream.
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-egress")]
             {
                 self.drifted_batch = None;
             }
@@ -2868,7 +2868,7 @@ fn prefer_over_trigger(code: ErrorCode) -> bool {
 /// `Reader`; each instance gets a distinct seed at construction time.
 /// Splitmix64 is the simplest non-trivial 64-bit generator with good
 /// statistical properties for this use case (uniform draws over small
-/// integer ranges); avoids pulling `rand` into the `sync-reader-ws`
+/// integer ranges); avoids pulling `rand` into the `sync-reader-qwp-ws`
 /// feature.
 ///
 /// The state is mutated on every draw. Splitmix64 is full-period

@@ -36,7 +36,7 @@
 // Egress is the only side that parses incoming frames; the ingress
 // QWP/WS sender uses just the writer. Suppress the avalanche of
 // dead-code warnings on the writer-only builds (`questdb-rs-ffi`
-// without `sync-reader-ws`, for example) — the items are still
+// without `sync-reader-qwp-ws`, for example) — the items are still
 // load-bearing for tests in this module.
 #![cfg_attr(not(feature = "_egress"), allow(dead_code))]
 

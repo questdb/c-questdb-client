@@ -59,8 +59,8 @@
 //! Run:
 //!
 //! ```text
-//! cargo bench --features sync-reader-ws --bench decoder
-//! QUESTDB_BENCH_ROWS=1000000 cargo bench --features sync-reader-ws --bench decoder
+//! cargo bench --features sync-reader-qwp-ws --bench decoder
+//! QUESTDB_BENCH_ROWS=1000000 cargo bench --features sync-reader-qwp-ws --bench decoder
 //! ```
 
 use std::time::Duration;

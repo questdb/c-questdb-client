@@ -22,6 +22,9 @@ features = [
     "tls-webpki-certs",
     "tls-native-certs",
     "sync-sender",
+    # QWP/UDP is no longer part of the `sync-sender` umbrella (best-effort,
+    # no auth/TLS) — the C ABI exposes every transport, so request it here.
+    "sync-sender-qwp-udp",
     # Owned (lifetime-free) pool handles + their borrow entry points. C / Python
     # cannot express Rust lifetimes, so the C ABI hands out owned handles via
     # `questdb::ffi_support` instead of the lifetime-bound `Borrowed*` handles.
@@ -31,7 +34,7 @@ features = [
 [features]
 # No default features. Existing consumers who only want the line sender
 # get exactly that — the egress reader is opt-in. Enable
-# `sync-reader-ws` explicitly (in Cargo.toml or via `--features`) to
+# `sync-reader-qwp-ws` explicitly (in Cargo.toml or via `--features`) to
 # bring the `reader_*` symbols back in.
 default = []
 # Expose the config parsing C API.
@@ -44,8 +47,12 @@ confstr-ffi = ["dep:questdb-confstr-ffi"]
 # Opt-in (NOT a default feature) so existing builds of `questdb-rs-ffi`
 # don't silently grow ~70 new exported symbols + a WebSocket transport
 # dependency. The in-tree CMake build enables it via
-# `corrosion_import_crate(FEATURES sync-reader-ws ...)`.
-sync-reader-ws = ["questdb-rs/sync-reader-ws", "questdb-rs/compression-zstd"]
+# `corrosion_import_crate(FEATURES sync-reader-qwp-ws ...)`.
+sync-reader-qwp-ws = ["questdb-rs/sync-reader-qwp-ws", "questdb-rs/sync-reader-zstd"]
+
+# DEPRECATED back-compat alias for the pre-rename feature name. Slated for
+# removal in the next major; migrate to `sync-reader-qwp-ws`.
+sync-reader-ws = ["sync-reader-qwp-ws"]
 
 # Apache Arrow integration (egress + ingress over QWP/WS). Adds the
 # `reader_cursor_next_arrow_batch` C export (egress) and the
@@ -53,7 +60,7 @@ sync-reader-ws = ["questdb-rs/sync-reader-ws", "questdb-rs/compression-zstd"]
 # exports (ingress), plus the Arrow C Data Interface struct
 # declarations. See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
 arrow = [
-    "sync-reader-ws",
+    "sync-reader-qwp-ws",
     "questdb-rs/arrow",
     "questdb-rs/sync-sender-qwp-ws",
     "dep:arrow",

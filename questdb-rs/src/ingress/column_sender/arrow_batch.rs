@@ -196,35 +196,35 @@ pub(crate) fn apply_overrides(
         match **ov {
             ArrowColumnOverride::Symbol { .. } => {
                 md.insert(
-                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
+                    crate::arrow_meta::COLUMN_TYPE.to_string(),
                     "symbol".to_string(),
                 );
                 md.insert(
-                    crate::egress::arrow::metadata::SYMBOL.to_string(),
+                    crate::arrow_meta::SYMBOL.to_string(),
                     "true".to_string(),
                 );
             }
             ArrowColumnOverride::NotSymbol { .. } => {
                 md.insert(
-                    crate::egress::arrow::metadata::SYMBOL.to_string(),
+                    crate::arrow_meta::SYMBOL.to_string(),
                     "false".to_string(),
                 );
             }
             ArrowColumnOverride::Ipv4 { .. } => {
                 md.insert(
-                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
+                    crate::arrow_meta::COLUMN_TYPE.to_string(),
                     "ipv4".to_string(),
                 );
             }
             ArrowColumnOverride::Char { .. } => {
                 md.insert(
-                    crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
+                    crate::arrow_meta::COLUMN_TYPE.to_string(),
                     "char".to_string(),
                 );
             }
             ArrowColumnOverride::Geohash { bits, .. } => {
                 md.insert(
-                    crate::egress::arrow::metadata::GEOHASH_BITS.to_string(),
+                    crate::arrow_meta::GEOHASH_BITS.to_string(),
                     bits.to_string(),
                 );
             }
@@ -318,24 +318,24 @@ pub(crate) enum ColumnKind {
 pub(crate) fn classify(field: &Field, _array: &dyn Array) -> Result<ColumnKind> {
     let md_type = field
         .metadata()
-        .get(crate::egress::arrow::metadata::COLUMN_TYPE)
+        .get(crate::arrow_meta::COLUMN_TYPE)
         .map(String::as_str);
     let md_ext = field
         .metadata()
-        .get(crate::egress::arrow::metadata::ARROW_EXTENSION_NAME)
+        .get(crate::arrow_meta::ARROW_EXTENSION_NAME)
         .map(String::as_str);
     let md_geo_bits = field
         .metadata()
-        .get(crate::egress::arrow::metadata::GEOHASH_BITS)
+        .get(crate::arrow_meta::GEOHASH_BITS)
         .and_then(|s| s.parse::<u8>().ok());
     let wants_symbol = md_type == Some("symbol")
         || field
             .metadata()
-            .get(crate::egress::arrow::metadata::SYMBOL)
+            .get(crate::arrow_meta::SYMBOL)
             .is_some_and(|v| v == "true");
     let wants_not_symbol = field
         .metadata()
-        .get(crate::egress::arrow::metadata::SYMBOL)
+        .get(crate::arrow_meta::SYMBOL)
         .is_some_and(|v| v == "false");
     let check_geohash_width = |bits: u8, max_bits: u8, dtype_name: &str| -> Result<u8> {
         if bits == 0 || bits > max_bits {
@@ -4015,7 +4015,7 @@ mod tests {
         sb.append_value("AAPL");
         let mut md = std::collections::HashMap::new();
         md.insert(
-            crate::egress::arrow::metadata::COLUMN_TYPE.to_string(),
+            crate::arrow_meta::COLUMN_TYPE.to_string(),
             "symbol".to_string(),
         );
         let f = Field::new("sym", DataType::Utf8, false).with_metadata(md);
@@ -4125,11 +4125,11 @@ mod tests {
             Field::new("int", DataType::Int32, true),
             Field::new("long", DataType::Int64, true),
             Field::new("char_u16", DataType::UInt16, true).with_metadata(metadata(&[(
-                crate::egress::arrow::metadata::COLUMN_TYPE,
+                crate::arrow_meta::COLUMN_TYPE,
                 "char",
             )])),
             Field::new("ipv4", DataType::UInt32, true).with_metadata(metadata(&[(
-                crate::egress::arrow::metadata::COLUMN_TYPE,
+                crate::arrow_meta::COLUMN_TYPE,
                 "ipv4",
             )])),
         ];
@@ -4209,7 +4209,7 @@ mod tests {
         .unwrap();
         let field =
             Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(metadata(&[(
-                crate::egress::arrow::metadata::ARROW_EXTENSION_NAME,
+                crate::arrow_meta::ARROW_EXTENSION_NAME,
                 "arrow.uuid",
             )]));
         let rb = single_col_batch(field, b.finish());
@@ -4246,7 +4246,7 @@ mod tests {
             true,
         )
         .with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::SYMBOL,
+            crate::arrow_meta::SYMBOL,
             "true",
         )]));
         let rb = single_col_batch(field, b.finish());
@@ -4273,7 +4273,7 @@ mod tests {
         let mut b = Int32Builder::new();
         b.append_value(0x0001_FFFF);
         let field = Field::new("g", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::GEOHASH_BITS,
+            crate::arrow_meta::GEOHASH_BITS,
             "20",
         )]));
         let rb = single_col_batch(field, b.finish());
@@ -4735,7 +4735,7 @@ mod tests {
         sb.append_value("A");
         sb.append_value("B");
         let field = Field::new("s", DataType::Utf8, false).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::COLUMN_TYPE,
+            crate::arrow_meta::COLUMN_TYPE,
             "symbol",
         )]));
         let rb = single_col_batch(field, sb.finish());
@@ -4762,7 +4762,7 @@ mod tests {
         sb.append_value("x");
         sb.append_value("y");
         let field = Field::new("s", DataType::Utf8, false).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::SYMBOL,
+            crate::arrow_meta::SYMBOL,
             "true",
         )]));
         let rb = single_col_batch(field, sb.finish());
@@ -4798,7 +4798,7 @@ mod tests {
         b.append_value(0x1234);
         b.append_null();
         let field = Field::new("g", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::GEOHASH_BITS,
+            crate::arrow_meta::GEOHASH_BITS,
             "20",
         )]));
         let rb = single_col_batch(field, b.finish());
@@ -4912,7 +4912,7 @@ mod tests {
     #[test]
     fn int8_byte_metadata_override_preserves_byte_wire() {
         let field = Field::new("v", DataType::Int8, true).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::COLUMN_TYPE,
+            crate::arrow_meta::COLUMN_TYPE,
             "byte",
         )]));
         let arr = arrow_array::Int8Array::from(vec![1i8, 2, 3]);
@@ -4924,7 +4924,7 @@ mod tests {
     #[test]
     fn int16_short_metadata_override_preserves_short_wire() {
         let field = Field::new("v", DataType::Int16, true).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::COLUMN_TYPE,
+            crate::arrow_meta::COLUMN_TYPE,
             "short",
         )]));
         let arr = arrow_array::Int16Array::from(vec![1i16, 2, 3]);
@@ -4936,7 +4936,7 @@ mod tests {
     #[test]
     fn int32_int_metadata_override_preserves_int_wire() {
         let field = Field::new("v", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::COLUMN_TYPE,
+            crate::arrow_meta::COLUMN_TYPE,
             "int",
         )]));
         let arr = arrow_array::Int32Array::from(vec![1i32, 2, 3]);
@@ -5097,7 +5097,7 @@ mod tests {
             true,
         )
         .with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::SYMBOL,
+            crate::arrow_meta::SYMBOL,
             "true",
         )]));
         let rb = single_col_batch(field, dict);
@@ -5674,7 +5674,7 @@ mod tests {
             true,
         )
         .with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::SYMBOL,
+            crate::arrow_meta::SYMBOL,
             "true",
         )]));
         let rb = single_col_batch(field, dict);
@@ -5722,7 +5722,7 @@ mod tests {
             true,
         )
         .with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::SYMBOL,
+            crate::arrow_meta::SYMBOL,
             "true",
         )]));
         let rb = single_col_batch(field, dict);
@@ -5954,7 +5954,7 @@ mod tests {
         // `questdb.column_type=int` pins the 4-byte INT path; a plain
         // Int32 would default-widen to LONG (covered separately below).
         let field = Field::new("v", DataType::Int32, false).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::COLUMN_TYPE,
+            crate::arrow_meta::COLUMN_TYPE,
             "int",
         )]));
         let rb = single_col_batch(field, sliced);
@@ -6112,7 +6112,7 @@ mod tests {
         let full = b.finish();
         let sliced = full.slice(2, 4); // idx [2,6) = [20, null, 30, 40]
         let field = Field::new("v", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::COLUMN_TYPE,
+            crate::arrow_meta::COLUMN_TYPE,
             "int",
         )]));
         let rb = single_col_batch(field, sliced);
@@ -6431,7 +6431,7 @@ mod tests {
         let mut b = Int64Builder::new();
         b.append_value(0x0FFF_FFFF_FFFF_FFFF);
         let field = Field::new("g", DataType::Int64, true).with_metadata(metadata(&[(
-            crate::egress::arrow::metadata::GEOHASH_BITS,
+            crate::arrow_meta::GEOHASH_BITS,
             "60",
         )]));
         let rb = single_col_batch(field, b.finish());
@@ -6580,7 +6580,7 @@ mod tests {
         let mut sb = StringBuilder::new();
         sb.append_value("AAPL");
         let id_md = metadata(&[(
-            crate::egress::arrow::metadata::ARROW_EXTENSION_NAME,
+            crate::arrow_meta::ARROW_EXTENSION_NAME,
             "arrow.uuid",
         )]);
         let id_field = Field::new("id", DataType::Int64, true).with_metadata(id_md);
@@ -6600,7 +6600,7 @@ mod tests {
         assert_eq!(
             id_after
                 .metadata()
-                .get(crate::egress::arrow::metadata::ARROW_EXTENSION_NAME)
+                .get(crate::arrow_meta::ARROW_EXTENSION_NAME)
                 .map(String::as_str),
             Some("arrow.uuid"),
             "unrelated extension metadata stripped: {:?}",
@@ -6610,7 +6610,7 @@ mod tests {
         assert_eq!(
             sym_after
                 .metadata()
-                .get(crate::egress::arrow::metadata::SYMBOL)
+                .get(crate::arrow_meta::SYMBOL)
                 .map(String::as_str),
             Some("true")
         );

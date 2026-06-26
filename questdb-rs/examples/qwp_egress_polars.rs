@@ -32,10 +32,10 @@
 //!
 //! ```bash
 //! cargo run --release --example qwp_egress_polars \
-//!     --features polars,sync-reader-ws,sync-sender-http
+//!     --features polars,sync-reader-qwp-ws,sync-sender-http
 //! ```
 //!
-//! (The `polars` feature pulls in `sync-sender-qwp-ws` + `sync-reader-ws`;
+//! (The `polars` feature pulls in `sync-sender-qwp-ws` + `sync-reader-qwp-ws`;
 //! `sync-sender-http` is for the table create + WAL count gate.)
 //!
 //! For **S2 wide** populate, launch the server with

@@ -44,6 +44,19 @@ mod keystore_roots;
 
 pub mod ingress;
 
+// Transport-neutral Arrow field-metadata keys, shared by the ingress encoder
+// and the egress adapter. Homed here so a sender-only `arrow-ingress` build
+// can use them without compiling the egress reader.
+#[cfg(feature = "_arrow")]
+#[doc(hidden)]
+pub mod arrow_meta;
+
+// Transport-neutral arrow<->polars_arrow FFI bridges, shared by both polars
+// directions.
+#[cfg(feature = "_polars")]
+#[doc(hidden)]
+pub(crate) mod polars_ffi;
+
 #[cfg(feature = "_egress")]
 pub mod egress;
 

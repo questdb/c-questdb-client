@@ -29,7 +29,7 @@
 //! from QuestDB. The module bundles the wire codec foundation (frame
 //! header, varint, message kinds, column type codes, errors), the
 //! `RESULT_BATCH` decoder and column views, the symbol dict and
-//! per-query schema, and — when `sync-reader-ws` is enabled — the WebSocket
+//! per-query schema, and — when `sync-reader-qwp-ws` is enabled — the WebSocket
 //! transport and `Reader`/`Cursor`/`BatchView` streaming API.
 
 // Sub-modules.
@@ -44,7 +44,7 @@
 // are surfaced via the top-level `pub use` block below; everything
 // else stays internal and is free to evolve without a breaking
 // change.
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-egress")]
 pub mod arrow;
 pub(crate) mod auth;
 pub(crate) mod binds;
@@ -55,19 +55,19 @@ pub(crate) mod decoder;
 pub mod error;
 pub(crate) mod gorilla;
 pub(crate) mod query_request;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub mod reader;
 pub(crate) mod schema;
 pub(crate) mod server_event;
 pub(crate) mod symbol_dict;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod tls;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod tracker;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod transport;
 pub mod wire;
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub(crate) mod ws;
 
 // Top-level public surface. Anything not listed here is either
@@ -90,7 +90,7 @@ pub use config::{
     MAX_FAILOVER_MAX_ATTEMPTS, MIN_COMPRESSION_LEVEL, ReaderConfig, Target, TlsVerify,
 };
 pub use error::{Error, ErrorCode, Result};
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub use reader::{
     BatchView, Cursor, FailoverEvent, FailoverPhase, FailoverProgressEvent, Reader, ReaderQuery,
     ReaderStats, Terminal,
@@ -105,7 +105,7 @@ pub use symbol_dict::{SymbolDict, SymbolEntry};
 /// removed without notice; everything in here moves on the same
 /// stability footing as `pub(crate)`.
 #[doc(hidden)]
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 pub mod _bench_internals {
     pub use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
     pub use crate::egress::schema::Schema;
@@ -119,7 +119,7 @@ pub mod _bench_internals {
     /// benchmark can isolate the column-build cost on top of the raw
     /// decode. The egress `schema` and `dict` are the ones
     /// [`decode_result_batch`] populated for the same payload.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-egress")]
     pub fn bench_batch_to_record_batch(
         schema: &Schema,
         batch: DecodedBatch,
@@ -136,7 +136,7 @@ pub mod _bench_internals {
     /// to polars via the Arrow C Data Interface
     /// (`record_batch_to_dataframe`). This is the honest
     /// `decode_plus_assemble`-to-DataFrame microbench with no network.
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-egress")]
     pub fn bench_batch_to_polars(
         schema: &Schema,
         batch: DecodedBatch,

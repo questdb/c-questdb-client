@@ -36,7 +36,7 @@ use std::slice;
 use crate::ingress::buffer::SymbolGlobalDict;
 use crate::{Result, error};
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 use super::arrow_batch;
 use super::chunk::{
     Chunk, ColumnDescriptor, ColumnKind, DesignatedTsDescriptor, SymbolCodesPtr, ValidityDescriptor,
@@ -264,7 +264,7 @@ fn replay_symbol_dense_count(per_column: &[Option<ResolvedColumn>]) -> Result<us
                     }
                 }
             }
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-ingress")]
             ResolvedColumn::Arrow(arrow) => {
                 for &gid in &arrow.gids {
                     highest = Some(highest.map_or(gid, |h| h.max(gid)));
@@ -412,7 +412,7 @@ fn estimate_frame_size(
                 .saturating_mul(4)
                 .saturating_add(bytes_len),
             ColumnKind::Symbol { .. } => row_count.saturating_mul(5),
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-ingress")]
             ColumnKind::ArrowDeferred { ref arr, .. } => arr.get_buffer_memory_size(),
             ColumnKind::NumpyDeferred { dtype, .. } => {
                 dtype.bytes_per_row().saturating_mul(row_count)
@@ -468,7 +468,7 @@ pub(crate) enum ResolvedColumn {
     Row(RowResolvedSymbol),
     /// `ColumnKind::ArrowDeferred` whose `arrow_kind` is a symbol
     /// variant. Per-non-null-row global ids are pre-computed.
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     Arrow(arrow_batch::ArrowResolvedSymbolColumn),
 }
 
@@ -558,7 +558,7 @@ fn resolve_symbols(
                     non_null_count,
                 })));
             }
-            #[cfg(feature = "arrow")]
+            #[cfg(feature = "arrow-ingress")]
             ColumnKind::ArrowDeferred {
                 arrow_kind,
                 ref arr,
@@ -690,7 +690,7 @@ unsafe fn encode_column(
                 encode_symbol(out, codes, resolved, row_count, validity);
             }
         }
-        #[cfg(feature = "arrow")]
+        #[cfg(feature = "arrow-ingress")]
         ColumnKind::ArrowDeferred {
             arrow_kind,
             ref arr,
@@ -1412,7 +1412,7 @@ mod tests {
         &bytes[start..start + len]
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     #[test]
     fn arrow_deferred_i64_column_matches_row_by_row() {
         use crate::ingress::column_sender::arrow_batch;
@@ -1440,7 +1440,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     #[test]
     fn arrow_deferred_symbol_column_interns_into_shared_dict() {
         use crate::ingress::column_sender::arrow_batch;
@@ -1465,7 +1465,7 @@ mod tests {
         assert_eq!(dict.next_id(), 2, "two unique symbols interned");
     }
 
-    #[cfg(feature = "arrow")]
+    #[cfg(feature = "arrow-ingress")]
     #[test]
     fn arrow_deferred_symbol_failure_rolls_back_dict() {
         use crate::ingress::column_sender::arrow_batch;

@@ -74,7 +74,7 @@ enum MockMode {
     /// Ack the first `n` binary frames, then close the socket — a peer that
     /// dies mid-stream after committing a prefix. The client's next read hits
     /// EOF and surfaces a transient (`FailoverRetry`) failure.
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-ingress")]
     AckThenClose(usize),
     /// Read (consume) the first `n` binary frames — so the client's writes
     /// provably succeed — then close **without** acking. Models a peer that
@@ -132,7 +132,7 @@ impl MockServer {
         Self::spawn_with_mode(max_accepts, MockMode::ReadThenClose(frames))
     }
 
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-ingress")]
     fn spawn_ack_then_close(max_accepts: usize, ack_first: usize) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::AckThenClose(ack_first))
     }
@@ -150,7 +150,7 @@ impl MockServer {
         (server, rx)
     }
 
-    #[cfg(feature = "polars")]
+    #[cfg(feature = "polars-ingress")]
     fn spawn_acking_on_port_after_delay(port: u16, max_accepts: usize, delay: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -272,7 +272,7 @@ fn run_mock_server_accept_loop(
                                 // Drop the stream immediately: the client's
                                 // next read sees EOF.
                             }
-                            #[cfg(feature = "polars")]
+                            #[cfg(feature = "polars-ingress")]
                             MockMode::AckThenClose(n) => ack_then_close(&mut stream, &stop, n),
                             MockMode::ReadThenClose(n) => read_then_close(&mut stream, &stop, n),
                         }
@@ -466,7 +466,7 @@ fn ack_when_released(
 /// Ack the first `n` binary frames the client sends, then close the socket so
 /// the client's next read hits EOF. Models a peer that commits a prefix and
 /// then dies mid-stream.
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 fn ack_then_close(stream: &mut std::net::TcpStream, stop: &AtomicBool, n: usize) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let mut next_wire_seq: u64 = 0;
@@ -2352,7 +2352,7 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
 
 // ---------- F1: retry-from-source at the DataFrame entry ----------
 
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
     // A QWP data frame carries `table_count >= 1` at bytes 6..8; the
     // header-only commit frame the `sync` sends has `table_count == 0`.
@@ -2366,7 +2366,7 @@ fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
 // is checked for the exact rows it lands, not just the frame count. Layout:
 // 12-byte header, delta-dict prefix, table, row/col counts, signature, then
 // the column body `flag(0) + row_count * i64_le`.
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
     fn varint(f: &[u8], pos: &mut usize) -> u64 {
         let (mut shift, mut value) = (0u32, 0u64);
@@ -2411,7 +2411,7 @@ fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
     rows
 }
 
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 #[test]
 fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     use crate::ingress::polars::PolarsIngestOptions;
@@ -2461,7 +2461,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     );
 }
 
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 #[test]
 fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     use crate::ingress::polars::PolarsIngestOptions;
@@ -2514,7 +2514,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     );
 }
 
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 #[test]
 fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     use crate::ingress::polars::PolarsIngestOptions;
@@ -2558,7 +2558,7 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     );
 }
 
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 #[test]
 fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     use crate::ingress::polars::PolarsIngestOptions;
@@ -2588,7 +2588,7 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     );
 }
 
-#[cfg(feature = "polars")]
+#[cfg(feature = "polars-ingress")]
 #[test]
 fn flush_polars_dataframe_applies_column_overrides() {
     use crate::ingress::column_sender::ArrowColumnOverride;
@@ -2627,14 +2627,14 @@ fn flush_polars_dataframe_applies_column_overrides() {
 /// Reader-pool (egress) ergonomic API tests: [`QuestDb::borrow_reader`] /
 /// [`crate::BorrowedReader`].
 ///
-/// Gated on `sync-reader-ws` (which provides `Reader` and implies `_egress`).
+/// Gated on `sync-reader-qwp-ws` (which provides `Reader` and implies `_egress`).
 /// The mock endpoint completes the WS upgrade (QWP version 1), emits one
 /// minimal `SERVER_INFO` frame — the reader's first expected frame at connect
 /// — then parks the connection, draining to EOF. That is enough to drive
 /// pool borrow / return / grow / reap / cap mechanics without a full query
 /// round-trip. The same endpoint also satisfies the column-sender eager-open
 /// at `connect` (which ignores the unsolicited `SERVER_INFO` while parked).
-#[cfg(feature = "sync-reader-ws")]
+#[cfg(feature = "sync-reader-qwp-ws")]
 mod reader_pool {
     use std::net::TcpListener;
     use std::sync::Arc;

@@ -51,7 +51,7 @@
 //! sender.flush_and_wait(&mut chunk, AckLevel::Ok)?;
 //! ```
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 mod arrow_batch;
 mod chunk;
 pub(crate) mod conf;
@@ -62,10 +62,10 @@ mod sender;
 mod validity;
 mod wire;
 
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 pub use arrow_batch::ArrowColumnOverride;
 pub use chunk::Chunk;
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 pub use chunk::ImportedArrowColumn;
 pub use numpy_wire::NumpyDtype;
 pub use sender::{AckLevel, ColumnSender};

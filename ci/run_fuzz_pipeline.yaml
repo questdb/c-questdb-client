@@ -251,14 +251,14 @@ stages:
               # invocation per scope so the proptest modules in src/egress/
               # actually run.
               PROPTEST_CASES=10000 cargo test --release \
-                --features sync-reader-ws \
+                --features sync-reader-qwp-ws \
                 --test qwp_egress_bounds_fuzz \
                 --test qwp_egress_fragmentation_fuzz
               PROPTEST_CASES=10000 cargo test --release \
-                --features sync-reader-ws \
+                --features sync-reader-qwp-ws \
                 --lib egress::binds::tests
               PROPTEST_CASES=10000 cargo test --release \
-                --features sync-reader-ws \
+                --features sync-reader-qwp-ws \
                 --lib egress::decoder::tests
             displayName: "Run QWP egress fuzz suite"
 

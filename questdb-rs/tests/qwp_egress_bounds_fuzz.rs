@@ -42,7 +42,7 @@
 //! Wire layout mirrored from the encoder side in `benches/decoder.rs` so
 //! the synthesised payload decodes cleanly before the fuzz loop starts.
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use proptest::prelude::*;
 

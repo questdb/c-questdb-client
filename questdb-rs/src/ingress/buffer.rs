@@ -37,7 +37,7 @@ pub(crate) use self::ilp::Buffer as IlpBuffer;
 #[allow(unused_imports)]
 pub(crate) use self::ilp::F64Serializer;
 
-#[cfg(all(feature = "_sender-qwp-ws", feature = "arrow"))]
+#[cfg(all(feature = "_sender-qwp-ws", feature = "arrow-ingress"))]
 pub(crate) use self::qwp::QWP_DECIMAL_MAX_SCALE;
 #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
 pub(crate) use self::qwp::QwpBuffer;
@@ -50,7 +50,7 @@ pub(crate) use self::qwp::{
 // `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
 // `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
 // build without `arrow` would otherwise carry an unused import.
-#[cfg(feature = "arrow")]
+#[cfg(feature = "arrow-ingress")]
 pub(crate) use self::qwp::QwpWsSymbolHasher;
 
 static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);

@@ -1068,7 +1068,7 @@ impl Buffer {
     /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
     /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
     ///
-    /// This last option requires the `chrono_timestamp` feature.
+    /// This last option requires the `chrono-timestamp` feature.
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,

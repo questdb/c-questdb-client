@@ -5,7 +5,7 @@
 //!
 //! Run with:
 //!     cargo run --release --example qwp_egress_failover \
-//!         --features sync-reader-ws \
+//!         --features sync-reader-qwp-ws \
 //!         -- "ws::addr=db-a:9000,db-b:9000,db-c:9000;target=primary" "SELECT 1"
 //!
 //! When ANY of the endpoints in the address list dies mid-query (peer
