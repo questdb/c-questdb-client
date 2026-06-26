@@ -186,3 +186,12 @@ class CClientRustColumnSidecar(CClientRustSidecar):
 
     def _default_binary(self) -> Path:
         return build_qwp_column_sidecar()
+
+    def send(self, table: str, count: int, start_index: int = 0,
+             src: str = "chunk") -> None:
+        """Column-major SEND with an explicit input shape. ``src`` is ``chunk``
+        (default; a borrowed-slice ``Chunk``) or ``arrow`` (an Arrow
+        ``RecordBatch``); the sidecar builds the matching column-major frame at
+        FLUSH. Both encode to the same QWP/WebSocket columnar wire."""
+        self._send(f"SEND {table} {count} {start_index} {src}")
+        self._expect_ok()

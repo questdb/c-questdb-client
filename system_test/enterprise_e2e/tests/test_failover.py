@@ -138,7 +138,9 @@ def test_kill9_primary_failover_no_data_loss_c_client_rust(
 
 @pytest.mark.c_client
 @pytest.mark.c_client_rust
+@pytest.mark.parametrize("src", ["chunk", "arrow"])
 def test_kill9_primary_failover_no_data_loss_c_client_rust_columnar(
+    src: str,
     server_factory,
     c_client_rust_column_sidecar: CClientRustColumnSidecar,
     obj_store,
@@ -147,12 +149,15 @@ def test_kill9_primary_failover_no_data_loss_c_client_rust_columnar(
     """Failover scenario driven by the c-questdb-client Rust binding's
     column-major (``ColumnSender``) QWP/WebSocket path. Same body as the
     row-major test -- kill -9 P1, wipe disk + object store, bring P2 up on
-    the same port -- but the sender appends a column-major ``Chunk`` over a
+    the same port -- but the sender ingests a column-major frame over a
     store-and-forward connection. Asserts P2 ends up with every row.
 
-    The schema (single LONG ``v`` + designated timestamp) matches the
-    row-major test, so the same ``wait_for_dense_sequence`` oracle applies."""
-    table = "trades_failover_c_client_rust_columnar"
+    ``src`` parametrizes the input shape: ``chunk`` (a borrowed-slice
+    ``Chunk``) or ``arrow`` (an Arrow ``RecordBatch``); both encode to the
+    same columnar wire. The schema (single LONG ``v`` + designated timestamp)
+    matches the row-major test, so the same ``wait_for_dense_sequence`` oracle
+    applies."""
+    table = f"trades_failover_c_client_rust_columnar_{src}"
     row_count = 50
     sf_dir = scenario_dir / "sf"
 
@@ -160,7 +165,7 @@ def test_kill9_primary_failover_no_data_loss_c_client_rust_columnar(
     p1_ports = p1.start()
 
     c_client_rust_column_sidecar.connect(_connect_string_columnar(p1_ports.http, sf_dir))
-    c_client_rust_column_sidecar.send(table, count=row_count, start_index=0)
+    c_client_rust_column_sidecar.send(table, count=row_count, start_index=0, src=src)
     c_client_rust_column_sidecar.flush()
 
     # Brief settle so P1 has a chance to OK the batch before the kill.

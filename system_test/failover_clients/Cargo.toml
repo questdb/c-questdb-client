@@ -18,6 +18,12 @@ publish = false
 #   - qwp_sidecar        — line-protocol ingress sender driven by the
 #                          questdb-enterprise e2e harness (Rust port of
 #                          com.questdb.e2e.QwpSidecarMain)
+#   - qwp_column_sidecar — same protocol, column-major (ColumnSender) sender;
+#                          SEND src selects the chunk | arrow input shape
 
 [dependencies]
-questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-ws", "sync-sender-qwp-ws"] }
+questdb-rs = { path = "../../questdb-rs", features = ["sync-reader-ws", "sync-sender-qwp-ws", "arrow"] }
+# Construct Arrow RecordBatches for qwp_column_sidecar's `SEND ... arrow` path.
+# Same major as questdb-rs's `arrow` dep so the RecordBatch type unifies.
+arrow-array = "58"
+arrow-schema = "58"
