@@ -54,10 +54,11 @@ def _resolve_client_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _build_failover_bin(bin_name: str) -> Path:
+def _build_failover_bin(bin_name: str, features: Optional[str] = None) -> Path:
     """Build (idempotently) a binary from the ``failover_clients`` crate and
     return its absolute path. Cargo no-ops when the target is already up to
-    date, so this is cheap to call from a session fixture."""
+    date, so this is cheap to call from a session fixture. ``features`` enables
+    optional crate features (e.g. ``polars``)."""
     client_root = _resolve_client_root()
     manifest = client_root / "system_test" / "failover_clients" / "Cargo.toml"
     if not manifest.is_file():
@@ -72,6 +73,8 @@ def _build_failover_bin(bin_name: str) -> Path:
         "--bin",
         bin_name,
     ]
+    if features:
+        cmd += ["--features", features]
     if profile == "release":
         cmd.insert(2, "--release")
     elif profile != "debug":
@@ -107,8 +110,12 @@ def build_qwp_sidecar() -> Path:
 
 
 def build_qwp_column_sidecar() -> Path:
-    """Build the column-major ``qwp_column_sidecar`` binary."""
-    return _build_failover_bin("qwp_column_sidecar")
+    """Build the column-major ``qwp_column_sidecar`` binary. With
+    ``C_QUESTDB_CLIENT_COLUMN_POLARS`` set, enable the heavy ``polars`` feature
+    so the ``SEND ... polars`` input shape is available; off by default to keep
+    the e2e build light."""
+    features = "polars" if os.environ.get("C_QUESTDB_CLIENT_COLUMN_POLARS") else None
+    return _build_failover_bin("qwp_column_sidecar", features=features)
 
 
 @dataclass

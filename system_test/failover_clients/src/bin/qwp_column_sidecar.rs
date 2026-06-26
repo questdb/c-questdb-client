@@ -47,6 +47,8 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use questdb::QuestDb;
 use questdb::ingress::ColumnName;
 use questdb::ingress::column_sender::{AckLevel, Chunk};
+#[cfg(feature = "polars")]
+use questdb::ingress::polars::PolarsIngestOptions;
 
 fn main() {
     let stdin = std::io::stdin();
@@ -108,6 +110,8 @@ enum SendSrc {
     #[default]
     Chunk,
     Arrow,
+    #[cfg(feature = "polars")]
+    Polars,
 }
 
 impl State {
@@ -153,6 +157,8 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             let src = match parts.get(3).copied() {
                 None | Some("chunk") => SendSrc::Chunk,
                 Some("arrow") => SendSrc::Arrow,
+                #[cfg(feature = "polars")]
+                Some("polars") => SendSrc::Polars,
                 Some(other) => return Err(format!("unknown SEND src: {other}")),
             };
 
@@ -207,6 +213,19 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                             )
                             .map_err(|e| e.to_string())?;
                     }
+                    #[cfg(feature = "polars")]
+                    SendSrc::Polars => {
+                        let df = build_polars_df(&state.v, &state.ts)?;
+                        let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
+                        let opts = PolarsIngestOptions::new().timestamp_column(ts_col);
+                        // flush_polars_dataframe owns the commit, ACKing each
+                        // checkpoint at the server `Ok` watermark (not durable),
+                        // so the store-and-forward backend still replays to the
+                        // successor after the kill.
+                        sender
+                            .flush_polars_dataframe(table.as_str(), &df, &opts)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
             state.v.clear();
@@ -243,6 +262,19 @@ fn build_arrow_batch(v: &[i64], ts: &[i64]) -> Result<RecordBatch, String> {
         Arc::new(TimestampMicrosecondArray::from(ts.to_vec())),
     ];
     RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
+}
+
+/// Build a polars `DataFrame` with a `v` LONG column and a `ts`
+/// microsecond-`Datetime` column — the same schema the other shapes use.
+#[cfg(feature = "polars")]
+fn build_polars_df(v: &[i64], ts: &[i64]) -> Result<polars::frame::DataFrame, String> {
+    use polars::prelude::*;
+    let v_col = Series::new(PlSmallStr::from("v"), v).into_column();
+    let ts_col = Series::new(PlSmallStr::from("ts"), ts)
+        .cast(&DataType::Datetime(TimeUnit::Microseconds, None))
+        .map_err(|e| e.to_string())?
+        .into_column();
+    DataFrame::new_with_height(v.len(), vec![v_col, ts_col]).map_err(|e| e.to_string())
 }
 
 fn reply_ok(out: &mut impl Write, payload: &str) -> Result<(), String> {
