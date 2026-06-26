@@ -199,16 +199,10 @@ pub(crate) fn apply_overrides(
                     crate::arrow_meta::COLUMN_TYPE.to_string(),
                     "symbol".to_string(),
                 );
-                md.insert(
-                    crate::arrow_meta::SYMBOL.to_string(),
-                    "true".to_string(),
-                );
+                md.insert(crate::arrow_meta::SYMBOL.to_string(), "true".to_string());
             }
             ArrowColumnOverride::NotSymbol { .. } => {
-                md.insert(
-                    crate::arrow_meta::SYMBOL.to_string(),
-                    "false".to_string(),
-                );
+                md.insert(crate::arrow_meta::SYMBOL.to_string(), "false".to_string());
             }
             ArrowColumnOverride::Ipv4 { .. } => {
                 md.insert(
@@ -4124,14 +4118,10 @@ mod tests {
             Field::new("short", DataType::Int16, true),
             Field::new("int", DataType::Int32, true),
             Field::new("long", DataType::Int64, true),
-            Field::new("char_u16", DataType::UInt16, true).with_metadata(metadata(&[(
-                crate::arrow_meta::COLUMN_TYPE,
-                "char",
-            )])),
-            Field::new("ipv4", DataType::UInt32, true).with_metadata(metadata(&[(
-                crate::arrow_meta::COLUMN_TYPE,
-                "ipv4",
-            )])),
+            Field::new("char_u16", DataType::UInt16, true)
+                .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "char")])),
+            Field::new("ipv4", DataType::UInt32, true)
+                .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "ipv4")])),
         ];
         let rb = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), cols).unwrap();
         assert_ok_with_table_count(&rb, 1);
@@ -4207,11 +4197,9 @@ mod tests {
             0x0F, 0x10,
         ])
         .unwrap();
-        let field =
-            Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(metadata(&[(
-                crate::arrow_meta::ARROW_EXTENSION_NAME,
-                "arrow.uuid",
-            )]));
+        let field = Field::new("id", DataType::FixedSizeBinary(16), true).with_metadata(metadata(
+            &[(crate::arrow_meta::ARROW_EXTENSION_NAME, "arrow.uuid")],
+        ));
         let rb = single_col_batch(field, b.finish());
         assert_ok_with_table_count(&rb, 1);
     }
@@ -4245,10 +4233,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
             true,
         )
-        .with_metadata(metadata(&[(
-            crate::arrow_meta::SYMBOL,
-            "true",
-        )]));
+        .with_metadata(metadata(&[(crate::arrow_meta::SYMBOL, "true")]));
         let rb = single_col_batch(field, b.finish());
         let out = encode(&rb);
         assert_qwp_header(&out, 1);
@@ -4272,10 +4257,8 @@ mod tests {
     fn geohash_routes_via_metadata() {
         let mut b = Int32Builder::new();
         b.append_value(0x0001_FFFF);
-        let field = Field::new("g", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::arrow_meta::GEOHASH_BITS,
-            "20",
-        )]));
+        let field = Field::new("g", DataType::Int32, true)
+            .with_metadata(metadata(&[(crate::arrow_meta::GEOHASH_BITS, "20")]));
         let rb = single_col_batch(field, b.finish());
         assert_ok_with_table_count(&rb, 1);
     }
@@ -4734,10 +4717,8 @@ mod tests {
         sb.append_value("B");
         sb.append_value("A");
         sb.append_value("B");
-        let field = Field::new("s", DataType::Utf8, false).with_metadata(metadata(&[(
-            crate::arrow_meta::COLUMN_TYPE,
-            "symbol",
-        )]));
+        let field = Field::new("s", DataType::Utf8, false)
+            .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "symbol")]));
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
@@ -4761,10 +4742,8 @@ mod tests {
         let mut sb = StringBuilder::new();
         sb.append_value("x");
         sb.append_value("y");
-        let field = Field::new("s", DataType::Utf8, false).with_metadata(metadata(&[(
-            crate::arrow_meta::SYMBOL,
-            "true",
-        )]));
+        let field = Field::new("s", DataType::Utf8, false)
+            .with_metadata(metadata(&[(crate::arrow_meta::SYMBOL, "true")]));
         let rb = single_col_batch(field, sb.finish());
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
@@ -4797,10 +4776,8 @@ mod tests {
         let mut b = Int32Builder::new();
         b.append_value(0x1234);
         b.append_null();
-        let field = Field::new("g", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::arrow_meta::GEOHASH_BITS,
-            "20",
-        )]));
+        let field = Field::new("g", DataType::Int32, true)
+            .with_metadata(metadata(&[(crate::arrow_meta::GEOHASH_BITS, "20")]));
         let rb = single_col_batch(field, b.finish());
         assert_ok_with_table_count(&rb, 1);
     }
@@ -4911,10 +4888,8 @@ mod tests {
 
     #[test]
     fn int8_byte_metadata_override_preserves_byte_wire() {
-        let field = Field::new("v", DataType::Int8, true).with_metadata(metadata(&[(
-            crate::arrow_meta::COLUMN_TYPE,
-            "byte",
-        )]));
+        let field = Field::new("v", DataType::Int8, true)
+            .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "byte")]));
         let arr = arrow_array::Int8Array::from(vec![1i8, 2, 3]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I8));
@@ -4923,10 +4898,8 @@ mod tests {
 
     #[test]
     fn int16_short_metadata_override_preserves_short_wire() {
-        let field = Field::new("v", DataType::Int16, true).with_metadata(metadata(&[(
-            crate::arrow_meta::COLUMN_TYPE,
-            "short",
-        )]));
+        let field = Field::new("v", DataType::Int16, true)
+            .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "short")]));
         let arr = arrow_array::Int16Array::from(vec![1i16, 2, 3]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I16));
@@ -4935,10 +4908,8 @@ mod tests {
 
     #[test]
     fn int32_int_metadata_override_preserves_int_wire() {
-        let field = Field::new("v", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::arrow_meta::COLUMN_TYPE,
-            "int",
-        )]));
+        let field = Field::new("v", DataType::Int32, true)
+            .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "int")]));
         let arr = arrow_array::Int32Array::from(vec![1i32, 2, 3]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I32));
@@ -5096,10 +5067,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
             true,
         )
-        .with_metadata(metadata(&[(
-            crate::arrow_meta::SYMBOL,
-            "true",
-        )]));
+        .with_metadata(metadata(&[(crate::arrow_meta::SYMBOL, "true")]));
         let rb = single_col_batch(field, dict);
         assert_ok_with_table_count(&rb, 1);
     }
@@ -5673,10 +5641,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
             true,
         )
-        .with_metadata(metadata(&[(
-            crate::arrow_meta::SYMBOL,
-            "true",
-        )]));
+        .with_metadata(metadata(&[(crate::arrow_meta::SYMBOL, "true")]));
         let rb = single_col_batch(field, dict);
         let err = encode_err(&rb);
         assert_eq!(err.code(), ErrorCode::ArrowIngest);
@@ -5721,10 +5686,7 @@ mod tests {
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
             true,
         )
-        .with_metadata(metadata(&[(
-            crate::arrow_meta::SYMBOL,
-            "true",
-        )]));
+        .with_metadata(metadata(&[(crate::arrow_meta::SYMBOL, "true")]));
         let rb = single_col_batch(field, dict);
         assert_ok_with_table_count(&rb, 1);
     }
@@ -5953,10 +5915,8 @@ mod tests {
         assert_eq!(sliced.len(), 4);
         // `questdb.column_type=int` pins the 4-byte INT path; a plain
         // Int32 would default-widen to LONG (covered separately below).
-        let field = Field::new("v", DataType::Int32, false).with_metadata(metadata(&[(
-            crate::arrow_meta::COLUMN_TYPE,
-            "int",
-        )]));
+        let field = Field::new("v", DataType::Int32, false)
+            .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "int")]));
         let rb = single_col_batch(field, sliced);
         let out = encode(&rb);
         assert_qwp_header(&out, 1);
@@ -6111,10 +6071,8 @@ mod tests {
         b.append_value(50);
         let full = b.finish();
         let sliced = full.slice(2, 4); // idx [2,6) = [20, null, 30, 40]
-        let field = Field::new("v", DataType::Int32, true).with_metadata(metadata(&[(
-            crate::arrow_meta::COLUMN_TYPE,
-            "int",
-        )]));
+        let field = Field::new("v", DataType::Int32, true)
+            .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "int")]));
         let rb = single_col_batch(field, sliced);
         let out = encode(&rb);
         let (rows, ty, body) = decode_single_column(&out);
@@ -6430,10 +6388,8 @@ mod tests {
     fn geohash_int64_bits_at_max_boundary_accepted() {
         let mut b = Int64Builder::new();
         b.append_value(0x0FFF_FFFF_FFFF_FFFF);
-        let field = Field::new("g", DataType::Int64, true).with_metadata(metadata(&[(
-            crate::arrow_meta::GEOHASH_BITS,
-            "60",
-        )]));
+        let field = Field::new("g", DataType::Int64, true)
+            .with_metadata(metadata(&[(crate::arrow_meta::GEOHASH_BITS, "60")]));
         let rb = single_col_batch(field, b.finish());
         assert_ok_with_table_count(&rb, 1);
     }
@@ -6579,10 +6535,7 @@ mod tests {
         b.append_value(1);
         let mut sb = StringBuilder::new();
         sb.append_value("AAPL");
-        let id_md = metadata(&[(
-            crate::arrow_meta::ARROW_EXTENSION_NAME,
-            "arrow.uuid",
-        )]);
+        let id_md = metadata(&[(crate::arrow_meta::ARROW_EXTENSION_NAME, "arrow.uuid")]);
         let id_field = Field::new("id", DataType::Int64, true).with_metadata(id_md);
         let sym_field = Field::new("sym", DataType::Utf8, false);
         let schema = Arc::new(ArrowSchema::new(vec![id_field, sym_field]));

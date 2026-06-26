@@ -63,7 +63,11 @@ use crate::ingress::{Sender, SenderBuilder};
 // re-export chain that feeds it stays live) but quiet the unused-import lint in
 // the plain library build that compiles neither retry path.
 #[cfg_attr(
-    not(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support")),
+    not(any(
+        feature = "polars-ingress",
+        feature = "polars-egress",
+        feature = "ffi-support"
+    )),
     allow(unused_imports)
 )]
 use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
@@ -1474,12 +1478,20 @@ fn reconnect_pick(inner: &Arc<DbInner>, deadline: Option<Instant>) -> Result<Col
     }
 }
 
-#[cfg(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support"))]
+#[cfg(any(
+    feature = "polars-ingress",
+    feature = "polars-egress",
+    feature = "ffi-support"
+))]
 fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|d| Instant::now() >= d)
 }
 
-#[cfg(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support"))]
+#[cfg(any(
+    feature = "polars-ingress",
+    feature = "polars-egress",
+    feature = "ffi-support"
+))]
 fn sleep_until_deadline(sleep_for: Duration, deadline: Option<Instant>) {
     let d = match deadline {
         Some(dl) => sleep_for.min(dl.saturating_duration_since(Instant::now())),

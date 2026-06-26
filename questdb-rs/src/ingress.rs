@@ -457,7 +457,11 @@ impl QwpWsConnector {
     /// returns stays live) but quiet the dead-code lint when neither is built.
     #[cfg(feature = "sync-sender-qwp-ws")]
     #[cfg_attr(
-        not(any(feature = "polars-ingress", feature = "polars-egress", feature = "ffi-support")),
+        not(any(
+            feature = "polars-ingress",
+            feature = "polars-egress",
+            feature = "ffi-support"
+        )),
         allow(dead_code)
     )]
     pub(crate) fn reconnect_policy(&self) -> sender::ReconnectPolicy {
