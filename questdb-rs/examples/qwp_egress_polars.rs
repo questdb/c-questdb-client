@@ -31,7 +31,7 @@
 //! Run against a QWP-schema-0x3 QuestDB with QWP/WS + HTTP on :9000:
 //!
 //! ```bash
-//! cargo +nightly run --release --example qwp_egress_polars \
+//! cargo run --release --example qwp_egress_polars \
 //!     --features polars,sync-reader-ws,sync-sender-http
 //! ```
 //!

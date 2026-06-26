@@ -331,10 +331,9 @@ required-features = ["polars", "sync-sender-qwp-ws"]
 # on the S1 narrow schema. Measures flush_polars_dataframe() e2e + the
 # column-sender encode floor and emits the §3.2 JSON metric contract
 # (client="rust-polars", direction="ingress"). Uses ureq for the DEDUP
-# table create + WAL count gate, hence sync-sender-http. The crate's
-# polars dep currently needs a nightly toolchain. Run with:
+# table create + WAL count gate, hence sync-sender-http. Run with:
 #
-#   cargo +nightly run --release --example qwp_ingress_polars \
+#   cargo run --release --example qwp_ingress_polars \
 #       --features polars,sync-sender-qwp-ws,sync-sender-http
 [[example]]
 name = "qwp_ingress_polars"
@@ -345,7 +344,7 @@ required-features = ["polars", "sync-sender-qwp-ws", "sync-sender-http"]
 # assemble vs the honest decode_plus_assemble sum, emitting the §3.2 JSON
 # (direction="egress"). Run with:
 #
-#   cargo +nightly run --release --example qwp_egress_polars \
+#   cargo run --release --example qwp_egress_polars \
 #       --features polars,sync-reader-ws,sync-sender-http
 [[example]]
 name = "qwp_egress_polars"

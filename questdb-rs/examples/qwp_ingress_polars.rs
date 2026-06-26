@@ -21,12 +21,11 @@
 //! Run against a QWP-schema-0x3 QuestDB with QWP/WS + HTTP on :9000:
 //!
 //! ```bash
-//! cargo +nightly run --release --example qwp_ingress_polars \
+//! cargo run --release --example qwp_ingress_polars \
 //!     --features polars,sync-sender-qwp-ws,sync-sender-http
 //! ```
 //!
-//! (The crate's `polars` dep currently needs a nightly toolchain; the
-//! `polars` feature already pulls in `sync-sender-qwp-ws` + `sync-reader-ws`.)
+//! (The `polars` feature already pulls in `sync-sender-qwp-ws` + `sync-reader-ws`.)
 //!
 //! For **S2 wide** the high-cardinality symbol delta-dict overflows the
 //! default `http.receive.buffer.size=1m`; launch the server with
