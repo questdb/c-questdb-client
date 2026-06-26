@@ -42,7 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# lib.sidecar comes from the Enterprise e2e harness (PYTHONPATH).
+# lib.sidecar / lib.egress_sidecar come from the Enterprise e2e harness (PYTHONPATH).
+from lib.egress_sidecar import EgressSidecar
 from lib.sidecar import Sidecar
 
 LOG = logging.getLogger(__name__)
@@ -116,6 +117,11 @@ def build_qwp_column_sidecar() -> Path:
     the e2e build light."""
     features = "polars" if os.environ.get("C_QUESTDB_CLIENT_COLUMN_POLARS") else None
     return _build_failover_bin("qwp_column_sidecar", features=features)
+
+
+def build_qwp_egress_sidecar() -> Path:
+    """Build the egress (read-side) ``qwp_egress_sidecar`` binary."""
+    return _build_failover_bin("qwp_egress_sidecar")
 
 
 @dataclass
@@ -202,3 +208,58 @@ class CClientRustColumnSidecar(CClientRustSidecar):
         FLUSH. Both encode to the same QWP/WebSocket columnar wire."""
         self._send(f"SEND {table} {count} {start_index} {src}")
         self._expect_ok()
+
+
+@dataclass
+class CClientRustEgressSidecar(EgressSidecar):
+    """c-questdb-client Rust-binding egress (read-side) sidecar. Drives
+    ``questdb::egress::Reader`` via the ``qwp_egress_sidecar`` binary, speaking
+    the same line protocol as the Java ``QwpEgressSidecarMain`` -- so
+    :class:`lib.egress_sidecar.EgressSidecar`'s CONNECT/QUERY/SHOW_ZONE/
+    SERVER_INFO/CLOSE verbs work unchanged; only the launched process differs."""
+
+    binary_path: Optional[Path] = field(default=None)
+
+    def start(self, *, ready_timeout: float = 30.0) -> None:
+        if self.process is not None:
+            raise RuntimeError(f"egress sidecar {self.name!r} already started")
+        binary = self.binary_path or build_qwp_egress_sidecar()
+        cmd = [str(binary)]
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_log = open(self.log_dir / f"{self.name}.stderr.log", "w", encoding="utf-8")
+
+        LOG.info("starting c-questdb-client (rust) egress sidecar %s (%s)", self.name, binary)
+        self.process = subprocess.Popen(
+            cmd,
+            env=os.environ.copy(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+
+        from lib.server import _drain  # noqa: PLC0415 - shared helper
+        self._stderr_thread = _drain(
+            self.process.stderr, stderr_log, f"{self.name}-stderr"
+        )
+
+        deadline = time.monotonic() + ready_timeout
+        while True:
+            if self.process.poll() is not None:
+                raise RuntimeError(
+                    f"egress sidecar {self.name!r} exited prematurely (code "
+                    f"{self.process.returncode}); see "
+                    f"{self.log_dir / f'{self.name}.stderr.log'}"
+                )
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"egress sidecar {self.name!r} did not READY within {ready_timeout}s"
+                )
+            line = self._readline(self.process.stdout, 0.2)
+            if line is None:
+                continue
+            line = line.strip()
+            if line == "READY":
+                break
+            LOG.warning("egress sidecar %s pre-READY: %r", self.name, line)

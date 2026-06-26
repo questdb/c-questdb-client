@@ -27,10 +27,14 @@ import pytest
 
 # server.wait_port_free and pg_query helpers come from the Enterprise
 # harness on PYTHONPATH (set up by conftest.py).
-from lib.pg_query import wait_for_dense_sequence
+from lib.pg_query import execute_ddl, wait_for_count, wait_for_dense_sequence
 from lib.server import wait_port_free
 
-from c_client_sidecar import CClientRustColumnSidecar, CClientRustSidecar
+from c_client_sidecar import (
+    CClientRustColumnSidecar,
+    CClientRustEgressSidecar,
+    CClientRustSidecar,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -74,6 +78,19 @@ def _connect_string_columnar(http_port: int, sf_dir: Path, *,
     ]
     if request_durable_ack:
         parts.append("request_durable_ack=on")
+    return ";".join(parts) + ";"
+
+
+def _egress_connect_string(http_ports: list[int]) -> str:
+    """Multi-endpoint read-side connect string. ``target`` defaults to ``any``,
+    so the Reader binds the first reachable endpoint (addr-order) and may fail
+    over to any of the others regardless of role."""
+    addr = ",".join(f"127.0.0.1:{p}" for p in http_ports)
+    parts = [
+        f"ws::addr={addr}",
+        "username=admin",
+        "password=quest",
+    ]
     return ";".join(parts) + ";"
 
 
@@ -201,3 +218,53 @@ def test_kill9_primary_failover_no_data_loss_c_client_rust_columnar(
     # on its own; wait for every row to land on the successor.
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
                             expected_count=row_count, timeout_s=60.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_primary_failover_egress_read_c_client_rust(
+    server_factory,
+    c_client_rust_egress_sidecar: CClientRustEgressSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """Read-side failover, driven by the c-questdb-client Rust binding's
+    ``Reader``. A primary + replica share the object store; the reader binds the
+    primary, then after a kill -9 the next query rebinds to the replica and
+    still returns every row.
+
+    Egress failover differs from the ingress tests -- the data must already
+    exist on the survivor (the replica applied the replicated WAL), so there is
+    no client-side replay. The assertion is that the read transparently walks to
+    a live endpoint and the row count is unchanged."""
+    table = "trades_egress_failover_c_client_rust"
+    row_count = 200
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+    r1 = server_factory("r1", role="replica")
+    r1_ports = r1.start()
+
+    # Seed on the primary; the WAL replicates to the replica via the shared
+    # object store.
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" AS ('
+        f'  SELECT x - 1 AS v, timestamp_sequence(0, 1000000) AS ts'
+        f'  FROM long_sequence({row_count})'
+        f') TIMESTAMP(ts) PARTITION BY DAY WAL'
+    ))
+    # Wait for the replica to catch up before we read from the cluster.
+    wait_for_count(port=r1_ports.pg, table=table, expected=row_count, timeout_s=60.0)
+
+    # Reader binds p1 first (addr-order); confirm the full read.
+    cs = _egress_connect_string([p1_ports.http, r1_ports.http])
+    c_client_rust_egress_sidecar.connect(cs)
+    rows, _ = c_client_rust_egress_sidecar.query(f'SELECT * FROM "{table}"')
+    assert rows == row_count
+
+    # Kill the bound primary; the next query must rebind to the replica.
+    p1.kill_9()
+    wait_port_free(p1_ports.http)
+
+    rows, _ = c_client_rust_egress_sidecar.query(f'SELECT * FROM "{table}"')
+    assert rows == row_count, f"expected {row_count} rows after failover, got {rows}"

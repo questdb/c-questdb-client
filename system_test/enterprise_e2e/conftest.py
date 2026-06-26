@@ -68,8 +68,10 @@ pytest_plugins = ("lib.shared_fixtures",)
 # Imports below depend on the sys.path insert above.
 from c_client_sidecar import (  # noqa: E402
     CClientRustColumnSidecar,
+    CClientRustEgressSidecar,
     CClientRustSidecar,
     build_qwp_column_sidecar,
+    build_qwp_egress_sidecar,
     build_qwp_sidecar,
 )
 
@@ -125,6 +127,33 @@ def c_client_rust_column_sidecar(
         classpath=None,
         name="c-client-rust-column-sidecar",
         binary_path=c_client_rust_column_sidecar_binary,
+    )
+    s.start()
+    try:
+        yield s
+    finally:
+        s.stop()
+
+
+@pytest.fixture(scope="session")
+def c_client_rust_egress_sidecar_binary() -> Path:
+    """One cargo build per session for the egress (read-side) sidecar."""
+    return build_qwp_egress_sidecar()
+
+
+@pytest.fixture(scope="function")
+def c_client_rust_egress_sidecar(
+    c_client_rust_egress_sidecar_binary: Path, log_dir: Path
+) -> Iterator[CClientRustEgressSidecar]:
+    """Read-side sidecar driven by the Rust binding's ``qwp_egress_sidecar``
+    binary (``questdb::egress::Reader``). Speaks the same line protocol as the
+    Enterprise Java egress sidecar, so it reuses
+    :class:`lib.egress_sidecar.EgressSidecar`'s verbs."""
+    s = CClientRustEgressSidecar(
+        log_dir=log_dir,
+        classpath=None,
+        name="c-client-rust-egress-sidecar",
+        binary_path=c_client_rust_egress_sidecar_binary,
     )
     s.start()
     try:
