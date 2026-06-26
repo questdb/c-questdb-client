@@ -146,10 +146,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             if state.db.is_none() {
                 return Err("no sender".to_string());
             }
-            let table = state
-                .table
-                .clone()
-                .ok_or_else(|| "no table".to_string())?;
+            let table = state.table.clone().ok_or_else(|| "no table".to_string())?;
             {
                 let db = state.db.as_ref().unwrap();
                 let mut chunk = Chunk::new(table.as_str());
