@@ -2747,6 +2747,7 @@ pub enum column_sender_arrow_override_kind {
     column_sender_arrow_override_ipv4 = 1,
     column_sender_arrow_override_char = 2,
     column_sender_arrow_override_geohash = 3,
+    column_sender_arrow_override_not_symbol = 4,
 }
 
 /// Per-column wire-type hint that overrides what the encoder would
@@ -2764,12 +2765,12 @@ pub struct column_sender_arrow_override {
     /// One of `column_sender_arrow_override_kind` as `u32`.
     pub kind: u32,
     /// Kind-specific argument:
-    /// - `_symbol`: 0 = mark column as `SYMBOL` (default), 1 = force
-    ///   the column NOT to be SYMBOL (Dictionary columns are decoded
-    ///   to VARCHAR on emit; no-op on plain Utf8 which is VARCHAR
-    ///   already).
     /// - `_geohash`: precision bits (1..=60).
-    /// - other kinds: ignored; pass 0.
+    /// - all other kinds: ignored; pass 0.
+    ///
+    /// To force a column NOT to be SYMBOL (Dictionary columns decode to
+    /// VARCHAR on emit; no-op on plain Utf8) use the dedicated
+    /// `_not_symbol` kind, not a non-zero `arg`.
     pub arg: u32,
 }
 
@@ -2842,11 +2843,13 @@ unsafe fn arrow_overrides_from_c<'a>(
                 == column_sender_arrow_override_kind::column_sender_arrow_override_symbol
                     as u32 =>
             {
-                if ov.arg == 0 {
-                    ArrowColumnOverride::Symbol { column }
-                } else {
-                    ArrowColumnOverride::NotSymbol { column }
-                }
+                ArrowColumnOverride::Symbol { column }
+            }
+            x if x
+                == column_sender_arrow_override_kind::column_sender_arrow_override_not_symbol
+                    as u32 =>
+            {
+                ArrowColumnOverride::NotSymbol { column }
             }
             x if x
                 == column_sender_arrow_override_kind::column_sender_arrow_override_ipv4 as u32 =>

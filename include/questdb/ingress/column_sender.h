@@ -1284,6 +1284,9 @@ typedef enum column_sender_arrow_override_kind
     column_sender_arrow_override_ipv4 = 1,
     column_sender_arrow_override_char = 2,
     column_sender_arrow_override_geohash = 3,
+    /** Force the column NOT to be SYMBOL: a Dictionary column is decoded
+     *  to VARCHAR on emit; a no-op on plain Utf8 (already VARCHAR). */
+    column_sender_arrow_override_not_symbol = 4,
 } column_sender_arrow_override_kind;
 
 /**
@@ -1294,8 +1297,8 @@ typedef enum column_sender_arrow_override_kind
  * the bytes are borrowed for the duration of the call.
  *
  * `arg` carries the geohash precision (1..=60) when `kind ==
- * column_sender_arrow_override_geohash`, and is ignored otherwise
- * (pass 0).
+ * column_sender_arrow_override_geohash`, and is ignored for every other
+ * kind (pass 0).
  */
 typedef struct column_sender_arrow_override
 {

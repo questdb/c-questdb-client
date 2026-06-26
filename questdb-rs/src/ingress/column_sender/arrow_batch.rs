@@ -36,14 +36,16 @@ use arrow_array::{
     Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
     DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
     DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeListArray,
-    LargeStringArray, ListArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
-    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    Float64Array, GenericByteViewArray, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, OffsetSizeTrait, RecordBatch,
+    StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
-    types::{UInt8Type, UInt16Type, UInt32Type},
+    types::{ByteViewType, UInt8Type, UInt16Type, UInt32Type},
 };
 use arrow_buffer::NullBuffer;
+use arrow_data::{ByteView, MAX_INLINE_VIEW_LEN};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use std::sync::Arc;
 
@@ -650,9 +652,10 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
     if arrow_offset.is_multiple_of(8) {
         let src_off = arrow_offset / 8;
         // The aligned fast path indexes `src` directly (unlike the unaligned
-        // branch's `lo_idx < src_len` guards). `from_ffi`'s `validate_full`
-        // and arrow-rs's safe builders both guarantee this length; assert it
-        // so any future unchecked producer trips in test/CI builds.
+        // branch's `lo_idx < src_len` guards). The null buffer's byte length is
+        // a structural invariant that `from_ffi`'s `validate()` and arrow-rs's
+        // safe builders both guarantee; assert it so any future unchecked
+        // producer trips in test/CI builds.
         debug_assert!(
             src.len() >= src_off + total_bytes,
             "arrow validity buffer too short: {} bytes, need {}",
@@ -1052,16 +1055,17 @@ fn write_varlen_u32_offsets_no_null(
             base
         ));
     }
-    // The fast path raw-copies the whole offset table, so only `base`/`end`
-    // are checked above. A validated array (FFI path runs `validate_full`)
-    // guarantees the intermediate offsets are monotonic; assert it so an
-    // unvalidated `build_unchecked` array trips in debug builds rather than
-    // shipping a frame with offsets pointing outside the data region.
+    // The fast path raw-copies the whole offset table and the single
+    // `[base, end)` data slab, both bounds-checked above, so it stays in-bounds
+    // for any offset values — the FFI import runs only structural `validate()`.
+    // Non-monotonic intermediate offsets therefore can't read out of bounds;
+    // they just produce a frame the server rejects. The assert surfaces such a
+    // malformed (e.g. `build_unchecked`) array in debug/CI builds.
     debug_assert!(
         arr_offsets[..row_count + 1]
             .windows(2)
             .all(|w| w[0] <= w[1]),
-        "{}: non-monotonic varlen offsets (caller must uphold validate_full)",
+        "{}: non-monotonic varlen offsets",
         label,
     );
     let used = (end - base) as usize;
@@ -1163,9 +1167,9 @@ where
 /// Per-row emit closure with a per-row `try_reserve_bytes` probe. Use
 /// when the outer caller did NOT reserve up front (i.e. passed
 /// `bytes_upper_bound = None` to `write_varlen_u32_offsets_with_bitmap`).
-fn emit_str_row<S: StrSource>(arr: &S) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + '_ {
+fn emit_str_row<S: VarlenSource>(arr: &S) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + '_ {
     move |out, row| {
-        let bytes = arr.value_bytes(row);
+        let bytes = arr.value_bytes(row)?;
         try_reserve_bytes(out, bytes.len(), "VARCHAR column")?;
         out.extend_from_slice(bytes);
         u32::try_from(bytes.len()).map_err(|_| {
@@ -1181,11 +1185,11 @@ fn emit_str_row<S: StrSource>(arr: &S) -> impl FnMut(&mut Vec<u8>, usize) -> Res
 /// Per-row emit closure without the per-row reserve probe. Caller MUST
 /// have reserved enough capacity up front (via `bytes_upper_bound`) so
 /// every `extend_from_slice` fits without reallocation.
-fn emit_str_row_no_reserve<S: StrSource>(
+fn emit_str_row_no_reserve<S: VarlenSource>(
     arr: &S,
 ) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + '_ {
     move |out, row| {
-        let bytes = arr.value_bytes(row);
+        let bytes = arr.value_bytes(row)?;
         out.extend_from_slice(bytes);
         u32::try_from(bytes.len()).map_err(|_| {
             fmt!(
@@ -1199,10 +1203,10 @@ fn emit_str_row_no_reserve<S: StrSource>(
 
 fn emit_bytes_row<'a, F>(get: F) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + 'a
 where
-    F: Fn(usize) -> &'a [u8] + 'a,
+    F: Fn(usize) -> Result<&'a [u8]> + 'a,
 {
     move |out, row| {
-        let bytes = get(row);
+        let bytes = get(row)?;
         try_reserve_bytes(out, bytes.len(), "BINARY column")?;
         out.extend_from_slice(bytes);
         u32::try_from(bytes.len()).map_err(|_| {
@@ -1217,10 +1221,10 @@ where
 
 fn emit_bytes_row_no_reserve<'a, F>(get: F) -> impl FnMut(&mut Vec<u8>, usize) -> Result<u32> + 'a
 where
-    F: Fn(usize) -> &'a [u8] + 'a,
+    F: Fn(usize) -> Result<&'a [u8]> + 'a,
 {
     move |out, row| {
-        let bytes = get(row);
+        let bytes = get(row)?;
         out.extend_from_slice(bytes);
         u32::try_from(bytes.len()).map_err(|_| {
             fmt!(
@@ -1292,7 +1296,7 @@ fn write_binary_payload(out: &mut Vec<u8>, arr: &BinaryArray, use_bitmap: bool) 
             arr,
             "BINARY column",
             bound,
-            emit_bytes_row_no_reserve(|row| arr.value(row)),
+            emit_bytes_row_no_reserve(|row| arr.value_bytes(row)),
         )
     } else {
         write_varlen_u32_offsets_no_null(
@@ -1317,7 +1321,7 @@ fn write_large_binary_payload(
             arr,
             "BINARY column",
             bound,
-            emit_bytes_row_no_reserve(|row| arr.value(row)),
+            emit_bytes_row_no_reserve(|row| arr.value_bytes(row)),
         )
     } else {
         write_varlen_large_offsets_no_null(out, arr.value_offsets(), arr.value_data(), arr.len())
@@ -1335,10 +1339,10 @@ fn write_binary_view_payload(
             arr,
             "BINARY column",
             None,
-            emit_bytes_row(|row| arr.value(row)),
+            emit_bytes_row(|row| arr.value_bytes(row)),
         )
     } else {
-        write_varlen_view_no_null(out, arr.len(), emit_bytes_row(|row| arr.value(row)))
+        write_varlen_view_no_null(out, arr.len(), emit_bytes_row(|row| arr.value_bytes(row)))
     }
 }
 
@@ -2227,29 +2231,148 @@ pub(crate) fn resolve_arrow_symbol_column(
     Ok(Some(resolved))
 }
 
-trait StrSource {
-    fn value_bytes(&self, row: usize) -> &[u8];
+/// Read row `row` of a contiguous varlen array as bytes, bounds-checked
+/// against the values buffer. Unlike arrow's `value()`/`value_unchecked` it
+/// never derefs an out-of-range offset and never builds a `&str`, so a
+/// producer-supplied array with a corrupt offset (the FFI import path runs
+/// only structural `validate()`) is a graceful error, not an OOB read or
+/// invalid-UTF-8 UB on the `panic = "abort"` crate.
+#[inline]
+fn checked_offset_bytes<'a, O: OffsetSizeTrait>(
+    offsets: &[O],
+    data: &'a [u8],
+    row: usize,
+    label: &str,
+) -> Result<&'a [u8]> {
+    let start = offsets[row].as_usize();
+    let end = offsets[row + 1].as_usize();
+    data.get(start..end).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: varlen offsets [{}, {}) out of range (data {} bytes) at row {}",
+            label,
+            start,
+            end,
+            data.len(),
+            row
+        )
+    })
 }
 
-impl StrSource for StringArray {
-    fn value_bytes(&self, row: usize) -> &[u8] {
-        self.value(row).as_bytes()
+/// Bounds-checked byte read for a view array row. Inline views reuse arrow's
+/// own `inline_value` (the bytes live in the views buffer); buffer-backed
+/// views validate the buffer index and slice range before reading. Same
+/// safety rationale as [`checked_offset_bytes`].
+#[inline]
+fn checked_view_bytes<'a, T: ByteViewType + ?Sized>(
+    arr: &'a GenericByteViewArray<T>,
+    row: usize,
+    label: &str,
+) -> Result<&'a [u8]> {
+    let raw = &arr.views()[row];
+    let len = (*raw as u32) as usize;
+    if len <= MAX_INLINE_VIEW_LEN as usize {
+        // SAFETY: `len <= MAX_INLINE_VIEW_LEN` and `raw` is a live view element,
+        // so the inline bytes are in-bounds of the 16-byte view word.
+        return Ok(unsafe { GenericByteViewArray::<T>::inline_value(raw, len) });
+    }
+    let view = ByteView::from(*raw);
+    let buffer = arr
+        .data_buffers()
+        .get(view.buffer_index as usize)
+        .ok_or_else(|| {
+            fmt!(
+                ArrowIngest,
+                "{}: view buffer index {} out of range ({} buffers) at row {}",
+                label,
+                view.buffer_index,
+                arr.data_buffers().len(),
+                row
+            )
+        })?;
+    let start = view.offset as usize;
+    let end = start.checked_add(len).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: view length overflow at row {}",
+            label,
+            row
+        )
+    })?;
+    buffer.as_slice().get(start..end).ok_or_else(|| {
+        fmt!(
+            ArrowIngest,
+            "{}: view slice [{}, {}) out of range (buffer {} bytes) at row {}",
+            label,
+            start,
+            end,
+            buffer.len(),
+            row
+        )
+    })
+}
+
+trait VarlenSource {
+    fn value_bytes(&self, row: usize) -> Result<&[u8]>;
+}
+
+impl VarlenSource for StringArray {
+    fn value_bytes(&self, row: usize) -> Result<&[u8]> {
+        checked_offset_bytes(
+            self.value_offsets(),
+            self.value_data(),
+            row,
+            "VARCHAR column",
+        )
     }
 }
 
-impl StrSource for LargeStringArray {
-    fn value_bytes(&self, row: usize) -> &[u8] {
-        self.value(row).as_bytes()
+impl VarlenSource for LargeStringArray {
+    fn value_bytes(&self, row: usize) -> Result<&[u8]> {
+        checked_offset_bytes(
+            self.value_offsets(),
+            self.value_data(),
+            row,
+            "VARCHAR column",
+        )
     }
 }
 
-impl StrSource for StringViewArray {
-    fn value_bytes(&self, row: usize) -> &[u8] {
-        self.value(row).as_bytes()
+impl VarlenSource for StringViewArray {
+    fn value_bytes(&self, row: usize) -> Result<&[u8]> {
+        checked_view_bytes(self, row, "VARCHAR column")
     }
 }
 
-fn resolve_symbol_strings<S: StrSource>(
+impl VarlenSource for BinaryArray {
+    fn value_bytes(&self, row: usize) -> Result<&[u8]> {
+        checked_offset_bytes(
+            self.value_offsets(),
+            self.value_data(),
+            row,
+            "BINARY column",
+        )
+    }
+}
+
+impl VarlenSource for LargeBinaryArray {
+    fn value_bytes(&self, row: usize) -> Result<&[u8]> {
+        checked_offset_bytes(
+            self.value_offsets(),
+            self.value_data(),
+            row,
+            "BINARY column",
+        )
+    }
+}
+
+impl VarlenSource for BinaryViewArray {
+    fn value_bytes(&self, row: usize) -> Result<&[u8]> {
+        checked_view_bytes(self, row, "BINARY column")
+    }
+}
+
+fn resolve_symbol_strings<S: VarlenSource>(
     arr: &dyn Array,
     source: &S,
     symbol_dict: &mut SymbolGlobalDict,
@@ -2267,7 +2390,7 @@ fn resolve_symbol_strings<S: StrSource>(
         if arr.is_null(row) {
             continue;
         }
-        let bytes = source.value_bytes(row);
+        let bytes = source.value_bytes(row)?;
         let gid = match seen.get(bytes) {
             Some(&gid) => gid,
             None => {
@@ -2299,11 +2422,10 @@ fn resolve_symbol_dict(
         symbol_dict: &mut SymbolGlobalDict,
         new_symbols: &mut Vec<Vec<u8>>,
         get_slot: impl Fn(&DictionaryArray<K::ArrowType>, usize) -> usize,
-        get_value_bytes: impl Fn(&V, usize) -> &[u8],
     ) -> Result<ArrowResolvedSymbolColumn>
     where
         K: DictKeyTag,
-        V: 'static,
+        V: VarlenSource + 'static,
     {
         let dict_arr = arr
             .as_any()
@@ -2318,199 +2440,150 @@ fn resolve_symbol_dict(
         })?;
         let dict_len = values_arr.len();
         let row_count = arr.len();
-        let mut referenced = vec![false; dict_len];
-        for row in 0..row_count {
-            if arr.is_null(row) {
-                continue;
+
+        let values_data = values_arr.to_data();
+        let identity: Vec<(usize, usize)> = values_data
+            .buffers()
+            .iter()
+            .map(|b| (b.as_ptr() as usize, b.len()))
+            .collect();
+        let (memo_idx, mut slot_to_gid) = symbol_dict.take_arrow_dict_memo(&identity, dict_len);
+
+        let resolved = (|| -> Result<Vec<u64>> {
+            let mut gids = Vec::with_capacity(non_null);
+            for row in 0..row_count {
+                if arr.is_null(row) {
+                    continue;
+                }
+                let slot = get_slot(dict_arr, row);
+                if slot >= dict_len {
+                    return Err(fmt!(
+                        ArrowIngest,
+                        "SYMBOL dictionary column: code {} out of range (dict_len={})",
+                        slot,
+                        dict_len
+                    ));
+                }
+                let gid = match slot_to_gid[slot] {
+                    u64::MAX => {
+                        if values_arr.is_null(slot) {
+                            return Err(fmt!(
+                                ArrowIngest,
+                                "SYMBOL dictionary column: referenced dictionary values \
+                                 slot {} is null",
+                                slot
+                            ));
+                        }
+                        let bytes = values_typed.value_bytes(slot)?;
+                        let (gid, is_new) = symbol_dict.intern(bytes)?;
+                        if is_new {
+                            new_symbols.push(bytes.to_vec());
+                        }
+                        slot_to_gid[slot] = gid;
+                        gid
+                    }
+                    gid => gid,
+                };
+                gids.push(gid);
             }
-            let slot = get_slot(dict_arr, row);
-            if slot >= dict_len {
-                return Err(fmt!(
-                    ArrowIngest,
-                    "SYMBOL dictionary column: code {} out of range (dict_len={})",
-                    slot,
-                    dict_len
-                ));
-            }
-            referenced[slot] = true;
-        }
-        let mut slot_to_gid = vec![u64::MAX; dict_len];
-        for (slot, marked) in referenced.iter().enumerate() {
-            if !*marked {
-                continue;
-            }
-            if values_arr.is_null(slot) {
-                return Err(fmt!(
-                    ArrowIngest,
-                    "SYMBOL dictionary column: referenced dictionary values slot {} is null",
-                    slot
-                ));
-            }
-            let bytes = get_value_bytes(values_typed, slot);
-            let (gid, is_new) = symbol_dict.intern(bytes)?;
-            if is_new {
-                new_symbols.push(bytes.to_vec());
-            }
-            slot_to_gid[slot] = gid;
-        }
-        let mut gids = Vec::with_capacity(non_null);
-        for row in 0..row_count {
-            if arr.is_null(row) {
-                continue;
-            }
-            let slot = get_slot(dict_arr, row);
-            let gid = slot_to_gid[slot];
-            debug_assert_ne!(gid, u64::MAX);
-            gids.push(gid);
-        }
-        Ok(ArrowResolvedSymbolColumn { gids })
+            Ok(gids)
+        })();
+
+        symbol_dict.restore_arrow_dict_memo(memo_idx, slot_to_gid);
+        Ok(ArrowResolvedSymbolColumn { gids: resolved? })
     }
 
     match (key, value) {
-        (DictKey::I8, DictValue::Utf8) => run::<I8KeyTag, StringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I8, DictValue::LargeUtf8) => run::<I8KeyTag, LargeStringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I8, DictValue::Utf8View) => run::<I8KeyTag, StringViewArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I16, DictValue::Utf8) => run::<I16KeyTag, StringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I16, DictValue::LargeUtf8) => run::<I16KeyTag, LargeStringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I16, DictValue::Utf8View) => run::<I16KeyTag, StringViewArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I32, DictValue::Utf8) => run::<I32KeyTag, StringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I32, DictValue::LargeUtf8) => run::<I32KeyTag, LargeStringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I32, DictValue::Utf8View) => run::<I32KeyTag, StringViewArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U8, DictValue::Utf8) => run::<U8KeyTag, StringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U8, DictValue::LargeUtf8) => run::<U8KeyTag, LargeStringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U8, DictValue::Utf8View) => run::<U8KeyTag, StringViewArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U16, DictValue::Utf8) => run::<U16KeyTag, StringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U16, DictValue::LargeUtf8) => run::<U16KeyTag, LargeStringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U16, DictValue::Utf8View) => run::<U16KeyTag, StringViewArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U32, DictValue::Utf8) => run::<U32KeyTag, StringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U32, DictValue::LargeUtf8) => run::<U32KeyTag, LargeStringArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U32, DictValue::Utf8View) => run::<U32KeyTag, StringViewArray>(
-            arr,
-            non_null,
-            symbol_dict,
-            new_symbols,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
+        (DictKey::I8, DictValue::Utf8) => {
+            run::<I8KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I8, DictValue::LargeUtf8) => {
+            run::<I8KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I8, DictValue::Utf8View) => {
+            run::<I8KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I16, DictValue::Utf8) => {
+            run::<I16KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I16, DictValue::LargeUtf8) => {
+            run::<I16KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I16, DictValue::Utf8View) => {
+            run::<I16KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I32, DictValue::Utf8) => {
+            run::<I32KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I32, DictValue::LargeUtf8) => {
+            run::<I32KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::I32, DictValue::Utf8View) => {
+            run::<I32KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U8, DictValue::Utf8) => {
+            run::<U8KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U8, DictValue::LargeUtf8) => {
+            run::<U8KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U8, DictValue::Utf8View) => {
+            run::<U8KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U16, DictValue::Utf8) => {
+            run::<U16KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U16, DictValue::LargeUtf8) => {
+            run::<U16KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U16, DictValue::Utf8View) => {
+            run::<U16KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U32, DictValue::Utf8) => {
+            run::<U32KeyTag, StringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U32, DictValue::LargeUtf8) => {
+            run::<U32KeyTag, LargeStringArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
+        (DictKey::U32, DictValue::Utf8View) => {
+            run::<U32KeyTag, StringViewArray>(arr, non_null, symbol_dict, new_symbols, |d, r| {
+                d.keys().value(r) as usize
+            })
+        }
     }
 }
 
@@ -2560,11 +2633,10 @@ fn write_dict_to_varchar_payload(
         out: &mut Vec<u8>,
         arr: &dyn Array,
         get_slot: impl Fn(&DictionaryArray<K::ArrowType>, usize) -> usize,
-        get_value_bytes: impl Fn(&V, usize) -> &[u8],
     ) -> Result<()>
     where
         K: DictKeyTag,
-        V: 'static,
+        V: VarlenSource + 'static,
     {
         let dict_arr = arr
             .as_any()
@@ -2593,7 +2665,7 @@ fn write_dict_to_varchar_payload(
                     slot
                 ));
             }
-            let bytes = get_value_bytes(values_typed, slot);
+            let bytes = values_typed.value_bytes(slot)?;
             try_reserve_bytes(out, bytes.len(), "VARCHAR column")?;
             out.extend_from_slice(bytes);
             u32::try_from(bytes.len()).map_err(|_| {
@@ -2607,114 +2679,60 @@ fn write_dict_to_varchar_payload(
     }
 
     match (key, value) {
-        (DictKey::I8, DictValue::Utf8) => run::<I8KeyTag, StringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I8, DictValue::LargeUtf8) => run::<I8KeyTag, LargeStringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I8, DictValue::Utf8View) => run::<I8KeyTag, StringViewArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I16, DictValue::Utf8) => run::<I16KeyTag, StringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I16, DictValue::LargeUtf8) => run::<I16KeyTag, LargeStringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I16, DictValue::Utf8View) => run::<I16KeyTag, StringViewArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I32, DictValue::Utf8) => run::<I32KeyTag, StringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I32, DictValue::LargeUtf8) => run::<I32KeyTag, LargeStringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::I32, DictValue::Utf8View) => run::<I32KeyTag, StringViewArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U8, DictValue::Utf8) => run::<U8KeyTag, StringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U8, DictValue::LargeUtf8) => run::<U8KeyTag, LargeStringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U8, DictValue::Utf8View) => run::<U8KeyTag, StringViewArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U16, DictValue::Utf8) => run::<U16KeyTag, StringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U16, DictValue::LargeUtf8) => run::<U16KeyTag, LargeStringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U16, DictValue::Utf8View) => run::<U16KeyTag, StringViewArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U32, DictValue::Utf8) => run::<U32KeyTag, StringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U32, DictValue::LargeUtf8) => run::<U32KeyTag, LargeStringArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
-        (DictKey::U32, DictValue::Utf8View) => run::<U32KeyTag, StringViewArray>(
-            out,
-            arr,
-            |d, r| d.keys().value(r) as usize,
-            |v, s| v.value(s).as_bytes(),
-        ),
+        (DictKey::I8, DictValue::Utf8) => {
+            run::<I8KeyTag, StringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I8, DictValue::LargeUtf8) => {
+            run::<I8KeyTag, LargeStringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I8, DictValue::Utf8View) => {
+            run::<I8KeyTag, StringViewArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I16, DictValue::Utf8) => {
+            run::<I16KeyTag, StringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I16, DictValue::LargeUtf8) => {
+            run::<I16KeyTag, LargeStringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I16, DictValue::Utf8View) => {
+            run::<I16KeyTag, StringViewArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I32, DictValue::Utf8) => {
+            run::<I32KeyTag, StringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I32, DictValue::LargeUtf8) => {
+            run::<I32KeyTag, LargeStringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::I32, DictValue::Utf8View) => {
+            run::<I32KeyTag, StringViewArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U8, DictValue::Utf8) => {
+            run::<U8KeyTag, StringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U8, DictValue::LargeUtf8) => {
+            run::<U8KeyTag, LargeStringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U8, DictValue::Utf8View) => {
+            run::<U8KeyTag, StringViewArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U16, DictValue::Utf8) => {
+            run::<U16KeyTag, StringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U16, DictValue::LargeUtf8) => {
+            run::<U16KeyTag, LargeStringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U16, DictValue::Utf8View) => {
+            run::<U16KeyTag, StringViewArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U32, DictValue::Utf8) => {
+            run::<U32KeyTag, StringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U32, DictValue::LargeUtf8) => {
+            run::<U32KeyTag, LargeStringArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
+        (DictKey::U32, DictValue::Utf8View) => {
+            run::<U32KeyTag, StringViewArray>(out, arr, |d, r| d.keys().value(r) as usize)
+        }
     }
 }
 
@@ -3313,11 +3331,11 @@ pub(crate) fn resolve_ts_column(batch: &RecordBatch, name: ColumnName<'_>) -> Re
 }
 
 fn check_array_data_bounds(arr: &dyn Array) -> Result<()> {
-    // Value- and offset-buffer bounds are validated by the FFI entry
-    // point (`arrow_ffi_import_*` runs `ArrayData::validate_full`) and by
-    // arrow-rs's safe builders on the native path. `from_ffi` itself does
-    // NOT validate, so this is a cheap structural cross-check only — do
-    // not rely on it for buffer-length safety.
+    // Per-cell value/offset bounds are enforced at emit time by the
+    // bounds-checked varlen accessors (`checked_offset_bytes` /
+    // `checked_view_bytes`), not by a `validate_full` scan at the FFI entry
+    // (which runs only structural `validate()`). This is a cheap structural
+    // cross-check only — do not rely on it for buffer-length safety.
     let null_count = arr.null_count();
     let row_count = arr.len();
     if null_count > row_count {
@@ -3707,6 +3725,33 @@ mod tests {
 
     fn col_name(name: &str) -> ColumnName<'_> {
         ColumnName::new(name).unwrap()
+    }
+
+    #[test]
+    fn malformed_varlen_offsets_reject_at_emit_not_oob() {
+        use arrow_buffer::Buffer;
+        use arrow_data::ArrayDataBuilder;
+
+        // Utf8 with offsets [0, 1000, 3]: first/last land inside the 3-byte
+        // values buffer (cheap `validate()` passes), but row 0's [0, 1000)
+        // range runs far past it. The FFI import no longer runs `validate_full`,
+        // so the per-cell emit path must reject this via its bounds-checked
+        // accessor rather than read out of bounds or build an invalid `&str`.
+        let values = Buffer::from_vec(b"abc".to_vec());
+        let offsets = Buffer::from_vec(vec![0i32, 1000, 3]);
+        let data = unsafe {
+            ArrayDataBuilder::new(DataType::Utf8)
+                .len(2)
+                .add_buffer(offsets)
+                .add_buffer(values)
+                .build_unchecked()
+        };
+        let arr = StringArray::from(data);
+        let mut out = Vec::new();
+        // `use_bitmap = true` forces the per-cell read path.
+        let err = write_string_payload(&mut out, &arr, true).unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ArrowIngest);
+        assert!(err.msg().contains("out of range"), "{}", err.msg());
     }
 
     fn arrow_schema_with(field: Field) -> Arc<ArrowSchema> {

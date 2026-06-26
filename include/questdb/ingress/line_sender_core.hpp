@@ -120,6 +120,13 @@ enum class line_sender_error_code
      *  `pool::borrow_column_sender_with_retry` (row-aligned reconnect backoff, bounded
      *  by `reconnect_max_duration`), and re-drive from your source. */
     failover_retry = 17,
+
+    /** Every reachable endpoint handshook but none matched the configured
+     *  `target=` role filter (e.g. `target=primary` against an all-replica
+     *  address list). Distinct from `socket_error` ("all endpoints
+     *  unreachable") so callers can tell "no primary elected" from "all
+     *  down". */
+    role_mismatch = 18,
 };
 
 /** The protocol used to connect with. */

@@ -4009,6 +4009,12 @@ const MAX_ARROW_ARRAY_N_BUFFERS_PER_NODE: i64 = 16;
 // drift.
 #[cfg(feature = "arrow")]
 const MAX_ARROW_ARRAY_LENGTH: i64 = questdb::ingress::column_sender::MAX_CHUNK_ROWS as i64;
+// `FFI_ArrowSchema::metadata()` reads the leading entry count straight from
+// the producer blob and feeds it to `HashMap::with_capacity` — an unbounded
+// `i32` there is a multi-gigabyte allocation that aborts the `panic = "abort"`
+// crate from ~4 bytes of input. Bound it before any node is converted.
+#[cfg(feature = "arrow")]
+const MAX_ARROW_SCHEMA_METADATA_ENTRIES: i32 = 65_536;
 
 // Residual trust boundary: the Arrow C Data Interface carries no byte length
 // for its buffers, so a producer that lies about offset/data buffer sizes or
@@ -4115,6 +4121,17 @@ unsafe fn validate_arrow_schema_depth(
             }
             validate_format_str(s)?;
             validate_name_str(s)?;
+            let metadata = (*s).metadata;
+            if !metadata.is_null() {
+                let header = std::slice::from_raw_parts(metadata as *const u8, 4);
+                let num_entries = i32::from_ne_bytes([header[0], header[1], header[2], header[3]]);
+                if !(0..=MAX_ARROW_SCHEMA_METADATA_ENTRIES).contains(&num_entries) {
+                    return Err(arrow_ingest_err(format!(
+                        "Arrow schema metadata declares {} entries (allowed 0..={})",
+                        num_entries, MAX_ARROW_SCHEMA_METADATA_ENTRIES
+                    )));
+                }
+            }
             let n = (*s).n_children;
             if n < 0 {
                 return Err(arrow_ingest_err(format!(
@@ -4359,8 +4376,17 @@ unsafe fn validate_arrow_array_depth(
                 // the eagerly-dereferenced ones here.
                 use arrow::datatypes::DataType;
                 let buffers = (*a).buffers;
+                // `from_ffi` sizes buffers off a dictionary's key type, not the
+                // dictionary itself (arrow `layout(Dictionary(key, _)) =>
+                // layout(key)`), so the eager-deref checks below must match on
+                // the key type too — otherwise `Dictionary(Utf8View, _)` skips
+                // them and `from_ffi` dereferences a NULL variadic slot.
+                let buf_dt = match &dt {
+                    DataType::Dictionary(key, _) => key.as_ref(),
+                    other => other,
+                };
                 let var_width = matches!(
-                    dt,
+                    buf_dt,
                     DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
                 );
                 if var_width && (*a).length > 0 && (*buffers.add(1)).is_null() {
@@ -4368,7 +4394,7 @@ unsafe fn validate_arrow_array_depth(
                         "Arrow variable-width array offset buffer (slot 1) is NULL",
                     ));
                 }
-                let view = matches!(dt, DataType::Utf8View | DataType::BinaryView);
+                let view = matches!(buf_dt, DataType::Utf8View | DataType::BinaryView);
                 if view
                     && (*a).n_buffers > 3
                     && (*buffers.add(((*a).n_buffers - 1) as usize)).is_null()
@@ -5939,6 +5965,68 @@ mod tests {
                 assert!(
                     err.msg().contains("requires at least"),
                     "expected too-few-buffers error, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn array_dictionary_view_key_null_variadic_buffer_rejected() {
+            // A dictionary whose index (key) type is a view ("vu" = Utf8View)
+            // is structurally invalid but parses to `Dictionary(Utf8View, _)`.
+            // `from_ffi` sizes buffers off the key type, so a NULL
+            // variadic-lengths slot would be dereferenced before
+            // `validate_full`. The pre-walk must strip the dictionary and
+            // reject it here.
+            unsafe {
+                let key_format = CString::new("vu").unwrap();
+                let val_format = CString::new("u").unwrap();
+                let v_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let v_raw = std::alloc::alloc_zeroed(v_layout) as *mut FFI_ArrowSchema;
+                (*v_raw).format = val_format.as_ptr();
+                let s_layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let s_raw = std::alloc::alloc_zeroed(s_layout) as *mut FFI_ArrowSchema;
+                (*s_raw).format = key_format.as_ptr();
+                (*s_raw).dictionary = v_raw;
+                let a_layout = std::alloc::Layout::new::<FFI_ArrowArray>();
+                let a_raw = std::alloc::alloc_zeroed(a_layout) as *mut FFI_ArrowArray;
+                let dummy: u8 = 0;
+                let p = &dummy as *const u8 as *const std::ffi::c_void;
+                let mut slots: [*const std::ffi::c_void; 4] = [p, p, p, std::ptr::null()];
+                (*a_raw).length = 1;
+                (*a_raw).n_buffers = 4;
+                (*a_raw).buffers = slots.as_mut_ptr();
+                let res = validate_arrow_array_depth(a_raw, s_raw);
+                (*a_raw).buffers = std::ptr::null_mut();
+                (*s_raw).dictionary = std::ptr::null_mut();
+                std::alloc::dealloc(v_raw as *mut u8, v_layout);
+                std::alloc::dealloc(s_raw as *mut u8, s_layout);
+                std::alloc::dealloc(a_raw as *mut u8, a_layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("variadic-lengths buffer is NULL"),
+                    "expected NULL variadic-lengths rejection, got: {}",
+                    err.msg()
+                );
+            }
+        }
+
+        #[test]
+        fn schema_metadata_entry_count_above_cap_rejected() {
+            unsafe {
+                let format = CString::new("i").unwrap();
+                let blob = (MAX_ARROW_SCHEMA_METADATA_ENTRIES + 1).to_ne_bytes();
+                let layout = std::alloc::Layout::new::<FFI_ArrowSchema>();
+                let raw = std::alloc::alloc_zeroed(layout) as *mut FFI_ArrowSchema;
+                (*raw).format = format.as_ptr();
+                (*raw).metadata = blob.as_ptr() as *const std::ffi::c_char;
+                let res = validate_arrow_schema_depth(raw);
+                (*raw).metadata = std::ptr::null();
+                std::alloc::dealloc(raw as *mut u8, layout);
+                let err = res.unwrap_err();
+                assert!(
+                    err.msg().contains("metadata"),
+                    "expected metadata entry-count rejection, got: {}",
                     err.msg()
                 );
             }

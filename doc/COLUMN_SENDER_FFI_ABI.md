@@ -1,15 +1,18 @@
 # Column-Major Sender — C ABI Specification
 
-**Status:** draft, pending approval
-**Header:** `include/questdb/ingress/column_sender.h` (to be added)
+**Status:** draft. The shipped header
+`include/questdb/ingress/column_sender.h` is the authoritative ABI; where
+this document and the header disagree, the header wins. Bindings must be
+generated against the header, not this spec.
+**Header:** `include/questdb/ingress/column_sender.h`
 **Sibling header:** `include/questdb/ingress/line_sender.h` (existing,
 shares error types)
 **Audience:** the Python wrapper repo, and anyone writing a C/C++
 client against this API.
 
-This document is self-contained. It is the contract between
-`c-questdb-client` (Rust core) and the Python wrapper repo. The Python
-repo can be implemented from this spec without reading any Rust code.
+This document explains the design intent. The exact function signatures,
+enum discriminants, and struct layouts are defined by
+`column_sender.h`; bindings must follow the header.
 
 ---
 
@@ -261,6 +264,7 @@ Validity: `pool_size <= pool_max` must hold; otherwise
 QUESTDB_CLIENT_API
 questdb_db* questdb_db_connect(
     const char* conf,
+    size_t conf_len,
     line_sender_error** err_out);
 
 /**

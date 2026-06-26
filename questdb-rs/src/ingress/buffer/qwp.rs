@@ -5070,6 +5070,21 @@ pub(crate) struct SymbolGlobalDict {
     entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
     cap: usize,
+    #[cfg(feature = "arrow")]
+    arrow_dict_memo: Vec<ArrowDictSlotMemo>,
+}
+
+/// Memoised `local dict slot -> global id` table for one Arrow dictionary
+/// (categorical) values array. Keyed by the array's buffer pointers+lengths:
+/// every batch sliced from the same chunk shares those buffers, so the costly
+/// per-string `intern` runs once per chunk instead of once per batch. The
+/// stored ids are only valid against the current dict contents, so
+/// [`SymbolGlobalDict::rollback`] drops the whole memo.
+#[cfg(feature = "arrow")]
+#[derive(Debug)]
+struct ArrowDictSlotMemo {
+    identity: Vec<(usize, usize)>,
+    slot_to_gid: Vec<u64>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5102,6 +5117,8 @@ impl SymbolGlobalDict {
             entries: Vec::new(),
             next_id: 0,
             cap: MAX_CONN_SYMBOL_DICT_SIZE,
+            #[cfg(feature = "arrow")]
+            arrow_dict_memo: Vec::new(),
         }
     }
 
@@ -5139,6 +5156,50 @@ impl SymbolGlobalDict {
             }
         }
         self.next_id = mark.next_id;
+        #[cfg(feature = "arrow")]
+        self.arrow_dict_memo.clear();
+    }
+
+    /// Borrow out the memoised `slot -> global id` table for an Arrow
+    /// dictionary values array with the given buffer `identity` and length.
+    /// An identity or length not seen since the last [`rollback`](Self::rollback)
+    /// yields a fresh `u64::MAX`-filled table. The caller fills any `u64::MAX`
+    /// slot via [`intern`](Self::intern) and must hand the table back with
+    /// [`restore_arrow_dict_memo`](Self::restore_arrow_dict_memo).
+    #[cfg(feature = "arrow")]
+    pub(crate) fn take_arrow_dict_memo(
+        &mut self,
+        identity: &[(usize, usize)],
+        dict_len: usize,
+    ) -> (usize, Vec<u64>) {
+        const MEMO_CAP: usize = 32;
+        if let Some(idx) = self
+            .arrow_dict_memo
+            .iter()
+            .position(|m| m.identity == identity)
+        {
+            let mut slot_to_gid = std::mem::take(&mut self.arrow_dict_memo[idx].slot_to_gid);
+            if slot_to_gid.len() != dict_len {
+                slot_to_gid.clear();
+                slot_to_gid.resize(dict_len, u64::MAX);
+            }
+            return (idx, slot_to_gid);
+        }
+        if self.arrow_dict_memo.len() >= MEMO_CAP {
+            self.arrow_dict_memo.clear();
+        }
+        self.arrow_dict_memo.push(ArrowDictSlotMemo {
+            identity: identity.to_vec(),
+            slot_to_gid: Vec::new(),
+        });
+        (self.arrow_dict_memo.len() - 1, vec![u64::MAX; dict_len])
+    }
+
+    #[cfg(feature = "arrow")]
+    pub(crate) fn restore_arrow_dict_memo(&mut self, idx: usize, slot_to_gid: Vec<u64>) {
+        if let Some(memo) = self.arrow_dict_memo.get_mut(idx) {
+            memo.slot_to_gid = slot_to_gid;
+        }
     }
 
     pub(crate) fn entry(&self, id: u64) -> Option<&[u8]> {
@@ -9096,6 +9157,36 @@ mod tests {
         let (_, is_new) = dict.intern(b"c").unwrap();
         assert!(is_new);
         assert_eq!(dict.len(), 2);
+    }
+
+    #[cfg(all(feature = "_sender-qwp-ws", feature = "arrow"))]
+    #[test]
+    fn arrow_dict_memo_reuses_table_and_clears_on_rollback() {
+        let mut dict = SymbolGlobalDict::new();
+        let mark = dict.mark();
+        let identity = [(0x1000usize, 8usize), (0x2000usize, 24usize)];
+
+        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, 3);
+        assert_eq!(table, vec![u64::MAX; 3]);
+        table[0] = 5;
+        table[2] = 7;
+        dict.restore_arrow_dict_memo(idx, table);
+
+        // Same identity → cache hit: the stored table comes back verbatim.
+        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, 3);
+        assert_eq!(idx2, idx);
+        assert_eq!(table2, vec![5, u64::MAX, 7]);
+        dict.restore_arrow_dict_memo(idx2, table2);
+
+        // A different values array → miss → fresh table.
+        let other = [(0x9000usize, 8usize), (0x2000usize, 24usize)];
+        let (_, fresh) = dict.take_arrow_dict_memo(&other, 2);
+        assert_eq!(fresh, vec![u64::MAX; 2]);
+
+        // Rollback drops every memoised id.
+        dict.rollback(mark);
+        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, 3);
+        assert_eq!(after_rollback, vec![u64::MAX; 3]);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
