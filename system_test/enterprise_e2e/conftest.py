@@ -66,7 +66,12 @@ if str(_ENT_E2E_DIR) not in sys.path:
 pytest_plugins = ("lib.shared_fixtures",)
 
 # Imports below depend on the sys.path insert above.
-from c_client_sidecar import CClientRustSidecar, build_qwp_sidecar  # noqa: E402
+from c_client_sidecar import (  # noqa: E402
+    CClientRustColumnSidecar,
+    CClientRustSidecar,
+    build_qwp_column_sidecar,
+    build_qwp_sidecar,
+)
 
 
 # --------------------------------------------------------------------
@@ -93,6 +98,33 @@ def c_client_rust_sidecar(
         classpath=None,
         name="c-client-rust-sidecar",
         binary_path=c_client_rust_sidecar_binary,
+    )
+    s.start()
+    try:
+        yield s
+    finally:
+        s.stop()
+
+
+@pytest.fixture(scope="session")
+def c_client_rust_column_sidecar_binary() -> Path:
+    """One cargo build per session for the column-major sidecar."""
+    return build_qwp_column_sidecar()
+
+
+@pytest.fixture(scope="function")
+def c_client_rust_column_sidecar(
+    c_client_rust_column_sidecar_binary: Path, log_dir: Path
+) -> Iterator[CClientRustColumnSidecar]:
+    """Sidecar driven by the Rust binding's column-major
+    ``qwp_column_sidecar`` binary. Speaks the same line protocol as
+    :func:`c_client_rust_sidecar`, so tests take a ``Sidecar``-typed
+    parameter polymorphically."""
+    s = CClientRustColumnSidecar(
+        log_dir=log_dir,
+        classpath=None,
+        name="c-client-rust-column-sidecar",
+        binary_path=c_client_rust_column_sidecar_binary,
     )
     s.start()
     try:

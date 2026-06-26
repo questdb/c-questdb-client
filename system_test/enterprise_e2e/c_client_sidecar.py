@@ -54,9 +54,9 @@ def _resolve_client_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def build_qwp_sidecar() -> Path:
-    """Build (idempotently) the Rust ``qwp_sidecar`` binary and return
-    its absolute path. Cargo no-ops when the target is already up to
+def _build_failover_bin(bin_name: str) -> Path:
+    """Build (idempotently) a binary from the ``failover_clients`` crate and
+    return its absolute path. Cargo no-ops when the target is already up to
     date, so this is cheap to call from a session fixture."""
     client_root = _resolve_client_root()
     manifest = client_root / "system_test" / "failover_clients" / "Cargo.toml"
@@ -70,7 +70,7 @@ def build_qwp_sidecar() -> Path:
         "--manifest-path",
         str(manifest),
         "--bin",
-        "qwp_sidecar",
+        bin_name,
     ]
     if profile == "release":
         cmd.insert(2, "--release")
@@ -79,7 +79,7 @@ def build_qwp_sidecar() -> Path:
             f"C_QUESTDB_CLIENT_PROFILE must be 'debug' or 'release', got {profile!r}"
         )
 
-    LOG.info("building qwp_sidecar (%s profile)", profile)
+    LOG.info("building %s (%s profile)", bin_name, profile)
     # Inherit stderr so cargo's progress lines reach the developer's
     # terminal during local runs; stdout is captured because cargo emits
     # nothing useful there and CI logs are quieter without it.
@@ -91,7 +91,7 @@ def build_qwp_sidecar() -> Path:
         / "failover_clients"
         / "target"
         / profile
-        / "qwp_sidecar"
+        / bin_name
     )
     if not binary.is_file():
         raise RuntimeError(
@@ -99,6 +99,16 @@ def build_qwp_sidecar() -> Path:
             "check the failover_clients crate manifest"
         )
     return binary
+
+
+def build_qwp_sidecar() -> Path:
+    """Build the row-major ``qwp_sidecar`` binary."""
+    return _build_failover_bin("qwp_sidecar")
+
+
+def build_qwp_column_sidecar() -> Path:
+    """Build the column-major ``qwp_column_sidecar`` binary."""
+    return _build_failover_bin("qwp_column_sidecar")
 
 
 @dataclass
@@ -112,10 +122,15 @@ class CClientRustSidecar(Sidecar):
 
     binary_path: Optional[Path] = field(default=None)
 
+    def _default_binary(self) -> Path:
+        """Binary built when no explicit ``binary_path`` is supplied.
+        Subclasses override to launch a different ``failover_clients`` bin."""
+        return build_qwp_sidecar()
+
     def start(self, *, ready_timeout: float = 30.0) -> None:
         if self.process is not None:
             raise RuntimeError(f"sidecar {self.name!r} already started")
-        binary = self.binary_path or build_qwp_sidecar()
+        binary = self.binary_path or self._default_binary()
         cmd = [str(binary)]
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -158,3 +173,16 @@ class CClientRustSidecar(Sidecar):
             if line == "READY":
                 break
             LOG.warning("sidecar %s pre-READY: %r", self.name, line)
+
+
+@dataclass
+class CClientRustColumnSidecar(CClientRustSidecar):
+    """c-questdb-client Rust-binding column-major sender sidecar.
+
+    Drives the ``QuestDb`` -> ``ColumnSender`` (column-major QWP/WebSocket)
+    path via the ``qwp_column_sidecar`` binary. Speaks the same line protocol
+    as :class:`CClientRustSidecar`, so the harness's CONNECT/SEND/FLUSH/CLOSE
+    verbs work unchanged and tests can take a ``Sidecar``-typed parameter."""
+
+    def _default_binary(self) -> Path:
+        return build_qwp_column_sidecar()

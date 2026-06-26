@@ -29,7 +29,7 @@ import pytest
 from lib.pg_query import wait_for_dense_sequence
 from lib.server import wait_port_free
 
-from c_client_sidecar import CClientRustSidecar
+from c_client_sidecar import CClientRustColumnSidecar, CClientRustSidecar
 
 LOG = logging.getLogger(__name__)
 
@@ -47,6 +47,29 @@ def _connect_string(http_port: int, sf_dir: Path, *,
         f"sf_dir={sf_dir}",
         f"reconnect_max_duration_millis={reconnect_max_ms}",
         f"close_flush_timeout_millis={close_flush_timeout_ms}",
+    ]
+    if request_durable_ack:
+        parts.append("request_durable_ack=on")
+    return ";".join(parts) + ";"
+
+
+def _connect_string_columnar(http_port: int, sf_dir: Path, *,
+                             request_durable_ack: bool = True,
+                             reconnect_max_ms: int = 60_000,
+                             close_flush_timeout_ms: int = 5_000) -> str:
+    """Column-major QWP/WebSocket connect string. Same store-and-forward
+    knobs as :func:`_connect_string`, with the ``qwpws`` schema and the
+    single-slot pool the column sender's store-and-forward path requires
+    (``pool_size=1`` / ``pool_max=1``)."""
+    parts = [
+        f"qwpws::addr=127.0.0.1:{http_port}",
+        "username=admin",
+        "password=quest",
+        f"sf_dir={sf_dir}",
+        f"reconnect_max_duration_millis={reconnect_max_ms}",
+        f"close_flush_timeout_millis={close_flush_timeout_ms}",
+        "pool_size=1",
+        "pool_max=1",
     ]
     if request_durable_ack:
         parts.append("request_durable_ack=on")
@@ -109,5 +132,53 @@ def test_kill9_primary_failover_no_data_loss_c_client_rust(
     # primary's row count is the authoritative answer to "did anything
     # get lost." Sidecar stats can lag legitimately under the piggyback
     # durable-ack contract.
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=row_count, timeout_s=60.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_kill9_primary_failover_no_data_loss_c_client_rust_columnar(
+    server_factory,
+    c_client_rust_column_sidecar: CClientRustColumnSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """Failover scenario driven by the c-questdb-client Rust binding's
+    column-major (``ColumnSender``) QWP/WebSocket path. Same body as the
+    row-major test -- kill -9 P1, wipe disk + object store, bring P2 up on
+    the same port -- but the sender appends a column-major ``Chunk`` over a
+    store-and-forward connection. Asserts P2 ends up with every row.
+
+    The schema (single LONG ``v`` + designated timestamp) matches the
+    row-major test, so the same ``wait_for_dense_sequence`` oracle applies."""
+    table = "trades_failover_c_client_rust_columnar"
+    row_count = 50
+    sf_dir = scenario_dir / "sf"
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    c_client_rust_column_sidecar.connect(_connect_string_columnar(p1_ports.http, sf_dir))
+    c_client_rust_column_sidecar.send(table, count=row_count, start_index=0)
+    c_client_rust_column_sidecar.flush()
+
+    # Brief settle so P1 has a chance to OK the batch before the kill.
+    time.sleep(0.5)
+
+    p1.kill_9()
+    wait_port_free(p1_ports.http)
+    wait_port_free(p1_ports.pg)
+
+    # Worst-case disaster: the only surviving copy is the sender's SF.
+    if p1.db_root.exists():
+        shutil.rmtree(p1.db_root)
+    obj_store.wipe()
+
+    p2 = server_factory("p2", db_root_name="p2-fresh")
+    p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+
+    # The column sender's store-and-forward backend reconnects and replays
+    # on its own; wait for every row to land on the successor.
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
                             expected_count=row_count, timeout_s=60.0)
