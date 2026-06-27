@@ -72,6 +72,24 @@ pub fn borrow_column_sender_owned_with_retry(
     db.borrow_column_sender_owned_with_retry(budget)
 }
 
+/// Borrow a **direct** (non-store-and-forward) column-major sender as an
+/// owned, lifetime-free handle. FFI counterpart to
+/// [`QuestDb::borrow_direct_column_sender`]; backs the C ABI's
+/// `questdb_db_borrow_direct_column_sender`.
+pub fn borrow_direct_column_sender_owned(db: &QuestDb) -> Result<OwnedColumnSender> {
+    db.borrow_direct_column_sender_owned()
+}
+
+/// Like [`borrow_direct_column_sender_owned`] but retries the connect within
+/// `budget` using the reconnect backoff. Backs the C ABI's
+/// `questdb_db_borrow_direct_column_sender_with_retry`.
+pub fn borrow_direct_column_sender_owned_with_retry(
+    db: &QuestDb,
+    budget: Duration,
+) -> Result<OwnedColumnSender> {
+    db.borrow_direct_column_sender_owned_with_retry(budget)
+}
+
 /// Borrow a row-major ([`crate::ingress::Sender`]) sender as an owned,
 /// lifetime-free handle. FFI counterpart to [`QuestDb::borrow_row_sender`];
 /// backs the C ABI's `questdb_db_borrow_row_sender`.

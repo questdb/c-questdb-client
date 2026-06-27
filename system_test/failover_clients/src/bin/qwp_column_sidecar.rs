@@ -182,13 +182,16 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             let table = state.table.clone().ok_or_else(|| "no table".to_string())?;
             {
                 let db = state.db.as_ref().unwrap();
-                let mut sender = db.borrow_column_sender().map_err(|e| e.to_string())?;
                 // Publish and wait for the server `Ok` watermark. The frame stays
                 // in the sf_dir until durably acked, so a kill-9 of the primary
                 // before that durable ack leaves it to replay to the successor —
-                // the row sidecar's OK-but-not-durable case.
+                // the row sidecar's OK-but-not-durable case. The store-and-forward
+                // (`borrow_column_sender`) handle composes publish-only `flush`
+                // with the `wait` ack barrier.
                 match state.src {
                     SendSrc::Chunk => {
+                        let mut sender =
+                            db.borrow_column_sender().map_err(|e| e.to_string())?;
                         let mut chunk = Chunk::new(table.as_str());
                         chunk
                             .column_i64("v", state.v.as_slice(), None)
@@ -196,32 +199,34 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                         chunk
                             .designated_timestamp_micros(state.ts.as_slice())
                             .map_err(|e| e.to_string())?;
-                        sender
-                            .flush_and_wait(&mut chunk, AckLevel::Ok)
-                            .map_err(|e| e.to_string())?;
+                        sender.flush(&mut chunk).map_err(|e| e.to_string())?;
+                        sender.wait(AckLevel::Ok).map_err(|e| e.to_string())?;
                     }
                     SendSrc::Arrow => {
+                        let mut sender =
+                            db.borrow_column_sender().map_err(|e| e.to_string())?;
                         let batch = build_arrow_batch(&state.v, &state.ts)?;
                         let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
                         sender
-                            .flush_arrow_batch_at_column_and_wait(
+                            .flush_arrow_batch_at_column(
                                 table.as_str(),
                                 &batch,
                                 ts_col,
                                 &[],
-                                AckLevel::Ok,
                             )
                             .map_err(|e| e.to_string())?;
+                        sender.wait(AckLevel::Ok).map_err(|e| e.to_string())?;
                     }
                     #[cfg(feature = "polars")]
                     SendSrc::Polars => {
+                        // `flush_polars_dataframe` lives on the direct sender: it
+                        // owns its own commit + replay from the source frame.
+                        let mut sender = db
+                            .borrow_direct_column_sender()
+                            .map_err(|e| e.to_string())?;
                         let df = build_polars_df(&state.v, &state.ts)?;
                         let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
                         let opts = PolarsIngestOptions::new().timestamp_column(ts_col);
-                        // flush_polars_dataframe owns the commit, ACKing each
-                        // checkpoint at the server `Ok` watermark (not durable),
-                        // so the store-and-forward backend still replays to the
-                        // successor after the kill.
                         sender
                             .flush_polars_dataframe(table.as_str(), &df, &opts)
                             .map_err(|e| e.to_string())?;

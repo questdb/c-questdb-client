@@ -95,30 +95,30 @@ TEST_CASE("pool construction throws on invalid connect string")
     CHECK_THROWS_AS(questdb::pool{"http::not-a-qwp-string;"}, qdb::line_sender_error);
 }
 
-TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
+TEST_CASE("borrowed_sf_column_sender returns conn to pool on destructor")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
 
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sf_column_sender();
         CHECK(conn->c_ptr() != nullptr);
         CHECK_FALSE(conn->must_close());
     }
     int accepts_before = mock->accepts();
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sf_column_sender();
         CHECK(conn->c_ptr() != nullptr);
     }
     CHECK(mock->accepts() == accepts_before);
 }
 
-TEST_CASE("borrowed_column_sender move transfers ownership without double-return")
+TEST_CASE("borrowed_sf_column_sender move transfers ownership without double-return")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto a = db.borrow_column_sender();
-    ::column_sender* raw = a->c_ptr();
+    auto a = db.borrow_sf_column_sender();
+    ::sf_column_sender* raw = a->c_ptr();
     REQUIRE(raw != nullptr);
 
     auto b = std::move(a);
@@ -129,7 +129,7 @@ TEST_CASE("column_chunk flush round-trips through the mock")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sf_column_sender();
 
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10, 20, 30};
@@ -150,7 +150,7 @@ TEST_CASE("flush rejects oversized table name")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sf_column_sender();
 
     std::string oversized(200, 'x');
     qdb::column_chunk chunk{oversized};
@@ -163,36 +163,38 @@ TEST_CASE("flush rejects oversized table name")
     conn.drop_on_return();
 }
 
-TEST_CASE("flush_and_wait rejects NULL conn")
+TEST_CASE("direct flush_and_wait rejects NULL conn")
 {
     qdb::column_chunk chunk{"trades"};
     int64_t v[] = {1};
     int64_t t[] = {1};
     chunk.column_i64("v", v, 1).designated_timestamp_nanos(t, 1);
 
-    qdb::column_sender_conn conn{nullptr};
+    // flush_and_wait is a direct-handle method (the SF handle composes
+    // flush() + wait()).
+    qdb::direct_column_sender_conn conn{nullptr};
     CHECK_THROWS_AS(
         conn.flush_and_wait(chunk, qdb::column_sender_ack_level::ok),
         qdb::line_sender_error);
 }
 
-TEST_CASE("flush_and_wait rejects durable ACK without opt-in and keeps the chunk")
+TEST_CASE("wait rejects durable ACK without opt-in and keeps the chunk")
 {
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
-    auto conn = db.borrow_column_sender();
+    auto conn = db.borrow_sf_column_sender();
 
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10};
     int64_t ts[] = {1'700'000'000'000'000'000LL};
     chunk.column_i64("qty", qty, 1).designated_timestamp_nanos(ts, 1);
 
-    // Durable opt-in is a preflight: this is rejected before any frame is
-    // published, so the chunk is left intact and the exception preserves the
-    // underlying `invalid_api_call` code.
+    // Durable is validated by `wait` (the ack barrier); with no `flush` no
+    // frame is published, so the chunk is left intact and the exception
+    // preserves the underlying `invalid_api_call` code.
     try
     {
-        conn->flush_and_wait(chunk, qdb::column_sender_ack_level::durable);
+        conn->wait(qdb::column_sender_ack_level::durable);
         FAIL("durable without opt-in must throw");
     }
     catch (const qdb::line_sender_error& e)
@@ -210,12 +212,12 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
 
     int accepts_before;
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sf_column_sender();
         accepts_before = mock->accepts();
         conn.drop_on_return();
     }
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sf_column_sender();
         CHECK(conn->c_ptr() != nullptr);
     }
     CHECK(mock->accepts() == accepts_before + 1);
@@ -237,7 +239,7 @@ TEST_CASE("pool reap_idle is callable")
     auto mock = spawn_mock(2);
     questdb::pool db{conf_for(mock->addr(), "pool_idle_timeout_ms=1;")};
     {
-        auto conn = db.borrow_column_sender();
+        auto conn = db.borrow_sf_column_sender();
         (void)conn;
     }
     [[maybe_unused]] size_t closed = db.reap_idle();

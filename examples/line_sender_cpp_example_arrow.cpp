@@ -55,13 +55,13 @@ bool example(const std::string& host, const std::string& port)
         ::line_sender_error_free(err);
         return false;
     }
-    ::column_sender* raw_conn = ::questdb_db_borrow_column_sender(db, &err);
+    ::sf_column_sender* raw_conn = ::questdb_db_borrow_sf_column_sender(db, &err);
     if (!raw_conn)
     {
         size_t err_len = 0;
         const char* err_msg = ::line_sender_error_msg(err, &err_len);
         std::fprintf(
-            stderr, "questdb_db_borrow_column_sender: %.*s\n",
+            stderr, "questdb_db_borrow_sf_column_sender: %.*s\n",
             static_cast<int>(err_len), err_msg);
         ::line_sender_error_free(err);
         ::questdb_db_close(db);
@@ -95,14 +95,14 @@ bool example(const std::string& host, const std::string& port)
         else
         {
             arrow_c_guard guard{c_arr, c_sch};
-            qdb::column_sender_conn conn{raw_conn};
+            qdb::sf_column_sender_conn conn{raw_conn};
             conn.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
-            if (!::column_sender_sync(raw_conn, ::column_sender_ack_level_ok, &err))
+            if (!::sf_column_sender_wait(raw_conn, ::column_sender_ack_level_ok, &err))
             {
                 size_t err_len = 0;
                 const char* err_msg = ::line_sender_error_msg(err, &err_len);
                 std::fprintf(
-                    stderr, "column_sender_sync: %.*s\n",
+                    stderr, "sf_column_sender_wait: %.*s\n",
                     static_cast<int>(err_len), err_msg);
                 ::line_sender_error_free(err);
             }
@@ -117,10 +117,10 @@ bool example(const std::string& host, const std::string& port)
         std::fprintf(stderr, "Error: %s\n", e.what());
     }
 
-    if (::column_sender_must_close(raw_conn))
-        ::questdb_db_drop_column_sender(db, raw_conn);
+    if (::sf_column_sender_must_close(raw_conn))
+        ::questdb_db_drop_sf_column_sender(db, raw_conn);
     else
-        ::questdb_db_return_column_sender(db, raw_conn);
+        ::questdb_db_return_sf_column_sender(db, raw_conn);
     ::questdb_db_close(db);
     return ok;
 }

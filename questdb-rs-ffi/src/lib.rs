@@ -5350,7 +5350,7 @@ mod tests {
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
@@ -5362,14 +5362,14 @@ mod tests {
 
             questdb_db_close(db);
 
-            assert!(!column_sender_flush(sender, chunk, &mut err));
+            assert!(!sf_column_sender_flush(sender, chunk, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
                 "QuestDb pool is closed",
             );
 
-            questdb_db_return_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
             column_sender_chunk_free(chunk);
         }
     }

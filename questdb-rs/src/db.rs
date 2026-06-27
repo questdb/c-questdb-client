@@ -104,8 +104,13 @@ fn lock_state(m: &Mutex<PoolState>) -> std::sync::MutexGuard<'_, PoolState> {
 /// The two pools are structurally identical (`Mutex<PoolState>`) but differ in
 /// what they hand out:
 /// * [`ColumnPoolKind::Main`] — the general-purpose pool behind
-///   [`QuestDb::borrow_column_sender`]: store-and-forward (single active
-///   borrower) when `sf_dir` is set, direct otherwise.
+///   [`QuestDb::borrow_column_sender`]: always store-and-forward — an
+///   in-memory queue when no `sf_dir` is set (pools freely up to `pool_max`),
+///   disk-backed and capped to a single active borrower when it is. The SFA
+///   queue owns delivery, so a borrow returned/dropped after a no-wait `flush`
+///   does not lose accepted frames; `sync` / `flush_and_wait` are an ack-wait
+///   barrier (block until the published frame reaches the requested
+///   [`AckLevel`]), not a commit-or-lose-data step.
 /// * [`ColumnPoolKind::Direct`] — the always-direct pool behind
 ///   [`QuestDb::borrow_direct_column_sender`], independent of `sf_dir`. Used by
 ///   DataFrame ingestion (Polars / Pandas), which drives its own replay from
@@ -437,9 +442,13 @@ impl QuestDb {
     /// Selection: pop the most-recently-returned slot from the free list;
     /// failing that, open a new connection if we are below `pool_max`;
     /// failing that, return `InvalidApiCall` (fail-fast at cap).
-    pub fn borrow_column_sender(&self) -> Result<BorrowedColumnSender<'_>> {
+    pub fn borrow_column_sender(&self) -> Result<SfColumnSender<'_>> {
         let cs = self.pick_column_sender()?;
-        Ok(BorrowedColumnSender::new(self, cs, ColumnPoolKind::Main))
+        Ok(SfColumnSender(ColumnSenderHandle::new(
+            self,
+            cs,
+            ColumnPoolKind::Main,
+        )))
     }
 
     /// Borrow a **direct** (non-store-and-forward) column sender from the
@@ -451,9 +460,13 @@ impl QuestDb {
     /// connection, never the store-and-forward queue. Unlike
     /// [`Self::borrow_column_sender`], this pool is always direct and always
     /// poolable up to `pool_max`, even when `sf_dir` is configured.
-    pub fn borrow_direct_column_sender(&self) -> Result<BorrowedColumnSender<'_>> {
+    pub fn borrow_direct_column_sender(&self) -> Result<DirectColumnSender<'_>> {
         let cs = pick_column_sender_inner(&self.inner, ColumnPoolKind::Direct)?;
-        Ok(BorrowedColumnSender::new(self, cs, ColumnPoolKind::Direct))
+        Ok(DirectColumnSender(ColumnSenderHandle::new(
+            self,
+            cs,
+            ColumnPoolKind::Direct,
+        )))
     }
 
     /// Borrow a **row-major** ([`crate::ingress::Sender`]) ILP sender from the
@@ -508,8 +521,40 @@ impl QuestDb {
         let deadline = Instant::now().checked_add(budget);
         Ok(OwnedColumnSender {
             inner: Arc::clone(&self.inner),
-            sender: Some(reconnect_pick(&self.inner, deadline)?),
+            sender: Some(reconnect_pick(&self.inner, ColumnPoolKind::Main, deadline)?),
             kind: ColumnPoolKind::Main,
+        })
+    }
+
+    /// FFI escape hatch: like [`Self::borrow_direct_column_sender`] but the
+    /// returned handle is not lifetime-bound to `&self` (carries an
+    /// `Arc<DbInner>` so it can outlive the user-facing `QuestDb` pointer).
+    /// Backs the C ABI's `questdb_db_borrow_direct_column_sender`. Hidden from
+    /// the Rust API; Rust callers should prefer the lifetime-bound
+    /// [`Self::borrow_direct_column_sender`].
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn borrow_direct_column_sender_owned(&self) -> Result<OwnedColumnSender> {
+        let cs = pick_column_sender_inner(&self.inner, ColumnPoolKind::Direct)?;
+        Ok(OwnedColumnSender {
+            inner: Arc::clone(&self.inner),
+            sender: Some(cs),
+            kind: ColumnPoolKind::Direct,
+        })
+    }
+
+    /// Like [`borrow_direct_column_sender_owned`] but retries the connect
+    /// within `budget` using the reconnect backoff. Backs the C ABI's
+    /// `questdb_db_borrow_direct_column_sender_with_retry`.
+    #[cfg(feature = "ffi-support")]
+    pub(crate) fn borrow_direct_column_sender_owned_with_retry(
+        &self,
+        budget: Duration,
+    ) -> Result<OwnedColumnSender> {
+        let deadline = Instant::now().checked_add(budget);
+        Ok(OwnedColumnSender {
+            inner: Arc::clone(&self.inner),
+            sender: Some(reconnect_pick(&self.inner, ColumnPoolKind::Direct, deadline)?),
+            kind: ColumnPoolKind::Direct,
         })
     }
 
@@ -858,15 +903,19 @@ impl Drop for QuestDb {
     }
 }
 
-/// A sender borrowed from a [`QuestDb`] pool.
+/// Shared pool plumbing behind the two public column-sender handles
+/// ([`SfColumnSender`] and [`DirectColumnSender`]). Holds the borrowed
+/// [`ColumnSender`] plus the bookkeeping needed to return it to the pool on
+/// drop / reborrow. The public wrappers expose only the mode-appropriate
+/// method surface; this type is private.
 ///
 /// On `Drop` the underlying connection is returned to the pool unless it
 /// has latched into `must_close=true`, in which case it is dropped (and
 /// auto-grow will open a fresh one for the next borrow).
 ///
-/// `BorrowedColumnSender` is **not** `Send` or `Sync`. The borrowed connection
-/// belongs to the borrowing thread for the duration of the borrow.
-pub struct BorrowedColumnSender<'a> {
+/// Not `Send` or `Sync`: the borrowed connection belongs to the borrowing
+/// thread for the duration of the borrow.
+struct ColumnSenderHandle<'a> {
     db: &'a QuestDb,
     sender: Option<ColumnSender>,
     /// Which pool this handle returns to on drop / reborrow.
@@ -876,7 +925,7 @@ pub struct BorrowedColumnSender<'a> {
     _not_send: PhantomData<Rc<()>>,
 }
 
-impl<'a> BorrowedColumnSender<'a> {
+impl<'a> ColumnSenderHandle<'a> {
     fn new(db: &'a QuestDb, sender: ColumnSender, kind: ColumnPoolKind) -> Self {
         Self {
             db,
@@ -884,6 +933,18 @@ impl<'a> BorrowedColumnSender<'a> {
             kind,
             _not_send: PhantomData,
         }
+    }
+
+    fn inner_mut(&mut self) -> &mut ColumnSender {
+        self.sender
+            .as_mut()
+            .expect("borrowed column sender already returned")
+    }
+
+    fn inner_ref(&self) -> &ColumnSender {
+        self.sender
+            .as_ref()
+            .expect("borrowed column sender already returned")
     }
 
     /// The pool's reconnect backoff budget; see [`QuestDb::reconnect_policy`].
@@ -971,33 +1032,280 @@ impl<'a> BorrowedColumnSender<'a> {
     }
 }
 
-impl Debug for BorrowedColumnSender<'_> {
+impl Debug for ColumnSenderHandle<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowedColumnSender")
+        f.debug_struct("ColumnSenderHandle")
             .field("sender", &self.sender)
             .finish()
     }
 }
 
-impl Deref for BorrowedColumnSender<'_> {
-    type Target = ColumnSender;
+/// Store-and-forward column sender borrowed from a [`QuestDb`] pool — the
+/// handle returned by [`QuestDb::borrow_column_sender`].
+///
+/// [`Self::flush`] appends a frame to the connection's store-and-forward
+/// queue, which owns delivery: returning or dropping the handle does not lose
+/// accepted frames. [`Self::wait`] is a server-ack barrier (block until the
+/// frames published so far reach the requested [`AckLevel`]) — needed only to
+/// *observe* delivery, never for durability. There is deliberately no
+/// `flush_and_wait` / `sync`: compose [`Self::flush`] then [`Self::wait`].
+///
+/// Not `Send` or `Sync`.
+pub struct SfColumnSender<'a>(ColumnSenderHandle<'a>);
 
-    fn deref(&self) -> &Self::Target {
-        self.sender
-            .as_ref()
-            .expect("borrowed sender already returned")
+impl<'a> SfColumnSender<'a> {
+    /// Encode and publish `chunk` into the store-and-forward queue, returning
+    /// as soon as the frame is accepted locally (no server round-trip). On
+    /// success `chunk` is cleared; on a delivery-uncertain failure the error
+    /// is tagged [`in_doubt`](crate::Error::in_doubt).
+    pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
+        self.0.inner_mut().flush(chunk)
+    }
+
+    /// Block until every frame published on this handle so far reaches
+    /// `ack_level`. Short-circuits when nothing is pending or the watermark
+    /// already covers the latest frame. `AckLevel::Durable` requires the pool
+    /// to have been opened with `request_durable_ack=on`.
+    pub fn wait(&mut self, ack_level: AckLevel) -> Result<()> {
+        self.0.inner_mut().sync(ack_level)
+    }
+
+    /// `true` once the connection has latched terminally closed.
+    #[must_use]
+    pub fn must_close(&self) -> bool {
+        self.0.inner_ref().must_close()
+    }
+
+    /// Force the connection to be dropped (not recycled) on return.
+    pub fn mark_must_close(&mut self) {
+        self.0.inner_mut().mark_must_close()
+    }
+
+    /// Always `true` for an SF handle (it wraps a store-and-forward backend).
+    /// Retained for symmetry with [`DirectColumnSender`] and test assertions.
+    #[cfg(test)]
+    pub(crate) fn is_store_and_forward(&self) -> bool {
+        self.0.inner_ref().is_store_and_forward()
+    }
+
+    /// In-flight (published-but-unacked) frame count. Always 0 for the SF
+    /// backend, whose queue tracks delivery internally.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> u32 {
+        self.0.inner_ref().in_flight()
+    }
+
+    /// Encode and publish an Arrow [`RecordBatch`](arrow_array::RecordBatch)
+    /// into the queue, letting the server stamp each row's designated
+    /// timestamp on arrival. Publish-only; call [`Self::wait`] for an ack.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_server_stamped<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_server_stamped(table, batch, overrides)
+    }
+
+    /// Encode and publish an Arrow [`RecordBatch`](arrow_array::RecordBatch)
+    /// into the queue, sourcing the designated timestamp from the named
+    /// column. Publish-only; call [`Self::wait`] for an ack.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        ts_column: crate::ingress::ColumnName<'_>,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_at_column(table, batch, ts_column, overrides)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sfa_sync_timeout_for_test(&mut self, timeout: Duration) {
+        self.0.inner_mut().set_sfa_sync_timeout_for_test(timeout)
     }
 }
 
-impl DerefMut for BorrowedColumnSender<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.sender
-            .as_mut()
-            .expect("borrowed sender already returned")
+impl Debug for SfColumnSender<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SfColumnSender").field(&self.0).finish()
     }
 }
 
-impl Drop for BorrowedColumnSender<'_> {
+/// Direct (pipelined, non-store-and-forward) column sender borrowed from a
+/// [`QuestDb`] pool — the handle returned by
+/// [`QuestDb::borrow_direct_column_sender`], used by DataFrame ingestion.
+///
+/// [`Self::flush`] pipelines a deferred frame; [`Self::commit`] (or
+/// [`Self::flush_and_wait`] on the final chunk) sends the commit boundary and
+/// waits for `ack_level`. Dropping the handle with uncommitted deferred frames
+/// discards them — re-drive the source from the last successful commit.
+///
+/// Not `Send` or `Sync`.
+pub struct DirectColumnSender<'a>(ColumnSenderHandle<'a>);
+
+impl<'a> DirectColumnSender<'a> {
+    /// Encode and pipeline `chunk` as a deferred frame without waiting. The
+    /// frame is not committed until [`Self::commit`] / [`Self::flush_and_wait`].
+    pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
+        self.0.inner_mut().flush(chunk)
+    }
+
+    /// Publish `chunk` as a non-deferred commit boundary and block until it
+    /// (and all prior pipelined frames) reach `ack_level`.
+    pub fn flush_and_wait(
+        &mut self,
+        chunk: &mut crate::ingress::column_sender::Chunk<'_>,
+        ack_level: AckLevel,
+    ) -> Result<()> {
+        self.0.inner_mut().flush_and_wait(chunk, ack_level)
+    }
+
+    /// Send the commit boundary for all pipelined frames and block until they
+    /// reach `ack_level`. The direct sender's durability checkpoint: frames
+    /// pipelined by [`Self::flush`] are lost if the handle is dropped before a
+    /// successful `commit`.
+    pub fn commit(&mut self, ack_level: AckLevel) -> Result<()> {
+        self.0.inner_mut().sync(ack_level)
+    }
+
+    /// Failover primitive: swap onto a fresh connection from the pool behind
+    /// the same handle after a transient flush failure. No-op on a healthy,
+    /// fully-committed connection.
+    pub fn reborrow_from_pool(&mut self) -> Result<()> {
+        self.0.reborrow_from_pool()
+    }
+
+    #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
+    pub(crate) fn reborrow_with_retry(&mut self, deadline: Option<Instant>) -> Result<()> {
+        self.0.reborrow_with_retry(deadline)
+    }
+
+    #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
+    pub(crate) fn reconnect_policy(&self) -> crate::ingress::ReconnectPolicy {
+        self.0.reconnect_policy()
+    }
+
+    /// `true` once the connection has latched terminally closed.
+    #[must_use]
+    pub fn must_close(&self) -> bool {
+        self.0.inner_ref().must_close()
+    }
+
+    /// Force the connection to be dropped (not recycled) on return.
+    pub fn mark_must_close(&mut self) {
+        self.0.inner_mut().mark_must_close()
+    }
+
+    /// Always `false` for a direct handle. Retained for symmetry with
+    /// [`SfColumnSender`] and test assertions.
+    #[cfg(test)]
+    pub(crate) fn is_store_and_forward(&self) -> bool {
+        self.0.inner_ref().is_store_and_forward()
+    }
+
+    /// In-flight (published-but-unacked) deferred frame count.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> u32 {
+        self.0.inner_ref().in_flight()
+    }
+
+    /// Publish-only Arrow flush (server-stamped). Pair with [`Self::commit`].
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_server_stamped<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_server_stamped(table, batch, overrides)
+    }
+
+    /// Publish-only Arrow flush (column-stamped). Pair with [`Self::commit`].
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        ts_column: crate::ingress::ColumnName<'_>,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_at_column(table, batch, ts_column, overrides)
+    }
+
+    /// ACKing Arrow flush (server-stamped): publish as a commit boundary and
+    /// wait for `ack_level`.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_server_stamped_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0.inner_mut().flush_arrow_batch_server_stamped_and_wait(
+            table, batch, overrides, ack_level,
+        )
+    }
+
+    /// ACKing Arrow flush (column-stamped): publish as a commit boundary and
+    /// wait for `ack_level`.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        ts_column: crate::ingress::ColumnName<'_>,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0.inner_mut().flush_arrow_batch_at_column_and_wait(
+            table, batch, ts_column, overrides, ack_level,
+        )
+    }
+}
+
+impl Debug for DirectColumnSender<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DirectColumnSender").field(&self.0).finish()
+    }
+}
+
+impl Drop for ColumnSenderHandle<'_> {
     fn drop(&mut self) {
         let Some(mut sender) = self.sender.take() else {
             return;
@@ -1486,11 +1794,15 @@ fn connect_sfa_pool(inner: &Arc<DbInner>) -> Result<ColumnSender> {
 /// retries; `AuthError` / `ProtocolVersionError` and deadline exhaustion are
 /// terminal.
 #[cfg(feature = "ffi-support")]
-fn reconnect_pick(inner: &Arc<DbInner>, deadline: Option<Instant>) -> Result<ColumnSender> {
+fn reconnect_pick(
+    inner: &Arc<DbInner>,
+    kind: ColumnPoolKind,
+    deadline: Option<Instant>,
+) -> Result<ColumnSender> {
     let policy = inner.connector.reconnect_policy();
     let mut backoff = policy.initial_backoff();
     loop {
-        match pick_column_sender_inner(inner, ColumnPoolKind::Main) {
+        match pick_column_sender_inner(inner, kind) {
             Ok(cs) => return Ok(cs),
             Err(e) if reconnect_error_is_terminal(&e) || reconnect_deadline_expired(deadline) => {
                 return Err(e);
@@ -1833,7 +2145,8 @@ const _: fn() = || {
     fn assert_not_send<T: ?Sized>() {
         let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
     }
-    assert_not_send::<BorrowedColumnSender<'_>>();
+    assert_not_send::<SfColumnSender<'_>>();
+    assert_not_send::<DirectColumnSender<'_>>();
     assert_not_send::<BorrowedRowSender<'_>>();
     #[cfg(feature = "_egress")]
     assert_not_send::<BorrowedReader<'_>>();

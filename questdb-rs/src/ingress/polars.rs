@@ -40,7 +40,7 @@
 //!
 //! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
 //!
-//! The one-call shortcut is [`BorrowedColumnSender::flush_polars_dataframe`].
+//! The one-call shortcut is [`DirectColumnSender::flush_polars_dataframe`].
 //! For full control over slicing and per-batch retry, drive the
 //! iterator directly:
 //!
@@ -50,7 +50,7 @@
 //! }
 //! ```
 //!
-//! [`BorrowedColumnSender::flush_polars_dataframe`]: crate::db::BorrowedColumnSender::flush_polars_dataframe
+//! [`DirectColumnSender::flush_polars_dataframe`]: crate::db::DirectColumnSender::flush_polars_dataframe
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -307,7 +307,7 @@ impl Iterator for DataFrameBatches<'_> {
 /// failover re-drive to ≈64 × `max_rows` rows.
 const CHECKPOINT_BATCHES: usize = 64;
 
-/// Optional knobs for [`BorrowedColumnSender::flush_polars_dataframe`].
+/// Optional knobs for [`DirectColumnSender::flush_polars_dataframe`].
 ///
 /// Every field defaults to "off", so `PolarsIngestOptions::default()` (or
 /// [`PolarsIngestOptions::new`]) reproduces the original three-argument
@@ -324,7 +324,7 @@ const CHECKPOINT_BATCHES: usize = 64;
 /// sender.flush_polars_dataframe("trades", &df, &opts)?;
 /// ```
 ///
-/// [`BorrowedColumnSender::flush_polars_dataframe`]: crate::db::BorrowedColumnSender::flush_polars_dataframe
+/// [`DirectColumnSender::flush_polars_dataframe`]: crate::db::DirectColumnSender::flush_polars_dataframe
 #[derive(Clone, Copy, Default)]
 pub struct PolarsIngestOptions<'a> {
     max_rows: Option<NonZeroUsize>,
@@ -372,7 +372,7 @@ impl<'a> PolarsIngestOptions<'a> {
     }
 }
 
-impl crate::db::BorrowedColumnSender<'_> {
+impl crate::db::DirectColumnSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `options.max_rows` rows
     /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
     /// commit at checkpoint boundaries — re-driving transparently across a
@@ -385,9 +385,11 @@ impl crate::db::BorrowedColumnSender<'_> {
     /// `PolarsIngestOptions::default()` preserves the previous behaviour
     /// (server-assigned timestamps, schema-derived wire types).
     ///
-    /// Unlike `ColumnSender::flush` / `ColumnSender::flush_arrow_batch_*`, which
-    /// leave rows uncommitted until you call `ColumnSender::sync`, this entry
+    /// Unlike the lower-level `flush` / `flush_arrow_batch_*`, which leave rows
+    /// uncommitted until you call [`DirectColumnSender::commit`], this entry
     /// owns the commit (and the failover replay boundary).
+    ///
+    /// [`DirectColumnSender::commit`]: crate::db::DirectColumnSender::commit
     ///
     /// [`TableName`]: crate::ingress::TableName
     ///
@@ -465,7 +467,7 @@ impl crate::db::BorrowedColumnSender<'_> {
 /// durable by each successful checkpoint, so on a transient error the caller
 /// re-drives only the uncommitted tail.
 fn drive_from_checkpoint(
-    sender: &mut crate::db::BorrowedColumnSender<'_>,
+    sender: &mut crate::db::DirectColumnSender<'_>,
     table: crate::ingress::TableName<'_>,
     df: &DataFrame,
     options: &PolarsIngestOptions<'_>,
@@ -516,7 +518,7 @@ fn drive_from_checkpoint(
     // committed; otherwise drain the trailing tail. This also covers the
     // empty-/no-batch case, where `sync` is the only completion wait.
     if !last_was_checkpoint {
-        sender.sync(AckLevel::Ok)?;
+        sender.commit(AckLevel::Ok)?;
     }
     Ok(())
 }

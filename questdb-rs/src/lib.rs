@@ -75,7 +75,7 @@ pub use error::*;
 mod db;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub use db::{BorrowedColumnSender, BorrowedRowSender, QuestDb};
+pub use db::{BorrowedRowSender, DirectColumnSender, QuestDb, SfColumnSender};
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
 pub use db::BorrowedReader;

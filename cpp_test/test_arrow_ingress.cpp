@@ -1,5 +1,5 @@
 // FFI-boundary smoke test for the C++ wrapper
-// `column_sender_conn::flush_arrow_batch` over the new conn-level Arrow
+// `direct_column_sender_conn::flush_arrow_batch` over the new conn-level Arrow
 // batch ingest API. Successful round-trip coverage and per-type
 // classification coverage live in the Rust unit tests under
 // `questdb-rs/src/ingress/column_sender/arrow_batch.rs` and the Python
@@ -25,27 +25,27 @@ namespace qdb = questdb::ingress;
 namespace qm = qwp_mock;
 using namespace questdb::ingress::literals;
 
-TEST_CASE("column_sender_conn::flush_arrow_batch rejects NULL conn")
+TEST_CASE("direct_column_sender_conn::flush_arrow_batch rejects NULL conn")
 {
     ArrowArray arr;
     ArrowSchema sch;
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_conn conn{nullptr};
+    qdb::direct_column_sender_conn conn{nullptr};
     CHECK_THROWS_AS(
         conn.flush_arrow_batch_server_stamped("t"_tn, arr, sch),
         qdb::line_sender_error);
 }
 
-TEST_CASE("column_sender_conn::flush_arrow_batch at_column rejects NULL conn")
+TEST_CASE("direct_column_sender_conn::flush_arrow_batch at_column rejects NULL conn")
 {
     ArrowArray arr;
     ArrowSchema sch;
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_conn conn{nullptr};
+    qdb::direct_column_sender_conn conn{nullptr};
     CHECK_THROWS_AS(
         conn.flush_arrow_batch("t"_tn, arr, sch, "ts"_cn),
         qdb::line_sender_error);
@@ -58,7 +58,7 @@ TEST_CASE("flush_arrow_batch_server_stamped_and_wait rejects NULL conn")
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_conn conn{nullptr};
+    qdb::direct_column_sender_conn conn{nullptr};
     CHECK_THROWS_AS(
         conn.flush_arrow_batch_server_stamped_and_wait(
             "t"_tn, arr, sch, qdb::column_sender_ack_level::ok),
@@ -72,21 +72,21 @@ TEST_CASE("flush_arrow_batch_and_wait rejects NULL conn")
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_conn conn{nullptr};
+    qdb::direct_column_sender_conn conn{nullptr};
     CHECK_THROWS_AS(
         conn.flush_arrow_batch_and_wait(
             "t"_tn, arr, sch, "ts"_cn, qdb::column_sender_ack_level::ok),
         qdb::line_sender_error);
 }
 
-TEST_CASE("column_sender_conn surfaces error_code on NULL-conn failure")
+TEST_CASE("direct_column_sender_conn surfaces error_code on NULL-conn failure")
 {
     ArrowArray arr;
     ArrowSchema sch;
     std::memset(&arr, 0, sizeof(arr));
     std::memset(&sch, 0, sizeof(sch));
 
-    qdb::column_sender_conn conn{nullptr};
+    qdb::direct_column_sender_conn conn{nullptr};
     try
     {
         conn.flush_arrow_batch_server_stamped("t"_tn, arr, sch);
@@ -103,8 +103,8 @@ TEST_CASE("column_sender_conn surfaces error_code on NULL-conn failure")
 // Mock-backed end-to-end coverage migrated from the deleted buffer-level
 // append_arrow API. Each TEST_CASE spins up an in-process mock and a
 // 1-slot `questdb_db` pool, then drives one
-// `column_sender_flush_arrow_batch[_at_column]` call against a borrowed
-// `column_sender*`.
+// `direct_column_sender_flush_arrow_batch[_at_column]` call against a borrowed
+// `direct_column_sender*`.
 //
 // Per-type wire correctness is covered by the Rust unit tests in
 // `questdb-rs/src/ingress/column_sender/arrow_batch.rs`; here we only
@@ -199,7 +199,7 @@ struct MockConn
 {
     qm::MockServer server;
     questdb_db* db = nullptr;
-    column_sender* conn = nullptr;
+    direct_column_sender* conn = nullptr;
 
     MockConn()
         : server(std::vector<qm::Script>{
@@ -211,7 +211,7 @@ struct MockConn
         db = questdb_db_connect(conf.c_str(), conf.size(), &err);
         REQUIRE(db != nullptr);
         REQUIRE(err == nullptr);
-        conn = questdb_db_borrow_column_sender(db, &err);
+        conn = questdb_db_borrow_direct_column_sender(db, &err);
         REQUIRE(conn != nullptr);
         REQUIRE(err == nullptr);
     }
@@ -221,7 +221,7 @@ struct MockConn
         if (db != nullptr)
         {
             if (conn != nullptr)
-                questdb_db_return_column_sender(db, conn);
+                questdb_db_return_direct_column_sender(db, conn);
             questdb_db_close(db);
         }
     }
@@ -239,7 +239,7 @@ void expect_flush_ok(
     ArrowArray& arr,
     ArrowSchema& sch)
 {
-    qdb::column_sender_conn conn{mc.conn};
+    qdb::direct_column_sender_conn conn{mc.conn};
     try
     {
         conn.flush_arrow_batch_server_stamped(
@@ -268,7 +268,7 @@ TEST_CASE("flush_arrow_batch: NULL array → invalid_api_call")
     std::memset(&sch, 0, sizeof(sch));
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch_server_stamped(
+    bool ok = direct_column_sender_flush_arrow_batch_server_stamped(
         mc.conn, tbl, nullptr, &sch, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
@@ -283,7 +283,7 @@ TEST_CASE("flush_arrow_batch: NULL schema → invalid_api_call")
     std::memset(&arr, 0, sizeof(arr));
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch_server_stamped(
+    bool ok = direct_column_sender_flush_arrow_batch_server_stamped(
         mc.conn, tbl, &arr, nullptr, nullptr, 0, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
@@ -305,7 +305,7 @@ TEST_CASE("flush_arrow_batch_*_and_wait: invalid ACK level rejected before impor
     ArrowSchema sch = make_schema("l", "qty");
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch_server_stamped_and_wait(
+    bool ok = direct_column_sender_flush_arrow_batch_server_stamped_and_wait(
         mc.conn, tbl, &arr, &sch, nullptr, 0, /*ack_level=*/99, &err);
     CHECK_FALSE(ok);
     REQUIRE(err != nullptr);
@@ -326,7 +326,7 @@ TEST_CASE("flush_arrow_batch_*_and_wait: durable without opt-in rejected before 
     ArrowSchema sch = make_schema("l", "qty");
     line_sender_error* err = nullptr;
     line_sender_table_name tbl{1, "t"};
-    bool ok = column_sender_flush_arrow_batch_server_stamped_and_wait(
+    bool ok = direct_column_sender_flush_arrow_batch_server_stamped_and_wait(
         mc.conn,
         tbl,
         &arr,
@@ -693,7 +693,7 @@ TEST_CASE("flush_arrow_batch_at_column: picks per-row ts from named Timestamp co
     outer_sch.children = child_schema_ptrs;
     outer_sch.release = schema_release_noop;
 
-    qdb::column_sender_conn conn{mc.conn};
+    qdb::direct_column_sender_conn conn{mc.conn};
     try
     {
         conn.flush_arrow_batch("t_dts_col"_tn, outer_arr, outer_sch, "ts"_cn);
