@@ -22,6 +22,7 @@ import os
 import shutil
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -39,20 +40,44 @@ from c_client_sidecar import (
 LOG = logging.getLogger(__name__)
 
 
-def _connect_string(http_port: int, sf_dir: Path, *,
+def _connect_string(http_port: int, sf_dir: Optional[Path], *,
                     request_durable_ack: bool = True,
                     reconnect_max_ms: int = 60_000,
-                    close_flush_timeout_ms: int = 5_000) -> str:
+                    close_flush_timeout_ms: int = 5_000,
+                    sender_id: Optional[str] = None,
+                    sf_max_bytes: Optional[int] = None) -> str:
+    """Row-major QWP/WebSocket connect string.
+
+    ``sf_dir`` selects the store-and-forward backend, the distinction the
+    two SF-survival tests below pivot on:
+      * a path  -> **disk-backed** SF (``SfaSlotQueue::open``). The on-disk
+        ``.sfa`` segments under ``<sf_dir>/<sender_id>/`` outlive the
+        *client* process, so a fresh sender that opens the same slot
+        recovers and replays them.
+      * ``None`` -> **in-memory** SF (``SfaSlotQueue::open_memory``). The
+        queue lives in the sender's address space, so it survives a
+        *server* restart/failover while the client stays alive, but is lost
+        if the client itself dies.
+
+    ``sender_id`` names the slot under ``sf_dir`` (disk-backed only).
+    ``sf_max_bytes`` caps one SF segment; a small value seals many segments
+    from a modest ingest, exercising multi-segment recovery cheaply.
+    """
     parts = [
         f"ws::addr=127.0.0.1:{http_port}",
         # Canonical "username" keyword (both Java and Rust senders
         # accept it; "user" is a Java-only alias).
         "username=admin",
         "password=quest",
-        f"sf_dir={sf_dir}",
         f"reconnect_max_duration_millis={reconnect_max_ms}",
         f"close_flush_timeout_millis={close_flush_timeout_ms}",
     ]
+    if sf_dir is not None:
+        parts.append(f"sf_dir={sf_dir}")
+    if sender_id is not None:
+        parts.append(f"sender_id={sender_id}")
+    if sf_max_bytes is not None:
+        parts.append(f"sf_max_bytes={sf_max_bytes}")
     if request_durable_ack:
         parts.append("request_durable_ack=on")
     return ";".join(parts) + ";"
@@ -150,6 +175,161 @@ def test_kill9_primary_failover_no_data_loss_c_client_rust(
     # primary's row count is the authoritative answer to "did anything
     # get lost." Sidecar stats can lag legitimately under the piggyback
     # durable-ack contract.
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=row_count, timeout_s=60.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_sender_kill9_sf_recovery_replays_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    c_client_rust_sidecar_binary: Path,
+    scenario_dir: Path,
+    log_dir: Path,
+) -> None:
+    """Disk-backed store-and-forward (``sf_dir`` set) must survive the
+    *client's own* death. SIGKILL the sender mid-flight while the primary
+    stays alive, then bring up a fresh sender on the same
+    ``sf_dir``/``sender_id``: it recovers the on-disk ``.sfa`` segments the
+    dead predecessor left behind and replays them to the live primary.
+
+    Contrast with the failover tests, which kill the *server* and lean on a
+    still-alive sender to reconnect. Here the *server* never dies; the
+    *sender* does, and durability rides entirely on the on-disk SF.
+
+    Dedup is mandatory: a fresh sender negotiates ``fsnAtZero`` from 0 on its
+    new WebSocket, so it re-delivers frames P1 had already accepted before
+    the kill. ``request_durable_ack=on`` prevents *loss*, not *duplicates*
+    after a sender crash; ``DEDUP UPSERT KEYS(timestamp, v)`` is the
+    documented escape valve, collapsing replayed rows back to one per ``v``
+    while leaving gaps and corruption for the dense-sequence oracle to
+    catch."""
+    table = "trades_sender_kill_c_client_rust"
+    row_count = 20_000
+    sf_dir = scenario_dir / "sf"
+    # 64 KiB segments seal many .sfa files from a modest ingest, so the
+    # recovery path scans a real multi-segment ring rather than one open
+    # segment.
+    sf_max_bytes = 64 * 1024
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    # Pre-create with DEDUP on (timestamp, v). The SEND verb emits one row
+    # per ``v`` at timestamp ``1_000_000us * (v + 1)``, so (timestamp, v) is
+    # unique per logical row -- duplicate replay collapses; gaps and
+    # corruption do not.
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
+
+    cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary",
+                         sf_max_bytes=sf_max_bytes)
+    c_client_rust_sidecar.connect(cs)
+    c_client_rust_sidecar.send(table, count=row_count, start_index=0)
+    c_client_rust_sidecar.flush()
+
+    # Small settle so some frames leave the wire and P1 OKs them; the rest
+    # stay in the SF. With request_durable_ack=on only the (slower) WAL
+    # upload trims, so the .sfa segments still hold un-acked frames at kill.
+    time.sleep(0.5)
+
+    # SIGKILL the sender process group -- no CLOSE, no EXIT. The kernel
+    # releases the slot lock; the .sfa segments are untouched on disk.
+    c_client_rust_sidecar.kill_9()
+    assert c_client_rust_sidecar.process is not None
+    assert c_client_rust_sidecar.process.poll() is not None, \
+        "sender must be dead before recovery"
+
+    # Guard that we're actually exercising recovery: un-trimmed .sfa
+    # segments must survive in the slot dir. (Had everything been
+    # durably-acked and trimmed, P1 would already hold every row and the
+    # restart would replay nothing.)
+    slot_dir = sf_dir / "primary"
+    sfa_files = sorted(slot_dir.glob("sf-*.sfa")) if slot_dir.exists() else []
+    assert sfa_files, (
+        f"expected un-trimmed .sfa segments in {slot_dir} after SIGKILL; "
+        f"test is not exercising the recovery path. dir contents: "
+        f"{list(slot_dir.iterdir()) if slot_dir.exists() else '<missing>'}"
+    )
+    LOG.info("recovery surface: %d .sfa segment(s) survived SIGKILL in %s",
+             len(sfa_files), slot_dir)
+
+    # Fresh sender on the SAME sf_dir + sender_id: it opens the same slot,
+    # recovers the segment ring, and replays it to the (still-alive) P1.
+    sidecar2 = CClientRustSidecar(
+        log_dir=log_dir,
+        classpath=None,
+        name="c-client-rust-sidecar-restart",
+        binary_path=c_client_rust_sidecar_binary,
+    )
+    sidecar2.start()
+    try:
+        sidecar2.connect(cs)
+        wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                                expected_count=row_count, timeout_s=90.0)
+    finally:
+        sidecar2.stop()
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_inmem_sf_survives_primary_failover_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """In-memory store-and-forward (no ``sf_dir``) must survive a *server*
+    failover while the client process stays alive. Same kill -9 + wipe +
+    successor-on-the-same-port disaster as the headline failover test, but
+    the sender holds its un-acked frames in RAM (``open_memory``) instead of
+    on disk: the still-running client reconnects to P2 and replays from
+    memory.
+
+    Complement of ``test_sender_kill9_sf_recovery_replays_c_client_rust``:
+    that one survives the *client* dying (disk-backed SF); this one survives
+    the *server* dying (in-memory SF) and would lose data if the client
+    itself were killed. ``request_durable_ack=on`` is what makes it hold:
+    without it the in-memory queue would trim on a plain server OK and the
+    OK-but-not-durable tail would vanish on failover. No dedup needed -- P2
+    is a fresh root with a wiped object store, so the replayed frames are
+    the only copy."""
+    table = "trades_inmem_failover_c_client_rust"
+    row_count = 50
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    # sf_dir=None -> in-memory SFA queue. The sidecar process must outlive
+    # the server failover for this copy to survive.
+    c_client_rust_sidecar.connect(_connect_string(p1_ports.http, None))
+    c_client_rust_sidecar.send(table, count=row_count, start_index=0)
+    c_client_rust_sidecar.flush()
+
+    # Brief settle so P1 OKs at least the first batch -- the OK-but-not-
+    # durable case the in-memory queue must not trim away.
+    time.sleep(0.5)
+
+    p1.kill_9()
+    wait_port_free(p1_ports.http)
+    wait_port_free(p1_ports.pg)
+
+    # Worst-case disaster: wipe local disk AND object store. The only
+    # surviving copy is the sender's in-memory SF.
+    if p1.db_root.exists():
+        shutil.rmtree(p1.db_root)
+    obj_store.wipe()
+
+    p2 = server_factory("p2", db_root_name="p2-fresh")
+    p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+
+    # The still-alive sender reconnects and replays from RAM; every row must
+    # land on the successor.
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
                             expected_count=row_count, timeout_s=60.0)
 

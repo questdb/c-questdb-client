@@ -79,12 +79,12 @@ fn main() {
         if trimmed.is_empty() {
             continue;
         }
-        if let Err(e) = handle(trimmed, &mut state, &mut out) {
-            if writeln!(out, "ERR {}", sanitize(&e)).is_err() || out.flush().is_err() {
-                let _ = writeln!(std::io::stderr(), "sidecar fatal: stdout write");
-                state.close();
-                process::exit(4);
-            }
+        if let Err(e) = handle(trimmed, &mut state, &mut out)
+            && (writeln!(out, "ERR {}", sanitize(&e)).is_err() || out.flush().is_err())
+        {
+            let _ = writeln!(std::io::stderr(), "sidecar fatal: stdout write");
+            state.close();
+            process::exit(4);
         }
     }
 
@@ -190,8 +190,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                 // with the `wait` ack barrier.
                 match state.src {
                     SendSrc::Chunk => {
-                        let mut sender =
-                            db.borrow_column_sender().map_err(|e| e.to_string())?;
+                        let mut sender = db.borrow_column_sender().map_err(|e| e.to_string())?;
                         let mut chunk = Chunk::new(table.as_str());
                         chunk
                             .column_i64("v", state.v.as_slice(), None)
@@ -203,17 +202,11 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                         sender.wait(AckLevel::Ok).map_err(|e| e.to_string())?;
                     }
                     SendSrc::Arrow => {
-                        let mut sender =
-                            db.borrow_column_sender().map_err(|e| e.to_string())?;
+                        let mut sender = db.borrow_column_sender().map_err(|e| e.to_string())?;
                         let batch = build_arrow_batch(&state.v, &state.ts)?;
                         let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
                         sender
-                            .flush_arrow_batch_at_column(
-                                table.as_str(),
-                                &batch,
-                                ts_col,
-                                &[],
-                            )
+                            .flush_arrow_batch_at_column(table.as_str(), &batch, ts_col, &[])
                             .map_err(|e| e.to_string())?;
                         sender.wait(AckLevel::Ok).map_err(|e| e.to_string())?;
                     }

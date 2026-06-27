@@ -58,11 +58,11 @@ fn main() {
         if trimmed.is_empty() {
             continue;
         }
-        if let Err(e) = handle(trimmed, &mut state, &mut out) {
-            if writeln!(out, "ERR {}", sanitize(&e)).is_err() || out.flush().is_err() {
-                let _ = writeln!(std::io::stderr(), "egress sidecar fatal: stdout write");
-                process::exit(4);
-            }
+        if let Err(e) = handle(trimmed, &mut state, &mut out)
+            && (writeln!(out, "ERR {}", sanitize(&e)).is_err() || out.flush().is_err())
+        {
+            let _ = writeln!(std::io::stderr(), "egress sidecar fatal: stdout write");
+            process::exit(4);
         }
     }
 }

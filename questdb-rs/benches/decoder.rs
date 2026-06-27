@@ -67,7 +67,10 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-#[cfg(feature = "polars")]
+// Used only inside the `#[cfg(feature = "arrow")]` workload blocks below; the
+// `polars` umbrella enables `arrow-egress` but not the `arrow` umbrella, so the
+// import must carry the same `arrow` + `polars` gate as its use sites.
+#[cfg(all(feature = "arrow", feature = "polars"))]
 use questdb::egress::_bench_internals::bench_batch_to_polars;
 #[cfg(feature = "arrow")]
 use questdb::egress::_bench_internals::bench_batch_to_record_batch;
@@ -75,7 +78,7 @@ use questdb::egress::_bench_internals::{
     Bytes, Schema, SymbolDict, ZstdScratch, decode_result_batch,
 };
 use questdb::egress::ColumnKind;
-#[cfg(feature = "polars")]
+#[cfg(all(feature = "arrow", feature = "polars"))]
 use questdb::egress::arrow::polars::record_batch_to_dataframe;
 
 // ---------------------------------------------------------------------------
