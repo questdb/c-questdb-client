@@ -470,8 +470,9 @@ land.
      build a `Vec<u64>` of length `dict_len` mapping local → global
      (unreferenced slots get `u64::MAX` sentinel).
   3. One pass over `codes` writing global IDs into the wire buffer.
-  This protects the 1M-per-connection wire limit and avoids
-  polluting `SymbolGlobalDict` with never-sent values.
+  This protects the 8 Mi-per-connection symbol-dictionary limit
+  (`MAX_CONN_SYMBOL_DICT_SIZE`) and avoids polluting `SymbolGlobalDict`
+  with never-sent values.
 - Validate codes are in `0..dict_len` for non-null rows; out-of-range
   is `InvalidApiCall`. Codes for null rows are not inspected.
 - Owner: 1 engineer.

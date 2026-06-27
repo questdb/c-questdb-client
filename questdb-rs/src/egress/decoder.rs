@@ -85,6 +85,15 @@ pub(crate) const MAX_COLUMNS_PER_TABLE: usize = 2048;
 pub(crate) const MAX_COLUMN_NAME_LENGTH: usize = 127;
 pub(crate) const MAX_TABLE_NAME_LENGTH: usize = 127;
 
+/// Ceiling on the *densified* size of one decoded batch. The wire-byte cap
+/// bounds compressed/sparse input, but a null-sparse column costs only its
+/// validity bitmap on the wire while densifying to `row_count * elem_size`:
+/// an all-null batch at the row/column caps can fit under the 64 MiB frame
+/// limit yet inflate to ~16 GiB of zeroed sentinels. Summing the per-column
+/// densified footprint against this budget turns that into a recoverable
+/// `ProtocolError` instead of an OOM abort.
+pub(crate) const MAX_DECODED_BATCH_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Take a zero-copy owned slice of `n` bytes from `parent` starting at the
 /// reader's current position, and advance the reader.
 fn read_owned(r: &mut ByteReader<'_>, parent: &Bytes, n: usize) -> Result<Bytes> {
@@ -466,6 +475,7 @@ pub fn decode_result_batch(
     // allocation that scales with column count.
     let mut columns = Vec::with_capacity(col_count);
     let connection_dict_size = dict.len();
+    let mut dense_budget = MAX_DECODED_BATCH_BYTES;
     for (i, col_meta) in schema.columns().iter().enumerate() {
         let kind = col_meta.kind;
         let col = decode_column(
@@ -475,6 +485,7 @@ pub fn decode_result_batch(
             row_count,
             flags_byte,
             connection_dict_size,
+            &mut dense_budget,
         )
         .map_err(|e| {
             Error::new(
@@ -506,6 +517,35 @@ pub fn decode_result_batch(
 // Per-column decode
 // ---------------------------------------------------------------------------
 
+/// Worst-case densified bytes per row for `kind`, used to charge the per-batch
+/// `MAX_DECODED_BATCH_BYTES` budget. This is the `row_count`-proportional part
+/// of the decode (sentinel-filled fixed buffers, symbol code slots, varlen /
+/// array offset slots); the value payloads of varlen and array columns are
+/// already bounded by the wire-byte cap and are not charged here.
+fn dense_row_bytes(kind: ColumnKind) -> usize {
+    match kind {
+        ColumnKind::Boolean | ColumnKind::Byte => 1,
+        ColumnKind::Short | ColumnKind::Char => 2,
+        ColumnKind::Int
+        | ColumnKind::Float
+        | ColumnKind::Symbol
+        | ColumnKind::Varchar
+        | ColumnKind::Binary
+        | ColumnKind::Ipv4 => 4,
+        ColumnKind::Long
+        | ColumnKind::Double
+        | ColumnKind::Timestamp
+        | ColumnKind::TimestampNanos
+        | ColumnKind::Date
+        | ColumnKind::Geohash
+        | ColumnKind::Decimal64
+        | ColumnKind::DoubleArray
+        | ColumnKind::LongArray => 8,
+        ColumnKind::Uuid | ColumnKind::Decimal128 => 16,
+        ColumnKind::Long256 | ColumnKind::Decimal256 => 32,
+    }
+}
+
 fn decode_column(
     r: &mut ByteReader<'_>,
     parent: &Bytes,
@@ -513,7 +553,17 @@ fn decode_column(
     row_count: usize,
     flags_byte: u8,
     connection_dict_size: usize,
+    dense_budget: &mut usize,
 ) -> Result<DecodedColumn> {
+    let cost = row_count.saturating_mul(dense_row_bytes(kind));
+    *dense_budget = dense_budget.checked_sub(cost).ok_or_else(|| {
+        fmt!(
+            ProtocolError,
+            "RESULT_BATCH densified data exceeds the {}-byte per-batch cap; \
+             a null-sparse batch cannot inflate client memory without bound",
+            MAX_DECODED_BATCH_BYTES
+        )
+    })?;
     Ok(match kind {
         ColumnKind::Boolean => DecodedColumn::Boolean(decode_boolean(r, parent, row_count)?),
         ColumnKind::Byte => {
@@ -3992,6 +4042,23 @@ mod tests {
         assert_eq!(c.value(0), 0xAA);
         assert_eq!(c.value(1), 0xBB);
         assert_eq!(c.value(2), 0xCC);
+    }
+
+    #[test]
+    fn decode_column_rejects_densified_batch_over_budget() {
+        // The budget is charged before any column bytes are read, so an
+        // exhausted budget trips without allocating or touching the reader.
+        let mut r = ByteReader::new(&[]);
+        let parent = Bytes::new();
+        let mut budget = 10usize;
+        let err =
+            decode_column(&mut r, &parent, ColumnKind::Long256, 16, 0, 0, &mut budget).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(
+            err.msg().contains("per-batch cap"),
+            "unexpected error: {}",
+            err.msg()
+        );
     }
 
     #[test]

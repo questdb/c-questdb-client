@@ -4354,7 +4354,13 @@ impl QwpWsColumnValues {
             Self::Ipv4 { cells } => cells.clear(),
             Self::Date { cells } => cells.clear(),
             Self::Char { cells } => cells.clear(),
-            Self::Geohash { cells, .. } => cells.clear(),
+            Self::Geohash {
+                cells,
+                precision_bits,
+            } => {
+                cells.clear();
+                *precision_bits = 0;
+            }
             Self::Symbol {
                 cells,
                 dict,
@@ -4461,7 +4467,16 @@ impl QwpWsColumnValues {
                     false
                 }
             }
-            Self::Geohash { cells, .. } => pop_value_cell_for_row(cells, row_idx),
+            Self::Geohash {
+                cells,
+                precision_bits,
+            } => {
+                let popped = pop_value_cell_for_row(cells, row_idx);
+                if popped && cells.is_empty() {
+                    *precision_bits = 0;
+                }
+                popped
+            }
             Self::LongArray { cells, data } => {
                 if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
                     data.truncate(cell.offset as usize);
@@ -9397,6 +9412,55 @@ mod tests {
             .unwrap();
         buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
             .expect("rollback must let the next value repin the decimal scale");
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_clear_resets_geohash_precision_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 7, 5)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        buf.clear();
+
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 7, 6)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("clear() must let the next batch repin the geohash precision");
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rollback_last_geohash_resets_precision_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("pos").unwrap().column_geohash("g", 7, 5).unwrap();
+        let err = buf.column_i64("g", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 7, 6)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("rollback must let the next value repin the geohash precision");
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

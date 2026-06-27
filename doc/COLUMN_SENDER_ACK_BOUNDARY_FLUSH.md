@@ -89,7 +89,6 @@ sync only as a completion/backpressure wait.
 ## 4. Non-goals
 
 - No change to the default behavior of existing `flush*` functions.
-- No implicit sync in `Drop`, C++ RAII destructors, or pool return.
 - No exactly-once guarantee. ACK wait failures can leave delivery uncertain.
 - No new wire protocol.
 - No removal of `sync()`.
@@ -315,6 +314,23 @@ Two interactions are defined explicitly:
   round-trip, not a no-op); in SFA mode it is a cheap re-check. Callers that
   always end with `sync()` therefore stay correct, just slightly less efficient
   than ending on the ACKing flush.
+
+### 6.6 Best-effort commit on drop / pool return
+
+Dropping a borrowed or owned sender (directly or via a C++ RAII destructor)
+that still holds un-sync'd deferred frames runs a single best-effort
+`sync(AckLevel::Ok)` so the common "loop `flush()`, then drop" path does not
+silently lose its tail. This is best-effort only and **not** a substitute for
+an explicit `sync()` / `flush_and_wait()`:
+
+- it can block the dropping thread up to `request_timeout` while the commit
+  round-trip completes;
+- on failure (or an already-dead transport) the connection is discarded rather
+  than recycled, the deferred data is lost, and the loss is logged at `warn`.
+
+Failover (`reborrow_from_pool`) does not run this commit — it discards the dead
+connection's un-sync'd window and logs it; re-drive from the last successful
+`sync()`.
 
 ---
 

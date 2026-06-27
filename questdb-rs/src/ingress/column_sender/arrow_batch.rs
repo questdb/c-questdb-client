@@ -2048,11 +2048,26 @@ fn list_level_descend_offsets(
                 start
             )
         })?;
-        let next_end = checked_offset_i32(offsets[end], end)?;
-        if next_end.checked_sub(next_start) != dim.checked_mul(end - start) {
-            return Err(ragged_inner_error_i32(&offsets[..], start, end, dim));
+        // Each inner list must have exactly `dim` elements; a uniform inner
+        // size is what lets the row collapse to a rectangular shape. The total
+        // span `dim * count` is necessary but not sufficient (e.g. [2,1,3]), so
+        // every inner list is checked individually.
+        let mut prev_end = first_end;
+        for i in (start + 1)..end {
+            let inner_end = checked_offset_i32(offsets[i + 1], i + 1)?;
+            let sz = inner_end.checked_sub(prev_end).ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "ARRAY List inner offsets non-monotonic at row {}",
+                    i
+                )
+            })?;
+            if sz != dim {
+                return Err(ragged_inner_error(i - start, dim, sz));
+            }
+            prev_end = inner_end;
         }
-        Ok((next_start, next_end, dim))
+        Ok((next_start, prev_end, dim))
     } else if let Some(la) = arr.as_any().downcast_ref::<LargeListArray>() {
         let offsets = la.offsets();
         if end <= start {
@@ -2075,11 +2090,22 @@ fn list_level_descend_offsets(
                 start
             )
         })?;
-        let next_end = checked_offset_i64(offsets[end], end)?;
-        if next_end.checked_sub(next_start) != dim.checked_mul(end - start) {
-            return Err(ragged_inner_error_i64(&offsets[..], start, end, dim));
+        let mut prev_end = first_end;
+        for i in (start + 1)..end {
+            let inner_end = checked_offset_i64(offsets[i + 1], i + 1)?;
+            let sz = inner_end.checked_sub(prev_end).ok_or_else(|| {
+                fmt!(
+                    ArrowIngest,
+                    "ARRAY LargeList inner offsets non-monotonic at row {}",
+                    i
+                )
+            })?;
+            if sz != dim {
+                return Err(ragged_inner_error(i - start, dim, sz));
+            }
+            prev_end = inner_end;
         }
-        Ok((next_start, next_end, dim))
+        Ok((next_start, prev_end, dim))
     } else if let Some(la) = arr.as_any().downcast_ref::<FixedSizeListArray>() {
         let stride = la.value_length() as usize;
         if end <= start {
@@ -2113,43 +2139,13 @@ fn list_level_descend_offsets(
 
 #[cold]
 #[inline(never)]
-fn ragged_inner_error_i32(offsets: &[i32], start: usize, end: usize, dim: usize) -> Error {
-    for i in start..end {
-        let sz = (offsets[i + 1] - offsets[i]) as usize;
-        if sz != dim {
-            return fmt!(
-                ArrowIngest,
-                "ARRAY row has ragged inner-list sizes: inner #{} has size {} but row's first inner is {}; N-dim ARRAY ingest requires uniform inner sizes per row",
-                i - start,
-                sz,
-                dim
-            );
-        }
-    }
+fn ragged_inner_error(inner_index: usize, first_dim: usize, this_size: usize) -> Error {
     fmt!(
         ArrowIngest,
-        "ARRAY row has ragged inner-list sizes (could not isolate diverging inner)"
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn ragged_inner_error_i64(offsets: &[i64], start: usize, end: usize, dim: usize) -> Error {
-    for i in start..end {
-        let sz = (offsets[i + 1] - offsets[i]) as usize;
-        if sz != dim {
-            return fmt!(
-                ArrowIngest,
-                "ARRAY row has ragged inner-list sizes: inner #{} has size {} but row's first inner is {}; N-dim ARRAY ingest requires uniform inner sizes per row",
-                i - start,
-                sz,
-                dim
-            );
-        }
-    }
-    fmt!(
-        ArrowIngest,
-        "ARRAY row has ragged inner-list sizes (could not isolate diverging inner)"
+        "ARRAY row has ragged inner-list sizes: inner #{} has size {} but row's first inner is {}; N-dim ARRAY ingest requires uniform inner sizes per row",
+        inner_index,
+        this_size,
+        first_dim
     )
 }
 
@@ -3559,13 +3555,15 @@ fn encode_arrow_batch_into_mode(
         .map_err(|_| fmt!(ArrowIngest, "row count {} exceeds u32::MAX", row_count))?;
 
     let mut classified: Vec<ClassifiedColumn<'_>> = Vec::with_capacity(user_col_count);
-    let mut seen_names: std::collections::HashSet<&str> =
+    let mut seen_names: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(user_col_count);
     for (idx, field) in schema.fields().iter().enumerate() {
         if Some(idx) == ts_col_idx {
             continue;
         }
-        if !seen_names.insert(field.name().as_str()) {
+        // QuestDB matches column names case-insensitively (Unicode), so fold
+        // before the duplicate check or `Foo`/`foo` ship as two colliding columns.
+        if !seen_names.insert(field.name().to_lowercase()) {
             return Err(fmt!(
                 ArrowIngest,
                 "duplicate column name in arrow batch: {:?}",
@@ -6393,6 +6391,61 @@ mod tests {
         outer.values().values().append_value(2.0);
         outer.values().append(true);
         outer.values().values().append_value(3.0);
+        outer.values().append(true);
+        outer.append(true);
+        let arr = outer.finish();
+        let field = Field::new("a", arr.data_type().clone(), true);
+        let rb = single_col_batch(field, arr);
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("ragged inner-list sizes"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn nested_list_ragged_inner_three_lists_summing_to_rectangle_errors() {
+        // Inner sizes [2,1,3] sum to dim(2) * count(3) == 6, so the old
+        // total-span check let this through and shipped a corrupt [3,2] matrix.
+        let mut outer = ListBuilder::new(ListBuilder::new(Float64Builder::new()));
+        for v in [1.0, 2.0] {
+            outer.values().values().append_value(v);
+        }
+        outer.values().append(true);
+        outer.values().values().append_value(3.0);
+        outer.values().append(true);
+        for v in [4.0, 5.0, 6.0] {
+            outer.values().values().append_value(v);
+        }
+        outer.values().append(true);
+        outer.append(true);
+        let arr = outer.finish();
+        let field = Field::new("a", arr.data_type().clone(), true);
+        let rb = single_col_batch(field, arr);
+        let err = encode_err(&rb);
+        assert_eq!(err.code(), ErrorCode::ArrowIngest);
+        assert!(
+            err.msg().contains("ragged inner-list sizes"),
+            "unexpected error: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn large_list_ragged_inner_three_lists_summing_to_rectangle_errors() {
+        use arrow_array::builder::LargeListBuilder;
+        let mut outer = LargeListBuilder::new(LargeListBuilder::new(Float64Builder::new()));
+        for v in [1.0, 2.0] {
+            outer.values().values().append_value(v);
+        }
+        outer.values().append(true);
+        outer.values().values().append_value(3.0);
+        outer.values().append(true);
+        for v in [4.0, 5.0, 6.0] {
+            outer.values().values().append_value(v);
+        }
         outer.values().append(true);
         outer.append(true);
         let arr = outer.finish();

@@ -477,13 +477,14 @@ size_t column_sender_chunk_row_count(
  * null rows — their slot value is ignored). `validity` is optional;
  * pass NULL when the column has no nulls.
  *
- * `name` / `name_len` are taken raw and checked ONLY for UTF-8 here; the
- * column-name grammar (illegal characters, dot placement, length cap) is
- * validated LAZILY at the next `column_sender_flush*`, so a bad name
- * surfaces as a flush error rather than at the append call. This differs
- * from the row API's `line_sender_column_name`, which is grammar-checked
- * eagerly at `line_sender_column_name_init`. There is intentionally no
- * pre-validated column-name overload on the column-sender surface.
+ * `name` / `name_len` are validated eagerly at this call: the bytes must be
+ * UTF-8 and satisfy the column-name grammar (illegal characters, dot
+ * placement, length cap) — the same rules the row API's
+ * `line_sender_column_name` enforces. A bad name makes this append return
+ * `false` with `*err_out` set and leaves the chunk unchanged, so check the
+ * return value here rather than deferring error handling to
+ * `column_sender_flush*`. There is intentionally no separate pre-validated
+ * column-name overload on the column-sender surface.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API

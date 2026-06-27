@@ -300,6 +300,13 @@ impl ColumnSender {
     /// for a server completion boundary. Call [`Self::sync`] (or use
     /// [`Self::flush_and_wait`]) to wait for the requested [`AckLevel`].
     ///
+    /// Frames published by `flush` are not committed until the next
+    /// [`Self::sync`] / [`Self::flush_and_wait`] completes: that ACK boundary is
+    /// the only durability and replay checkpoint. If a later flush or sync fails
+    /// and you reborrow onto a fresh connection, re-drive the source from the
+    /// last successful `sync`, not just the failing `chunk` — every frame
+    /// published since that checkpoint is discarded with the dead connection.
+    ///
     /// On success `chunk` is cleared. On failure `chunk` is left untouched and
     /// the data is **not** guaranteed undelivered: a transport error that fails
     /// mid-frame may already have put bytes on the wire. Such a failure reports

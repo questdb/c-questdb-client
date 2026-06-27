@@ -149,19 +149,7 @@ struct ReaderInUseSlot<'a> {
 }
 
 #[cfg(feature = "_egress")]
-impl<'a> ReaderInUseSlot<'a> {
-    fn reserve_within_cap(
-        state: &'a Mutex<ReaderPoolState>,
-        pool_max: usize,
-    ) -> std::result::Result<Self, usize> {
-        let mut guard = lock_reader_state(state);
-        if guard.total() >= pool_max {
-            return Err(guard.in_use);
-        }
-        guard.in_use += 1;
-        Ok(Self { state, armed: true })
-    }
-
+impl ReaderInUseSlot<'_> {
     fn commit(mut self) {
         self.armed = false;
     }
@@ -184,19 +172,7 @@ struct RowSenderInUseSlot<'a> {
     armed: bool,
 }
 
-impl<'a> RowSenderInUseSlot<'a> {
-    fn reserve_within_cap(
-        state: &'a Mutex<RowSenderPoolState>,
-        pool_max: usize,
-    ) -> std::result::Result<Self, usize> {
-        let mut guard = lock_row_sender_state(state);
-        if guard.total() >= pool_max {
-            return Err(guard.in_use);
-        }
-        guard.in_use += 1;
-        Ok(Self { state, armed: true })
-    }
-
+impl RowSenderInUseSlot<'_> {
     fn commit(mut self) {
         self.armed = false;
     }
@@ -572,34 +548,33 @@ impl QuestDb {
     }
 
     fn pick_row_sender(&self) -> Result<Sender> {
-        let mut state = lock_row_sender_state(&self.inner.row_sender_state);
-        if self.inner.shutdown.load(Ordering::SeqCst) {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "QuestDb pool is closed; cannot borrow row sender"
-            ));
-        }
-        if let Some(entry) = state.free.pop() {
-            state.in_use += 1;
-            drop(state);
-            return Ok(entry.sender);
-        }
-        drop(state);
-
-        let slot = match RowSenderInUseSlot::reserve_within_cap(
-            &self.inner.row_sender_state,
-            self.inner.pool_max,
-        ) {
-            Ok(slot) => slot,
-            Err(in_use) => {
+        let slot = {
+            let mut state = lock_row_sender_state(&self.inner.row_sender_state);
+            if self.inner.shutdown.load(Ordering::SeqCst) {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "QuestDb pool is closed; cannot borrow row sender"
+                ));
+            }
+            if let Some(entry) = state.free.pop() {
+                state.in_use += 1;
+                drop(state);
+                return Ok(entry.sender);
+            }
+            if state.total() >= self.inner.pool_max {
                 return Err(error::fmt!(
                     InvalidApiCall,
                     "Row-sender pool exhausted: {} row senders are currently borrowed \
                      and the pool is at its `pool_max` cap of {}. Return a sender or \
                      raise `pool_max`.",
-                    in_use,
+                    state.in_use,
                     self.inner.pool_max
                 ));
+            }
+            state.in_use += 1;
+            RowSenderInUseSlot {
+                state: &self.inner.row_sender_state,
+                armed: true,
             }
         };
         let sender = SenderBuilder::from_conf(&self.inner.conf)?.build()?;
@@ -763,35 +738,34 @@ impl QuestDb {
     #[cfg(feature = "_egress")]
     fn pick_reader(&self) -> crate::egress::error::Result<Reader> {
         use crate::egress::error::{Error as EgressError, ErrorCode as EgressErrorCode};
-        let mut state = lock_reader_state(&self.inner.reader_state);
-        if self.inner.shutdown.load(Ordering::SeqCst) {
-            return Err(EgressError::new(
-                EgressErrorCode::InvalidApiCall,
-                "QuestDb pool is closed; cannot borrow reader",
-            ));
-        }
-        if let Some(entry) = state.free.pop() {
-            state.in_use += 1;
-            drop(state);
-            return Ok(entry.reader);
-        }
-        drop(state);
-
-        let slot = match ReaderInUseSlot::reserve_within_cap(
-            &self.inner.reader_state,
-            self.inner.pool_max,
-        ) {
-            Ok(slot) => slot,
-            Err(in_use) => {
+        let slot = {
+            let mut state = lock_reader_state(&self.inner.reader_state);
+            if self.inner.shutdown.load(Ordering::SeqCst) {
+                return Err(EgressError::new(
+                    EgressErrorCode::InvalidApiCall,
+                    "QuestDb pool is closed; cannot borrow reader",
+                ));
+            }
+            if let Some(entry) = state.free.pop() {
+                state.in_use += 1;
+                drop(state);
+                return Ok(entry.reader);
+            }
+            if state.total() >= self.inner.pool_max {
                 return Err(EgressError::new(
                     EgressErrorCode::InvalidApiCall,
                     format!(
                         "Reader pool exhausted: {} readers are currently borrowed and \
                          the pool is at its `pool_max` cap of {}. \
                          Release a reader or raise `pool_max`.",
-                        in_use, self.inner.pool_max
+                        state.in_use, self.inner.pool_max
                     ),
                 ));
+            }
+            state.in_use += 1;
+            ReaderInUseSlot {
+                state: &self.inner.reader_state,
+                armed: true,
             }
         };
         let reader = Reader::from_conf(&self.inner.conf)?;
@@ -905,6 +879,11 @@ impl<'a> BorrowedColumnSender<'a> {
                 return Ok(());
             }
             if sender.in_flight() > 0 {
+                log::warn!(
+                    "column sender failover dropped a connection with un-sync'd \
+                     deferred frame(s); their data is discarded. Re-drive the source \
+                     from the last successful sync(), not from the failing chunk."
+                );
                 sender.mark_must_close();
             }
             record_sender_transport_failure(&self.db.inner, sender);

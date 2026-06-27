@@ -1902,6 +1902,13 @@ public:
         }
         else
         {
+            ensure_impl();
+            auto sender_protocol = this->protocol();
+            // A WebSocket sender has no row buffer (new_buffer() rejects it),
+            // so an absent buffer here is simply nothing to flush.
+            if (sender_protocol == protocol::qwpws ||
+                sender_protocol == protocol::qwpwss)
+                return;
             line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep, _impl, buffer2._impl);
@@ -1945,6 +1952,13 @@ public:
         }
         else
         {
+            ensure_impl();
+            auto sender_protocol = this->protocol();
+            // A WebSocket sender has no row buffer (new_buffer() rejects it),
+            // so an absent buffer here is simply nothing to flush.
+            if (sender_protocol == protocol::qwpws ||
+                sender_protocol == protocol::qwpwss)
+                return;
             line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep_with_flags,

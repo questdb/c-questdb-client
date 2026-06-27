@@ -1232,6 +1232,14 @@ unsafe fn emit_f64_ndarray(
     validity: Option<&ValidityDescriptor>,
 ) -> Result<()> {
     let nd = ndim as usize;
+    if nd == 0 || nd > MAX_ARRAY_DIMS {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "F64Ndarray ndim {} must be in 1..={}",
+            nd,
+            MAX_ARRAY_DIMS
+        ));
+    }
     let leaf_count: usize = shape[..nd]
         .iter()
         .copied()
