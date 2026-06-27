@@ -41,6 +41,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -199,7 +200,9 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                             .designated_timestamp_micros(state.ts.as_slice())
                             .map_err(|e| e.to_string())?;
                         sender.flush(&mut chunk).map_err(|e| e.to_string())?;
-                        sender.wait(AckLevel::Ok).map_err(|e| e.to_string())?;
+                        sender
+                            .wait(AckLevel::Ok, Duration::ZERO)
+                            .map_err(|e| e.to_string())?;
                     }
                     SendSrc::Arrow => {
                         let mut sender = db.borrow_column_sender().map_err(|e| e.to_string())?;
@@ -208,7 +211,9 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                         sender
                             .flush_arrow_batch_at_column(table.as_str(), &batch, ts_col, &[])
                             .map_err(|e| e.to_string())?;
-                        sender.wait(AckLevel::Ok).map_err(|e| e.to_string())?;
+                        sender
+                            .wait(AckLevel::Ok, Duration::ZERO)
+                            .map_err(|e| e.to_string())?;
                     }
                     #[cfg(feature = "polars")]
                     SendSrc::Polars => {
