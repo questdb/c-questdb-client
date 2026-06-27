@@ -631,7 +631,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sf_column_sender(
             db,
             "questdb_db_borrow_sf_column_sender",
             err_out,
-            |q| questdb::ffi_support::borrow_column_sender_owned(q),
+            questdb::ffi_support::borrow_column_sender_owned,
             sf_column_sender,
         )
     }
@@ -649,7 +649,7 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_column_sender(
             db,
             "questdb_db_borrow_direct_column_sender",
             err_out,
-            |q| questdb::ffi_support::borrow_direct_column_sender_owned(q),
+            questdb::ffi_support::borrow_direct_column_sender_owned,
             direct_column_sender,
         )
     }
@@ -815,9 +815,8 @@ unsafe fn cs_must_close_body<T: CsHandle>(conn: *const T, fn_name: &str) -> bool
     }
     let state: *const AtomicU32 = unsafe { T::latch(conn) };
     let mut err_box: *mut line_sender_error = std::ptr::null_mut();
-    let guard = unsafe {
-        InUseGuard::acquire(conn as *mut T, state, fn_name, T::TYPE_NAME, &mut err_box)
-    };
+    let guard =
+        unsafe { InUseGuard::acquire(conn as *mut T, state, fn_name, T::TYPE_NAME, &mut err_box) };
     if guard.is_none() {
         if !err_box.is_null() {
             unsafe { crate::line_sender_error_free(err_box) };
@@ -2705,7 +2704,13 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
         return false;
     }
     let _conn_guard = match unsafe {
-        InUseGuard::acquire(conn, direct_column_sender::latch(conn), fn_name, "direct_column_sender", err_out)
+        InUseGuard::acquire(
+            conn,
+            direct_column_sender::latch(conn),
+            fn_name,
+            "direct_column_sender",
+            err_out,
+        )
     } {
         Some(g) => g,
         None => return false,
@@ -2782,7 +2787,18 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_server_stamped(
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { arrow_batch_impl(conn, table, array, schema, None, overrides, overrides_len, err_out) }
+    unsafe {
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            None,
+            overrides,
+            overrides_len,
+            err_out,
+        )
+    }
 }
 
 /// Direct-handle publish-only Arrow flush (server-stamped). Pair with
@@ -2799,7 +2815,18 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_server_stamped(
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { arrow_batch_impl(conn, table, array, schema, None, overrides, overrides_len, err_out) }
+    unsafe {
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            None,
+            overrides,
+            overrides_len,
+            err_out,
+        )
+    }
 }
 
 /// Variant of [`column_sender_flush_arrow_batch_server_stamped`] that
@@ -2820,7 +2847,16 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
-        arrow_batch_impl(conn, table, array, schema, Some(ts_column), overrides, overrides_len, err_out)
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            Some(ts_column),
+            overrides,
+            overrides_len,
+            err_out,
+        )
     }
 }
 
@@ -2840,7 +2876,16 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
-        arrow_batch_impl(conn, table, array, schema, Some(ts_column), overrides, overrides_len, err_out)
+        arrow_batch_impl(
+            conn,
+            table,
+            array,
+            schema,
+            Some(ts_column),
+            overrides,
+            overrides_len,
+            err_out,
+        )
     }
 }
 

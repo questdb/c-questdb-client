@@ -553,7 +553,11 @@ impl QuestDb {
         let deadline = Instant::now().checked_add(budget);
         Ok(OwnedColumnSender {
             inner: Arc::clone(&self.inner),
-            sender: Some(reconnect_pick(&self.inner, ColumnPoolKind::Direct, deadline)?),
+            sender: Some(reconnect_pick(
+                &self.inner,
+                ColumnPoolKind::Direct,
+                deadline,
+            )?),
             kind: ColumnPoolKind::Direct,
         })
     }
@@ -1273,9 +1277,9 @@ impl<'a> DirectColumnSender<'a> {
         T: TryInto<crate::ingress::TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        self.0.inner_mut().flush_arrow_batch_server_stamped_and_wait(
-            table, batch, overrides, ack_level,
-        )
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_server_stamped_and_wait(table, batch, overrides, ack_level)
     }
 
     /// ACKing Arrow flush (column-stamped): publish as a commit boundary and
@@ -1293,9 +1297,9 @@ impl<'a> DirectColumnSender<'a> {
         T: TryInto<crate::ingress::TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        self.0.inner_mut().flush_arrow_batch_at_column_and_wait(
-            table, batch, ts_column, overrides, ack_level,
-        )
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_at_column_and_wait(table, batch, ts_column, overrides, ack_level)
     }
 }
 
