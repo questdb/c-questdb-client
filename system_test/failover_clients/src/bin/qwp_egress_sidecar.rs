@@ -112,8 +112,13 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             let sql = "(SHOW PARAMETERS) WHERE property_path = 'replication.zone'";
             let mut cursor = reader.execute(sql).map_err(|e| e.to_string())?;
             let mut value: Option<String> = None;
+            // Drain the cursor to completion -- do NOT break early. The Rust
+            // Reader poisons a connection whose cursor is dropped before it
+            // is fully read, which would make the NEXT SHOW_ZONE fail with
+            // "connection is closed and cannot be reused". SHOW PARAMETERS
+            // returns a tiny result, so draining the rest is cheap.
             while let Some(view) = cursor.next_batch().map_err(|e| e.to_string())? {
-                if view.row_count() == 0 {
+                if value.is_some() || view.row_count() == 0 {
                     continue;
                 }
                 let idx = view
@@ -127,7 +132,6 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                     ColumnView::Symbol(c) => c.resolve(0).map(|s| s.to_string()),
                     _ => return Err("SHOW PARAMETERS 'value' column is not a string".into()),
                 };
-                break;
             }
             drop(cursor);
             // Reserve <unset> for "row not present" or a NULL/empty value, so
