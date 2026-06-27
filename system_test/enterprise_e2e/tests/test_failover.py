@@ -28,7 +28,7 @@ import pytest
 
 # server.wait_port_free and pg_query helpers come from the Enterprise
 # harness on PYTHONPATH (set up by conftest.py).
-from lib.pg_query import execute_ddl, wait_for_count, wait_for_dense_sequence
+from lib.pg_query import count_rows, execute_ddl, wait_for_count, wait_for_dense_sequence
 from lib.server import wait_port_free
 
 from c_client_sidecar import (
@@ -560,3 +560,385 @@ def test_zone_failover_stays_in_zone_then_crosses_c_client_rust(
     a2.kill_9()
     wait_port_free(a2_ports.http)
     _wait_for_zone(c_client_rust_egress_sidecar, ZONE_B)
+
+
+# ---------------------------------------------------------------------------
+# Additional deterministic failover scenarios ported from the Enterprise
+# reference suite (questdb-ent/e2e/tests/test_failover.py). Bodies inlined
+# per binding (cheap duplication; the bindings diverge over time). The
+# sender-side recovery test ``test_sender_kill9_sf_recovery_replays`` is
+# already covered above, so it is not re-ported here.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_failover_during_active_send_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """Kill P1 *while* the Rust sender is still pushing batches -- the
+    sender has an in-flight send buffer at the moment the wire dies, not
+    just an idle connection."""
+    table = "trades_inflight_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    batches = 5
+    rows_per_batch = 20
+    expected = batches * rows_per_batch
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+    c_client_rust_sidecar.connect(_connect_string(p1_ports.http, sf_dir))
+
+    # First batch synchronously, then more batches without flushing between
+    # them so the I/O thread is actively draining frames when we yank the rug.
+    c_client_rust_sidecar.send(table, count=rows_per_batch, start_index=0)
+    c_client_rust_sidecar.flush()
+    for i in range(1, batches):
+        c_client_rust_sidecar.send(table, count=rows_per_batch,
+                                   start_index=i * rows_per_batch)
+    p1.kill_9()
+    wait_port_free(p1_ports.http)
+    wait_port_free(p1_ports.pg)
+    if p1.db_root.exists():
+        shutil.rmtree(p1.db_root)
+    obj_store.wipe()
+
+    p2 = server_factory("p2", db_root_name="p2-fresh")
+    p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+
+    # Flush now; the sender reconnects transparently inside the call.
+    c_client_rust_sidecar.flush()
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=expected, timeout_s=60.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_two_failovers_in_one_scenario_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """Two failovers in a row driven by the Rust sender. Each successor
+    picks up where the previous left off; no row is lost across two kill
+    events from one sender."""
+    table = "trades_two_fail_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    rows_per_phase = 25
+    expected = rows_per_phase * 3
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+    c_client_rust_sidecar.connect(_connect_string(p1_ports.http, sf_dir))
+    c_client_rust_sidecar.send(table, count=rows_per_phase, start_index=0)
+    c_client_rust_sidecar.flush()
+    time.sleep(0.5)
+    p1.kill_9()
+    wait_port_free(p1_ports.http)
+    wait_port_free(p1_ports.pg)
+    if p1.db_root.exists():
+        shutil.rmtree(p1.db_root)
+    obj_store.wipe()
+
+    p2 = server_factory("p2", db_root_name="p2-fresh")
+    p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+    c_client_rust_sidecar.send(table, count=rows_per_phase, start_index=rows_per_phase)
+    c_client_rust_sidecar.flush()
+    time.sleep(0.5)
+    p2.kill_9()
+    wait_port_free(p1_ports.http)
+    wait_port_free(p1_ports.pg)
+    if p2.db_root.exists():
+        shutil.rmtree(p2.db_root)
+    obj_store.wipe()
+
+    p3 = server_factory("p3", db_root_name="p3-fresh")
+    p3.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+    c_client_rust_sidecar.send(table, count=rows_per_phase, start_index=rows_per_phase * 2)
+    c_client_rust_sidecar.flush()
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=expected, timeout_s=90.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_no_request_durable_ack_loses_rows_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """Negative case: WITHOUT ``request_durable_ack=on`` the SF trims on OK
+    frames, so killing P1 between OK and WAL upload then wiping disk +
+    object store *should* lose rows. Asserting the loss proves the positive
+    failover tests pass *because of* the opt-in, not by luck."""
+    table = "trades_no_durable_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    row_count = 50
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+    c_client_rust_sidecar.connect(
+        _connect_string(p1_ports.http, sf_dir, request_durable_ack=False))
+    c_client_rust_sidecar.send(table, count=row_count, start_index=0)
+    published_fsn = c_client_rust_sidecar.flush()
+    # Wait deterministically for OK-driven trim to drain the SF.
+    assert c_client_rust_sidecar.await_acked(published_fsn, timeout_ms=15_000), (
+        f"OKs for fsn={published_fsn} not received within 15s; "
+        "cannot set up the OK-driven-trim scenario under test."
+    )
+
+    baseline_reconn = c_client_rust_sidecar.stats().reconn_succ
+
+    p1.kill_9()
+    wait_port_free(p1_ports.http)
+    wait_port_free(p1_ports.pg)
+    if p1.db_root.exists():
+        shutil.rmtree(p1.db_root)
+    obj_store.wipe()
+
+    p2 = server_factory("p2", db_root_name="p2-fresh")
+    p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+
+    # Wait for the sender to reconnect to P2 -- proves it had the chance to
+    # replay anything still in its SF (so the loss is the trim, not a miss).
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if c_client_rust_sidecar.stats().reconn_succ > baseline_reconn:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail(
+            f"sender never reconnected to P2 within 15s "
+            f"(reconn_succ stayed at {baseline_reconn}); the loss assertion "
+            "would pass for the wrong reason."
+        )
+
+    try:
+        observed = count_rows(port=p1_ports.pg, table=table, timeout_s=10.0)
+    except TimeoutError:
+        # Table never created on P2 -- 100% loss, the strongest form.
+        observed = 0
+    LOG.info("OK-only trim observed=%d expected_loss=%d", observed, row_count)
+    assert observed < row_count, (
+        "OK-driven trim is supposed to be vulnerable; if every row still "
+        "survives without request_durable_ack=on the test setup isn't "
+        "actually exercising the failure mode it claims to."
+    )
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_orphan_drainer_durable_ack_survives_kill_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """The orphan drainer must honour ``request_durable_ack=on``. A "ghost"
+    sender writes rows with durable-ack opt-in and closes with
+    ``close_flush_timeout_millis=0`` so its SF slot retains the
+    un-durably-acked frames; a "foreground" sender with ``drain_orphans=on``
+    adopts the orphan slot and must NOT trim it on plain OK before the WAL
+    upload is durable. After kill+wipe, only the drainer's SF carries the
+    rows forward."""
+    table = "trades_orphan_drain_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    row_count = 50
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    ghost_cs = (
+        f"ws::addr=127.0.0.1:{p1_ports.http};"
+        "username=admin;password=quest;"
+        f"sf_dir={sf_dir};"
+        "sender_id=ghost;"
+        "request_durable_ack=on;"
+        # CLOSE returns immediately; the ghost slot stays full of
+        # un-durably-acked frames -- the drainer is what should empty it.
+        "close_flush_timeout_millis=0;"
+    )
+    c_client_rust_sidecar.connect(ghost_cs)
+    c_client_rust_sidecar.send(table, count=row_count, start_index=0)
+    c_client_rust_sidecar.flush()
+    c_client_rust_sidecar.close()
+
+    fg_cs = (
+        f"ws::addr=127.0.0.1:{p1_ports.http};"
+        "username=admin;password=quest;"
+        f"sf_dir={sf_dir};"
+        "sender_id=primary;"
+        "drain_orphans=on;"
+        "request_durable_ack=on;"
+        "reconnect_max_duration_millis=60000;"
+        "close_flush_timeout_millis=5000;"
+    )
+    c_client_rust_sidecar.connect(fg_cs)
+
+    # Window for the drainer to schedule, connect, push the orphan frame(s),
+    # and receive OK back from P1.
+    time.sleep(1.0)
+
+    p1.kill_9()
+    wait_port_free(p1_ports.http)
+    wait_port_free(p1_ports.pg)
+    if p1.db_root.exists():
+        shutil.rmtree(p1.db_root)
+    obj_store.wipe()
+
+    p2 = server_factory("p2", db_root_name="p2-fresh")
+    p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=row_count, timeout_s=60.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_sender_repeated_sigkill_no_state_corruption_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    c_client_rust_sidecar_binary: Path,
+    obj_store,
+    scenario_dir: Path,
+    log_dir: Path,
+) -> None:
+    """Multi-cycle SIGKILL torture. Kill-and-restart the Rust sender N times
+    against the same primary and the same ``sf_dir``/``sender_id``; the
+    on-disk slot state must stay consistent through every recovery. Catches
+    bugs that *accumulate* across cycles -- stale .sfa files, slot-lock
+    release flakes, sealed segments that never trim. ``sf_max_bytes`` forces
+    frequent rotation so each cycle leaves multiple sealed segments."""
+    table = "trades_multi_cycle_c_client_rust"
+    cycles = 6
+    rows_per_cycle = 200
+    total = cycles * rows_per_cycle
+    sf_dir = scenario_dir / "sf"
+    settle_secs = [0.0, 0.1, 0.3, 0.0, 0.2, 0.5]
+    assert len(settle_secs) == cycles
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
+
+    cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary", sf_max_bytes=8192)
+
+    fixture_consumed = False
+    for cycle in range(cycles):
+        if not fixture_consumed:
+            current = c_client_rust_sidecar
+            fixture_consumed = True
+        else:
+            current = CClientRustSidecar(
+                log_dir=log_dir, classpath=None,
+                name=f"c-client-rust-cycle{cycle}",
+                binary_path=c_client_rust_sidecar_binary,
+            )
+            current.start()
+        current.connect(cs)
+        current.send(table, count=rows_per_cycle, start_index=cycle * rows_per_cycle)
+        current.flush()
+        if settle_secs[cycle] > 0:
+            time.sleep(settle_secs[cycle])
+        current.kill_9()
+        LOG.info("cycle %d/%d: killed after %dms settle",
+                 cycle + 1, cycles, int(settle_secs[cycle] * 1000))
+
+    slot_dir = sf_dir / "primary"
+    sfa_files = sorted(slot_dir.glob("sf-*.sfa")) if slot_dir.exists() else []
+    assert sfa_files, (
+        f"expected un-trimmed .sfa segments in {slot_dir} after {cycles} "
+        f"SIGKILL cycles; recovery path is not under test. dir contents: "
+        f"{list(slot_dir.iterdir()) if slot_dir.exists() else '<missing>'}"
+    )
+    LOG.info("recovery surface after %d kills: %d .sfa file(s) in %s",
+             cycles, len(sfa_files), slot_dir)
+
+    final = CClientRustSidecar(
+        log_dir=log_dir, classpath=None, name="c-client-rust-final",
+        binary_path=c_client_rust_sidecar_binary,
+    )
+    final.start()
+    try:
+        final.connect(cs)
+        wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                                expected_count=total, timeout_s=180.0)
+    finally:
+        final.stop()
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_partial_ack_sealed_segment_replay_dedup_collapses_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    c_client_rust_sidecar_binary: Path,
+    obj_store,
+    scenario_dir: Path,
+    log_dir: Path,
+) -> None:
+    """Recovery through a partially-acked surviving sealed segment is correct:
+    the persisted ``ack-watermark`` carries the previous sender's durable-ack
+    high-water mark across the SIGKILL boundary, so the new sender positions
+    past the already-acked prefix instead of re-replaying it. Any residual
+    re-replay is absorbed by DEDUP on the target."""
+    table = "trades_partial_ack_c_client_rust"
+    batch_size = 200
+    batches = 10
+    row_count = batch_size * batches
+    sf_dir = scenario_dir / "sf"
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
+
+    cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary", sf_max_bytes=32768)
+    c_client_rust_sidecar.connect(cs)
+    # Many smaller flushes -> many frames -> exercise the
+    # multiple-frames-per-segment path that makes partial-ack possible.
+    for b in range(batches):
+        c_client_rust_sidecar.send(table, count=batch_size, start_index=b * batch_size)
+        c_client_rust_sidecar.flush()
+
+    # Let the WAL apply + durable-ack cadence trim the early sealed segments
+    # while the most-recent ones stay un-durably-acked.
+    time.sleep(4.0)
+
+    slot_dir = sf_dir / "primary"
+    pre_kill = sorted(slot_dir.glob("sf-*.sfa")) if slot_dir.exists() else []
+    LOG.info("pre-kill SF surface: %d .sfa file(s) survived partial trim",
+             len(pre_kill))
+    assert pre_kill, (
+        "expected at least one un-durably-acked .sfa segment at kill time; "
+        "partial-ack recovery path is not under test. If this consistently "
+        "fails, raise sf_max_bytes or reduce the settle time."
+    )
+
+    c_client_rust_sidecar.kill_9()
+
+    sidecar2 = CClientRustSidecar(
+        log_dir=log_dir, classpath=None, name="c-client-rust-sidecar-restart",
+        binary_path=c_client_rust_sidecar_binary,
+    )
+    sidecar2.start()
+    try:
+        sidecar2.connect(cs)
+        wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                                expected_count=row_count, timeout_s=120.0)
+    finally:
+        sidecar2.stop()
