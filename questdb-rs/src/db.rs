@@ -25,11 +25,11 @@
 //! Column-sender connection pool.
 //!
 //! `QuestDb` is a thread-safe pool of [`crate::ingress::Sender`] handles to
-//! a single QuestDB QWP/WebSocket endpoint. The pool eagerly opens
-//! `pool_size` connections at `connect`, auto-grows up to `pool_max` on
-//! demand, and (under `pool_reap=auto`) runs a background thread that closes
-//! above-`pool_size` connections after they have been idle for
-//! `pool_idle_timeout_ms`.
+//! a single QuestDB QWP/WebSocket endpoint. The pool is lazy: `connect`
+//! opens no connections, the first borrow opens one, it auto-grows up to
+//! `pool_max` on demand, and (under `pool_reap=auto`) runs a background
+//! thread that closes above-`pool_size` connections after they have been
+//! idle for `pool_idle_timeout_ms`.
 //!
 //! Each pool slot is handed out as a [`BorrowedColumnSender<'_>`] which returns
 //! itself to the pool on `Drop`. Slots whose underlying connection has
@@ -236,8 +236,8 @@ struct DbInner {
     /// pool connects through the pre-resolved `connector` instead.
     conf: String,
     /// Resolved, reusable QWP/WebSocket connect ingredients (endpoint list,
-    /// TLS, auth, config). Every sender connection — eager-open, auto-grow,
-    /// and failover re-borrow — opens through this connector so it rotates
+    /// TLS, auth, config). Every sender connection — first-borrow open,
+    /// auto-grow, and failover re-borrow — opens through this connector so it rotates
     /// across the configured endpoints. A single-endpoint pool behaves
     /// exactly as before (one endpoint, no rotation).
     connector: QwpWsConnector,
@@ -367,7 +367,7 @@ impl QuestDb {
     ///
     /// | Key                    | Default | Meaning                                                        |
     /// |------------------------|---------|----------------------------------------------------------------|
-    /// | `pool_size`            | 1       | Warm / minimum connections, opened eagerly here.               |
+    /// | `pool_size`            | 1       | Warm / minimum connections (lazy: opened on first borrow, not at connect). |
     /// | `pool_max`             | 64      | Hard cap on auto-grow. Borrow at the cap returns `InvalidApiCall`. |
     /// | `pool_idle_timeout_ms` | 60000   | Above-`pool_size` idle connections are closed after this long. |
     /// | `pool_reap`            | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |

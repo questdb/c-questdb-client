@@ -53,11 +53,16 @@ questdb::egress::reader connect_to(const qm::MockServer& srv)
     return questdb::egress::reader{questdb::ingress::utf8_view{conf}};
 }
 
+// Unaligned little-endian load. `column::values<T>()` hands out a `const T*`
+// borrowed from the wire payload that need not satisfy `alignof(T)`, so the
+// memcpy must read through a byte pointer: copying straight from `const T* p`
+// lets the compiler lower the memcpy to a typed (alignment-assuming) load,
+// which traps under UBSan `-fsanitize=alignment` on arm64.
 template <typename T>
 T load_le(const T* p)
 {
     T v;
-    std::memcpy(&v, p, sizeof(T));
+    std::memcpy(&v, reinterpret_cast<const unsigned char*>(p), sizeof(T));
     return v;
 }
 
@@ -4363,10 +4368,11 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 // hands out query readers as well as senders; a borrowed reader returns to
 // the pool on destruction unless `mark_must_close()` was called.
 //
-// Each pool eager-opens `pool_size` column connections at construction
-// (script[0..pool_size]); reader borrows consume the trailing scripts. The
-// reader connection sends SERVER_INFO at connect, then parks on the query
-// request that never arrives.
+// The pool is lazy: construction opens no connections (mirroring the Rust
+// `reader_pool_*` tests, which assert `server.accepted() == 0` right after
+// `connect`), so reader borrows consume scripts from index 0. The reader
+// connection sends SERVER_INFO at connect, then parks on the query request
+// that never arrives.
 // ---------------------------------------------------------------------------
 
 namespace
@@ -4387,9 +4393,10 @@ std::string pool_conf(const std::string& addr)
 
 TEST_CASE("pool::borrow_reader borrows a usable reader and recycles it")
 {
-    // script[0] = column eager-open (parks); script[1..] = reader borrows.
+    // Lazy pool: construction opens nothing, so the first reader borrow
+    // consumes script[0]; the re-borrow reuses the recycled reader and
+    // opens no new connection.
     qm::MockServer srv({
-        qm::Script{qm::ActionAwaitClientFrame{0x51}},
         reader_park_script(),
     });
     questdb::pool db{pool_conf(srv.addr())};
@@ -4414,8 +4421,10 @@ TEST_CASE("pool::borrow_reader borrows a usable reader and recycles it")
 
 TEST_CASE("pool::borrow_reader honours mark_must_close (drops, not recycles)")
 {
+    // Lazy pool: construction opens nothing. The first borrow consumes
+    // script[0]; after the must-close drop the re-borrow opens a fresh
+    // connection and consumes script[1].
     qm::MockServer srv({
-        qm::Script{qm::ActionAwaitClientFrame{0x51}}, // column eager-open
         reader_park_script(), // first reader borrow
         reader_park_script(), // re-borrow after the must-close drop
     });

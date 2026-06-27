@@ -1346,6 +1346,25 @@ inline bool bitmap_is_null(
     return validity && row < row_count &&
            ((validity[row >> 3] >> (row & 7)) & 1);
 }
+
+/** Load one `T` at element index `row` from a densely-packed, borrowed
+ *  buffer. Reads through a byte pointer so a misaligned `T*` is never
+ *  formed or indexed: densified column slices borrow from the wire payload
+ *  at offsets that need not satisfy `alignof(T)`, and indexing a misaligned
+ *  `T*` is undefined behaviour (it traps under UBSan `-fsanitize=alignment`
+ *  on strict-alignment targets such as arm64). `base` may be passed as a
+ *  `const T*`; it decays to `const void*` here and is only ever read as
+ *  bytes. */
+template <typename T>
+inline T load_unaligned(const void* base, size_t row) noexcept
+{
+    T value;
+    std::memcpy(
+        &value,
+        static_cast<const uint8_t*>(base) + row * sizeof(T),
+        sizeof(T));
+    return value;
+}
 } // namespace detail
 
 /** Fixed-width primitive view: BOOLEAN, BYTE, SHORT, CHAR, INT, IPV4,
@@ -1353,9 +1372,12 @@ inline bool bitmap_is_null(
  *
  *  `values` may not be aligned to `alignof(T)` — densified column
  *  slices may borrow from the wire payload at offsets that don't
- *  satisfy `T`'s alignment. Use `value(row)` for safe per-row access;
- *  for bulk reads use `std::memcpy` or unaligned-load intrinsics
- *  rather than `values[row]`. */
+ *  satisfy `T`'s alignment. Use `value(row)` for safe per-row access.
+ *  For bulk reads, copy each element through a *byte* pointer, e.g.
+ *  `std::memcpy(&v, reinterpret_cast<const unsigned char*>(values + r),
+ *  sizeof(T))`; never `values[row]` and never `std::memcpy(&v, values + r,
+ *  sizeof(T))` directly — both let the compiler emit an alignment-assuming
+ *  load that is undefined behaviour on strict-alignment targets (arm64). */
 template <typename T>
 struct fixed_view
 {
@@ -1372,9 +1394,7 @@ struct fixed_view
     {
         if (row >= row_count || is_null(row))
             return std::nullopt;
-        T v;
-        std::memcpy(&v, values + row, sizeof(T));
-        return v;
+        return detail::load_unaligned<T>(values, row);
     }
 };
 
@@ -1755,9 +1775,7 @@ public:
         ensure_row_in_range(row, "column::get");
         if (is_null(row))
             return std::nullopt;
-        T value;
-        std::memcpy(&value, base + row, sizeof(T));
-        return value;
+        return detail::load_unaligned<T>(base, row);
     }
 
     /** Strict overload: explicit `required` kind, bypasses the whitelist. */
@@ -1768,9 +1786,7 @@ public:
         ensure_row_in_range(row, "column::get(kind)");
         if (is_null(row))
             return std::nullopt;
-        T value;
-        std::memcpy(&value, base + row, sizeof(T));
-        return value;
+        return detail::load_unaligned<T>(base, row);
     }
 
     /** DECIMAL64 row → `nullable<decimal64>`. */

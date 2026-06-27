@@ -91,10 +91,10 @@ static int closed_port_phase(void)
  * the ingress error type onto the read path.
  *
  * Targets the same guaranteed-closed 127.0.0.1:1 port via a `qwpws::`
- * connect string. `questdb_db_connect_reader` eagerly opens the pool's
- * writer slot during the call, so the connect fails cleanly and the
- * failure is reported as a `reader_error*` (not a
- * `line_sender_error*`). Also exercises the NULL-idempotent
+ * connect string. The pool is lazy: `questdb_db_connect_reader` opens no
+ * socket, so the connect itself succeeds and the connect failure surfaces
+ * on the first `questdb_db_borrow_reader` — reported as a `reader_error*`
+ * (not a `line_sender_error*`). Also exercises the NULL-idempotent
  * `questdb_db_close` / `questdb_db_return_reader` paths.
  */
 static int pool_reader_only_phase(void)
@@ -105,12 +105,38 @@ static int pool_reader_only_phase(void)
     struct questdb_db* db =
         questdb_db_connect_reader(conf, strlen(conf), &err);
 
-    if (db != NULL)
+    /*
+     * Lazy pool: connect opens nothing, so it succeeds even against a
+     * guaranteed-closed port.
+     */
+    if (db == NULL)
+    {
+        size_t connect_msg_len = 0;
+        const char* connect_msg =
+            err != NULL ? reader_error_msg(err, &connect_msg_len) : NULL;
+        fprintf(
+            stderr,
+            "smoke pool: questdb_db_connect_reader unexpectedly failed for a "
+            "lazy pool: %.*s\n",
+            (int)connect_msg_len,
+            connect_msg ? connect_msg : "(no error)");
+        if (err != NULL)
+            reader_error_free(err);
+        return 1;
+    }
+
+    /*
+     * The connect failure must surface here, on the first borrow, as a
+     * `reader_error*`.
+     */
+    reader* reader = questdb_db_borrow_reader(db, &err);
+    if (reader != NULL)
     {
         fprintf(
             stderr,
-            "smoke pool: expected questdb_db_connect_reader to fail "
-            "against a guaranteed-closed port, but it succeeded\n");
+            "smoke pool: expected questdb_db_borrow_reader to fail against a "
+            "guaranteed-closed port, but it succeeded\n");
+        reader_close(reader);
         questdb_db_close(db);
         if (err != NULL)
             reader_error_free(err);
@@ -121,8 +147,9 @@ static int pool_reader_only_phase(void)
     {
         fprintf(
             stderr,
-            "smoke pool: questdb_db_connect_reader returned NULL but did "
+            "smoke pool: questdb_db_borrow_reader returned NULL but did "
             "not set an error — FFI error-propagation contract violated\n");
+        questdb_db_close(db);
         return 1;
     }
 
@@ -132,14 +159,16 @@ static int pool_reader_only_phase(void)
     {
         fprintf(
             stderr,
-            "smoke pool: connect error has empty message — egress error "
-            "accessor broken on the pool connect path\n");
+            "smoke pool: borrow error has empty message — egress error "
+            "accessor broken on the pool borrow path\n");
         reader_error_free(err);
+        questdb_db_close(db);
         return 1;
     }
 
     /* Single egress error type, freed through the egress accessor. */
     reader_error_free(err);
+    questdb_db_close(db);
 
     /* NULL-idempotent teardown paths reachable from this header. */
     questdb_db_return_reader(NULL, NULL);

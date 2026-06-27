@@ -4231,7 +4231,14 @@ impl QwpWsColumnBuffer {
                 precision_bits
             ));
         }
-        if *col_precision == 0 {
+        // The first value of a batch (re)pins the column precision. The
+        // column structure is retained across flushes (`clear_rows` keeps it
+        // but empties `cells`), so `cells.is_empty()` — not `*col_precision
+        // == 0` — marks the start of a fresh batch. Keying off the sentinel
+        // `0` instead would leave a reused, fully-omitted geohash column
+        // encoding precision 0, which the server rejects with
+        // "invalid GeoHash precision: 0".
+        if cells.is_empty() {
             *col_precision = precision_bits;
         } else if *col_precision != precision_bits {
             return Err(error::fmt!(
@@ -4354,12 +4361,13 @@ impl QwpWsColumnValues {
             Self::Ipv4 { cells } => cells.clear(),
             Self::Date { cells } => cells.clear(),
             Self::Char { cells } => cells.clear(),
-            Self::Geohash {
-                cells,
-                precision_bits,
-            } => {
+            Self::Geohash { cells, .. } => {
+                // Keep the pinned precision across clears. The next batch's
+                // first value re-pins it (see `append_geohash`); if the reused
+                // column is omitted entirely, the retained precision keeps the
+                // all-null column's wire encoding valid (precision 0 is
+                // rejected by the server).
                 cells.clear();
-                *precision_bits = 0;
             }
             Self::Symbol {
                 cells,
@@ -4467,15 +4475,12 @@ impl QwpWsColumnValues {
                     false
                 }
             }
-            Self::Geohash {
-                cells,
-                precision_bits,
-            } => {
-                let popped = pop_value_cell_for_row(cells, row_idx);
-                if popped && cells.is_empty() {
-                    *precision_bits = 0;
-                }
-                popped
+            Self::Geohash { cells, .. } => {
+                // Rolling back the last value leaves `cells` empty; the pinned
+                // precision is retained so a reused or partially-rolled-back
+                // column keeps a valid precision. The next value re-pins via
+                // `cells.is_empty()` in `append_geohash`.
+                pop_value_cell_for_row(cells, row_idx)
             }
             Self::LongArray { cells, data } => {
                 if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
@@ -9440,6 +9445,81 @@ mod tests {
             .unwrap();
         buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
             .expect("clear() must let the next batch repin the geohash precision");
+    }
+
+    /// Parse a single-table WS replay message whose first column is a GEOHASH
+    /// and return `(row_count, precision_bits)` read straight off the wire.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn ws_first_geohash_precision(message: &[u8]) -> (u64, u64) {
+        let (_, _, mut pos) = ws_delta_entries(message);
+        let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
+        assert_eq!(table_count, 1, "helper expects exactly one table");
+        let _table_name = read_test_bytes(message, &mut pos);
+        let row_count = read_test_varint(message, &mut pos);
+        let column_count = read_test_varint(message, &mut pos);
+        assert!(column_count >= 1);
+        // Inline schema: (name, wire-type byte) per column, all up front.
+        let mut types = Vec::with_capacity(column_count as usize);
+        for _ in 0..column_count {
+            let _name = read_test_bytes(message, &mut pos);
+            types.push(message[pos]);
+            pos += 1;
+        }
+        assert_eq!(types[0], QWP_TYPE_GEOHASH, "first column must be a geohash");
+        // Data section, column 0: null-flag, optional bitmap, precision varint.
+        let uses_null_bitmap = message[pos];
+        pos += 1;
+        if uses_null_bitmap == 1 {
+            pos += row_count.div_ceil(8) as usize;
+        }
+        let precision = read_test_varint(message, &mut pos);
+        (row_count, precision)
+    }
+
+    /// Regression for the QWP/WS fuzz failure "invalid GeoHash precision: 0".
+    ///
+    /// The column-major buffer retains columns across flushes. A geohash
+    /// column pinned in one batch and then omitted from a later batch (reused
+    /// buffer) must still encode a *valid* precision for its all-null rows —
+    /// resetting the pinned precision to the sentinel `0` made the server
+    /// reject the frame.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_reused_geohash_omitted_in_next_batch_keeps_valid_precision() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        // Batch 1: pin the geohash precision (25) on table "pos".
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 0x1AB_CDEF, 25)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        // Reuse the buffer: clear() retains the geohash column but empties rows.
+        buf.clear();
+
+        // Batch 2: same table, geohash omitted (only an i64 column is set). The
+        // retained, all-null geohash column is still serialized.
+        buf.table("pos")
+            .unwrap()
+            .column_i64("n", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        let (row_count, precision) = ws_first_geohash_precision(&scratch.message);
+        assert_eq!(row_count, 1);
+        assert_eq!(
+            precision, 25,
+            "retained all-null geohash column must keep a valid precision, not reset to 0"
+        );
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

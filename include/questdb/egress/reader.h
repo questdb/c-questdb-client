@@ -411,9 +411,11 @@ struct questdb_db;
  * `reader_error*` into `*err_out` (release with
  * `reader_error_free`).
  *
- * Like `questdb_db_connect`, this eagerly opens `pool_size` (default 1)
- * writer connections during the call; the reader pool stays lazy and
- * opens a reader socket only on the first `questdb_db_borrow_reader`.
+ * Like `questdb_db_connect`, the pool is lazy: this opens no connections
+ * during the call (so it succeeds even against an unreachable endpoint).
+ * The reader pool opens a reader socket on the first
+ * `questdb_db_borrow_reader`, which is where connect-time transport
+ * failures surface.
  */
 QUESTDB_CLIENT_API
 struct questdb_db* questdb_db_connect_reader(

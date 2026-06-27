@@ -3658,12 +3658,13 @@ use questdb::QuestDb;
 /// ownership transfers to the caller (release with
 /// `reader_error_free`).
 ///
-/// NOTE: the pool is unified. Like `questdb_db_connect`, this eagerly
-/// opens `pool_size` (default 1) **writer** connections during the call;
-/// the reader pool itself stays lazy, opening a reader socket only on the
-/// first `questdb_db_borrow_reader`. Connect-time errors are mapped from
-/// the ingress error category onto the closest `reader_error_code`
-/// (the diagnostic message is preserved verbatim).
+/// NOTE: the pool is unified and lazy. Like `questdb_db_connect`, this opens
+/// no connections during the call (so it succeeds even against an
+/// unreachable endpoint); the reader pool opens a reader socket on the
+/// first `questdb_db_borrow_reader`, which is where connect-time transport
+/// failures surface. Those errors are mapped from the ingress error
+/// category onto the closest `reader_error_code` (the diagnostic message is
+/// preserved verbatim).
 #[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_connect_reader(
