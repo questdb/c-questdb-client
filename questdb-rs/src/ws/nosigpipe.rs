@@ -26,8 +26,8 @@
 //!
 //! Background. `Cursor::Drop` on the egress reader emits a 9-byte
 //! `CANCEL` frame and then a 4-byte `Close` frame on the same socket
-//! (see [`crate::egress::reader::Cursor`] → [`super::super::transport::WsTransport::try_write_cancel`]
-//! → [`super::super::transport::WsTransport::close_in_place`]). If the
+//! (see `crate::egress::reader::Cursor` → `WsTransport::try_write_cancel`
+//! → `WsTransport::close_in_place`). If the
 //! peer has gone away between the two writes, Linux consumes `sk_err`
 //! on the first `write(2)` (which returns `ECONNRESET`) and raises
 //! `SIGPIPE` on the second — the clean-`sk_err`/`sk_shutdown` path in

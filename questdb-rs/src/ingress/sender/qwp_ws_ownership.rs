@@ -36,7 +36,7 @@ pub enum QwpWsProgress {
     Background,
     /// Do not start a background runner. The caller must call
     /// [`crate::ingress::Sender::drive_once`] or
-    /// [`crate::ingress::Sender::await_acked_fsn`] to advance WebSocket progress.
+    /// [`crate::ingress::Sender::wait`] to advance WebSocket progress.
     Manual,
 }
 

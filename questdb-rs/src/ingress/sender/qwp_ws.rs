@@ -3105,6 +3105,14 @@ pub(crate) fn qwp_ws_acked_fsn_manual(
     Ok(state.store.completed_fsn())
 }
 
+/// Manual-mode OK watermark. Manual progress has no background durable-ACK
+/// runner, so server acceptance and completion coincide: the OK watermark is
+/// the completed watermark.
+pub(crate) fn qwp_ws_ok_fsn_manual(state: &ManualQwpWsHandlerState) -> crate::Result<Option<u64>> {
+    check_manual_driver_error(state)?;
+    Ok(state.store.completed_fsn())
+}
+
 pub(crate) fn qwp_ws_check_error_background(state: &SyncQwpWsHandlerState) -> crate::Result<()> {
     state.runner.check_error()
 }

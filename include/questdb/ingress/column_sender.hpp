@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -764,14 +765,23 @@ public:
     /**
      * Block until every frame published on this conn so far reaches `level`.
      * The SFA queue owns delivery, so this is needed only to *observe* the ack,
-     * never for durability. Bounded by `request_timeout`; throws on error.
+     * never for durability. `timeout` is a no-progress deadline (it fires only
+     * if the ack watermark fails to advance for that long); the default of zero
+     * waits indefinitely. Throws on error.
      */
-    void wait(column_sender_ack_level level = column_sender_ack_level::ok)
+    void wait(
+        column_sender_ack_level level = column_sender_ack_level::ok,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
     {
+        if (timeout.count() < 0)
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket wait timeout must not be negative."};
         line_sender_error::wrapped_call(
             ::sf_column_sender_wait,
             _raw,
-            static_cast<uint32_t>(level));
+            static_cast<uint32_t>(level),
+            static_cast<uint64_t>(timeout.count()));
     }
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW

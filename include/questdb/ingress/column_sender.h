@@ -1301,10 +1301,16 @@ bool direct_column_sender_flush(
  * parameter is `uint32_t` rather than `enum column_sender_ack_level` so
  * an out-of-range value returns `line_sender_error_invalid_api_call`
  * instead of being undefined behaviour at the language boundary.
+ *
+ * `timeout_millis` is the no-progress deadline (it fires only if the ack
+ * watermark fails to advance for that long); `0` waits indefinitely.
  */
 QUESTDB_CLIENT_API
 bool sf_column_sender_wait(
-    sf_column_sender* conn, uint32_t ack_level, line_sender_error** err_out);
+    sf_column_sender* conn,
+    uint32_t ack_level,
+    uint64_t timeout_millis,
+    line_sender_error** err_out);
 
 /**
  * Direct commit: send the commit boundary for all pipelined frames and block

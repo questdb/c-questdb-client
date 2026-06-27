@@ -3448,33 +3448,49 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
     }
 }
 
+/// Acknowledgement level for [`line_sender_qwpws_wait`]. These mirror the
+/// column-major `column_sender_ack_level_*` values; the FFI takes a `uint32_t`.
+#[allow(non_upper_case_globals)]
+pub const line_sender_qwpws_ack_level_ok: u32 = 0;
+#[allow(non_upper_case_globals)]
+pub const line_sender_qwpws_ack_level_durable: u32 = 1;
+
+/// Wait until every QWP/WebSocket frame published so far on `sender` reaches
+/// `ack_level` (a `line_sender_qwpws_ack_level_*` value). This is the
+/// row-major counterpart to the column-major `sf_column_sender_wait`.
+///
+/// `timeout_millis` is a no-progress deadline (it fires only if the ack
+/// watermark fails to advance for that long); `0` waits indefinitely.
+///
+/// Returns `true` once the boundary is acknowledged. Returns `false` and sets
+/// `err_out` on the no-progress timeout (`line_sender_error_failover_retry`), a
+/// server rejection, a transport failure, or an invalid `ack_level`. With
+/// nothing published yet it succeeds immediately.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_qwpws_await_acked_fsn(
+pub unsafe extern "C" fn line_sender_qwpws_wait(
     sender: *mut line_sender,
-    fsn: u64,
+    ack_level: u32,
     timeout_millis: u64,
-    reached_out: *mut bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
-        if reached_out.is_null() {
-            set_err_out(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "line_sender_qwpws_await_acked_fsn requires non-NULL reached_out".to_string(),
-            );
-            return false;
-        }
-        let Some(sender) =
-            qwpws_line_sender_mut(sender, err_out, "line_sender_qwpws_await_acked_fsn")
-        else {
+        let ack_level = match ack_level {
+            0 => questdb::ingress::AckLevel::Ok,
+            1 => questdb::ingress::AckLevel::Durable,
+            other => {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!("line_sender_qwpws_wait: invalid ack_level {other} (expected 0 or 1)"),
+                );
+                return false;
+            }
+        };
+        let Some(sender) = qwpws_line_sender_mut(sender, err_out, "line_sender_qwpws_wait") else {
             return false;
         };
-        match sender.await_acked_fsn(fsn, Duration::from_millis(timeout_millis)) {
-            Ok(reached) => {
-                *reached_out = reached;
-                true
-            }
+        match sender.wait(ack_level, Duration::from_millis(timeout_millis)) {
+            Ok(()) => true,
             Err(err) => {
                 set_err_out_from_sender_error(err_out, sender, err);
                 false
@@ -5534,14 +5550,7 @@ mod tests {
             );
             free_err(&mut err);
 
-            let mut reached = true;
-            assert!(!line_sender_qwpws_await_acked_fsn(
-                sender,
-                0,
-                0,
-                &mut reached,
-                &mut err
-            ));
+            assert!(!line_sender_qwpws_wait(sender, 0, 0, &mut err));
             assert!(!err.is_null());
             assert_err_code(
                 line_sender_error_get_code(err),

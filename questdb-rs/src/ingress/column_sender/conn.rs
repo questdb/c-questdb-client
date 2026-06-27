@@ -1115,7 +1115,7 @@ fn ws_header_len_for(payload_len: usize) -> usize {
 }
 
 /// Write the RFC 6455 binary-frame client header into `out`. `out.len()`
-/// must equal [`ws_header_len_for(payload_len)`].
+/// must equal `ws_header_len_for(payload_len)`.
 fn write_ws_header(out: &mut [u8], payload_len: usize, mask_key: [u8; 4]) {
     const FIN_BIT: u8 = 0x80;
     const BINARY_OPCODE: u8 = 0x2;

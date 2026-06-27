@@ -1110,7 +1110,8 @@ fn month_offset_to_micros(month_offset: i64) -> Option<i64> {
 
 /// Days from the Unix epoch (1970-01-01) to the given proleptic
 /// Gregorian (year, month, day). Howard Hinnant's `days_from_civil`
-/// (public-domain algorithm, http://howardhinnant.github.io/date_algorithms.html).
+/// (public-domain algorithm,
+/// <http://howardhinnant.github.io/date_algorithms.html>).
 /// Safe for `|year| < ~2.5e16`; callers above cap year first.
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };

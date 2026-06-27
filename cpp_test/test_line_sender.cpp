@@ -2803,7 +2803,7 @@ TEST_CASE("line_sender c++ qwpws extension helpers reject qwpudp sender")
     CHECK_THROWS_AS(sender.acked_fsn(), questdb::ingress::line_sender_error);
     CHECK_THROWS_AS(sender.drive_once(), questdb::ingress::line_sender_error);
     CHECK_THROWS_AS(
-        sender.await_acked_fsn(0, std::chrono::milliseconds{0}),
+        sender.wait(questdb::ingress::qwpws_ack_level::ok),
         questdb::ingress::line_sender_error);
     CHECK_THROWS_AS(
         sender.poll_qwp_ws_error(), questdb::ingress::line_sender_error);

@@ -40,7 +40,7 @@
 //!   and return when it is committed"). To pipeline many batches for
 //!   throughput instead, publish each with [`ColumnSender::flush`] and drain
 //!   once at the end with [`ColumnSender::sync`] at the requested [`AckLevel`].
-//! - Drop the [`crate::BorrowedColumnSender`] to return its connection to the pool.
+//! - Drop the [`crate::SfColumnSender`] to return its connection to the pool.
 //!
 //! ```ignore
 //! let mut sender = db.borrow_column_sender()?;

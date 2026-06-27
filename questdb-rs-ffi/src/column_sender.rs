@@ -3359,17 +3359,22 @@ unsafe fn reexport_record_batch_into(
 /// for the server's object-store durability watermarks.
 ///
 /// No-progress timeout: if the server stays connected but never advances the
-/// ack/durable watermark for `request_timeout` (default 30s) — a back-pressured
-/// WAL or stuck commit — sync returns `line_sender_error_failover_retry`. The
-/// deadline resets on every watermark advance, so a slow-but-progressing sync
-/// (e.g. a `durable` upload under pressure) is not cut off. The unacked frames
-/// are retained: drop the conn and re-borrow to replay (store-and-forward) or
-/// re-drive from source (direct).
+/// ack/durable watermark — a back-pressured WAL or stuck commit — the wait
+/// returns `line_sender_error_failover_retry`. The deadline resets on every
+/// watermark advance, so a slow-but-progressing wait (e.g. a `durable` upload
+/// under pressure) is not cut off. The unacked frames are retained: drop the
+/// conn and re-borrow to replay (store-and-forward) or re-drive from source
+/// (direct).
+///
+/// `timeout` selects the bound: `Some` is the store-and-forward `wait`'s
+/// per-call no-progress deadline (`Duration::ZERO` waits forever); `None` is
+/// the direct `commit`, whose bound is the connection `request_timeout`.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 unsafe fn cs_wait_body<T: CsHandle>(
     conn: *mut T,
     ack_level: u32,
+    timeout: Option<std::time::Duration>,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
@@ -3399,20 +3404,35 @@ unsafe fn cs_wait_body<T: CsHandle>(
         return false;
     }
     let sender = unsafe { T::owned_mut(conn).get_mut() };
-    bubble!(err_out, sender.sync(ack_level));
+    match timeout {
+        Some(timeout) => bubble!(err_out, sender.wait(ack_level, timeout)),
+        None => bubble!(err_out, sender.sync(ack_level)),
+    }
     true
 }
 
 /// Store-and-forward ack barrier: block until every frame published on `conn`
 /// so far reaches `ack_level`. The SFA queue owns delivery, so this is needed
 /// only to *observe* the ack, never for durability.
+///
+/// `timeout_millis` is a no-progress deadline (it fires only if the ack
+/// watermark fails to advance for that long); `0` waits indefinitely.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sf_column_sender_wait(
     conn: *mut sf_column_sender,
     ack_level: u32,
+    timeout_millis: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { cs_wait_body(conn, ack_level, "sf_column_sender_wait", err_out) }
+    unsafe {
+        cs_wait_body(
+            conn,
+            ack_level,
+            Some(std::time::Duration::from_millis(timeout_millis)),
+            "sf_column_sender_wait",
+            err_out,
+        )
+    }
 }
 
 /// Direct commit: send the commit boundary for all pipelined frames and block
@@ -3423,7 +3443,15 @@ pub unsafe extern "C" fn direct_column_sender_commit(
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { cs_wait_body(conn, ack_level, "direct_column_sender_commit", err_out) }
+    unsafe {
+        cs_wait_body(
+            conn,
+            ack_level,
+            None,
+            "direct_column_sender_commit",
+            err_out,
+        )
+    }
 }
 
 // ===========================================================================

@@ -265,16 +265,6 @@ impl ColumnSender {
         }
     }
 
-    /// Override the store-and-forward `sync` no-progress deadline. Tests use
-    /// this to exercise the timeout without waiting for the production default
-    /// (`request_timeout`, 30s). No-op on the direct backend.
-    #[cfg(test)]
-    pub(crate) fn set_sfa_sync_timeout_for_test(&mut self, timeout: Duration) {
-        if let ColumnSenderBackend::StoreAndForward(sfa) = &mut self.backend {
-            sfa.sync_timeout = timeout;
-        }
-    }
-
     pub(crate) fn in_flight(&self) -> u32 {
         match &self.backend {
             ColumnSenderBackend::Direct(direct) => direct.conn.in_flight(),
@@ -555,6 +545,22 @@ impl ColumnSender {
             ColumnSenderBackend::StoreAndForward(sfa) => sfa.sync(ack_level),
         }
     }
+
+    /// Store-and-forward only: wait up to `timeout` for every frame published
+    /// so far to reach `ack_level`. `timeout` is a no-progress deadline — it
+    /// fires only if the ack watermark fails to advance for that long;
+    /// `Duration::ZERO` waits indefinitely. On expiry it returns a
+    /// [`ErrorCode::FailoverRetry`](crate::error::ErrorCode::FailoverRetry)
+    /// error and the queued frames are retained for replay.
+    pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
+        match &mut self.backend {
+            ColumnSenderBackend::StoreAndForward(sfa) => sfa.wait(ack_level, timeout),
+            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "wait(timeout) is store-and-forward only; the direct sender uses commit()."
+            )),
+        }
+    }
 }
 
 impl DirectColumnBackend {
@@ -769,7 +775,7 @@ impl SfaColumnBackend {
         chunk.clear();
         if let WaitForAck::Yes(level) = wait {
             // The frame is in the local queue; a wait failure is delivery-unknown.
-            self.wait_for_boundary(level, boundary)
+            self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
         Ok(())
@@ -816,25 +822,34 @@ impl SfaColumnBackend {
                 }
             };
         if let WaitForAck::Yes(level) = wait {
-            self.wait_for_boundary(level, boundary)
+            self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
         Ok(())
     }
 
     fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
+        self.wait(ack_level, self.sync_timeout)
+    }
+
+    fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.validate_ack_level(ack_level)?;
         let Some(boundary) = qwp_ws_published_fsn_background(&self.state)? else {
             return Ok(());
         };
-        self.wait_for_boundary(ack_level, boundary)
+        self.wait_for_boundary(ack_level, boundary, timeout)
     }
 
     /// Block until the OK/durable watermark reaches `boundary`, then record it
     /// as the satisfied watermark (so a trailing `sync(level)`/`flush_and_wait`
     /// on the same boundary short-circuits). Short-circuits immediately when the
     /// cached watermark already covers `boundary`.
-    fn wait_for_boundary(&mut self, ack_level: AckLevel, boundary: u64) -> Result<()> {
+    fn wait_for_boundary(
+        &mut self,
+        ack_level: AckLevel,
+        boundary: u64,
+        timeout: Duration,
+    ) -> Result<()> {
         let last_boundary = match ack_level {
             AckLevel::Ok => self.last_ok_sync_boundary,
             AckLevel::Durable => self.last_durable_sync_boundary,
@@ -877,13 +892,8 @@ impl SfaColumnBackend {
 
             qwp_ws_check_error_background(&self.state)?;
 
-            if !self.sync_timeout.is_zero() && deadline_anchor.elapsed() >= self.sync_timeout {
-                return Err(sfa_sync_timeout(
-                    self.sync_timeout,
-                    ack_level,
-                    boundary,
-                    completed,
-                ));
+            if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
+                return Err(sfa_sync_timeout(timeout, ack_level, boundary, completed));
             }
             thread::sleep(Duration::from_millis(10));
         }

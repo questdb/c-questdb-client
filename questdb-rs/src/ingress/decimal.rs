@@ -73,7 +73,7 @@ impl<'a> DecimalView<'a> {
     /// - `scale` does not exceed the QuestDB maximum of 76 decimal places.
     /// - The mantissa fits into at most 32 bytes (ILP binary limit).
     ///
-    /// Returns an [`error::ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
+    /// Returns an [`error::ErrorCode::InvalidDecimal`]
     /// error if either constraint is violated.
     pub fn try_new_scaled<T>(scale: u32, value: T) -> Result<Self>
     where
@@ -108,7 +108,7 @@ impl<'a> DecimalView<'a> {
     /// Accepts plain decimals, optional `+/-` prefixes, `NaN`, `Infinity`, and scientific
     /// notation (`e`/`E`).
     ///
-    /// Returns [`error::ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
+    /// Returns [`error::ErrorCode::InvalidDecimal`]
     /// if disallowed characters are encountered.
     pub fn try_new_string(value: &'a str) -> Result<Self> {
         // Basic validation: ensure only numerical characters are present (accepts NaN, Inf[inity], and e-notation)
@@ -142,7 +142,7 @@ impl<'a> DecimalView<'a> {
 
     /// Serializes the decimal view into the provided output buffer using the ILP encoding.
     ///
-    /// Delegates to [`serialize_string`] for textual representations and [`serialize_scaled`] for
+    /// Delegates to `serialize_string` for textual representations and `serialize_scaled` for
     /// the compact binary format.
     pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
         match self {

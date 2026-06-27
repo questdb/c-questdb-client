@@ -1689,6 +1689,22 @@ private:
 };
 
 /**
+ * Acknowledgement level for `line_sender::wait`. Mirrors the C
+ * `line_sender_qwpws_ack_level` values.
+ */
+enum class qwpws_ack_level : uint32_t
+{
+    /** Wait for the server to accept every published frame. */
+    ok = 0,
+
+    /**
+     * Wait for durable-ACK coverage. Falls back to ordinary acceptance when
+     * the connection did not negotiate durable acks.
+     */
+    durable = 1,
+};
+
+/**
  * Inserts data into QuestDB via the InfluxDB Line Protocol.
  *
  * Batch up rows in a `line_sender_buffer` object, then call
@@ -2047,22 +2063,28 @@ public:
     }
 
     /**
-     * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
-     * Returns false on timeout.
+     * Wait until every QWP/WebSocket frame published so far reaches
+     * `ack_level`. Row-major counterpart to the column-major
+     * store-and-forward wait. `timeout` is a no-progress deadline (it fires
+     * only if the ack watermark fails to advance for that long); the default
+     * of zero waits indefinitely. Throws on the no-progress timeout, a server
+     * rejection, or a transport failure; returns immediately when nothing has
+     * been published yet.
      */
-    bool await_acked_fsn(
-        uint64_t fsn, std::chrono::milliseconds timeout)
+    void wait(
+        qwpws_ack_level ack_level = qwpws_ack_level::ok,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
     {
         ensure_impl();
-        const auto timeout_millis = checked_timeout_millis(timeout);
-        bool reached = false;
+        if (timeout.count() < 0)
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket wait timeout must not be negative."};
         line_sender_error::wrapped_call(
-            ::line_sender_qwpws_await_acked_fsn,
+            ::line_sender_qwpws_wait,
             _impl,
-            fsn,
-            timeout_millis,
-            &reached);
-        return reached;
+            static_cast<uint32_t>(ack_level),
+            static_cast<uint64_t>(timeout.count()));
     }
 
     /**
@@ -2170,16 +2192,6 @@ private:
         if (fsn.has_value)
             return fsn.value;
         return std::nullopt;
-    }
-
-    static uint64_t checked_timeout_millis(
-        std::chrono::milliseconds timeout)
-    {
-        if (timeout.count() < 0)
-            throw line_sender_error{
-                line_sender_error_code::invalid_api_call,
-                "QWP/WebSocket ACK timeout must not be negative."};
-        return static_cast<uint64_t>(timeout.count());
     }
 
     void ensure_impl() const

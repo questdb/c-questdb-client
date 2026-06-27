@@ -971,7 +971,7 @@ unsafe fn encode_varchar(
 /// (Arrow LargeUtf8 layout) and narrows each to `u32` in-place while
 /// writing — no intermediate `Vec<i32>` allocation. Per-offset
 /// `u32::MAX` overflow has already been rejected at chunk-build time by
-/// [`validate_varchar_offsets_i64`](super::chunk::validate_varchar_offsets_i64),
+/// `validate_varchar_offsets_i64`,
 /// so the narrowing here is always lossless.
 unsafe fn encode_varchar_large(
     out: &mut Vec<u8>,

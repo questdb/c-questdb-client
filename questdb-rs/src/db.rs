@@ -31,7 +31,7 @@
 //! thread that closes above-`pool_size` connections after they have been
 //! idle for `pool_idle_timeout_ms`.
 //!
-//! Each pool slot is handed out as a [`BorrowedColumnSender<'_>`] which returns
+//! Each pool slot is handed out as a [`SfColumnSender`] which returns
 //! itself to the pool on `Drop`. Slots whose underlying connection has
 //! latched into `must_close=true` are dropped on return instead of being
 //! recycled.
@@ -196,7 +196,7 @@ impl Drop for ReaderInUseSlot<'_> {
     }
 }
 
-/// Row-major sender equivalent of [`ReaderInUseSlot`]: reserves an `in_use`
+/// Row-major sender equivalent of `ReaderInUseSlot`: reserves an `in_use`
 /// slot under the cap and releases it on drop unless `commit` is called.
 struct RowSenderInUseSlot<'a> {
     state: &'a Mutex<RowSenderPoolState>,
@@ -224,7 +224,7 @@ impl Drop for RowSenderInUseSlot<'_> {
 /// internal state is `Mutex`-guarded so [`QuestDb::borrow_column_sender`] /
 /// [`QuestDb::reap_idle`] / Drop-driven returns are safe to interleave.
 ///
-/// Each borrow ([`BorrowedColumnSender`]) is **not** `Send` — it belongs to the
+/// Each borrow ([`SfColumnSender`] / [`DirectColumnSender`]) is **not** `Send` — it belongs to the
 /// thread that borrowed it. To ingest in parallel, borrow one sender per
 /// worker thread from the same `QuestDb`.
 pub struct QuestDb {
@@ -1066,12 +1066,17 @@ impl<'a> SfColumnSender<'a> {
         self.0.inner_mut().flush(chunk)
     }
 
-    /// Block until every frame published on this handle so far reaches
-    /// `ack_level`. Short-circuits when nothing is pending or the watermark
-    /// already covers the latest frame. `AckLevel::Durable` requires the pool
-    /// to have been opened with `request_durable_ack=on`.
-    pub fn wait(&mut self, ack_level: AckLevel) -> Result<()> {
-        self.0.inner_mut().sync(ack_level)
+    /// Wait up to `timeout` for every frame published on this handle so far to
+    /// reach `ack_level`. Short-circuits when nothing is pending or the
+    /// watermark already covers the latest frame. `AckLevel::Durable` requires
+    /// the pool to have been opened with `request_durable_ack=on`.
+    ///
+    /// `timeout` is a no-progress deadline (it fires only if the ack watermark
+    /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
+    /// On expiry it returns an [`ErrorCode::FailoverRetry`](crate::ErrorCode)
+    /// error and the queued frames are retained for replay.
+    pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
+        self.0.inner_mut().wait(ack_level, timeout)
     }
 
     /// `true` once the connection has latched terminally closed.
@@ -1136,11 +1141,6 @@ impl<'a> SfColumnSender<'a> {
         self.0
             .inner_mut()
             .flush_arrow_batch_at_column(table, batch, ts_column, overrides)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_sfa_sync_timeout_for_test(&mut self, timeout: Duration) {
-        self.0.inner_mut().set_sfa_sync_timeout_for_test(timeout)
     }
 }
 
@@ -1369,7 +1369,7 @@ impl Drop for OwnedColumnSender {
 
 /// A row-major [`crate::ingress::Sender`] borrowed from a [`QuestDb`] pool.
 ///
-/// Companion to [`BorrowedColumnSender`] (the column-major handle). Derefs to
+/// Companion to [`SfColumnSender`] / [`DirectColumnSender`] (the column-major handles). Derefs to
 /// `Sender`, so the usual `Buffer` build + `flush` flow works unchanged. On
 /// `Drop` the sender is returned to the row-sender pool, unless its connection
 /// has latched `must_close` (or [`Self::mark_must_close`] was called), in which
@@ -1381,7 +1381,7 @@ pub struct BorrowedRowSender<'a> {
     db: &'a QuestDb,
     sender: Option<Sender>,
     must_close: bool,
-    /// !Send / !Sync marker, mirroring [`BorrowedColumnSender`].
+    /// !Send / !Sync marker, mirroring [`SfColumnSender`].
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -1528,7 +1528,7 @@ pub struct BorrowedReader<'a> {
     db: &'a QuestDb,
     reader: Option<Reader>,
     must_close: bool,
-    /// !Send / !Sync marker, mirroring [`BorrowedColumnSender`].
+    /// !Send / !Sync marker, mirroring [`SfColumnSender`].
     _not_send: PhantomData<Rc<()>>,
 }
 

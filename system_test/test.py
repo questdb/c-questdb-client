@@ -1792,7 +1792,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 self._write_row(sender, table_name, 0)
                 fsn = sender.flush_and_get_fsn()
                 self.assertEqual(fsn, 0)
-                self.assertTrue(sender.await_acked_fsn(fsn, 30000))
+                sender.wait(1)  # AckLevel::Durable
                 self.assertEqual(sender.acked_fsn(), fsn)
                 sender.close_drain()
             finally:
@@ -1841,7 +1841,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 third_fsn = sender.flush_and_get_fsn()
                 self.assertEqual(third_fsn, 2)
 
-                self.assertTrue(sender.await_acked_fsn(third_fsn, 30000))
+                sender.wait(1)  # AckLevel::Durable
                 sender.close_drain()
             finally:
                 sender.close(False)
@@ -1896,7 +1896,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 final_fsn = sender.flush_and_get_fsn()
 
                 self.assertEqual((first_fsn, rejected_fsn, final_fsn), (0, 1, 2))
-                self.assertTrue(sender.await_acked_fsn(final_fsn, 30000))
+                sender.wait(1)  # AckLevel::Durable
                 diagnostic = self._retry_poll_qwp_ws_error(sender)
                 self.assertEqual(diagnostic.category, qls.QwpWsErrorCategory.SCHEMA_MISMATCH)
                 self.assertEqual(diagnostic.applied_policy, qls.QwpWsErrorPolicy.DROP_AND_CONTINUE)

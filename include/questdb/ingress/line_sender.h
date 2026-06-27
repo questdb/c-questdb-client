@@ -1839,15 +1839,38 @@ bool line_sender_qwpws_acked_fsn(
     line_sender_error** err_out);
 
 /**
- * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
- * Timeout is a normal successful result with `*reached_out == false`.
+ * Acknowledgement level for `line_sender_qwpws_wait`.
+ */
+typedef enum line_sender_qwpws_ack_level
+{
+    /** Wait for the server to accept every published frame. */
+    line_sender_qwpws_ack_level_ok = 0,
+
+    /**
+     * Wait for durable-ACK coverage. Falls back to ordinary acceptance when
+     * the connection did not negotiate durable acks.
+     */
+    line_sender_qwpws_ack_level_durable = 1,
+} line_sender_qwpws_ack_level;
+
+/**
+ * Wait until every QWP/WebSocket frame published so far reaches `ack_level`
+ * (a `line_sender_qwpws_ack_level` value). This is the row-major counterpart
+ * to `sf_column_sender_wait`.
+ *
+ * `timeout_millis` is a no-progress deadline (it fires only if the ack
+ * watermark fails to advance for that long); `0` waits indefinitely.
+ *
+ * Returns `false` and sets `err_out` on the no-progress timeout
+ * (`line_sender_error_failover_retry`), a server rejection, a transport
+ * failure, or an invalid `ack_level`. With nothing published yet it succeeds
+ * immediately.
  */
 QUESTDB_CLIENT_API
-bool line_sender_qwpws_await_acked_fsn(
+bool line_sender_qwpws_wait(
     line_sender* sender,
-    uint64_t fsn,
+    uint32_t ack_level,
     uint64_t timeout_millis,
-    bool* reached_out,
     line_sender_error** err_out);
 
 /**

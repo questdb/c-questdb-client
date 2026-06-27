@@ -42,7 +42,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process;
 use std::time::Duration;
 
-use questdb::ingress::{Buffer, Sender, TimestampMicros};
+use questdb::ingress::{AckLevel, Buffer, Sender, TimestampMicros};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -188,14 +188,22 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             if parts.len() < 2 {
                 return Err("usage: AWAIT_ACKED <fsn> <timeout_ms>".into());
             }
-            let fsn: u64 = parts[0].parse().map_err(|_| "invalid fsn".to_string())?;
+            // `fsn` is retained for wire-protocol compatibility; the AckLevel
+            // `wait` API waits for the full published boundary (no token).
+            let _fsn: u64 = parts[0].parse().map_err(|_| "invalid fsn".to_string())?;
             let timeout_ms: u64 = parts[1]
                 .parse()
                 .map_err(|_| "invalid timeout_ms".to_string())?;
-            let reached = sender
-                .await_acked_fsn(fsn, Duration::from_millis(timeout_ms))
-                .map_err(|e| e.to_string())?;
-            reply_ok(out, if reached { "true" } else { "false" })
+            match sender.wait(AckLevel::Durable, Duration::from_millis(timeout_ms)) {
+                Ok(()) => reply_ok(out, "true"),
+                Err(e)
+                    if e.code() == questdb::ErrorCode::FailoverRetry
+                        && e.msg().contains("timed out") =>
+                {
+                    reply_ok(out, "false")
+                }
+                Err(e) => Err(e.to_string()),
+            }
         }
         "STATS" => {
             let sender = state

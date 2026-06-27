@@ -1226,11 +1226,9 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
         let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
         assert_eq!(fsn, 0, "mode={}", progress.name());
         assert!(buf.is_empty(), "mode={}", progress.name());
-        assert!(
-            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
-            "mode={}",
-            progress.name()
-        );
+        sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
         assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
         assert!(!sender.must_close(), "mode={}", progress.name());
@@ -1275,13 +1273,9 @@ fn qwp_ws_drop_reject_reports_error_and_continues_in_all_progress_modes() {
 
         assert_eq!(first_fsn, 0, "mode={}", progress.name());
         assert_eq!(second_fsn, 1, "mode={}", progress.name());
-        assert!(
-            sender
-                .await_acked_fsn(second_fsn, Duration::from_secs(5))
-                .unwrap(),
-            "mode={}",
-            progress.name()
-        );
+        sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
         assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 
         let received = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1325,7 +1319,7 @@ fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
 
         let err = sender
-            .await_acked_fsn(fsn, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ServerRejection);
         assert!(
@@ -1522,12 +1516,22 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
             .unwrap();
 
         let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        // The durable ack is gated server-side: a bounded wait must time out.
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_millis(50))
+            .expect_err("gated durable ack must time out the bounded wait");
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailoverRetry,
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
+        );
         assert!(
-            !sender
-                .await_acked_fsn(fsn, Duration::from_millis(50))
-                .unwrap(),
-            "mode={}",
-            progress.name()
+            err.msg().contains("timed out"),
+            "mode={}: {}",
+            progress.name(),
+            err.msg()
         );
         assert_eq!(
             sender.acked_fsn().unwrap(),
@@ -1537,11 +1541,9 @@ fn qwp_ws_durable_ack_completion_waits_for_durable_confirmation_in_all_progress_
         );
 
         allow_ack_tx.send(()).unwrap();
-        assert!(
-            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
-            "mode={}",
-            progress.name()
-        );
+        sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
         assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
         done_tx.send(()).unwrap();
@@ -1818,11 +1820,9 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
     assert_eq!(&frames[0][0..4], b"QWP1");
     assert_eq!(&frames[1][0..4], b"QWP1");
 
-    assert!(
-        sender
-            .await_acked_fsn(second_fsn, Duration::from_secs(5))
-            .unwrap()
-    );
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 }
 
@@ -1905,11 +1905,9 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
     assert_eq!(second_fsn, 1);
     assert!(sender.drive_once().unwrap());
     assert!(sender.drive_once().unwrap());
-    assert!(
-        sender
-            .await_acked_fsn(second_fsn, Duration::from_secs(5))
-            .unwrap()
-    );
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 
     let first_error = sender.poll_qwp_ws_error().unwrap().unwrap();
@@ -2705,11 +2703,9 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
 
     let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(received_frames.len(), 2);
-    assert!(
-        sender
-            .await_acked_fsn(second_fsn, Duration::from_secs(5))
-            .unwrap()
-    );
+    sender
+        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .unwrap();
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
     assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
@@ -3280,12 +3276,10 @@ fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
             .at_now()
             .unwrap();
 
-        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-        assert!(
-            sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
-            "mode={}",
-            progress.name()
-        );
+        sender.flush_and_get_fsn(&mut buf).unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
 
         // Both wire dumps should be identical QWP messages — replay re-encodes
         // against fresh state but with the same row, so the bytes match.

@@ -75,6 +75,11 @@ pub use decimal::DecimalView;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub mod column_sender;
 
+/// Acknowledgement level shared by the column-major and row-major senders'
+/// `wait` / `sync` APIs. Re-exported at the `ingress` root so row-major
+/// callers ([`Sender::wait`]) need not reach into [`column_sender`].
+pub use column_sender::AckLevel;
+
 #[cfg(feature = "polars-ingress")]
 pub mod polars;
 
@@ -522,7 +527,7 @@ impl QwpWsConnector {
     }
 }
 
-/// One connection opened by [`QwpWsConnector::connect_round`], tagged with the
+/// One connection opened by `QwpWsConnector::connect_round_pooled`, tagged with the
 /// endpoint index it landed on so the pool can mark that endpoint unhealthy if
 /// the connection later dies.
 #[cfg(feature = "sync-sender-qwp-ws")]

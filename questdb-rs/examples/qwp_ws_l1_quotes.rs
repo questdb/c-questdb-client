@@ -62,7 +62,7 @@
 //!     curl 'http://localhost:9000/exec?query=SELECT%20count()%20FROM%20l1_quotes'
 //!     curl 'http://localhost:9000/exec?query=SELECT%20*%20FROM%20l1_quotes%20LIMIT%2010'
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use questdb::QuestDb;
 use questdb::ingress::column_sender::{AckLevel, Chunk};
@@ -222,8 +222,9 @@ fn main() -> questdb::Result<()> {
     // This example pipelines many chunks (publish-only `flush`) and drains
     // once here for throughput. To publish one batch and then block for its
     // server ack, call `sender.flush(&mut chunk)?` followed by
-    // `sender.wait(AckLevel::Ok)?`.
-    sender.wait(AckLevel::Ok)?;
+    // `sender.wait(AckLevel::Ok, timeout)?`. `timeout` is a no-progress
+    // deadline; `Duration::ZERO` waits indefinitely.
+    sender.wait(AckLevel::Ok, Duration::from_secs(30))?;
     eprintln!();
     let send_elapsed = send_start.elapsed();
 

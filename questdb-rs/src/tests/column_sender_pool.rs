@@ -711,7 +711,7 @@ fn check_store_and_forward_sync_reports_drop_and_continue_once(extras: &str) {
     chunk.designated_timestamp_nanos(&ts1).unwrap();
     sender.flush(&mut chunk).unwrap();
     let err = sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect_err("first SFA frame is schema-rejected");
     assert_eq!(err.code(), ErrorCode::ServerRejection);
     assert_eq!(
@@ -725,7 +725,7 @@ fn check_store_and_forward_sync_reports_drop_and_continue_once(extras: &str) {
     chunk.designated_timestamp_nanos(&ts2).unwrap();
     sender.flush(&mut chunk).unwrap();
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("old drop-and-continue rejection must not poison later sync");
 }
 
@@ -739,7 +739,6 @@ fn check_store_and_forward_sync_times_out_on_silent_but_alive_peer(extras: &str)
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
-    sender.set_sfa_sync_timeout_for_test(Duration::from_millis(150));
 
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -750,7 +749,7 @@ fn check_store_and_forward_sync_times_out_on_silent_but_alive_peer(extras: &str)
 
     let start = Instant::now();
     let err = sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_millis(150))
         .expect_err("silent-but-alive peer must not block sync forever");
     let elapsed = start.elapsed();
 
@@ -863,13 +862,13 @@ fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(ext
     );
 
     release_acks.store(true, Ordering::SeqCst);
-    sender.wait(AckLevel::Ok).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
 
     let ts3 = [3_i64];
     let mut third = Chunk::new("trades");
     append_one_symbol_row(&mut third, b"gamma", &ts3);
     sender.flush(&mut third).unwrap();
-    sender.wait(AckLevel::Ok).unwrap();
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
     let third_payload = frames.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(
         read_symbol_prefix(&third_payload),
@@ -893,7 +892,7 @@ fn check_store_and_forward_flush_and_wait_waits_for_ok_boundary(extras: &str) {
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("SFA ACKing flush must wait for the local boundary to reach OK");
     assert!(
         chunk.is_empty(),
@@ -903,7 +902,7 @@ fn check_store_and_forward_flush_and_wait_waits_for_ok_boundary(extras: &str) {
     // A trailing sync on the satisfied boundary is a cheap re-check (the
     // watermark cache was written back by the ACKing flush).
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("trailing sync on the satisfied boundary must succeed");
 }
 
@@ -926,7 +925,7 @@ fn store_and_forward_flush_and_wait_durable_without_opt_in_keeps_chunk() {
     // Durable is validated by `wait`, the ack barrier; with no `flush` the
     // chunk is never published and stays replayable.
     let err = sender
-        .wait(AckLevel::Durable)
+        .wait(AckLevel::Durable, Duration::from_secs(30))
         .expect_err("durable without opt-in must be rejected up front");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(
@@ -948,7 +947,6 @@ fn check_store_and_forward_flush_and_wait_timeout_after_append_clears_chunk(extr
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
-    sender.set_sfa_sync_timeout_for_test(Duration::from_millis(150));
 
     let mut chunk = Chunk::new("trades");
     let qty = [1_i64];
@@ -959,7 +957,7 @@ fn check_store_and_forward_flush_and_wait_timeout_after_append_clears_chunk(extr
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
     let err = sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_millis(150))
         .expect_err("silent-but-alive peer must time out the boundary wait");
     assert_eq!(err.code(), ErrorCode::FailoverRetry, "{}", err.msg());
     assert!(
@@ -988,7 +986,7 @@ fn check_store_and_forward_flush_and_wait_surfaces_server_rejection(extras: &str
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
     let err = sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect_err("server rejection inside the waited range must surface");
     assert_eq!(err.code(), ErrorCode::ServerRejection);
     assert_eq!(
@@ -1008,7 +1006,6 @@ fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &
     assert!(sender.is_store_and_forward());
     // Bound the no-progress wait so a protocol regression fails fast instead of
     // blocking on the 30s request timeout.
-    sender.set_sfa_sync_timeout_for_test(Duration::from_secs(5));
 
     let mut chunk = Chunk::new("trades");
     chunk.column_i64("qty", &[7_i64], None).unwrap();
@@ -1017,7 +1014,7 @@ fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
     sender
-        .wait(AckLevel::Durable)
+        .wait(AckLevel::Durable, Duration::from_secs(5))
         .expect("durable wait must commit once the durable ACK arrives");
     assert!(
         chunk.is_empty(),
@@ -1071,7 +1068,7 @@ fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
     // hangs).
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match sender.wait(AckLevel::Ok) {
+        match sender.wait(AckLevel::Ok, Duration::from_secs(30)) {
             Ok(()) => break,
             Err(e) if e.code() == ErrorCode::FailoverRetry && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50));
@@ -2006,7 +2003,7 @@ fn refuses_durable_ack_without_opt_in() {
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
     let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
-        .wait(AckLevel::Durable)
+        .wait(AckLevel::Durable, Duration::from_secs(30))
         .expect_err("durable without opt-in must fail");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(
@@ -2044,7 +2041,7 @@ fn durable_ack_without_opt_in_does_not_publish_commit_frame() {
     let db = QuestDb::connect(&conf_for(port, "")).unwrap();
     let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
-        .wait(AckLevel::Durable)
+        .wait(AckLevel::Durable, Duration::from_secs(30))
         .expect_err("durable without opt-in must fail before publish");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(
@@ -2073,7 +2070,7 @@ fn empty_chunk_flush_round_trips() {
     assert_eq!(chunk.row_count(), 0);
     sender.flush(&mut chunk).unwrap();
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("empty-chunk flush must round-trip");
     // Flush clears the chunk.
     assert_eq!(chunk.row_count(), 0);
@@ -2118,7 +2115,9 @@ fn flush_clears_chunk_for_reuse_and_can_repeat() {
     let mut chunk = Chunk::new("trades");
     for _ in 0..3 {
         sender.flush(&mut chunk).unwrap();
-        sender.wait(AckLevel::Ok).expect("repeated empty flush");
+        sender
+            .wait(AckLevel::Ok, Duration::from_secs(30))
+            .expect("repeated empty flush");
     }
 }
 
@@ -2147,7 +2146,7 @@ fn flush_and_wait_publishes_and_waits_for_ok() {
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("wait must return after the OK ack");
     assert!(chunk.is_empty(), "successful ACKing flush clears the chunk");
 }
@@ -2163,7 +2162,7 @@ fn flush_and_wait_empty_chunk_behaves_like_sync() {
         .flush(&mut chunk)
         .expect("publish-only flush of the empty chunk");
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("empty-chunk flush + wait collapses to a bare wait");
     assert_eq!(chunk.row_count(), 0);
 }
@@ -2204,7 +2203,7 @@ fn flush_and_wait_durable_without_opt_in_leaves_chunk_untouched() {
     // Durable is validated by `wait` before it touches the wire; with no
     // `flush` no frame is published and the chunk is left untouched.
     let err = sender
-        .wait(AckLevel::Durable)
+        .wait(AckLevel::Durable, Duration::from_secs(30))
         .expect_err("durable without opt-in must fail before publish");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(
@@ -2249,7 +2248,7 @@ fn flush_and_wait_boundary_covers_prior_flush() {
     let mut b = one_i64_row("trades", &b_val, &b_ts);
     sender.flush(&mut b).expect("publish-only flush of B");
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("wait after B must drain A and B");
     assert!(b.is_empty());
     assert_eq!(
@@ -2375,7 +2374,9 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
     assert_eq!(chunk.row_count(), 3);
 
     sender.flush(&mut chunk).unwrap();
-    sender.wait(AckLevel::Ok).expect("numeric chunk flush");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("numeric chunk flush");
     assert!(chunk.is_empty(), "flush must clear the chunk");
 
     // Second flush with the SAME schema re-inlines the schema (QWP is
@@ -2391,7 +2392,7 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
         .unwrap();
     sender.flush(&mut chunk).unwrap();
     sender
-        .wait(AckLevel::Ok)
+        .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("second flush (schema reuse)");
 }
 
@@ -2428,7 +2429,9 @@ fn varchar_chunk_round_trips() {
         .unwrap();
     assert_eq!(chunk.row_count(), 4);
     sender.flush(&mut chunk).unwrap();
-    sender.wait(AckLevel::Ok).expect("varchar flush");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("varchar flush");
     assert!(chunk.is_empty());
 }
 
@@ -2449,7 +2452,9 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
         .expect("symbol_dict_i32 first flush");
     chunk.designated_timestamp_nanos(&[1, 2, 3, 4]).unwrap();
     sender.flush(&mut chunk).unwrap();
-    sender.wait(AckLevel::Ok).expect("symbol flush 1");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("symbol flush 1");
 
     // Second flush re-uses entry 0 ("alpha", already in the global dict)
     // and adds entry 1 ("beta"). With the connection-scoped dict the
@@ -2459,7 +2464,9 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
         .expect("symbol_dict_i32 second flush");
     chunk.designated_timestamp_nanos(&[5, 6, 7, 8]).unwrap();
     sender.flush(&mut chunk).unwrap();
-    sender.wait(AckLevel::Ok).expect("symbol flush 2");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("symbol flush 2");
 }
 
 /// Read a LEB128 varint at `*pos`, advancing `pos`.
