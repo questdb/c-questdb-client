@@ -39,6 +39,9 @@ from c_client_sidecar import (
 
 LOG = logging.getLogger(__name__)
 
+ZONE_A = "zone-A"
+ZONE_B = "zone-B"
+
 
 def _connect_string(http_port: int, sf_dir: Optional[Path], *,
                     request_durable_ack: bool = True,
@@ -106,17 +109,58 @@ def _connect_string_columnar(http_port: int, sf_dir: Path, *,
     return ";".join(parts) + ";"
 
 
-def _egress_connect_string(http_ports: list[int]) -> str:
-    """Multi-endpoint read-side connect string. ``target`` defaults to ``any``,
-    so the Reader binds the first reachable endpoint (addr-order) and may fail
-    over to any of the others regardless of role."""
+def _egress_connect_string(http_ports: list[int], *, zone: Optional[str] = None,
+                           target: str = "any",
+                           failover_max_duration_ms: int = 15_000,
+                           auth_timeout_ms: int = 5_000) -> str:
+    """Multi-endpoint read-side (``Reader``) connect string.
+
+    ``target=any`` (default) binds the first reachable endpoint in addr-order
+    and may fail over to any of the others regardless of role. ``zone`` is a
+    *preference*: the Reader prefers endpoints whose server-advertised
+    ``zone_id`` matches, but it is not a hard filter -- it still binds a
+    different-zone host when no same-zone host is reachable. Same-zone
+    preference only biases selection once at least two hosts have been
+    classified; the first connect against an all-Unknown tracker is decided
+    by addr-order. The short failover/auth timeouts keep the per-host walk
+    snappy so kill-and-rebind stays well inside the assertion budget.
+    """
     addr = ",".join(f"127.0.0.1:{p}" for p in http_ports)
     parts = [
         f"ws::addr={addr}",
         "username=admin",
         "password=quest",
+        f"target={target}",
+        f"failover_max_duration_ms={failover_max_duration_ms}",
+        f"auth_timeout_ms={auth_timeout_ms}",
     ]
+    if zone is not None:
+        parts.append(f"zone={zone}")
     return ";".join(parts) + ";"
+
+
+def _wait_for_zone(egress_sidecar: CClientRustEgressSidecar, expected_zone: str,
+                   *, timeout_s: float = 15.0) -> None:
+    """Poll ``SHOW_ZONE`` until it settles on ``expected_zone`` (or fail).
+
+    A read-side failover takes a few hundred ms: the bound socket surfaces a
+    transport error, the Reader's per-execute reconnect loop walks to a
+    surviving endpoint, re-issues the query, and only then returns a fresh
+    SHOW_ZONE reply. A single immediate assert would race the first
+    just-failed attempt, so we poll -- the *terminal* zone is asserted;
+    transient values along the way are tolerated."""
+    deadline = time.monotonic() + timeout_s
+    observed = ""
+    while time.monotonic() < deadline:
+        observed = egress_sidecar.show_zone()
+        if observed == expected_zone:
+            return
+        time.sleep(0.1)
+    pytest.fail(
+        f"SHOW_ZONE never settled on {expected_zone!r} within {timeout_s}s "
+        f"(last observed: {observed!r}); the Reader did not bind the "
+        f"expected zone."
+    )
 
 
 @pytest.mark.c_client
@@ -456,3 +500,63 @@ def test_primary_failover_egress_read_c_client_rust(
 
     rows, _ = c_client_rust_egress_sidecar.query(f'SELECT * FROM "{table}"')
     assert rows == row_count, f"expected {row_count} rows after failover, got {rows}"
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_zone_failover_stays_in_zone_then_crosses_c_client_rust(
+    server_factory,
+    c_client_rust_egress_sidecar: CClientRustEgressSidecar,
+) -> None:
+    """Zone-aware read-side failover across 3 servers in 2 zones, driven by
+    the c-questdb-client Rust binding's ``Reader``.
+
+    Topology: two zone-A servers (a1, a2) and one zone-B server (b1), listed
+    zone-A-first in ``addr=`` with ``zone=A``. The oracle is the Reader
+    itself -- ``SHOW_ZONE`` runs ``(SHOW PARAMETERS) WHERE
+    property_path = 'replication.zone'`` over the bound connection, so the
+    answer can only come from whichever server the client is currently
+    talking to (a cached client-side zone would be caught here).
+
+    Sequence:
+      1. Bind -> zone A (addr-order first wins on the all-Unknown tracker).
+      2. Kill the bound zone-A host (a1). Intra-zone failover: the surviving
+         zone-A sibling (a2) keeps the client in zone A. This is the
+         "still connected to zone A" guarantee while any zone-A host lives.
+      3. Kill the last zone-A host (a2). Zone exhaustion: ``zone=`` is a
+         preference, NOT a hard filter, so the Reader falls through to
+         zone B (b1) rather than erroring. The cross happens exactly at
+         exhaustion -- not one host early.
+
+    Complements the single-server-per-zone egress test above and mirrors
+    the Enterprise Java ``test_zone_failover.py`` suite; the binding under
+    test is the Rust ``Reader``, the Enterprise side only orchestrates the
+    forked zoned servers."""
+    a1 = server_factory("a1", zone=ZONE_A)
+    a1_ports = a1.start()
+    a2 = server_factory("a2", role="replica", zone=ZONE_A)
+    a2_ports = a2.start()
+    b1 = server_factory("b1", role="replica", zone=ZONE_B)
+    b1_ports = b1.start()
+
+    # zone-A endpoints first in addr-order so the initial bind and the first
+    # (intra-zone) failover deterministically stay in zone A -- the
+    # all-Unknown tracker decides the first pick by addr-order, and a
+    # surviving zone-A sibling earlier in the list beats the zone-B host.
+    cs = _egress_connect_string(
+        [a1_ports.http, a2_ports.http, b1_ports.http], zone=ZONE_A)
+    c_client_rust_egress_sidecar.connect(cs)
+    assert c_client_rust_egress_sidecar.show_zone() == ZONE_A, \
+        "addr=A,A,B with zone=A should bind a zone-A host first"
+
+    # Intra-zone failover: kill the bound zone-A host; the client must stay
+    # in zone A via the surviving zone-A sibling (a2).
+    a1.kill_9()
+    wait_port_free(a1_ports.http)
+    _wait_for_zone(c_client_rust_egress_sidecar, ZONE_A)
+
+    # Zone exhaustion: kill the last zone-A host. Only zone B remains, so
+    # the zone preference falls through (preference, not hard filter).
+    a2.kill_9()
+    wait_port_free(a2_ports.http)
+    _wait_for_zone(c_client_rust_egress_sidecar, ZONE_B)
