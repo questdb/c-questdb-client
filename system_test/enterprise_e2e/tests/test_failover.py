@@ -208,10 +208,14 @@ def test_sender_kill9_sf_recovery_replays_c_client_rust(
     table = "trades_sender_kill_c_client_rust"
     row_count = 20_000
     sf_dir = scenario_dir / "sf"
-    # 64 KiB segments seal many .sfa files from a modest ingest, so the
+    # 64 KiB segments roll the SF across several sealed .sfa files, so the
     # recovery path scans a real multi-segment ring rather than one open
-    # segment.
+    # segment. A single QWP publication must fit inside ONE segment, so the
+    # rows are published in sub-segment chunks below (one big flush of all
+    # 20k rows would be ~320 KiB and be rejected with
+    # PayloadExceedsByteCapacity).
     sf_max_bytes = 64 * 1024
+    chunk_rows = 1_000  # ~16 KiB per publication, comfortably under 64 KiB
 
     p1 = server_factory("p1")
     p1_ports = p1.start()
@@ -230,8 +234,12 @@ def test_sender_kill9_sf_recovery_replays_c_client_rust(
     cs = _connect_string(p1_ports.http, sf_dir, sender_id="primary",
                          sf_max_bytes=sf_max_bytes)
     c_client_rust_sidecar.connect(cs)
-    c_client_rust_sidecar.send(table, count=row_count, start_index=0)
-    c_client_rust_sidecar.flush()
+    # Publish in sub-segment chunks: each flush is one QWP publication that
+    # must fit in a single segment, and the sequence of them seals multiple
+    # .sfa segments for the recovery walk.
+    for start in range(0, row_count, chunk_rows):
+        c_client_rust_sidecar.send(table, count=chunk_rows, start_index=start)
+        c_client_rust_sidecar.flush()
 
     # Small settle so some frames leave the wire and P1 OKs them; the rest
     # stay in the SF. With request_durable_ack=on only the (slower) WAL
