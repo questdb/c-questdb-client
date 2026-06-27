@@ -257,6 +257,7 @@ _column_sender_sync = _setsig(
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
     ctypes.c_uint32,
+    ctypes.c_uint64,
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
@@ -358,9 +359,12 @@ def conn_must_close(conn_ptr) -> bool:
     return bool(_conn_must_close(conn_ptr))
 
 
-def column_sender_sync(conn_ptr, ack_level: int = 0) -> None:
+def column_sender_sync(
+    conn_ptr, ack_level: int = 0, timeout_millis: int = 0
+) -> None:
     err_ref = ctypes.POINTER(_LineSenderError)()
-    ok = _column_sender_sync(conn_ptr, ack_level, ctypes.byref(err_ref))
+    ok = _column_sender_sync(
+        conn_ptr, ack_level, timeout_millis, ctypes.byref(err_ref))
     if not ok:
         raise _take_sender_error(err_ref)
 
