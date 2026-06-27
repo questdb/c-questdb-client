@@ -39,6 +39,7 @@
 use crate::error::{self, Result};
 #[cfg(feature = "_sync-sender")]
 use crate::ingress::SenderBuilder;
+#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::column_sender::AckLevel;
 use crate::ingress::{Buffer, Protocol, ProtocolVersion};
 use std::fmt::{Debug, Formatter};

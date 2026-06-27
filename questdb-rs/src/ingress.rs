@@ -78,6 +78,7 @@ pub mod column_sender;
 /// Acknowledgement level shared by the column-major and row-major senders'
 /// `wait` / `sync` APIs. Re-exported at the `ingress` root so row-major
 /// callers ([`Sender::wait`]) need not reach into [`column_sender`].
+#[cfg(feature = "sync-sender-qwp-ws")]
 pub use column_sender::AckLevel;
 
 #[cfg(feature = "polars-ingress")]
