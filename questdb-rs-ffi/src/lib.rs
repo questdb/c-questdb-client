@@ -4975,16 +4975,34 @@ mod tests {
     }
 
     fn read_request_until_blank(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        // The mock server sets a short per-read timeout (~50ms) on accepted
+        // sockets so the post-handshake read loop can poll for shutdown. That
+        // same timeout applies to this handshake read, so a slow CI agent can
+        // surface a transient WouldBlock/TimedOut before the client finishes
+        // sending its upgrade request. Tolerate those by retrying until an
+        // overall deadline, rather than propagating them (which previously made
+        // callers .unwrap() panic and flake the test on macOS).
         let mut buf = Vec::new();
         let mut tmp = [0u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let n = stream.read(&mut tmp)?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(buf)
