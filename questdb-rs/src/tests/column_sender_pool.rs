@@ -48,7 +48,9 @@ use crate::ErrorCode;
 use crate::QuestDb;
 use crate::ingress::column_sender::{AckLevel, Chunk};
 use crate::tests::qwp_ws::{
-    perform_server_upgrade, read_frame, write_qwp_error_response, write_qwp_ok_response,
+    perform_server_upgrade, perform_server_upgrade_durable, read_frame,
+    write_qwp_durable_ack_response, write_qwp_error_response, write_qwp_ok_response,
+    write_qwp_ok_response_with_table_entries, write_server_frame,
 };
 use tempfile::TempDir;
 
@@ -82,6 +84,10 @@ enum MockMode {
     /// client's ACK-wait read hits EOF, a *post-publication* delivery-unknown
     /// failure.
     ReadThenClose(usize),
+    /// Durable-ACK mode: upgrade with `X-QWP-Durable-Ack: enabled`, OK each
+    /// data frame with a `trades` table seq_txn, and answer every keepalive
+    /// ping with a pong + a durable-ACK frame so a `Durable` boundary commits.
+    AckEachFrameDurable,
 }
 
 /// Spawn a mock server that performs the WS upgrade for up to `max_accepts`
@@ -147,6 +153,13 @@ impl MockServer {
     fn spawn_acking_capturing(max_accepts: usize) -> (Self, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel();
         let server = Self::spawn_with_mode_capture(max_accepts, MockMode::AckEachFrame, Some(tx));
+        (server, rx)
+    }
+
+    fn spawn_acking_durable_capturing(max_accepts: usize) -> (Self, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel();
+        let server =
+            Self::spawn_with_mode_capture(max_accepts, MockMode::AckEachFrameDurable, Some(tx));
         (server, rx)
     }
 
@@ -255,10 +268,20 @@ fn run_mock_server_accept_loop(
                 let capture = capture.clone();
                 let mode = mode.clone();
                 let h = thread::spawn(move || {
-                    if perform_server_upgrade(&mut stream).is_ok() {
+                    // Durable mode needs the `X-QWP-Durable-Ack: enabled` upgrade
+                    // header; every other mode uses the plain upgrade.
+                    let upgraded = if matches!(mode, MockMode::AckEachFrameDurable) {
+                        perform_server_upgrade_durable(&mut stream).is_ok()
+                    } else {
+                        perform_server_upgrade(&mut stream).is_ok()
+                    };
+                    if upgraded {
                         match mode {
                             MockMode::Park => park_connection(&mut stream, &stop),
                             MockMode::AckEachFrame => ack_each_frame(&mut stream, &stop, capture),
+                            MockMode::AckEachFrameDurable => {
+                                ack_each_frame_durable(&mut stream, &stop, capture)
+                            }
                             MockMode::ErrorEachFrame(status) => {
                                 error_each_frame(&mut stream, &stop, status)
                             }
@@ -296,6 +319,61 @@ impl Drop for MockServer {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.join.take() {
             let _ = h.join();
+        }
+    }
+}
+
+/// Durable-ACK variant of [`ack_each_frame`]: OK each data frame with a
+/// `("trades", seq_txn)` table entry and answer each keepalive ping (opcode
+/// 0x9) with a pong (0xA) + a durable-ACK frame carrying the same seq_txn, so
+/// the runner's durable watermark advances and a `Durable` boundary commits.
+fn ack_each_frame_durable(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    capture: Option<mpsc::Sender<Vec<u8>>>,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut next_wire_seq: u64 = 0;
+    let mut seq_txn: i64 = 0;
+    while !stop.load(Ordering::SeqCst) {
+        match read_frame(stream) {
+            Ok((_fin, opcode, payload)) => match opcode {
+                0x8 => break, // close
+                0x9 => {
+                    // Keepalive ping: pong, then confirm everything OK'd so far
+                    // as durable.
+                    if write_server_frame(stream, 0xA, &payload, false).is_err() {
+                        break;
+                    }
+                    if write_qwp_durable_ack_response(stream, &[("trades", seq_txn)]).is_err() {
+                        break;
+                    }
+                }
+                0x2 => {
+                    if let Some(tx) = &capture {
+                        let _ = tx.send(payload);
+                    }
+                    seq_txn += 1;
+                    if write_qwp_ok_response_with_table_entries(
+                        stream,
+                        next_wire_seq,
+                        &[("trades", seq_txn)],
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                    next_wire_seq += 1;
+                }
+                _ => {}
+            },
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
         }
     }
 }
@@ -602,17 +680,6 @@ fn refuses_non_qwp_ws_schema() {
 }
 
 #[test]
-fn refuses_store_and_forward_keys_without_sf_dir() {
-    let err = QuestDb::connect("qwpws::addr=localhost:9000;sender_id=s1;").unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ConfigError);
-    assert!(
-        err.msg().contains("sf_dir") && err.msg().contains("sender_id"),
-        "msg: {}",
-        err.msg()
-    );
-}
-
-#[test]
 fn store_and_forward_pool_allows_one_active_borrower() {
     let server = MockServer::spawn(2);
     let dir = TempDir::new().unwrap();
@@ -631,14 +698,9 @@ fn store_and_forward_pool_allows_one_active_borrower() {
     let _again = db.borrow_column_sender().unwrap();
 }
 
-#[test]
-fn store_and_forward_sync_reports_drop_and_continue_once() {
+fn check_store_and_forward_sync_reports_drop_and_continue_once(extras: &str) {
     let server = MockServer::spawn_error_first_then_ack(1, QWP_STATUS_SCHEMA_MISMATCH);
-    let dir = TempDir::new().unwrap();
-    let conf = conf_for_endpoints(
-        &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
-    );
+    let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
 
@@ -667,19 +729,14 @@ fn store_and_forward_sync_reports_drop_and_continue_once() {
         .expect("old drop-and-continue rejection must not poison later sync");
 }
 
-#[test]
-fn store_and_forward_sync_times_out_on_silent_but_alive_peer() {
+fn check_store_and_forward_sync_times_out_on_silent_but_alive_peer(extras: &str) {
     // `Park` mode finishes the WS upgrade and keeps the connection alive
     // (draining frames) but never acks — the back-pressured-WAL / stuck-commit
     // case. Without a deadline the SFA `sync` poll loop would spin forever;
     // with one it must surface a `FailoverRetry` so the caller regains control,
     // matching the direct backend's `request_timeout`-bounded behaviour.
     let server = MockServer::spawn(1);
-    let dir = TempDir::new().unwrap();
-    let conf = conf_for_endpoints(
-        &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
-    );
+    let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
     sender.set_sfa_sync_timeout_for_test(Duration::from_millis(150));
@@ -724,7 +781,7 @@ fn drop_with_in_flight_best_effort_commits_and_recycles() {
     let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
     let db = QuestDb::connect(&conf).unwrap();
     {
-        let mut sender = db.borrow_column_sender().unwrap();
+        let mut sender = db.borrow_direct_column_sender().unwrap();
         let qty = [1_i64];
         let ts = [1_i64];
         let mut c1 = Chunk::new("trades");
@@ -739,21 +796,16 @@ fn drop_with_in_flight_best_effort_commits_and_recycles() {
         assert!(sender.in_flight() > 0, "deferred flush must be in-flight");
     }
     assert_eq!(
-        db.free_count(),
+        db.direct_free_count(),
         1,
         "healthy connection must be recycled after drop best-effort sync"
     );
-    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.direct_in_use_count(), 0);
 }
 
-#[test]
-fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow() {
+fn check_store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow(extras: &str) {
     let server = MockServer::spawn(4);
-    let dir = TempDir::new().unwrap();
-    let conf = conf_for_endpoints(
-        &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
-    );
+    let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
 
     {
@@ -775,17 +827,9 @@ fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow() 
     );
 }
 
-#[test]
-fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk() {
+fn check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(extras: &str) {
     let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
-    let dir = TempDir::new().unwrap();
-    let conf = conf_for_endpoints(
-        &[server.port()],
-        &format!(
-            "sf_dir={};pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
-            dir.path().display()
-        ),
-    );
+    let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
 
@@ -834,14 +878,9 @@ fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk() {
     );
 }
 
-#[test]
-fn store_and_forward_flush_and_wait_waits_for_ok_boundary() {
+fn check_store_and_forward_flush_and_wait_waits_for_ok_boundary(extras: &str) {
     let server = MockServer::spawn_acking(1);
-    let dir = TempDir::new().unwrap();
-    let conf = conf_for_endpoints(
-        &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
-    );
+    let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
 
@@ -896,17 +935,12 @@ fn store_and_forward_flush_and_wait_durable_without_opt_in_keeps_chunk() {
     );
 }
 
-#[test]
-fn store_and_forward_flush_and_wait_timeout_after_append_clears_chunk() {
+fn check_store_and_forward_flush_and_wait_timeout_after_append_clears_chunk(extras: &str) {
     // Park mode finishes the upgrade and drains frames but never acks. The
     // local append succeeds (the frame is queued and replayable), then the
     // boundary wait times out: a `FailoverRetry` whose delivery is unknown.
     let server = MockServer::spawn(1);
-    let dir = TempDir::new().unwrap();
-    let conf = conf_for_endpoints(
-        &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
-    );
+    let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
     sender.set_sfa_sync_timeout_for_test(Duration::from_millis(150));
@@ -931,14 +965,9 @@ fn store_and_forward_flush_and_wait_timeout_after_append_clears_chunk() {
     );
 }
 
-#[test]
-fn store_and_forward_flush_and_wait_surfaces_server_rejection() {
+fn check_store_and_forward_flush_and_wait_surfaces_server_rejection(extras: &str) {
     let server = MockServer::spawn_erroring(1, QWP_STATUS_SCHEMA_MISMATCH);
-    let dir = TempDir::new().unwrap();
-    let conf = conf_for_endpoints(
-        &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
-    );
+    let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
 
@@ -957,24 +986,269 @@ fn store_and_forward_flush_and_wait_surfaces_server_rejection() {
     );
 }
 
+fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &str) {
+    // With `request_durable_ack=on` and a server that confirms durability, an
+    // `AckLevel::Durable` ACKing flush commits and clears the chunk (the
+    // success counterpart to the durable opt-in *guard* tests).
+    let (server, _frames) = MockServer::spawn_acking_durable_capturing(2);
+    let conf = conf_for_endpoints(&[server.port()], extras);
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+    assert!(sender.is_store_and_forward());
+    // Bound the no-progress wait so a protocol regression fails fast instead of
+    // blocking on the 30s request timeout.
+    sender.set_sfa_sync_timeout_for_test(Duration::from_secs(5));
+
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &[7_i64], None).unwrap();
+    chunk.designated_timestamp_nanos(&[1_i64]).unwrap();
+    sender
+        .flush_and_wait(&mut chunk, AckLevel::Durable)
+        .expect("durable flush_and_wait must commit once the durable ACK arrives");
+    assert!(
+        chunk.is_empty(),
+        "a committed durable ACKing flush clears the chunk"
+    );
+}
+
 #[test]
-fn eager_open_opens_pool_size_connections() {
+fn store_and_forward_flush_and_wait_durable_succeeds_with_opt_in_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(&sf_disk_extras(
+        &dir,
+        "pool_reap=manual;request_durable_ack=on;durable_ack_keepalive_interval_millis=1;",
+    ));
+}
+#[test]
+fn store_and_forward_flush_and_wait_durable_succeeds_with_opt_in_memory() {
+    check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(
+        "pool_reap=manual;request_durable_ack=on;durable_ack_keepalive_interval_millis=1;",
+    );
+}
+
+#[test]
+fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
+    // The in-memory SF background runner owns reconnects: when the first
+    // endpoint dies mid-stream, the runner rotates to a live endpoint and
+    // replays its queue, so the row lands without the caller re-driving from
+    // source. The caller only retries `sync` (which surfaces `FailoverRetry`
+    // until the runner has caught up).
+    let dead = MockServer::spawn_upgrade_then_close(1);
+    let (live, frames) = MockServer::spawn_acking_capturing(4);
+    // No `sf_dir` -> in-memory SF; a longer reconnect budget so the runner can
+    // rotate to the live endpoint.
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{},127.0.0.1:{};auth_timeout=2000;\
+         reconnect_max_duration_millis=10000;pool_reap=manual;",
+        dead.port(),
+        live.port()
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().expect("borrow");
+    assert!(sender.is_store_and_forward());
+
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &[7_i64], None).unwrap();
+    chunk.designated_timestamp_nanos(&[1_i64]).unwrap();
+    sender.flush(&mut chunk).unwrap();
+
+    // Retry `sync` until the runner has reconnected to the live endpoint and
+    // the OK boundary advances (bounded so a stuck runner fails rather than
+    // hangs).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match sender.sync(AckLevel::Ok) {
+            Ok(()) => break,
+            Err(e) if e.code() == ErrorCode::FailoverRetry && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("sync did not recover after reconnect: {}", e.msg()),
+        }
+    }
+
+    // `sync` returned OK, so the live endpoint acked the replayed frame: the
+    // runner reconnected and re-sent the queued row there (not the dead peer).
+    let replayed: Vec<Vec<u8>> = frames.try_iter().collect();
+    assert!(
+        !replayed.is_empty(),
+        "the live endpoint must receive the replayed data frame after reconnect"
+    );
+    assert_eq!(
+        live.accepted(),
+        1,
+        "the runner must reconnect to the live endpoint exactly once"
+    );
+}
+
+// Each `check_store_and_forward_*` behaviour above runs on both backends that
+// `borrow_column_sender` uses: disk-backed SF (`sf_dir` set, single-borrower)
+// and in-memory SF (no `sf_dir`, pools freely). The body is backend-agnostic;
+// only the conf differs. The `_dir` `TempDir` outlives each `check_*` call
+// because the call opens and drops its `QuestDb` before the wrapper returns.
+fn sf_disk_extras(dir: &TempDir, extra: &str) -> String {
+    format!("sf_dir={};{extra}", dir.path().display())
+}
+
+#[test]
+fn store_and_forward_sync_reports_drop_and_continue_once_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_sync_reports_drop_and_continue_once(&sf_disk_extras(
+        &dir,
+        "pool_reap=manual;",
+    ));
+}
+#[test]
+fn store_and_forward_sync_reports_drop_and_continue_once_memory() {
+    check_store_and_forward_sync_reports_drop_and_continue_once("pool_reap=manual;");
+}
+
+#[test]
+fn store_and_forward_sync_times_out_on_silent_but_alive_peer_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_sync_times_out_on_silent_but_alive_peer(&sf_disk_extras(
+        &dir,
+        "pool_reap=manual;",
+    ));
+}
+#[test]
+fn store_and_forward_sync_times_out_on_silent_but_alive_peer_memory() {
+    check_store_and_forward_sync_times_out_on_silent_but_alive_peer("pool_reap=manual;");
+}
+
+#[test]
+fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow(
+        &sf_disk_extras(&dir, "pool_reap=manual;"),
+    );
+}
+#[test]
+fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow_memory() {
+    check_store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow(
+        "pool_reap=manual;",
+    );
+}
+
+#[test]
+fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(&sf_disk_extras(
+        &dir,
+        "pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+    ));
+}
+#[test]
+fn store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk_memory() {
+    check_store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk(
+        "pool_reap=manual;max_in_flight=1;sf_append_deadline_millis=25;",
+    );
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_waits_for_ok_boundary_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_flush_and_wait_waits_for_ok_boundary(&sf_disk_extras(
+        &dir,
+        "pool_reap=manual;",
+    ));
+}
+#[test]
+fn store_and_forward_flush_and_wait_waits_for_ok_boundary_memory() {
+    check_store_and_forward_flush_and_wait_waits_for_ok_boundary("pool_reap=manual;");
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_timeout_after_append_clears_chunk_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_flush_and_wait_timeout_after_append_clears_chunk(&sf_disk_extras(
+        &dir,
+        "pool_reap=manual;",
+    ));
+}
+#[test]
+fn store_and_forward_flush_and_wait_timeout_after_append_clears_chunk_memory() {
+    check_store_and_forward_flush_and_wait_timeout_after_append_clears_chunk("pool_reap=manual;");
+}
+
+#[test]
+fn store_and_forward_flush_and_wait_surfaces_server_rejection_disk() {
+    let dir = TempDir::new().unwrap();
+    check_store_and_forward_flush_and_wait_surfaces_server_rejection(&sf_disk_extras(
+        &dir,
+        "pool_reap=manual;",
+    ));
+}
+#[test]
+fn store_and_forward_flush_and_wait_surfaces_server_rejection_memory() {
+    check_store_and_forward_flush_and_wait_surfaces_server_rejection("pool_reap=manual;");
+}
+
+#[test]
+fn pool_is_lazy_and_opens_on_first_borrow() {
     let server = MockServer::spawn(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=3;pool_max=4;")).unwrap();
-    assert_eq!(db.free_count(), 3);
+    // Lazy pool, like the row-major sender: `connect` opens nothing.
+    assert_eq!(db.free_count(), 0);
     assert_eq!(db.in_use_count(), 0);
-    // Give the server thread time to register the accepts (the upgrades
-    // complete before `connect` returns, but the AtomicUsize is incremented
-    // before `perform_server_upgrade`).
-    wait_until(Duration::from_secs(2), || server.accepted() == 3);
-    drop(db);
+    assert_eq!(server.accepted(), 0);
+    // The first borrow opens exactly one connection.
+    let _b = db.borrow_column_sender().expect("borrow");
+    assert_eq!(db.in_use_count(), 1);
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 1),
+        "first borrow opens one connection; accepted={}",
+        server.accepted()
+    );
+}
+
+#[test]
+fn borrow_column_sender_is_in_memory_store_and_forward_without_sf_dir() {
+    // Without `sf_dir`, `borrow_column_sender` yields an in-memory
+    // store-and-forward sender (mirroring the row-major sender). Unlike
+    // disk-backed SF it pools freely up to `pool_max` rather than being capped
+    // to a single active borrower.
+    let server = MockServer::spawn(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
+
+    let b1 = db.borrow_column_sender().expect("b1");
+    assert!(
+        b1.is_store_and_forward(),
+        "borrow_column_sender must be store-and-forward even without sf_dir"
+    );
+
+    // In-memory SF pools freely: concurrent borrows succeed (disk-backed SF
+    // would reject the second with a single-borrower error).
+    let b2 = db
+        .borrow_column_sender()
+        .expect("b2 (in-memory SF pools freely)");
+    let b3 = db
+        .borrow_column_sender()
+        .expect("b3 (in-memory SF pools freely)");
+    assert!(b2.is_store_and_forward());
+    assert!(b3.is_store_and_forward());
+    assert_eq!(db.in_use_count(), 3);
+
+    // Each in-memory SF borrower has its own connection + background runner.
+    assert!(
+        wait_until(Duration::from_secs(2), || server.accepted() == 3),
+        "each in-memory SF borrow opens its own connection; accepted={}",
+        server.accepted()
+    );
+
+    // At the cap, the next borrow fails fast like any pooled resource.
+    let err = db
+        .borrow_column_sender()
+        .expect_err("must fail-fast at pool_max");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
 }
 
 #[test]
 fn borrow_and_return_reuses_connection() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
-    assert_eq!(db.free_count(), 1);
+    // Lazy pool: nothing open until the first borrow.
+    assert_eq!(db.free_count(), 0);
     {
         let _borrow = db.borrow_column_sender().expect("borrow");
         assert_eq!(db.free_count(), 0);
@@ -983,9 +1257,9 @@ fn borrow_and_return_reuses_connection() {
     // Drop returns the sender to the pool.
     assert_eq!(db.free_count(), 1);
     assert_eq!(db.in_use_count(), 0);
-    // Same physical connection — server only ever accepted one.
+    // Re-borrow reuses it — the server only ever accepted one connection.
+    let _again = db.borrow_column_sender().expect("reuse");
     assert_eq!(server.accepted(), 1);
-    drop(db);
 }
 
 #[cfg(feature = "ffi-support")]
@@ -1037,6 +1311,177 @@ fn fail_fast_at_pool_max() {
         .expect_err("must fail-fast at cap");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
+}
+
+// ---------------------------------------------------------------------------
+// Direct column-sender pool (`borrow_direct_column_sender`).
+//
+// A second, always-direct pool that exists independently of `sf_dir`: it is
+// lazy (no eager open), never store-and-forward, and poolable up to `pool_max`
+// on its own free list, separate from the main `borrow_column_sender` pool.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_pool_is_lazy_and_hands_out_direct_senders() {
+    let server = MockServer::spawn(4);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+
+    // Both pools are lazy: `connect` opens nothing.
+    assert_eq!(db.free_count(), 0);
+    assert_eq!(db.direct_free_count(), 0);
+    assert_eq!(db.direct_in_use_count(), 0);
+
+    {
+        let sender = db.borrow_direct_column_sender().expect("borrow direct");
+        assert!(
+            !sender.is_store_and_forward(),
+            "direct pool must never hand out a store-and-forward sender"
+        );
+        assert_eq!(db.direct_in_use_count(), 1);
+        assert_eq!(db.direct_free_count(), 0);
+        // A direct borrow leaves the main pool untouched.
+        assert_eq!(db.free_count(), 0);
+        assert_eq!(db.in_use_count(), 0);
+    }
+
+    // Drop recycles the direct sender onto the direct free list.
+    assert_eq!(db.direct_in_use_count(), 0);
+    assert_eq!(db.direct_free_count(), 1);
+    drop(db);
+}
+
+#[test]
+fn direct_pool_recycles_the_same_connection() {
+    let server = MockServer::spawn(4);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
+
+    {
+        let _b = db
+            .borrow_direct_column_sender()
+            .expect("first direct borrow");
+    }
+    assert_eq!(db.direct_free_count(), 1);
+    let after_first = server.accepted();
+
+    // Re-borrow reuses the recycled connection: no new server accept.
+    let _b2 = db
+        .borrow_direct_column_sender()
+        .expect("reuse recycled direct");
+    assert_eq!(db.direct_free_count(), 0);
+    assert_eq!(db.direct_in_use_count(), 1);
+    assert_eq!(
+        server.accepted(),
+        after_first,
+        "re-borrow must reuse the recycled connection, not open a new one"
+    );
+}
+
+#[test]
+fn direct_pool_auto_grows_and_fails_fast_at_pool_max() {
+    let server = MockServer::spawn(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
+
+    let b1 = db.borrow_direct_column_sender().expect("d1");
+    let b2 = db.borrow_direct_column_sender().expect("d2 (auto-grow)");
+    let b3 = db.borrow_direct_column_sender().expect("d3 (auto-grow)");
+    assert_eq!(db.direct_in_use_count(), 3);
+    assert_eq!(db.direct_free_count(), 0);
+
+    let err = db
+        .borrow_direct_column_sender()
+        .expect_err("direct pool must fail-fast at pool_max");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("pool_max"), "msg: {}", err.msg());
+
+    drop(b1);
+    drop(b2);
+    drop(b3);
+    assert_eq!(db.direct_free_count(), 3);
+    drop(db);
+}
+
+#[test]
+fn direct_and_main_pools_are_independent() {
+    let server = MockServer::spawn(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let _main = db.borrow_column_sender().expect("main borrow");
+    assert_eq!(db.in_use_count(), 1);
+    assert_eq!(db.direct_in_use_count(), 0);
+
+    let _direct = db.borrow_direct_column_sender().expect("direct borrow");
+    assert_eq!(db.in_use_count(), 1);
+    assert_eq!(db.direct_in_use_count(), 1);
+
+    // Each pool enforces `pool_max` on its own free list, so the main pool can
+    // still grow to its cap while a direct borrow is outstanding.
+    let _main2 = db.borrow_column_sender().expect("main grows to cap");
+    assert_eq!(db.in_use_count(), 2);
+    assert_eq!(db.direct_in_use_count(), 1);
+}
+
+#[test]
+fn direct_pool_is_direct_even_when_sf_dir_is_set() {
+    // With `sf_dir` the main pool is store-and-forward (single active
+    // borrower). The direct pool must still hand out a plain direct sender,
+    // from its own free list, so a direct borrow co-exists with the single
+    // SFA borrow.
+    let server = MockServer::spawn(4);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let main = db.borrow_column_sender().expect("main SFA borrow");
+    assert!(
+        main.is_store_and_forward(),
+        "with sf_dir the main pool must be store-and-forward"
+    );
+    // The main pool is single-borrower in SFA mode.
+    let err = db.borrow_column_sender().expect_err("second main borrow");
+    assert!(err.msg().contains("store-and-forward"), "{}", err.msg());
+
+    // The direct pool is unaffected: it yields a direct sender concurrently.
+    let direct = db
+        .borrow_direct_column_sender()
+        .expect("direct borrow alongside the SFA borrow");
+    assert!(
+        !direct.is_store_and_forward(),
+        "direct pool must be direct even when sf_dir is set"
+    );
+    assert_eq!(db.direct_in_use_count(), 1);
+
+    drop(direct);
+    drop(main);
+    drop(db);
+}
+
+#[test]
+fn direct_pool_reaps_idle_connections() {
+    let server = MockServer::spawn(4);
+    // Short idle timeout + manual reap so the test drives reaping itself.
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=1;pool_max=4;pool_idle_timeout_ms=1;pool_reap=manual;",
+    ))
+    .unwrap();
+
+    {
+        let _b = db.borrow_direct_column_sender().expect("borrow direct");
+    }
+    assert_eq!(db.direct_free_count(), 1);
+
+    // The direct pool is lazy (no warm-min floor), so an idle entry past the
+    // timeout is fully reaped.
+    let reaped = wait_until(Duration::from_secs(2), || {
+        db.reap_idle();
+        db.direct_free_count() == 0
+    });
+    assert!(reaped, "idle direct sender must be reaped");
+    assert_eq!(db.direct_free_count(), 0);
+    drop(db);
 }
 
 #[test]
@@ -1227,12 +1672,8 @@ fn row_sender_pool_grows_and_reuses_physical_connections() {
     let server = MockServer::spawn_acking(16);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
 
-    // `pool_size=1` eager-opens exactly one *column* connection.
-    assert!(
-        wait_until(Duration::from_secs(2), || server.accepted() == 1),
-        "eager-open must connect one column slot; accepted={}",
-        server.accepted()
-    );
+    // Lazy pools: `connect` opens nothing.
+    assert_eq!(server.accepted(), 0);
 
     // Three concurrent row borrows each open a fresh connection.
     let r1 = db.borrow_row_sender().expect("r1");
@@ -1240,7 +1681,7 @@ fn row_sender_pool_grows_and_reuses_physical_connections() {
     let r3 = db.borrow_row_sender().expect("r3 (grow)");
     assert_eq!(db.row_sender_in_use_count(), 3);
     assert!(
-        wait_until(Duration::from_secs(2), || server.accepted() == 4),
+        wait_until(Duration::from_secs(2), || server.accepted() == 3),
         "each row borrow must open a fresh connection; accepted={}",
         server.accepted()
     );
@@ -1255,7 +1696,7 @@ fn row_sender_pool_grows_and_reuses_physical_connections() {
     let _a = db.borrow_row_sender().expect("reuse 1");
     let _b = db.borrow_row_sender().expect("reuse 2");
     assert_eq!(db.row_sender_free_count(), 1);
-    assert_eq!(server.accepted(), 4, "reuse must not open new connections");
+    assert_eq!(server.accepted(), 3, "reuse must not open new connections");
 }
 
 #[test]
@@ -1277,8 +1718,8 @@ fn row_sender_mark_must_close_drops_instead_of_recycling() {
     // The next borrow therefore opens a brand-new connection.
     let _fresh = db.borrow_row_sender().expect("re-borrow after drop");
     assert!(
-        wait_until(Duration::from_secs(2), || server.accepted() == 3),
-        "re-borrow must open a new connection (1 column + 2 row); accepted={}",
+        wait_until(Duration::from_secs(2), || server.accepted() == 2),
+        "re-borrow must open a new connection (2 row borrows total); accepted={}",
         server.accepted()
     );
 }
@@ -1381,8 +1822,8 @@ fn auto_reaper_closes_idle_row_senders() {
 
 #[test]
 fn row_sender_build_failure_releases_in_use_slot() {
-    // Bring the pool up against a live server (the column eager-open succeeds),
-    // then kill the server so a subsequent row-sender build cannot connect. The
+    // Bring the pool up against a live server, then kill the server so a
+    // subsequent row-sender build cannot connect. The
     // failed build must release the `in_use` slot it reserved rather than
     // permanently burning a pool slot.
     let server = MockServer::spawn_acking(4);
@@ -1628,7 +2069,7 @@ fn empty_chunk_flush_round_trips() {
 fn deferred_flush_reserves_slot_for_sync_commit() {
     let server = MockServer::spawn(2);
     let db = QuestDb::connect(&conf_for(server.port(), "close_flush_timeout_millis=50;")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     let mut chunk = Chunk::new("trades");
 
     for _ in 0..127 {
@@ -1803,7 +2244,7 @@ fn flush_and_wait_skips_the_deferred_reserve_guard() {
     // `sync_all_acks` drains everything to zero.
     let (server, release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
 
     let mut filler = Chunk::new("trades");
     for _ in 0..127 {
@@ -1842,7 +2283,7 @@ fn flush_and_wait_ack_wait_failure_after_publish_clears_chunk() {
     // with the conn latched `must_close`.
     let server = MockServer::spawn_read_then_close(1, 1);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
 
     let val = [5_i64];
     let ts = [5_i64];
@@ -2035,7 +2476,7 @@ fn parse_delta_dict_prefix(frame: &[u8]) -> (u64, Vec<Vec<u8>>) {
 fn symbol_dict_reuse_resends_only_new_symbols_on_the_wire() {
     let (server, frames) = MockServer::spawn_acking_capturing(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
 
     let dict_bytes = b"alphabetagamma";
     let dict_offsets: [i32; 4] = [0, 5, 9, 14];
@@ -2101,7 +2542,7 @@ fn server_error_latches_conn_and_pool_drops_it() {
     ))
     .unwrap();
     {
-        let mut sender = db.borrow_column_sender().expect("borrow");
+        let mut sender = db.borrow_direct_column_sender().expect("borrow");
         let err = sender
             .sync(AckLevel::Ok)
             .expect_err("server error must surface");
@@ -2110,13 +2551,19 @@ fn server_error_latches_conn_and_pool_drops_it() {
         assert!(err.msg().contains("0x09"), "msg: {}", err.msg());
         assert!(err.msg().contains("injected"), "msg: {}", err.msg());
         assert!(sender.must_close(), "errored conn must be latched");
-        assert_eq!(db.in_use_count(), 1);
+        assert_eq!(db.direct_in_use_count(), 1);
     }
     // The latched connection must be dropped, not returned to the free pool.
-    assert_eq!(db.free_count(), 0, "latched conn must not be recycled");
-    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(
+        db.direct_free_count(),
+        0,
+        "latched conn must not be recycled"
+    );
+    assert_eq!(db.direct_in_use_count(), 0);
     // The next borrow must therefore open a brand-new physical connection.
-    let _fresh = db.borrow_column_sender().expect("re-borrow after drop");
+    let _fresh = db
+        .borrow_direct_column_sender()
+        .expect("re-borrow after drop");
     assert!(
         wait_until(Duration::from_secs(2), || server.accepted() == 2),
         "re-borrow must open a new connection; accepted={}",
@@ -2160,7 +2607,7 @@ fn transient_transport_failure_maps_to_failover_retry() {
     // (not SocketError), so callers can tell "retry on a fresh conn" apart.
     let server = MockServer::spawn_upgrade_then_close(2);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Ok)
         .expect_err("server closed mid-sync must error");
@@ -2175,7 +2622,7 @@ fn server_data_rejection_stays_terminal_not_failover_retry() {
     // re-tagged FailoverRetry.
     let server = MockServer::spawn_erroring(2, 0x09);
     let db = QuestDb::connect(&conf_for(server.port(), "")).unwrap();
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Ok)
         .expect_err("server data rejection must surface");
@@ -2185,7 +2632,7 @@ fn server_data_rejection_stays_terminal_not_failover_retry() {
 
 #[test]
 fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
-    // Endpoint A (first in the list) is the primary that the eager-open lands
+    // Endpoint A (first in the list) is the primary that the first borrow lands
     // on, then dies on the first sync. Endpoint B is a live acking server.
     // After the transient failure, `reborrow_from_pool` must rotate to B and
     // must NOT re-attempt the dead A (the pool-level health tracker marks it
@@ -2198,15 +2645,15 @@ fn reborrow_after_primary_failure_lands_on_live_endpoint_and_skips_dead() {
     ))
     .unwrap();
 
-    // Eager-open connected to the primary (first endpoint).
+    // The first (lazy) borrow connects to the primary (first endpoint).
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     assert!(
         wait_until(Duration::from_secs(2), || primary.accepted() == 1),
-        "eager-open must connect to the primary; accepted={}",
+        "first borrow must connect to the primary; accepted={}",
         primary.accepted()
     );
     assert_eq!(live.accepted(), 0, "live endpoint must be untouched so far");
 
-    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender
         .sync(AckLevel::Ok)
         .expect_err("primary died mid-sync");
@@ -2244,13 +2691,13 @@ fn failed_reborrow_keeps_handle_erroring_without_panicking() {
     ))
     .unwrap();
 
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     assert!(
         wait_until(Duration::from_secs(2), || primary.accepted() == 1),
-        "eager-open must connect to the primary; accepted={}",
+        "first borrow must connect to the primary; accepted={}",
         primary.accepted()
     );
 
-    let mut sender = db.borrow_column_sender().expect("borrow");
     let err = sender.sync(AckLevel::Ok).expect_err("primary died");
     assert_eq!(err.code(), ErrorCode::FailoverRetry);
 
@@ -2259,7 +2706,7 @@ fn failed_reborrow_keeps_handle_erroring_without_panicking() {
         .expect_err("replacement endpoint is unreachable");
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert_eq!(
-        db.in_use_count(),
+        db.direct_in_use_count(),
         1,
         "failed same-handle reborrow must retain the logical pool slot"
     );
@@ -2272,7 +2719,7 @@ fn failed_reborrow_keeps_handle_erroring_without_panicking() {
     assert_eq!(err.code(), ErrorCode::FailoverRetry);
 
     drop(sender);
-    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.direct_in_use_count(), 0);
 }
 
 #[test]
@@ -2282,7 +2729,7 @@ fn reborrow_on_single_endpoint_pool_reuses_the_same_endpoint() {
     let server = MockServer::spawn_acking(3);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     sender.sync(AckLevel::Ok).expect("first sync");
 
     sender
@@ -2292,9 +2739,9 @@ fn reborrow_on_single_endpoint_pool_reuses_the_same_endpoint() {
 
     // Exactly one slot remains in use behind the handle (no leak, no growth
     // past the borrow).
-    assert_eq!(db.in_use_count(), 1);
+    assert_eq!(db.direct_in_use_count(), 1);
     drop(sender);
-    assert_eq!(db.in_use_count(), 0);
+    assert_eq!(db.direct_in_use_count(), 0);
 }
 
 #[test]
@@ -2311,13 +2758,12 @@ fn dead_endpoint_stays_skipped_across_repeated_reborrows() {
         "pool_size=1;pool_max=2;",
     ))
     .unwrap();
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     assert!(
         wait_until(Duration::from_secs(2), || dead.accepted() == 1),
-        "eager-open must land on the first endpoint"
+        "first borrow must land on the first endpoint"
     );
-
-    let mut sender = db.borrow_column_sender().expect("borrow");
-    // First sync hits the dead eager-open conn.
+    // First sync hits the dead conn.
     let err = sender.sync(AckLevel::Ok).expect_err("primary died");
     assert_eq!(err.code(), ErrorCode::FailoverRetry);
 
@@ -2429,16 +2875,16 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     ))
     .unwrap();
 
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     assert!(
         wait_until(Duration::from_secs(2), || primary.accepted() == 1),
-        "eager-open must connect to the primary; accepted={}",
+        "first borrow must connect to the primary; accepted={}",
         primary.accepted()
     );
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4, 5, 6]).into_column();
     let df = DataFrame::new_with_height(6, vec![i]).unwrap();
 
-    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("failover must re-drive the df onto the live endpoint");
@@ -2481,9 +2927,10 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     ))
     .unwrap();
 
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     assert!(
         wait_until(Duration::from_secs(2), || primary.accepted() == 1),
-        "eager-open must connect to the primary; accepted={}",
+        "first borrow must connect to the primary; accepted={}",
         primary.accepted()
     );
 
@@ -2491,7 +2938,6 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     let i = Series::new(PlSmallStr::from("i"), vals.as_slice()).into_column();
     let df = DataFrame::new_with_height(66, vec![i]).unwrap();
 
-    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
         .expect("failover must re-drive the uncommitted tail onto the live endpoint");
@@ -2537,16 +2983,16 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     ))
     .unwrap();
 
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     assert!(
         wait_until(Duration::from_secs(2), || primary.accepted() == 1),
-        "eager-open must connect to the primary; accepted={}",
+        "first borrow must connect to the primary; accepted={}",
         primary.accepted()
     );
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2]).into_column();
     let df = DataFrame::new_with_height(2, vec![i]).unwrap();
 
-    let mut sender = db.borrow_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("reborrow connect failures must retry until the recovery endpoint is live");
@@ -2570,7 +3016,7 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
     let df = DataFrame::new_with_height(4, vec![i]).unwrap();
 
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
         .expect("healthy single-endpoint flush must commit in one pass");
@@ -2607,7 +3053,7 @@ fn flush_polars_dataframe_applies_column_overrides() {
     let df = DataFrame::new_with_height(4, vec![s, i]).unwrap();
 
     let overrides = [ArrowColumnOverride::Symbol { column: "s" }];
-    let mut sender = db.borrow_column_sender().expect("borrow");
+    let mut sender = db.borrow_direct_column_sender().expect("borrow");
     sender
         .flush_polars_dataframe(
             "trades",
@@ -2632,8 +3078,8 @@ fn flush_polars_dataframe_applies_column_overrides() {
 /// minimal `SERVER_INFO` frame — the reader's first expected frame at connect
 /// — then parks the connection, draining to EOF. That is enough to drive
 /// pool borrow / return / grow / reap / cap mechanics without a full query
-/// round-trip. The same endpoint also satisfies the column-sender eager-open
-/// at `connect` (which ignores the unsolicited `SERVER_INFO` while parked).
+/// round-trip. The same endpoint also serves any lazily-opened column-sender
+/// borrow (which ignores the unsolicited `SERVER_INFO` while parked).
 #[cfg(feature = "sync-reader-qwp-ws")]
 mod reader_pool {
     use std::net::TcpListener;
@@ -2739,8 +3185,7 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-        // The reader pool starts empty — the eager-open only warms the
-        // column-sender pool.
+        // All pools are lazy, so the reader pool starts empty.
         assert_eq!(db.reader_free_count(), 0);
         assert_eq!(db.reader_in_use_count(), 0);
 
@@ -2791,12 +3236,8 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(16);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
 
-        // `pool_size=1` eager-opens exactly one *column* connection.
-        assert!(
-            wait_until(Duration::from_secs(2), || server.accepted() == 1),
-            "eager-open must connect one column slot; accepted={}",
-            server.accepted()
-        );
+        // Lazy pools: `connect` opens nothing.
+        assert_eq!(server.accepted(), 0);
 
         // Three concurrent reader borrows each open a fresh connection.
         let r1 = db.borrow_reader().expect("r1");
@@ -2804,8 +3245,8 @@ mod reader_pool {
         let r3 = db.borrow_reader().expect("r3 (grow)");
         assert_eq!(db.reader_in_use_count(), 3);
         assert!(
-            wait_until(Duration::from_secs(2), || server.accepted() == 4),
-            "each reader borrow must open a fresh connection (1 column + 3 readers); accepted={}",
+            wait_until(Duration::from_secs(2), || server.accepted() == 3),
+            "each reader borrow must open a fresh connection (3 readers); accepted={}",
             server.accepted()
         );
 
@@ -2819,7 +3260,7 @@ mod reader_pool {
         let _a = db.borrow_reader().expect("reuse 1");
         let _b = db.borrow_reader().expect("reuse 2");
         assert_eq!(db.reader_free_count(), 1);
-        assert_eq!(server.accepted(), 4, "reuse must not open new connections");
+        assert_eq!(server.accepted(), 3, "reuse must not open new connections");
     }
 
     /// Borrowing past `pool_max` fails fast with an egress `InvalidApiCall`
@@ -2865,8 +3306,8 @@ mod reader_pool {
         // The next borrow therefore opens a brand-new connection.
         let _fresh = db.borrow_reader().expect("re-borrow after must-close");
         assert!(
-            wait_until(Duration::from_secs(2), || server.accepted() == 3),
-            "re-borrow must open a new connection (1 column + 2 readers); accepted={}",
+            wait_until(Duration::from_secs(2), || server.accepted() == 2),
+            "re-borrow must open a new connection (2 readers total); accepted={}",
             server.accepted()
         );
     }
@@ -2880,7 +3321,7 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-        let col = db.borrow_column_sender().expect("column sender"); // reuses the eager free slot
+        let col = db.borrow_column_sender().expect("column sender"); // opens a fresh connection
         let row = db.borrow_row_sender().expect("row sender"); // opens a fresh connection
         let reader = db.borrow_reader().expect("reader"); // opens a fresh connection
 
@@ -2889,8 +3330,8 @@ mod reader_pool {
         assert_eq!(db.row_sender_in_use_count(), 1);
         assert_eq!(db.reader_in_use_count(), 1);
 
-        // 1 column eager-open + 1 row + 1 reader = three independent live
-        // connections, each pool capped separately at pool_max=2.
+        // 1 column + 1 row + 1 reader = three independent live connections,
+        // each pool capped separately at pool_max=2.
         assert!(
             wait_until(Duration::from_secs(2), || server.accepted() == 3),
             "expected 3 independent connections; accepted={}",

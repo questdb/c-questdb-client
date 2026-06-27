@@ -332,7 +332,7 @@ fn measure_e2e(
     warmups: usize,
 ) -> Result<(Vec<u64>, Vec<u64>), Box<dyn Error>> {
     let mut run = || -> Result<(), Box<dyn Error>> {
-        let mut sender = db.borrow_column_sender()?;
+        let mut sender = db.borrow_direct_column_sender()?;
         sender.flush_polars_dataframe(table, df, opts)?;
         Ok(())
     };

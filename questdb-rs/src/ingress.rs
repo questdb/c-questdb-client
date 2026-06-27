@@ -472,24 +472,9 @@ impl QwpWsConnector {
         )
     }
 
-    /// Open one connection via [`sender::qwp_ws::connect_qwp_ws_endpoint_round`]:
-    /// the round picks the next healthy endpoint from `tracker`, skips ones
-    /// marked unhealthy / role-rejected, and rotates to the writable primary
-    /// on a `QwpWsRoleReject`. On success the chosen endpoint is recorded
-    /// healthy; on a transport failure that endpoint is recorded unhealthy.
-    pub(crate) fn connect_round(
-        &self,
-        tracker: &mut sender::qwp_ws::QwpWsHostHealthTracker,
-    ) -> Result<RawQwpWsRoundStream> {
-        // Owned-tracker path (eager pool warm-up loop + single-connection
-        // drivers): the caller holds the tracker by value, so there is no
-        // lock to take.
-        self.connect_round_with(tracker)
-    }
-
     /// Pool path: drive the connect round against the *shared* health tracker
-    /// behind `health`, locking it only per tracker operation. Unlike the
-    /// owned [`Self::connect_round`], the health lock is **never** held across
+    /// behind `health`, locking it only per tracker operation. The health lock
+    /// is **never** held across
     /// the blocking TCP/TLS/WS-upgrade handshake, so concurrent cold-start
     /// borrows no longer serialize end-to-end and dead-sender returns that
     /// need the same lock are not stalled behind one slow / black-holed

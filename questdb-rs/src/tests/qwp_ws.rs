@@ -179,6 +179,17 @@ pub(crate) fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<
     perform_server_upgrade_with_version(stream, 1)
 }
 
+/// Like [`perform_server_upgrade`] but advertises `X-QWP-Durable-Ack: enabled`,
+/// which the durable-ACK runner requires before it will request durable
+/// confirmation. Sets the same read/write timeouts as `perform_server_upgrade`.
+pub(crate) fn perform_server_upgrade_durable(
+    stream: &mut TcpStream,
+) -> std::io::Result<Vec<String>> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(upgrade_mock_stream_with_durable_ack(stream, true))
+}
+
 /// Like [`perform_server_upgrade`] but advertises an arbitrary
 /// `X-QWP-Version`. The egress reader skips the `SERVER_INFO` read and the
 /// role check when the negotiated version is `0`, which lets a park-only
@@ -244,7 +255,7 @@ pub(crate) fn write_server_info_frame(stream: &mut TcpStream) -> std::io::Result
     write_server_frame(stream, 0x2, &frame, false)
 }
 
-fn write_server_frame(
+pub(crate) fn write_server_frame(
     stream: &mut TcpStream,
     opcode: u8,
     payload: &[u8],
@@ -325,7 +336,7 @@ pub(crate) fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> st
     write_server_binary_frame(stream, &ok)
 }
 
-fn write_qwp_ok_response_with_table_entries(
+pub(crate) fn write_qwp_ok_response_with_table_entries(
     stream: &mut TcpStream,
     wire_seq: u64,
     entries: &[(&str, i64)],
@@ -337,7 +348,7 @@ fn write_qwp_ok_response_with_table_entries(
     write_server_binary_frame(stream, &ok)
 }
 
-fn write_qwp_durable_ack_response(
+pub(crate) fn write_qwp_durable_ack_response(
     stream: &mut TcpStream,
     entries: &[(&str, i64)],
 ) -> std::io::Result<()> {

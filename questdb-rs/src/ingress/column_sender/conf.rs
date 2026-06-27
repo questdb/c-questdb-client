@@ -79,7 +79,13 @@ impl Default for PoolConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedConf {
     pub(crate) pool: PoolConfig,
-    pub(crate) store_and_forward: bool,
+    /// `sf_dir` was set: the main pool is **disk-backed** store-and-forward,
+    /// which shares one queue + `sender_id` and therefore allows a single
+    /// active borrower. When false the main pool is **in-memory**
+    /// store-and-forward, which pools freely up to `pool_max` (like the
+    /// row-major sender pool). Either way the main pool is store-and-forward;
+    /// this flag only selects disk vs in-memory / single-borrower vs pooled.
+    pub(crate) sf_disk: bool,
 }
 
 /// Validate and extract pool-specific knobs from a column-sender connect
@@ -112,15 +118,14 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
     let mut pool_size_specified = false;
     let mut pool_max_specified = false;
     let mut sf_dir_specified = false;
-    let mut store_and_forward_key: Option<String> = None;
 
     walk_params(params, |key, value| {
-        if is_store_and_forward_key(key) {
-            if key == "sf_dir" {
-                sf_dir_specified = true;
-            } else if store_and_forward_key.is_none() {
-                store_and_forward_key = Some(key.to_string());
-            }
+        // `sf_dir` selects disk-backed (single-borrower) store-and-forward;
+        // all other `sf_*` / `sender_id` keys are passthrough to the
+        // `SenderBuilder`, tuning the in-memory or disk queue — the same as the
+        // row-major sender, which accepts them with or without `sf_dir`.
+        if key == "sf_dir" {
+            sf_dir_specified = true;
         }
         match key {
             "request_durable_ack" => {
@@ -202,15 +207,6 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         ));
     }
 
-    if !sf_dir_specified && let Some(key) = store_and_forward_key {
-        return Err(error::fmt!(
-            ConfigError,
-            "Column-sender store-and-forward configuration key {:?} requires \
-             explicit \"sf_dir\" opt-in",
-            key
-        ));
-    }
-
     if sf_dir_specified {
         if pool_size_specified && pool.pool_size > 1 {
             return Err(error::fmt!(
@@ -244,7 +240,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
 
     Ok(ParsedConf {
         pool,
-        store_and_forward: sf_dir_specified,
+        sf_disk: sf_dir_specified,
     })
 }
 
@@ -266,10 +262,6 @@ fn is_qwp_ws_schema(service: &str) -> bool {
         || service.eq_ignore_ascii_case("qwpwss")
         || service.eq_ignore_ascii_case("ws")
         || service.eq_ignore_ascii_case("wss")
-}
-
-fn is_store_and_forward_key(key: &str) -> bool {
-    key == "sender_id" || key.starts_with("sf_")
 }
 
 fn parse_pool_usize(key: &str, value: &str) -> Result<usize> {
@@ -361,7 +353,7 @@ mod tests {
         assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX);
         assert_eq!(p.pool.pool_idle_timeout, DEFAULT_POOL_IDLE_TIMEOUT);
         assert_eq!(p.pool.pool_reap, PoolReap::Auto);
-        assert!(!p.store_and_forward);
+        assert!(!p.sf_disk);
     }
 
     #[test]
@@ -385,7 +377,7 @@ mod tests {
     #[test]
     fn sf_dir_selects_store_and_forward_and_caps_pool_max() {
         let p = parse_ok("qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;");
-        assert!(p.store_and_forward);
+        assert!(p.sf_disk);
         assert_eq!(p.pool.pool_size, 1);
         assert_eq!(p.pool.pool_max, 1);
     }
@@ -395,13 +387,17 @@ mod tests {
         let p = parse_ok(
             "qwpws::addr=localhost:9000;sf_dir=/tmp/qdb-sf;pool_size=1;pool_max=1;sender_id=abc;",
         );
-        assert!(p.store_and_forward);
+        assert!(p.sf_disk);
         assert_eq!(p.pool.pool_size, 1);
         assert_eq!(p.pool.pool_max, 1);
     }
 
     #[test]
-    fn refuses_sf_keys_without_sf_dir() {
+    fn accepts_sf_keys_without_sf_dir() {
+        // In-memory store-and-forward is always on, so SF tuning keys are
+        // accepted without `sf_dir` (passthrough to the SenderBuilder), matching
+        // the row-major sender. They select in-memory SF: `sf_disk` stays false
+        // and the pool is not capped to a single borrower.
         for key in [
             "sender_id",
             "sf_max_bytes",
@@ -410,14 +406,9 @@ mod tests {
             "sf_append_deadline_millis",
         ] {
             let conf = format!("qwpws::addr=localhost:9000;{key}=whatever;");
-            let err = parse_err(&conf);
-            assert_eq!(err.code(), ErrorCode::ConfigError);
-            assert!(
-                err.msg().contains("sf_dir") && err.msg().contains(key),
-                "{} -> {}",
-                key,
-                err.msg()
-            );
+            let p = parse_ok(&conf);
+            assert!(!p.sf_disk, "{key} must not imply disk-backed SF");
+            assert_eq!(p.pool.pool_max, DEFAULT_POOL_MAX, "key {key}");
         }
     }
 

@@ -6740,9 +6740,7 @@ mod tests {
     fn not_symbol_override_decodes_dict_with_nulls() {
         use arrow_array::DictionaryArray;
         use arrow_array::types::Int16Type;
-        let dict = DictionaryArray::<Int16Type>::from_iter(
-            [Some("x"), None, Some("y"), Some("x")].into_iter(),
-        );
+        let dict = DictionaryArray::<Int16Type>::from_iter([Some("x"), None, Some("y"), Some("x")]);
         let f = Field::new(
             "s",
             DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
