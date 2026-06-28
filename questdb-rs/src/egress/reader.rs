@@ -2268,8 +2268,7 @@ impl<'r> Cursor<'r> {
     fn replay_query_same_connection(&mut self) -> Result<()> {
         let new_rid = self.reader.alloc_request_id();
         self.request_id = new_rid;
-        self.encoded_request =
-            patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
+        self.encoded_request = patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
         // Mirror execute(): the schema rides batch_seq==0 of the new query.
         self.reader.query_schema = None;
         self.last_batch = None;
@@ -3233,10 +3232,7 @@ const STALE_PLAN_PATTERNS: [&str; 2] = [
 /// re-issuing the query. Gated on `INTERNAL_ERROR` so a genuinely
 /// different error that merely echoes the text in its message can't be
 /// silently swallowed.
-fn is_stale_plan_error(
-    status: crate::egress::wire::msg_kind::StatusCode,
-    message: &str,
-) -> bool {
+fn is_stale_plan_error(status: crate::egress::wire::msg_kind::StatusCode, message: &str) -> bool {
     use crate::egress::wire::msg_kind::StatusCode as S;
     if status != S::InternalError {
         return false;
