@@ -1220,6 +1220,7 @@ impl<'r> ReaderQuery<'r> {
             failover_budget,
             failover_resets: 0,
             decode_failover_rounds: 0,
+            stale_plan_retries: 0,
             data_delivered: false,
             #[cfg(feature = "arrow-egress")]
             drifted_batch: None,
@@ -1295,6 +1296,18 @@ const CANCEL_DRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// deterministic corruption. Raw read failures are unaffected and keep
 /// the full budget.
 const MAX_DECODE_FAILOVER_ROUNDS: u32 = 1;
+
+/// Bound on transparent re-issues of a query the server rejected with the
+/// transient stale-cached-plan `INTERNAL_ERROR` (see [`is_stale_plan_error`]).
+///
+/// Each retry is a same-connection resend that makes the server recompile
+/// the query against the table's *current* metadata; a single retry clears
+/// the realistic one-`ALTER`-in-flight race. The cap stops a table under
+/// relentless concurrent schema churn from looping forever — once spent, the
+/// stale-plan error surfaces like any other server error. Retries are
+/// naturally paced by the server's recompile + round-trip latency, so the
+/// loop never busy-spins and no client-side sleep is needed.
+const MAX_STALE_PLAN_RETRIES: u32 = 15;
 
 /// Classifies the origin of a mid-query stream failure routed through
 /// [`Cursor::failover_after_stream_failure`]. Decode failures get a
@@ -1456,6 +1469,13 @@ pub struct Cursor<'r> {
     /// reconnect/replay loop that drains the whole per-Execute budget;
     /// once the cap is hit the decode error is surfaced terminally.
     decode_failover_rounds: u32,
+    /// Count of transparent same-connection query re-issues this cursor has
+    /// performed in response to the server's transient stale-cached-plan
+    /// `INTERNAL_ERROR` (see [`Cursor::next_batch`] and
+    /// [`is_stale_plan_error`]). Capped at [`MAX_STALE_PLAN_RETRIES`]; stays
+    /// `0` on the happy path. Distinct from `failover_resets` — no reconnect
+    /// is involved, the recompile happens on the existing healthy connection.
+    stale_plan_retries: u32,
     /// Sticky: set the first time a `RESULT_BATCH` is yielded to the
     /// caller and never reset. Drives the safety check in
     /// [`Cursor::next_batch`] that refuses mid-query failover when no
@@ -2026,6 +2046,42 @@ impl<'r> Cursor<'r> {
                         self.terminate_with_close();
                         return Err(e);
                     }
+                    // Transparent recovery from the transient stale-cached-plan
+                    // fault. An async `ALTER COLUMN TYPE` bumps the table's
+                    // metadata version between this query's server-side
+                    // compilation and its execution, so the server rejects its
+                    // own cached plan with `INTERNAL_ERROR`. The recompile on
+                    // the very next execution succeeds — this is exactly how
+                    // QuestDB's PGWire / REST endpoints self-heal, and that
+                    // friction must never leak to the caller (it is not
+                    // something a user can act on, so surfacing it is pure
+                    // noise).
+                    //
+                    // Replaying is safe only before any row was handed to the
+                    // caller (`!data_delivered`): the fault is a compile-time
+                    // error that fires before `batch_seq == 0`, so in practice
+                    // the guard always holds — but it is load-bearing, because
+                    // replaying after delivery would re-stream rows the caller
+                    // already consumed. The connection is healthy (the
+                    // `QUERY_ERROR` is terminal only for *this* request_id), so
+                    // unlike failover we re-issue on the same connection with a
+                    // fresh request_id instead of reconnecting. `cancelling`
+                    // suppresses the retry so a concurrent `cancel()` wins.
+                    if !self.cancelling
+                        && !self.data_delivered
+                        && self.stale_plan_retries < MAX_STALE_PLAN_RETRIES
+                        && is_stale_plan_error(status, &message)
+                    {
+                        self.stale_plan_retries = self.stale_plan_retries.saturating_add(1);
+                        match self.replay_query_same_connection() {
+                            Ok(()) => continue,
+                            Err(e) => {
+                                self.reader.cursor_active = false;
+                                self.done = true;
+                                return Err(e);
+                            }
+                        }
+                    }
                     self.reader.cursor_active = false;
                     self.done = true;
                     return Err(map_server_status(status, message));
@@ -2048,6 +2104,16 @@ impl<'r> Cursor<'r> {
     /// query did or did not silently restart.
     pub fn failover_resets(&self) -> u32 {
         self.failover_resets
+    }
+
+    /// Number of times this cursor transparently re-issued its query on the
+    /// current connection after the server reported the transient
+    /// stale-cached-plan `INTERNAL_ERROR` (see [`Cursor::next_batch`]).
+    /// Stays `0` on the happy path; exposed for tests and diagnostics that
+    /// want to confirm the self-heal fired (and how often) without the
+    /// caller ever seeing the underlying error.
+    pub fn stale_plan_retries(&self) -> u32 {
+        self.stale_plan_retries
     }
 
     /// Opt this cursor into transparent mid-query replay from the
@@ -2181,6 +2247,40 @@ impl<'r> Cursor<'r> {
         }
         warn_on_protocol_error_failover(&e, kind.context());
         self.failover_reconnect_and_replay(e)
+    }
+
+    /// Re-issue the stashed `QUERY_REQUEST` on the *current* connection with
+    /// a fresh `request_id`. Used to transparently recover from the
+    /// transient stale-cached-plan `INTERNAL_ERROR`: the connection is
+    /// healthy (the `QUERY_ERROR` was terminal only for the old
+    /// request_id), so unlike [`Cursor::failover_reconnect_and_replay`] this
+    /// does NOT reconnect. It patches the 8-byte request_id span in place,
+    /// clears the per-query schema (mirroring [`ReaderQuery::execute`] so a
+    /// stale schema can't bind the replayed rows), drops any half-built
+    /// batch view, and resends the same bytes verbatim — no builder/bind
+    /// clone, no re-encode. The server recompiles against the table's
+    /// current metadata and streams afresh from `batch_seq == 0`.
+    ///
+    /// The connection-scoped symbol dict is deliberately *not* reset: this
+    /// is a sequential query on the same connection (just like a second
+    /// `execute()`), so the dict — and the per-cursor caches keyed on it —
+    /// remain valid. `cursor_active` stays `true`; the cursor is still live.
+    fn replay_query_same_connection(&mut self) -> Result<()> {
+        let new_rid = self.reader.alloc_request_id();
+        self.request_id = new_rid;
+        self.encoded_request =
+            patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
+        // Mirror execute(): the schema rides batch_seq==0 of the new query.
+        self.reader.query_schema = None;
+        self.last_batch = None;
+        // Any parked drift-replay batch belonged to the rejected attempt.
+        #[cfg(feature = "arrow-egress")]
+        {
+            self.drifted_batch = None;
+        }
+        self.reader
+            .transport_mut()
+            .and_then(|t| t.write_message(self.encoded_request.clone()))
     }
 
     /// Drop the per-cursor SYMBOL caches keyed on the connection dict.
@@ -3112,6 +3212,37 @@ fn read_server_info_frame(transport: &mut WsTransport, timeout: Duration) -> Res
             std::mem::discriminant(&other)
         )),
     }
+}
+
+/// Substrings QuestDB uses for the transient "the cached query plan no
+/// longer matches the table's current metadata version" condition. The
+/// server raises it (as `INTERNAL_ERROR`, `0x06`) when an async
+/// `ALTER TABLE ... ALTER COLUMN TYPE` bumps a table's metadata version
+/// between a SELECT's compilation and its execution. The wire has no
+/// dedicated "retryable" status — every transient server fault is folded
+/// into `INTERNAL_ERROR` — so the condition is identified by message text,
+/// matched case-insensitively. Kept lowercase so the match is a plain
+/// `contains` against the lowercased server message.
+const STALE_PLAN_PATTERNS: [&str; 2] = [
+    "cached query plan cannot be used",
+    "table schema has changed",
+];
+
+/// True when a server `QUERY_ERROR` is the transient stale-cached-plan
+/// fault that [`Cursor::next_batch`] recovers from by transparently
+/// re-issuing the query. Gated on `INTERNAL_ERROR` so a genuinely
+/// different error that merely echoes the text in its message can't be
+/// silently swallowed.
+fn is_stale_plan_error(
+    status: crate::egress::wire::msg_kind::StatusCode,
+    message: &str,
+) -> bool {
+    use crate::egress::wire::msg_kind::StatusCode as S;
+    if status != S::InternalError {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    STALE_PLAN_PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 fn map_server_status(

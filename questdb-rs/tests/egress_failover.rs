@@ -887,6 +887,182 @@ fn cache_reset_mid_stream_does_not_break_cursor() {
     assert_eq!(cursor.failover_resets(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// Transient stale-cached-plan recovery (server INTERNAL_ERROR, status 0x06).
+//
+// An async `ALTER COLUMN TYPE` can bump a table's metadata version between a
+// query's server-side compilation and its execution; the server then rejects
+// its own cached plan with INTERNAL_ERROR. The reader must absorb this
+// transparently — re-issue on the same healthy connection so the server
+// recompiles — and never surface it to the caller. These pin that contract
+// against the scripted mock so it can't regress into user-visible friction.
+// ---------------------------------------------------------------------------
+
+/// `0x06` INTERNAL_ERROR — the catch-all the server folds every transient
+/// fault into, including the stale-cached-plan condition.
+const STATUS_INTERNAL_ERROR: u8 = 0x06;
+
+/// The exact server message shape (`9.x` QuestDB) for the stale-plan fault.
+fn stale_plan_message() -> String {
+    "cached query plan cannot be used because table schema has changed \
+     [table=weather0, expectedTableId=33, actualTableId=33, \
+     expectedMetadataVersion=61, actualMetadataVersion=62]"
+        .to_string()
+}
+
+#[test]
+fn stale_cached_plan_internal_error_is_transparently_retried() {
+    // One connection: the first query is rejected with the transient
+    // stale-plan INTERNAL_ERROR, the cursor silently re-issues on the SAME
+    // connection (second AwaitQueryRequest), and the recompiled query then
+    // streams a normal batch + RESULT_END. The caller must see only the
+    // successful rows — never the error.
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: stale_plan_message(),
+        },
+        // The transparent replay lands here on the same connection.
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    {
+        let view = cursor
+            .next_batch()
+            .expect("stale-plan error must be absorbed, not surfaced")
+            .expect("recompiled query must yield its batch");
+        assert_eq!(view.row_count(), 2);
+        let ColumnView::Long(c) = view.column(0).expect("col 0") else {
+            panic!("replayed column should decode as Long");
+        };
+        assert_eq!((c.value(0), c.value(1)), (1, 2));
+    }
+    assert!(
+        cursor.next_batch().expect("terminal").is_none(),
+        "RESULT_END must terminate the cursor cleanly after the silent retry"
+    );
+    // Exactly one transparent retry; no failover/reconnect was involved.
+    assert_eq!(cursor.stale_plan_retries(), 1);
+    assert_eq!(cursor.failover_resets(), 0);
+    // One connection served the whole exchange — the retry stayed in place.
+    assert_eq!(srv.accepts(), 1, "retry must reuse the same connection");
+}
+
+#[test]
+fn non_stale_internal_error_still_surfaces_to_caller() {
+    // A generic INTERNAL_ERROR (same status byte, different message) is NOT
+    // the stale-plan condition and must surface unchanged — swallowing every
+    // 0x06 would hide real server faults.
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: "table reader is distressed: out of file handles".to_string(),
+        },
+    ]]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("a non-stale internal error must surface, not be swallowed"),
+    };
+    assert_eq!(err.code(), ErrorCode::ServerInternalError);
+    assert_eq!(cursor.stale_plan_retries(), 0);
+    assert_eq!(srv.accepts(), 1, "no retry, so no second connection");
+}
+
+#[test]
+fn stale_cached_plan_after_rows_delivered_surfaces() {
+    // The load-bearing `!data_delivered` guard: once a batch has been handed
+    // to the caller, a later stale-plan error CANNOT be replayed (that would
+    // re-stream consumed rows). It must surface instead.
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![7, 8, 9]),
+        },
+        Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: stale_plan_message(),
+        },
+    ]]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    {
+        let view = cursor
+            .next_batch()
+            .expect("first next_batch")
+            .expect("batch present");
+        assert_eq!(view.row_count(), 3);
+    }
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("stale-plan error after delivery must surface, not replay"),
+    };
+    assert_eq!(err.code(), ErrorCode::ServerInternalError);
+    assert_eq!(cursor.stale_plan_retries(), 0);
+}
+
+#[test]
+fn stale_cached_plan_retry_budget_exhausts_and_surfaces() {
+    // A table under relentless schema churn keeps returning the stale-plan
+    // error. The cursor must retry a bounded number of times and then
+    // surface the error rather than loop forever. Script
+    // `MAX_STALE_PLAN_RETRIES + 1` (= 16) error replies; the cursor spends
+    // its 15 retries and surfaces on the 16th.
+    let mut script = vec![Action::SendServerInfo {
+        role: ServerRole::Standalone,
+        node_id: "n1".into(),
+    }];
+    // 16 = MAX_STALE_PLAN_RETRIES (15) + the final un-retried surface.
+    for _ in 0..16 {
+        script.push(Action::AwaitQueryRequest);
+        script.push(Action::SendQueryError {
+            status: STATUS_INTERNAL_ERROR,
+            message: stale_plan_message(),
+        });
+    }
+    let srv = MockServer::start(vec![script]);
+    let conf = format!("ws::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("exhausted retry budget must surface the stale-plan error"),
+    };
+    assert_eq!(err.code(), ErrorCode::ServerInternalError);
+    assert_eq!(cursor.stale_plan_retries(), 15);
+    // All retries stayed on the one connection.
+    assert_eq!(srv.accepts(), 1);
+}
+
 #[test]
 fn mid_query_close_triggers_failover() {
     // Server A: closes after QUERY_REQUEST. Server B: completes.
