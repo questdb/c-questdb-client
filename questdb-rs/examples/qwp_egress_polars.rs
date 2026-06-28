@@ -416,10 +416,7 @@ fn populate(
     let opts = PolarsIngestOptions::new()
         .max_rows(10_000)
         .timestamp_column(ts_col);
-    {
-        let mut sender = db.borrow_direct_column_sender()?;
-        sender.flush_polars_dataframe(table, df, &opts)?;
-    }
+    db.flush_polars_dataframe(table, df, &opts)?;
     eprintln!("[qwp_egress_polars] waiting for WAL apply (count() == {rows}) ...");
     wait_for_count(base, table, rows)
 }

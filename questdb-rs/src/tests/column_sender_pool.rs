@@ -3100,6 +3100,110 @@ fn flush_polars_dataframe_applies_column_overrides() {
     );
 }
 
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn flush_arrow_batch_server_stamped_commits_in_one_call() {
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
+    // `db.flush_arrow_batch(.., None, ..)` borrows a direct sender internally,
+    // publishes one server-stamped batch as a commit boundary, waits for the
+    // `Ok` ack, and returns the sender to the pool — all without the caller
+    // touching a sender.
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+    let arr = Arc::new(Int64Array::from(vec![1i64, 2, 3, 4]));
+    let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+
+    db.flush_arrow_batch("trades", &batch, None, &[], None)
+        .expect("server-stamped single-batch flush must commit in one call");
+
+    assert_eq!(
+        server.accepted(),
+        1,
+        "a healthy endpoint needs no re-borrow"
+    );
+    assert_eq!(
+        data_frame_count(&frames),
+        1,
+        "one batch = one data frame (the ACKing flush folds the sync in)"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
+    use std::sync::Arc;
+
+    use crate::ErrorCode;
+    use crate::ingress::AckLevel;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
+    // The connect string did not set `request_durable_ack=on`, so a
+    // caller-named `Durable` level must be rejected up front rather than
+    // silently downgraded.
+    let (server, _frames) = MockServer::spawn_acking_capturing(1);
+    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+    let arr = Arc::new(Int64Array::from(vec![1i64, 2]));
+    let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+
+    let err = db
+        .flush_arrow_batch("trades", &batch, None, &[], Some(AckLevel::Durable))
+        .expect_err("Durable without request_durable_ack=on must be rejected");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn flush_arrow_batch_at_column_commits_in_one_call() {
+    use std::sync::Arc;
+
+    use arrow_array::{Float64Array, RecordBatch, TimestampNanosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    // The `Some(ts)` arm sources the designated timestamp from the named
+    // column and threads through to `flush_arrow_batch_at_column_and_wait`.
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Float64, false),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+    ]));
+    let price = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+    let ts = Arc::new(TimestampNanosecondArray::from(vec![
+        1_000_000_000,
+        2_000_000_000,
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![price, ts]).unwrap();
+
+    let ts_col = crate::ingress::ColumnName::new("ts").unwrap();
+    // Explicit `Some(AckLevel::Ok)` is honored (and valid without the durable
+    // opt-in).
+    db.flush_arrow_batch(
+        "trades",
+        &batch,
+        Some(ts_col),
+        &[],
+        Some(crate::ingress::AckLevel::Ok),
+    )
+    .expect("column-stamped single-batch flush must commit in one call");
+
+    assert_eq!(
+        server.accepted(),
+        1,
+        "a healthy endpoint needs no re-borrow"
+    );
+    assert_eq!(data_frame_count(&frames), 1, "one batch = one data frame");
+}
+
 /// Reader-pool (egress) ergonomic API tests: [`QuestDb::borrow_reader`] /
 /// [`crate::BorrowedReader`].
 ///

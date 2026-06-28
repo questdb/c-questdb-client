@@ -40,17 +40,19 @@
 //!
 //! [`ErrorCode::ArrowIngest`]: crate::ErrorCode::ArrowIngest
 //!
-//! The one-call shortcut is [`DirectColumnSender::flush_polars_dataframe`].
-//! For full control over slicing and per-batch retry, drive the
-//! iterator directly:
+//! The one-call shortcut is [`QuestDb::flush_polars_dataframe`], which
+//! borrows a direct column sender from the pool internally — callers never
+//! handle the sender themselves. For full control over slicing and per-batch
+//! retry, borrow a direct sender and drive the iterator directly:
 //!
 //! ```ignore
+//! let mut sender = db.borrow_direct_column_sender()?;
 //! for rb in questdb::ingress::polars::dataframe_to_batches(&df, None) {
 //!     sender.flush_arrow_batch_at_column(table, &rb?, "ts".try_into()?, &[])?;
 //! }
 //! ```
 //!
-//! [`DirectColumnSender::flush_polars_dataframe`]: crate::db::DirectColumnSender::flush_polars_dataframe
+//! [`QuestDb::flush_polars_dataframe`]: crate::QuestDb::flush_polars_dataframe
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -307,7 +309,7 @@ impl Iterator for DataFrameBatches<'_> {
 /// failover re-drive to ≈64 × `max_rows` rows.
 const CHECKPOINT_BATCHES: usize = 64;
 
-/// Optional knobs for [`DirectColumnSender::flush_polars_dataframe`].
+/// Optional knobs for [`QuestDb::flush_polars_dataframe`].
 ///
 /// Every field defaults to "off", so `PolarsIngestOptions::default()` (or
 /// [`PolarsIngestOptions::new`]) reproduces the original three-argument
@@ -321,15 +323,16 @@ const CHECKPOINT_BATCHES: usize = 64;
 ///     .max_rows(50_000)
 ///     .timestamp_column(ColumnName::new("ts")?)
 ///     .overrides(&overrides);
-/// sender.flush_polars_dataframe("trades", &df, &opts)?;
+/// db.flush_polars_dataframe("trades", &df, &opts)?;
 /// ```
 ///
-/// [`DirectColumnSender::flush_polars_dataframe`]: crate::db::DirectColumnSender::flush_polars_dataframe
+/// [`QuestDb::flush_polars_dataframe`]: crate::QuestDb::flush_polars_dataframe
 #[derive(Clone, Copy, Default)]
 pub struct PolarsIngestOptions<'a> {
     max_rows: Option<NonZeroUsize>,
     timestamp_column: Option<crate::ingress::ColumnName<'a>>,
     overrides: &'a [crate::ingress::column_sender::ArrowColumnOverride<'a>],
+    ack_level: Option<crate::ingress::column_sender::AckLevel>,
 }
 
 impl<'a> PolarsIngestOptions<'a> {
@@ -368,6 +371,20 @@ impl<'a> PolarsIngestOptions<'a> {
         overrides: &'a [crate::ingress::column_sender::ArrowColumnOverride<'a>],
     ) -> Self {
         self.overrides = overrides;
+        self
+    }
+
+    /// Block each checkpoint (and the trailing commit) until the frame reaches
+    /// `level`. Defaults to the connect string's level — the same one the
+    /// store-and-forward senders use:
+    /// [`AckLevel::Durable`](crate::ingress::AckLevel::Durable) when
+    /// `request_durable_ack=on`, otherwise
+    /// [`AckLevel::Ok`](crate::ingress::AckLevel::Ok). Requesting `Durable`
+    /// without `request_durable_ack=on` is rejected with
+    /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
+    #[must_use]
+    pub fn ack_level(mut self, level: crate::ingress::column_sender::AckLevel) -> Self {
+        self.ack_level = Some(level);
         self
     }
 }
@@ -416,7 +433,7 @@ impl crate::db::DirectColumnSender<'_> {
     ///
     /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
     /// [`ReconnectPolicy`]: crate::ingress::ReconnectPolicy
-    pub fn flush_polars_dataframe<'t, T>(
+    pub(crate) fn flush_polars_dataframe<'t, T>(
         &mut self,
         table: T,
         df: &DataFrame,
@@ -458,6 +475,50 @@ impl crate::db::DirectColumnSender<'_> {
     }
 }
 
+impl crate::db::QuestDb {
+    /// Flush a polars [`DataFrame`] to `table` in a single call.
+    ///
+    /// This is the recommended DataFrame ingestion entry point: it borrows a
+    /// direct column sender from the pool, drives the whole frame, and returns
+    /// the sender to the pool on completion (or error) — callers never handle a
+    /// sender. It is exactly equivalent to:
+    ///
+    /// ```ignore
+    /// let mut sender = db.borrow_direct_column_sender()?;
+    /// sender.flush_polars_dataframe(table, df, options)?; // crate-internal
+    /// ```
+    ///
+    /// `table` accepts anything convertible into a [`TableName`] (a bare `&str`
+    /// works). `options` ([`PolarsIngestOptions`]) carries the optional
+    /// designated-timestamp column, per-column wire-type `overrides` and batch
+    /// size.
+    ///
+    /// Commit, checkpoint and at-least-once failover-replay semantics are
+    /// unchanged from the underlying driver: the call owns the commit (the
+    /// replay boundary), re-driving the uncommitted tail onto a live endpoint
+    /// across a transient [`ErrorCode::FailoverRetry`] within the pool's
+    /// [`ReconnectPolicy`] budget, and returns only once the whole `df` is
+    /// committed. A re-driven tail can produce **duplicate rows** unless the
+    /// destination table has `DEDUP UPSERT KEYS` covering them.
+    ///
+    /// [`TableName`]: crate::ingress::TableName
+    /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
+    /// [`ReconnectPolicy`]: crate::ingress::ReconnectPolicy
+    pub fn flush_polars_dataframe<'t, T>(
+        &self,
+        table: T,
+        df: &DataFrame,
+        options: &PolarsIngestOptions<'_>,
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let mut sender = self.borrow_direct_column_sender()?;
+        sender.flush_polars_dataframe(table, df, options)
+    }
+}
+
 /// Single forward pass over `df`, skipping the first `*committed` batches (the
 /// tail already durable from an earlier attempt). Non-checkpoint batches are
 /// published with a no-wait flush; every [`CHECKPOINT_BATCHES`]th batch is
@@ -473,7 +534,11 @@ fn drive_from_checkpoint(
     options: &PolarsIngestOptions<'_>,
     committed: &mut usize,
 ) -> Result<()> {
-    use crate::ingress::column_sender::AckLevel;
+    // No caller-named level falls back to the connect string's default — the
+    // same level the store-and-forward senders use for this pool.
+    let ack = options
+        .ack_level
+        .unwrap_or_else(|| sender.default_ack_level());
 
     let skip = *committed;
     let mut last_was_checkpoint = false;
@@ -498,13 +563,13 @@ fn drive_from_checkpoint(
                 &rb,
                 ts,
                 options.overrides,
-                AckLevel::Ok,
+                ack,
             )?,
             (None, true) => sender.flush_arrow_batch_server_stamped_and_wait(
                 table,
                 &rb,
                 options.overrides,
-                AckLevel::Ok,
+                ack,
             )?,
         }
         if checkpoint {
@@ -518,7 +583,7 @@ fn drive_from_checkpoint(
     // committed; otherwise drain the trailing tail. This also covers the
     // empty-/no-batch case, where `sync` is the only completion wait.
     if !last_was_checkpoint {
-        sender.commit(AckLevel::Ok)?;
+        sender.commit(ack)?;
     }
     Ok(())
 }

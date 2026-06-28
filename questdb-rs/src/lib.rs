@@ -75,7 +75,13 @@ pub use error::*;
 mod db;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub use db::{BorrowedRowSender, DirectColumnSender, QuestDb, SfColumnSender};
+pub use db::{BorrowedRowSender, QuestDb, SfColumnSender};
+// Internal transport behind `QuestDb::flush_arrow_batch` /
+// `QuestDb::flush_polars_dataframe`. Not part of the public API: hidden from
+// the docs and has no documented constructor. Kept reachable only so the
+// crate's own ingestion entry points can name it.
+#[doc(hidden)]
+pub use db::DirectColumnSender;
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
 pub use db::BorrowedReader;

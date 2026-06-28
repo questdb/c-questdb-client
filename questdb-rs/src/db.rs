@@ -224,7 +224,7 @@ impl Drop for RowSenderInUseSlot<'_> {
 /// internal state is `Mutex`-guarded so [`QuestDb::borrow_column_sender`] /
 /// [`QuestDb::reap_idle`] / Drop-driven returns are safe to interleave.
 ///
-/// Each borrow ([`SfColumnSender`] / [`DirectColumnSender`]) is **not** `Send` — it belongs to the
+/// Each borrow ([`SfColumnSender`] / the internal direct sender) is **not** `Send` — it belongs to the
 /// thread that borrowed it. To ingest in parallel, borrow one sender per
 /// worker thread from the same `QuestDb`.
 pub struct QuestDb {
@@ -454,12 +454,11 @@ impl QuestDb {
     /// Borrow a **direct** (non-store-and-forward) column sender from the
     /// always-direct pool, independent of `sf_dir`.
     ///
-    /// This is the transport behind DataFrame ingestion (Polars / Pandas):
-    /// those paths own their own commit + replay (re-iterating the source frame
-    /// from the last committed checkpoint), so they want a plain pipelined
-    /// connection, never the store-and-forward queue. Unlike
-    /// [`Self::borrow_column_sender`], this pool is always direct and always
-    /// poolable up to `pool_max`, even when `sf_dir` is configured.
+    /// Not part of the public API: the direct sender is the transport behind
+    /// [`Self::flush_arrow_batch`] / [`Self::flush_polars_dataframe`], which own
+    /// their own commit + replay. Hidden from the docs; callers ingest through
+    /// those entry points rather than handling a sender.
+    #[doc(hidden)]
     pub fn borrow_direct_column_sender(&self) -> Result<DirectColumnSender<'_>> {
         let cs = pick_column_sender_inner(&self.inner, ColumnPoolKind::Direct)?;
         Ok(DirectColumnSender(ColumnSenderHandle::new(
@@ -467,6 +466,80 @@ impl QuestDb {
             cs,
             ColumnPoolKind::Direct,
         )))
+    }
+
+    /// Flush a single Arrow [`RecordBatch`](arrow_array::RecordBatch) to
+    /// `table` in one call.
+    ///
+    /// This is the recommended entry point for one-off Arrow ingestion: it
+    /// borrows a direct column sender from the pool, publishes the batch as a
+    /// commit boundary, waits for the server `Ok` ack, and returns the sender
+    /// to the pool — callers never handle a sender.
+    ///
+    /// `timestamp_column` selects where each row's designated timestamp comes
+    /// from:
+    /// * `Some(col)` — source it from the named `Timestamp(_)` column of
+    ///   `batch` (mirrors the old `flush_arrow_batch_at_column`).
+    /// * `None` — let the server stamp each row on arrival (mirrors the old
+    ///   `flush_arrow_batch_server_stamped`).
+    ///
+    /// `overrides` carries per-column wire-type hints (e.g. promote a UTF-8
+    /// column to SYMBOL, or a UInt32 to IPv4); pass `&[]` when the Arrow schema
+    /// is self-describing.
+    ///
+    /// `ack_level` chooses how far the call blocks before returning:
+    /// * `None` — wait for the connect string's default, i.e. the same level
+    ///   the store-and-forward senders use: [`AckLevel::Durable`] when
+    ///   `request_durable_ack=on`, otherwise [`AckLevel::Ok`].
+    /// * `Some(level)` — wait for exactly `level`. Requesting
+    ///   [`AckLevel::Durable`] without `request_durable_ack=on` is rejected with
+    ///   [`ErrorCode::InvalidApiCall`].
+    ///
+    /// The call publishes the batch as a commit boundary and blocks until the
+    /// resolved ack level is reached, so the rows are durable when it returns
+    /// `Ok(())`. On a transient [`ErrorCode::FailoverRetry`] it surfaces the
+    /// error rather than replaying (the batch is fully owned by the caller, so
+    /// retrying is a plain re-call); the DataFrame path
+    /// ([`Self::flush_polars_dataframe`]) re-drives automatically instead.
+    ///
+    /// [`ErrorCode::FailoverRetry`]: crate::ErrorCode::FailoverRetry
+    /// [`ErrorCode::InvalidApiCall`]: crate::ErrorCode::InvalidApiCall
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch<'t, T>(
+        &self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        timestamp_column: Option<crate::ingress::ColumnName<'_>>,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+        ack_level: Option<AckLevel>,
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let ack = ack_level.unwrap_or_else(|| self.default_ack_level());
+        let mut sender = self.borrow_direct_column_sender()?;
+        // `table` is moved into exactly one arm, so the generic `T` flows
+        // straight through to the chosen `_and_wait` method unchanged.
+        match timestamp_column {
+            Some(ts) => {
+                sender.flush_arrow_batch_at_column_and_wait(table, batch, ts, overrides, ack)
+            }
+            None => sender.flush_arrow_batch_server_stamped_and_wait(table, batch, overrides, ack),
+        }
+    }
+
+    /// The ack level these convenience flushes wait for when the caller does
+    /// not name one: [`AckLevel::Durable`] when the connect string set
+    /// `request_durable_ack=on`, otherwise [`AckLevel::Ok`]. Mirrors the level
+    /// the store-and-forward senders use for the same pool.
+    #[cfg(feature = "arrow-ingress")]
+    pub(crate) fn default_ack_level(&self) -> AckLevel {
+        if self.inner.connector.request_durable_ack() {
+            AckLevel::Durable
+        } else {
+            AckLevel::Ok
+        }
     }
 
     /// Borrow a **row-major** ([`crate::ingress::Sender`]) ILP sender from the
@@ -1204,6 +1277,13 @@ impl<'a> DirectColumnSender<'a> {
         self.0.reconnect_policy()
     }
 
+    /// The pool's default ack level (see [`QuestDb::default_ack_level`]),
+    /// reached through the handle's owning `QuestDb`.
+    #[cfg(feature = "polars-ingress")]
+    pub(crate) fn default_ack_level(&self) -> AckLevel {
+        self.0.db.default_ack_level()
+    }
+
     /// `true` once the connection has latched terminally closed.
     #[must_use]
     pub fn must_close(&self) -> bool {
@@ -1230,7 +1310,7 @@ impl<'a> DirectColumnSender<'a> {
 
     /// Publish-only Arrow flush (server-stamped). Pair with [`Self::commit`].
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_server_stamped<'t, T>(
+    pub(crate) fn flush_arrow_batch_server_stamped<'t, T>(
         &mut self,
         table: T,
         batch: &arrow_array::RecordBatch,
@@ -1247,7 +1327,7 @@ impl<'a> DirectColumnSender<'a> {
 
     /// Publish-only Arrow flush (column-stamped). Pair with [`Self::commit`].
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_at_column<'t, T>(
+    pub(crate) fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
         table: T,
         batch: &arrow_array::RecordBatch,
@@ -1266,7 +1346,7 @@ impl<'a> DirectColumnSender<'a> {
     /// ACKing Arrow flush (server-stamped): publish as a commit boundary and
     /// wait for `ack_level`.
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_server_stamped_and_wait<'t, T>(
+    pub(crate) fn flush_arrow_batch_server_stamped_and_wait<'t, T>(
         &mut self,
         table: T,
         batch: &arrow_array::RecordBatch,
@@ -1285,7 +1365,7 @@ impl<'a> DirectColumnSender<'a> {
     /// ACKing Arrow flush (column-stamped): publish as a commit boundary and
     /// wait for `ack_level`.
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_at_column_and_wait<'t, T>(
+    pub(crate) fn flush_arrow_batch_at_column_and_wait<'t, T>(
         &mut self,
         table: T,
         batch: &arrow_array::RecordBatch,
@@ -1369,7 +1449,7 @@ impl Drop for OwnedColumnSender {
 
 /// A row-major [`crate::ingress::Sender`] borrowed from a [`QuestDb`] pool.
 ///
-/// Companion to [`SfColumnSender`] / [`DirectColumnSender`] (the column-major handles). Derefs to
+/// Companion to [`SfColumnSender`] (the column-major handle). Derefs to
 /// `Sender`, so the usual `Buffer` build + `flush` flow works unchanged. On
 /// `Drop` the sender is returned to the row-sender pool, unless its connection
 /// has latched `must_close` (or [`Self::mark_must_close`] was called), in which

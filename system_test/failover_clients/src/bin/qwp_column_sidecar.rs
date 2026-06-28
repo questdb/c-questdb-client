@@ -217,16 +217,13 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                     }
                     #[cfg(feature = "polars")]
                     SendSrc::Polars => {
-                        // `flush_polars_dataframe` lives on the direct sender: it
-                        // owns its own commit + replay from the source frame.
-                        let mut sender = db
-                            .borrow_direct_column_sender()
-                            .map_err(|e| e.to_string())?;
+                        // `flush_polars_dataframe` lives on `db`: it borrows a
+                        // direct sender internally and owns its own commit +
+                        // replay from the source frame.
                         let df = build_polars_df(&state.v, &state.ts)?;
                         let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
                         let opts = PolarsIngestOptions::new().timestamp_column(ts_col);
-                        sender
-                            .flush_polars_dataframe(table.as_str(), &df, &opts)
+                        db.flush_polars_dataframe(table.as_str(), &df, &opts)
                             .map_err(|e| e.to_string())?;
                     }
                 }
