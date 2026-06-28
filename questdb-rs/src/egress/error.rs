@@ -50,6 +50,13 @@ pub enum ErrorCode {
     /// Network-level failure (connect, read, write, close).
     SocketError,
 
+    /// The TCP connect (dial) to an endpoint exceeded the configured
+    /// `connect_timeout`. Distinct from [`SocketError`](Self::SocketError)
+    /// so a caller can tell a timed-out dial apart from a refused / reset
+    /// connection. Failover-eligible: the reader advances to the next
+    /// endpoint, exactly as it does for `SocketError`.
+    ConnectTimeout,
+
     /// TLS handshake failure.
     TlsError,
 

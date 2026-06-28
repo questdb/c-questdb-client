@@ -330,6 +330,12 @@ pub const DEFAULT_FAILOVER_MAX_DURATION_MS: u64 = 30_000;
 /// circuit breaking, not transport retry.
 pub const MAX_FAILOVER_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 
+/// Hard upper bound on `connect_timeout` (the per-endpoint TCP dial
+/// budget), in milliseconds. Same 1-hour cap as the other timeouts;
+/// beyond it the user wants application-level circuit breaking, not a
+/// single dial that pins a thread for an hour.
+pub const MAX_CONNECT_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
 /// Default `zstd` compression level advertised in `X-QWP-Accept-Encoding`
 /// as `zstd;level=N`.
 ///
@@ -472,6 +478,17 @@ pub struct ReaderConfig {
     /// programmatic-only (not a connect-string key) so it tracks the
     /// Java reference's `withServerInfoTimeout` surface.
     pub server_info_timeout_ms: u64,
+    /// Per-endpoint TCP connect (dial) budget, in milliseconds. `0`
+    /// (the default) means "no client-imposed connect timeout": the dial
+    /// uses the OS default, which can hang for tens of seconds against a
+    /// black-holed host that silently drops SYNs. When `> 0`, each dial is
+    /// a `TcpStream::connect_timeout` bounded by this value (per resolved
+    /// address); exceeding it surfaces [`ErrorCode::ConnectTimeout`] and,
+    /// under failover, advances to the next endpoint. Connect-string key:
+    /// `connect_timeout`. Does NOT bound name resolution, the TLS
+    /// handshake, the WS upgrade (see `auth_timeout_ms`), or the
+    /// `SERVER_INFO` read (see `server_info_timeout_ms`).
+    pub connect_timeout_ms: u64,
     /// Client's zone identifier — opaque case-insensitive string (e.g.
     /// `eu-west-1a`, `dc-amsterdam`). When set, the host-health tracker
     /// prefers endpoints whose server-advertised `zone_id` matches
@@ -748,6 +765,7 @@ impl ReaderConfig {
         let mut failover_max_duration_ms: u64 = DEFAULT_FAILOVER_MAX_DURATION_MS;
         let mut auth_timeout_ms: u64 = DEFAULT_AUTH_TIMEOUT_MS;
         let server_info_timeout_ms: u64 = DEFAULT_SERVER_INFO_TIMEOUT_MS;
+        let mut connect_timeout_ms: u64 = 0;
         let mut zone: Option<String> = None;
         let mut tls_verify = TlsVerify::On;
         let mut tls_ca = default_tls_ca();
@@ -889,6 +907,9 @@ impl ReaderConfig {
                 "auth_timeout_ms" => {
                     auth_timeout_ms = parse_value("auth_timeout_ms", val)?;
                 }
+                "connect_timeout" => {
+                    connect_timeout_ms = parse_value("connect_timeout", val)?;
+                }
                 "zone" => {
                     // Empty / whitespace-only is treated as unset
                     // (zone-blind). Reject CR/LF — these are headers /
@@ -1018,6 +1039,7 @@ impl ReaderConfig {
             failover_max_duration_ms,
             auth_timeout_ms,
             server_info_timeout_ms,
+            connect_timeout_ms,
             zone,
             auth,
             tls_verify,
@@ -1133,6 +1155,17 @@ impl ReaderConfig {
                 "\"server_info_timeout_ms\" {} exceeds the hard cap of {} (1 hour)",
                 self.server_info_timeout_ms,
                 MAX_SERVER_INFO_TIMEOUT_MS
+            ));
+        }
+        // `connect_timeout = 0` is the documented "OS default" sentinel —
+        // don't reject it. Cap the upper bound so a typo can't pin a dialing
+        // thread for an hour.
+        if self.connect_timeout_ms > MAX_CONNECT_TIMEOUT_MS {
+            return Err(fmt!(
+                ConfigError,
+                "\"connect_timeout\" {} exceeds the hard cap of {} (1 hour)",
+                self.connect_timeout_ms,
+                MAX_CONNECT_TIMEOUT_MS
             ));
         }
         // String fields & auth aren't covered by the numeric/range
@@ -1906,6 +1939,47 @@ mod tests {
         let conf = format!("ws::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS);
         let c = ReaderConfig::from_conf(&conf).unwrap();
         assert_eq!(c.auth_timeout_ms, MAX_AUTH_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn connect_timeout_defaults_to_os_default() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
+        assert_eq!(
+            c.connect_timeout_ms, 0,
+            "default is the OS-default dial (0)"
+        );
+    }
+
+    #[test]
+    fn connect_timeout_parses_from_connect_string() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1;connect_timeout=250").unwrap();
+        assert_eq!(c.connect_timeout_ms, 250);
+    }
+
+    #[test]
+    fn connect_timeout_zero_is_os_default() {
+        // `0` is the documented sentinel for "no client connect timeout";
+        // must not be rejected.
+        let c = ReaderConfig::from_conf("ws::addr=h:1;connect_timeout=0").unwrap();
+        assert_eq!(c.connect_timeout_ms, 0);
+    }
+
+    #[test]
+    fn connect_timeout_at_cap_accepted() {
+        let conf = format!("ws::addr=h:1;connect_timeout={}", MAX_CONNECT_TIMEOUT_MS);
+        let c = ReaderConfig::from_conf(&conf).unwrap();
+        assert_eq!(c.connect_timeout_ms, MAX_CONNECT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn connect_timeout_above_cap_rejected() {
+        let conf = format!(
+            "ws::addr=h:1;connect_timeout={}",
+            MAX_CONNECT_TIMEOUT_MS + 1
+        );
+        let err = ReaderConfig::from_conf(&conf).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("connect_timeout"), "msg: {}", err.msg());
     }
 
     #[test]

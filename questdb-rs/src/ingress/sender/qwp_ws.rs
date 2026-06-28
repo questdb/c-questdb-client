@@ -2165,9 +2165,10 @@ fn connect_qwp_ws_tcp(
     host: &str,
     port: &str,
     request_timeout: Duration,
+    connect_timeout: Option<Duration>,
 ) -> crate::Result<NoSigpipeTcp> {
     let addrs = resolve_qwp_ws_addrs(host, port)?;
-    connect_tcp_to_any_addr(host, port, &addrs, request_timeout)
+    connect_tcp_to_any_addr(host, port, &addrs, request_timeout, connect_timeout)
 }
 
 fn connect_tcp_to_any_addr(
@@ -2175,10 +2176,22 @@ fn connect_tcp_to_any_addr(
     port: &str,
     addrs: &[SocketAddr],
     request_timeout: Duration,
+    connect_timeout: Option<Duration>,
 ) -> crate::Result<NoSigpipeTcp> {
     let mut failures = Vec::new();
+    // Stays true only while *every* attempted address failed specifically with
+    // a connect timeout — lets us surface a distinct, retryable `ConnectTimeout`
+    // rather than burying it under the generic `SocketError`.
+    let mut all_timed_out = true;
     for addr in addrs {
-        match TcpStream::connect(addr) {
+        // `connect_timeout = None` keeps the OS-default blocking dial; `Some`
+        // uses the native non-blocking connect + poll + SO_ERROR check that
+        // `connect_timeout` implements per platform, bounded per address.
+        let res = match connect_timeout {
+            Some(d) => TcpStream::connect_timeout(addr, d),
+            None => TcpStream::connect(addr),
+        };
+        match res {
             Ok(tcp) => {
                 tcp.set_nodelay(true).ok();
                 tcp.set_read_timeout(Some(request_timeout)).ok();
@@ -2189,21 +2202,34 @@ fn connect_tcp_to_any_addr(
                 match NoSigpipeTcp::new(tcp) {
                     Ok(wrapped) => return Ok(wrapped),
                     Err(err) => {
+                        all_timed_out = false;
                         failures.push(format!("{addr}: SO_NOSIGPIPE setup failed: {err}"));
                         continue;
                     }
                 }
             }
-            Err(io) => failures.push(format!("{addr}: {io}")),
+            Err(io) => {
+                if io.kind() != std::io::ErrorKind::TimedOut {
+                    all_timed_out = false;
+                }
+                failures.push(format!("{addr}: {io}"));
+            }
         }
     }
-    Err(error::fmt!(
-        SocketError,
+    let msg = format!(
         "Could not connect to {}:{}; tried {}",
         host,
         port,
         failures.join(", ")
-    ))
+    );
+    // A dial that burned its `connect_timeout` on every candidate surfaces as a
+    // distinct `ConnectTimeout` (still retryable in the reconnect loop) so
+    // callers can tell a timed-out dial apart from refused / reset.
+    Err(if connect_timeout.is_some() && all_timed_out {
+        error::fmt!(ConnectTimeout, "{}", msg)
+    } else {
+        error::fmt!(SocketError, "{}", msg)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2472,8 +2498,9 @@ pub(crate) fn establish_connection(
 ) -> crate::Result<(WsStream, codec::QwpWsHandshakeResult, Vec<u8>)> {
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
+    let connect_timeout = *qwp_ws.connect_timeout;
 
-    let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout)?;
+    let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout)?;
 
     let host_header = if (use_tls && port == "443") || (!use_tls && port == "80") {
         host.to_string()
@@ -3590,11 +3617,43 @@ mod tests {
             &port.to_string(),
             &[bad_v6, good_v4],
             Duration::from_secs(1),
+            None,
         )
         .unwrap();
 
         drop(tcp);
         let _ = accepted.join().unwrap();
+    }
+
+    #[test]
+    fn connect_tcp_to_any_addr_times_out_against_blackhole() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+        // 192.0.2.1 is RFC 5737 TEST-NET-1: globally unrouted, so the SYN is
+        // dropped and the dial blocks until connect_timeout fires (instead of
+        // the OS default, which is tens of seconds).
+        let blackhole = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 19009));
+        let start = std::time::Instant::now();
+        let err = match connect_tcp_to_any_addr(
+            "192.0.2.1",
+            "19009",
+            &[blackhole],
+            Duration::from_secs(1),
+            Some(Duration::from_millis(300)),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("dialing a blackhole endpoint must not succeed"),
+        };
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::ConnectTimeout,
+            "expected ConnectTimeout, got {:?}: {}",
+            err.code(),
+            err.msg()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the dial must be bounded by connect_timeout (~300ms)"
+        );
     }
 
     #[test]
@@ -3606,7 +3665,7 @@ mod tests {
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let io_timeout = Duration::from_millis(250);
 
-        let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout).unwrap();
+        let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout, None).unwrap();
 
         assert_eq!(tcp.tcp().read_timeout().unwrap(), Some(io_timeout));
         assert_eq!(tcp.tcp().write_timeout().unwrap(), Some(io_timeout));

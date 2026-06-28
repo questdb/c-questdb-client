@@ -47,6 +47,12 @@ pub enum ErrorCode {
     /// A network error connecting or flushing data out.
     SocketError,
 
+    /// The TCP connect (dial) to the server exceeded the configured
+    /// `connect_timeout`. Distinct from [`SocketError`](Self::SocketError)
+    /// so a caller can tell a timed-out dial apart from a refused / reset
+    /// connection. Currently produced only by the QWP/WebSocket transport.
+    ConnectTimeout,
+
     /// The string or symbol field is not encoded in valid UTF-8.
     ///
     /// *This error is reserved for the

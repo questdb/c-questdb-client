@@ -848,6 +848,49 @@ fn happy_path_no_failover() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// connect_timeout: bound the TCP dial (native non-blocking connect + poll),
+// surfacing a distinct, failover-eligible ConnectTimeout on expiry.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn connect_timeout_set_does_not_break_a_reachable_connect() {
+    // A reachable endpoint must still connect normally with connect_timeout
+    // set — the budget bounds only the dial, and the mock accepts instantly.
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n1")]);
+    let conf = format!("ws::addr={};connect_timeout=5000", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("reachable connect within budget");
+    let mut cursor = reader.prepare("select 1").execute().expect("execute");
+    assert!(cursor.next_batch().expect("next").is_none());
+}
+
+#[test]
+fn connect_timeout_fires_against_a_blackhole_endpoint() {
+    // 192.0.2.1 is RFC 5737 TEST-NET-1: globally unrouted, so the SYN is
+    // dropped and the dial blocks until connect_timeout fires (instead of the
+    // OS default, which is tens of seconds). `failover=off` so the single
+    // timed-out dial surfaces immediately rather than retrying the budget.
+    let conf = "ws::addr=192.0.2.1:19009;connect_timeout=300;failover=off";
+    let start = Instant::now();
+    let err = match Reader::from_conf(conf) {
+        Err(e) => e,
+        Ok(_) => panic!("dialing a blackhole endpoint must not succeed"),
+    };
+    let elapsed = start.elapsed();
+    assert_eq!(
+        err.code(),
+        ErrorCode::ConnectTimeout,
+        "expected ConnectTimeout, got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the dial must be bounded by connect_timeout (~300ms), took {:?}",
+        elapsed
+    );
+}
+
 #[test]
 fn cache_reset_mid_stream_does_not_break_cursor() {
     // The server emits CACHE_RESET to invalidate the per-connection

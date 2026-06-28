@@ -2894,6 +2894,7 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
     matches!(
         code,
         ErrorCode::SocketError
+            | ErrorCode::ConnectTimeout
             | ErrorCode::HandshakeError
             | ErrorCode::TlsError
             | ErrorCode::ProtocolError
@@ -3375,6 +3376,7 @@ mod tests {
         // between endpoints, plus RoleMismatch (soft skip).
         for code in [
             SocketError,
+            ConnectTimeout,
             HandshakeError,
             TlsError,
             ProtocolError,

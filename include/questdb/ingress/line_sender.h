@@ -154,6 +154,11 @@ typedef enum line_sender_error_code
      *  ("all endpoints unreachable") so callers can tell "no primary
      *  elected" from "all down". */
     line_sender_error_role_mismatch = 18,
+    /** The TCP connect (dial) to the server exceeded the configured
+     *  `connect_timeout`. Distinct from `line_sender_error_socket_error` so a
+     *  caller can tell a timed-out dial apart from a refused / reset
+     *  connection. Produced by the QWP/WebSocket transport. */
+    line_sender_error_connect_timeout = 19,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */

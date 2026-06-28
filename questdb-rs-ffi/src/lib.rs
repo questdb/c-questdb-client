@@ -305,6 +305,11 @@ pub enum line_sender_error_code {
     /// address list). Distinct from `socket_error` ("all endpoints
     /// unreachable") so callers can tell "no primary elected" from "all down".
     line_sender_error_role_mismatch = 18,
+    /// The TCP connect (dial) to the server exceeded the configured
+    /// `connect_timeout`. Distinct from `line_sender_error_socket_error` so a
+    /// caller can tell a timed-out dial apart from a refused / reset
+    /// connection. Produced by the QWP/WebSocket transport.
+    line_sender_error_connect_timeout = 19,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -351,6 +356,7 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::ArrowIngest => line_sender_error_code::line_sender_error_arrow_ingest,
             ErrorCode::FailoverRetry => line_sender_error_code::line_sender_error_failover_retry,
             ErrorCode::RoleMismatch => line_sender_error_code::line_sender_error_role_mismatch,
+            ErrorCode::ConnectTimeout => line_sender_error_code::line_sender_error_connect_timeout,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4832,6 +4838,8 @@ mod tests {
             (line_sender_error_failover_retry, 17),
             // Reader/egress role-filter exhaustion. Append-only.
             (line_sender_error_role_mismatch, 18),
+            // QWP/WebSocket connect timeout. Append-only.
+            (line_sender_error_connect_timeout, 19),
         ];
         for (variant, want) in expected {
             assert_eq!(
@@ -4869,6 +4877,7 @@ mod tests {
                 ErrorCode::ArrowIngest => "ArrowIngest",
                 ErrorCode::FailoverRetry => "FailoverRetry",
                 ErrorCode::RoleMismatch => "RoleMismatch",
+                ErrorCode::ConnectTimeout => "ConnectTimeout",
                 _ => "unmapped",
             }
         }
@@ -4892,6 +4901,7 @@ mod tests {
             ErrorCode::ArrowIngest,
             ErrorCode::FailoverRetry,
             ErrorCode::RoleMismatch,
+            ErrorCode::ConnectTimeout,
         ] {
             assert_ne!(
                 cover(code),

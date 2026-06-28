@@ -127,6 +127,11 @@ pub enum reader_error_code {
     /// produced `ArrayData`'s invariants). Indicates a client bug — not
     /// user-recoverable. Only emitted with the `arrow` feature enabled.
     reader_error_arrow_export = 22,
+    /// The TCP connect (dial) to an endpoint exceeded the configured
+    /// `connect_timeout`. Distinct from `reader_error_socket_error` so a
+    /// caller can tell a timed-out dial apart from a refused / reset
+    /// connection.
+    reader_error_connect_timeout = 23,
 }
 
 impl From<ErrorCode> for reader_error_code {
@@ -156,6 +161,7 @@ impl From<ErrorCode> for reader_error_code {
             ErrorCode::SchemaDrift => reader_error_schema_drift,
             ErrorCode::NoSchema => reader_error_no_schema,
             ErrorCode::ArrowExport => reader_error_arrow_export,
+            ErrorCode::ConnectTimeout => reader_error_connect_timeout,
             // ErrorCode is `#[non_exhaustive]`. Any future variant added
             // upstream that the C ABI hasn't been taught about falls
             // back to ProtocolError so callers see *something* rather
@@ -3971,6 +3977,7 @@ mod tests {
             ErrorCode::SchemaDrift,
             ErrorCode::NoSchema,
             ErrorCode::ArrowExport,
+            ErrorCode::ConnectTimeout,
         ];
         for code in codes {
             let c: reader_error_code = code.into();
@@ -3991,6 +3998,7 @@ mod tests {
         assert_eq!(reader_error_code::reader_error_schema_drift as u32, 20);
         assert_eq!(reader_error_code::reader_error_no_schema as u32, 21);
         assert_eq!(reader_error_code::reader_error_arrow_export as u32, 22);
+        assert_eq!(reader_error_code::reader_error_connect_timeout as u32, 23);
     }
 
     #[test]

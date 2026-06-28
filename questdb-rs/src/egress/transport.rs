@@ -153,7 +153,15 @@ impl WsTransport {
             let mut last_err: Option<std::io::Error> = None;
             let mut connected: Option<TcpStream> = None;
             for addr in &resolved {
-                match TcpStream::connect(addr) {
+                // `connect_timeout = 0` keeps the OS-default blocking dial;
+                // `> 0` uses the native non-blocking connect + poll +
+                // SO_ERROR check that `connect_timeout` implements per
+                // platform, bounded per resolved address.
+                let res = match config.connect_timeout_ms {
+                    0 => TcpStream::connect(addr),
+                    ms => TcpStream::connect_timeout(addr, Duration::from_millis(ms)),
+                };
+                match res {
                     Ok(s) => {
                         connected = Some(s);
                         break;
@@ -165,13 +173,21 @@ impl WsTransport {
                 Some(s) => s,
                 None => {
                     let e = last_err.expect("non-empty addrs but no last_err");
-                    return Err(fmt!(
-                        SocketError,
+                    let msg = format!(
                         "could not connect to {} (tried {} address(es)): {}",
                         endpoint,
                         resolved.len(),
                         e
-                    ));
+                    );
+                    // A dial that burned its `connect_timeout` budget
+                    // surfaces as a distinct, failover-eligible
+                    // `ConnectTimeout` so callers can tell a timed-out dial
+                    // apart from refused / reset.
+                    return Err(if e.kind() == std::io::ErrorKind::TimedOut {
+                        fmt!(ConnectTimeout, "{}", msg)
+                    } else {
+                        fmt!(SocketError, "{}", msg)
+                    });
                 }
             }
         };

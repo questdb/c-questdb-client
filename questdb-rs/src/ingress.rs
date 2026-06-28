@@ -987,6 +987,8 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "auth_timeout_ms" => builder.qwp_ws_auth_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
+                "connect_timeout" => builder.qwp_ws_connect_timeout_millis(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
                 "close_flush_timeout_millis" => builder.close_flush_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "request_durable_ack" => builder.request_durable_ack(val)?,
@@ -1775,6 +1777,29 @@ impl SenderBuilder {
         qwp_ws
             .auth_timeout
             .set_specified("auth_timeout_ms", Duration::from_millis(millis as u64))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn qwp_ws_connect_timeout_millis(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"connect_timeout\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let millis: i64 = parse_conf_value("connect_timeout", value)?;
+        if millis <= 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "connect_timeout must be > 0: {}",
+                millis
+            ));
+        }
+        qwp_ws.connect_timeout.set_specified(
+            "connect_timeout",
+            Some(Duration::from_millis(millis as u64)),
+        )?;
         Ok(self)
     }
 

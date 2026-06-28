@@ -209,6 +209,11 @@ typedef enum reader_error_code
      *  not user-recoverable. Only emitted when the `arrow` feature
      *  is enabled. */
     reader_error_arrow_export = 22,
+    /** The TCP connect (dial) to an endpoint exceeded the configured
+     *  `connect_timeout`. Distinct from `reader_error_socket_error` so a
+     *  caller can tell a timed-out dial apart from a refused / reset
+     *  connection. */
+    reader_error_connect_timeout = 23,
 } reader_error_code;
 
 /**
