@@ -1309,7 +1309,10 @@ impl<'a> DirectColumnSender<'a> {
     }
 
     /// Publish-only Arrow flush (server-stamped). Pair with [`Self::commit`].
-    #[cfg(feature = "arrow-ingress")]
+    /// Only the DataFrame checkpoint loop pipelines publish-only frames, so this
+    /// is gated on `polars-ingress` (a plain `arrow-ingress` build reaches the
+    /// server only through the ACKing `flush_arrow_batch`).
+    #[cfg(feature = "polars-ingress")]
     pub(crate) fn flush_arrow_batch_server_stamped<'t, T>(
         &mut self,
         table: T,
@@ -1326,7 +1329,9 @@ impl<'a> DirectColumnSender<'a> {
     }
 
     /// Publish-only Arrow flush (column-stamped). Pair with [`Self::commit`].
-    #[cfg(feature = "arrow-ingress")]
+    /// `polars-ingress`-gated for the same reason as
+    /// [`Self::flush_arrow_batch_server_stamped`].
+    #[cfg(feature = "polars-ingress")]
     pub(crate) fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
         table: T,
