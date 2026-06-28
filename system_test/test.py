@@ -38,6 +38,7 @@ import argparse
 import unittest
 import itertools
 import inspect
+import random
 import numpy as np
 import time
 import tempfile
@@ -100,6 +101,21 @@ from decimal import Decimal
 QDB_FIXTURE: QuestDbFixtureBase = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
 BUILD_MODE = None
+# Per-test API/CONF/ENV fuzzing. `run_with_fixtures` seeds this once (random,
+# or from QDB_BUILD_MODE_SEED) and prints it so any failure is reproducible.
+# The matrix used to run the whole functional suite 3× — once per BuildMode —
+# at the latest protocol; instead we now run each test once and pick its build
+# mode pseudo-randomly from (seed, test-id), collapsing that 3× into 1×.
+BUILD_MODE_SEED = None
+# True only while the SUITE_MATRIX run uses the per-test fuzzer (set in
+# `_run_selected_tests`). Gates the build-mode override + API-only deferral in
+# `_BuildModeFuzzResult` so the other suites (which pin BuildMode.CONF) are
+# untouched.
+_BUILD_MODE_FUZZ_ACTIVE = False
+# The exact skipTest reason every API-only test/helper raises. The fuzzer keys
+# on it to detect an API-only test that drew CONF/ENV and defer it to a single
+# forced-API retry pass — so no API-only coverage is ever lost to the dice.
+_API_ONLY_SKIP_REASON = 'BuildMode.API-only test'
 QWP_WS_SMOKE_TLS = False
 
 SUITE_MATRIX = 'matrix'
@@ -201,6 +217,74 @@ def _select_tests(suite_kind):
     return suite
 
 
+def _is_latest_protocol() -> bool:
+    """True when the active fixture is pinned to the newest protocol version —
+    the only slice where API/ENV add coverage over CONF, so the only slice the
+    build-mode fuzzer randomizes. Older/auto versions stay on CONF, exactly as
+    the old cartesian product did."""
+    latest = sorted(list(qls.ProtocolVersion))[-1]
+    return QDB_FIXTURE.protocol_version == latest
+
+
+def _select_build_mode_for(test):
+    """Pick the BuildMode for a single matrix test. Deterministic in
+    (seed, test-id), so the printed seed reproduces every choice and the
+    selection is independent of execution order. Non-latest/auto protocol
+    versions are pinned to CONF to mirror the pre-fuzz matrix."""
+    if not _is_latest_protocol():
+        return qls.BuildMode.CONF
+    rng = random.Random(f'{BUILD_MODE_SEED}:{test.id()}')
+    return rng.choice(list(qls.BuildMode))
+
+
+class _BuildModeFuzzResult(unittest.TextTestResult):
+    """TextTestResult that, while the matrix fuzzer is active, assigns each
+    test a pseudo-random BuildMode before it runs and re-queues API-only tests
+    that drew CONF/ENV for a single forced-API retry pass (so the dice never
+    drop their coverage). Fully inert when `_BUILD_MODE_FUZZ_ACTIVE` is False,
+    so the CONF-pinned QWP/WS suites behave exactly as before."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.deferred_api_tests = []
+        self._chosen_mode = None
+
+    def startTest(self, test):
+        if _BUILD_MODE_FUZZ_ACTIVE:
+            global BUILD_MODE
+            BUILD_MODE = _select_build_mode_for(test)
+            self._chosen_mode = BUILD_MODE
+            if self.showAll:
+                self.stream.write(f'[build_mode={BUILD_MODE.name}] ')
+        super().startTest(test)
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        # An API-only test that drew CONF/ENV at the latest protocol skipped
+        # only because of the dice — defer it for one forced-API run so its
+        # coverage survives. At non-latest protocols API-only tests are meant
+        # to skip (only CONF runs there), so don't defer.
+        if (_BUILD_MODE_FUZZ_ACTIVE
+                and reason == _API_ONLY_SKIP_REASON
+                and self._chosen_mode is not qls.BuildMode.API
+                and _is_latest_protocol()):
+            self.deferred_api_tests.append(test)
+
+    def _note_build_mode(self, test):
+        if _BUILD_MODE_FUZZ_ACTIVE and self._chosen_mode is not None:
+            self.stream.writeln(
+                f'    >>> failed under build_mode={self._chosen_mode.name}; '
+                f'reproduce with QDB_BUILD_MODE_SEED={BUILD_MODE_SEED}')
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self._note_build_mode(test)
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self._note_build_mode(test)
+
+
 def _run_selected_tests(suite_kind):
     suite = _select_tests(suite_kind)
     if suite.countTestCases() == 0:
@@ -220,8 +304,31 @@ def _run_selected_tests(suite_kind):
         runner_args['tb_locals'] = getattr(program, 'tb_locals', False)
     if 'durations' in runner_params:
         runner_args['durations'] = getattr(program, 'durations', None)
-    runner = unittest.TextTestRunner(**runner_args)
-    return runner.run(suite).wasSuccessful()
+    runner_args['resultclass'] = _BuildModeFuzzResult
+
+    # The per-test BuildMode fuzzer runs only for the functional matrix suite
+    # (the other suites pin BuildMode.CONF) and only once a seed exists.
+    global _BUILD_MODE_FUZZ_ACTIVE, BUILD_MODE
+    _BUILD_MODE_FUZZ_ACTIVE = (suite_kind == SUITE_MATRIX and BUILD_MODE_SEED is not None)
+    try:
+        runner = unittest.TextTestRunner(**runner_args)
+        result = runner.run(suite)
+        ok = result.wasSuccessful()
+        deferred = getattr(result, 'deferred_api_tests', [])
+        if deferred:
+            # Single forced-API retry pass for the API-only tests the fuzzer
+            # happened to assign CONF/ENV. No fuzzing here — BuildMode.API is
+            # pinned so they actually run instead of self-skipping.
+            _BUILD_MODE_FUZZ_ACTIVE = False
+            BUILD_MODE = qls.BuildMode.API
+            sys.stderr.write(
+                f'>>>> Re-running {len(deferred)} API-only test(s) under '
+                f'BuildMode.API (the fuzzer had assigned them CONF/ENV)\n')
+            retry_runner = unittest.TextTestRunner(**runner_args)
+            ok = retry_runner.run(unittest.TestSuite(deferred)).wasSuccessful() and ok
+        return ok
+    finally:
+        _BUILD_MODE_FUZZ_ACTIVE = False
 
 
 def _read_exact(sock, byte_count, pending=b''):
@@ -4189,8 +4296,21 @@ def run_with_fixtures(args):
     global BUILD_MODE
     global QWP_WS_SMOKE_TLS
 
+    global BUILD_MODE_SEED
+
     is_docker = bool(getattr(args, 'docker', None))
     latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
+
+    # Seed the per-test API/CONF/ENV fuzzer once per process. Default random;
+    # override via QDB_BUILD_MODE_SEED to reproduce a specific run's choices.
+    if BUILD_MODE_SEED is None:
+        _env_seed = os.environ.get('QDB_BUILD_MODE_SEED')
+        BUILD_MODE_SEED = int(_env_seed) if _env_seed not in (None, '') \
+            else random.randrange(1 << 63)
+        sys.stderr.write(
+            f'>>>> build_mode fuzz seed = {BUILD_MODE_SEED} '
+            f'(API/CONF/ENV picked per-test at the latest protocol; '
+            f're-run with QDB_BUILD_MODE_SEED={BUILD_MODE_SEED} to reproduce)\n')
     run_matrix_suite = _select_tests(SUITE_MATRIX).countTestCases() > 0
     run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
     run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
@@ -4209,21 +4329,23 @@ def run_with_fixtures(args):
                 try:
                     sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
                     QDB_FIXTURE.start()
-                    for http, protocol_version, build_mode in itertools.product(
+                    for http, protocol_version in itertools.product(
                             (False, True),  # http
-                            [None] + list(qls.ProtocolVersion),  # None is for `auto`
-                            list(qls.BuildMode)):
-                        if (build_mode in (qls.BuildMode.API, qls.BuildMode.ENV)) and (protocol_version != latest_protocol):
-                            continue
+                            [None] + list(qls.ProtocolVersion)):  # None is `auto`
                         if http and auth:
                             continue
                         if auth and (protocol_version != latest_protocol):
                             continue
                         sys.stderr.write(
-                            f'>>>> Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]\n')
-                        # Read the version _after_ a first start so it can rely
-                        # on the live one from the `select build` query.
-                        BUILD_MODE = build_mode
+                            f'>>>> Running tests [auth={auth}, http={http}, '
+                            f'protocol_version={protocol_version}, '
+                            f'build_mode=fuzzed(seed={BUILD_MODE_SEED})]\n')
+                        # BuildMode is now chosen per-test by the fuzzer in
+                        # `_BuildModeFuzzResult`, collapsing the old 3×
+                        # API/CONF/ENV sweep at the latest protocol into one
+                        # pass. This assignment is only a fallback for when the
+                        # fuzzer is inactive.
+                        BUILD_MODE = qls.BuildMode.CONF
                         QDB_FIXTURE.http = http
                         QDB_FIXTURE.protocol_version = protocol_version
                         port_to_proxy = QDB_FIXTURE.http_server_port \
