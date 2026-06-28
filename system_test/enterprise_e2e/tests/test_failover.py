@@ -18,7 +18,6 @@ can either run every binding's tests (``-m c_client``) or just one
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import time
 from pathlib import Path
@@ -391,15 +390,13 @@ def test_inmem_sf_survives_primary_failover_c_client_rust(
 @pytest.mark.parametrize(
     "src",
     [
+        # Store-and-forward column shapes only. The direct-path `polars`
+        # shape (Db::flush_polars_dataframe) does NOT survive this body's
+        # kill-9 + object-store wipe -- it has no client-side SF replay --
+        # so its failover coverage lives in test_polars_db_failover.py, which
+        # uses the correct no-wipe survival model and asserts auto-redrive.
         "chunk",
         "arrow",
-        pytest.param(
-            "polars",
-            marks=pytest.mark.skipif(
-                not os.environ.get("C_QUESTDB_CLIENT_COLUMN_POLARS"),
-                reason="set C_QUESTDB_CLIENT_COLUMN_POLARS to build the sidecar's polars feature",
-            ),
-        ),
     ],
 )
 def test_kill9_primary_failover_no_data_loss_c_client_rust_columnar(
