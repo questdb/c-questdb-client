@@ -2828,7 +2828,10 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut predicate: F) -> bool {
 
 // ---------- F1: retry-from-source at the DataFrame entry ----------
 
-#[cfg(feature = "polars-ingress")]
+// Used by both the arrow-ingress and polars-ingress tests below.
+// `polars-ingress` implies `arrow-ingress`, so gate on the latter to keep
+// the helper available whenever either test set compiles.
+#[cfg(feature = "arrow-ingress")]
 fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
     // A QWP data frame carries `table_count >= 1` at bytes 6..8; the
     // header-only commit frame the `sync` sends has `table_count == 0`.
