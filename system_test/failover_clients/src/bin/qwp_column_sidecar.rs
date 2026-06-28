@@ -18,11 +18,18 @@
 //!   EXIT                                        -> (no reply, exits 0)
 //!
 //! `<src>` selects the column-major input shape FLUSH builds from the
-//! accumulated rows: `chunk` (default; a `Chunk` of borrowed column slices) or
-//! `arrow` (an Arrow `RecordBatch`). Both funnel to the same QWP/WebSocket
-//! columnar wire and the same store-and-forward backend, so the failover
-//! contract is identical — the variants differ only in how the sender ingests
-//! the data.
+//! accumulated rows:
+//!   - `chunk` (default; a `Chunk` of borrowed column slices) and `arrow` (an
+//!     Arrow `RecordBatch`) both go through the **store-and-forward** column
+//!     sender (`borrow_column_sender`), so the SF replay/failover contract is
+//!     identical to the row sidecar.
+//!   - `arrow_db` drives the **direct** (non-store-and-forward) `Db` facade
+//!     entry point `Db::flush_arrow_batch`, the one application code calls.
+//!     It publishes the batch as a commit boundary and blocks until the
+//!     default ack level, but it does NOT replay: on a primary move
+//!     mid-publish it surfaces `FailoverRetry` as `ERR`, and the documented
+//!     caller contract is to re-call (the harness re-issues `FLUSH`). This is
+//!     the path the `flush_arrow_batch` failover tests exercise.
 //!
 //! Durability model: the column sender expresses acknowledgement through
 //! `AckLevel`, not an integer FSN. `SEND` accumulates a single `LONG` column
@@ -111,6 +118,9 @@ enum SendSrc {
     #[default]
     Chunk,
     Arrow,
+    /// Direct `Db::flush_arrow_batch` (non-store-and-forward). The API under
+    /// test by the `flush_arrow_batch` failover scenarios.
+    ArrowDb,
     #[cfg(feature = "polars")]
     Polars,
 }
@@ -158,6 +168,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             let src = match parts.get(3).copied() {
                 None | Some("chunk") => SendSrc::Chunk,
                 Some("arrow") => SendSrc::Arrow,
+                Some("arrow_db") => SendSrc::ArrowDb,
                 #[cfg(feature = "polars")]
                 Some("polars") => SendSrc::Polars,
                 Some(other) => return Err(format!("unknown SEND src: {other}")),
@@ -213,6 +224,22 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                             .map_err(|e| e.to_string())?;
                         sender
                             .wait(AckLevel::Ok, Duration::ZERO)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    SendSrc::ArrowDb => {
+                        // The DIRECT (non-store-and-forward) facade entry point
+                        // under test. `Db::flush_arrow_batch` borrows a direct
+                        // column sender internally, publishes the batch as a
+                        // commit boundary, and blocks until the default ack
+                        // level (Durable when request_durable_ack=on, else Ok).
+                        // It owns no SF queue, so on a primary move mid-publish
+                        // it returns FailoverRetry rather than replaying; that
+                        // surfaces here as `ERR` and the harness re-issues FLUSH
+                        // (state.v/ts are only cleared on success below, so the
+                        // batch is rebuilt identically on the re-call).
+                        let batch = build_arrow_batch(&state.v, &state.ts)?;
+                        let ts_col = ColumnName::new("ts").map_err(|e| e.to_string())?;
+                        db.flush_arrow_batch(table.as_str(), &batch, Some(ts_col), &[], None)
                             .map_err(|e| e.to_string())?;
                     }
                     #[cfg(feature = "polars")]

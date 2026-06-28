@@ -202,10 +202,12 @@ class CClientRustColumnSidecar(CClientRustSidecar):
 
     def send(self, table: str, count: int, start_index: int = 0,
              src: str = "chunk") -> None:
-        """Column-major SEND with an explicit input shape. ``src`` is ``chunk``
-        (default; a borrowed-slice ``Chunk``) or ``arrow`` (an Arrow
-        ``RecordBatch``); the sidecar builds the matching column-major frame at
-        FLUSH. Both encode to the same QWP/WebSocket columnar wire."""
+        """Column-major SEND with an explicit input shape. ``src`` is one of:
+        ``chunk`` (default; a borrowed-slice ``Chunk``) or ``arrow`` (an Arrow
+        ``RecordBatch``) -- both go through the store-and-forward column sender;
+        or ``arrow_db`` -- the direct ``Db::flush_arrow_batch`` facade (no
+        store-and-forward; surfaces FailoverRetry to the caller). The sidecar
+        builds the matching column-major frame at FLUSH."""
         self._send(f"SEND {table} {count} {start_index} {src}")
         self._expect_ok()
 
