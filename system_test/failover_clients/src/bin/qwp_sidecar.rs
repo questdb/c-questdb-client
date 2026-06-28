@@ -210,23 +210,33 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                 .sender
                 .as_ref()
                 .ok_or_else(|| "no sender".to_string())?;
-            // `acked_fsn` returns None until the first ACK lands; emit
-            // -1 to match the Python parser's default and the Java
-            // sidecar's "no-frame-yet" convention.
+            // Best-effort, never replies ERR: STATS is a diagnostic verb the
+            // harness calls *after* write errors (e.g. a write to a node that
+            // went read-only on a role switch) to read counters. The sender's
+            // accessors can surface its last wire error as Err in that state;
+            // the Java sidecar's STATS always returns its counters regardless,
+            // so mirror that and fall back to the -1/0 sentinels the Python
+            // parser already expects rather than failing the whole STATS.
+            // `acked_fsn` also returns None until the first ACK lands -> -1.
             let acked = sender
                 .acked_fsn()
-                .map_err(|e| e.to_string())?
+                .ok()
+                .flatten()
                 .map(|n| n as i64)
                 .unwrap_or(-1);
-            let totals = sender.qwp_ws_totals().map_err(|e| e.to_string())?;
-            let payload = format!(
-                "acked={acked} sent={} acks={} reconnAttempts={} reconnSucc={} serverErrors={}",
-                totals.frames_sent,
-                totals.acks,
-                totals.reconnect_attempts,
-                totals.reconnects_succeeded,
-                totals.server_errors,
-            );
+            let payload = match sender.qwp_ws_totals() {
+                Ok(t) => format!(
+                    "acked={acked} sent={} acks={} reconnAttempts={} reconnSucc={} serverErrors={}",
+                    t.frames_sent,
+                    t.acks,
+                    t.reconnect_attempts,
+                    t.reconnects_succeeded,
+                    t.server_errors,
+                ),
+                Err(_) => format!(
+                    "acked={acked} sent=0 acks=0 reconnAttempts=0 reconnSucc=0 serverErrors=0"
+                ),
+            };
             reply_ok(out, &payload)
         }
         "CLOSE" => {

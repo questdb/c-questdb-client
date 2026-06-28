@@ -701,8 +701,15 @@ def test_no_request_durable_ack_loses_rows_c_client_rust(
     p2 = server_factory("p2", db_root_name="p2-fresh")
     p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
 
-    # Wait for the sender to reconnect to P2 -- proves it had the chance to
-    # replay anything still in its SF (so the loss is the trim, not a miss).
+    # Force a reconnect to P2. Unlike the Java client, the Rust sender only
+    # (re)connects when it has data to flush -- an idle sender whose SF was
+    # OK-trimmed never reconnects on its own. Send a fresh probe row so the
+    # sender connects to P2, proving it CAN reach the successor (so the loss
+    # assertion below can't pass for a "never reached P2" reason). The probe
+    # (index row_count) is the only row P2 receives; the OK-trimmed original
+    # batch is gone.
+    c_client_rust_sidecar.send(table, count=1, start_index=row_count)
+    c_client_rust_sidecar.flush()
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
         if c_client_rust_sidecar.stats().reconn_succ > baseline_reconn:
@@ -710,7 +717,7 @@ def test_no_request_durable_ack_loses_rows_c_client_rust(
         time.sleep(0.1)
     else:
         pytest.fail(
-            f"sender never reconnected to P2 within 15s "
+            f"sender never reconnected to P2 within 15s even after a probe send "
             f"(reconn_succ stayed at {baseline_reconn}); the loss assertion "
             "would pass for the wrong reason."
         )
@@ -790,6 +797,14 @@ def test_orphan_drainer_durable_ack_survives_kill_c_client_rust(
 
     p2 = server_factory("p2", db_root_name="p2-fresh")
     p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+
+    # When P1 died mid-drain the orphan worker returned RetryLater and stopped:
+    # the Rust drainer (drain_orphan_to_completion) does NOT autonomously
+    # reconnect to a successor within one attempt. The orphan slot is only
+    # re-attempted by a *fresh* orphan scan, which runs on the next CONNECT with
+    # drain_orphans=on. Reconnect the foreground sender so a new scan adopts the
+    # still-un-acked ghost slot and replays it to P2.
+    c_client_rust_sidecar.connect(fg_cs)
 
     wait_for_dense_sequence(port=p1_ports.pg, table=table,
                             expected_count=row_count, timeout_s=60.0)
