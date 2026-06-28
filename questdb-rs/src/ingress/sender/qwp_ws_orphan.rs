@@ -441,9 +441,13 @@ impl OrphanDrainer {
                 *config.qwp_ws.reconnect_initial_backoff,
                 *config.qwp_ws.reconnect_max_backoff,
             ),
-            // Java orphan drainers reuse the foreground WebSocket connection
-            // factory but trim orphan files on ordinary OKs, not durable ACKs.
-            false,
+            // Honour the connect string's request_durable_ack, exactly like the
+            // foreground sender. When durable-ack was requested the orphan slot
+            // must be trimmed only on durable ACKs, not ordinary OKs -- otherwise
+            // an OK'd-but-not-yet-durable orphan frame is dropped on a plain OK
+            // and is lost when the primary fails over before the WAL upload,
+            // instead of surviving in the slot and replaying to the successor.
+            *config.qwp_ws.request_durable_ack,
         );
         OrphanOpenOutcome::Drainer(Box::new(Self {
             slot_dir,
