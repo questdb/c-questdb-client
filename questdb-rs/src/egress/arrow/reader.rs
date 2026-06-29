@@ -41,11 +41,12 @@ pub struct CursorRecordBatchReader<'r, 'c> {
     pending: Option<RecordBatch>,
     poisoned: bool,
     /// `Cursor::failover_resets()` at the point `schema` was pinned. A
-    /// later batch arriving with a higher count is the first frame of a
     /// transparently-replayed query (re-read from `batch_seq 0` on a new
-    /// endpoint), so the pinned schema is re-snapshotted from it rather
-    /// than treated as drift. `fetch_all_arrow` reads the same counter to
-    /// discard its partial accumulation.
+    /// endpoint) bumps the cursor counter; the replayed batch 0 is accepted
+    /// without an internal drift check but must still match the pinned
+    /// schema, since a [`RecordBatchReader`]'s schema is fixed for its
+    /// lifetime. `fetch_all_arrow` reads the same counter to discard its
+    /// partial accumulation.
     resets_at_pin: u32,
 }
 
@@ -93,11 +94,11 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
             return Some(Ok(rb));
         }
         // A transparent mid-query failover re-reads the result from
-        // `batch_seq 0` on a new endpoint, so the pinned schema is
-        // re-snapshotted from the first replayed batch instead of being
-        // compared against it; the drift check resumes against the new
-        // schema. Pass `None` (no drift check) for that first replayed
-        // frame so the new node's batch 0 isn't rejected as drift.
+        // `batch_seq 0` on a new endpoint. Pass `None` (no drift check) for
+        // that first replayed frame so the new node's batch 0 isn't rejected,
+        // then require it to match the pinned schema: a RecordBatchReader's
+        // schema must be stable for its lifetime, so a genuinely different
+        // post-failover schema is surfaced as drift, not silently swapped in.
         let drift_check = if self.cursor.failover_resets() == self.resets_at_pin {
             Some(&self.schema)
         } else {
@@ -106,7 +107,16 @@ impl Iterator for CursorRecordBatchReader<'_, '_> {
         match self.cursor.next_arrow_batch_inner(drift_check, false) {
             Ok(Some(rb)) => {
                 if self.cursor.failover_resets() != self.resets_at_pin {
-                    self.schema = rb.schema();
+                    if rb.schema() != self.schema {
+                        self.poisoned = true;
+                        return Some(Err(external_arrow_error(Error::new(
+                            ErrorCode::SchemaDrift,
+                            "post-failover replay returned a different schema; \
+                             a RecordBatchReader schema must be stable for the \
+                             reader's lifetime; use Cursor::next_arrow_batch to \
+                             handle drift explicitly",
+                        ))));
+                    }
                     self.resets_at_pin = self.cursor.failover_resets();
                 } else if has_tentative_array(&self.schema) && rb.schema() != self.schema {
                     self.poisoned = true;

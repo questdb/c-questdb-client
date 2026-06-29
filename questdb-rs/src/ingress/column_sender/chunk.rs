@@ -470,6 +470,10 @@ impl<'a> Chunk<'a> {
 
     /// Append an `i8` column (QWP wire type `BYTE`). `validity` may
     /// carry per-row null bits (Arrow shape: bit = 1 means VALID).
+    ///
+    /// QWP `BYTE` has no NULL representation on the wire: null rows are
+    /// written as `0`. Use a wider column (`column_i32` / `column_i64`) if
+    /// you need to distinguish null from `0` downstream.
     pub fn column_i8(
         &mut self,
         name: &str,
@@ -488,7 +492,12 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Append an `i16` column (QWP wire type `SHORT`).
+    /// Append an `i16` column (QWP wire type `SHORT`). `validity` may
+    /// carry per-row null bits.
+    ///
+    /// QWP `SHORT` has no NULL representation on the wire: null rows are
+    /// written as `0`. Use a wider column (`column_i32` / `column_i64`) if
+    /// you need to distinguish null from `0` downstream.
     pub fn column_i16(
         &mut self,
         name: &str,
@@ -774,7 +783,7 @@ impl<'a> Chunk<'a> {
         let row_count = offsets.len() - 1;
         let row_count = check_row_count(self.row_count, row_count, validity)?;
         validate_varchar_offsets(offsets, bytes.len())?;
-        validate_varchar_utf8(&bytes[offsets[0] as usize..offsets[offsets.len() - 1] as usize])?;
+        validate_varchar_utf8_cells(bytes, offsets)?;
         self.push_column(
             name,
             QWP_TYPE_VARCHAR,
@@ -813,7 +822,7 @@ impl<'a> Chunk<'a> {
         let row_count = offsets.len() - 1;
         let row_count = check_row_count(self.row_count, row_count, validity)?;
         validate_varchar_offsets_i64(offsets, bytes.len())?;
-        validate_varchar_utf8(&bytes[offsets[0] as usize..offsets[offsets.len() - 1] as usize])?;
+        validate_varchar_utf8_cells(bytes, offsets)?;
         self.push_column(
             name,
             QWP_TYPE_VARCHAR,
@@ -1011,6 +1020,14 @@ impl<'a> Chunk<'a> {
                 "symbol dict offsets must have at least one entry (dict_len + 1)"
             ));
         }
+        let dict_len = dict_offsets_len - 1;
+        if dict_len > super::MAX_SYMBOL_DICT_ENTRIES {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "symbol dict has {dict_len} entries, exceeding the per-column maximum of {}",
+                super::MAX_SYMBOL_DICT_ENTRIES
+            ));
+        }
         match dict_offsets {
             SymbolOffsetsPtr::I32(p) => {
                 let offsets = unsafe { slice::from_raw_parts(p, dict_offsets_len) };
@@ -1021,7 +1038,6 @@ impl<'a> Chunk<'a> {
                 validate_varchar_offsets_i64(offsets, dict_bytes.len())?;
             }
         }
-        let dict_len = dict_offsets_len - 1;
 
         // Range-check codes for non-null rows. The encoder relies on
         // every non-null code being a valid dict index, so we surface
@@ -1261,10 +1277,30 @@ impl<'a> Chunk<'a> {
     }
 }
 
-fn validate_varchar_utf8(bytes: &[u8]) -> Result<()> {
-    std::str::from_utf8(bytes)
-        .map(|_| ())
-        .map_err(|e| error::fmt!(InvalidApiCall, "VARCHAR bytes are not valid UTF-8: {}", e))
+/// Validate that the span `[offsets[0], offsets[last])` of `bytes` is UTF-8
+/// and that every interior offset lands on a char boundary. The encoder
+/// slices each cell by `offsets`, so a span that is valid as a whole but
+/// whose offsets split a multi-byte character would emit per-cell-invalid
+/// VARCHAR; reject that here at append time.
+fn validate_varchar_utf8_cells<O>(bytes: &[u8], offsets: &[O]) -> Result<()>
+where
+    O: Copy + Into<i64>,
+{
+    let base: i64 = offsets[0].into();
+    let end: i64 = offsets[offsets.len() - 1].into();
+    let span = std::str::from_utf8(&bytes[base as usize..end as usize])
+        .map_err(|e| error::fmt!(InvalidApiCall, "VARCHAR bytes are not valid UTF-8: {}", e))?;
+    for o in offsets.get(1..offsets.len() - 1).unwrap_or(&[]) {
+        let off: i64 = (*o).into();
+        if !span.is_char_boundary((off - base) as usize) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "VARCHAR offset {} splits a multi-byte UTF-8 character",
+                off
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_varchar_offsets(offsets: &[i32], bytes_len: usize) -> Result<()> {
@@ -1510,6 +1546,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("UTF-8"));
+    }
+
+    #[test]
+    fn varchar_rejects_offset_splitting_multibyte_char() {
+        let mut chunk = Chunk::new("t");
+        // "é" is two bytes (0xC3 0xA9): the whole span is valid UTF-8, but
+        // splitting it at offset 1 yields two individually-invalid cells.
+        let offsets = [0i32, 1, 2];
+        let err = chunk
+            .column_varchar("v", &offsets, &[0xC3, 0xA9], None)
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("splits a multi-byte"));
+    }
+
+    #[test]
+    fn varchar_accepts_char_aligned_multibyte_offsets() {
+        let mut chunk = Chunk::new("t");
+        // "a" then "é": every offset lands on a char boundary, so both cells
+        // are independently valid UTF-8.
+        chunk
+            .column_varchar("v", &[0i32, 1, 3], &[0x61, 0xC3, 0xA9], None)
+            .unwrap();
+        assert_eq!(chunk.row_count(), 2);
     }
 
     #[test]

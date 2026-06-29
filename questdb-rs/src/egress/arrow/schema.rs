@@ -235,11 +235,11 @@ fn ndim_from_shapes(shapes: &[u32], shape_offsets: &[u32]) -> Result<Option<usiz
             )
         })? as usize;
         if dims > 0 {
-            if dims > shapes.len() {
+            if w[1] as usize > shapes.len() {
                 return Err(fmt!(
                     ProtocolError,
-                    "shape_offsets points past shapes buffer (dim_count={}, shapes.len()={})",
-                    dims,
+                    "shape_offsets points past shapes buffer (end={}, shapes.len()={})",
+                    w[1],
                     shapes.len()
                 ));
             }

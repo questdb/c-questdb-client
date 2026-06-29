@@ -141,8 +141,11 @@ typedef enum column_sender_ack_level
  * ------------------------------------------------------------------------- */
 
 /**
- * Open a connection pool. Eagerly opens `pool_size` connections (default
- * 1); any auth / TLS / connect error during those opens fails the call.
+ * Open a connection pool. The pool is lazy: this call parses and validates
+ * the connect string but opens no connections; the first borrow opens one,
+ * so auth / TLS / connect errors surface from the borrow, not from here.
+ * `pool_size` (default 1) is the warm minimum the reaper keeps once
+ * connections have been opened.
  *
  * `conf` is a `qwpws::` / `qwpwss::` connect string. Pool-specific keys:
  *   `pool_size`            (default 1)   warm/min connections;
@@ -1191,6 +1194,13 @@ typedef struct column_sender_numpy_extras
  * reading past the real allocation (host-memory leak onto the wire, or a
  * crash). Pass `arr.nbytes` for a NumPy array; pass `0` when `data` is
  * NULL (only legal with `row_count == 0`).
+ *
+ * CONTIGUITY: the buffer MUST be C-contiguous. The walk reads `row_count`
+ * elements forward from `data` at the dtype's native stride; NumPy strides
+ * are not passed in and cannot be checked here, so a non-contiguous view
+ * (sliced / transposed / reversed) whose `nbytes` still matches the length
+ * check is read out of bounds — undefined behaviour. Call
+ * `numpy.ascontiguousarray(arr)` before handing the buffer over.
  */
 QUESTDB_CLIENT_API
 bool column_sender_chunk_append_numpy_column(

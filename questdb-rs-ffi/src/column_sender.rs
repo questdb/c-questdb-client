@@ -410,6 +410,18 @@ unsafe fn name_str<'a>(
         }
         return None;
     }
+    if name_len > isize::MAX as usize {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "name length exceeds the maximum addressable size".to_string(),
+                ),
+            );
+        }
+        return None;
+    }
     let slice = if name_len == 0 {
         &[]
     } else {
@@ -545,9 +557,10 @@ macro_rules! bubble {
 // Pool
 // ===========================================================================
 
-/// Open a connection pool. Eagerly opens `pool_size` connections; any
-/// server/auth/TLS error during those opens fails the call. `conf` is a
-/// NUL-terminated UTF-8 string.
+/// Open a connection pool. The pool is lazy: this call parses and validates
+/// the connect string but opens no connections; the first borrow opens one,
+/// so server/auth/TLS errors surface from the borrow, not from here. `conf`
+/// is a UTF-8 string of `conf_len` bytes.
 ///
 /// Returns NULL on failure. When `err_out != NULL`, the error is placed
 /// in `*err_out` and ownership transfers to the caller (release with
@@ -2313,8 +2326,14 @@ unsafe fn resolve_numpy_dtype(
 /// pointing at `array_ndim` per-dim u32 sizes, each >= 1). For every
 /// other dtype, `extras` is ignored and may be NULL.
 ///
-/// Strided and non-native-endian arrays are not supported; consolidate
-/// upstream.
+/// # CONTIGUITY
+///
+/// The buffer MUST be C-contiguous and native-endian. The walk reads
+/// `row_count` elements forward at the dtype's native stride; NumPy strides
+/// are not passed in and cannot be checked, so a non-contiguous view
+/// (sliced / transposed / reversed) whose `nbytes` still satisfies the
+/// length check is read out of bounds — undefined behaviour. Call
+/// `numpy.ascontiguousarray(arr)` upstream before handing the buffer over.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
     chunk: *mut column_sender_chunk,
@@ -3515,6 +3534,78 @@ mod tests {
         assert!(db.is_null());
         assert!(!err.is_null());
         unsafe { line_sender_error_free(err) };
+    }
+
+    #[test]
+    fn borrow_column_sender_with_retry_null_db_is_safe() {
+        // The NULL-db guard lives in `borrow_cs`, shared by both retry shims:
+        // NULL in → NULL out + a populated error, never a deref/abort.
+        for budget in [0u64, 50] {
+            let mut err_sf: *mut line_sender_error = std::ptr::null_mut();
+            let sf = unsafe {
+                questdb_db_borrow_sf_column_sender_with_retry(
+                    std::ptr::null_mut(),
+                    budget,
+                    &mut err_sf,
+                )
+            };
+            assert!(sf.is_null());
+            assert!(!err_sf.is_null());
+            unsafe { line_sender_error_free(err_sf) };
+
+            let mut err_direct: *mut line_sender_error = std::ptr::null_mut();
+            let direct = unsafe {
+                questdb_db_borrow_direct_column_sender_with_retry(
+                    std::ptr::null_mut(),
+                    budget,
+                    &mut err_direct,
+                )
+            };
+            assert!(direct.is_null());
+            assert!(!err_direct.is_null());
+            unsafe { line_sender_error_free(err_direct) };
+        }
+    }
+
+    #[test]
+    fn borrow_direct_column_sender_with_retry_fails_against_dead_endpoint() {
+        // Bind then drop to get a definitely-closed local port. The pool is
+        // lazy, so the connect only happens on borrow; a closed port refuses
+        // immediately, so the Direct retry shim must exhaust its budget and
+        // surface NULL + a populated error across the FFI boundary — not panic
+        // or abort under the crate's `panic = "abort"` profile.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+            listener.local_addr().expect("local_addr").port()
+        };
+        let conf = format!(
+            "qwpws::addr=127.0.0.1:{port};auth_timeout=2000;reconnect_max_duration_millis=1000;"
+        );
+        let mut err: *mut line_sender_error = std::ptr::null_mut();
+        let db =
+            unsafe { questdb_db_connect(conf.as_ptr() as *const c_char, conf.len(), &mut err) };
+        assert!(
+            !db.is_null(),
+            "lazy connect opens no socket, so it succeeds"
+        );
+        assert!(err.is_null());
+
+        // Non-zero budget: the retry loop makes a few attempts, then gives up
+        // once the budget is spent.
+        let conn = unsafe { questdb_db_borrow_direct_column_sender_with_retry(db, 150, &mut err) };
+        assert!(conn.is_null(), "borrow against a closed port must fail");
+        assert!(!err.is_null(), "a failed borrow must populate err_out");
+        unsafe { line_sender_error_free(err) };
+
+        // Zero budget makes a single attempt; still fails, error reported, no
+        // leak or panic.
+        let mut err0: *mut line_sender_error = std::ptr::null_mut();
+        let conn0 = unsafe { questdb_db_borrow_direct_column_sender_with_retry(db, 0, &mut err0) };
+        assert!(conn0.is_null());
+        assert!(!err0.is_null());
+        unsafe { line_sender_error_free(err0) };
+
+        unsafe { questdb_db_close(db) };
     }
 
     #[test]

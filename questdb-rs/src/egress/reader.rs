@@ -1793,10 +1793,21 @@ impl<'r> Cursor<'r> {
             };
             match outcome {
                 NextOutcome::Done => return Ok(None),
-                NextOutcome::HaveBatch => self
-                    .last_batch
-                    .take()
-                    .expect("HaveBatch implies last_batch"),
+                // `next_batch_inner` populates `last_batch` before returning
+                // `HaveBatch`; re-check softly rather than `.expect()`, since a
+                // panic would abort the whole process across the FFI boundary
+                // (`panic=abort`) if a future refactor broke the invariant.
+                NextOutcome::HaveBatch => match self.last_batch.take() {
+                    Some(b) => b,
+                    None => {
+                        let e = fmt!(
+                            ProtocolError,
+                            "internal invariant: next_batch produced a batch without a decoded view"
+                        );
+                        self.stash_arrow_terminal_error(&e);
+                        return Err(e);
+                    }
+                },
             }
         };
         let egress_schema = match self.reader.query_schema.as_ref() {

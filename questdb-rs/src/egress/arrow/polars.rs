@@ -154,10 +154,10 @@ impl Iterator for CursorPolarsIter<'_, '_> {
             rb
         } else {
             // A transparent mid-query failover re-reads the result from
-            // `batch_seq 0` on a new endpoint, so the pinned schema is
-            // re-snapshotted from the first replayed batch instead of
-            // being compared against it. Pass `None` (no drift check)
-            // for that frame so the new node's batch 0 isn't rejected.
+            // `batch_seq 0` on a new endpoint. Pass `None` (no drift check)
+            // for that frame so the new node's batch 0 isn't rejected, then
+            // require it to match the pinned schema so the iterator's
+            // `schema()` stays stable across the replay.
             let drift_check = if self.cursor.failover_resets() == self.resets_at_pin {
                 Some(&self.schema)
             } else {
@@ -166,7 +166,16 @@ impl Iterator for CursorPolarsIter<'_, '_> {
             match self.cursor.next_arrow_batch_inner(drift_check, false) {
                 Ok(Some(rb)) => {
                     if self.cursor.failover_resets() != self.resets_at_pin {
-                        self.schema = rb.schema();
+                        if rb.schema() != self.schema {
+                            self.poisoned = true;
+                            return Some(Err(Error::new(
+                                ErrorCode::SchemaDrift,
+                                "post-failover replay returned a different \
+                                 schema; the iterator pins the first batch's \
+                                 schema. Use Cursor::next_polars to handle \
+                                 drift explicitly",
+                            )));
+                        }
                         self.resets_at_pin = self.cursor.failover_resets();
                     } else if has_tentative_array(&self.schema) && rb.schema() != self.schema {
                         self.poisoned = true;

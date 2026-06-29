@@ -1354,6 +1354,159 @@ fn failover_after_batch_replays_and_rereads_schema() {
     assert_eq!(events[0].new_addr.port, srv_b.addr.port());
 }
 
+/// `Cursor::as_arrow_reader` pins the first batch's schema. A transparent
+/// mid-query failover re-reads from `batch_seq 0` on the new node; when that
+/// replay carries the **same** schema the reader must keep yielding batches
+/// (and `schema()` must stay stable), not poison.
+#[cfg(feature = "arrow-egress")]
+#[test]
+fn failover_arrow_reader_same_schema_continues() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![3, 4, 5]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // Install a reset callback so the streaming reader opts into transparent
+    // replay (clears the silent-duplicate guard) and a post-failover batch
+    // actually reaches the adapter instead of `FailoverWouldDuplicate`.
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(|_: &FailoverEvent| {})
+        .execute()
+        .expect("execute");
+    {
+        let mut arrow_reader = cursor.as_arrow_reader().expect("first batch + schema");
+        let pinned = arrow_reader.schema();
+
+        // Batch 1: A's pre-drop LONG batch.
+        let b1 = arrow_reader
+            .next()
+            .expect("first item")
+            .expect("first batch ok");
+        assert_eq!(b1.num_rows(), 2);
+        assert_eq!(b1.schema(), pinned);
+
+        // Batch 2: A is gone — fail over to B, whose replayed batch 0 has the
+        // SAME schema, so the reader continues instead of poisoning.
+        let b2 = arrow_reader
+            .next()
+            .expect("post-failover item")
+            .expect("post-failover batch ok");
+        assert_eq!(b2.num_rows(), 3);
+        assert_eq!(b2.schema(), pinned);
+        assert_eq!(
+            arrow_reader.schema(),
+            pinned,
+            "RecordBatchReader::schema must stay stable across failover"
+        );
+
+        assert!(
+            arrow_reader.next().is_none(),
+            "B's RESULT_END terminates the reader cleanly"
+        );
+    }
+    assert_eq!(cursor.failover_resets(), 1);
+}
+
+/// Companion to [`failover_arrow_reader_same_schema_continues`]: when the
+/// post-failover replay carries a **different** schema (B serves DOUBLE where
+/// A served LONG), the adapter cannot keep a stable `schema()`, so it must
+/// surface [`ErrorCode::SchemaDrift`] and poison rather than silently adopt
+/// the new node's schema.
+#[cfg(feature = "arrow-egress")]
+#[test]
+fn failover_arrow_reader_schema_drift_poisons() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Long(vec![1, 2]),
+        },
+        Action::HardDrop,
+    ]]);
+    let srv_b = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "b".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendBatch {
+            batch_seq: 0,
+            column: BatchColumn::Double(vec![1.5, 2.5, 3.5]),
+        },
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!(
+        "ws::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    // Reset callback opts the streaming reader into transparent replay so the
+    // divergent post-failover batch reaches the adapter (rather than
+    // surfacing `FailoverWouldDuplicate`) and exercises the drift check.
+    let mut cursor = reader
+        .prepare("select 1")
+        .on_failover_reset(|_: &FailoverEvent| {})
+        .execute()
+        .expect("execute");
+    {
+        let mut arrow_reader = cursor.as_arrow_reader().expect("first batch + schema");
+
+        // Batch 1: A's LONG batch decodes fine against the pinned schema.
+        let b1 = arrow_reader
+            .next()
+            .expect("first item")
+            .expect("first batch ok");
+        assert_eq!(b1.num_rows(), 2);
+
+        // Batch 2: fail over to B, whose DOUBLE schema diverges from the pinned
+        // LONG schema — surfaced as SchemaDrift, not silently swapped in.
+        let err = arrow_reader
+            .next()
+            .expect("post-failover item present")
+            .expect_err("divergent post-failover schema must yield an error");
+        let qerr = questdb::egress::arrow::try_downcast_questdb(&err)
+            .expect("adapter error downcasts to a questdb Error");
+        assert_eq!(qerr.code(), ErrorCode::SchemaDrift);
+
+        assert!(
+            arrow_reader.next().is_none(),
+            "reader is poisoned after drift"
+        );
+    }
+    assert_eq!(cursor.failover_resets(), 1);
+}
+
 /// Regression pin for the reconnect-path schema clear
 /// (`query_schema = None` in `Reader::reconnect_with_failover`): when
 /// the replayed query's *first* frame from the new node is a

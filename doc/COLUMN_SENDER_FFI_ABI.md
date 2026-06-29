@@ -1367,9 +1367,14 @@ int main(void) {
 These are not part of the C ABI; they are guidance for the Python repo
 agent.
 
-- **Pandas numeric columns** → `Series.to_numpy(copy=False)` gives a
-  contiguous `np.ndarray` whose `.ctypes.data` pointer goes straight
-  to FFI. No copy.
+- **Pandas numeric columns** → `Series.to_numpy(copy=False)` gives an
+  `np.ndarray` whose `.ctypes.data` pointer goes straight to FFI. The
+  numpy appender reads `row_count` elements forward at the dtype's native
+  stride and cannot see numpy strides, so the array **must be
+  C-contiguous**: wrap it in `np.ascontiguousarray(arr)` (a no-op when it
+  already is) before handing over the pointer. A non-contiguous view
+  (sliced / transposed / reversed) whose `nbytes` still matches the
+  length check is read out of bounds — undefined behaviour.
 - **Pandas nulls** → `Series.isna().values` is a `np.ndarray[bool]`;
   pack it LSB-first into a `uint8_t*` bitmap (provide a vectorised
   helper using `numpy.packbits(... bitorder='little')`).

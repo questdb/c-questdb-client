@@ -679,6 +679,20 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
     try_reserve_bytes(out, total_bytes, "QWP bitmap")?;
     let arrow_offset = nulls.offset();
     let src = nulls.inner().values();
+    // The null buffer must hold bits `[arrow_offset, arrow_offset + bits)`.
+    // `validate()` already guarantees this, but re-check at runtime so a caller
+    // that skips validation gets an error — rather than an OOB read (aligned
+    // branch) or silently materialised nulls (unaligned branch) — on the
+    // `panic = "abort"` FFI.
+    let needed = (arrow_offset + bits).div_ceil(8);
+    if src.len() < needed {
+        return Err(fmt!(
+            ArrowIngest,
+            "arrow validity buffer too short: {} bytes, need {}",
+            src.len(),
+            needed
+        ));
+    }
     let full_bytes = bits / 8;
     let trailing_bits = bits % 8;
     let dst_start = out.len();
@@ -686,19 +700,6 @@ fn write_qwp_bitmap_from_arrow(out: &mut Vec<u8>, nulls: &NullBuffer) -> Result<
     let dst = &mut out[dst_start..dst_start + total_bytes];
     if arrow_offset.is_multiple_of(8) {
         let src_off = arrow_offset / 8;
-        // The aligned fast path indexes `src` directly (unlike the unaligned
-        // branch's `lo_idx < src_len` guards). `validate()` already guarantees
-        // the null buffer is long enough; re-check at runtime so a caller that
-        // skips validation gets an error rather than an OOB read on the
-        // `panic = "abort"` FFI.
-        if src.len() < src_off + total_bytes {
-            return Err(fmt!(
-                ArrowIngest,
-                "arrow validity buffer too short: {} bytes, need {}",
-                src.len(),
-                src_off + total_bytes
-            ));
-        }
         let src_slice = &src[src_off..src_off + full_bytes];
         let dst_slice = &mut dst[..full_bytes];
         let word_bytes = (full_bytes / 8) * 8;

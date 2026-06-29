@@ -110,6 +110,10 @@ enum class error_code : int
      *  not user-recoverable. Only raised with the `arrow` feature
      *  enabled. */
     arrow_export     = ::reader_error_arrow_export,
+    /** The TCP connect (dial) to an endpoint exceeded the configured
+     *  `connect_timeout`. Distinct from `socket_error` so a caller can tell a
+     *  timed-out dial apart from a refused / reset connection. */
+    connect_timeout  = ::reader_error_connect_timeout,
 };
 
 /**

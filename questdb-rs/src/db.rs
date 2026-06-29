@@ -1399,7 +1399,7 @@ impl Drop for ColumnSenderHandle<'_> {
         let Some(mut sender) = self.sender.take() else {
             return;
         };
-        commit_in_flight_on_drop(&mut sender);
+        commit_in_flight_on_drop(&self.db.inner, &mut sender);
         return_to_pool(&self.db.inner, sender, self.kind);
     }
 }
@@ -1446,7 +1446,7 @@ impl OwnedColumnSender {
 impl Drop for OwnedColumnSender {
     fn drop(&mut self) {
         if let Some(mut sender) = self.sender.take() {
-            commit_in_flight_on_drop(&mut sender);
+            commit_in_flight_on_drop(&self.inner, &mut sender);
             return_to_pool(&self.inner, sender, self.kind);
         }
     }
@@ -1947,15 +1947,21 @@ fn connect_conn_pool(inner: &Arc<DbInner>) -> Result<ColumnConn> {
 }
 
 /// Best-effort commit of un-sync'd deferred frames on drop, so the natural
-/// `flush()`-loop-then-drop path doesn't silently lose data. On failure the
+/// `flush()`-loop-then-drop path doesn't silently lose data. Commits at the
+/// pool's default ack level so a `request_durable_ack=on` pool still waits for
+/// the durability ACK instead of silently downgrading to `Ok`. On failure the
 /// connection is latched `must_close` so the next borrower can't commit these
 /// frames under a foreign table.
-fn commit_in_flight_on_drop(sender: &mut ColumnSender) {
+fn commit_in_flight_on_drop(inner: &Arc<DbInner>, sender: &mut ColumnSender) {
     if sender.in_flight() == 0 {
         return;
     }
-    let committed =
-        !sender.must_close() && !sender.transport_dead() && sender.sync(AckLevel::Ok).is_ok();
+    let ack = if inner.connector.request_durable_ack() {
+        AckLevel::Durable
+    } else {
+        AckLevel::Ok
+    };
+    let committed = !sender.must_close() && !sender.transport_dead() && sender.sync(ack).is_ok();
     if !committed {
         log::warn!(
             "column sender dropped with un-sync'd deferred frame(s) that could \

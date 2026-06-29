@@ -355,19 +355,13 @@ impl ColumnConn {
         Ok(())
     }
 
-    /// Drain any QWP responses available without blocking. Returns the
-    /// number of responses consumed (OK acks, durable acks, etc.).
-    pub(crate) fn try_drain_acks(&mut self) -> Result<u32> {
-        let mut drained = 0u32;
-        loop {
-            match self.try_recv_qwp_response()? {
-                None => return Ok(drained),
-                Some(response) => {
-                    self.process_response(response)?;
-                    drained += 1;
-                }
-            }
+    /// Drain any QWP responses available without blocking, processing each
+    /// (OK acks, durable acks, etc.) into the in-flight bookkeeping.
+    pub(crate) fn try_drain_acks(&mut self) -> Result<()> {
+        while let Some(response) = self.try_recv_qwp_response()? {
+            self.process_response(response)?;
         }
+        Ok(())
     }
 
     /// Block until the in-flight count drops by at least one, freeing a

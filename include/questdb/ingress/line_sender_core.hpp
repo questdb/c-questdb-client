@@ -127,6 +127,12 @@ enum class line_sender_error_code
      *  unreachable") so callers can tell "no primary elected" from "all
      *  down". */
     role_mismatch = 18,
+
+    /** The TCP connect (dial) to the server exceeded the configured
+     *  `connect_timeout`. Distinct from `socket_error` so a caller can tell a
+     *  timed-out dial apart from a refused / reset connection. Produced by the
+     *  QWP/WebSocket transport. */
+    connect_timeout = 19,
 };
 
 /** The protocol used to connect with. */
