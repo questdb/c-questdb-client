@@ -456,6 +456,14 @@ impl QwpWsConnector {
         *self.qwp_ws.request_timeout
     }
 
+    /// Bound on how long the store-and-forward column-sender pool waits for a
+    /// connection's background runner to deliver its queued frames before the
+    /// connection is dropped (pool close / shutdown return). `Duration::ZERO`
+    /// disables the wait. Parsed from `close_flush_timeout_millis`.
+    pub(crate) fn close_flush_timeout(&self) -> Duration {
+        *self.qwp_ws.close_flush_timeout
+    }
+
     /// Reconnect backoff budget parsed from the connect string's
     /// `reconnect_*` keys. Only the retry-capable borrow paths consume it
     /// (the polars `reborrow_with_retry` and the FFI owned `*_with_retry`

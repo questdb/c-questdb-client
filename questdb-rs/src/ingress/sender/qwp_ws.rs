@@ -533,23 +533,29 @@ where
     }
 
     fn close_drain(&self, timeout: Duration) -> crate::Result<()> {
-        let deadline = Instant::now().checked_add(timeout);
-        self.lifecycle.begin_close();
-        self.backpressure.notify_all();
+        self.begin_close();
         if timeout.is_zero() {
             return Ok(());
         }
-        {
-            let mut store = self.lock_shared()?;
-            check_store_error(&store)?;
-            if store.all_published_receipts_resolved() {
-                store
-                    .close_queue()
-                    .map_err(driver_error_to_error_without_state)?;
-                return Ok(());
-            }
-        }
+        self.drain_to_deadline(Instant::now().checked_add(timeout))
+    }
 
+    /// Stop accepting new publications and wake the background runner so it
+    /// flushes whatever is already queued. Non-blocking and idempotent; pairs
+    /// with [`Self::drain_to_deadline`]. The column-sender pool calls this on
+    /// every connection being retired *before* waiting on any of them, so a
+    /// multi-connection close drains in parallel rather than serially.
+    fn begin_close(&self) {
+        self.lifecycle.begin_close();
+        self.backpressure.notify_all();
+    }
+
+    /// Block until every published frame has resolved its receipt, then close
+    /// the queue; give up with a `SocketError` once `deadline` passes (an
+    /// already-elapsed deadline fails fast, which is what bounds a batched pool
+    /// close). `deadline == None` waits indefinitely. Assumes
+    /// [`Self::begin_close`] has already run.
+    fn drain_to_deadline(&self, deadline: Option<Instant>) -> crate::Result<()> {
         loop {
             let backpressure_generation = self.backpressure.generation();
             {
@@ -3220,6 +3226,28 @@ pub(crate) fn qwp_ws_close_drain_background(
     state: &mut SyncQwpWsHandlerState,
 ) -> crate::Result<()> {
     let result = state.runner.close_drain(state.close_drain_timeout);
+    if let Some(mut orphan_pool) = state.orphan_pool.take() {
+        orphan_pool.close();
+    }
+    result
+}
+
+/// Non-blocking: stop accepting new publications and wake the runner to flush
+/// what is queued. The column-sender pool signals every connection being
+/// retired before waiting on any, so a batched close drains in parallel.
+pub(crate) fn qwp_ws_begin_close_background(state: &SyncQwpWsHandlerState) {
+    state.runner.begin_close();
+}
+
+/// Wait (until `deadline`) for the background runner to deliver every published
+/// frame, then close the queue and the orphan-drainer pool. A `None` deadline
+/// waits indefinitely; an already-elapsed deadline fails fast. Pairs with
+/// [`qwp_ws_begin_close_background`].
+pub(crate) fn qwp_ws_drain_to_deadline_background(
+    state: &mut SyncQwpWsHandlerState,
+    deadline: Option<Instant>,
+) -> crate::Result<()> {
+    let result = state.runner.drain_to_deadline(deadline);
     if let Some(mut orphan_pool) = state.orphan_pool.take() {
         orphan_pool.close();
     }
