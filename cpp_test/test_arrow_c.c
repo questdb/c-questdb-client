@@ -1,5 +1,5 @@
 /* C ABI FFI-boundary tests for the conn-level Arrow batch ingest API
- * (`sf_column_sender_flush_arrow_batch_server_stamped[_at_column]`) and the unchanged
+ * (`sf_column_sender_flush_arrow_batch_at_now[_at_column]`) and the unchanged
  * egress reader API. Successful round-trip coverage lives in the Rust
  * unit tests under `questdb-rs/src/ingress/column_sender/arrow_batch.rs`
  * and the Python system tests under `system_test/`. */
@@ -126,7 +126,7 @@ TEST(test_ingress_null_conn_returns_false)
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table("t");
-    bool ok = sf_column_sender_flush_arrow_batch_server_stamped(
+    bool ok = sf_column_sender_flush_arrow_batch_at_now(
         NULL, tbl, &arr, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL conn → false");
     CHECK(err != NULL, "err_out populated");
@@ -151,7 +151,7 @@ TEST(test_ingress_null_array_returns_false)
      * checks conn before array. To validate the NULL-array branch we'd
      * need a real conn, which requires a live mock server. Coverage moved
      * to Rust unit tests. */
-    bool ok = sf_column_sender_flush_arrow_batch_server_stamped(
+    bool ok = sf_column_sender_flush_arrow_batch_at_now(
         NULL, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array path through NULL-conn short-circuit");
     if (err)
@@ -1102,7 +1102,7 @@ static void run_arrow_flush(
     }
     line_sender_error* err = NULL;
     line_sender_table_name tbl = make_table(table);
-    bool ok = sf_column_sender_flush_arrow_batch_server_stamped(
+    bool ok = sf_column_sender_flush_arrow_batch_at_now(
         conn, tbl, arr, sch, NULL, 0, &err);
     if (!ok)
     {
@@ -1139,7 +1139,7 @@ TEST(test_mock_ingress_null_array_via_real_conn)
     struct ArrowSchema sch;
     memset(&sch, 0, sizeof(sch));
     line_sender_error* err = NULL;
-    bool ok = sf_column_sender_flush_arrow_batch_server_stamped(
+    bool ok = sf_column_sender_flush_arrow_batch_at_now(
         conn, make_table("t"), NULL, &sch, NULL, 0, &err);
     CHECK(!ok, "NULL array → false");
     CHECK(err != NULL, "err_out populated");
@@ -1249,7 +1249,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
 {
     /* The original test exercised three DesignatedTimestamp kinds
      * (Now / ServerNow / Column). In the new conn-level API the first
-     * two collapse onto `sf_column_sender_flush_arrow_batch_server_stamped`
+     * two collapse onto `sf_column_sender_flush_arrow_batch_at_now`
      * (no per-row stamp — server stamps on arrival), and Column maps to the
      * dedicated `sf_column_sender_flush_arrow_batch_at_column`. We cover
      * both surviving variants here. */
@@ -1307,7 +1307,7 @@ TEST(test_mock_ingress_both_designated_timestamp_variants)
 }
 
 /* Exercises the documented `array->release` ownership contract of
- * `sf_column_sender_flush_arrow_batch_server_stamped` on all three states: pre-import
+ * `sf_column_sender_flush_arrow_batch_at_now` on all three states: pre-import
  * failure leaves release intact (caller frees), a malformed nested schema
  * is rejected gracefully (not by aborting the panic=abort FFI crate) with
  * release intact, and a structurally-valid batch that reaches the Arrow
@@ -1328,7 +1328,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = sf_column_sender_flush_arrow_batch_server_stamped(
+        bool ok = sf_column_sender_flush_arrow_batch_at_now(
             conn, make_table("rc_a"), &arr, NULL, NULL, 0, &err);
         CHECK(!ok, "NULL schema → false");
         CHECK(
@@ -1350,7 +1350,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "+l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = sf_column_sender_flush_arrow_batch_server_stamped(
+        bool ok = sf_column_sender_flush_arrow_batch_at_now(
             conn, make_table("rc_b"), &arr, &sch, NULL, 0, &err);
         CHECK(!ok, "malformed +l schema → false");
         CHECK(err != NULL, "err_out populated on malformed schema");
@@ -1380,7 +1380,7 @@ TEST(test_mock_ingress_arrow_release_contract)
         struct ArrowSchema sch;
         build_primitive(2, sizeof(int64_t), values, "l", "v", &arr, &sch);
         line_sender_error* err = NULL;
-        bool ok = sf_column_sender_flush_arrow_batch_server_stamped(
+        bool ok = sf_column_sender_flush_arrow_batch_at_now(
             conn, make_table("rc_c"), &arr, &sch, NULL, 0, &err);
         (void)ok;
         CHECK(

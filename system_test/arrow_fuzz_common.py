@@ -261,7 +261,7 @@ def ingest_via_arrow(
     slice_window: Optional[Tuple[int, int]] = None,
 ) -> None:
     """Ingest one RecordBatch through `column_sender_flush_arrow_batch_at_column`
-    (when `ts_col` is set) or `column_sender_flush_arrow_batch_server_stamped`
+    (when `ts_col` is set) or `column_sender_flush_arrow_batch_at_now`
     (when `ts_col` is None — the server stamps each row on arrival).
 
     When `slice_window=(offset, length)` is supplied the batch is sliced to

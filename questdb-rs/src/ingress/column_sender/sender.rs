@@ -353,7 +353,7 @@ impl ColumnSender {
     /// discard that column's role as the designated timestamp and silently
     /// substitute server arrival time, producing wrong partitions/order.
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_server_stamped<'t, T>(
+    pub fn flush_arrow_batch_at_now<'t, T>(
         &mut self,
         table: T,
         batch: &RecordBatch,
@@ -368,11 +368,11 @@ impl ColumnSender {
             .map_err(FlushFailure::into_error)
     }
 
-    /// ACKing counterpart of [`Self::flush_arrow_batch_server_stamped`]:
+    /// ACKing counterpart of [`Self::flush_arrow_batch_at_now`]:
     /// publish `batch` as a boundary, then wait for `ack_level`. The same
     /// boundary/durable/failure contract as [`Self::flush_and_wait`] applies.
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_server_stamped_and_wait<'t, T>(
+    pub fn flush_arrow_batch_at_now_and_wait<'t, T>(
         &mut self,
         table: T,
         batch: &RecordBatch,
@@ -398,7 +398,7 @@ impl ColumnSender {
     /// Encode and publish an Arrow [`RecordBatch`], sourcing the per-row
     /// designated timestamp from the named `Timestamp(_)` column of the batch.
     ///
-    /// Use [`Self::flush_arrow_batch_server_stamped`] to instead let the server
+    /// Use [`Self::flush_arrow_batch_at_now`] to instead let the server
     /// stamp each row on arrival.
     #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_at_column<'t, T>(
@@ -497,7 +497,7 @@ impl ColumnSender {
     /// whether to re-export the caller's `ArrowArray`.
     #[doc(hidden)]
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_server_stamped_and_wait_ffi(
+    pub fn flush_arrow_batch_at_now_and_wait_ffi(
         &mut self,
         table: TableName<'_>,
         batch: &RecordBatch,

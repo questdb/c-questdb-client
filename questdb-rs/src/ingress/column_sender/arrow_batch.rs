@@ -3538,7 +3538,7 @@ fn encode_arrow_batch_into_mode(
             ArrowIngest,
             "RecordBatch has no designated timestamp; call \
              flush_arrow_batch_at_column to source it from a Timestamp(_) column, \
-             or flush_arrow_batch_server_stamped to explicitly let the server \
+             or flush_arrow_batch_at_now to explicitly let the server \
              stamp each row on arrival."
         ));
     }
@@ -4024,7 +4024,7 @@ mod tests {
         assert!(
             err.msg().contains("no designated timestamp")
                 && err.msg().contains("flush_arrow_batch_at_column")
-                && err.msg().contains("flush_arrow_batch_server_stamped"),
+                && err.msg().contains("flush_arrow_batch_at_now"),
             "unexpected message: {}",
             err.msg()
         );

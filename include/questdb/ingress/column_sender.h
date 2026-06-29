@@ -466,7 +466,7 @@ column_sender_chunk* column_sender_chunk_new(
  * the name and never sets `*err_out`. The 127-byte length cap is still
  * applied at the first flush — identical type AND validation timing to
  * the Arrow flush entrypoints (`sf_column_sender_flush_arrow_batch_at_column`
- * / `_server_stamped`), which also take a `line_sender_table_name`.
+ * / `_at_now`), which also take a `line_sender_table_name`.
  *
  * Use this when you validated the table name once and want to share it
  * between the chunk path and an Arrow flush, instead of being forced to
@@ -775,7 +775,7 @@ bool column_sender_chunk_symbol_dict_i32(
  *
  * Single entry point that consumes an Apache Arrow C Data Interface
  * `ArrowArray` + `ArrowSchema` pair and routes to the same encoding
- * infrastructure as `sf_column_sender_flush_arrow_batch_server_stamped`. Supports the
+ * infrastructure as `sf_column_sender_flush_arrow_batch_at_now`. Supports the
  * full Arrow type matrix (43 classifications including all primitives,
  * timestamps, dates, decimals, UUID, LONG256, geohash, dictionary-
  * encoded symbols across all key/value variants, and varlen
@@ -1365,7 +1365,7 @@ typedef enum column_sender_arrow_override_kind
 
 /**
  * Per-column wire-type hint passed to
- * `sf_column_sender_flush_arrow_batch_server_stamped` (and `_at_column`) to
+ * `sf_column_sender_flush_arrow_batch_at_now` (and `_at_column`) to
  * steer encoding without having to attach
  * `questdb.*` Field metadata to the Arrow schema. Caller owns `column`;
  * the bytes are borrowed for the duration of the call.
@@ -1415,7 +1415,7 @@ typedef struct column_sender_arrow_override
  * the chunk with `column_sender_chunk_new_validated`.
  */
 QUESTDB_CLIENT_API
-bool sf_column_sender_flush_arrow_batch_server_stamped(
+bool sf_column_sender_flush_arrow_batch_at_now(
     sf_column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -1426,9 +1426,9 @@ bool sf_column_sender_flush_arrow_batch_server_stamped(
 
 /** Direct-handle publish-only Arrow flush (server-stamped). Pair with
  *  `direct_column_sender_commit`, or use
- *  `direct_column_sender_flush_arrow_batch_server_stamped_and_wait`. */
+ *  `direct_column_sender_flush_arrow_batch_at_now_and_wait`. */
 QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_server_stamped(
+bool direct_column_sender_flush_arrow_batch_at_now(
     direct_column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -1438,7 +1438,7 @@ bool direct_column_sender_flush_arrow_batch_server_stamped(
     line_sender_error** err_out);
 
 /**
- * Same as `sf_column_sender_flush_arrow_batch_server_stamped` but picks the
+ * Same as `sf_column_sender_flush_arrow_batch_at_now` but picks the
  * designated timestamp from a named column of the batch instead of
  * letting the server stamp each row. Same ownership and `overrides`
  * contract.
@@ -1469,7 +1469,7 @@ bool direct_column_sender_flush_arrow_batch_at_column(
     line_sender_error** err_out);
 
 /**
- * ACKing counterpart of `sf_column_sender_flush_arrow_batch_server_stamped`:
+ * ACKing counterpart of `sf_column_sender_flush_arrow_batch_at_now`:
  * publish `array` as a boundary, then wait for `ack_level`.
  *
  * `ack_level` is validated before the Arrow C Data Interface import consumes
@@ -1486,7 +1486,7 @@ bool direct_column_sender_flush_arrow_batch_at_column(
  * Callers MUST check `array->release != NULL` before invoking it on failure.
  */
 QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_server_stamped_and_wait(
+bool direct_column_sender_flush_arrow_batch_at_now_and_wait(
     direct_column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -1500,7 +1500,7 @@ bool direct_column_sender_flush_arrow_batch_server_stamped_and_wait(
  * ACKing counterpart of `sf_column_sender_flush_arrow_batch_at_column`: publish
  * `array` (timestamp sourced from `ts_column`) as a boundary, then wait for
  * `ack_level`. Same ACK-validation preflight and phase-aware re-export contract
- * as `direct_column_sender_flush_arrow_batch_server_stamped_and_wait`.
+ * as `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
  * Callers MUST check `array->release != NULL` before invoking it on failure.
  */
 QUESTDB_CLIENT_API

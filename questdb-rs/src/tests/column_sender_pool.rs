@@ -3105,7 +3105,7 @@ fn flush_polars_dataframe_applies_column_overrides() {
 
 #[cfg(feature = "arrow-ingress")]
 #[test]
-fn flush_arrow_batch_server_stamped_commits_in_one_call() {
+fn flush_arrow_batch_at_now_commits_in_one_call() {
     use std::sync::Arc;
 
     use arrow_array::{Int64Array, RecordBatch};

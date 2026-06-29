@@ -933,7 +933,7 @@ pub unsafe extern "C" fn column_sender_chunk_new(
 /// still applied at the first flush — identical type *and* validation
 /// timing to the Arrow flush entrypoints
 /// (`column_sender_flush_arrow_batch_at_column` /
-/// `_server_stamped`), which also take a [`line_sender_table_name`].
+/// `_at_now`), which also take a [`line_sender_table_name`].
 ///
 /// Use this when you already validated the table name once (e.g. to share
 /// it between the chunk path and an Arrow flush) instead of being forced
@@ -1753,7 +1753,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_arrow_import(
 
 /// Append a slice of one column from an Arrow C Data Interface array.
 /// Routes through the same encoding infrastructure as
-/// `column_sender_flush_arrow_batch_server_stamped`; supports the full
+/// `column_sender_flush_arrow_batch_at_now`; supports the full
 /// 43-variant Arrow type matrix (`arrow_batch::classify`).
 ///
 /// `row_offset` and `row_count` describe the slice of the array to
@@ -2778,7 +2778,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
 /// `_geohash` — carries `arg` outside `1..=60`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_server_stamped(
+pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now(
     conn: *mut sf_column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -2803,10 +2803,10 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_server_stamped(
 
 /// Direct-handle publish-only Arrow flush (server-stamped). Pair with
 /// `direct_column_sender_commit`, or use
-/// `direct_column_sender_flush_arrow_batch_server_stamped_and_wait`.
+/// `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_server_stamped(
+pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now(
     conn: *mut direct_column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -2829,7 +2829,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_server_stamped(
     }
 }
 
-/// Variant of [`column_sender_flush_arrow_batch_server_stamped`] that
+/// Variant of [`column_sender_flush_arrow_batch_at_now`] that
 /// sources each row's designated timestamp from a named `Timestamp(_)`
 /// column inside the batch. The column must be `Timestamp(Microsecond |
 /// Nanosecond | Millisecond, _)` with no null rows and no values before
@@ -2889,7 +2889,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
     }
 }
 
-/// ACKing counterpart of `column_sender_flush_arrow_batch_server_stamped`:
+/// ACKing counterpart of `column_sender_flush_arrow_batch_at_now`:
 /// publish `array` as a boundary, then wait for `ack_level`.
 ///
 /// `ack_level` carries a `column_sender_ack_level_*` constant. It is validated
@@ -2910,7 +2910,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_server_stamped_and_wait(
+pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now_and_wait(
     conn: *mut direct_column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -2938,7 +2938,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_server_stamped_a
 /// ACKing counterpart of `column_sender_flush_arrow_batch_at_column`: publish
 /// `array` (timestamp sourced from `ts_column`) as a boundary, then wait for
 /// `ack_level`. Same ACK-validation preflight and phase-aware re-export
-/// contract as `column_sender_flush_arrow_batch_server_stamped_and_wait`.
+/// contract as `column_sender_flush_arrow_batch_at_now_and_wait`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column_and_wait(
@@ -2983,7 +2983,7 @@ pub enum column_sender_arrow_override_kind {
 /// Per-column wire-type hint that overrides what the encoder would
 /// otherwise derive from the Arrow `Field`'s data type alone. Caller
 /// owns `column`; the bytes are borrowed for the duration of the
-/// `column_sender_flush_arrow_batch_server_stamped` / `_at_column` call
+/// `column_sender_flush_arrow_batch_at_now` / `_at_column` call
 /// and must outlive it.
 #[cfg(feature = "arrow")]
 #[repr(C)]
@@ -3180,7 +3180,7 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
     let sender = unsafe { T::owned_mut(conn).get_mut() };
     let result = match ts_column {
         Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name(), &overrides),
-        None => sender.flush_arrow_batch_server_stamped(table_name, &rb, &overrides),
+        None => sender.flush_arrow_batch_at_now(table_name, &rb, &overrides),
     };
     match result {
         Ok(()) => true,
@@ -3288,8 +3288,9 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
             &overrides,
             ack_level,
         ),
-        None => sender
-            .flush_arrow_batch_server_stamped_and_wait_ffi(table_name, &rb, &overrides, ack_level),
+        None => {
+            sender.flush_arrow_batch_at_now_and_wait_ffi(table_name, &rb, &overrides, ack_level)
+        }
     };
     match result {
         Ok(()) => true,

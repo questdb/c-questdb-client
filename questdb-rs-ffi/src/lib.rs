@@ -4491,7 +4491,7 @@ unsafe fn validate_arrow_array_depth(
 ///
 /// Shared by every FFI entry point that consumes a caller-built Arrow
 /// C Data Interface pair (currently
-/// `column_sender_flush_arrow_batch_server_stamped` / `_at_column`).
+/// `column_sender_flush_arrow_batch_at_now` / `_at_column`).
 #[cfg(feature = "arrow")]
 pub(crate) unsafe fn arrow_ffi_import_record_batch(
     array: *mut arrow::ffi::FFI_ArrowArray,

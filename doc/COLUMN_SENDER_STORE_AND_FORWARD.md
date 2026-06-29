@@ -177,7 +177,7 @@ defer_commit = false
 This applies to:
 
 - `flush(&mut Chunk)`;
-- `flush_arrow_batch_server_stamped`;
+- `flush_arrow_batch_at_now`;
 - `flush_arrow_batch_at_column`;
 - dataframe routes that call through the C ABI.
 

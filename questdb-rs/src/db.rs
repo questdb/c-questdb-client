@@ -481,7 +481,7 @@ impl QuestDb {
     /// * `Some(col)` — source it from the named `Timestamp(_)` column of
     ///   `batch` (mirrors the old `flush_arrow_batch_at_column`).
     /// * `None` — let the server stamp each row on arrival (mirrors the old
-    ///   `flush_arrow_batch_server_stamped`).
+    ///   `flush_arrow_batch_at_now`).
     ///
     /// `overrides` carries per-column wire-type hints (e.g. promote a UTF-8
     /// column to SYMBOL, or a UInt32 to IPv4); pass `&[]` when the Arrow schema
@@ -525,7 +525,7 @@ impl QuestDb {
             Some(ts) => {
                 sender.flush_arrow_batch_at_column_and_wait(table, batch, ts, overrides, ack)
             }
-            None => sender.flush_arrow_batch_server_stamped_and_wait(table, batch, overrides, ack),
+            None => sender.flush_arrow_batch_at_now_and_wait(table, batch, overrides, ack),
         }
     }
 
@@ -1181,7 +1181,7 @@ impl<'a> SfColumnSender<'a> {
     /// into the queue, letting the server stamp each row's designated
     /// timestamp on arrival. Publish-only; call [`Self::wait`] for an ack.
     #[cfg(feature = "arrow-ingress")]
-    pub fn flush_arrow_batch_server_stamped<'t, T>(
+    pub fn flush_arrow_batch_at_now<'t, T>(
         &mut self,
         table: T,
         batch: &arrow_array::RecordBatch,
@@ -1193,7 +1193,7 @@ impl<'a> SfColumnSender<'a> {
     {
         self.0
             .inner_mut()
-            .flush_arrow_batch_server_stamped(table, batch, overrides)
+            .flush_arrow_batch_at_now(table, batch, overrides)
     }
 
     /// Encode and publish an Arrow [`RecordBatch`](arrow_array::RecordBatch)
@@ -1313,7 +1313,7 @@ impl<'a> DirectColumnSender<'a> {
     /// is gated on `polars-ingress` (a plain `arrow-ingress` build reaches the
     /// server only through the ACKing `flush_arrow_batch`).
     #[cfg(feature = "polars-ingress")]
-    pub(crate) fn flush_arrow_batch_server_stamped<'t, T>(
+    pub(crate) fn flush_arrow_batch_at_now<'t, T>(
         &mut self,
         table: T,
         batch: &arrow_array::RecordBatch,
@@ -1325,12 +1325,12 @@ impl<'a> DirectColumnSender<'a> {
     {
         self.0
             .inner_mut()
-            .flush_arrow_batch_server_stamped(table, batch, overrides)
+            .flush_arrow_batch_at_now(table, batch, overrides)
     }
 
     /// Publish-only Arrow flush (column-stamped). Pair with [`Self::commit`].
     /// `polars-ingress`-gated for the same reason as
-    /// [`Self::flush_arrow_batch_server_stamped`].
+    /// [`Self::flush_arrow_batch_at_now`].
     #[cfg(feature = "polars-ingress")]
     pub(crate) fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
@@ -1351,7 +1351,7 @@ impl<'a> DirectColumnSender<'a> {
     /// ACKing Arrow flush (server-stamped): publish as a commit boundary and
     /// wait for `ack_level`.
     #[cfg(feature = "arrow-ingress")]
-    pub(crate) fn flush_arrow_batch_server_stamped_and_wait<'t, T>(
+    pub(crate) fn flush_arrow_batch_at_now_and_wait<'t, T>(
         &mut self,
         table: T,
         batch: &arrow_array::RecordBatch,
@@ -1364,7 +1364,7 @@ impl<'a> DirectColumnSender<'a> {
     {
         self.0
             .inner_mut()
-            .flush_arrow_batch_server_stamped_and_wait(table, batch, overrides, ack_level)
+            .flush_arrow_batch_at_now_and_wait(table, batch, overrides, ack_level)
     }
 
     /// ACKing Arrow flush (column-stamped): publish as a commit boundary and

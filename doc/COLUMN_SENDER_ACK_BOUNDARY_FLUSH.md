@@ -116,8 +116,8 @@ sender.flush(&mut chunk)?;
 sender.flush_and_wait(&mut chunk, AckLevel::Ok)?;
 sender.flush_and_wait(&mut chunk, AckLevel::Durable)?;
 
-sender.flush_arrow_batch_server_stamped(table, &batch, overrides)?;
-sender.flush_arrow_batch_server_stamped_and_wait(
+sender.flush_arrow_batch_at_now(table, &batch, overrides)?;
+sender.flush_arrow_batch_at_now_and_wait(
     table,
     &batch,
     overrides,
@@ -148,7 +148,7 @@ bool column_sender_flush_and_wait(
     uint32_t ack_level,
     line_sender_error** err_out);
 
-bool column_sender_flush_arrow_batch_server_stamped_and_wait(
+bool column_sender_flush_arrow_batch_at_now_and_wait(
     column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -183,8 +183,8 @@ conn.flush(chunk);                                   // publish only
 conn.flush_and_wait(chunk, column_sender_ack_level::ok);
 conn.flush_and_wait(chunk, column_sender_ack_level::durable);
 
-conn.flush_arrow_batch_server_stamped(table, array, schema, overrides, n);
-conn.flush_arrow_batch_server_stamped_and_wait(
+conn.flush_arrow_batch_at_now(table, array, schema, overrides, n);
+conn.flush_arrow_batch_at_now_and_wait(
     table, array, schema, column_sender_ack_level::ok, overrides, n);
 
 conn.flush_arrow_batch(table, array, schema, ts_column, overrides, n);

@@ -696,7 +696,7 @@ bool column_sender_chunk_symbol_dict_i32(
 
 Single entry point that consumes one column from an Apache Arrow C
 Data Interface array and routes through the same classifier and
-encoder used by `column_sender_flush_arrow_batch_server_stamped`
+encoder used by `column_sender_flush_arrow_batch_at_now`
 (§13.1). Coverage is
 the full 43-variant `ColumnKind` matrix — all primitives, timestamps,
 dates, decimals (Decimal32/64/128/256), UUID, LONG256, geohash,
@@ -1144,7 +1144,7 @@ Conn-level 1-copy entry that bypasses the `column_sender_chunk` and
 outgoing QWP frame in a single pass.
 
 - **Designated timestamp**: either explicitly omitted
-  (`flush_arrow_batch_server_stamped`) → server stamps each row on
+  (`flush_arrow_batch_at_now`) → server stamps each row on
   arrival; or sourced from a named `Timestamp(_)` column
   (`flush_arrow_batch_at_column`). A batch with no designated timestamp
   is rejected unless the server-stamp opt-in is used — there is no
@@ -1161,7 +1161,7 @@ outgoing QWP frame in a single pass.
 ```c
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch_server_stamped(
+bool column_sender_flush_arrow_batch_at_now(
     column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
@@ -1179,7 +1179,7 @@ bool column_sender_flush_arrow_batch_at_column(
 #endif
 ```
 
-Coverage matches the Rust `ColumnSender::flush_arrow_batch_server_stamped`
+Coverage matches the Rust `ColumnSender::flush_arrow_batch_at_now`
 — all 43 classified `ColumnKind` variants from
 `column_sender::arrow_batch::classify`. Failure paths surface as
 `line_sender_error_arrow_unsupported_column_kind` (column kind has no
@@ -1208,7 +1208,7 @@ bool column_sender_flush_and_wait(
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 QUESTDB_CLIENT_API
-bool column_sender_flush_arrow_batch_server_stamped_and_wait(
+bool column_sender_flush_arrow_batch_at_now_and_wait(
     column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,

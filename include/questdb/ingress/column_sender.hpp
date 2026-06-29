@@ -790,7 +790,7 @@ public:
      * `wait()`. Ownership: on success `array.release` is consumed; on failure
      * it may also have been consumed — check before invoking. `schema` borrowed.
      */
-    void flush_arrow_batch_server_stamped(
+    void flush_arrow_batch_at_now(
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
@@ -799,7 +799,7 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_flush_arrow_batch_server_stamped,
+            ::sf_column_sender_flush_arrow_batch_at_now,
             _raw,
             table_c,
             &array,
@@ -902,7 +902,7 @@ public:
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
     /** Publish-only Arrow flush (server-stamped). Pair with `commit()`. */
-    void flush_arrow_batch_server_stamped(
+    void flush_arrow_batch_at_now(
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
@@ -911,7 +911,7 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
-            ::direct_column_sender_flush_arrow_batch_server_stamped,
+            ::direct_column_sender_flush_arrow_batch_at_now,
             _raw,
             table_c,
             &array,
@@ -926,7 +926,7 @@ public:
      * a post-publication failure it is not — check `array.release` before
      * invoking it. Throws on error.
      */
-    void flush_arrow_batch_server_stamped_and_wait(
+    void flush_arrow_batch_at_now_and_wait(
         table_name_view table,
         ::ArrowArray& array,
         const ::ArrowSchema& schema,
@@ -936,7 +936,7 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
-            ::direct_column_sender_flush_arrow_batch_server_stamped_and_wait,
+            ::direct_column_sender_flush_arrow_batch_at_now_and_wait,
             _raw,
             table_c,
             &array,

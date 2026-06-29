@@ -1,7 +1,7 @@
 //! Polars sub-feature: convert a [`DataFrame`] into Arrow
 //! [`RecordBatch`]es for consumption by
 //! [`ColumnSender::flush_arrow_batch_at_column`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_at_column]
-//! (or [`ColumnSender::flush_arrow_batch_server_stamped`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_server_stamped]
+//! (or [`ColumnSender::flush_arrow_batch_at_now`][crate::ingress::column_sender::ColumnSender::flush_arrow_batch_at_now]
 //! when the server should assign timestamps).
 //!
 //! [`dataframe_to_batches`] is the primary entry point. It returns an
@@ -362,7 +362,7 @@ impl<'a> PolarsIngestOptions<'a> {
 
     /// Per-column wire-type hints, applied to every batch sliced out of the
     /// frame. Same meaning as the `overrides` argument of
-    /// `ColumnSender::flush_arrow_batch_server_stamped` — the intended path for Polars frames
+    /// `ColumnSender::flush_arrow_batch_at_now` — the intended path for Polars frames
     /// built without pyarrow, whose Arrow schema carries no `questdb.*` field
     /// metadata.
     #[must_use]
@@ -555,9 +555,7 @@ fn drive_from_checkpoint(
             (Some(ts), false) => {
                 sender.flush_arrow_batch_at_column(table, &rb, ts, options.overrides)?
             }
-            (None, false) => {
-                sender.flush_arrow_batch_server_stamped(table, &rb, options.overrides)?
-            }
+            (None, false) => sender.flush_arrow_batch_at_now(table, &rb, options.overrides)?,
             (Some(ts), true) => sender.flush_arrow_batch_at_column_and_wait(
                 table,
                 &rb,
@@ -565,12 +563,9 @@ fn drive_from_checkpoint(
                 options.overrides,
                 ack,
             )?,
-            (None, true) => sender.flush_arrow_batch_server_stamped_and_wait(
-                table,
-                &rb,
-                options.overrides,
-                ack,
-            )?,
+            (None, true) => {
+                sender.flush_arrow_batch_at_now_and_wait(table, &rb, options.overrides, ack)?
+            }
         }
         if checkpoint {
             // The ACKing flush committed the boundary covering every batch up
