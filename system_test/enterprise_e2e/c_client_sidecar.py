@@ -124,6 +124,85 @@ def build_qwp_egress_sidecar() -> Path:
     return _build_failover_bin("qwp_egress_sidecar")
 
 
+def _build_native_sidecar(*, src_name: str, bin_name: str,
+                          compiler_default: str, compiler_env: str,
+                          std_flag: str) -> Path:
+    """Build (idempotently) a C or C++ sidecar from ``system_test/c_sidecars``
+    and return its absolute path.
+
+    Two steps, both cheap to repeat from a session fixture:
+
+      1. ``cargo build`` the ``questdb-rs-ffi`` crate so ``libquestdb_client``
+         carries the *current* QWP-WS C ABI (the checked-in ``build/`` artifact
+         can be stale -- e.g. the pre-rename ``..._await_acked_fsn`` symbol).
+      2. Compile + link the one sidecar translation unit against that shared
+         library, with an rpath so the binary finds it at run time.
+
+    The compiler is ``compiler_default`` unless ``compiler_env`` (``CC`` /
+    ``CXX``) overrides it. Honours ``C_QUESTDB_CLIENT_PROFILE`` like the cargo
+    sidecars so a release CI run links the release library."""
+    client_root = _resolve_client_root()
+    profile = os.environ.get("C_QUESTDB_CLIENT_PROFILE", "debug")
+    if profile not in ("debug", "release"):
+        raise RuntimeError(
+            f"C_QUESTDB_CLIENT_PROFILE must be 'debug' or 'release', got {profile!r}"
+        )
+
+    ffi_manifest = client_root / "questdb-rs-ffi" / "Cargo.toml"
+    if not ffi_manifest.is_file():
+        raise RuntimeError(f"questdb-rs-ffi Cargo.toml not found at {ffi_manifest}")
+    cargo = ["cargo", "build", "--manifest-path", str(ffi_manifest)]
+    if profile == "release":
+        cargo.append("--release")
+    LOG.info("building libquestdb_client (%s) for %s", profile, bin_name)
+    subprocess.run(cargo, check=True, stdout=subprocess.PIPE)
+
+    libdir = client_root / "questdb-rs-ffi" / "target" / profile
+    if not (libdir / "libquestdb_client.so").is_file():
+        raise RuntimeError(f"libquestdb_client.so missing in {libdir} after cargo build")
+
+    src = client_root / "system_test" / "c_sidecars" / src_name
+    if not src.is_file():
+        raise RuntimeError(f"sidecar source not found at {src}")
+    out_dir = client_root / "system_test" / "c_sidecars" / "target" / profile
+    out_dir.mkdir(parents=True, exist_ok=True)
+    binary = out_dir / bin_name
+
+    compiler = os.environ.get(compiler_env, compiler_default)
+    cmd = [
+        compiler, std_flag, "-O2", "-Wall",
+        "-I", str(client_root / "include"),
+        "-o", str(binary), str(src),
+        "-L", str(libdir), "-lquestdb_client",
+        f"-Wl,-rpath,{libdir}",
+        "-lpthread", "-ldl", "-lm",
+    ]
+    LOG.info("compiling %s: %s", bin_name, " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    if not binary.is_file():
+        raise RuntimeError(f"{compiler} succeeded but {binary} is missing")
+    return binary
+
+
+def build_c_sidecar() -> Path:
+    """Build the C-binding ``qwp_c_sidecar`` (row-major QWP-WS via the C FFI)."""
+    return _build_native_sidecar(
+        src_name="qwp_c_sidecar.c", bin_name="qwp_c_sidecar",
+        compiler_default="cc", compiler_env="CC", std_flag="-std=c11")
+
+
+def build_cpp_sidecar() -> Path:
+    """Build the C++-binding ``qwp_cpp_sidecar``. The c-questdb-client C++
+    wrapper has no row-major QWP-WS surface (``line_sender::new_buffer()``
+    rejects WebSocket senders -- WS is column-major in C++), so this C++
+    translation unit drives the row-major store-and-forward path via the C ABI
+    while still compiling + linking the C++ header. That is the c_client_cpp
+    signal: row-major QWP-WS works from a C++ binary."""
+    return _build_native_sidecar(
+        src_name="qwp_cpp_sidecar.cpp", bin_name="qwp_cpp_sidecar",
+        compiler_default="c++", compiler_env="CXX", std_flag="-std=c++17")
+
+
 @dataclass
 class CClientRustSidecar(Sidecar):
     """c-questdb-client Rust-binding sender sidecar. Inherits every
@@ -265,3 +344,33 @@ class CClientRustEgressSidecar(EgressSidecar):
             if line == "READY":
                 break
             LOG.warning("egress sidecar %s pre-READY: %r", self.name, line)
+
+
+@dataclass
+class CClientCSidecar(CClientRustSidecar):
+    """c-questdb-client **C-binding** sender sidecar.
+
+    Drives the row-major QWP-WS store-and-forward path through the C FFI
+    (``qwp_c_sidecar``: ``line_sender_from_conf`` + ``line_sender_qwpws_*``).
+    Speaks the same line protocol as every other sidecar, so it reuses
+    :class:`lib.sidecar.Sidecar`'s CONNECT/SEND/FLUSH/AWAIT_ACKED/CLOSE verbs
+    and the inherited :meth:`CClientRustSidecar.start` launch; only the built
+    binary differs."""
+
+    def _default_binary(self) -> Path:
+        return build_c_sidecar()
+
+
+@dataclass
+class CClientCppSidecar(CClientRustSidecar):
+    """c-questdb-client **C++-binding** sender sidecar (``qwp_cpp_sidecar``).
+
+    The C++ wrapper has no row-major QWP-WS API (``line_sender::new_buffer()``
+    throws for WebSocket senders; WS is column-major in C++), so this C++
+    translation unit includes the C++ header (proving it compiles + links under
+    C++17) and drives the row-major store-and-forward path via the C ABI -- the
+    same path a real C++ user takes for row-major WS. Same line protocol as the
+    other sidecars."""
+
+    def _default_binary(self) -> Path:
+        return build_cpp_sidecar()

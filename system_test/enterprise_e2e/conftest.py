@@ -67,9 +67,13 @@ pytest_plugins = ("lib.shared_fixtures",)
 
 # Imports below depend on the sys.path insert above.
 from c_client_sidecar import (  # noqa: E402
+    CClientCppSidecar,
+    CClientCSidecar,
     CClientRustColumnSidecar,
     CClientRustEgressSidecar,
     CClientRustSidecar,
+    build_c_sidecar,
+    build_cpp_sidecar,
     build_qwp_column_sidecar,
     build_qwp_egress_sidecar,
     build_qwp_sidecar,
@@ -154,6 +158,59 @@ def c_client_rust_egress_sidecar(
         classpath=None,
         name="c-client-rust-egress-sidecar",
         binary_path=c_client_rust_egress_sidecar_binary,
+    )
+    s.start()
+    try:
+        yield s
+    finally:
+        s.stop()
+
+
+@pytest.fixture(scope="session")
+def c_client_c_sidecar_binary() -> Path:
+    """One C build per session (cargo build of the FFI lib + cc of the
+    sidecar; both no-op when already current)."""
+    return build_c_sidecar()
+
+
+@pytest.fixture(scope="function")
+def c_client_c_sidecar(
+    c_client_c_sidecar_binary: Path, log_dir: Path
+) -> Iterator[CClientCSidecar]:
+    """Sidecar driven by the c-questdb-client **C** binding's ``qwp_c_sidecar``
+    binary. Speaks the same QWP-WS line protocol as the Rust sidecar, so tests
+    take a ``Sidecar``-typed parameter polymorphically."""
+    s = CClientCSidecar(
+        log_dir=log_dir,
+        classpath=None,
+        name="c-client-c-sidecar",
+        binary_path=c_client_c_sidecar_binary,
+    )
+    s.start()
+    try:
+        yield s
+    finally:
+        s.stop()
+
+
+@pytest.fixture(scope="session")
+def c_client_cpp_sidecar_binary() -> Path:
+    """One C++ build per session (cargo build of the FFI lib + c++ of the
+    sidecar; both no-op when already current)."""
+    return build_cpp_sidecar()
+
+
+@pytest.fixture(scope="function")
+def c_client_cpp_sidecar(
+    c_client_cpp_sidecar_binary: Path, log_dir: Path
+) -> Iterator[CClientCppSidecar]:
+    """Sidecar driven by the c-questdb-client **C++** binding's
+    ``qwp_cpp_sidecar`` binary. Same QWP-WS line protocol as the others."""
+    s = CClientCppSidecar(
+        log_dir=log_dir,
+        classpath=None,
+        name="c-client-cpp-sidecar",
+        binary_path=c_client_cpp_sidecar_binary,
     )
     s.start()
     try:
