@@ -20,6 +20,7 @@ stages:
         displayName: "on"
         strategy:
           matrix:
+
             linux:
               imageName: "hetzner-incus"
             linux-stable:
@@ -285,17 +286,10 @@ stages:
           - script: ctest --output-on-failure -E rust_tests
             workingDirectory: build_sanitize
             displayName: "ctest under ASan + UBSan"
-      # Runs the full system_test/test.py against a fresh build of
-      # QuestDB master. Moved off Microsoft-hosted ubuntu-latest because
-      # the QWP/WS fuzz portion of the run filled the agent disk ("No
-      # space left", SIGBUS); the hetzner-incus pool — already used by
-      # TestQwpWsFuzzLinux below and by the cron-time fuzz pipeline —
-      # has enough headroom. Pool image is built from
-      # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
-      # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
-      # zip, curl, gh, and rustup. This job installs cmake and python3-pip,
-      # then uses pip for numpy>=2 before compile.yaml installs the standard
-      # Python dependencies, including pyarrow/polars, for non-macOS builds.
+      # Runs the full system_test suite against a fresh build of QuestDB
+      # master. The job stays on the self-hosted x86 pool for disk headroom;
+      # incus_prepare installs cmake and numpy>=2, exports the image JDKs, and
+      # provisions a user-writable Rust toolchain in the ephemeral container.
       - job: TestVsQuestDBMaster
         displayName: "Vs QuestDB master"
         pool:

@@ -6,11 +6,14 @@
 # `agent` user is in the `docker` group), and a *root-owned* rustup under
 # /root/.cargo (exposed only via /etc/profile.d/rust.sh).
 #
-# This template fills the gaps every Linux job needs: it wipes leftovers from
-# the reused container, apt-installs the packages the image lacks, exports the
-# image's JDK paths, and provisions a *user-writable* Rust toolchain. Jobs that
-# include compile.yaml must also set `imageName: hetzner-incus` so its pip step
-# is skipped (numpy comes from apt here; PEP 668 on Ubuntu 24.04+ rejects
+# This template fills the gaps every Linux job needs: it apt-installs the
+# packages the image lacks, exports the image's JDK paths, and provisions a
+# *user-writable* Rust toolchain. Each job runs in a fresh ephemeral container
+# (incus-azure-pipelines registers the agent with `run.sh --once`, then powers
+# the container off and lets Incus reap it), so there is no cross-job state to
+# clean up. Jobs that include compile.yaml must also set
+# `imageName: hetzner-incus` so its pip step is skipped (numpy comes from apt,
+# or the pipNumpy step below; PEP 668 on Ubuntu 24.04+ rejects
 # pip-into-system-python).
 parameters:
   # Packages the image does not ship that this job needs. cmake +
@@ -30,12 +33,6 @@ parameters:
     default: false
 
 steps:
-  # incus containers are reused across jobs, so wipe known leftover artifacts
-  # before we start (matches questdb/questdb's templates/steps.yml).
-  - bash: |
-      rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
-    displayName: "incus: cleanup /tmp leftovers"
-
   - bash: |
       set -eux
       sudo apt-get update
@@ -83,9 +80,10 @@ steps:
       # user can neither read nor extend — so `rustup install beta/nightly`
       # (needed by the RunOnLinux toolchain matrix) would fail against it.
       # Always provision a user-writable rustup in the default $HOME/.cargo +
-      # $HOME/.rustup locations instead. rustup-init is idempotent and the
-      # incus container is reused across jobs, so this is effectively a
-      # one-time cost. Subsequent steps get cargo/rustup via prependpath.
+      # $HOME/.rustup locations instead. The container is ephemeral (one job,
+      # then reaped), so $HOME/.cargo starts empty and rustup-init runs every
+      # job; the guard below is just defensive. Subsequent steps get
+      # cargo/rustup via prependpath.
       if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
           | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
