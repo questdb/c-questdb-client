@@ -47,7 +47,8 @@ stages:
       # self-hosted hetzner-incus pool. Split out of RunOn because incus needs
       # a prep preamble the mac/Windows legs must not run — mirroring the
       # TestQwpWsFuzz / TestQwpWsFuzzLinux split below. incus_prepare installs
-      # cmake + python3-numpy, exports the image JDKs, and provisions a
+      # cmake (apt) and numpy>=2 (pip, via pipNumpy — the full system_test
+      # suite needs numpy 2.x), exports the image JDKs, and provisions a
       # user-writable rustup so the beta/nightly legs can install their
       # toolchains. imageName='hetzner-incus' tells compile.yaml to skip its
       # pip step. run_all_tests.py downloads and runs a QuestDB 9.2.0 release,
@@ -189,8 +190,8 @@ stages:
       # (the `agent` user is in the docker group) and the dedicated hosts
       # have more disk headroom than Microsoft-hosted. The server runs in an
       # ephemeral container (removed between configs), so there is no on-host
-      # server data; only cmake + python3-numpy are apt-installed per job
-      # (via incus_prepare).
+      # server data; incus_prepare apt-installs cmake and pip-installs numpy>=2
+      # (the integration suite's test_f64_arr_max_dims needs numpy 2.x).
       #
       # Scope note: the nightly image is Linux/amd64 only, so the
       # mac/windows fuzz legs stay from-source, as does any run that must
