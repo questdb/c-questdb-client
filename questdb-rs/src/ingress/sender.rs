@@ -940,8 +940,10 @@ fn qwp_ws_sleep_until(deadline: Option<Instant>) {
 
 /// Error for a [`Sender::wait`] that made no ack progress within its
 /// no-progress `timeout`. Classified [`ErrorCode::FailoverRetry`]: the
-/// published frames are retained, so the caller can drop and re-borrow to
-/// replay, mirroring the column-major store-and-forward wait.
+/// published frames are retained and the background runner keeps delivering
+/// them, so recover by retrying `wait()` until it returns `Ok` — not by
+/// re-flushing, which would duplicate the rows. Mirrors the column-major
+/// store-and-forward wait.
 #[cfg(feature = "sync-sender-qwp-ws")]
 fn qwp_ws_wait_timeout(
     ack_level: AckLevel,
@@ -963,7 +965,10 @@ fn qwp_ws_wait_timeout(
             "QWP/WebSocket wait({level}) timed out after {timeout:?} with no ack \
              progress (target FSN {boundary}, {progress}); the connection is alive \
              but the server is not advancing the watermark. The published frames \
-             are retained; drop this sender and re-borrow to replay."
+             remain queued and the background runner keeps delivering them: retry \
+             wait() to keep awaiting the ack, or close the pool to drain. Do not \
+             re-flush the same data, which is already accepted and would be \
+             delivered twice."
         ),
     )
 }

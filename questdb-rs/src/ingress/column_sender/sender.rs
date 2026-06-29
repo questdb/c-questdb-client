@@ -962,14 +962,19 @@ impl SfaColumnBackend {
     }
 }
 
-/// The store-and-forward `sync` poll loop made no progress toward `boundary`
+/// The store-and-forward `wait` poll loop made no progress toward `boundary`
 /// for `sync_timeout`. The connection is alive but the server is not advancing
 /// the ack/durable watermark (e.g. back-pressured WAL or a stuck commit).
 ///
-/// Classified `FailoverRetry` — the local SFA queue still holds every unacked
-/// frame, so the caller can drop this borrow and re-borrow to replay, exactly
-/// as on the direct backend's transport-timeout path. The sync has *not*
-/// committed; the watermark simply has not reached `boundary` yet.
+/// Classified `FailoverRetry`, but — unlike the direct backend's
+/// transport-timeout path, which drops the connection and discards its
+/// uncommitted frames — the local SFA queue still holds every unacked frame
+/// and the background runner keeps delivering them across reborrows and
+/// reconnects. Re-flushing the same data would therefore duplicate it. The
+/// correct recovery is to retry `wait()` (idempotent — it only re-observes
+/// the watermark) until the runner catches up, or to close/drain the pool.
+/// Delivery has *not* failed; the watermark simply has not reached `boundary`
+/// yet.
 fn sfa_sync_timeout(
     sync_timeout: Duration,
     ack_level: AckLevel,
@@ -987,10 +992,13 @@ fn sfa_sync_timeout(
     crate::Error::new(
         ErrorCode::FailoverRetry,
         format!(
-            "QWP/WebSocket store-and-forward sync({}) timed out after {:?} \
+            "QWP/WebSocket store-and-forward wait({}) timed out after {:?} \
              with no ack progress (target FSN {}, {}); the connection is alive \
-             but the server is not advancing the watermark. The queued frames \
-             are retained; drop this sender and re-borrow to replay.",
+             but the server is not advancing the watermark. The frames remain \
+             queued and the background runner keeps delivering them: retry \
+             wait() to keep awaiting the ack, or close the pool to drain. Do \
+             not re-flush the same data, which is already accepted and would \
+             be delivered twice.",
             level, sync_timeout, boundary, progress
         ),
     )

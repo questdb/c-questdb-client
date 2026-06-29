@@ -1157,7 +1157,9 @@ impl<'a> SfColumnSender<'a> {
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
     /// On expiry it returns an [`ErrorCode::FailoverRetry`](crate::ErrorCode)
-    /// error and the queued frames are retained for replay.
+    /// error; the frames remain queued and the background runner keeps
+    /// delivering them, so recover by calling `wait()` again until it returns
+    /// `Ok` — not by re-flushing, which would deliver the same rows twice.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.0.inner_mut().wait(ack_level, timeout)
     }
