@@ -12,36 +12,20 @@ stages:
   - stage: BuildAndTest
     displayName: "Building and testing"
     jobs:
+      # mac/Windows legs of the build+test matrix stay on Microsoft-hosted
+      # images — hetzner-incus is Linux/amd64-only. The four Linux toolchain
+      # legs were split out into RunOnLinux below.
       - job: RunOn
         displayName: "on"
         strategy:
           matrix:
-            linux:
-              imageName: "ubuntu-latest"
-              poolName: "Azure Pipelines"
-            linux-stable:
-              imageName: "ubuntu-latest"
-              poolName: "Azure Pipelines"
-              toolchain: "stable"
-            linux-beta:
-              imageName: "ubuntu-latest"
-              poolName: "Azure Pipelines"
-              toolchain: "beta"
-            linux-nightly:
-              imageName: "ubuntu-latest"
-              poolName: "Azure Pipelines"
-              toolchain: "nightly"
             mac:
               imageName: "macos-latest"
-              poolName: "Azure Pipelines"
             windows-msvc-2022:
               imageName: "windows-2022"
-              poolName: "Azure Pipelines"
             windows-msvc-2025:
               imageName: "windows-2025"
-              poolName: "Azure Pipelines"
         pool:
-          name: $(poolName)
           vmImage: $(imageName)
         timeoutInMinutes: 60
         steps:
@@ -54,37 +38,72 @@ stages:
               cd questdb-rs
               cargo build --examples --features almost-all-features
             displayName: "Build Rust examples"
-          ############################# temp for test begin #####################
-          #- script: |
-          #    git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
-          #  displayName: git clone questdb
-          #- task: Maven@3
-          #  displayName: "Compile QuestDB"
-          #  inputs:
-          #    mavenPOMFile: "questdb/pom.xml"
-          #    jdkVersionOption: "1.17"
-          #    options: "-DskipTests -Pbuild-web-console"
-          ############################# temp for test end #####################
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_17_X64)
             displayName: "Tests"
-          # - task: PublishBuildArtifacts@1
-          #   inputs:
-          #     pathToPublish: ./build
-          #   displayName: "Publish build directory"
+
+      # Linux legs of the build+test matrix (the four Rust toolchains) on the
+      # self-hosted hetzner-incus pool. Split out of RunOn because incus needs
+      # a prep preamble the mac/Windows legs must not run — mirroring the
+      # TestQwpWsFuzz / TestQwpWsFuzzLinux split below. incus_prepare installs
+      # cmake (apt) and numpy>=2 (pip, via pipNumpy — the full system_test
+      # suite needs numpy 2.x), exports the image JDKs, and provisions a
+      # user-writable rustup so the beta/nightly legs can install their
+      # toolchains. imageName='hetzner-incus' tells compile.yaml to skip its
+      # pip step. run_all_tests.py downloads and runs a QuestDB 9.2.0 release,
+      # so the Tests step needs JDK 17 ($(JAVA_HOME_17_X64)).
+      - job: RunOnLinux
+        displayName: "on linux"
+        strategy:
+          matrix:
+            linux:
+              imageName: "hetzner-incus"
+            linux-stable:
+              imageName: "hetzner-incus"
+              toolchain: "stable"
+            linux-beta:
+              imageName: "hetzner-incus"
+              toolchain: "beta"
+            linux-nightly:
+              imageName: "hetzner-incus"
+              toolchain: "nightly"
+        pool:
+          name: hetzner-incus
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: templates/incus_prepare.yaml
+            parameters:
+              aptPackages:
+                - cmake
+              pipNumpy: true
+          - template: templates/compile.yaml
+          - script: |
+              cd questdb-rs
+              cargo build --examples --features almost-all-features
+            displayName: "Build Rust examples"
+          - script: python3 ci/run_all_tests.py
+            env:
+              JAVA_HOME: $(JAVA_HOME_17_X64)
+            displayName: "Tests"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:
-          vmImage: "ubuntu-latest"
+          name: hetzner-incus
         timeoutInMinutes: 10
         steps:
           - checkout: self
+          - template: templates/incus_prepare.yaml
+            parameters:
+              aptPackages:
+                - clang-format
           - script: |
-              apt install clang-format
-              rustup component add clippy
-              rustup component add rustfmt
-            displayName: "Install clang-format, clippy and rustfmt"
+              rustup component add clippy rustfmt
+            displayName: "Add clippy and rustfmt components"
           - script: |
               cd questdb-rs
               cargo fmt --all -- --check
@@ -133,13 +152,19 @@ stages:
       - job: SanitizeCppTests
         displayName: "C/C++ tests under ASan + UBSan"
         pool:
-          vmImage: "ubuntu-latest"
+          name: hetzner-incus
         timeoutInMinutes: 60
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
+          # cargo (for the corrosion-built Rust FFI lib) comes from the
+          # template; numpy is not needed here, so only cmake is apt-installed.
+          - template: templates/incus_prepare.yaml
+            parameters:
+              aptPackages:
+                - cmake
           - script: |
               cmake -S . -B build_sanitize \
                 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -161,13 +186,12 @@ stages:
       # published 1:1 on loopback); the failover crash is a `docker kill`
       # (SIGKILL), the graceful path a `docker stop` (SIGTERM).
       #
-      # Back on Microsoft-hosted ubuntu-latest (which ships docker
-      # pre-installed): the disk pressure that originally pushed this job
-      # to hetzner-incus came from the from-source build plus on-host
-      # server data, both now gone (the server lives in an ephemeral
-      # container, removed between configs). If fuzz-portion disk
-      # pressure ever recurs, move this job to a pool with more headroom
-      # that also has docker.
+      # Runs on the self-hosted hetzner-incus pool: the image ships docker
+      # (the `agent` user is in the docker group) and the dedicated hosts
+      # have more disk headroom than Microsoft-hosted. The server runs in an
+      # ephemeral container (removed between configs), so there is no on-host
+      # server data; incus_prepare apt-installs cmake and pip-installs numpy>=2
+      # (the integration suite's test_f64_arr_max_dims needs numpy 2.x).
       #
       # Scope note: the nightly image is Linux/amd64 only, so the
       # mac/windows fuzz legs stay from-source, as does any run that must
@@ -177,15 +201,21 @@ stages:
       - job: TestVsQuestDBNightly
         displayName: "Vs QuestDB nightly (docker)"
         pool:
-          vmImage: "ubuntu-latest"
+          name: hetzner-incus
         timeoutInMinutes: 90
         variables:
+          imageName: hetzner-incus
           QUESTDB_IMAGE: "questdb/questdb:nightly"
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
+          - template: templates/incus_prepare.yaml
+            parameters:
+              aptPackages:
+                - cmake
+              pipNumpy: true
           - template: templates/compile.yaml
           - script: |
               docker pull $(QUESTDB_IMAGE)
@@ -291,14 +321,10 @@ stages:
               pathToPublish: $(Build.ArtifactStagingDirectory)/qdb-log-$(Agent.OS).zip
               artifactName: qdb-log-$(Agent.OS)
 
-      # Linux leg on self-hosted hetzner-incus — mirrors the equivalent
-      # job in ci/run_fuzz_pipeline.yaml. Pool image is built from
-      # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
-      # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
-      # zip, curl, gh, and rustup; only cmake and python3-numpy are
-      # apt-installed per job. imageName='hetzner-incus' tells
-      # compile.yaml to skip its pip step (PEP 668 / EXTERNALLY-MANAGED
-      # on Ubuntu 24.04+).
+      # Linux leg on self-hosted hetzner-incus — mirrors the equivalent job in
+      # ci/run_fuzz_pipeline.yaml. incus_prepare handles the agent prep (apt
+      # cmake + python3-numpy, JDK paths, user-writable rustup);
+      # imageName='hetzner-incus' tells compile.yaml to skip its pip step.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
         pool:
@@ -311,50 +337,7 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - bash: |
-              rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
-            displayName: "Cleanup /tmp leftovers"
-          - bash: |
-              set -eux
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cmake python3-numpy
-              JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
-              JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
-              for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
-                if [ ! -x "$p/bin/javac" ]; then
-                  echo "Expected JDK missing at $p" >&2
-                  ls /usr/lib/jvm/ >&2 || true
-                  exit 1
-                fi
-              done
-              # `set -x` traces `echo "##vso[...]VALUE"` as `+ echo
-              # '##vso[...]VALUE'`; Azure's stdout parser matches `##vso[`
-              # anywhere on the line and takes everything past `]` to EOL
-              # as the value, including the trailing `'` bash added.
-              # Disable trace just for these two echoes so JAVA_HOME does
-              # not end up as `/usr/lib/jvm/java-25-openjdk-amd64'`.
-              set +x
-              echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
-              echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
-            displayName: "Install missing deps + resolve JDKs"
-          - bash: |
-              set -eux
-              # `|| true` lets the fallback path take over if the file
-              # references something the build user can't read (e.g.
-              # /etc/profile.d/rust.sh sources /root/.cargo/env).
-              if [ -f /etc/profile.d/rust.sh ]; then . /etc/profile.d/rust.sh || true; fi
-              if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env" || true; fi
-              if ! command -v cargo >/dev/null 2>&1; then
-                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                  | sh -s -- -y --default-toolchain stable --profile minimal
-                . "$HOME/.cargo/env"
-              fi
-              CARGO_BIN="$(dirname "$(command -v cargo)")"
-              echo "Using cargo from: $CARGO_BIN"
-              # See JAVA_HOME comment above re: `set -x` + `##vso[...]`.
-              set +x
-              echo "##vso[task.prependpath]$CARGO_BIN"
-            displayName: "Resolve Rust toolchain"
+          - template: templates/incus_prepare.yaml
           - template: templates/compile.yaml
           - template: templates/clone_questdb.yaml
           - task: Maven@3
@@ -394,23 +377,22 @@ stages:
       - job: TestQwpEgressLiveServerFuzz
         displayName: "QWP egress live-server suite"
         pool:
-          vmImage: "ubuntu-latest"
+          name: hetzner-incus
+        variables:
+          imageName: hetzner-incus
         timeoutInMinutes: 30
         steps:
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
+          - template: templates/incus_prepare.yaml
           - template: templates/compile.yaml
           - template: templates/clone_questdb.yaml
-          - script: |
-              set -euo pipefail
-              JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
-              sudo mkdir -p /opt/jdk25
-              curl -fsSL "$JDK_URL" | sudo tar -xz -C /opt/jdk25 --strip-components=1
-              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/jdk25"
-              echo "##vso[task.prependpath]/opt/jdk25/bin"
-            displayName: "Install JDK 25 (required by QuestDB master)"
+          # JDK 25 (required to build QuestDB master) is provided by the
+          # image; incus_prepare already points JAVA_HOME at it, so the Maven
+          # task's "default" jdkVersionOption picks it up. No adoptium
+          # download needed.
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:

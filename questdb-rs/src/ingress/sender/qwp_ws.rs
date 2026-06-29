@@ -3313,8 +3313,22 @@ mod tests {
 
         let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout).unwrap();
 
-        assert_eq!(tcp.read_timeout().unwrap(), Some(io_timeout));
-        assert_eq!(tcp.write_timeout().unwrap(), Some(io_timeout));
+        // The OS rounds SO_RCVTIMEO / SO_SNDTIMEO to the kernel timer
+        // granularity, so the value read back is not necessarily exactly what
+        // we set: a CONFIG_HZ=250 kernel (4ms tick) rounds 250ms up to 252ms.
+        // Assert the timeout was set to approximately io_timeout rather than
+        // bit-for-bit equal, so the test is portable across kernel HZ values.
+        let slack = Duration::from_millis(20);
+        let read_timeout = tcp.read_timeout().unwrap().expect("read timeout set");
+        let write_timeout = tcp.write_timeout().unwrap().expect("write timeout set");
+        assert!(
+            read_timeout <= io_timeout + slack && read_timeout + slack >= io_timeout,
+            "read timeout {read_timeout:?} not within {slack:?} of {io_timeout:?}"
+        );
+        assert!(
+            write_timeout <= io_timeout + slack && write_timeout + slack >= io_timeout,
+            "write timeout {write_timeout:?} not within {slack:?} of {io_timeout:?}"
+        );
         drop(tcp);
         let _ = accepted.join().unwrap();
     }
