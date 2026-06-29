@@ -76,6 +76,10 @@ stages:
             lfs: false
             submodules: false
           - template: templates/incus_prepare.yaml
+            parameters:
+              aptPackages:
+                - cmake
+              pipNumpy: true
           - template: templates/compile.yaml
           - script: |
               cd questdb-rs
@@ -207,6 +211,10 @@ stages:
             lfs: false
             submodules: false
           - template: templates/incus_prepare.yaml
+            parameters:
+              aptPackages:
+                - cmake
+              pipNumpy: true
           - template: templates/compile.yaml
           - script: |
               docker pull $(QUESTDB_IMAGE)
