@@ -1,0 +1,82 @@
+# Prepare a self-hosted hetzner-incus agent for a Linux job.
+#
+# The pool image is built from questdb/azure-ci-runners'
+# roles/incus/files/provision.sh, which ships openjdk-17-jdk, openjdk-25-jdk,
+# maven, build-essential, zip, curl, git, jq, gh, GraalVM 17/25, Docker (the
+# `agent` user is in the `docker` group), and a *root-owned* rustup under
+# /root/.cargo (exposed only via /etc/profile.d/rust.sh).
+#
+# This template fills the gaps every Linux job needs: it wipes leftovers from
+# the reused container, apt-installs the packages the image lacks, exports the
+# image's JDK paths, and provisions a *user-writable* Rust toolchain. Jobs that
+# include compile.yaml must also set `imageName: hetzner-incus` so its pip step
+# is skipped (numpy comes from apt here; PEP 668 on Ubuntu 24.04+ rejects
+# pip-into-system-python).
+parameters:
+  # Packages the image does not ship that this job needs. cmake +
+  # python3-numpy is the common case; override per job, e.g. [clang-format].
+  - name: aptPackages
+    type: object
+    default:
+      - cmake
+      - python3-numpy
+
+steps:
+  # incus containers are reused across jobs, so wipe known leftover artifacts
+  # before we start (matches questdb/questdb's templates/steps.yml).
+  - bash: |
+      rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
+    displayName: "incus: cleanup /tmp leftovers"
+
+  - bash: |
+      set -eux
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends ${{ join(' ', parameters.aptPackages) }}
+    displayName: "incus: apt install"
+
+  - bash: |
+      set -eux
+      # Image-provided JDK paths (provision.sh installs openjdk-17-jdk and
+      # openjdk-25-jdk). JAVA_HOME defaults to 25 because the
+      # QuestDB-from-master Maven builds need it; steps that want 17 (the
+      # cmake build in compile.yaml, run_all_tests.py) read
+      # $(JAVA_HOME_17_X64) explicitly.
+      JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
+      JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
+      for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
+        if [ ! -x "$p/bin/javac" ]; then
+          echo "Expected JDK missing at $p" >&2
+          ls /usr/lib/jvm/ >&2 || true
+          exit 1
+        fi
+      done
+      # `set -x` traces `echo "##vso[...]VALUE"` as `+ echo '##vso[...]VALUE'`;
+      # Azure's stdout parser matches `##vso[` anywhere on the line and takes
+      # everything past `]` to EOL as the value, including the trailing `'`
+      # bash added. Disable trace just for these echoes so JAVA_HOME does not
+      # end up as `/usr/lib/jvm/java-25-openjdk-amd64'`.
+      set +x
+      echo "##vso[task.setvariable variable=JAVA_HOME_17_X64]$JAVA_PATH_17"
+      echo "##vso[task.setvariable variable=JAVA_HOME_25_X64]$JAVA_PATH_25"
+      echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH_25"
+    displayName: "incus: resolve JDKs"
+
+  - bash: |
+      set -eux
+      # The image installs rustup as root in /root/.cargo, which the agent
+      # user can neither read nor extend — so `rustup install beta/nightly`
+      # (needed by the RunOnLinux toolchain matrix) would fail against it.
+      # Always provision a user-writable rustup in the default $HOME/.cargo +
+      # $HOME/.rustup locations instead. rustup-init is idempotent and the
+      # incus container is reused across jobs, so this is effectively a
+      # one-time cost. Subsequent steps get cargo/rustup via prependpath.
+      if ! [ -x "$HOME/.cargo/bin/cargo" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+      fi
+      . "$HOME/.cargo/env"
+      cargo --version
+      # See the JAVA_HOME comment above re: `set -x` + `##vso[...]`.
+      set +x
+      echo "##vso[task.prependpath]$HOME/.cargo/bin"
+    displayName: "incus: resolve Rust toolchain"
