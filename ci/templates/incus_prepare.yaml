@@ -20,6 +20,14 @@ parameters:
     default:
       - cmake
       - python3-numpy
+  # Set true for jobs that run the full system_test suite. Ubuntu 24.04's apt
+  # numpy is 1.26 (max 32 ndarray dims), but test_f64_arr_max_dims builds a
+  # 33-dim array, which needs numpy >= 2.0. This installs pip + numpy>=2
+  # (shadowing any apt numpy). PEP 668 blocks pip into system python, hence
+  # --break-system-packages.
+  - name: pipNumpy
+    type: boolean
+    default: false
 
 steps:
   # incus containers are reused across jobs, so wipe known leftover artifacts
@@ -33,6 +41,14 @@ steps:
       sudo apt-get update
       sudo apt-get install -y --no-install-recommends ${{ join(' ', parameters.aptPackages) }}
     displayName: "incus: apt install"
+
+  - ${{ if parameters.pipNumpy }}:
+    - bash: |
+        set -eux
+        sudo apt-get install -y --no-install-recommends python3-pip
+        python3 -m pip install --break-system-packages --upgrade 'numpy>=2'
+        python3 -c 'import numpy; print("numpy", numpy.__version__)'
+      displayName: "incus: install numpy>=2 (pip)"
 
   - bash: |
       set -eux
