@@ -1527,6 +1527,69 @@ class TestArrowIngressFuzz(afc.ArrowFuzzBase):
                 afc.ingest_via_arrow(self._fixture, table, rb)
                 afc.wait_for_rows(self._fixture, table, rb.num_rows)
 
+class TestColumnSenderBorrowWithRetry(unittest.TestCase):
+    """Cross-FFI coverage for the `questdb_db_borrow_*_column_sender_with_retry`
+    shims — the retry/backoff borrow driven through the C ABI from Python."""
+
+    def test_direct_with_retry_fails_against_dead_endpoint(self):
+        import socket
+        from arrow_ffi import (
+            db_connect,
+            db_close,
+            db_borrow_direct_conn_with_retry,
+        )
+        # Bind then close to get a definitely-closed local port. The pool is
+        # lazy, so the connect only happens on borrow; a closed port refuses
+        # immediately, so the Direct retry shim must exhaust its budget and
+        # raise across the FFI boundary instead of hanging or crashing.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+        probe.close()
+        conf = f"qwpws::addr=127.0.0.1:{dead_port};".encode("utf-8")
+        db = db_connect(conf)  # lazy: opens no socket, so it succeeds
+        try:
+            # Non-zero budget exercises the retry loop (attempts + backoff).
+            with self.assertRaises(ArrowSenderError):
+                db_borrow_direct_conn_with_retry(db, 200)
+            # Zero budget makes a single attempt; still fails.
+            with self.assertRaises(ArrowSenderError):
+                db_borrow_direct_conn_with_retry(db, 0)
+        finally:
+            db_close(db)
+
+    def test_sf_with_retry_borrows_against_live_fixture(self):
+        from arrow_ffi import (
+            db_connect,
+            db_close,
+            db_borrow_conn_with_retry,
+            db_return_conn,
+            db_drop_conn,
+            conn_must_close,
+        )
+        from test import skip_if_unsupported_qwp_ws_fixture
+        fixture = afc.get_live_fixture(self)  # skips when no live fixture
+        conf = afc.ingress_conf(fixture).encode("utf-8")
+        try:
+            db = db_connect(conf)
+        except ArrowSenderError as e:
+            skip_if_unsupported_qwp_ws_fixture(e, fixture)
+            raise
+        try:
+            try:
+                conn = db_borrow_conn_with_retry(db, 5000)
+            except ArrowSenderError as e:
+                skip_if_unsupported_qwp_ws_fixture(e, fixture)
+                raise
+            self.assertTrue(conn)
+            if conn_must_close(conn):
+                db_drop_conn(db, conn)
+            else:
+                db_return_conn(db, conn)
+        finally:
+            db_close(db)
+
+
 def register(loop_registry):
     loop_registry.append(TestArrowIngressPerKind)
     loop_registry.append(TestArrowIngressDesignatedTs)
@@ -1536,6 +1599,7 @@ def register(loop_registry):
     loop_registry.append(TestArrowIngressMultiBatch)
     loop_registry.append(TestArrowIngressSfa)
     loop_registry.append(TestArrowIngressFuzz)
+    loop_registry.append(TestColumnSenderBorrowWithRetry)
 
 if __name__ == "__main__":
     print(

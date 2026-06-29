@@ -35,6 +35,10 @@ class _QwpwsConn(ctypes.Structure):
     """Opaque `column_sender*` (borrowed pooled connection)."""
 
 
+class _DirectColumnSender(ctypes.Structure):
+    """Opaque `direct_column_sender*` (borrowed pipelined connection)."""
+
+
 class ArrowSenderError(_SenderError):
     """`SenderError` carrying the `line_sender_error_code` discriminant."""
 
@@ -192,6 +196,22 @@ _db_borrow_conn = _setsig(
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
+_db_borrow_conn_with_retry = _setsig(
+    "questdb_db_borrow_sf_column_sender_with_retry",
+    ctypes.POINTER(_QwpwsConn),
+    ctypes.POINTER(_QuestdbDb),
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
+)
+
+_db_borrow_direct_conn_with_retry = _setsig(
+    "questdb_db_borrow_direct_column_sender_with_retry",
+    ctypes.POINTER(_DirectColumnSender),
+    ctypes.POINTER(_QuestdbDb),
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
+)
+
 _db_return_conn = _setsig(
     "questdb_db_return_sf_column_sender",
     None,
@@ -340,6 +360,26 @@ def db_borrow_conn(db_ptr):
     """Borrow a pooled `column_sender*`."""
     err_ref = ctypes.POINTER(_LineSenderError)()
     conn = _db_borrow_conn(db_ptr, ctypes.byref(err_ref))
+    if not conn:
+        raise _take_sender_error(err_ref)
+    return conn
+
+
+def db_borrow_conn_with_retry(db_ptr, budget_ms: int):
+    """Borrow a store-and-forward `column_sender*`, retrying the connect
+    within `budget_ms` (`0` makes a single attempt)."""
+    err_ref = ctypes.POINTER(_LineSenderError)()
+    conn = _db_borrow_conn_with_retry(db_ptr, budget_ms, ctypes.byref(err_ref))
+    if not conn:
+        raise _take_sender_error(err_ref)
+    return conn
+
+
+def db_borrow_direct_conn_with_retry(db_ptr, budget_ms: int):
+    """Borrow a pipelined (Direct) `direct_column_sender*`, retrying the
+    connect within `budget_ms` (`0` makes a single attempt)."""
+    err_ref = ctypes.POINTER(_LineSenderError)()
+    conn = _db_borrow_direct_conn_with_retry(db_ptr, budget_ms, ctypes.byref(err_ref))
     if not conn:
         raise _take_sender_error(err_ref)
     return conn

@@ -62,6 +62,7 @@ from arrow_ingress_fuzz import (
     TestArrowIngressMultiBatch,
     TestArrowIngressSfa,
     TestArrowIngressFuzz,
+    TestColumnSenderBorrowWithRetry,
 )
 from arrow_round_trip_fuzz import (
     TestArrowRoundTripPerKind,
