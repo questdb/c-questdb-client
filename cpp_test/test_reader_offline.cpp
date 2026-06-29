@@ -33,6 +33,37 @@
 #include <questdb/egress/reader.h>
 #include <questdb/egress/reader.hpp>
 
+// Pin the back-compat `reader_error_*` aliases (object-like `#define`s in
+// reader.h that expand to `line_sender_error_*`) to their expected unified
+// discriminants. A copy-paste slip in an alias is otherwise invisible: every
+// surviving runtime comparison is symbolic, so it would tautologically pass.
+// The expected numbers here are themselves cross-checked against the Rust enum
+// + C header by `c_header_line_sender_enum_matches_rust` in questdb-rs-ffi.
+static_assert(reader_error_could_not_resolve_addr == 0, "reader alias drift");
+static_assert(reader_error_invalid_api_call == 1, "reader alias drift");
+static_assert(reader_error_socket_error == 2, "reader alias drift");
+static_assert(reader_error_invalid_utf8 == 3, "reader alias drift");
+static_assert(reader_error_auth_error == 6, "reader alias drift");
+static_assert(reader_error_tls_error == 7, "reader alias drift");
+static_assert(reader_error_config_error == 10, "reader alias drift");
+static_assert(reader_error_role_mismatch == 18, "reader alias drift");
+static_assert(reader_error_connect_timeout == 19, "reader alias drift");
+static_assert(reader_error_handshake_error == 20, "reader alias drift");
+static_assert(reader_error_unsupported_server == 21, "reader alias drift");
+static_assert(reader_error_protocol_error == 22, "reader alias drift");
+static_assert(reader_error_invalid_bind == 23, "reader alias drift");
+static_assert(reader_error_server_schema_mismatch == 24, "reader alias drift");
+static_assert(reader_error_server_parse_error == 25, "reader alias drift");
+static_assert(reader_error_server_internal_error == 26, "reader alias drift");
+static_assert(reader_error_server_security_error == 27, "reader alias drift");
+static_assert(reader_error_limit_exceeded == 28, "reader alias drift");
+static_assert(reader_error_server_limit_exceeded == 29, "reader alias drift");
+static_assert(reader_error_cancelled == 30, "reader alias drift");
+static_assert(reader_error_failover_would_duplicate == 31, "reader alias drift");
+static_assert(reader_error_schema_drift == 32, "reader alias drift");
+static_assert(reader_error_no_schema == 33, "reader alias drift");
+static_assert(reader_error_arrow_export == 34, "reader alias drift");
+
 #include <cstdlib>
 #include <cstring>
 #include <string>

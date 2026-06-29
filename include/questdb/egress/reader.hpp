@@ -67,54 +67,10 @@ namespace questdb::egress
 // same contract the C API does.
 // ---------------------------------------------------------------------------
 
-/**
- * Stripped-prefix `enum class` mirroring `::reader_error_code`. The
- * underlying type is `int` and each variant has the same discriminant as
- * its C counterpart, so the two are reinterpret-castable. Matches the
- * style of `questdb::ingress::line_sender_error_code`.
- */
-enum class error_code : int
-{
-    could_not_resolve_addr = ::reader_error_could_not_resolve_addr,
-    config_error           = ::reader_error_config_error,
-    invalid_api_call       = ::reader_error_invalid_api_call,
-    socket_error           = ::reader_error_socket_error,
-    tls_error              = ::reader_error_tls_error,
-    handshake_error        = ::reader_error_handshake_error,
-    auth_error             = ::reader_error_auth_error,
-    unsupported_server     = ::reader_error_unsupported_server,
-    role_mismatch          = ::reader_error_role_mismatch,
-    protocol_error         = ::reader_error_protocol_error,
-    invalid_utf8           = ::reader_error_invalid_utf8,
-    invalid_bind           = ::reader_error_invalid_bind,
-    server_schema_mismatch = ::reader_error_server_schema_mismatch,
-    server_parse_error     = ::reader_error_server_parse_error,
-    server_internal_error  = ::reader_error_server_internal_error,
-    server_security_error  = ::reader_error_server_security_error,
-    limit_exceeded         = ::reader_error_limit_exceeded,
-    server_limit_exceeded     = ::reader_error_server_limit_exceeded,
-    cancelled                 = ::reader_error_cancelled,
-    failover_would_duplicate  = ::reader_error_failover_would_duplicate,
-
-    /** Streaming Arrow adapter observed a mid-stream schema change. The
-     *  cursor is still usable; re-call `next_arrow_batch` after dropping
-     *  any partial state to snapshot the new schema. Only raised with
-     *  the `arrow` feature enabled. */
-    schema_drift     = ::reader_error_schema_drift,
-    /** `next_arrow_batch` was called on a stream that terminated before
-     *  any batch was produced — no schema to snapshot. Only raised with
-     *  the `arrow` feature enabled. */
-    no_schema        = ::reader_error_no_schema,
-    /** Arrow C Data Interface export failed (arrow-rs rejected the
-     *  produced `ArrayData`'s invariants). Indicates a client bug —
-     *  not user-recoverable. Only raised with the `arrow` feature
-     *  enabled. */
-    arrow_export     = ::reader_error_arrow_export,
-    /** The TCP connect (dial) to an endpoint exceeded the configured
-     *  `connect_timeout`. Distinct from `socket_error` so a caller can tell a
-     *  timed-out dial apart from a refused / reset connection. */
-    connect_timeout  = ::reader_error_connect_timeout,
-};
+/** Egress error code. Alias of the unified `questdb::error_code`
+ *  (so `error_code::config_error` and the C `reader_error_config_error`
+ *  name the same value). */
+using error_code = ::questdb::error_code;
 
 /**
  * Stripped-prefix `enum class` mirroring `::reader_column_kind`. The
@@ -177,14 +133,9 @@ enum class terminal_kind : int
 // keeps existing C-prefix usage (`e.code() == reader_error_config_error`)
 // compiling while new code can prefer `error_code::config_error`.
 // ---------------------------------------------------------------------------
-inline bool operator==(error_code l, ::reader_error_code r) noexcept
-{ return static_cast<int>(l) == static_cast<int>(r); }
-inline bool operator==(::reader_error_code l, error_code r) noexcept
-{ return r == l; }
-inline bool operator!=(error_code l, ::reader_error_code r) noexcept
-{ return !(l == r); }
-inline bool operator!=(::reader_error_code l, error_code r) noexcept
-{ return !(l == r); }
+// (The `error_code` <-> C error-enum bridge lives in `namespace questdb`
+// alongside the unified `questdb::error_code`, since `egress::error_code` is
+// now an alias of it — see line_sender_core.hpp.)
 
 inline bool operator==(column_kind l, ::reader_column_kind r) noexcept
 { return static_cast<int>(l) == static_cast<int>(r); }
@@ -219,17 +170,15 @@ inline bool operator!=(::reader_terminal_kind l, terminal_kind r) noexcept
  * Thrown by `reader` and `cursor` methods on failure. The raw error code is
  * available via `code()`; the human-readable message via `what()`.
  */
-class reader_error : public std::runtime_error
+class reader_error : public ::questdb::error
 {
 public:
     reader_error(error_code code, const std::string& what)
-        : std::runtime_error{what}
-        , _code{code}
+        : ::questdb::error{code, what}
     {
     }
 
-    /** Error code categorising the error. */
-    error_code code() const noexcept { return _code; }
+    // `code()` is inherited from `questdb::error`.
 
 private:
     static reader_error from_c(::reader_error* c_err)
@@ -259,8 +208,6 @@ private:
         if (c_err) throw from_c(c_err);
         return result;
     }
-
-    error_code _code;
 
     friend class reader;
     friend class cursor;

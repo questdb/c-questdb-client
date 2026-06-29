@@ -51,127 +51,14 @@ use crate::line_sender_utf8;
 // Error type
 // ---------------------------------------------------------------------------
 
-/// An error that occurred when using the line reader.
-pub struct reader_error(Error);
-
-/// Category of egress error. Mirrors `questdb::egress::ErrorCode`.
-///
-/// Discriminants are explicit and append-only — must stay in lockstep
-/// with `reader_error_code` in `include/questdb/egress/reader.h`.
-/// Inserting a new variant in the middle would silently renumber later
-/// ones across recompiles and break ABI for any shared-library consumer
-/// holding a previously-built header.
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub enum reader_error_code {
-    /// Bad URL, host, or interface in the connect string.
-    reader_error_could_not_resolve_addr = 0,
-    /// Bad configuration string or builder argument.
-    reader_error_config_error = 1,
-    /// Methods called in the wrong order (e.g. `execute` while a cursor is live).
-    reader_error_invalid_api_call = 2,
-    /// Network-level failure (connect, read, write, close).
-    reader_error_socket_error = 3,
-    /// TLS handshake failure.
-    reader_error_tls_error = 4,
-    /// HTTP-upgrade or WebSocket handshake failure.
-    reader_error_handshake_error = 5,
-    /// Authentication or authorization failure.
-    reader_error_auth_error = 6,
-    /// Server returned an unsupported QWP version, encoding, or capability.
-    reader_error_unsupported_server = 7,
-    /// All endpoints connected but none advertised a role matching the
-    /// configured `target` filter.
-    reader_error_role_mismatch = 8,
-    /// Wire-format violation: bad magic, truncated frame, unknown
-    /// discriminant, invalid varint, symbol-dict reference miss, etc.
-    reader_error_protocol_error = 9,
-    /// String or symbol field was not valid UTF-8.
-    reader_error_invalid_utf8 = 10,
-    /// Bind parameter index, count, or value rejected client-side
-    /// (covers timestamp / decimal / geohash range failures too —
-    /// see `ErrorCode::InvalidBind` on the Rust side).
-    reader_error_invalid_bind = 11,
-    /// Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`).
-    reader_error_server_schema_mismatch = 12,
-    /// Server-reported QWP `PARSE_ERROR` (status `0x05`).
-    reader_error_server_parse_error = 13,
-    /// Server-reported QWP `INTERNAL_ERROR` (status `0x06`).
-    reader_error_server_internal_error = 14,
-    /// Server-reported QWP `SECURITY_ERROR` (status `0x08`).
-    reader_error_server_security_error = 15,
-    /// Client-side limit hit (e.g. an array row exceeds the configured cap).
-    reader_error_limit_exceeded = 16,
-    /// Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`).
-    reader_error_server_limit_exceeded = 17,
-    /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
-    reader_error_cancelled = 18,
-    /// Mid-query failover was eligible but at least one batch had already
-    /// been delivered to the caller and no `on_failover_reset` callback
-    /// was installed; replay would silently double-deliver rows already
-    /// consumed, so the cursor was terminated instead. Install
-    /// `reader_query_on_failover_reset` to opt in to replays, or
-    /// re-execute the query from scratch.
-    reader_error_failover_would_duplicate = 19,
-    /// Streaming Arrow adapter saw a mid-stream schema change. The cursor
-    /// is still usable; the next `reader_cursor_next_arrow_batch` call
-    /// snapshots the new schema and re-delivers the batch that triggered
-    /// the drift (it is preserved, not discarded). Only emitted with the
-    /// `arrow` feature enabled.
-    reader_error_schema_drift = 20,
-    /// `reader_cursor_next_arrow_batch` was called on a stream that
-    /// terminated before any batch was produced — no schema to snapshot.
-    /// Only emitted with the `arrow` feature enabled.
-    reader_error_no_schema = 21,
-    /// Arrow C Data Interface export failed (arrow-rs rejected the
-    /// produced `ArrayData`'s invariants). Indicates a client bug — not
-    /// user-recoverable. Only emitted with the `arrow` feature enabled.
-    reader_error_arrow_export = 22,
-    /// The TCP connect (dial) to an endpoint exceeded the configured
-    /// `connect_timeout`. Distinct from `reader_error_socket_error` so a
-    /// caller can tell a timed-out dial apart from a refused / reset
-    /// connection.
-    reader_error_connect_timeout = 23,
-}
-
-impl From<ErrorCode> for reader_error_code {
-    fn from(code: ErrorCode) -> Self {
-        use reader_error_code::*;
-        match code {
-            ErrorCode::CouldNotResolveAddr => reader_error_could_not_resolve_addr,
-            ErrorCode::ConfigError => reader_error_config_error,
-            ErrorCode::InvalidApiCall => reader_error_invalid_api_call,
-            ErrorCode::SocketError => reader_error_socket_error,
-            ErrorCode::TlsError => reader_error_tls_error,
-            ErrorCode::HandshakeError => reader_error_handshake_error,
-            ErrorCode::AuthError => reader_error_auth_error,
-            ErrorCode::UnsupportedServer => reader_error_unsupported_server,
-            ErrorCode::RoleMismatch => reader_error_role_mismatch,
-            ErrorCode::ProtocolError => reader_error_protocol_error,
-            ErrorCode::InvalidUtf8 => reader_error_invalid_utf8,
-            ErrorCode::InvalidBind => reader_error_invalid_bind,
-            ErrorCode::ServerSchemaMismatch => reader_error_server_schema_mismatch,
-            ErrorCode::ServerParseError => reader_error_server_parse_error,
-            ErrorCode::ServerInternalError => reader_error_server_internal_error,
-            ErrorCode::ServerSecurityError => reader_error_server_security_error,
-            ErrorCode::LimitExceeded => reader_error_limit_exceeded,
-            ErrorCode::ServerLimitExceeded => reader_error_server_limit_exceeded,
-            ErrorCode::Cancelled => reader_error_cancelled,
-            ErrorCode::FailoverWouldDuplicate => reader_error_failover_would_duplicate,
-            ErrorCode::SchemaDrift => reader_error_schema_drift,
-            ErrorCode::NoSchema => reader_error_no_schema,
-            ErrorCode::ArrowExport => reader_error_arrow_export,
-            ErrorCode::ConnectTimeout => reader_error_connect_timeout,
-            // ErrorCode is `#[non_exhaustive]`. Any future variant added
-            // upstream that the C ABI hasn't been taught about falls
-            // back to ProtocolError so callers see *something* rather
-            // than a build failure when versions skew. Production builds
-            // should never hit this — both crates rebuild together
-            // in-workspace.
-            _ => reader_error_protocol_error,
-        }
-    }
-}
+/// The egress reader shares the client's single unified error object and code
+/// enum. `reader_error` / `reader_error_code` are back-compat aliases of the
+/// canonical [`crate::line_sender_error`] / [`crate::line_sender_error_code`].
+/// The one `From<ErrorCode>` that maps every category — ingest and query —
+/// lives in `lib.rs`, so there is a single source of truth for the C error
+/// codes.
+pub type reader_error = crate::line_sender_error;
+pub type reader_error_code = crate::line_sender_error_code;
 
 /// Stash a deferred error on a `reader_query` (first-error-wins).
 /// NULL-safe: logs and drops the error when `query` is NULL since the
@@ -232,7 +119,7 @@ unsafe fn write_err_box(err_out: *mut *mut reader_error, err: Error) {
         return;
     }
     unsafe {
-        *err_out = Box::into_raw(Box::new(reader_error(err)));
+        *err_out = Box::into_raw(Box::new(crate::line_sender_error::from_error(err)));
     }
 }
 
@@ -374,14 +261,14 @@ use utf8_in::validated_utf8;
 
 /// Error code categorising the error.
 ///
-/// NULL-safe: passing `NULL` returns `reader_error_invalid_api_call`
+/// NULL-safe: passing `NULL` returns `line_sender_error_invalid_api_call`
 /// (the caller is misusing the accessor) rather than dereferencing.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_error_get_code(error: *const reader_error) -> reader_error_code {
     if error.is_null() {
-        return reader_error_code::reader_error_invalid_api_call;
+        return reader_error_code::line_sender_error_invalid_api_call;
     }
-    unsafe { (*error).0.code().into() }
+    unsafe { (*error).error.code().into() }
 }
 
 /// UTF-8 encoded error message. Never returns NULL.
@@ -406,7 +293,7 @@ pub unsafe extern "C" fn reader_error_msg(
             // valid for any caller's lifetime.
             return c"".as_ptr();
         }
-        let msg: &str = (*error).0.msg();
+        let msg: &str = (*error).error.msg();
         if !len_out.is_null() {
             *len_out = msg.len();
         }
@@ -1309,7 +1196,7 @@ pub unsafe extern "C" fn reader_failover_event_elapsed_ns(ev: *const reader_fail
 
 /// Error code that triggered the failover (the cause-of-death of the
 /// previous connection). NULL-safe: returns
-/// `reader_error_invalid_api_call` when `ev` is NULL (the same
+/// `line_sender_error_invalid_api_call` when `ev` is NULL (the same
 /// sentinel as `reader_error_get_code(NULL)`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_failover_event_trigger_code(
@@ -1318,7 +1205,7 @@ pub unsafe extern "C" fn reader_failover_event_trigger_code(
     unsafe {
         match ev_ref(ev) {
             Some(e) => e.trigger.code().into(),
-            None => reader_error_code::reader_error_invalid_api_call,
+            None => reader_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -1611,7 +1498,7 @@ pub unsafe extern "C" fn reader_failover_progress_event_attempt(
 }
 
 /// Trigger error code (the cause-of-death of the previous connection).
-/// NULL-safe: returns `reader_error_invalid_api_call` when `ev`
+/// NULL-safe: returns `line_sender_error_invalid_api_call` when `ev`
 /// is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_failover_progress_event_trigger_code(
@@ -1620,7 +1507,7 @@ pub unsafe extern "C" fn reader_failover_progress_event_trigger_code(
     unsafe {
         match pev_ref(ev) {
             Some(e) => e.trigger.code().into(),
-            None => reader_error_code::reader_error_invalid_api_call,
+            None => reader_error_code::line_sender_error_invalid_api_call,
         }
     }
 }
@@ -1681,7 +1568,7 @@ pub unsafe extern "C" fn reader_failover_progress_event_server_info(
 
 /// Final error code (GaveUp phase only). Returns `true` and writes the
 /// code to `*out_code` on GaveUp; returns `false` and writes
-/// `reader_error_invalid_api_call` outside GaveUp or when `ev`/
+/// `line_sender_error_invalid_api_call` outside GaveUp or when `ev`/
 /// `out_code` is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reader_failover_progress_event_final_error_code(
@@ -1698,7 +1585,7 @@ pub unsafe extern "C" fn reader_failover_progress_event_final_error_code(
                 true
             }
             None => {
-                *out_code = reader_error_code::reader_error_invalid_api_call;
+                *out_code = reader_error_code::line_sender_error_invalid_api_call;
                 false
             }
         }
@@ -2029,7 +1916,7 @@ pub unsafe extern "C" fn reader_query_execute(
         // Including both the success-side
         // `Box::into_raw(Box::new(reader_cursor { .. }))` and
         // the error-side
-        // `Box::into_raw(Box::new(reader_error(..)))` inside
+        // `Box::into_raw(Box::new(line_sender_error::from_error(..)))` inside
         // the guarded closure closes the two allocation gaps left by
         // the previous narrower `catch_unwind` that wrapped only
         // `q.execute()`.
@@ -2220,7 +2107,7 @@ ffi_bind_method!(reader_query_bind_null_geohash, bind_null_geohash, precision_bi
 /// The payload is re-validated as UTF-8 on entry. A caller that hand-rolled
 /// a `line_sender_utf8` with invalid bytes (bypassing `line_sender_utf8_init`)
 /// has the error stored on the query and surfaced from
-/// `reader_query_execute` with `reader_error_invalid_utf8`. This
+/// `reader_query_execute` with `line_sender_error_invalid_utf8`. This
 /// function returns void, so deferred surfacing is the only way to report
 /// the error without aborting.
 #[unsafe(no_mangle)]
@@ -3709,9 +3596,9 @@ pub unsafe extern "C" fn questdb_db_connect_reader(
     match QuestDb::connect(conf) {
         Ok(db) => Box::into_raw(Box::new(questdb_db(db))),
         Err(err) => {
-            // Map the ingress connect error onto the egress error type so a
-            // reader-only consumer only ever sees `reader_error`.
-            unsafe { write_err_box(err_out, Error::from(err)) };
+            // Ingest and query share one error type now, so the connect error
+            // flows straight into the reader's `err_out` with no conversion.
+            unsafe { write_err_box(err_out, err) };
             ptr::null_mut()
         }
     }
@@ -3818,7 +3705,9 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn make_error(code: ErrorCode, msg: &str) -> *mut reader_error {
-        Box::into_raw(Box::new(reader_error(Error::new(code, msg))))
+        Box::into_raw(Box::new(crate::line_sender_error::from_error(Error::new(
+            code, msg,
+        ))))
     }
 
     #[test]
@@ -3826,7 +3715,7 @@ mod tests {
         unsafe {
             let err = make_error(ErrorCode::InvalidApiCall, "boom");
             let got = reader_error_get_code(err) as u32;
-            let want = reader_error_code::reader_error_invalid_api_call as u32;
+            let want = reader_error_code::line_sender_error_invalid_api_call as u32;
             assert_eq!(got, want);
             let mut len: size_t = 0;
             let p = reader_error_msg(err, &mut len);
@@ -3874,7 +3763,7 @@ mod tests {
             assert!(!ok);
             assert!(!err.is_null(), "err_out must be set on NULL handle");
             let code = reader_error_get_code(err) as u32;
-            let want = reader_error_code::reader_error_invalid_api_call as u32;
+            let want = reader_error_code::line_sender_error_invalid_api_call as u32;
             assert_eq!(code, want);
             reader_error_free(err);
         }
@@ -3983,7 +3872,9 @@ mod tests {
             let c: reader_error_code = code.into();
             // Trip through the public C accessor as well.
             unsafe {
-                let err = Box::into_raw(Box::new(reader_error(Error::new(code, ""))));
+                let err = Box::into_raw(Box::new(crate::line_sender_error::from_error(
+                    Error::new(code, ""),
+                )));
                 let got = reader_error_get_code(err);
                 assert_eq!(c as u32, got as u32, "round-trip mismatch for {:?}", code);
                 reader_error_free(err);
@@ -3991,15 +3882,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reader_error_code_arrow_discriminants_are_abi_stable() {
-        // Pin numeric values for the Arrow-related variants exposed to C/FFI
-        // consumers. Append-only past the existing tail at 19.
-        assert_eq!(reader_error_code::reader_error_schema_drift as u32, 20);
-        assert_eq!(reader_error_code::reader_error_no_schema as u32, 21);
-        assert_eq!(reader_error_code::reader_error_arrow_export as u32, 22);
-        assert_eq!(reader_error_code::reader_error_connect_timeout as u32, 23);
-    }
+    // (Discriminant ABI-stability for the unified enum — including the
+    // query/reader codes — is pinned by
+    // `line_sender_error_code_discriminants_are_abi_stable` in `lib.rs`.)
 
     #[test]
     fn column_kind_round_trips_for_every_variant() {
