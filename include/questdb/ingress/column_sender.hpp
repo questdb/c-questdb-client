@@ -728,9 +728,11 @@ inline column_chunk& column_chunk::append_arrow_import(
 #endif
 
 /**
- * Borrowed `::sf_column_sender*` wrapper: publish-only `flush` plus the `wait`
- * ack barrier and the Arrow-batch ingest. The store-and-forward queue owns
- * delivery. Owned by `borrowed_sf_column_sender`; do not construct directly.
+ * Thin non-owning view over a borrowed `::sf_column_sender*`: publish-only
+ * `flush` plus the `wait` ack barrier and the Arrow-batch ingest. The
+ * store-and-forward queue owns delivery. Use this directly when adapting a
+ * raw C-borrowed handle; `borrowed_sf_column_sender` keeps the same view
+ * private so pooled leases cannot escape the guard.
  */
 class sf_column_sender_conn
 {
@@ -861,6 +863,7 @@ public:
         , _force_drop{other._force_drop}
     {
         other._db = nullptr;
+        other._conn = sf_column_sender_conn{nullptr};
         other._force_drop = false;
     }
 
@@ -873,6 +876,7 @@ public:
             _conn = std::move(other._conn);
             _force_drop = other._force_drop;
             other._db = nullptr;
+            other._conn = sf_column_sender_conn{nullptr};
             other._force_drop = false;
         }
         return *this;
@@ -880,10 +884,70 @@ public:
 
     ~borrowed_sf_column_sender() noexcept { release(); }
 
-    sf_column_sender_conn* operator->() noexcept { return &_conn; }
-    const sf_column_sender_conn* operator->() const noexcept { return &_conn; }
-    sf_column_sender_conn& operator*() noexcept { return _conn; }
-    const sf_column_sender_conn& operator*() const noexcept { return _conn; }
+    /** `true` if this guard currently owns a borrowed conn. */
+    explicit operator bool() const noexcept
+    {
+        return _db && _conn.c_ptr();
+    }
+
+    /**
+     * Encode `chunk` and publish it into the store-and-forward queue, returning
+     * as soon as it is accepted locally. On success `chunk` is cleared; on
+     * failure it is left untouched. Call `wait()` to block for the server ack.
+     * Throws on error.
+     */
+    void flush(column_chunk& chunk)
+    {
+        _conn.flush(chunk);
+    }
+
+    /**
+     * Block until every frame published on this conn so far reaches `level`.
+     * The SFA queue owns delivery, so this is needed only to *observe* the ack,
+     * never for durability. `timeout` is a no-progress deadline (it fires only
+     * if the ack watermark fails to advance for that long); the default of zero
+     * waits indefinitely. Throws on error.
+     */
+    void wait(
+        column_sender_ack_level level = column_sender_ack_level::ok,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
+    {
+        _conn.wait(level, timeout);
+    }
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+    /**
+     * Publish-only Arrow flush (server-stamped) into the queue. Pair with
+     * `wait()`. Ownership: on success `array.release` is consumed; on failure
+     * it may also have been consumed; check before invoking. `schema` borrowed.
+     */
+    void flush_arrow_batch_at_now(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        _conn.flush_arrow_batch_at_now(
+            table, array, schema, overrides, overrides_len);
+    }
+
+    /**
+     * Publish-only Arrow flush sourcing the designated timestamp from a named
+     * `Timestamp(_)` column of the batch. Pair with `wait()`.
+     */
+    void flush_arrow_batch(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        _conn.flush_arrow_batch(
+            table, array, schema, ts_column, overrides, overrides_len);
+    }
+#endif
 
     /** `true` if this conn will be dropped rather than recycled on return
      * (force-marked, a flush left it must-close, or the pool has been closed).
@@ -916,6 +980,7 @@ private:
                 ::questdb_db_return_sf_column_sender(_db, raw);
         }
         _db = nullptr;
+        _conn = sf_column_sender_conn{nullptr};
     }
 
     ::questdb_db* _db;
@@ -1065,9 +1130,6 @@ public:
 
     /** Force the sender to drop on return instead of recycling. */
     void drop_on_return() noexcept { _force_drop = true; }
-
-    ::row_sender* c_ptr() noexcept { return _sender; }
-    const ::row_sender* c_ptr() const noexcept { return _sender; }
 
 private:
     friend class pool;

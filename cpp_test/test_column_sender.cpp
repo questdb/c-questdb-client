@@ -103,13 +103,13 @@ TEST_CASE("borrowed_sf_column_sender returns conn to pool on destructor")
 
     {
         auto conn = db.borrow_sf_column_sender();
-        CHECK(conn->c_ptr() != nullptr);
-        CHECK_FALSE(conn->must_close());
+        CHECK(static_cast<bool>(conn));
+        CHECK_FALSE(conn.must_close());
     }
     int accepts_before = mock->accepts();
     {
         auto conn = db.borrow_sf_column_sender();
-        CHECK(conn->c_ptr() != nullptr);
+        CHECK(static_cast<bool>(conn));
     }
     CHECK(mock->accepts() == accepts_before);
 }
@@ -119,11 +119,11 @@ TEST_CASE("borrowed_sf_column_sender move transfers ownership without double-ret
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
     auto a = db.borrow_sf_column_sender();
-    ::sf_column_sender* raw = a->c_ptr();
-    REQUIRE(raw != nullptr);
+    REQUIRE(static_cast<bool>(a));
 
     auto b = std::move(a);
-    CHECK(b->c_ptr() == raw);
+    CHECK_FALSE(static_cast<bool>(a));
+    CHECK(static_cast<bool>(b));
 }
 
 TEST_CASE("column_chunk flush round-trips through the mock")
@@ -140,7 +140,7 @@ TEST_CASE("column_chunk flush round-trips through the mock")
     chunk.column_i64("qty", qty, 3)
          .designated_timestamp_nanos(ts, 3);
 
-    conn->flush(chunk);
+    conn.flush(chunk);
     CHECK(chunk.row_count() == 0);
 
     // The mock graceful-closes after one frame, so sync() would hang.
@@ -235,7 +235,7 @@ TEST_CASE("flush rejects oversized table name")
     int64_t t[] = {1};
     chunk.column_i64("v", v, 1).designated_timestamp_nanos(t, 1);
 
-    CHECK_THROWS_AS(conn->flush(chunk), qdb::line_sender_error);
+    CHECK_THROWS_AS(conn.flush(chunk), qdb::line_sender_error);
     CHECK(chunk.row_count() == 1);
     conn.drop_on_return();
 }
@@ -256,7 +256,7 @@ TEST_CASE("wait rejects durable ACK without opt-in and keeps the chunk")
     // preserves the underlying `invalid_api_call` code.
     try
     {
-        conn->wait(qdb::column_sender_ack_level::durable);
+        conn.wait(qdb::column_sender_ack_level::durable);
         FAIL("durable without opt-in must throw");
     }
     catch (const qdb::line_sender_error& e)
@@ -280,7 +280,7 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
     }
     {
         auto conn = db.borrow_sf_column_sender();
-        CHECK(conn->c_ptr() != nullptr);
+        CHECK(static_cast<bool>(conn));
     }
     CHECK(mock->accepts() == accepts_before + 1);
 }
