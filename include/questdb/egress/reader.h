@@ -315,17 +315,17 @@ QUESTDB_CLIENT_API
 void reader_close(reader* reader);
 
 /**
- * Mark a pool-borrowed reader for must-close: the next
- * `reader_close` will drop the reader instead of returning it
- * to the pool. No-op on standalone readers (they're dropped on
- * close regardless) and on NULL handles.
+ * Force a pool-borrowed reader to drop on return: the next `reader_close`
+ * will drop the reader instead of returning it to the pool. No-op on
+ * standalone readers (they're dropped on close regardless) and on NULL
+ * handles.
  *
  * Use this when the cursor lifecycle detected a state that makes
  * the reader unsafe to recycle — e.g. a cursor abandoned mid-stream,
  * which causes the Rust `Cursor::Drop` to tear down the transport.
  */
 QUESTDB_CLIENT_API
-void reader_mark_must_close(reader* reader);
+void reader_drop_on_return(reader* reader);
 
 /* Reader pool (provided by `questdb/ingress/column_sender.h`'s
  * `questdb_db` opaque). Same FFI surface as the writer-side
@@ -396,7 +396,7 @@ void questdb_db_close(struct questdb_db* db);
  *
  * The returned `reader*` is equivalent to one constructed via
  * `reader_from_conf`. On `reader_close` the reader is
- * returned to the pool (or dropped if `reader_mark_must_close`
+ * returned to the pool (or dropped if `reader_drop_on_return`
  * was called first, or if the pool has been closed).
  */
 QUESTDB_CLIENT_API

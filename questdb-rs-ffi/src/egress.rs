@@ -140,17 +140,17 @@ fn wrap_pooled_reader(reader: Reader, pool: questdb::ffi_support::ReaderPoolHand
     }))
 }
 
-/// Mark a pool-borrowed reader for must-close: the next
-/// `reader_close` will drop the reader instead of returning it
-/// to the pool. No-op on standalone readers (they're dropped on
-/// close regardless) and on NULL handles.
+/// Force a pool-borrowed reader to drop on return: the next
+/// `reader_close` will drop the reader instead of returning it to the
+/// pool. No-op on standalone readers (they're dropped on close regardless)
+/// and on NULL handles.
 ///
 /// Useful when the cursor lifecycle detected a state that makes the
 /// reader unsafe to recycle (e.g. a cursor abandoned mid-stream,
 /// which causes the Rust `Cursor::Drop` to tear down the transport).
 #[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reader_mark_must_close(reader: *mut reader) {
+pub unsafe extern "C" fn reader_drop_on_return(reader: *mut reader) {
     if reader.is_null() {
         return;
     }
@@ -3617,8 +3617,8 @@ pub unsafe extern "C" fn questdb_db_connect_reader(
 /// The returned `reader*` is equivalent to one constructed via
 /// `reader_from_conf`: cursor lifecycle, stat getters, and
 /// failover all work the same. On `reader_close` the reader is
-/// returned to the pool (or dropped if it was marked must-close via
-/// `reader_mark_must_close`, or if the pool has been closed).
+/// returned to the pool (or dropped if `reader_drop_on_return` was called,
+/// or if the pool has been closed).
 #[cfg(feature = "sync-reader-qwp-ws")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_borrow_reader(

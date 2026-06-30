@@ -718,16 +718,14 @@ public:
         ::reader_reset_timing(_impl);
     }
 
-    /** Mark a pool-borrowed reader to be dropped (not recycled) when it is
-     *  returned to its pool on destruction. Mirrors Rust
-     *  `BorrowedReader::mark_must_close`. No-op for standalone readers
-     *  (constructed from a config string / `from_env`), which are closed on
-     *  destruction regardless.
+    /** Force a pool-borrowed reader to drop on return instead of recycling.
+     *  No-op for standalone readers (constructed from a config string /
+     *  `from_env`), which are closed on destruction regardless.
      *  @throws reader_error if this reader has been moved from. */
-    void mark_must_close()
+    void drop_on_return()
     {
         ensure_impl();
-        ::reader_mark_must_close(_impl);
+        ::reader_drop_on_return(_impl);
     }
 
     /** Negotiated QWP server version.
@@ -776,8 +774,9 @@ private:
     /// Borrow a pooled reader from a `questdb_db` pool. Backs
     /// `questdb::ingress::pool::borrow_reader`. The returned reader is
     /// equivalent to a standalone one; on destruction `reader_close`
-    /// returns it to the pool (or drops it if marked must-close or the
-    /// pool has been closed). Preparing a new query after pool close fails.
+    /// returns it to the pool (or drops it if `drop_on_return()` was called
+    /// or the pool has been closed). Preparing a new query after pool close
+    /// fails.
     static reader borrow_from_pool(::questdb_db* db)
     {
         return reader{

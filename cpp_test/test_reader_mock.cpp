@@ -4366,7 +4366,7 @@ TEST_CASE("mock: column::visit dispatches DOUBLE_ARRAY to array_view<double>")
 // Mirrors the Rust `QuestDb::borrow_reader` coverage
 // (questdb-rs/src/tests/column_sender_pool.rs::reader_pool). The unified pool
 // hands out query readers as well as senders; a borrowed reader returns to
-// the pool on destruction unless `mark_must_close()` was called.
+// the pool on destruction unless `drop_on_return()` was called.
 //
 // The pool is lazy: construction opens no connections (mirroring the Rust
 // `reader_pool_*` tests, which assert `server.accepted() == 0` right after
@@ -4419,24 +4419,24 @@ TEST_CASE("pool::borrow_reader borrows a usable reader and recycles it")
     CHECK(srv.accepts() == accepts_before_reuse);
 }
 
-TEST_CASE("pool::borrow_reader honours mark_must_close (drops, not recycles)")
+TEST_CASE("pool::borrow_reader honours drop_on_return (drops, not recycles)")
 {
     // Lazy pool: construction opens nothing. The first borrow consumes
-    // script[0]; after the must-close drop the re-borrow opens a fresh
+    // script[0]; after the drop-on-return the re-borrow opens a fresh
     // connection and consumes script[1].
     qm::MockServer srv({
         reader_park_script(), // first reader borrow
-        reader_park_script(), // re-borrow after the must-close drop
+        reader_park_script(), // re-borrow after drop-on-return
     });
     questdb::pool db{pool_conf(srv.addr())};
 
     {
         auto reader = db.borrow_reader();
         CHECK(reader.server_version() == 1);
-        reader.mark_must_close(); // drop on return instead of recycling
+        reader.drop_on_return();
     }
 
-    // The must-close reader was dropped, so the next borrow opens a fresh
+    // The drop-on-return reader was dropped, so the next borrow opens a fresh
     // connection (one more accept).
     int accepts_before = srv.accepts();
     {

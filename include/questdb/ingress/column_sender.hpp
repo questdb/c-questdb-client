@@ -1262,7 +1262,7 @@ public:
      * `pool_max` / `pool_idle_timeout_ms` budget; the pool is lazy (a
      * connection opens on first borrow). The returned `reader` is
      * equivalent to a standalone one and returns itself to the pool on
-     * destruction — unless `reader::mark_must_close()` was called, in which
+     * destruction — unless `reader::drop_on_return()` was called, in which
      * case it is dropped. If the pool has already been closed by the time the
      * reader is destroyed, it is closed instead of recycled. Throws
      * `reader_error` on cap exhaustion or transport failure.
