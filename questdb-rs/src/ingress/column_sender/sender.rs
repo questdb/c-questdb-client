@@ -34,7 +34,8 @@ use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::SymbolGlobalDict;
 use crate::ingress::sender::qwp_ws::{
     SyncQwpWsHandlerState, publish_qwp_ws_payload_background, qwp_ws_acked_fsn_background,
-    qwp_ws_check_error_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
+    qwp_ws_begin_close_background, qwp_ws_check_error_background,
+    qwp_ws_drain_to_deadline_background, qwp_ws_is_terminal_background, qwp_ws_ok_fsn_background,
     qwp_ws_poll_sender_error_in_range_background, qwp_ws_published_fsn_background,
 };
 #[cfg(feature = "arrow-ingress")]
@@ -311,6 +312,58 @@ impl ColumnSender {
         match &self.backend {
             ColumnSenderBackend::Direct(direct) => direct.conn.in_flight(),
             ColumnSenderBackend::StoreAndForward(_) => 0,
+        }
+    }
+
+    /// Non-blocking: `true` once the store-and-forward backend has no
+    /// undelivered frames — every published frame has reached the pool's ack
+    /// watermark (durable when `durable`, otherwise the OK watermark) — so the
+    /// connection can be retired without losing data. A terminal backend
+    /// reports `true`: its queued frames are already unrecoverable. Always
+    /// `true` for the direct backend, which owns no background queue.
+    ///
+    /// The pool reaper uses this to avoid evicting an idle connection whose
+    /// background runner is still flushing.
+    pub(crate) fn sfa_fully_delivered(&self, durable: bool) -> bool {
+        let ColumnSenderBackend::StoreAndForward(sfa) = &self.backend else {
+            return true;
+        };
+        if qwp_ws_is_terminal_background(&sfa.state) {
+            return true;
+        }
+        let Ok(Some(published)) = qwp_ws_published_fsn_background(&sfa.state) else {
+            // Nothing published yet, or a terminal/poisoned read: no
+            // recoverable frames are queued.
+            return true;
+        };
+        let watermark = if durable {
+            qwp_ws_acked_fsn_background(&sfa.state)
+        } else {
+            qwp_ws_ok_fsn_background(&sfa.state)
+        };
+        matches!(watermark, Ok(Some(w)) if w >= published)
+    }
+
+    /// Non-blocking: stop accepting new store-and-forward publications and wake
+    /// the background runner to flush what is queued. Pairs with
+    /// [`Self::drain_to_deadline`]. No-op for the direct backend.
+    pub(crate) fn begin_close(&self) {
+        if let ColumnSenderBackend::StoreAndForward(sfa) = &self.backend {
+            qwp_ws_begin_close_background(&sfa.state);
+        }
+    }
+
+    /// Block until the store-and-forward queue has delivered every published
+    /// frame, or `deadline` elapses. `Ok(())` means fully drained (or nothing
+    /// was queued); `Err` means the drain timed out or the transport went
+    /// terminal with frames still undelivered. No-op `Ok(())` for the direct
+    /// backend, whose deferred frames are handled by `commit_in_flight_on_drop`.
+    pub(crate) fn drain_to_deadline(&mut self, deadline: Option<Instant>) -> crate::Result<()> {
+        match &mut self.backend {
+            ColumnSenderBackend::Direct(_) => Ok(()),
+            ColumnSenderBackend::StoreAndForward(sfa) => {
+                qwp_ws_drain_to_deadline_background(&mut sfa.state, deadline)
+            }
         }
     }
 
@@ -1258,14 +1311,19 @@ impl SfaColumnBackend {
     }
 }
 
-/// The store-and-forward `sync` poll loop made no progress toward `boundary`
+/// The store-and-forward `wait` poll loop made no progress toward `boundary`
 /// for `sync_timeout`. The connection is alive but the server is not advancing
 /// the ack/durable watermark (e.g. back-pressured WAL or a stuck commit).
 ///
-/// Classified `FailoverRetry` — the local SFA queue still holds every unacked
-/// frame, so the caller can drop this borrow and re-borrow to replay, exactly
-/// as on the direct backend's transport-timeout path. The sync has *not*
-/// committed; the watermark simply has not reached `boundary` yet.
+/// Classified `FailoverRetry`, but — unlike the direct backend's
+/// transport-timeout path, which drops the connection and discards its
+/// uncommitted frames — the local SFA queue still holds every unacked frame
+/// and the background runner keeps delivering them across reborrows and
+/// reconnects. Re-flushing the same data would therefore duplicate it. The
+/// correct recovery is to retry `wait()` (idempotent — it only re-observes
+/// the watermark) until the runner catches up, or to close/drain the pool.
+/// Delivery has *not* failed; the watermark simply has not reached `boundary`
+/// yet.
 fn sfa_sync_timeout(
     sync_timeout: Duration,
     ack_level: AckLevel,
@@ -1283,10 +1341,13 @@ fn sfa_sync_timeout(
     crate::Error::new(
         ErrorCode::FailoverRetry,
         format!(
-            "QWP/WebSocket store-and-forward sync({}) timed out after {:?} \
+            "QWP/WebSocket store-and-forward wait({}) timed out after {:?} \
              with no ack progress (target FSN {}, {}); the connection is alive \
-             but the server is not advancing the watermark. The queued frames \
-             are retained; drop this sender and re-borrow to replay.",
+             but the server is not advancing the watermark. The frames remain \
+             queued and the background runner keeps delivering them: retry \
+             wait() to keep awaiting the ack, or close the pool to drain. Do \
+             not re-flush the same data, which is already accepted and would \
+             be delivered twice.",
             level, sync_timeout, boundary, progress
         ),
     )

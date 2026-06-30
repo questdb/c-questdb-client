@@ -117,104 +117,48 @@ extern "C" {
 // not check, and dereferencing the NULL slot will SIGSEGV (or worse, silently
 // corrupt memory if the page happens to be mapped).
 
-/////////// Error handling.
+/////////// Error handling (unified with the line sender).
+//
+// Ingest and query share ONE error object and ONE error-code enum. The
+// reader's error type and codes are back-compat aliases of the canonical
+// `line_sender_error` / `line_sender_error_code` declared in
+// <questdb/ingress/line_sender.h> (already included above). The query codes
+// live at discriminants 20..34 of that enum; the shared codes reuse the
+// frozen ingress numbers, so e.g. `reader_error_invalid_api_call == 1`.
 
-/** An error that occurred when using the line reader. */
-typedef struct reader_error reader_error;
+/** An error that occurred when using the line reader.
+ *  Alias of `line_sender_error` — the client's single error object. */
+typedef line_sender_error reader_error;
 
-/**
- * Category of egress error.
- *
- * Discriminants are explicit and append-only across releases — inserting
- * a new variant in the middle would silently renumber later ones across
- * recompiles, breaking ABI for shared-library consumers. New error codes
- * MUST be added at the end with the next free integer.
- */
-typedef enum reader_error_code
-{
-    /** Bad URL, host, or interface in the connect string. */
-    reader_error_could_not_resolve_addr = 0,
-    /** Bad configuration string or builder argument. */
-    reader_error_config_error = 1,
-    /** Methods called in the wrong order (e.g. `execute` while a cursor is live). */
-    reader_error_invalid_api_call = 2,
-    /** Network-level failure (connect, read, write, close). */
-    reader_error_socket_error = 3,
-    /** TLS handshake failure. */
-    reader_error_tls_error = 4,
-    /** HTTP-upgrade or WebSocket handshake failure. */
-    reader_error_handshake_error = 5,
-    /** Authentication or authorization failure. */
-    reader_error_auth_error = 6,
-    /** Server returned an unsupported QWP version, encoding, or capability. */
-    reader_error_unsupported_server = 7,
-    /** All endpoints connected, but none advertised a role matching the
-     *  configured `target` filter (e.g. `target=replica` against a
-     *  single-node OSS server emitting `STANDALONE`). */
-    reader_error_role_mismatch = 8,
-    /** Wire-format violation: bad magic, truncated frame, unknown
-     *  discriminant, invalid varint, symbol-dict reference miss, etc. */
-    reader_error_protocol_error = 9,
-    /** String or symbol field was not valid UTF-8. */
-    reader_error_invalid_utf8 = 10,
-    /** Bind parameter index, count, or value rejected client-side
-     *  (before the QUERY_REQUEST hits the wire). Covers timestamp /
-     *  decimal / geohash range failures too — every reachable
-     *  client-side validation flows through bind encoding. */
-    reader_error_invalid_bind = 11,
-    /** Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`). */
-    reader_error_server_schema_mismatch = 12,
-    /** Server-reported QWP `PARSE_ERROR` (status `0x05`). */
-    reader_error_server_parse_error = 13,
-    /** Server-reported QWP `INTERNAL_ERROR` (status `0x06`). */
-    reader_error_server_internal_error = 14,
-    /** Server-reported QWP `SECURITY_ERROR` (status `0x08`). */
-    reader_error_server_security_error = 15,
-    /** Client-side limit hit (e.g. an array row exceeds the configured
-     *  per-row element cap). */
-    reader_error_limit_exceeded = 16,
-    /** Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`). */
-    reader_error_server_limit_exceeded = 17,
-    /** Query was cancelled (locally or via server `CANCELLED` status `0x0A`). */
-    reader_error_cancelled = 18,
-    /** Mid-query failover was eligible but at least one batch had
-     *  already been delivered to the caller and no
-     *  `on_failover_reset` callback was installed; replay would
-     *  silently double-deliver rows already consumed, so the cursor
-     *  was terminated instead. Install a failover-reset callback via
-     *  `reader_query_on_failover_reset` (and discard partial
-     *  state on each invocation) to opt in to replays, or re-execute
-     *  the query from scratch when this code surfaces. Initial-
-     *  connect failover (before any batch is yielded) is unaffected
-     *  and remains transparent. */
-    reader_error_failover_would_duplicate = 19,
-    /** Streaming Arrow adapter saw a mid-stream schema change. The
-     *  cursor remains usable; its pinned schema snapshot is cleared
-     *  by this error, so the next
-     *  `reader_cursor_next_arrow_batch` call snapshots the new
-     *  schema and resumes streaming. The batch that triggered the
-     *  drift is preserved and re-delivered (under the new schema) by
-     *  that next call, not discarded. Only emitted when the `arrow`
-     *  feature is enabled. */
-    reader_error_schema_drift = 20,
-    /** A higher-level streaming Arrow adapter (Rust `as_arrow_reader` /
-     *  `iter_polars`) was asked for a schema on a stream that terminated
-     *  before any batch was produced. `reader_cursor_next_arrow_batch`
-     *  itself reports an empty stream as `reader_arrow_batch_end`, so
-     *  pure-C callers do not observe this code. Only present when the
-     *  `arrow` feature is enabled. */
-    reader_error_no_schema = 21,
-    /** Arrow C Data Interface export failed (arrow-rs rejected the
-     *  produced `ArrayData`'s invariants). Indicates a client bug —
-     *  not user-recoverable. Only emitted when the `arrow` feature
-     *  is enabled. */
-    reader_error_arrow_export = 22,
-    /** The TCP connect (dial) to an endpoint exceeded the configured
-     *  `connect_timeout`. Distinct from `reader_error_socket_error` so a
-     *  caller can tell a timed-out dial apart from a refused / reset
-     *  connection. */
-    reader_error_connect_timeout = 23,
-} reader_error_code;
+/** Category of error. Alias of the unified `line_sender_error_code`. */
+typedef line_sender_error_code reader_error_code;
+
+/* Back-compat names for the reader error codes — each maps onto its
+ * canonical `line_sender_error_*` counterpart in the unified enum. */
+#define reader_error_could_not_resolve_addr line_sender_error_could_not_resolve_addr
+#define reader_error_config_error line_sender_error_config_error
+#define reader_error_invalid_api_call line_sender_error_invalid_api_call
+#define reader_error_socket_error line_sender_error_socket_error
+#define reader_error_tls_error line_sender_error_tls_error
+#define reader_error_handshake_error line_sender_error_handshake_error
+#define reader_error_auth_error line_sender_error_auth_error
+#define reader_error_unsupported_server line_sender_error_unsupported_server
+#define reader_error_role_mismatch line_sender_error_role_mismatch
+#define reader_error_protocol_error line_sender_error_protocol_error
+#define reader_error_invalid_utf8 line_sender_error_invalid_utf8
+#define reader_error_invalid_bind line_sender_error_invalid_bind
+#define reader_error_server_schema_mismatch line_sender_error_server_schema_mismatch
+#define reader_error_server_parse_error line_sender_error_server_parse_error
+#define reader_error_server_internal_error line_sender_error_server_internal_error
+#define reader_error_server_security_error line_sender_error_server_security_error
+#define reader_error_limit_exceeded line_sender_error_limit_exceeded
+#define reader_error_server_limit_exceeded line_sender_error_server_limit_exceeded
+#define reader_error_cancelled line_sender_error_cancelled
+#define reader_error_failover_would_duplicate line_sender_error_failover_would_duplicate
+#define reader_error_schema_drift line_sender_error_schema_drift
+#define reader_error_no_schema line_sender_error_no_schema
+#define reader_error_arrow_export line_sender_error_arrow_export
+#define reader_error_connect_timeout line_sender_error_connect_timeout
 
 /**
  * Error code categorising the error.
@@ -1980,7 +1924,7 @@ typedef enum reader_arrow_batch_result
  * untouched.
  *
  * Mid-stream schema drift (the underlying QuestDB table altered between
- * batches) surfaces as `reader_error_schema_drift` (= 20) on the
+ * batches) surfaces as `reader_error_schema_drift` on the
  * call that detects it; the cursor's pinned schema snapshot is then
  * cleared so the next call re-snapshots the new schema and resumes. The
  * batch that triggered the drift is preserved and re-delivered (under the

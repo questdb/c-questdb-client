@@ -27,6 +27,7 @@ import pytest
 
 # server.wait_port_free and pg_query helpers come from the Enterprise
 # harness on PYTHONPATH (set up by conftest.py).
+from lib.lifecycle import submit_switch
 from lib.pg_query import count_rows, execute_ddl, wait_for_count, wait_for_dense_sequence
 from lib.server import wait_port_free
 
@@ -954,3 +955,513 @@ def test_partial_ack_sealed_segment_replay_dedup_collapses_c_client_rust(
                                 expected_count=row_count, timeout_s=120.0)
     finally:
         sidecar2.stop()
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_orphan_drainer_durable_ack_trim_timing_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """No-kill pin of the exact line fix 19b9fda changed: an adopted orphan
+    slot under ``request_durable_ack=on`` must be trimmed ONLY once the WAL
+    upload is durable, never on a plain server OK.
+
+    Where ``test_orphan_drainer_durable_ack_survives_kill`` proves the
+    end-to-end *consequence* (rows survive a failover) and so needs a kill +
+    object-store wipe, this test pins the *cause* directly and deterministically
+    by holding the OK->durable window open with the harness durability gate
+    (``obj_store.freeze()`` makes the filesystem store reject writes, so the
+    server's durable-upload watermark -- and therefore the durable ack -- cannot
+    advance while local commits still get a plain OK). With that window held:
+
+      1. assert the adopted orphan ``.sfa`` segments are RETAINED after the OK,
+      2. thaw, then assert they are trimmed once the durable ack arrives.
+
+    Pre-fix (orphan drainer hard-coded OK-trim) step 1 fails the instant the
+    drainer receives the OK -- the slot is trimmed while the store is still
+    frozen. No failover, no wipe; it fails fast and points straight at the
+    regression."""
+    table = "trades_orphan_trim_timing_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    ghost_slot = sf_dir / "ghost"
+    row_count = 50
+
+    def orphan_sfa() -> list[Path]:
+        return sorted(ghost_slot.glob("sf-*.sfa")) if ghost_slot.exists() else []
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    # Pre-create while the store is writable so the table's structure is
+    # registered before the freeze; the test pivots on the durability of the
+    # *row* commits, not the create. DEDUP keeps the post-thaw re-scan replay
+    # idempotent so the dense-sequence oracle stays focused on trim timing
+    # (duplicate-freeness across a partial-durability kill is the subject of
+    # test_orphan_drainer_partial_durability_at_kill).
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
+
+    # Hold the OK->durable window open across the whole orphan handoff. frozen()
+    # thaws on exit even if an assertion inside raises, so a failure never
+    # leaves the store read-only for teardown.
+    with obj_store.frozen():
+        # Ghost writes durable-ack rows and abandons the slot
+        # (close_flush_timeout_millis=0 -> CLOSE returns immediately), leaving
+        # ghost/ full of OK'd-but-not-durable frames: the orphan.
+        ghost_cs = (
+            f"ws::addr=127.0.0.1:{p1_ports.http};"
+            "username=admin;password=quest;"
+            f"sf_dir={sf_dir};"
+            "sender_id=ghost;"
+            "request_durable_ack=on;"
+            "close_flush_timeout_millis=0;"
+        )
+        c_client_rust_sidecar.connect(ghost_cs)
+        c_client_rust_sidecar.send(table, count=row_count, start_index=0)
+        c_client_rust_sidecar.flush()
+        c_client_rust_sidecar.close()
+        assert orphan_sfa(), (
+            f"ghost slot {ghost_slot} should hold .sfa frames after an abandon "
+            f"with close_flush_timeout_millis=0; got {list(ghost_slot.iterdir()) if ghost_slot.exists() else '<missing>'}"
+        )
+
+        # Foreground sender adopts the orphan slot; its background drainer pushes
+        # the frames and P1 returns a plain OK (local commit), but no durable ack
+        # can arrive while the store is frozen.
+        fg_cs = (
+            f"ws::addr=127.0.0.1:{p1_ports.http};"
+            "username=admin;password=quest;"
+            f"sf_dir={sf_dir};"
+            "sender_id=primary;"
+            "drain_orphans=on;"
+            "request_durable_ack=on;"
+            "reconnect_max_duration_millis=60000;"
+            "close_flush_timeout_millis=5000;"
+        )
+        c_client_rust_sidecar.connect(fg_cs)
+
+        # The orphan rows reaching P1 proves the drainer pushed them and P1 OK'd
+        # them -- the exact moment pre-fix OK-trim would delete the slot.
+        wait_for_count(port=p1_ports.pg, table=table, expected=row_count, timeout_s=30.0)
+
+        # THE CRUX: with the store still frozen no durable ack is possible, so a
+        # correct (post-19b9fda) drainer RETAINS the adopted orphan slot. Hold
+        # the assertion a few seconds so a pre-fix OK-trim has ample time to
+        # fire after the OK.
+        hold_deadline = time.monotonic() + 5.0
+        while time.monotonic() < hold_deadline:
+            assert orphan_sfa(), (
+                "orphan .sfa segments were trimmed on a plain server OK while the "
+                "object store was frozen (no durable ack possible) -- the orphan "
+                "drainer is OK-trimming instead of honouring request_durable_ack "
+                "(regression of c-questdb-client fix 19b9fda)."
+            )
+            time.sleep(0.25)
+
+    # Thawed: the uploader's retry now publishes the parked WAL, the durable
+    # watermark advances, and the server can finally durable-ack. Re-scan via a
+    # fresh foreground connect (the proven orphan re-adoption path) so the
+    # now-durable slot is completed, and assert the .sfa segments disappear.
+    c_client_rust_sidecar.connect(fg_cs)
+    trim_deadline = time.monotonic() + 60.0
+    while time.monotonic() < trim_deadline:
+        if not orphan_sfa():
+            break
+        time.sleep(0.5)
+    else:
+        pytest.fail(
+            f"orphan .sfa segments in {ghost_slot} were never trimmed after the "
+            "object store was thawed and the rows became durable; the drainer is "
+            "not completing the durably-acked orphan slot."
+        )
+
+    # Loss-free and (via DEDUP) duplicate-free: every orphan row is on P1 exactly
+    # once. Confirms the retained-then-trimmed slot actually carried the data.
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=row_count, timeout_s=30.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_orphan_drainer_partial_durability_at_kill_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """Partial durability across a kill: when an orphan slot is killed with
+    some frames already durable and some only OK'd, exactly the non-durable
+    frames must replay -- loss-free AND duplicate-free.
+
+    Split the orphan into two halves on one ghost slot:
+      * batch 1 is made durable BEFORE the freeze (await_acked under
+        request_durable_ack=on returns only on the durable ack, so the ghost
+        slot durably trims it -- those frames now live in the object store and
+        are gone from the slot);
+      * batch 2 is written AFTER ``obj_store.freeze()``, so it is OK'd but never
+        durable; the ghost abandons the slot with only batch 2 left in it.
+
+    The foreground drainer adopts the slot and pushes batch 2 (P1 OKs locally).
+    P1 is then killed *without wiping the object store*. The successor comes up
+    as a replica on the dead primary's ports -- a fresh primary would refuse the
+    populated store (ER007: the object store owns another database's DataID),
+    whereas a replica legitimately adopts the store's DataID and downloads the
+    durable batch 1 -- and is then promoted so it can take the ingress replay.
+    The re-adopting drainer replays batch 2 from the slot to the promoted
+    successor. The dense-sequence oracle then proves it holds exactly ``[0..N)``
+    -- batch 1 recovered from the store (not lost, not duplicated by a stale
+    re-push), batch 2 recovered from the client SF. No DEDUP on the table, so a
+    spurious re-push of the already-durable half would surface as extra rows.
+
+    Pre-fix, batch 2 would have been OK-trimmed off the adopted slot before the
+    kill and lost (gap at ``[M..N)``); the OK-trim regression that 19b9fda fixes
+    is what this guards on the partial-durability boundary."""
+    table = "trades_orphan_partial_dura_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    ghost_slot = sf_dir / "ghost"
+    row_count = 60
+    durable_rows = 30  # batch 1: [0..30) made durable before the freeze
+    # batch 2: [30..60) OK'd-but-not-durable, carried across the kill in the SF
+
+    def orphan_sfa() -> list[Path]:
+        return sorted(ghost_slot.glob("sf-*.sfa")) if ghost_slot.exists() else []
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    # No DEDUP: the dense-sequence oracle must be free to catch a duplicate of
+    # the already-durable half as an extra row.
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL"
+    ))
+
+    ghost_cs = (
+        f"ws::addr=127.0.0.1:{p1_ports.http};"
+        "username=admin;password=quest;"
+        f"sf_dir={sf_dir};"
+        "sender_id=ghost;"
+        "request_durable_ack=on;"
+        "close_flush_timeout_millis=0;"
+    )
+    c_client_rust_sidecar.connect(ghost_cs)
+
+    # Batch 1 -> durable. await_acked under request_durable_ack=on only returns
+    # once the WAL upload is durable, so this both proves batch 1 reached the
+    # object store and durably trims it out of the ghost slot.
+    c_client_rust_sidecar.send(table, count=durable_rows, start_index=0)
+    fsn1 = c_client_rust_sidecar.flush()
+    assert c_client_rust_sidecar.await_acked(fsn1, timeout_ms=30_000), (
+        f"batch 1 (fsn={fsn1}) was not durably acked within 30s; cannot set up "
+        "the partial-durability split under test."
+    )
+
+    # Freeze: from here nothing can become durable. Batch 2 is OK'd-but-not-
+    # durable, and the ghost abandons the slot holding only batch 2.
+    obj_store.freeze()
+    try:
+        c_client_rust_sidecar.send(table, count=row_count - durable_rows,
+                                   start_index=durable_rows)
+        c_client_rust_sidecar.flush()
+        c_client_rust_sidecar.close()
+        assert orphan_sfa(), (
+            f"ghost slot {ghost_slot} should retain batch-2 .sfa frames after "
+            "abandon; the durable batch-1 trim must not have emptied the slot."
+        )
+
+        # Foreground drainer adopts the slot and pushes batch 2; P1 OKs locally
+        # but cannot durable-ack while frozen.
+        fg_cs = (
+            f"ws::addr=127.0.0.1:{p1_ports.http};"
+            "username=admin;password=quest;"
+            f"sf_dir={sf_dir};"
+            "sender_id=primary;"
+            "drain_orphans=on;"
+            "request_durable_ack=on;"
+            "reconnect_max_duration_millis=60000;"
+            "close_flush_timeout_millis=5000;"
+        )
+        c_client_rust_sidecar.connect(fg_cs)
+
+        # All N rows applied on P1 (batch 1 + drained batch 2) confirms the
+        # drainer pushed batch 2 and P1 OK'd it -- the pre-fix OK-trim point.
+        wait_for_count(port=p1_ports.pg, table=table, expected=row_count, timeout_s=30.0)
+
+        # Kill with batch 2 still only OK'd. Crucially do NOT wipe the object
+        # store: batch 1 is durable there and must survive on the successor.
+        p1.kill_9()
+        wait_port_free(p1_ports.http)
+        wait_port_free(p1_ports.pg)
+        if p1.db_root.exists():
+            shutil.rmtree(p1.db_root)
+    finally:
+        # Thaw so the successor can read the store (and write its own uploads).
+        obj_store.thaw()
+
+    # Successor comes up as a replica on the dead primary's ports: a fresh
+    # primary would hit ER007 against the populated store, but a replica adopts
+    # the store's DataID and downloads the durable batch 1. min_http exposes the
+    # lifecycle control plane used to promote it below.
+    p2 = server_factory("p2", db_root_name="p2-fresh", role="replica")
+    p2_ports = p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg, min_http=True)
+
+    # Replica has caught up once batch 1 is visible; batch 2 never reached the
+    # store (frozen until after the kill), so the replica must NOT have it yet.
+    wait_for_count(port=p1_ports.pg, table=table, expected=durable_rows, timeout_s=60.0)
+
+    # Promote so the successor accepts the ingress replay of batch 2.
+    assert p2_ports.min_http is not None, "replica must expose min-http for promotion"
+    submit_switch(p2_ports.min_http, "primary", wait=True, wait_timeout_s=60.0)
+
+    # Re-scan so the drainer re-adopts the still-un-acked ghost slot and replays
+    # batch 2 to the promoted successor.
+    c_client_rust_sidecar.connect(fg_cs)
+
+    # Exactly [0..N): batch 1 recovered from the store, batch 2 replayed from the
+    # client SF, no gap (loss-free) and no extra (the already-durable half is not
+    # re-pushed -> duplicate-free).
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=row_count, timeout_s=90.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_orphan_drainer_multi_slot_durable_ack_survives_kill_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """Several orphan slots adopted concurrently (``max_background_drainers>1``)
+    must ALL survive a primary failover under ``request_durable_ack=on``: every
+    non-durable frame across every slot replays to the successor.
+
+    ``K`` ghost senders each abandon a slot full of OK'd-but-not-durable frames
+    over a disjoint ``v`` range; one foreground sender with ``drain_orphans=on``
+    and ``max_background_drainers=K`` adopts all ``K`` at once. The object store
+    is frozen for the whole handoff so nothing becomes durable -- this is what
+    makes the kill deterministic: no frame is durably trimmed off a client slot
+    before the kill, so the subsequent object-store wipe cannot strand a
+    legitimately-durable row. After kill + disk/store wipe, a fresh successor on
+    the same ports holds nothing; only the ``K`` client slots carry the data,
+    and a re-scan replays them all. The dense-sequence oracle proves every
+    slot's frames landed exactly once -- nothing lost, nothing duplicated.
+
+    Pre-fix every adopted slot OK-trims on the plain OK, so the whole
+    ``[0..K*R)`` range vanishes on failover (the single-slot
+    ``..._survives_kill`` test is this with ``K=1``; here the value is the
+    concurrent multi-drainer fan-out)."""
+    table = "trades_orphan_multi_slot_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    slots = 3
+    rows_per_slot = 40
+    total = slots * rows_per_slot
+
+    def slot_sfa(i: int) -> list[Path]:
+        d = sf_dir / f"ghost{i}"
+        return sorted(d.glob("sf-*.sfa")) if d.exists() else []
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    # DEDUP keeps P1's row count clean at the retention check below: a pre-fix
+    # drainer re-pushes frames under concurrent multi-slot drain, and without
+    # DEDUP that overshoot would trip the count gate during setup instead of the
+    # retention assertion that names the actual regression. (P2 is wiped fresh
+    # and auto-creates without DEDUP, but needs none -- post-wipe replay delivers
+    # each frame once.)
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
+
+    # Freeze spans the whole handoff AND the kill: thawing before the kill would
+    # let the uploader durably-trim some slots and the wipe below would then
+    # lose them. thaw() runs in the finally so teardown can always clean up.
+    obj_store.freeze()
+    try:
+        # K ghosts, each abandoning a slot of OK'd-but-not-durable frames over a
+        # disjoint v-range.
+        for i in range(slots):
+            ghost_cs = (
+                f"ws::addr=127.0.0.1:{p1_ports.http};"
+                "username=admin;password=quest;"
+                f"sf_dir={sf_dir};"
+                f"sender_id=ghost{i};"
+                "request_durable_ack=on;"
+                "close_flush_timeout_millis=0;"
+            )
+            c_client_rust_sidecar.connect(ghost_cs)
+            c_client_rust_sidecar.send(table, count=rows_per_slot,
+                                       start_index=i * rows_per_slot)
+            c_client_rust_sidecar.flush()
+            c_client_rust_sidecar.close()
+            assert slot_sfa(i), (
+                f"ghost{i} slot should hold .sfa frames after an abandon with "
+                "close_flush_timeout_millis=0."
+            )
+
+        # One foreground sender adopts all K slots concurrently.
+        fg_cs = (
+            f"ws::addr=127.0.0.1:{p1_ports.http};"
+            "username=admin;password=quest;"
+            f"sf_dir={sf_dir};"
+            "sender_id=primary;"
+            "drain_orphans=on;"
+            "request_durable_ack=on;"
+            f"max_background_drainers={slots};"
+            "reconnect_max_duration_millis=60000;"
+            "close_flush_timeout_millis=5000;"
+        )
+        c_client_rust_sidecar.connect(fg_cs)
+
+        # Every slot's frames pushed + OK'd on P1 (frozen => none durable).
+        wait_for_count(port=p1_ports.pg, table=table, expected=total, timeout_s=45.0)
+
+        # CRUX: with the store frozen no durable ack is possible, so every
+        # adopted slot must be RETAINED. Pre-fix each slot OK-trims here under
+        # the concurrent drainers; hold a few seconds so that trim would fire.
+        hold_deadline = time.monotonic() + 3.0
+        while time.monotonic() < hold_deadline:
+            retained = [i for i in range(slots) if slot_sfa(i)]
+            assert len(retained) == slots, (
+                f"only slots {retained} of {slots} retained their .sfa while the "
+                "store was frozen (no durable ack possible) -- a concurrently "
+                "adopted orphan slot OK-trimmed instead of honouring "
+                "request_durable_ack (regression of fix 19b9fda)."
+            )
+            time.sleep(0.25)
+
+        # Kill with all K slots still only OK'd.
+        p1.kill_9()
+        wait_port_free(p1_ports.http)
+        wait_port_free(p1_ports.pg)
+        if p1.db_root.exists():
+            shutil.rmtree(p1.db_root)
+    finally:
+        obj_store.thaw()
+
+    # Worst-case disaster: only the K client slots survive. (wipe self-thaws, so
+    # ordering vs the finally above is immaterial.)
+    obj_store.wipe()
+
+    p2 = server_factory("p2", db_root_name="p2-fresh")
+    p2.start(http_port=p1_ports.http, pg_port=p1_ports.pg)
+
+    # A fresh orphan scan re-adopts all K slots and replays them to the successor.
+    c_client_rust_sidecar.connect(fg_cs)
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=total, timeout_s=90.0)
+
+
+@pytest.mark.c_client
+@pytest.mark.c_client_rust
+def test_orphan_drainer_durable_ack_survives_drain_reconnect_c_client_rust(
+    server_factory,
+    c_client_rust_sidecar: CClientRustSidecar,
+    obj_store,
+    scenario_dir: Path,
+) -> None:
+    """A drain connection dropping and reconnecting mid-drain must not
+    prematurely trim un-durable orphan frames.
+
+    With the object store frozen so the adopted slot can never durable-ack,
+    repeatedly tear the drainer down and re-adopt (each foreground reconnect
+    drops the previous drain connection and starts a fresh orphan scan). Across
+    every reconnect the slot must be RETAINED -- never trimmed on the connection
+    churn nor on the plain OKs the drainer keeps collecting. Thawing then
+    completes the slot normally.
+
+    No kill: the primary stays up throughout, so the churn is isolated to the
+    drain connection (this is the angle the kill-based tests can't isolate --
+    there the connection drop and the data-loss window coincide). Pre-fix the
+    very first adoption OK-trims the slot, so there is nothing left for the
+    reconnect loop to retain and it fails on cycle 0."""
+    table = "trades_orphan_drain_reconnect_c_client_rust"
+    sf_dir = scenario_dir / "sf"
+    ghost_slot = sf_dir / "ghost"
+    row_count = 50
+    reconnects = 3
+
+    def orphan_sfa() -> list[Path]:
+        return sorted(ghost_slot.glob("sf-*.sfa")) if ghost_slot.exists() else []
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start()
+
+    # DEDUP so each reconnect's re-adoption replay is idempotent on the
+    # still-alive primary; this test asserts trim discipline, not dup-freeness.
+    execute_ddl(port=p1_ports.pg, ddl=(
+        f'CREATE TABLE "{table}" ('
+        "v LONG, timestamp TIMESTAMP"
+        ") TIMESTAMP(timestamp) PARTITION BY DAY WAL "
+        "DEDUP UPSERT KEYS(timestamp, v)"
+    ))
+
+    fg_cs = (
+        f"ws::addr=127.0.0.1:{p1_ports.http};"
+        "username=admin;password=quest;"
+        f"sf_dir={sf_dir};"
+        "sender_id=primary;"
+        "drain_orphans=on;"
+        "request_durable_ack=on;"
+        "reconnect_max_duration_millis=60000;"
+        "close_flush_timeout_millis=5000;"
+    )
+
+    with obj_store.frozen():
+        # Ghost abandons an orphan slot of OK'd-but-not-durable frames.
+        ghost_cs = (
+            f"ws::addr=127.0.0.1:{p1_ports.http};"
+            "username=admin;password=quest;"
+            f"sf_dir={sf_dir};"
+            "sender_id=ghost;"
+            "request_durable_ack=on;"
+            "close_flush_timeout_millis=0;"
+        )
+        c_client_rust_sidecar.connect(ghost_cs)
+        c_client_rust_sidecar.send(table, count=row_count, start_index=0)
+        c_client_rust_sidecar.flush()
+        c_client_rust_sidecar.close()
+        assert orphan_sfa(), "ghost slot should hold .sfa frames after abandon"
+
+        # Drop-and-re-adopt the orphan repeatedly. The store stays frozen, so no
+        # durable ack can arrive and the slot must survive every reconnect.
+        for cycle in range(reconnects):
+            c_client_rust_sidecar.connect(fg_cs)  # drops prior drainer; fresh scan re-adopts
+            wait_for_count(port=p1_ports.pg, table=table, expected=row_count, timeout_s=30.0)
+            hold = time.monotonic() + 2.0
+            while time.monotonic() < hold:
+                assert orphan_sfa(), (
+                    f"orphan .sfa trimmed across drain reconnect #{cycle} while the "
+                    "store was frozen (no durable ack possible) -- premature trim on "
+                    "connection churn or a plain OK (regression of fix 19b9fda)."
+                )
+                time.sleep(0.2)
+
+    # Thaw + one more reconnect lets the now-durable slot complete and trim.
+    c_client_rust_sidecar.connect(fg_cs)
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        if not orphan_sfa():
+            break
+        time.sleep(0.5)
+    else:
+        pytest.fail(
+            f"orphan .sfa in {ghost_slot} never trimmed after thaw + reconnect; "
+            "the drainer is not completing the durably-acked slot."
+        )
+
+    # Loss-free and (via DEDUP) duplicate-free despite the reconnect churn.
+    wait_for_dense_sequence(port=p1_ports.pg, table=table,
+                            expected_count=row_count, timeout_s=30.0)

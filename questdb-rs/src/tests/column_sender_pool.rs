@@ -2813,6 +2813,153 @@ fn close_joins_reaper_cleanly() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Store-and-forward durability on pool close / reap (in-memory queue).
+//
+// The SfColumnSender contract is that a parked connection's background runner
+// keeps delivering, and that pool close / reap do not silently drop frames the
+// runner has accepted but not yet delivered. These tests pin the three teardown
+// paths that enforce it. The mock captures a frame when it is *sent* (eagerly,
+// before the ack), so "loss" is observed through the client-side contract —
+// reap protecting an undelivered connection, and close blocking on delivery —
+// not through the capture channel.
+// ---------------------------------------------------------------------------
+
+/// Reap must not evict an idle connection whose store-and-forward queue still
+/// holds undelivered (published-but-unacked) frames — its runner is still
+/// delivering. Three connections go idle above the warm floor; only the empty
+/// one is reapable, the two with held-back acks are skipped.
+///
+/// Without the skip, reap would evict the two oldest (one of them undelivered)
+/// down to the floor: it would report 2 reaped and leave 1 idle. With it, it
+/// reports 1 reaped (the empty connection) and leaves the 2 undelivered ones.
+#[test]
+fn reap_skips_connections_with_undelivered_frames() {
+    let (server, release, _frames) = MockServer::spawn_ack_when_released_capturing(3);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_size=1;pool_max=3;pool_idle_timeout_ms=1;pool_reap=manual;\
+         close_flush_timeout_millis=2000;",
+    ))
+    .unwrap();
+
+    // Open three distinct connections; b1 stays empty, b2 and b3 each publish a
+    // frame whose ack the server withholds, so they read as undelivered.
+    let b1 = db.borrow_column_sender().expect("b1");
+    let mut b2 = db.borrow_column_sender().expect("b2");
+    let mut b3 = db.borrow_column_sender().expect("b3");
+    assert!(wait_until(Duration::from_secs(5), || server.accepted() == 3));
+
+    let v = [1_i64];
+    let t = [1_i64];
+    let mut c2 = one_i64_row("trades", &v, &t);
+    b2.flush(&mut c2).expect("publish-only flush on b2");
+    let mut c3 = one_i64_row("trades", &v, &t);
+    b3.flush(&mut c3).expect("publish-only flush on b3");
+
+    // Return to the free list in order [b1, b2, b3] (oldest first).
+    drop(b1);
+    drop(b2);
+    drop(b3);
+    assert_eq!(db.free_count(), 3);
+
+    // Let the idle timeout (1 ms) elapse, then reap. Only the empty b1 may go.
+    thread::sleep(Duration::from_millis(50));
+    let reaped = db.reap_idle();
+    assert_eq!(
+        reaped, 1,
+        "only the empty connection is reapable; the undelivered ones are skipped"
+    );
+    assert_eq!(
+        db.free_count(),
+        2,
+        "both connections with undelivered frames must survive the reap"
+    );
+
+    // Drain cleanly on teardown.
+    release.store(true, Ordering::SeqCst);
+    drop(db);
+}
+
+/// `db.close()` must block until a parked connection's store-and-forward queue
+/// has actually delivered its frames — not return immediately and strand them
+/// by stopping the runner. With the server withholding acks, close stays
+/// blocked; once the acks are released, delivery resolves and close returns.
+///
+/// Without the close-time drain this fails: `close()` returns promptly while
+/// the acks are still held.
+#[test]
+fn close_blocks_until_store_and_forward_queue_is_delivered() {
+    let (server, release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        // Generous drain budget so close blocks on delivery, not on the timeout.
+        "pool_reap=manual;close_flush_timeout_millis=30000;",
+    ))
+    .unwrap();
+
+    {
+        let mut sender = db.borrow_column_sender().expect("borrow");
+        let v = [7_i64];
+        let t = [7_i64];
+        let mut chunk = one_i64_row("trades", &v, &t);
+        sender.flush(&mut chunk).expect("publish-only flush");
+    } // handle returned to the pool; runner still owns the unacked frame.
+    assert!(wait_until(Duration::from_secs(5), || server.accepted() == 1));
+
+    let closed = Arc::new(AtomicBool::new(false));
+    let closed_thread = Arc::clone(&closed);
+    let closer = thread::spawn(move || {
+        db.close();
+        closed_thread.store(true, Ordering::SeqCst);
+    });
+
+    // While the acks are held, close must stay blocked in the drain.
+    assert!(
+        !wait_until(Duration::from_millis(500), || closed.load(Ordering::SeqCst)),
+        "close() must not return while published frames are still undelivered"
+    );
+
+    // Release the acks: delivery resolves and close can finish.
+    release.store(true, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(35), || closed.load(Ordering::SeqCst)),
+        "close() must return once delivery completes"
+    );
+    closer.join().expect("closer thread");
+}
+
+/// A silent-but-alive peer (connected, never acks) must not make `close()` hang:
+/// the close-time drain is bounded by `close_flush_timeout`, after which the
+/// undelivered frame is discarded with a warning and close returns.
+#[test]
+fn close_drain_is_bounded_when_peer_never_acks() {
+    // Acks are withheld for the whole test (never released).
+    let (server, _release, _frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = QuestDb::connect(&conf_for(
+        server.port(),
+        "pool_reap=manual;close_flush_timeout_millis=200;",
+    ))
+    .unwrap();
+
+    {
+        let mut sender = db.borrow_column_sender().expect("borrow");
+        let v = [5_i64];
+        let t = [5_i64];
+        let mut chunk = one_i64_row("trades", &v, &t);
+        sender.flush(&mut chunk).expect("publish-only flush");
+    }
+    assert!(wait_until(Duration::from_secs(5), || server.accepted() == 1));
+
+    let start = Instant::now();
+    db.close();
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "close() must be bounded by close_flush_timeout, not hang (took {:?})",
+        start.elapsed()
+    );
+}
+
 // ---------- F0: endpoint rotation + health, transient classification ----------
 
 #[test]

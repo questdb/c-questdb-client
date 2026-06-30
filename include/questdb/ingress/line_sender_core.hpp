@@ -41,6 +41,111 @@
 #    include <span>
 #endif
 
+namespace questdb
+{
+
+/**
+ * Category of error. Single, unified enum for the whole client: it spans both
+ * ingest and query. Pinned to the C ABI enum `::line_sender_error_code`
+ * (include/questdb/ingress/line_sender.h), which the Rust test
+ * `c_header_line_sender_enum_matches_rust` cross-checks against the library.
+ * `questdb::ingress::line_sender_error_code` and `questdb::egress::error_code`
+ * are aliases of this type.
+ */
+enum class error_code : int
+{
+    could_not_resolve_addr = ::line_sender_error_could_not_resolve_addr,
+    invalid_api_call = ::line_sender_error_invalid_api_call,
+    socket_error = ::line_sender_error_socket_error,
+    invalid_utf8 = ::line_sender_error_invalid_utf8,
+    invalid_name = ::line_sender_error_invalid_name,
+    invalid_timestamp = ::line_sender_error_invalid_timestamp,
+    auth_error = ::line_sender_error_auth_error,
+    tls_error = ::line_sender_error_tls_error,
+    http_not_supported = ::line_sender_error_http_not_supported,
+    server_flush_error = ::line_sender_error_server_flush_error,
+    config_error = ::line_sender_error_config_error,
+    array_error = ::line_sender_error_array_error,
+    protocol_version_error = ::line_sender_error_protocol_version_error,
+    invalid_decimal = ::line_sender_error_invalid_decimal,
+    server_rejection = ::line_sender_error_server_rejection,
+    arrow_unsupported_column_kind = ::line_sender_error_arrow_unsupported_column_kind,
+    arrow_ingest = ::line_sender_error_arrow_ingest,
+    failover_retry = ::line_sender_error_failover_retry,
+    role_mismatch = ::line_sender_error_role_mismatch,
+    connect_timeout = ::line_sender_error_connect_timeout,
+    // Query / reader (egress) categories.
+    handshake_error = ::line_sender_error_handshake_error,
+    unsupported_server = ::line_sender_error_unsupported_server,
+    protocol_error = ::line_sender_error_protocol_error,
+    invalid_bind = ::line_sender_error_invalid_bind,
+    server_schema_mismatch = ::line_sender_error_server_schema_mismatch,
+    server_parse_error = ::line_sender_error_server_parse_error,
+    server_internal_error = ::line_sender_error_server_internal_error,
+    server_security_error = ::line_sender_error_server_security_error,
+    limit_exceeded = ::line_sender_error_limit_exceeded,
+    server_limit_exceeded = ::line_sender_error_server_limit_exceeded,
+    cancelled = ::line_sender_error_cancelled,
+    failover_would_duplicate = ::line_sender_error_failover_would_duplicate,
+    schema_drift = ::line_sender_error_schema_drift,
+    no_schema = ::line_sender_error_no_schema,
+    arrow_export = ::line_sender_error_arrow_export,
+    batch_too_large = ::line_sender_error_batch_too_large,
+};
+
+// Bridge equality between the C++ `questdb::error_code` and the C ABI enum
+// `::line_sender_error_code` (identical `int` values), so existing comparisons
+// like `e.code() == line_sender_error_socket_error` — and, via the
+// `reader_error_*` aliases, `e.code() == reader_error_cancelled` — keep
+// compiling. Lives in `namespace questdb` so ADL on `error_code` finds it from
+// both `questdb::ingress` and `questdb::egress`.
+inline bool operator==(error_code l, ::line_sender_error_code r) noexcept
+{
+    return static_cast<int>(l) == static_cast<int>(r);
+}
+inline bool operator==(::line_sender_error_code l, error_code r) noexcept
+{
+    return r == l;
+}
+inline bool operator!=(error_code l, ::line_sender_error_code r) noexcept
+{
+    return !(l == r);
+}
+inline bool operator!=(::line_sender_error_code l, error_code r) noexcept
+{
+    return !(l == r);
+}
+
+/**
+ * Base class for every QuestDB client error, ingest or query.
+ *
+ * `catch (const questdb::error&)` handles a failure from either direction.
+ * `questdb::ingress::line_sender_error` (which additionally exposes
+ * `in_doubt()` / `qwp_ws_diagnostic()`) and `questdb::egress::reader_error`
+ * are subclasses for direction-specific `catch` sites.
+ */
+class error : public std::runtime_error
+{
+public:
+    /** Error code categorising the error. */
+    error_code code() const noexcept
+    {
+        return _code;
+    }
+
+protected:
+    error(error_code code, const std::string& what)
+        : std::runtime_error{what}
+        , _code{code}
+    {
+    }
+
+private:
+    error_code _code;
+};
+
+} // namespace questdb
+
 namespace questdb::ingress
 {
 constexpr const char* inaddr_any = "0.0.0.0";
@@ -49,98 +154,9 @@ class line_sender;
 class line_sender_buffer;
 class opts;
 
-/** Category of error.
- *
- *  Discriminants are pinned to match the C ABI (see
- *  `include/questdb/ingress/line_sender.h` and the Rust enum
- *  `line_sender_error_code` in `questdb-rs-ffi`). Append-only: new
- *  variants go at the tail.
- */
-enum class line_sender_error_code
-{
-    /** The host, port, or interface was incorrect. */
-    could_not_resolve_addr = 0,
-
-    /** Called methods in the wrong order. E.g. `symbol` after `column`. */
-    invalid_api_call = 1,
-
-    /** A network error connecting or flushing data out. */
-    socket_error = 2,
-
-    /** The string or symbol field is not encoded in valid UTF-8. */
-    invalid_utf8 = 3,
-
-    /** The table name or column name contains bad characters. */
-    invalid_name = 4,
-
-    /** The supplied timestamp is invalid. */
-    invalid_timestamp = 5,
-
-    /** Error during the authentication process. */
-    auth_error = 6,
-
-    /** Error during TLS handshake. */
-    tls_error = 7,
-
-    /** The server does not support ILP over HTTP. */
-    http_not_supported = 8,
-
-    /** Error sent back from the server during flush. */
-    server_flush_error = 9,
-
-    /** Bad configuration. */
-    config_error = 10,
-
-    /** There was an error serializing an array. */
-    array_error = 11,
-
-    /**  Line sender protocol version error. */
-    protocol_version_error = 12,
-
-    /** The supplied decimal is invalid. */
-    invalid_decimal = 13,
-
-    /** QWP/WebSocket server rejection or terminal protocol violation. */
-    server_rejection = 14,
-
-    /** `{sf,direct}_column_sender_conn::flush_arrow_batch_*` was passed a column whose
-     *  Arrow type / metadata combination has no QuestDB ingress mapping.
-     *  Only raised with the `arrow` feature enabled. */
-    arrow_unsupported_column_kind = 15,
-
-    /** `{sf,direct}_column_sender_conn::flush_arrow_batch_*` rejected a `RecordBatch` at
-     *  the contract layer (invalid format, structural error against the
-     *  Arrow C Data Interface). Only raised with the `arrow` feature
-     *  enabled. */
-    arrow_ingest = 16,
-
-    /** Reconnectable failure on the column-major sender's flush/sync path
-     *  (transport error, EOF, closed connection). The operation has not
-     *  committed: drop the connection, re-acquire one with
-     *  `pool::borrow_column_sender_with_retry` (row-aligned reconnect backoff, bounded
-     *  by `reconnect_max_duration`), and re-drive from your source. */
-    failover_retry = 17,
-
-    /** Every reachable endpoint handshook but none matched the configured
-     *  `target=` role filter (e.g. `target=primary` against an all-replica
-     *  address list). Distinct from `socket_error` ("all endpoints
-     *  unreachable") so callers can tell "no primary elected" from "all
-     *  down". */
-    role_mismatch = 18,
-
-    /** The TCP connect (dial) to the server exceeded the configured
-     *  `connect_timeout`. Distinct from `socket_error` so a caller can tell a
-     *  timed-out dial apart from a refused / reset connection. Produced by the
-     *  QWP/WebSocket transport. */
-    connect_timeout = 19,
-
-    /** An irreducible QWP/WebSocket unit (the table schema plus a single row
-     *  block) exceeds the negotiated per-batch cap. The column sender splits
-     *  oversize chunks into smaller frames automatically, so this only surfaces
-     *  when splitting cannot make a frame fit. Distinct from `invalid_api_call`
-     *  so callers can recognise it without matching on the error message text. */
-    batch_too_large = 20,
-};
+/** Category of error. Alias of the unified `questdb::error_code`
+ *  (`line_sender_error_code` is the sender-facing spelling). */
+using line_sender_error_code = ::questdb::error_code;
 
 /** The protocol used to connect with. */
 enum class protocol
@@ -276,7 +292,7 @@ enum class ca
  * For QWP/WebSocket terminal diagnostics, `.qwp_ws_diagnostic()` returns the
  * structured server or protocol error that halted the sender.
  */
-class line_sender_error : public std::runtime_error
+class line_sender_error : public ::questdb::error
 {
 public:
     line_sender_error(
@@ -284,18 +300,14 @@ public:
         const std::string& what,
         bool in_doubt = false,
         std::optional<qwp_ws_error> qwp_ws_diagnostic = std::nullopt)
-        : std::runtime_error{what}
-        , _code{code}
+        : ::questdb::error{code, what}
         , _in_doubt{in_doubt}
         , _qwp_ws_diagnostic{std::move(qwp_ws_diagnostic)}
     {
     }
 
-    /** Error code categorizing the error. */
-    line_sender_error_code code() const noexcept
-    {
-        return _code;
-    }
+    // `code()` is inherited from `questdb::error` (returns the unified
+    // `error_code`, aliased here as `line_sender_error_code`).
 
     /**
      * Whether the failed operation is *delivery-unknown* ("in doubt"): the
@@ -369,7 +381,6 @@ private:
         bool (*F)(T*, size_t, const char*, ::line_sender_error**)>
     friend class basic_view;
 
-    line_sender_error_code _code;
     bool _in_doubt;
     std::optional<qwp_ws_error> _qwp_ws_diagnostic;
 };

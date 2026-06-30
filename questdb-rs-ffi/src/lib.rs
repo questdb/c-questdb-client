@@ -223,10 +223,26 @@ macro_rules! upd_opts {
     }};
 }
 
-/// An error that occurred when using the line sender.
+/// An error that occurred when using the QuestDB client.
+///
+/// This is the single, unified error object for both ingest and query;
+/// `reader_error` (egress) is a back-compat alias of it.
 pub struct line_sender_error {
     error: Error,
     qwp_ws_error: Option<QwpWsSenderError>,
+}
+
+#[cfg(feature = "sync-reader-qwp-ws")]
+impl line_sender_error {
+    /// Wrap a [`questdb::Error`] as the FFI error object, with no QWP/WS
+    /// sender diagnostic attached. Used by the reader (egress) entry points,
+    /// which never carry a sender-side QWP/WS rejection.
+    pub(crate) fn from_error(err: Error) -> Self {
+        line_sender_error {
+            error: err,
+            qwp_ws_error: None,
+        }
+    }
 }
 
 /// Category of error.
@@ -311,25 +327,72 @@ pub enum line_sender_error_code {
     /// connection. Produced by the QWP/WebSocket transport.
     line_sender_error_connect_timeout = 19,
 
+    // --- Query / reader (egress) categories, appended 20..=34 ------------
+    // The unified error type spans both ingest and query. These categories
+    // are emitted by the query (reader) path; discriminants 0..=19 above are
+    // the frozen ingress ABI, so query codes are appended here.
+    /// HTTP-upgrade or WebSocket handshake failure.
+    line_sender_error_handshake_error = 20,
+    /// Server returned an unsupported QWP version, encoding, or capability.
+    line_sender_error_unsupported_server = 21,
+    /// Wire-format violation: bad magic, truncated frame, unknown
+    /// discriminant, invalid varint, symbol-dict reference miss, etc.
+    line_sender_error_protocol_error = 22,
+    /// Bind parameter index, count, or value rejected client-side (covers
+    /// timestamp / decimal / geohash range failures on the query path too).
+    line_sender_error_invalid_bind = 23,
+    /// Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`).
+    line_sender_error_server_schema_mismatch = 24,
+    /// Server-reported QWP `PARSE_ERROR` (status `0x05`).
+    line_sender_error_server_parse_error = 25,
+    /// Server-reported QWP `INTERNAL_ERROR` (status `0x06`).
+    line_sender_error_server_internal_error = 26,
+    /// Server-reported QWP `SECURITY_ERROR` (status `0x08`).
+    line_sender_error_server_security_error = 27,
+    /// Client-side limit hit (e.g. an array row exceeds the configured cap).
+    line_sender_error_limit_exceeded = 28,
+    /// Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`).
+    line_sender_error_server_limit_exceeded = 29,
+    /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
+    line_sender_error_cancelled = 30,
+    /// Mid-query failover was eligible but at least one batch had already
+    /// been delivered and no `on_failover_reset` callback was installed;
+    /// the cursor terminated rather than silently double-deliver rows.
+    line_sender_error_failover_would_duplicate = 31,
+    /// Streaming Arrow adapter saw a mid-stream schema change. Only emitted
+    /// with the `arrow` feature enabled.
+    line_sender_error_schema_drift = 32,
+    /// `*_next_arrow_batch` was called on a stream that terminated before any
+    /// batch was produced — no schema to snapshot. Only emitted with the
+    /// `arrow` feature enabled.
+    line_sender_error_no_schema = 33,
+    /// Arrow C Data Interface export failed (arrow-rs rejected the produced
+    /// `ArrayData`'s invariants). Only emitted with the `arrow` feature.
+    line_sender_error_arrow_export = 34,
+
     /// An irreducible QWP/WebSocket unit (the table schema plus a single row
     /// block) exceeds the negotiated per-batch cap. The column sender splits
     /// oversize chunks into smaller frames automatically, so this only surfaces
     /// when splitting cannot make a frame fit. Distinct from
     /// `line_sender_error_invalid_api_call` so callers can recognise it without
     /// matching on the error message text.
-    line_sender_error_batch_too_large = 20,
+    line_sender_error_batch_too_large = 35,
 }
+
+// The client error model is unified across ingest and query:
+// `line_sender_error_code` is the single C error enum. `reader_error_code`
+// (in the egress module) is a back-compat alias of it.
 
 impl From<ErrorCode> for line_sender_error_code {
     fn from(code: ErrorCode) -> Self {
-        // `ErrorCode` is `#[non_exhaustive]`; the trailing `_ =>` is
-        // mandatory by the Rust language. To stop a future upstream
-        // variant from silently downgrading to `invalid_api_call`,
-        // the test
-        // `line_sender_error_code_covers_every_upstream_variant`
-        // exhaustively lists every current variant and fails to
-        // compile when a new one is added without an explicit arm
-        // below.
+        // `ErrorCode` is `#[non_exhaustive]` and defined in the *other* crate
+        // (`questdb-rs`), so this match cannot be made exhaustive — the `_ =>`
+        // arm is mandatory and a future upstream variant would silently route
+        // to `invalid_api_call`. The real tripwire for that lives where it can
+        // be enforced at compile time: the wildcard-free `#[cfg(test)]` match
+        // `every_error_code_is_ffi_mapped` in `questdb-rs/src/error.rs` (the
+        // defining crate, where `#[non_exhaustive]` does not force a wildcard)
+        // fails to compile when a variant is added, prompting a new arm here.
         match code {
             ErrorCode::CouldNotResolveAddr => {
                 line_sender_error_code::line_sender_error_could_not_resolve_addr
@@ -365,6 +428,36 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::FailoverRetry => line_sender_error_code::line_sender_error_failover_retry,
             ErrorCode::RoleMismatch => line_sender_error_code::line_sender_error_role_mismatch,
             ErrorCode::ConnectTimeout => line_sender_error_code::line_sender_error_connect_timeout,
+            // Query / reader (egress) categories.
+            ErrorCode::HandshakeError => line_sender_error_code::line_sender_error_handshake_error,
+            ErrorCode::UnsupportedServer => {
+                line_sender_error_code::line_sender_error_unsupported_server
+            }
+            ErrorCode::ProtocolError => line_sender_error_code::line_sender_error_protocol_error,
+            ErrorCode::InvalidBind => line_sender_error_code::line_sender_error_invalid_bind,
+            ErrorCode::ServerSchemaMismatch => {
+                line_sender_error_code::line_sender_error_server_schema_mismatch
+            }
+            ErrorCode::ServerParseError => {
+                line_sender_error_code::line_sender_error_server_parse_error
+            }
+            ErrorCode::ServerInternalError => {
+                line_sender_error_code::line_sender_error_server_internal_error
+            }
+            ErrorCode::ServerSecurityError => {
+                line_sender_error_code::line_sender_error_server_security_error
+            }
+            ErrorCode::LimitExceeded => line_sender_error_code::line_sender_error_limit_exceeded,
+            ErrorCode::ServerLimitExceeded => {
+                line_sender_error_code::line_sender_error_server_limit_exceeded
+            }
+            ErrorCode::Cancelled => line_sender_error_code::line_sender_error_cancelled,
+            ErrorCode::FailoverWouldDuplicate => {
+                line_sender_error_code::line_sender_error_failover_would_duplicate
+            }
+            ErrorCode::SchemaDrift => line_sender_error_code::line_sender_error_schema_drift,
+            ErrorCode::NoSchema => line_sender_error_code::line_sender_error_no_schema,
+            ErrorCode::ArrowExport => line_sender_error_code::line_sender_error_arrow_export,
             ErrorCode::BatchTooLarge => line_sender_error_code::line_sender_error_batch_too_large,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
@@ -4817,110 +4910,155 @@ mod tests {
         unsafe { line_sender_error_free(in_doubt) };
     }
 
+    /// The hand-maintained, authoritative `(upstream ErrorCode, C enum
+    /// variant, discriminant)` table for the unified C error enum — the single
+    /// source every error-code test agrees against. New variants are appended
+    /// (ingress 0..=19 frozen; query/egress 20..=34).
+    fn c_error_code_abi() -> &'static [(ErrorCode, line_sender_error_code, u32)] {
+        use ErrorCode as E;
+        use line_sender_error_code::*;
+        &[
+            (
+                E::CouldNotResolveAddr,
+                line_sender_error_could_not_resolve_addr,
+                0,
+            ),
+            (E::InvalidApiCall, line_sender_error_invalid_api_call, 1),
+            (E::SocketError, line_sender_error_socket_error, 2),
+            (E::InvalidUtf8, line_sender_error_invalid_utf8, 3),
+            (E::InvalidName, line_sender_error_invalid_name, 4),
+            (E::InvalidTimestamp, line_sender_error_invalid_timestamp, 5),
+            (E::AuthError, line_sender_error_auth_error, 6),
+            (E::TlsError, line_sender_error_tls_error, 7),
+            (E::HttpNotSupported, line_sender_error_http_not_supported, 8),
+            (E::ServerFlushError, line_sender_error_server_flush_error, 9),
+            (E::ConfigError, line_sender_error_config_error, 10),
+            (E::ArrayError, line_sender_error_array_error, 11),
+            (
+                E::ProtocolVersionError,
+                line_sender_error_protocol_version_error,
+                12,
+            ),
+            (E::InvalidDecimal, line_sender_error_invalid_decimal, 13),
+            (E::ServerRejection, line_sender_error_server_rejection, 14),
+            (
+                E::ArrowUnsupportedColumnKind,
+                line_sender_error_arrow_unsupported_column_kind,
+                15,
+            ),
+            (E::ArrowIngest, line_sender_error_arrow_ingest, 16),
+            (E::FailoverRetry, line_sender_error_failover_retry, 17),
+            (E::RoleMismatch, line_sender_error_role_mismatch, 18),
+            (E::ConnectTimeout, line_sender_error_connect_timeout, 19),
+            (E::HandshakeError, line_sender_error_handshake_error, 20),
+            (
+                E::UnsupportedServer,
+                line_sender_error_unsupported_server,
+                21,
+            ),
+            (E::ProtocolError, line_sender_error_protocol_error, 22),
+            (E::InvalidBind, line_sender_error_invalid_bind, 23),
+            (
+                E::ServerSchemaMismatch,
+                line_sender_error_server_schema_mismatch,
+                24,
+            ),
+            (
+                E::ServerParseError,
+                line_sender_error_server_parse_error,
+                25,
+            ),
+            (
+                E::ServerInternalError,
+                line_sender_error_server_internal_error,
+                26,
+            ),
+            (
+                E::ServerSecurityError,
+                line_sender_error_server_security_error,
+                27,
+            ),
+            (E::LimitExceeded, line_sender_error_limit_exceeded, 28),
+            (
+                E::ServerLimitExceeded,
+                line_sender_error_server_limit_exceeded,
+                29,
+            ),
+            (E::Cancelled, line_sender_error_cancelled, 30),
+            (
+                E::FailoverWouldDuplicate,
+                line_sender_error_failover_would_duplicate,
+                31,
+            ),
+            (E::SchemaDrift, line_sender_error_schema_drift, 32),
+            (E::NoSchema, line_sender_error_no_schema, 33),
+            (E::ArrowExport, line_sender_error_arrow_export, 34),
+            (E::BatchTooLarge, line_sender_error_batch_too_large, 35),
+        ]
+    }
+
     #[test]
     fn line_sender_error_code_discriminants_are_abi_stable() {
-        // Pin numeric values exposed to C/FFI consumers (questdb-py via
-        // ctypes/cffi, Go cgo, Java FFM) that cache them. New variants must
-        // be appended to preserve the ABI.
-        use line_sender_error_code::*;
-        let expected: &[(line_sender_error_code, u32)] = &[
-            (line_sender_error_could_not_resolve_addr, 0),
-            (line_sender_error_invalid_api_call, 1),
-            (line_sender_error_socket_error, 2),
-            (line_sender_error_invalid_utf8, 3),
-            (line_sender_error_invalid_name, 4),
-            (line_sender_error_invalid_timestamp, 5),
-            (line_sender_error_auth_error, 6),
-            (line_sender_error_tls_error, 7),
-            (line_sender_error_http_not_supported, 8),
-            (line_sender_error_server_flush_error, 9),
-            (line_sender_error_config_error, 10),
-            (line_sender_error_array_error, 11),
-            (line_sender_error_protocol_version_error, 12),
-            (line_sender_error_invalid_decimal, 13),
-            // New since 6.1.0 — must remain at the tail.
-            (line_sender_error_server_rejection, 14),
-            // New since 7.0.0 — arrow feature. Append-only.
-            (line_sender_error_arrow_unsupported_column_kind, 15),
-            (line_sender_error_arrow_ingest, 16),
-            // Column-sender failover. Append-only.
-            (line_sender_error_failover_retry, 17),
-            // Reader/egress role-filter exhaustion. Append-only.
-            (line_sender_error_role_mismatch, 18),
-            // QWP/WebSocket connect timeout. Append-only.
-            (line_sender_error_connect_timeout, 19),
-        ];
-        for (variant, want) in expected {
+        // Pin the numeric values exposed to C/FFI consumers (questdb-py via
+        // ctypes/cffi, Go cgo, Java FFM) that cache them. Append-only.
+        for (_code, variant, want) in c_error_code_abi() {
             assert_eq!(
                 *variant as u32, *want,
-                "{:?} discriminant changed — appended-only ABI broken",
-                variant,
+                "{variant:?} discriminant changed — append-only ABI broken",
             );
         }
     }
 
     #[test]
-    fn line_sender_error_code_covers_every_upstream_variant() {
-        // Tripwire for the `_ =>` arm in `impl From<ErrorCode> for
-        // line_sender_error_code`. Whenever a new variant is added
-        // upstream, also add it to the iteration below; the runtime
-        // assertion catches missing FFI mappings on the next test run.
-        fn cover(code: ErrorCode) -> &'static str {
-            match code {
-                ErrorCode::CouldNotResolveAddr => "CouldNotResolveAddr",
-                ErrorCode::InvalidApiCall => "InvalidApiCall",
-                ErrorCode::SocketError => "SocketError",
-                ErrorCode::InvalidUtf8 => "InvalidUtf8",
-                ErrorCode::InvalidName => "InvalidName",
-                ErrorCode::InvalidTimestamp => "InvalidTimestamp",
-                ErrorCode::AuthError => "AuthError",
-                ErrorCode::TlsError => "TlsError",
-                ErrorCode::HttpNotSupported => "HttpNotSupported",
-                ErrorCode::ServerFlushError => "ServerFlushError",
-                ErrorCode::ConfigError => "ConfigError",
-                ErrorCode::ArrayError => "ArrayError",
-                ErrorCode::ProtocolVersionError => "ProtocolVersionError",
-                ErrorCode::InvalidDecimal => "InvalidDecimal",
-                ErrorCode::ServerRejection => "ServerRejection",
-                ErrorCode::ArrowUnsupportedColumnKind => "ArrowUnsupportedColumnKind",
-                ErrorCode::ArrowIngest => "ArrowIngest",
-                ErrorCode::FailoverRetry => "FailoverRetry",
-                ErrorCode::RoleMismatch => "RoleMismatch",
-                ErrorCode::ConnectTimeout => "ConnectTimeout",
-                ErrorCode::BatchTooLarge => "BatchTooLarge",
-                _ => "unmapped",
-            }
+    fn from_error_code_maps_to_pinned_discriminants() {
+        // Exercises the REAL `impl From<ErrorCode>` and pins each code to its
+        // C discriminant, so a transposed or wrong-but-valid arm is caught.
+        for (code, variant, want) in c_error_code_abi() {
+            let got: line_sender_error_code = (*code).into();
+            assert_eq!(got as u32, *want, "From mapping for {code:?}");
+            assert_eq!(*variant as u32, *want);
         }
-        for code in [
-            ErrorCode::CouldNotResolveAddr,
-            ErrorCode::InvalidApiCall,
-            ErrorCode::SocketError,
-            ErrorCode::InvalidUtf8,
-            ErrorCode::InvalidName,
-            ErrorCode::InvalidTimestamp,
-            ErrorCode::AuthError,
-            ErrorCode::TlsError,
-            ErrorCode::HttpNotSupported,
-            ErrorCode::ServerFlushError,
-            ErrorCode::ConfigError,
-            ErrorCode::ArrayError,
-            ErrorCode::ProtocolVersionError,
-            ErrorCode::InvalidDecimal,
-            ErrorCode::ServerRejection,
-            ErrorCode::ArrowUnsupportedColumnKind,
-            ErrorCode::ArrowIngest,
-            ErrorCode::FailoverRetry,
-            ErrorCode::RoleMismatch,
-            ErrorCode::ConnectTimeout,
-            ErrorCode::BatchTooLarge,
-        ] {
-            assert_ne!(
-                cover(code),
-                "unmapped",
-                "FFI mapping missing for {:?}",
-                code
+    }
+
+    #[test]
+    fn c_header_line_sender_enum_matches_rust() {
+        // Cross-check against the hand-maintained C header (the source of truth
+        // C / C++ / Python compile against). The trailing comma anchors the
+        // match to a whole enum entry, so `= 2` cannot masquerade as a prefix
+        // of `= 23`. This guard would have caught the reader-header divergence.
+        let header = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../include/questdb/ingress/line_sender.h"
+        ));
+        for (_code, variant, disc) in c_error_code_abi() {
+            let needle = format!("{variant:?} = {disc},");
+            assert!(
+                header.contains(&needle),
+                "C header is missing or disagrees on `{needle}` \
+                 (include/questdb/ingress/line_sender.h vs the Rust enum)",
             );
         }
+        // The header must not declare MORE codes than Rust knows about (an
+        // added header variant without a matching Rust variant). Count enum
+        // entries `line_sender_error_X = <digit>...,`.
+        let header_variants = header
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("line_sender_error_")
+                    && t.trim_end().ends_with(',')
+                    && t.split(" = ")
+                        .nth(1)
+                        .is_some_and(|r| r.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+            })
+            .count();
+        assert_eq!(
+            header_variants,
+            c_error_code_abi().len(),
+            "C header declares {header_variants} error-code entries but Rust has {} \
+             — a variant was added on one side only",
+            c_error_code_abi().len(),
+        );
     }
 
     fn utf8(bytes: &'static [u8]) -> line_sender_utf8 {
@@ -5483,7 +5621,7 @@ mod tests {
             assert!(query.is_null());
             assert_reader_error_contains(
                 &mut err,
-                egress::reader_error_code::reader_error_invalid_api_call,
+                egress::reader_error_code::line_sender_error_invalid_api_call,
                 "QuestDb pool is closed",
             );
 

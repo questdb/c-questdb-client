@@ -160,13 +160,69 @@ typedef enum line_sender_error_code
      *  connection. Produced by the QWP/WebSocket transport. */
     line_sender_error_connect_timeout = 19,
 
+    /* Query / reader (egress) categories. The error model is unified across
+     * ingest and query: these are emitted by the reader. Appended at 20..34
+     * so the ingress discriminants 0..19 stay frozen. The reader aliases
+     * (`reader_error_*` in <questdb/egress/reader.h>) map onto these. */
+
+    /** HTTP-upgrade or WebSocket handshake failure. */
+    line_sender_error_handshake_error = 20,
+
+    /** Server returned an unsupported QWP version, encoding, or capability. */
+    line_sender_error_unsupported_server = 21,
+
+    /** Wire-format violation: bad magic, truncated frame, unknown
+     *  discriminant, invalid varint, symbol-dict reference miss, etc. */
+    line_sender_error_protocol_error = 22,
+
+    /** Bind parameter index, count, or value rejected client-side (covers
+     *  timestamp / decimal / geohash range failures on the query path too). */
+    line_sender_error_invalid_bind = 23,
+
+    /** Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`). */
+    line_sender_error_server_schema_mismatch = 24,
+
+    /** Server-reported QWP `PARSE_ERROR` (status `0x05`). */
+    line_sender_error_server_parse_error = 25,
+
+    /** Server-reported QWP `INTERNAL_ERROR` (status `0x06`). */
+    line_sender_error_server_internal_error = 26,
+
+    /** Server-reported QWP `SECURITY_ERROR` (status `0x08`). */
+    line_sender_error_server_security_error = 27,
+
+    /** Client-side limit hit (e.g. an array row exceeds the configured cap). */
+    line_sender_error_limit_exceeded = 28,
+
+    /** Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`). */
+    line_sender_error_server_limit_exceeded = 29,
+
+    /** Query was cancelled (locally or via server `CANCELLED` status `0x0A`). */
+    line_sender_error_cancelled = 30,
+
+    /** Mid-query failover was eligible but a batch had already been delivered
+     *  and no `on_failover_reset` callback was installed; the cursor
+     *  terminated rather than silently double-deliver rows. */
+    line_sender_error_failover_would_duplicate = 31,
+
+    /** Streaming Arrow adapter saw a mid-stream schema change. `arrow`
+     *  feature only. */
+    line_sender_error_schema_drift = 32,
+
+    /** A streaming Arrow adapter was asked for a schema on a stream that
+     *  ended before any batch was produced. `arrow` feature only. */
+    line_sender_error_no_schema = 33,
+
+    /** Arrow C Data Interface export failed. `arrow` feature only. */
+    line_sender_error_arrow_export = 34,
+
     /** An irreducible QWP/WebSocket unit (the table schema plus a single row
      *  block) exceeds the negotiated per-batch cap. The column sender splits
      *  oversize chunks into smaller frames automatically, so this only surfaces
      *  when splitting cannot make a frame fit. Distinct from
      *  `line_sender_error_invalid_api_call` so callers can recognise it without
      *  matching on the error message text. */
-    line_sender_error_batch_too_large = 20,
+    line_sender_error_batch_too_large = 35,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */

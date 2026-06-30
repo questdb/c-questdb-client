@@ -106,11 +106,13 @@ fn lock_state(m: &Mutex<PoolState>) -> std::sync::MutexGuard<'_, PoolState> {
 /// * [`ColumnPoolKind::Main`] — the general-purpose pool behind
 ///   [`QuestDb::borrow_column_sender`]: always store-and-forward — an
 ///   in-memory queue when no `sf_dir` is set (pools freely up to `pool_max`),
-///   disk-backed and capped to a single active borrower when it is. The SFA
-///   queue owns delivery, so a borrow returned/dropped after a no-wait `flush`
-///   does not lose accepted frames; `sync` / `flush_and_wait` are an ack-wait
-///   barrier (block until the published frame reaches the requested
-///   [`AckLevel`]), not a commit-or-lose-data step.
+///   disk-backed and capped to a single active borrower when it is. A parked
+///   connection's background runner keeps delivering, and pool close / reap
+///   flush queued frames best-effort within `close_flush_timeout`; for a hard
+///   delivery guarantee on an in-memory queue, call [`SfColumnSender::wait`]
+///   before close (or use `sf_dir`). `wait` is an ack-wait barrier (block until
+///   the published frame reaches the requested [`AckLevel`]), not a
+///   commit-or-lose-data step.
 /// * [`ColumnPoolKind::Direct`] — the always-direct pool behind
 ///   [`QuestDb::borrow_direct_column_sender`], independent of `sf_dir`. Used by
 ///   DataFrame ingestion (Polars / Pandas), which drives its own replay from
@@ -1120,11 +1122,19 @@ impl Debug for ColumnSenderHandle<'_> {
 /// Store-and-forward column sender borrowed from a [`QuestDb`] pool — the
 /// handle returned by [`QuestDb::borrow_column_sender`].
 ///
-/// [`Self::flush`] appends a frame to the connection's store-and-forward
-/// queue, which owns delivery: returning or dropping the handle does not lose
-/// accepted frames. [`Self::wait`] is a server-ack barrier (block until the
-/// frames published so far reach the requested [`AckLevel`]) — needed only to
-/// *observe* delivery, never for durability. There is deliberately no
+/// [`Self::flush`] appends a frame to the connection's store-and-forward queue
+/// and returns as soon as it is accepted locally (no server round-trip); the
+/// connection's background runner delivers it asynchronously. While the handle
+/// is borrowed or parked in the pool the runner keeps delivering, so returning
+/// or dropping the handle does not by itself lose accepted frames.
+///
+/// Delivery is completed best-effort when the pool is closed or the connection
+/// is retired, bounded by `close_flush_timeout` (default 5s): an in-memory
+/// queue whose server stays unreachable past that window drops its undelivered
+/// tail, logging a warning. For a hard guarantee, call [`Self::wait`] before
+/// closing the pool — it blocks until the frames published so far reach the
+/// requested [`AckLevel`], i.e. confirms delivery — or configure `sf_dir` for
+/// crash-durable on-disk persistence with replay. There is deliberately no
 /// `flush_and_wait` / `sync`: compose [`Self::flush`] then [`Self::wait`].
 ///
 /// Not `Send` or `Sync`.
@@ -1147,7 +1157,9 @@ impl<'a> SfColumnSender<'a> {
     /// `timeout` is a no-progress deadline (it fires only if the ack watermark
     /// fails to advance for that long); `Duration::ZERO` waits indefinitely.
     /// On expiry it returns an [`ErrorCode::FailoverRetry`](crate::ErrorCode)
-    /// error and the queued frames are retained for replay.
+    /// error; the frames remain queued and the background runner keeps
+    /// delivering them, so recover by calling `wait()` again until it returns
+    /// `Ok` — not by re-flushing, which would deliver the same rows twice.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.0.inner_mut().wait(ack_level, timeout)
     }
@@ -1972,22 +1984,88 @@ fn commit_in_flight_on_drop(inner: &Arc<DbInner>, sender: &mut ColumnSender) {
     }
 }
 
-fn return_to_pool(inner: &Arc<DbInner>, sender: ColumnSender, kind: ColumnPoolKind) {
+/// Best-effort delivery of a store-and-forward connection's queued frames just
+/// before it is dropped (not recycled) — on pool shutdown or a `must_close`
+/// return. While a connection is parked in the free list its background runner
+/// keeps delivering, but dropping it stops the runner, so we give the queue a
+/// bounded window (the configured `close_flush_timeout`) to finish. On timeout
+/// or a terminal transport the undelivered frames are discarded with a warning,
+/// mirroring [`commit_in_flight_on_drop`] for the direct backend. No-op for the
+/// direct backend and for a connection that has already drained.
+fn drain_sfa_before_drop(inner: &DbInner, sender: &mut ColumnSender) {
+    let timeout = inner.connector.close_flush_timeout();
+    if timeout.is_zero() {
+        return;
+    }
+    let durable = inner.connector.request_durable_ack();
+    if sender.sfa_fully_delivered(durable) {
+        return;
+    }
+    sender.begin_close();
+    if let Err(err) = sender.drain_to_deadline(Instant::now().checked_add(timeout)) {
+        log::warn!(
+            "store-and-forward column sender dropped with frame(s) that could \
+             not be delivered within close_flush_timeout; their data is \
+             discarded. Call wait() before closing the pool, or set sf_dir for \
+             crash-durable persistence. Cause: {err}"
+        );
+    }
+}
+
+/// Batched [`drain_sfa_before_drop`] for the connections retired together when
+/// the pool is closed. Every runner is signalled first (non-blocking) so their
+/// deliveries overlap, then each is awaited under a *single* shared deadline —
+/// so total close time is roughly one `close_flush_timeout` no matter how many
+/// connections are draining, instead of the sum.
+fn drain_sfa_senders_bounded(inner: &DbInner, senders: &mut [ColumnSender]) {
+    let timeout = inner.connector.close_flush_timeout();
+    if timeout.is_zero() || senders.is_empty() {
+        return;
+    }
+    let durable = inner.connector.request_durable_ack();
+    for sender in senders.iter() {
+        sender.begin_close();
+    }
+    let deadline = Instant::now().checked_add(timeout);
+    for sender in senders.iter_mut() {
+        if sender.sfa_fully_delivered(durable) {
+            continue;
+        }
+        if let Err(err) = sender.drain_to_deadline(deadline) {
+            log::warn!(
+                "store-and-forward column sender dropped on pool close with \
+                 frame(s) that could not be delivered within close_flush_timeout; \
+                 their data is discarded. Call wait() before close, or set \
+                 sf_dir for crash-durable persistence. Cause: {err}"
+            );
+        }
+    }
+}
+
+fn return_to_pool(inner: &Arc<DbInner>, mut sender: ColumnSender, kind: ColumnPoolKind) {
     let must_close = sender.must_close();
     // A transport-dead connection marks its endpoint unhealthy in the shared
     // tracker so the next borrow rotates away from the dead peer (until it
     // re-probes healthy). A pool-driven `mark_must_close` (un-sync'd pending
     // frames) or a server-data rejection leaves the endpoint healthy.
     record_sender_transport_failure(inner, &sender);
-    let mut state = lock_state(column_pool_state(inner, kind));
-    state.in_use = state.in_use.saturating_sub(1);
-    if !must_close && !inner.shutdown.load(Ordering::SeqCst) {
-        state.free.push(PoolEntry {
-            sender,
-            last_idle_at: Instant::now(),
-        });
+    let recycle = !must_close && !inner.shutdown.load(Ordering::SeqCst);
+    {
+        let mut state = lock_state(column_pool_state(inner, kind));
+        state.in_use = state.in_use.saturating_sub(1);
+        if recycle {
+            state.free.push(PoolEntry {
+                sender,
+                last_idle_at: Instant::now(),
+            });
+            return;
+        }
     }
-    drop(state);
+    // Not recycling: this connection and its background runner are about to be
+    // dropped. The store-and-forward (Main) pool owns a delivery contract, so
+    // drain its queue first (bounded, outside the pool lock); the direct pool
+    // discards uncommitted deferred frames by design, so this is a no-op there.
+    drain_sfa_before_drop(inner, &mut sender);
 }
 
 fn finish_replaced_sender(inner: &Arc<DbInner>, sender: ColumnSender, kind: ColumnPoolKind) {
@@ -2073,11 +2151,15 @@ fn drain_idle_inner(inner: &DbInner) -> usize {
 }
 
 fn drain_idle_senders(inner: &DbInner) -> usize {
-    let to_drop: Vec<ColumnSender> = {
+    let mut to_drop: Vec<ColumnSender> = {
         let mut state = lock_state(&inner.state);
         state.free.drain(..).map(|entry| entry.sender).collect()
     };
     let dropped = to_drop.len();
+    // The Main pool is store-and-forward: deliver each connection's queued
+    // frames (bounded by close_flush_timeout, shared across all of them) before
+    // the runners are stopped on drop. Done outside the pool lock.
+    drain_sfa_senders_bounded(inner, &mut to_drop);
     drop(to_drop);
     dropped
 }
@@ -2117,6 +2199,7 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
     // Drop the to-be-closed connections OUTSIDE the lock so closing a connection
     // (which may take an unbounded amount of time) does not stall concurrent
     // borrows.
+    let durable = inner.connector.request_durable_ack();
     let to_drop: Vec<ColumnSender> = {
         let mut state = lock_state(&inner.state);
         let mut to_drop = Vec::new();
@@ -2131,7 +2214,14 @@ fn reap_idle_senders(inner: &DbInner) -> usize {
                 break;
             }
             let idle_for = now.saturating_duration_since(state.free[i].last_idle_at);
-            if idle_for > inner.pool_idle_timeout {
+            // Never evict a connection whose store-and-forward queue still holds
+            // undelivered frames: its background runner is still delivering, and
+            // dropping it now would lose that data. It becomes reapable once the
+            // runner drains it (or the transport goes terminal). `sfa_fully_delivered`
+            // is a lock-free progress read in the healthy case.
+            if idle_for > inner.pool_idle_timeout
+                && state.free[i].sender.sfa_fully_delivered(durable)
+            {
                 let entry = state.free.remove(i);
                 to_drop.push(entry.sender);
             } else {
