@@ -240,21 +240,6 @@ TEST_CASE("flush rejects oversized table name")
     conn.drop_on_return();
 }
 
-TEST_CASE("direct flush_and_wait rejects NULL conn")
-{
-    qdb::column_chunk chunk{"trades"};
-    int64_t v[] = {1};
-    int64_t t[] = {1};
-    chunk.column_i64("v", v, 1).designated_timestamp_nanos(t, 1);
-
-    // flush_and_wait is a direct-handle method (the SF handle composes
-    // flush() + wait()).
-    qdb::direct_column_sender_conn conn{nullptr};
-    CHECK_THROWS_AS(
-        conn.flush_and_wait(chunk, qdb::column_sender_ack_level::ok),
-        qdb::line_sender_error);
-}
-
 TEST_CASE("wait rejects durable ACK without opt-in and keeps the chunk")
 {
     auto mock = spawn_mock(1);

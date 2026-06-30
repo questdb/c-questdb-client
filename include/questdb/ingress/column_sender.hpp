@@ -50,7 +50,7 @@ class reader;
 namespace questdb::ingress
 {
 
-/** Ack level for `sf_column_sender_conn::wait` / `direct_column_sender_conn::commit`. */
+/** Ack level for `sf_column_sender_conn::wait` / `borrowed_row_sender::wait`. */
 enum class column_sender_ack_level : uint32_t
 {
     ok = ::column_sender_ack_level_ok,
@@ -86,7 +86,6 @@ private:
 
 /** Forward decl. */
 class sf_column_sender_conn;
-class direct_column_sender_conn;
 
 /**
  * RAII wrapper around `::column_sender_chunk*`. Move-only.
@@ -838,168 +837,6 @@ private:
     ::sf_column_sender* _raw;
 };
 
-/**
- * Borrowed `::direct_column_sender*` wrapper: `flush` (pipelined deferred) +
- * `flush_and_wait` + `commit` and the Arrow-batch ingest, for DataFrame
- * ingestion. Owned by `borrowed_direct_column_sender`; do not construct
- * directly.
- */
-class direct_column_sender_conn
-{
-public:
-    explicit direct_column_sender_conn(::direct_column_sender* raw) noexcept
-        : _raw{raw}
-    {
-    }
-
-    ::direct_column_sender* c_ptr() noexcept { return _raw; }
-    const ::direct_column_sender* c_ptr() const noexcept { return _raw; }
-
-    /** `true` if the conn has latched terminal must-close, or the pool closed. */
-    bool must_close() const noexcept
-    {
-        return ::direct_column_sender_must_close(_raw);
-    }
-
-    /**
-     * Pipeline `chunk` as a deferred frame without waiting. Not committed until
-     * `commit()` / `flush_and_wait()`. On success `chunk` is cleared. Throws on
-     * error.
-     */
-    void flush(column_chunk& chunk)
-    {
-        line_sender_error::wrapped_call(
-            ::direct_column_sender_flush, _raw, chunk.c_ptr());
-    }
-
-    /**
-     * Publish `chunk` as a non-deferred commit boundary and block until it (and
-     * all prior pipelined frames) reach `level`. Once published, `chunk` is
-     * cleared even if the ACK wait then fails. Throws on error.
-     */
-    void flush_and_wait(column_chunk& chunk, column_sender_ack_level level)
-    {
-        line_sender_error::wrapped_call(
-            ::direct_column_sender_flush_and_wait,
-            _raw,
-            chunk.c_ptr(),
-            static_cast<uint32_t>(level));
-    }
-
-    /**
-     * Send the commit boundary for all pipelined frames and block until they
-     * reach `level`. The direct sender's durability checkpoint: frames pipelined
-     * by `flush()` are lost if the conn is dropped before a successful commit.
-     * Bounded by `request_timeout`; throws on error.
-     */
-    void commit(column_sender_ack_level level = column_sender_ack_level::ok)
-    {
-        line_sender_error::wrapped_call(
-            ::direct_column_sender_commit,
-            _raw,
-            static_cast<uint32_t>(level));
-    }
-
-#ifdef QUESTDB_CLIENT_ENABLE_ARROW
-    /** Publish-only Arrow flush (server-stamped). Pair with `commit()`. */
-    void flush_arrow_batch_at_now(
-        table_name_view table,
-        ::ArrowArray& array,
-        const ::ArrowSchema& schema,
-        const ::column_sender_arrow_override* overrides = nullptr,
-        size_t overrides_len = 0)
-    {
-        ::line_sender_table_name table_c{table.size(), table.data()};
-        line_sender_error::wrapped_call(
-            ::direct_column_sender_flush_arrow_batch_at_now,
-            _raw,
-            table_c,
-            &array,
-            &schema,
-            overrides,
-            overrides_len);
-    }
-
-    /**
-     * ACKing Arrow flush (server-stamped): publish as a boundary, then wait for
-     * `level`. On a pre-publication failure `array` is re-exported for retry; on
-     * a post-publication failure it is not — check `array.release` before
-     * invoking it. Throws on error.
-     */
-    void flush_arrow_batch_at_now_and_wait(
-        table_name_view table,
-        ::ArrowArray& array,
-        const ::ArrowSchema& schema,
-        column_sender_ack_level level,
-        const ::column_sender_arrow_override* overrides = nullptr,
-        size_t overrides_len = 0)
-    {
-        ::line_sender_table_name table_c{table.size(), table.data()};
-        line_sender_error::wrapped_call(
-            ::direct_column_sender_flush_arrow_batch_at_now_and_wait,
-            _raw,
-            table_c,
-            &array,
-            &schema,
-            overrides,
-            overrides_len,
-            static_cast<uint32_t>(level));
-    }
-
-    /** Publish-only Arrow flush sourcing the timestamp from `ts_column`. */
-    void flush_arrow_batch(
-        table_name_view table,
-        ::ArrowArray& array,
-        const ::ArrowSchema& schema,
-        column_name_view ts_column,
-        const ::column_sender_arrow_override* overrides = nullptr,
-        size_t overrides_len = 0)
-    {
-        ::line_sender_table_name table_c{table.size(), table.data()};
-        ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
-        line_sender_error::wrapped_call(
-            ::direct_column_sender_flush_arrow_batch_at_column,
-            _raw,
-            table_c,
-            &array,
-            &schema,
-            ts_c,
-            overrides,
-            overrides_len);
-    }
-
-    /**
-     * ACKing counterpart of the `ts_column` `flush_arrow_batch`. Callers MUST
-     * check `array.release != nullptr` before invoking it on failure.
-     */
-    void flush_arrow_batch_and_wait(
-        table_name_view table,
-        ::ArrowArray& array,
-        const ::ArrowSchema& schema,
-        column_name_view ts_column,
-        column_sender_ack_level level,
-        const ::column_sender_arrow_override* overrides = nullptr,
-        size_t overrides_len = 0)
-    {
-        ::line_sender_table_name table_c{table.size(), table.data()};
-        ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
-        line_sender_error::wrapped_call(
-            ::direct_column_sender_flush_arrow_batch_at_column_and_wait,
-            _raw,
-            table_c,
-            &array,
-            &schema,
-            ts_c,
-            overrides,
-            overrides_len,
-            static_cast<uint32_t>(level));
-    }
-#endif
-
-private:
-    ::direct_column_sender* _raw;
-};
-
 /** Forward decl. */
 class pool;
 
@@ -1048,6 +885,14 @@ public:
     sf_column_sender_conn& operator*() noexcept { return _conn; }
     const sf_column_sender_conn& operator*() const noexcept { return _conn; }
 
+    /** `true` if this conn will be dropped rather than recycled on return
+     * (force-marked, a flush left it must-close, or the pool has been closed).
+     * Mirrors `borrowed_row_sender::must_close()`. */
+    bool must_close() const noexcept
+    {
+        return _conn.c_ptr() && _conn.must_close();
+    }
+
     /** Force the conn to drop on return instead of recycling. */
     void drop_on_return() noexcept { _force_drop = true; }
 
@@ -1075,84 +920,6 @@ private:
 
     ::questdb_db* _db;
     sf_column_sender_conn _conn;
-    bool _force_drop{false};
-};
-
-/**
- * RAII guard for a borrowed direct connection. On destruction the conn is
- * returned to the pool (or dropped). Constructed only via
- * `pool::borrow_direct_column_sender()`.
- *
- * @warning The destructor returns/drops the conn but does NOT commit. A direct
- * conn that has `flush()`ed (pipelined deferred frames) but not yet
- * `commit()`ed loses those frames on destruction — their source chunks were
- * already cleared. Call `commit()` (or `flush_and_wait()` on the final chunk)
- * before this guard goes out of scope. The destructor is deliberately
- * non-committing: it must not throw or block.
- */
-class borrowed_direct_column_sender
-{
-public:
-    borrowed_direct_column_sender(const borrowed_direct_column_sender&) = delete;
-    borrowed_direct_column_sender& operator=(const borrowed_direct_column_sender&) = delete;
-
-    borrowed_direct_column_sender(borrowed_direct_column_sender&& other) noexcept
-        : _db{other._db}
-        , _conn{std::move(other._conn)}
-        , _force_drop{other._force_drop}
-    {
-        other._db = nullptr;
-        other._force_drop = false;
-    }
-
-    borrowed_direct_column_sender& operator=(borrowed_direct_column_sender&& other) noexcept
-    {
-        if (this != &other)
-        {
-            release();
-            _db = other._db;
-            _conn = std::move(other._conn);
-            _force_drop = other._force_drop;
-            other._db = nullptr;
-            other._force_drop = false;
-        }
-        return *this;
-    }
-
-    ~borrowed_direct_column_sender() noexcept { release(); }
-
-    direct_column_sender_conn* operator->() noexcept { return &_conn; }
-    const direct_column_sender_conn* operator->() const noexcept { return &_conn; }
-    direct_column_sender_conn& operator*() noexcept { return _conn; }
-    const direct_column_sender_conn& operator*() const noexcept { return _conn; }
-
-    /** Force the conn to drop on return instead of recycling. */
-    void drop_on_return() noexcept { _force_drop = true; }
-
-private:
-    friend class pool;
-
-    borrowed_direct_column_sender(::questdb_db* db, ::direct_column_sender* raw) noexcept
-        : _db{db}
-        , _conn{raw}
-    {
-    }
-
-    void release() noexcept
-    {
-        ::direct_column_sender* raw = _conn.c_ptr();
-        if (_db && raw)
-        {
-            if (_force_drop || ::direct_column_sender_must_close(raw))
-                ::questdb_db_drop_direct_column_sender(_db, raw);
-            else
-                ::questdb_db_return_direct_column_sender(_db, raw);
-        }
-        _db = nullptr;
-    }
-
-    ::questdb_db* _db;
-    direct_column_sender_conn _conn;
     bool _force_drop{false};
 };
 
@@ -1399,23 +1166,6 @@ public:
         return borrowed_sf_column_sender{_raw, raw};
     }
 
-    /** Borrow a direct (pipelined, non-store-and-forward) conn for DataFrame
-     * ingestion. Throws on cap exhaustion or transport failure. */
-    borrowed_direct_column_sender borrow_direct_column_sender()
-    {
-        auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_direct_column_sender, _raw);
-        return borrowed_direct_column_sender{_raw, raw};
-    }
-
-    /** Direct-handle counterpart of `borrow_sf_column_sender_with_retry`. */
-    borrowed_direct_column_sender borrow_direct_column_sender_with_retry(uint64_t budget_ms)
-    {
-        auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_direct_column_sender_with_retry, _raw, budget_ms);
-        return borrowed_direct_column_sender{_raw, raw};
-    }
-
     /**
      * Borrow a row-major sender from the pool, mirroring Rust
      * `QuestDb::borrow_row_sender`. Row senders are pooled on a separate,
@@ -1492,7 +1242,7 @@ namespace questdb
 {
 // `questdb::pool` is the canonical, top-level spelling of the connection
 // pool. The pool is cross-cutting — it hands out write-side senders
-// (`borrow_sf_column_sender` / `borrow_direct_column_sender`) and read-side query readers (`borrow_reader`) — so it
+// (`borrow_sf_column_sender`) and read-side query readers (`borrow_reader`) — so it
 // belongs at the top-level `questdb` namespace rather than under `ingress`.
 // This re-export is the C++ analogue of the Rust `questdb::QuestDb`
 // re-export; `questdb::ingress::pool` remains valid for back-compat.

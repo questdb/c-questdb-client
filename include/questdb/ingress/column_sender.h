@@ -82,18 +82,11 @@ typedef struct questdb_db questdb_db;
  *  ack barrier; the store-and-forward queue owns delivery. */
 typedef struct sf_column_sender sf_column_sender;
 
-/** Borrowed direct (pipelined, non-store-and-forward) QWP/WS connection — the
- *  DataFrame-ingest sibling of `sf_column_sender`, returned via
- *  `questdb_db_return_direct_column_sender`. Same single-threaded / latch
- *  contract; exposes `direct_column_sender_flush` +
- *  `direct_column_sender_flush_and_wait` + `direct_column_sender_commit`. */
-typedef struct direct_column_sender direct_column_sender;
-
 /** Borrowed row-major QWP/WS sender. Not thread-safe; belongs to the
  *  borrowing thread until returned via `questdb_db_return_row_sender`.
  *  Builds rows through an ordinary `line_sender_buffer` and sends them with
  *  `row_sender_flush` / `row_sender_flush_and_keep`. Companion to the
- *  column-major senders (`sf_column_sender` / `direct_column_sender`) and
+ *  column-major sender (`sf_column_sender`) and
  *  `reader` (query). */
 typedef struct row_sender row_sender;
 
@@ -199,17 +192,6 @@ sf_column_sender* questdb_db_borrow_sf_column_sender(
     line_sender_error** err_out);
 
 /**
- * Borrow a direct (pipelined, non-store-and-forward) connection from the
- * always-direct pool, the DataFrame-ingest sibling of
- * `questdb_db_borrow_sf_column_sender`. Returns NULL on failure; sets
- * `*err_out` if provided.
- */
-QUESTDB_CLIENT_API
-direct_column_sender* questdb_db_borrow_direct_column_sender(
-    questdb_db* db,
-    line_sender_error** err_out);
-
-/**
  * Like `questdb_db_borrow_sf_column_sender` but retries the connect within `budget_ms`
  * using the row sender's reconnect backoff (centered-jittered exponential with
  * a role-reject reset; authentication and protocol-version errors are
@@ -220,13 +202,6 @@ direct_column_sender* questdb_db_borrow_direct_column_sender(
  */
 QUESTDB_CLIENT_API
 sf_column_sender* questdb_db_borrow_sf_column_sender_with_retry(
-    questdb_db* db,
-    uint64_t budget_ms,
-    line_sender_error** err_out);
-
-/** Direct-handle counterpart of `questdb_db_borrow_sf_column_sender_with_retry`. */
-QUESTDB_CLIENT_API
-direct_column_sender* questdb_db_borrow_direct_column_sender_with_retry(
     questdb_db* db,
     uint64_t budget_ms,
     line_sender_error** err_out);
@@ -247,16 +222,15 @@ uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);
  * `db` is currently ignored — the conn carries its own reference to
  * the pool — but accepted for symmetry with the borrow call.
  *
- * @warning Returning a conn that has flushed but not yet
- * `sf_column_sender_wait`'d silently discards every deferred (non-first) flush
- * since the last sync: in direct mode those flushes were sent with the
- * deferred-commit flag and their source chunks were already cleared, so the
- * data is unrecoverable. Call `sf_column_sender_wait` (or
- * `direct_column_sender_flush_and_wait` on the final chunk) before returning to
- * avoid data loss. This differs from the row sender, where every
- * `row_sender_flush` commits on its own — the column sender pipelines deferred
- * flushes for throughput and relies on an explicit sync to commit them, so the
- * trailing sync is mandatory, not optional.
+ * Returning is safe: `sf_column_sender_flush` enqueues each frame into the
+ * at-least-once store-and-forward queue, which owns delivery. A returned
+ * (parked) conn's background runner keeps delivering, so no explicit
+ * `sf_column_sender_wait` is needed to avoid data loss. The only durability
+ * nuance is at pool close on an in-memory queue (no `sf_dir`): close/reap
+ * flush queued frames best-effort within `close_flush_timeout`, so for a hard
+ * delivery guarantee call `sf_column_sender_wait` before close, or configure
+ * `sf_dir`. `sf_column_sender_wait` is an ack-observation barrier, not a
+ * commit-or-lose-data step.
  *
  * Mutually exclusive with `questdb_db_drop_sf_column_sender` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
@@ -265,12 +239,6 @@ QUESTDB_CLIENT_API
 void questdb_db_return_sf_column_sender(
     questdb_db* db,
     sf_column_sender* conn);
-
-/** Direct-handle counterpart of `questdb_db_return_sf_column_sender`. */
-QUESTDB_CLIENT_API
-void questdb_db_return_direct_column_sender(
-    questdb_db* db,
-    direct_column_sender* conn);
 
 /**
  * Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
@@ -284,13 +252,10 @@ void questdb_db_return_direct_column_sender(
  * releases the slot lock; unresolved frames remain in `sf_dir` for the next
  * owner to replay.
  *
- * @warning Dropping a conn that has flushed but not yet `sf_column_sender_wait`'d
- * silently discards every deferred (non-first) flush since the last sync: in
- * direct mode those flushes were sent with the deferred-commit flag and their
- * source chunks were already cleared, so the data is unrecoverable (it is not
- * persisted in `sf_dir` for replay either). If those flushes must not be lost,
- * call `sf_column_sender_wait` (or `direct_column_sender_flush_and_wait` on the final
- * chunk) before dropping.
+ * @warning Dropping discards any queued frames not yet delivered. With `sf_dir`
+ * configured they persist in the spool for the next owner to replay; on an
+ * in-memory queue (no `sf_dir`) they are lost. If those frames must not be
+ * lost, call `sf_column_sender_wait` before dropping (or configure `sf_dir`).
  *
  * Mutually exclusive with `questdb_db_return_sf_column_sender` on the same `conn`:
  * call exactly one of the two. Calling both (or either twice) is UB.
@@ -299,12 +264,6 @@ QUESTDB_CLIENT_API
 void questdb_db_drop_sf_column_sender(
     questdb_db* db,
     sf_column_sender* conn);
-
-/** Direct-handle counterpart of `questdb_db_drop_sf_column_sender`. */
-QUESTDB_CLIENT_API
-void questdb_db_drop_direct_column_sender(
-    questdb_db* db,
-    direct_column_sender* conn);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
  * `questdb_db_return_reader`, `questdb_db_dbg_reader_*_count`) live in
@@ -331,10 +290,6 @@ size_t questdb_db_reap_idle(questdb_db* db);
  */
 QUESTDB_CLIENT_API
 bool sf_column_sender_must_close(const sf_column_sender* conn);
-
-/** Direct-handle counterpart of `sf_column_sender_must_close`. */
-QUESTDB_CLIENT_API
-bool direct_column_sender_must_close(const direct_column_sender* conn);
 
 /* -------------------------------------------------------------------------
  * Row-major sender borrow
@@ -1307,45 +1262,26 @@ bool column_sender_chunk_designated_timestamp_seconds(
  * ACK. On success, `chunk` is cleared (allocations retained) and `true`
  * is returned. On failure, `chunk` is left untouched.
  *
- * Direct mode: the first flush is sent as an immediate commit. Later flushes
- * are sent with QWP's deferred-commit flag so callers can pipeline many
- * chunks. Call `sf_column_sender_wait` after the final flush to send the commit
- * frame and wait until all in-flight frames are acknowledged at `ack_level`.
+ * Every flushed frame is non-deferred and is first accepted into the local
+ * store-and-forward queue, which owns delivery. `sf_column_sender_flush`
+ * success means local queue acceptance, not server acknowledgement.
+ * `sf_column_sender_wait` does not send a commit frame; it waits for frames
+ * already published to the local queue, up to the sync-call boundary, to be
+ * acknowledged at `ack_level`.
  *
- * Store-and-forward mode: every flushed frame is non-deferred and is first
- * accepted into the local SFA queue. `sf_column_sender_wait` does not send a
- * commit frame; it waits for frames already published to the local queue up to
- * the sync-call boundary. `sf_column_sender_flush` success means local queue
- * acceptance, not server acknowledgement.
- *
- * In direct mode, the connection keeps one protocol in-flight slot reserved
- * for the sync commit frame. If that reserve would be exhausted, flush returns
- * `line_sender_error_invalid_api_call`; call `sf_column_sender_wait` before
- * flushing more chunks.
- *
- * No-progress timeout (both modes): `sf_column_sender_wait` returns
+ * No-progress timeout: `sf_column_sender_wait` returns
  * `line_sender_error_failover_retry` if the server stays connected but never
  * advances the ack/durable watermark for `request_timeout` (default 30s) — a
  * back-pressured WAL or stuck commit. The deadline resets on every watermark
  * advance, so a slow-but-progressing sync (e.g. a `durable` upload under
  * pressure) is not cut off. On this error the unacked frames are retained:
- * drop the conn and re-borrow to replay (store-and-forward) or re-drive from
- * source (direct). Raise `request_timeout` to wait longer.
+ * drop the conn and re-borrow to replay. Raise `request_timeout` to wait
+ * longer.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
 bool sf_column_sender_flush(
     sf_column_sender* conn,
-    column_sender_chunk* chunk,
-    line_sender_error** err_out);
-
-/**
- * Pipeline a deferred frame on a direct connection. Not committed until
- * `direct_column_sender_commit` / `direct_column_sender_flush_and_wait`.
- */
-QUESTDB_CLIENT_API
-bool direct_column_sender_flush(
-    direct_column_sender* conn,
     column_sender_chunk* chunk,
     line_sender_error** err_out);
 
@@ -1363,40 +1299,6 @@ bool sf_column_sender_wait(
     sf_column_sender* conn,
     uint32_t ack_level,
     uint64_t timeout_millis,
-    line_sender_error** err_out);
-
-/**
- * Direct commit: send the commit boundary for all pipelined frames and block
- * until they reach `ack_level`. The direct sender's durability checkpoint;
- * frames pipelined by `direct_column_sender_flush` are lost if the conn is
- * dropped before a successful commit.
- */
-QUESTDB_CLIENT_API
-bool direct_column_sender_commit(
-    direct_column_sender* conn, uint32_t ack_level, line_sender_error** err_out);
-
-/**
- * Publish `chunk` as a completion boundary, then wait until every frame
- * published before or by this call reaches `ack_level` (see
- * `sf_column_sender_wait` for the level meanings and the no-progress timeout).
- *
- * `ack_level` carries a `column_sender_ack_level_*` constant. An out-of-range
- * value, or `column_sender_ack_level_durable` without `request_durable_ack=on`,
- * returns `line_sender_error_invalid_api_call` before `chunk` is touched.
- *
- * Boundary: success acknowledges all prior no-wait flushes plus this one. An
- * empty `chunk` behaves like `sf_column_sender_wait`.
- *
- * Failure contract: on a pre-publication failure `chunk` is left untouched and
- * retryable. Once the frame is published `chunk` is cleared even if the ACK
- * wait then fails — delivery of that frame is then unknown, and the conn should
- * be dropped and re-borrowed per the error class. No internal failover retry.
- */
-QUESTDB_CLIENT_API
-bool direct_column_sender_flush_and_wait(
-    direct_column_sender* conn,
-    column_sender_chunk* chunk,
-    uint32_t ack_level,
     line_sender_error** err_out);
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
@@ -1477,19 +1379,6 @@ bool sf_column_sender_flush_arrow_batch_at_now(
     size_t overrides_len,
     line_sender_error** err_out);
 
-/** Direct-handle publish-only Arrow flush (server-stamped). Pair with
- *  `direct_column_sender_commit`, or use
- *  `direct_column_sender_flush_arrow_batch_at_now_and_wait`. */
-QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_at_now(
-    direct_column_sender* conn,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    const column_sender_arrow_override* overrides,
-    size_t overrides_len,
-    line_sender_error** err_out);
-
 /**
  * Same as `sf_column_sender_flush_arrow_batch_at_now` but picks the
  * designated timestamp from a named column of the batch instead of
@@ -1507,66 +1396,6 @@ bool sf_column_sender_flush_arrow_batch_at_column(
     size_t overrides_len,
     line_sender_error** err_out);
 
-/** Direct-handle publish-only Arrow flush (column-stamped). Pair with
- *  `direct_column_sender_commit`, or use
- *  `direct_column_sender_flush_arrow_batch_at_column_and_wait`. */
-QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_at_column(
-    direct_column_sender* conn,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    line_sender_column_name ts_column,
-    const column_sender_arrow_override* overrides,
-    size_t overrides_len,
-    line_sender_error** err_out);
-
-/**
- * ACKing counterpart of `sf_column_sender_flush_arrow_batch_at_now`:
- * publish `array` as a boundary, then wait for `ack_level`.
- *
- * `ack_level` is validated before the Arrow C Data Interface import consumes
- * `array->release`, so a rejected level (out-of-range, or
- * `column_sender_ack_level_durable` without `request_durable_ack=on`) returns
- * `line_sender_error_invalid_api_call` and leaves `array` untouched.
- *
- * Ownership differs from the publish-only flush on the failure path. On a
- * provably pre-publication failure the batch is re-exported into `*array` (a
- * fresh `release`) so the caller can drop+re-borrow and retry. On any
- * post-publication failure — including an ACK-wait / store-and-forward
- * no-progress timeout reported as `line_sender_error_failover_retry` — the
- * batch is NOT re-exported (`array->release` stays NULL): delivery is unknown.
- * Callers MUST check `array->release != NULL` before invoking it on failure.
- */
-QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_at_now_and_wait(
-    direct_column_sender* conn,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    const column_sender_arrow_override* overrides,
-    size_t overrides_len,
-    uint32_t ack_level,
-    line_sender_error** err_out);
-
-/**
- * ACKing counterpart of `sf_column_sender_flush_arrow_batch_at_column`: publish
- * `array` (timestamp sourced from `ts_column`) as a boundary, then wait for
- * `ack_level`. Same ACK-validation preflight and phase-aware re-export contract
- * as `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
- * Callers MUST check `array->release != NULL` before invoking it on failure.
- */
-QUESTDB_CLIENT_API
-bool direct_column_sender_flush_arrow_batch_at_column_and_wait(
-    direct_column_sender* conn,
-    line_sender_table_name table,
-    struct ArrowArray* array,
-    const struct ArrowSchema* schema,
-    line_sender_column_name ts_column,
-    const column_sender_arrow_override* overrides,
-    size_t overrides_len,
-    uint32_t ack_level,
-    line_sender_error** err_out);
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */
 
 #ifdef __cplusplus
