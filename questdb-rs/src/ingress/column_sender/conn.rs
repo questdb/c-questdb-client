@@ -272,7 +272,7 @@ impl ColumnConn {
         let payload_len = self.write_buf.len() - WS_HEADER_RESERVE;
         if payload_len > self.max_buf_size {
             return Err(PublishError::BeforeWrite(error::fmt!(
-                InvalidApiCall,
+                BatchTooLarge,
                 "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
                 payload_len,
                 self.max_buf_size

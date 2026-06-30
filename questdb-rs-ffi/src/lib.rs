@@ -310,6 +310,14 @@ pub enum line_sender_error_code {
     /// caller can tell a timed-out dial apart from a refused / reset
     /// connection. Produced by the QWP/WebSocket transport.
     line_sender_error_connect_timeout = 19,
+
+    /// An irreducible QWP/WebSocket unit (the table schema plus a single row
+    /// block) exceeds the negotiated per-batch cap. The column sender splits
+    /// oversize chunks into smaller frames automatically, so this only surfaces
+    /// when splitting cannot make a frame fit. Distinct from
+    /// `line_sender_error_invalid_api_call` so callers can recognise it without
+    /// matching on the error message text.
+    line_sender_error_batch_too_large = 20,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -357,6 +365,7 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::FailoverRetry => line_sender_error_code::line_sender_error_failover_retry,
             ErrorCode::RoleMismatch => line_sender_error_code::line_sender_error_role_mismatch,
             ErrorCode::ConnectTimeout => line_sender_error_code::line_sender_error_connect_timeout,
+            ErrorCode::BatchTooLarge => line_sender_error_code::line_sender_error_batch_too_large,
             _ => line_sender_error_code::line_sender_error_invalid_api_call,
         }
     }
@@ -4878,6 +4887,7 @@ mod tests {
                 ErrorCode::FailoverRetry => "FailoverRetry",
                 ErrorCode::RoleMismatch => "RoleMismatch",
                 ErrorCode::ConnectTimeout => "ConnectTimeout",
+                ErrorCode::BatchTooLarge => "BatchTooLarge",
                 _ => "unmapped",
             }
         }
@@ -4902,6 +4912,7 @@ mod tests {
             ErrorCode::FailoverRetry,
             ErrorCode::RoleMismatch,
             ErrorCode::ConnectTimeout,
+            ErrorCode::BatchTooLarge,
         ] {
             assert_ne!(
                 cover(code),

@@ -672,6 +672,20 @@ fn unused_local_port() -> u16 {
     listener.local_addr().expect("unused local addr").port()
 }
 
+/// Parse the `row_count` field out of a captured QWP frame: header(12) then
+/// `delta_start`, the new-symbol delta, the table name, then `row_count`.
+fn frame_row_count(payload: &[u8]) -> u64 {
+    const QWP_HEADER_LEN: usize = 12;
+    let mut pos = QWP_HEADER_LEN;
+    read_test_varint(payload, &mut pos); // delta_start
+    let new_symbols = read_test_varint(payload, &mut pos);
+    for _ in 0..new_symbols {
+        read_test_bytes(payload, &mut pos);
+    }
+    read_test_bytes(payload, &mut pos); // table name
+    read_test_varint(payload, &mut pos)
+}
+
 #[test]
 fn refuses_non_qwp_ws_schema() {
     let err = QuestDb::connect("http::addr=localhost:9000;").unwrap_err();
@@ -800,6 +814,177 @@ fn drop_with_in_flight_best_effort_commits_and_recycles() {
         "healthy connection must be recycled after drop best-effort sync"
     );
     assert_eq!(db.direct_in_use_count(), 0);
+}
+
+#[test]
+fn direct_flush_splits_oversize_chunk_into_capped_deferred_frames() {
+    // A chunk larger than the negotiated cap must split into multiple frames,
+    // each within the cap, all but the last deferred so the whole chunk still
+    // commits at a single boundary, and with every row sent exactly once.
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(
+        server.port(),
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+
+    {
+        let mut sender = db.borrow_direct_column_sender().unwrap();
+        sender
+            .flush_and_wait(&mut chunk, AckLevel::Ok)
+            .expect("oversize chunk splits, sends, and commits");
+    }
+
+    // flush_and_wait has returned, so every frame is already on the channel.
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+
+    assert!(
+        captured.len() > 1,
+        "oversize chunk must split into multiple frames, got {}",
+        captured.len()
+    );
+    for (i, frame) in captured.iter().enumerate() {
+        assert!(
+            frame.len() <= CAP,
+            "frame {i} is {} bytes, exceeds cap {CAP}",
+            frame.len()
+        );
+        let deferred = frame[5] & FLAG_DEFER_COMMIT != 0;
+        if i + 1 < captured.len() {
+            assert!(deferred, "frame {i} (not the last) must be deferred");
+        } else {
+            assert!(!deferred, "the last frame must carry the commit boundary");
+        }
+    }
+    let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert_eq!(
+        total, ROWS as u64,
+        "split frames must cover every row exactly once"
+    );
+}
+
+#[test]
+fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
+    // A chunk whose small-row prefix fits but whose final row is irreducibly
+    // larger than the cap: splitting publishes the prefix as deferred frames,
+    // then the floor fails with batch_too_large. The connection must be marked
+    // must_close so the drop-time best-effort commit discards the uncommitted
+    // prefix rather than committing a partial chunk.
+    const CAP: usize = 2048;
+    const PREFIX_ROWS: usize = 200;
+    let server = MockServer::spawn_acking(1);
+    let conf = conf_for(
+        server.port(),
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let big = "x".repeat(CAP * 2);
+    let mut offsets = vec![0i32];
+    let mut bytes = Vec::new();
+    for _ in 0..PREFIX_ROWS {
+        bytes.push(b's');
+        offsets.push(bytes.len() as i32);
+    }
+    bytes.extend_from_slice(big.as_bytes());
+    offsets.push(bytes.len() as i32);
+    let ts: Vec<i64> = (0..=PREFIX_ROWS as i64).collect();
+
+    let mut chunk = Chunk::new("trades");
+    chunk.column_varchar("v", &offsets, &bytes, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    let err = sender
+        .flush(&mut chunk)
+        .expect_err("the irreducible final row must fail the flush");
+    assert_eq!(err.code(), ErrorCode::BatchTooLarge);
+    assert!(
+        sender.must_close(),
+        "connection must be torn down so the uncommitted deferred prefix is \
+         discarded instead of committed on drop"
+    );
+}
+
+#[test]
+fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
+    // The store-and-forward backend also splits an oversize chunk, but into
+    // independently-committed self-sufficient frames — never deferred ones,
+    // which the frame-granular replay queue could drop on a reconnect that
+    // trims them after their ack but before a commit boundary.
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+    const FLAG_DEFER_COMMIT: u8 = 0x01;
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "max_buf_size={CAP};sf_dir={};pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let qty: Vec<i64> = (0..ROWS as i64).collect();
+    let ts: Vec<i64> = (0..ROWS as i64)
+        .map(|x| 1_700_000_000_000_000_000 + x)
+        .collect();
+    let mut chunk = Chunk::new("trades");
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+
+    let mut sender = db.borrow_column_sender().unwrap();
+    sender
+        .flush(&mut chunk)
+        .expect("oversize chunk splits and appends");
+    sender
+        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .expect("all split frames commit");
+
+    let mut captured = Vec::new();
+    while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
+        captured.push(frame);
+    }
+
+    assert!(
+        captured.len() > 1,
+        "oversize chunk must split into multiple frames, got {}",
+        captured.len()
+    );
+    for (i, frame) in captured.iter().enumerate() {
+        assert!(
+            frame.len() <= CAP,
+            "frame {i} is {} bytes, exceeds cap {CAP}",
+            frame.len()
+        );
+        assert_eq!(
+            frame[5] & FLAG_DEFER_COMMIT,
+            0,
+            "store-and-forward frame {i} must be self-sufficient, not deferred"
+        );
+    }
+    let total: u64 = captured.iter().map(|f| frame_row_count(f)).sum();
+    assert_eq!(
+        total, ROWS as u64,
+        "split frames must cover every row exactly once"
+    );
 }
 
 fn check_store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow(extras: &str) {
@@ -2845,7 +3030,7 @@ fn data_frame_count(frames: &mpsc::Receiver<Vec<u8>>) -> usize {
 // is checked for the exact rows it lands, not just the frame count. Layout:
 // 12-byte header, delta-dict prefix, table, row/col counts, signature, then
 // the column body `flag(0) + row_count * i64_le`.
-#[cfg(feature = "polars-ingress")]
+#[cfg(feature = "arrow-ingress")]
 fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
     fn varint(f: &[u8], pos: &mut usize) -> u64 {
         let (mut shift, mut value) = (0u32, 0u64);
@@ -2888,6 +3073,60 @@ fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
         }
     }
     rows
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
+    // The Arrow RecordBatch path must split an oversize batch into cap-sized
+    // frames just like the chunk path; every row must land exactly once.
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use std::sync::Arc;
+
+    const CAP: usize = 2048;
+    const ROWS: usize = 512; // ~8 B/row -> ~4 KB, vs the 2048 B cap
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(
+        server.port(),
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let vals: Vec<i64> = (0..ROWS as i64).collect();
+    let arr: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
+    let batch = RecordBatch::try_from_iter([("seq", arr)]).unwrap();
+
+    let mut sender = db.borrow_direct_column_sender().unwrap();
+    sender
+        .flush_arrow_batch_at_now("trades", &batch, &[])
+        .expect("oversize arrow batch splits and publishes");
+    sender
+        .commit(AckLevel::Ok)
+        .expect("the split frames commit at one boundary");
+
+    // Drain the channel once: counting and decoding both consume `try_iter`,
+    // so collect first and derive both from the same captured frames.
+    let captured: Vec<Vec<u8>> = frames.try_iter().collect();
+    let data_frames = captured
+        .iter()
+        .filter(|f| f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1)
+        .count();
+    assert!(
+        data_frames > 1,
+        "oversize arrow batch must split into multiple frames, got {data_frames}"
+    );
+    let (replay_tx, replay_rx) = mpsc::channel();
+    for f in captured {
+        replay_tx.send(f).unwrap();
+    }
+    drop(replay_tx);
+    let mut got = redriven_i64_rows(&replay_rx);
+    got.sort_unstable();
+    assert_eq!(
+        got, vals,
+        "split frames must cover every row of the batch exactly once"
+    );
 }
 
 #[cfg(feature = "polars-ingress")]

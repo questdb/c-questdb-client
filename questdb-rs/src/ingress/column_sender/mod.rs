@@ -90,6 +90,20 @@ pub const MAX_CHUNK_ROWS: usize = 16 * 1024 * 1024;
 /// `dict_offsets` length bound is derived from this (`entries + 1`).
 pub const MAX_SYMBOL_DICT_ENTRIES: usize = crate::ingress::buffer::MAX_CONN_SYMBOL_DICT_SIZE;
 
+/// Default rows per chunk for DataFrame / Arrow ingestion helpers. Only a
+/// pipelining-granularity knob: the column sender splits any frame that exceeds
+/// the negotiated batch cap regardless of this value. Divisible by 8 so it
+/// never forces validity-bitmap realignment.
+///
+/// Each language binding hardcodes this same literal (e.g. the Python client's
+/// `DEFAULT_MAX_CHUNK_ROWS`); keep them in sync when changing it. Tests on both
+/// sides pin the value so a change cannot drift silently.
+pub const DEFAULT_MAX_CHUNK_ROWS: usize = 16_384;
+
+// Pin the literal: changing the value above forces this assert and the binding
+// tests to be updated together, so the cross-binding default can't drift.
+const _: () = assert!(DEFAULT_MAX_CHUNK_ROWS == 16_384);
+
 const _: () = assert!(
     cfg!(target_endian = "little"),
     "column_sender bulk-copy fast paths assume a little-endian host; \

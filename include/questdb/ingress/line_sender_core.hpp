@@ -133,6 +133,13 @@ enum class line_sender_error_code
      *  timed-out dial apart from a refused / reset connection. Produced by the
      *  QWP/WebSocket transport. */
     connect_timeout = 19,
+
+    /** An irreducible QWP/WebSocket unit (the table schema plus a single row
+     *  block) exceeds the negotiated per-batch cap. The column sender splits
+     *  oversize chunks into smaller frames automatically, so this only surfaces
+     *  when splitting cannot make a frame fit. Distinct from `invalid_api_call`
+     *  so callers can recognise it without matching on the error message text. */
+    batch_too_large = 20,
 };
 
 /** The protocol used to connect with. */

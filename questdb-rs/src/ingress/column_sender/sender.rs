@@ -57,6 +57,48 @@ fn classify_flush_error(err: crate::Error) -> crate::Error {
     err
 }
 
+/// Outcome of publishing a single frame on the direct backend.
+enum FrameOutcome {
+    Published,
+    /// The encoded frame exceeded the negotiated cap before any byte reached
+    /// the wire, so the caller may split the row range and retry. Carries the
+    /// detailed size error so the split floor can surface exact byte counts.
+    TooLarge(crate::Error),
+}
+
+/// Outcome of appending a single frame on the store-and-forward backend.
+enum SfaOutcome {
+    Published(u64),
+    /// The encoded frame exceeded the negotiated cap before it was queued, so
+    /// the caller may split the row range and retry. Carries the detailed size
+    /// error so the split floor can surface exact byte counts.
+    TooLarge(crate::Error),
+}
+
+/// The immutable inputs to an Arrow-batch flush, bundled so the recursive split
+/// helpers don't thread five arguments through every call. `batch.slice(...)`
+/// (zero-copy) produces the sub-range views.
+#[cfg(feature = "arrow-ingress")]
+struct ArrowFrameSpec<'a> {
+    table: TableName<'a>,
+    batch: &'a RecordBatch,
+    ts_col_idx: Option<usize>,
+    server_stamp: bool,
+    overrides: &'a [ArrowColumnOverride<'a>],
+}
+
+/// Split point for an oversize `row_count`: the largest multiple of 8 not
+/// exceeding `row_count / 2` (at least 8). `None` once the block is at the
+/// 8-row floor, which cannot be split further because bit-packed `Bool`
+/// columns and validity bitmaps are only byte-addressable.
+fn split_mid(row_count: usize) -> Option<usize> {
+    if row_count <= 8 {
+        return None;
+    }
+    let mid = (row_count / 2) & !7;
+    Some(if mid == 0 { 8 } else { mid })
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AckLevel {
@@ -599,6 +641,58 @@ impl DirectColumnBackend {
 
         self.conn.try_drain_acks().map_err(direct_not_delivered)?;
 
+        // Whole-chunk fast path: no slicing, no extra allocation. Only when a
+        // single frame would exceed the negotiated cap do we fall back to
+        // splitting the row range into multiple frames, all but the last
+        // deferred so the chunk still commits atomically at one boundary.
+        match self.publish_frame(chunk, None, defer_commit)? {
+            FrameOutcome::Published => {}
+            FrameOutcome::TooLarge(err) => {
+                let row_count = chunk.row_count();
+                match split_mid(row_count) {
+                    Some(mid) => {
+                        // Splitting publishes deferred prefix frames as it goes.
+                        // If a later sub-range hits the floor, those frames sit
+                        // on the wire uncommitted; tear the connection down so
+                        // the drop-time best-effort commit discards them instead
+                        // of committing a partial chunk under a later boundary.
+                        let mut result = self.publish_split(chunk, 0, mid, true);
+                        if result.is_ok() {
+                            result = self.publish_split(chunk, mid, row_count - mid, defer_commit);
+                        }
+                        if let Err(e) = result {
+                            self.conn.mark_must_close();
+                            return Err(e);
+                        }
+                    }
+                    None => return Err(direct_not_delivered(err)),
+                }
+            }
+        }
+
+        // Once published, the chunk is no longer needed for completion/replay
+        // (rule holds even if the later ACK wait fails).
+        chunk.clear();
+
+        if let WaitForAck::Yes(level) = wait {
+            self.conn
+                .sync_all_acks(level)
+                .map_err(direct_delivery_unknown)?;
+        }
+        Ok(())
+    }
+
+    /// Publish one frame. `range` is `None` for the whole chunk (the hot path,
+    /// no slice allocation) or `Some((offset, count))` for a sub-range while
+    /// splitting. Returns [`FrameOutcome::TooLarge`] (nothing on the wire, dict
+    /// rolled back) when the frame exceeds the cap so the caller can split;
+    /// every other failure is a terminal [`FlushFailure`].
+    fn publish_frame(
+        &mut self,
+        chunk: &Chunk<'_>,
+        range: Option<(usize, usize)>,
+        defer_commit: bool,
+    ) -> std::result::Result<FrameOutcome, FlushFailure> {
         if defer_commit && !self.conn.has_sync_commit_slot() {
             return Err(FlushFailure::NotDelivered(error::fmt!(
                 InvalidApiCall,
@@ -614,39 +708,69 @@ impl DirectColumnBackend {
         }
 
         let dict_mark = self.symbol_dict.mark();
-        let published = match self.conn.publish_qwp(|out| {
-            encoder::encode_chunk_into(
+        let result = self.conn.publish_qwp(|out| match range {
+            None => encoder::encode_chunk_into(
                 out,
                 chunk,
                 &mut self.symbol_dict,
                 &mut self.scratch,
                 defer_commit,
-            )
-        }) {
-            Ok(p) => p,
+            ),
+            Some((offset, count)) => {
+                let view = unsafe { chunk.slice_rows(offset, count) };
+                encoder::encode_chunk_into(
+                    out,
+                    &view,
+                    &mut self.symbol_dict,
+                    &mut self.scratch,
+                    defer_commit,
+                )
+            }
+        });
+
+        match result {
+            Ok(published) => {
+                self.conn.push_pending(published.fsn);
+                self.first_frame_sent = true;
+                Ok(FrameOutcome::Published)
+            }
+            Err(PublishError::BeforeWrite(e)) if e.code() == ErrorCode::BatchTooLarge => {
+                self.symbol_dict.rollback(dict_mark);
+                Ok(FrameOutcome::TooLarge(e))
+            }
             Err(PublishError::BeforeWrite(e)) => {
                 if e.code() != ErrorCode::SocketError {
                     self.symbol_dict.rollback(dict_mark);
                 }
-                return Err(direct_not_delivered(e));
+                Err(direct_not_delivered(e))
             }
             // Bytes may be on the wire: do not roll back the dict, and report
             // delivery as unknown.
-            Err(PublishError::DuringWrite(e)) => return Err(direct_delivery_unknown(e)),
-        };
-
-        self.conn.push_pending(published.fsn);
-        // Once published, the chunk is no longer needed for completion/replay
-        // (rule holds even if the later ACK wait fails).
-        chunk.clear();
-        self.first_frame_sent = true;
-
-        if let WaitForAck::Yes(level) = wait {
-            self.conn
-                .sync_all_acks(level)
-                .map_err(direct_delivery_unknown)?;
+            Err(PublishError::DuringWrite(e)) => Err(direct_delivery_unknown(e)),
         }
-        Ok(())
+    }
+
+    /// Publish rows `[row_offset, row_offset + row_count)`, recursively halving
+    /// the range whenever a frame is still too large. The prefix half is always
+    /// deferred; the tail half inherits `defer_commit` so the original commit
+    /// boundary lands on the very last frame.
+    fn publish_split(
+        &mut self,
+        chunk: &Chunk<'_>,
+        row_offset: usize,
+        row_count: usize,
+        defer_commit: bool,
+    ) -> std::result::Result<(), FlushFailure> {
+        match self.publish_frame(chunk, Some((row_offset, row_count)), defer_commit)? {
+            FrameOutcome::Published => Ok(()),
+            FrameOutcome::TooLarge(err) => match split_mid(row_count) {
+                Some(mid) => {
+                    self.publish_split(chunk, row_offset, mid, true)?;
+                    self.publish_split(chunk, row_offset + mid, row_count - mid, defer_commit)
+                }
+                None => Err(direct_not_delivered(err)),
+            },
+        }
     }
 
     #[cfg(feature = "arrow-ingress")]
@@ -672,6 +796,55 @@ impl DirectColumnBackend {
 
         self.conn.try_drain_acks().map_err(direct_not_delivered)?;
 
+        let spec = ArrowFrameSpec {
+            table,
+            batch,
+            ts_col_idx,
+            server_stamp,
+            overrides,
+        };
+        // Whole-batch fast path; split the row range only when a single frame
+        // exceeds the cap, all but the last deferred so the batch still commits
+        // at one boundary.
+        match self.publish_arrow_frame(&spec, None, defer_commit)? {
+            FrameOutcome::Published => {}
+            FrameOutcome::TooLarge(err) => {
+                let row_count = batch.num_rows();
+                match split_mid(row_count) {
+                    Some(mid) => {
+                        let mut result = self.publish_arrow_split(&spec, 0, mid, true);
+                        if result.is_ok() {
+                            result =
+                                self.publish_arrow_split(&spec, mid, row_count - mid, defer_commit);
+                        }
+                        if let Err(e) = result {
+                            self.conn.mark_must_close();
+                            return Err(e);
+                        }
+                    }
+                    None => return Err(direct_not_delivered(err)),
+                }
+            }
+        }
+
+        if let WaitForAck::Yes(level) = wait {
+            self.conn
+                .sync_all_acks(level)
+                .map_err(direct_delivery_unknown)?;
+        }
+        Ok(())
+    }
+
+    /// Arrow counterpart of [`Self::publish_frame`]: `range` is `None` for the
+    /// whole batch or `Some((offset, count))` for a zero-copy `batch.slice`
+    /// sub-range while splitting.
+    #[cfg(feature = "arrow-ingress")]
+    fn publish_arrow_frame(
+        &mut self,
+        spec: &ArrowFrameSpec<'_>,
+        range: Option<(usize, usize)>,
+        defer_commit: bool,
+    ) -> std::result::Result<FrameOutcome, FlushFailure> {
         if defer_commit && !self.conn.has_sync_commit_slot() {
             return Err(FlushFailure::NotDelivered(error::fmt!(
                 InvalidApiCall,
@@ -687,37 +860,66 @@ impl DirectColumnBackend {
         }
 
         let dict_mark = self.symbol_dict.mark();
-        let published = match self.conn.publish_qwp(|out| {
+        let sliced;
+        let batch = match range {
+            None => spec.batch,
+            Some((offset, count)) => {
+                sliced = spec.batch.slice(offset, count);
+                &sliced
+            }
+        };
+        let result = self.conn.publish_qwp(|out| {
             arrow_batch::encode_arrow_batch_into(
                 out,
-                table,
+                spec.table,
                 batch,
-                ts_col_idx,
-                server_stamp,
-                overrides,
+                spec.ts_col_idx,
+                spec.server_stamp,
+                spec.overrides,
                 &mut self.symbol_dict,
                 defer_commit,
             )
-        }) {
-            Ok(p) => p,
+        });
+
+        match result {
+            Ok(published) => {
+                self.conn.push_pending(published.fsn);
+                self.first_frame_sent = true;
+                Ok(FrameOutcome::Published)
+            }
+            Err(PublishError::BeforeWrite(e)) if e.code() == ErrorCode::BatchTooLarge => {
+                self.symbol_dict.rollback(dict_mark);
+                Ok(FrameOutcome::TooLarge(e))
+            }
             Err(PublishError::BeforeWrite(e)) => {
                 if e.code() != ErrorCode::SocketError {
                     self.symbol_dict.rollback(dict_mark);
                 }
-                return Err(direct_not_delivered(e));
+                Err(direct_not_delivered(e))
             }
-            Err(PublishError::DuringWrite(e)) => return Err(direct_delivery_unknown(e)),
-        };
-
-        self.conn.push_pending(published.fsn);
-        self.first_frame_sent = true;
-
-        if let WaitForAck::Yes(level) = wait {
-            self.conn
-                .sync_all_acks(level)
-                .map_err(direct_delivery_unknown)?;
+            Err(PublishError::DuringWrite(e)) => Err(direct_delivery_unknown(e)),
         }
-        Ok(())
+    }
+
+    /// Arrow counterpart of [`Self::publish_split`].
+    #[cfg(feature = "arrow-ingress")]
+    fn publish_arrow_split(
+        &mut self,
+        spec: &ArrowFrameSpec<'_>,
+        row_offset: usize,
+        row_count: usize,
+        defer_commit: bool,
+    ) -> std::result::Result<(), FlushFailure> {
+        match self.publish_arrow_frame(spec, Some((row_offset, row_count)), defer_commit)? {
+            FrameOutcome::Published => Ok(()),
+            FrameOutcome::TooLarge(err) => match split_mid(row_count) {
+                Some(mid) => {
+                    self.publish_arrow_split(spec, row_offset, mid, true)?;
+                    self.publish_arrow_split(spec, row_offset + mid, row_count - mid, defer_commit)
+                }
+                None => Err(direct_not_delivered(err)),
+            },
+        }
     }
 }
 
@@ -750,28 +952,26 @@ impl SfaColumnBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
-        self.payload.clear();
-        let dict_mark = self.symbol_dict.mark();
-        if let Err(e) = encoder::encode_chunk_replay_into(
-            &mut self.payload,
-            chunk,
-            &mut self.symbol_dict,
-            &mut self.scratch,
-        ) {
-            self.symbol_dict.rollback(dict_mark);
-            return Err(FlushFailure::NotDelivered(e));
-        }
         let max_buf_size = self.effective_max_buf_size();
-        // Local append is atomic: a failed append did not accept the frame
-        // (`NotDelivered`); the returned FSN is the boundary to wait for.
-        let boundary =
-            match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
-                Ok(fsn) => fsn,
-                Err(e) => {
-                    self.symbol_dict.rollback(dict_mark);
-                    return Err(FlushFailure::NotDelivered(e));
+        // Whole-chunk fast path; only split when a single frame exceeds the cap.
+        // Each split frame is a self-sufficient replay frame committed on its
+        // own — the store-and-forward queue is frame-granular and at-least-once,
+        // so deferred (uncommitted) frames could be lost on a reconnect that
+        // trims them after their ack but before the commit. The boundary to wait
+        // for is the last frame's FSN; its cumulative ack covers the prefix.
+        let boundary = match self.publish_chunk_sfa(chunk, None, max_buf_size)? {
+            SfaOutcome::Published(fsn) => fsn,
+            SfaOutcome::TooLarge(err) => {
+                let row_count = chunk.row_count();
+                match split_mid(row_count) {
+                    Some(mid) => {
+                        self.publish_split_sfa(chunk, 0, mid, max_buf_size)?;
+                        self.publish_split_sfa(chunk, mid, row_count - mid, max_buf_size)?
+                    }
+                    None => return Err(FlushFailure::NotDelivered(err)),
                 }
-            };
+            }
+        };
         chunk.clear();
         if let WaitForAck::Yes(level) = wait {
             // The frame is in the local queue; a wait failure is delivery-unknown.
@@ -779,6 +979,80 @@ impl SfaColumnBackend {
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
         Ok(())
+    }
+
+    /// Encode `range` (`None` = whole chunk, no slice allocation) as a replay
+    /// frame, check it against the cap, and append it to the queue. Returns
+    /// [`SfaOutcome::TooLarge`] (nothing queued, dict rolled back) when the frame
+    /// exceeds the cap so the caller can split.
+    fn publish_chunk_sfa(
+        &mut self,
+        chunk: &Chunk<'_>,
+        range: Option<(usize, usize)>,
+        max_buf_size: usize,
+    ) -> std::result::Result<SfaOutcome, FlushFailure> {
+        self.payload.clear();
+        let dict_mark = self.symbol_dict.mark();
+        let encoded = match range {
+            None => encoder::encode_chunk_replay_into(
+                &mut self.payload,
+                chunk,
+                &mut self.symbol_dict,
+                &mut self.scratch,
+            ),
+            Some((offset, count)) => {
+                let view = unsafe { chunk.slice_rows(offset, count) };
+                encoder::encode_chunk_replay_into(
+                    &mut self.payload,
+                    &view,
+                    &mut self.symbol_dict,
+                    &mut self.scratch,
+                )
+            }
+        };
+        if let Err(e) = encoded {
+            self.symbol_dict.rollback(dict_mark);
+            return Err(FlushFailure::NotDelivered(e));
+        }
+        if self.payload.len() > max_buf_size {
+            self.symbol_dict.rollback(dict_mark);
+            return Ok(SfaOutcome::TooLarge(error::fmt!(
+                BatchTooLarge,
+                "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
+                self.payload.len(),
+                max_buf_size
+            )));
+        }
+        // Local append is atomic: a failed append did not accept the frame
+        // (`NotDelivered`); the returned FSN is the boundary to wait for.
+        match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
+            Ok(fsn) => Ok(SfaOutcome::Published(fsn)),
+            Err(e) => {
+                self.symbol_dict.rollback(dict_mark);
+                Err(FlushFailure::NotDelivered(e))
+            }
+        }
+    }
+
+    /// Append rows `[row_offset, row_offset + row_count)`, halving the range
+    /// whenever a frame is still too large. Returns the last frame's FSN.
+    fn publish_split_sfa(
+        &mut self,
+        chunk: &Chunk<'_>,
+        row_offset: usize,
+        row_count: usize,
+        max_buf_size: usize,
+    ) -> std::result::Result<u64, FlushFailure> {
+        match self.publish_chunk_sfa(chunk, Some((row_offset, row_count)), max_buf_size)? {
+            SfaOutcome::Published(fsn) => Ok(fsn),
+            SfaOutcome::TooLarge(err) => match split_mid(row_count) {
+                Some(mid) => {
+                    self.publish_split_sfa(chunk, row_offset, mid, max_buf_size)?;
+                    self.publish_split_sfa(chunk, row_offset + mid, row_count - mid, max_buf_size)
+                }
+                None => Err(FlushFailure::NotDelivered(err)),
+            },
+        }
     }
 
     #[cfg(feature = "arrow-ingress")]
@@ -798,34 +1072,109 @@ impl SfaColumnBackend {
         if let Err(e) = qwp_ws_check_error_background(&self.state) {
             return Err(FlushFailure::NotDelivered(e));
         }
-        self.payload.clear();
-        let dict_mark = self.symbol_dict.mark();
-        if let Err(e) = arrow_batch::encode_arrow_batch_replay_into(
-            &mut self.payload,
+        let max_buf_size = self.effective_max_buf_size();
+        let spec = ArrowFrameSpec {
             table,
             batch,
             ts_col_idx,
             server_stamp,
             overrides,
-            &mut self.symbol_dict,
-        ) {
-            self.symbol_dict.rollback(dict_mark);
-            return Err(FlushFailure::NotDelivered(e));
-        }
-        let max_buf_size = self.effective_max_buf_size();
-        let boundary =
-            match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
-                Ok(fsn) => fsn,
-                Err(e) => {
-                    self.symbol_dict.rollback(dict_mark);
-                    return Err(FlushFailure::NotDelivered(e));
+        };
+        // Whole-batch fast path; split into self-sufficient frames only when one
+        // exceeds the cap (see the rationale on `flush_chunk`).
+        let boundary = match self.publish_arrow_sfa(&spec, None, max_buf_size)? {
+            SfaOutcome::Published(fsn) => fsn,
+            SfaOutcome::TooLarge(err) => {
+                let row_count = batch.num_rows();
+                match split_mid(row_count) {
+                    Some(mid) => {
+                        self.publish_arrow_split_sfa(&spec, 0, mid, max_buf_size)?;
+                        self.publish_arrow_split_sfa(&spec, mid, row_count - mid, max_buf_size)?
+                    }
+                    None => return Err(FlushFailure::NotDelivered(err)),
                 }
-            };
+            }
+        };
         if let WaitForAck::Yes(level) = wait {
             self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
         Ok(())
+    }
+
+    /// Arrow counterpart of [`Self::publish_chunk_sfa`].
+    #[cfg(feature = "arrow-ingress")]
+    fn publish_arrow_sfa(
+        &mut self,
+        spec: &ArrowFrameSpec<'_>,
+        range: Option<(usize, usize)>,
+        max_buf_size: usize,
+    ) -> std::result::Result<SfaOutcome, FlushFailure> {
+        self.payload.clear();
+        let dict_mark = self.symbol_dict.mark();
+        let sliced;
+        let batch = match range {
+            None => spec.batch,
+            Some((offset, count)) => {
+                sliced = spec.batch.slice(offset, count);
+                &sliced
+            }
+        };
+        if let Err(e) = arrow_batch::encode_arrow_batch_replay_into(
+            &mut self.payload,
+            spec.table,
+            batch,
+            spec.ts_col_idx,
+            spec.server_stamp,
+            spec.overrides,
+            &mut self.symbol_dict,
+        ) {
+            self.symbol_dict.rollback(dict_mark);
+            return Err(FlushFailure::NotDelivered(e));
+        }
+        if self.payload.len() > max_buf_size {
+            self.symbol_dict.rollback(dict_mark);
+            return Ok(SfaOutcome::TooLarge(error::fmt!(
+                BatchTooLarge,
+                "QWP frame ({} bytes) exceeds max_buf_size ({} bytes)",
+                self.payload.len(),
+                max_buf_size
+            )));
+        }
+        match publish_qwp_ws_payload_background(&mut self.state, &self.payload, max_buf_size) {
+            Ok(fsn) => Ok(SfaOutcome::Published(fsn)),
+            Err(e) => {
+                self.symbol_dict.rollback(dict_mark);
+                Err(FlushFailure::NotDelivered(e))
+            }
+        }
+    }
+
+    /// Arrow counterpart of [`Self::publish_split_sfa`]. Returns the last
+    /// frame's FSN.
+    #[cfg(feature = "arrow-ingress")]
+    fn publish_arrow_split_sfa(
+        &mut self,
+        spec: &ArrowFrameSpec<'_>,
+        row_offset: usize,
+        row_count: usize,
+        max_buf_size: usize,
+    ) -> std::result::Result<u64, FlushFailure> {
+        match self.publish_arrow_sfa(spec, Some((row_offset, row_count)), max_buf_size)? {
+            SfaOutcome::Published(fsn) => Ok(fsn),
+            SfaOutcome::TooLarge(err) => match split_mid(row_count) {
+                Some(mid) => {
+                    self.publish_arrow_split_sfa(spec, row_offset, mid, max_buf_size)?;
+                    self.publish_arrow_split_sfa(
+                        spec,
+                        row_offset + mid,
+                        row_count - mid,
+                        max_buf_size,
+                    )
+                }
+                None => Err(FlushFailure::NotDelivered(err)),
+            },
+        }
     }
 
     fn sync(&mut self, ack_level: AckLevel) -> Result<()> {
@@ -956,4 +1305,33 @@ fn sfa_sender_error(sender_error: QwpWsSenderError) -> crate::Error {
         ),
     )
     .with_qwp_ws_rejection(sender_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_mid;
+
+    #[test]
+    fn split_mid_floors_at_eight_rows() {
+        assert_eq!(split_mid(0), None);
+        assert_eq!(split_mid(1), None);
+        assert_eq!(split_mid(8), None);
+    }
+
+    #[test]
+    fn split_mid_returns_eight_aligned_point_below_count() {
+        for count in [9usize, 12, 15, 16, 17, 100, 10_000, 16_384] {
+            let mid = split_mid(count).unwrap();
+            assert_eq!(
+                mid % 8,
+                0,
+                "split point must be 8-aligned for count {count}"
+            );
+            assert!(mid >= 8, "split point must be at least 8 for count {count}");
+            assert!(
+                mid < count,
+                "split point must make progress for count {count}"
+            );
+        }
+    }
 }

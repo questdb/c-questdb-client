@@ -1167,6 +1167,197 @@ mod tests {
         out
     }
 
+    fn encode_fresh(chunk: &Chunk<'_>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut dict = SymbolGlobalDict::new();
+        let mut scratch = EncodeScratch::new();
+        encode_chunk_into(&mut out, chunk, &mut dict, &mut scratch, false).unwrap();
+        out
+    }
+
+    /// `slice_rows(0, n)` must reproduce the whole-chunk bytes for every column
+    /// kind, exercising the pointer math, `offsets_len`, and `non_null_count`
+    /// recompute for fixed-width, float, bool, and validity-bearing columns.
+    #[test]
+    fn slice_rows_full_range_matches_whole_chunk() {
+        let n = 24usize;
+        let i64s: Vec<i64> = (0..n as i64).map(|x| x * 7 - 3).collect();
+        let f64s: Vec<f64> = (0..n).map(|x| x as f64 * 1.5).collect();
+        let ts: Vec<i64> = (0..n as i64)
+            .map(|x| 1_700_000_000_000_000_000 + x)
+            .collect();
+        let bool_bytes = [0b1010_1010u8, 0b0101_0101, 0b1100_0011];
+        // Row 0 and row 22 null.
+        let valid_bytes = [0b1111_1110u8, 0b1111_1111, 0b1011_1111];
+        let validity = Validity::from_bitmap(&valid_bytes, n).unwrap();
+
+        let mut chunk = Chunk::new("trades");
+        chunk.column_i64("a", &i64s, Some(&validity)).unwrap();
+        chunk.column_f64("b", &f64s, None).unwrap();
+        chunk.column_bool("c", &bool_bytes, n, None).unwrap();
+        chunk.designated_timestamp_nanos(&ts).unwrap();
+
+        let whole = encode_fresh(&chunk);
+        let view = unsafe { chunk.slice_rows(0, n) };
+        let sliced = encode_fresh(&view);
+        assert_eq!(whole, sliced);
+    }
+
+    /// `slice_rows(off, count)` must encode byte-identically to a chunk built
+    /// directly from rows `[off, off + count)`, proving the slice lands on the
+    /// right rows rather than row 0.
+    #[test]
+    fn slice_rows_subrange_matches_freshly_built_subchunk() {
+        let n = 24usize;
+        let vals: Vec<i64> = (0..n as i64).map(|x| x * 11 + 5).collect();
+        let ts: Vec<i64> = (0..n as i64)
+            .map(|x| 1_700_000_000_000_000_000 + x)
+            .collect();
+
+        let mut src = Chunk::new("trades");
+        src.column_i64("v", &vals, None).unwrap();
+        src.designated_timestamp_nanos(&ts).unwrap();
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let mut fresh = Chunk::new("trades");
+        fresh.column_i64("v", &vals[8..16], None).unwrap();
+        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
+    }
+
+    fn build_varchar(strings: &[&str]) -> (Vec<i32>, Vec<u8>) {
+        let mut offsets = Vec::with_capacity(strings.len() + 1);
+        let mut bytes = Vec::new();
+        offsets.push(0i32);
+        for s in strings {
+            bytes.extend_from_slice(s.as_bytes());
+            offsets.push(bytes.len() as i32);
+        }
+        (offsets, bytes)
+    }
+
+    /// VARCHAR slicing keeps absolute offsets into the full byte buffer; the
+    /// encoder must re-base them. A slice at offset 8 (offsets[8] != 0) must
+    /// encode identically to a fresh chunk of the same strings (offsets from 0),
+    /// proving the re-basing path.
+    #[test]
+    fn slice_rows_subrange_varchar_matches_freshly_built_subchunk() {
+        let owned: Vec<String> = (0..16).map(|i| format!("val-{i}")).collect();
+        let strs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let (offsets, bytes) = build_varchar(&strs);
+        let ts: Vec<i64> = (0..16).collect();
+
+        let mut src = Chunk::new("trades");
+        src.column_varchar("v", &offsets, &bytes, None).unwrap();
+        src.designated_timestamp_nanos(&ts).unwrap();
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let (foffsets, fbytes) = build_varchar(&strs[8..16]);
+        let mut fresh = Chunk::new("trades");
+        fresh.column_varchar("v", &foffsets, &fbytes, None).unwrap();
+        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
+    }
+
+    /// SYMBOL slicing advances the per-row codes pointer while sharing the
+    /// dictionary verbatim. A slice must encode identically to a fresh chunk of
+    /// the same rows (both resolve the shared dict against a fresh global dict).
+    #[test]
+    fn slice_rows_subrange_symbol_matches_freshly_built_subchunk() {
+        let dict_bytes = b"aabbcc";
+        let dict_offsets = [0i32, 2, 4, 6];
+        let codes: Vec<i32> = (0..16).map(|i| i % 3).collect();
+        let ts: Vec<i64> = (0..16).collect();
+
+        let mut src = Chunk::new("trades");
+        src.symbol_dict_i32("s", &codes, &dict_offsets, dict_bytes, None)
+            .unwrap();
+        src.designated_timestamp_nanos(&ts).unwrap();
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let mut fresh = Chunk::new("trades");
+        fresh
+            .symbol_dict_i32("s", &codes[8..16], &dict_offsets, dict_bytes, None)
+            .unwrap();
+        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
+    }
+
+    /// ARROW slicing forwards to `arr.slice(offset, count)`, producing an array
+    /// with a non-zero internal offset. The encoder must honour that offset: a
+    /// slice must encode identically to a fresh array of the same rows (offset
+    /// 0).
+    #[cfg(feature = "arrow-ingress")]
+    #[test]
+    fn slice_rows_subrange_arrow_matches_freshly_built_subchunk() {
+        use crate::ingress::column_sender::arrow_batch;
+        use arrow_array::{ArrayRef, Int64Array};
+        use std::sync::Arc;
+
+        let values: Vec<i64> = (0..16).map(|i| i * 13 - 7).collect();
+        let ts: Vec<i64> = (0..16).collect();
+
+        let arr: ArrayRef = Arc::new(Int64Array::from(values.clone()));
+        let mut src = Chunk::new("trades");
+        src.push_arrow_deferred("v", arrow_batch::ColumnKind::I64, arr)
+            .unwrap();
+        src.designated_timestamp_nanos(&ts).unwrap();
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let fresh_arr: ArrayRef = Arc::new(Int64Array::from(values[8..16].to_vec()));
+        let mut fresh = Chunk::new("trades");
+        fresh
+            .push_arrow_deferred("v", arrow_batch::ColumnKind::I64, fresh_arr)
+            .unwrap();
+        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
+    }
+
+    /// NUMPY slicing advances the raw data pointer by `offset * bytes_per_row`.
+    /// A slice must encode identically to a fresh column built from the rows'
+    /// bytes at offset 0.
+    #[test]
+    fn slice_rows_subrange_numpy_matches_freshly_built_subchunk() {
+        use crate::ingress::column_sender::NumpyDtype;
+
+        let values: Vec<i64> = (0..16).map(|i| i * 17 + 3).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ts: Vec<i64> = (0..16).collect();
+
+        let mut src = Chunk::new("trades");
+        unsafe {
+            src.push_numpy_deferred("v", NumpyDtype::I64Direct, bytes.as_ptr(), 16, None)
+                .unwrap();
+        }
+        src.designated_timestamp_nanos(&ts).unwrap();
+        let view = unsafe { src.slice_rows(8, 8) };
+        let sliced = encode_fresh(&view);
+
+        let fresh_bytes: Vec<u8> = values[8..16].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut fresh = Chunk::new("trades");
+        unsafe {
+            fresh
+                .push_numpy_deferred("v", NumpyDtype::I64Direct, fresh_bytes.as_ptr(), 8, None)
+                .unwrap();
+        }
+        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        let direct = encode_fresh(&fresh);
+
+        assert_eq!(sliced, direct);
+    }
+
     /// The chunk (column-major) flush path must reject exactly the table
     /// names that the row/arrow API's [`TableName::new`] rejects — same
     /// grammar, no drift. A divergence here means the same malformed name

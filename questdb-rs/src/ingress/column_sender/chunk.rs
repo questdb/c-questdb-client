@@ -201,6 +201,29 @@ impl ValidityDescriptor {
     pub(crate) fn has_nulls(&self) -> bool {
         self.non_null_count < self.bit_len
     }
+
+    /// Slice to rows `[row_offset, row_offset + row_count)`. `row_offset` must
+    /// be a multiple of 8 so the bitmap pointer stays byte-addressable.
+    /// `non_null_count` is recomputed for the sub-range because the VARCHAR
+    /// dense-offset path sizes its output from it.
+    ///
+    /// SAFETY: the source bitmap must cover `row_offset + row_count` bits and
+    /// still be alive.
+    unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Self {
+        debug_assert_eq!(row_offset % 8, 0);
+        debug_assert!(row_offset + row_count <= self.bit_len);
+        let bits = unsafe { self.bits.add(row_offset / 8) };
+        let mut non_null_count = 0usize;
+        for i in 0..row_count {
+            let byte = unsafe { *bits.add(i / 8) };
+            non_null_count += ((byte >> (i % 8)) & 1) as usize;
+        }
+        Self {
+            bits,
+            bit_len: row_count,
+            non_null_count,
+        }
+    }
 }
 
 /// Per-column kind dispatch. Each variant carries the raw pointer(s) the
@@ -338,6 +361,18 @@ impl SymbolCodesPtr {
             }
         }
     }
+
+    /// SAFETY: `n` must be within the codes buffer the variant points at.
+    #[inline]
+    unsafe fn offset_rows(self, n: usize) -> Self {
+        unsafe {
+            match self {
+                SymbolCodesPtr::I8(p) => SymbolCodesPtr::I8(p.add(n)),
+                SymbolCodesPtr::I16(p) => SymbolCodesPtr::I16(p.add(n)),
+                SymbolCodesPtr::I32(p) => SymbolCodesPtr::I32(p.add(n)),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -361,6 +396,136 @@ impl SymbolOffsetsPtr {
     }
 }
 
+impl ColumnKind {
+    /// Build a kind that views rows `[row_offset, row_offset + row_count)` of
+    /// `self`. Zero-copy: every variant advances its pointer(s) / Arrow array
+    /// rather than copying data. `row_offset` must be a multiple of 8 (bit-
+    /// packed `Bool` and validity bitmaps are only byte-addressable).
+    ///
+    /// SAFETY: the source buffers must cover `row_offset + row_count` rows and
+    /// still be alive.
+    unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Self {
+        debug_assert_eq!(row_offset % 8, 0);
+        unsafe {
+            match self {
+                ColumnKind::Byte { data } => ColumnKind::Byte {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Short { data } => ColumnKind::Short {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Int { data } => ColumnKind::Int {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Long { data } => ColumnKind::Long {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Float { data } => ColumnKind::Float {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Double { data } => ColumnKind::Double {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Bool { bits } => ColumnKind::Bool {
+                    bits: bits.add(row_offset / 8),
+                },
+                ColumnKind::Ipv4 { data } => ColumnKind::Ipv4 {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::TsNanos { data } => ColumnKind::TsNanos {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::TsMicros { data } => ColumnKind::TsMicros {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::DateMillis { data } => ColumnKind::DateMillis {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Uuid { data } => ColumnKind::Uuid {
+                    data: data.add(row_offset),
+                },
+                ColumnKind::Long256 { data } => ColumnKind::Long256 {
+                    data: data.add(row_offset),
+                },
+                // Offsets are absolute into `bytes`, so a sub-range of the
+                // offset table still indexes the full (unsliced) byte buffer.
+                ColumnKind::Varchar {
+                    offsets,
+                    offsets_len: _,
+                    bytes,
+                    bytes_len,
+                } => ColumnKind::Varchar {
+                    offsets: offsets.add(row_offset),
+                    offsets_len: row_count + 1,
+                    bytes: *bytes,
+                    bytes_len: *bytes_len,
+                },
+                ColumnKind::VarcharLarge {
+                    offsets,
+                    offsets_len: _,
+                    bytes,
+                    bytes_len,
+                } => ColumnKind::VarcharLarge {
+                    offsets: offsets.add(row_offset),
+                    offsets_len: row_count + 1,
+                    bytes: *bytes,
+                    bytes_len: *bytes_len,
+                },
+                ColumnKind::Binary {
+                    offsets,
+                    offsets_len: _,
+                    bytes,
+                    bytes_len,
+                } => ColumnKind::Binary {
+                    offsets: offsets.add(row_offset),
+                    offsets_len: row_count + 1,
+                    bytes: *bytes,
+                    bytes_len: *bytes_len,
+                },
+                // Per-row `codes` shift; the dictionary spans all rows and is
+                // shared verbatim across slices.
+                ColumnKind::Symbol {
+                    codes,
+                    dict_offsets,
+                    dict_offsets_len,
+                    dict_bytes,
+                    dict_bytes_len,
+                } => ColumnKind::Symbol {
+                    codes: codes.offset_rows(row_offset),
+                    dict_offsets: *dict_offsets,
+                    dict_offsets_len: *dict_offsets_len,
+                    dict_bytes: *dict_bytes,
+                    dict_bytes_len: *dict_bytes_len,
+                },
+                #[cfg(feature = "arrow-ingress")]
+                ColumnKind::ArrowDeferred { arrow_kind, arr } => ColumnKind::ArrowDeferred {
+                    arrow_kind: *arrow_kind,
+                    arr: arr.slice(row_offset, row_count),
+                },
+                ColumnKind::NumpyDeferred {
+                    dtype,
+                    data,
+                    row_count: _,
+                } => ColumnKind::NumpyDeferred {
+                    dtype: *dtype,
+                    data: data.add(row_offset * dtype.bytes_per_row()),
+                    row_count,
+                },
+            }
+        }
+    }
+}
+
+impl DesignatedTsDescriptor {
+    /// SAFETY: the source buffer must cover `row_offset` rows and still be alive.
+    unsafe fn slice_rows(&self, row_offset: usize) -> Self {
+        Self {
+            unit: self.unit,
+            data: unsafe { self.data.add(row_offset) },
+        }
+    }
+}
+
 /// One column slot in a [`Chunk`]. `name` is owned (the chunk holds it
 /// for diagnostics + signature emission); everything else is borrowed.
 pub(crate) struct ColumnDescriptor {
@@ -373,6 +538,7 @@ pub(crate) struct ColumnDescriptor {
 /// Precision of a designated timestamp column. Each variant pairs a QWP
 /// wire type with the multiplier needed to reach microseconds, so an
 /// illegal (wire type, scale) combination cannot be constructed.
+#[derive(Clone, Copy)]
 pub(crate) enum DesignatedTsUnit {
     Micros,
     Nanos,
@@ -462,6 +628,39 @@ impl<'a> Chunk<'a> {
         self.row_count = None;
         self.columns.clear();
         self.designated_ts = None;
+    }
+
+    /// Build a chunk viewing rows `[row_offset, row_offset + row_count)` of
+    /// `self`, used to split an oversize chunk into cap-sized frames. Column
+    /// data is re-pointed (zero-copy); the table name and column names are
+    /// cloned. `row_offset` must be a multiple of 8.
+    ///
+    /// SAFETY: the caller's column buffers must still be alive (the same
+    /// invariant `flush` relies on) and cover `row_offset + row_count` rows.
+    pub(crate) unsafe fn slice_rows(&self, row_offset: usize, row_count: usize) -> Chunk<'a> {
+        let columns = self
+            .columns
+            .iter()
+            .map(|col| ColumnDescriptor {
+                name: col.name.clone(),
+                wire_type: col.wire_type,
+                kind: unsafe { col.kind.slice_rows(row_offset, row_count) },
+                validity: col
+                    .validity
+                    .as_ref()
+                    .map(|v| unsafe { v.slice_rows(row_offset, row_count) }),
+            })
+            .collect();
+        Chunk {
+            table: self.table.clone(),
+            row_count: Some(row_count),
+            columns,
+            designated_ts: self
+                .designated_ts
+                .as_ref()
+                .map(|ts| unsafe { ts.slice_rows(row_offset) }),
+            _marker: PhantomData,
+        }
     }
 
     // -------------------------------------------------------------------

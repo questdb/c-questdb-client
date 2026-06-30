@@ -64,8 +64,11 @@ use polars::prelude::{Column, CompatLevel, Series};
 
 use crate::{Result, fmt};
 
-/// Suggested default chunk size for [`dataframe_to_batches`].
-pub const DEFAULT_MAX_BATCH_ROWS: usize = 10_000;
+/// Suggested default chunk size for [`dataframe_to_batches`]. Shares the
+/// cross-binding default so the Python columnar path and this helper stay
+/// aligned; the column sender splits any frame exceeding the negotiated cap
+/// regardless of this value.
+pub const DEFAULT_MAX_BATCH_ROWS: usize = crate::ingress::column_sender::DEFAULT_MAX_CHUNK_ROWS;
 
 const _: () = assert!(
     std::mem::size_of::<polars_arrow::ffi::ArrowArray>()

@@ -119,6 +119,15 @@ pub enum ErrorCode {
     /// unreachable") so callers can tell "no primary elected yet" from
     /// "everything is down".
     RoleMismatch,
+
+    /// An irreducible QWP/WebSocket unit (the table schema plus a single
+    /// row block) exceeds the negotiated per-batch cap
+    /// (`min(max_buf_size, server X-QWP-Max-Batch-Size)`). The column sender
+    /// splits oversize chunks into smaller frames automatically, so this only
+    /// surfaces when splitting cannot make a frame fit. Distinct from
+    /// [`InvalidApiCall`](Self::InvalidApiCall) so callers can recognise it
+    /// without matching on the error message text.
+    BatchTooLarge,
 }
 
 /// An error that occurred when using QuestDB client library.
