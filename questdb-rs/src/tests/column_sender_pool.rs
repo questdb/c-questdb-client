@@ -3246,11 +3246,8 @@ fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
 
     let mut sender = db.borrow_direct_column_sender().unwrap();
     sender
-        .flush_arrow_batch_at_now("trades", &batch, &[])
-        .expect("oversize arrow batch splits and publishes");
-    sender
-        .commit(AckLevel::Ok)
-        .expect("the split frames commit at one boundary");
+        .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+        .expect("oversize arrow batch splits, publishes, and commits at one boundary");
 
     // Drain the channel once: counting and decoding both consume `try_iter`,
     // so collect first and derive both from the same captured frames.
