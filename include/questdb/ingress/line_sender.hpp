@@ -101,6 +101,37 @@ public:
             _backend_kind::qwp_udp};
     }
 
+    /**
+     * Construct a standalone QWP/WebSocket columnar buffer.
+     *
+     * This is the buffer kind a `borrowed_row_sender` requires. When you hold
+     * the row sender, prefer `borrowed_row_sender::new_buffer()`, which
+     * matches the sender's configured name-length cap automatically.
+     */
+    static line_sender_buffer qwp_ws(
+        size_t init_buf_size = 64 * 1024,
+        size_t max_name_len = 127)
+    {
+        auto* raw_buffer =
+            ::line_sender_buffer_new_qwp_ws_with_max_name_len(max_name_len);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
+        return line_sender_buffer{
+            raw_buffer,
+            protocol_version::v1,
+            init_buf_size,
+            max_name_len,
+            _backend_kind::qwp_ws};
+    }
+
     line_sender_buffer(const line_sender_buffer& other)
         : _impl{
               other._impl
@@ -1140,7 +1171,8 @@ private:
     enum class _backend_kind
     {
         ilp,
-        qwp_udp
+        qwp_udp,
+        qwp_ws
     };
 
     line_sender_buffer(
@@ -1166,6 +1198,10 @@ private:
             {
             case _backend_kind::qwp_udp:
                 tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
+                    _max_name_len);
+                break;
+            case _backend_kind::qwp_ws:
+                tmp = ::line_sender_buffer_new_qwp_ws_with_max_name_len(
                     _max_name_len);
                 break;
             case _backend_kind::ilp:

@@ -25,6 +25,7 @@
 #include <questdb/ingress/column_sender.hpp>
 #include <questdb/ingress/line_sender.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -144,6 +145,82 @@ TEST_CASE("column_chunk flush round-trips through the mock")
 
     // The mock graceful-closes after one frame, so sync() would hang.
     conn.drop_on_return();
+}
+
+TEST_CASE("borrowed_row_sender::new_buffer mints a flushable QWP/WS buffer")
+{
+    // Regression guard: a pooled row sender must be able to construct the
+    // QWP/WS columnar buffer it requires (`row_sender_new_buffer`). Before
+    // this was wired, C/C++ callers had no way to build a buffer that
+    // `row_sender_flush` would accept.
+    auto mock = spawn_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto rs = db.borrow_row_sender();
+
+    auto buf = rs.new_buffer();
+    buf.table("trades")
+        .symbol("sym", "ETH-USD")
+        .column("price", 2615.54)
+        .at(qdb::timestamp_nanos::now());
+    rs.flush(buf);
+
+    // The mock graceful-closes after one frame, so wait() would hang.
+    rs.drop_on_return();
+}
+
+TEST_CASE("borrowed_row_sender::new_buffer preserves max_name_len on lazy reinit")
+{
+    // A buffer minted from a row sender configured with `max_name_len=16`
+    // must, after a move nulls its impl, lazily re-init with that same cap —
+    // not the default 127. The cap check is `name.len() > max_name_len`, so
+    // the boundary is exact: 16 chars is accepted, 17 rejected. Pinning both
+    // sides proves the sender's cap (not the 127 default) was carried over.
+    // Each case needs a fresh buffer: a second `table()` on a buffer that
+    // already accepted one would fail with a *state* error, masking the cap.
+    auto mock = spawn_mock(1);
+    questdb::pool db{conf_for(mock->addr(), "max_name_len=16;")};
+    auto rs = db.borrow_row_sender();
+
+    {
+        // 17 chars: rejected by the cap-16 re-init (pins cap <= 16).
+        auto buf = rs.new_buffer();
+        auto moved = std::move(buf); // nulls buf._impl; table() triggers may_init
+        CHECK(moved.row_count() == 0);
+        try
+        {
+            buf.table("table_name_len_17");
+            FAIL("17-char name must exceed the cap-16 re-init");
+        }
+        catch (const qdb::line_sender_error& e)
+        {
+            CHECK(e.code() == qdb::line_sender_error_code::invalid_name);
+        }
+    }
+
+    {
+        // 16 chars: accepted (pins cap >= 16).
+        auto buf = rs.new_buffer();
+        auto moved = std::move(buf);
+        CHECK_NOTHROW(buf.table("table_name_len16"));
+    }
+
+    rs.drop_on_return();
+}
+
+TEST_CASE("borrowed_row_sender::wait rejects a negative timeout")
+{
+    // The negative-timeout guard throws before any FFI call, so it is safe to
+    // exercise against the one-shot mock: nothing is published, so there is no
+    // ack to wait for and no hang risk.
+    auto mock = spawn_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto rs = db.borrow_row_sender();
+
+    CHECK_THROWS_AS(
+        rs.wait(qdb::column_sender_ack_level::ok, std::chrono::milliseconds{-1}),
+        qdb::line_sender_error);
+
+    rs.drop_on_return();
 }
 
 TEST_CASE("flush rejects oversized table name")

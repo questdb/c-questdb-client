@@ -1145,6 +1145,34 @@ pub unsafe extern "C" fn line_sender_buffer_new_qwp_with_max_name_len(
     }))
 }
 
+/// Construct a QWP/WebSocket columnar `line_sender_buffer` with a
+/// `max_name_len` of `127` (the QuestDB server default).
+///
+/// This is the buffer kind a `row_sender` borrowed from a `questdb_db` pool
+/// requires. When you hold the `row_sender`, prefer `row_sender_new_buffer`,
+/// which matches the sender's configured name-length cap automatically.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws() -> *mut line_sender_buffer {
+    let buffer = Buffer::new_qwp_ws();
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: true,
+    }))
+}
+
+/// Construct a QWP/WebSocket columnar `line_sender_buffer` with a custom
+/// maximum length for table and column names.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_new_qwp_ws_with_max_name_len(
+    max_name_len: size_t,
+) -> *mut line_sender_buffer {
+    let buffer = Buffer::qwp_ws_with_max_name_len(max_name_len);
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: true,
+    }))
+}
+
 /// Release the `line_sender_buffer` object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_free(buffer: *mut line_sender_buffer) {
@@ -3936,6 +3964,47 @@ pub unsafe extern "C" fn row_sender_must_close(sender: *const row_sender) -> boo
     unsafe { (*sender).0.must_close() }
 }
 
+/// Returns the configured max_name_len for buffers created from this row
+/// sender, or 0 if `sender` is NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn row_sender_get_max_name_len(sender: *const row_sender) -> size_t {
+    if sender.is_null() {
+        return 0;
+    }
+    unsafe { (*sender).0.get().max_name_len() }
+}
+
+/// Construct a `line_sender_buffer` matching the row sender's protocol
+/// settings — a QWP/WebSocket columnar buffer. This is the row-sender
+/// counterpart of `line_sender_buffer_new_for_sender`, and the only buffer a
+/// `row_sender` accepts: build rows with the ordinary `line_sender_buffer`
+/// API, then publish via `row_sender_flush` / `row_sender_flush_and_keep`.
+/// Returns NULL and sets `*err_out` if `sender` is NULL. The returned buffer
+/// must be released with `line_sender_buffer_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn row_sender_new_buffer(
+    sender: *const row_sender,
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender_buffer {
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "row_sender_new_buffer: sender pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return ptr::null_mut();
+    }
+    let buffer = unsafe { (*sender).0.get().new_buffer() };
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: true,
+    }))
+}
+
 /// Flush the buffer of rows through the borrowed row sender, then clear the
 /// buffer. Returns `true` on success; on failure returns `false` and sets
 /// `*err_out`. Mirrors `line_sender_flush` for the standalone sender.
@@ -4001,6 +4070,68 @@ pub unsafe extern "C" fn row_sender_flush_and_keep(
         let s = (*sender).0.get_mut();
         let buffer = unwrap_buffer(buffer);
         match s.flush_and_keep(buffer) {
+            Ok(()) => true,
+            Err(err) => {
+                set_err_out_from_sender_error(err_out, s, err);
+                false
+            }
+        }
+    }
+}
+
+/// Wait until every frame published so far through `sender` reaches
+/// `ack_level` (a `column_sender_ack_level_*` value, i.e. the same
+/// `0`=Ok / `1`=Durable encoding as `line_sender_qwpws_ack_level_*`). This is the
+/// row-major counterpart of `sf_column_sender_wait`: the store-and-forward
+/// queue owns delivery, so this is needed only to *observe* the ack (e.g.
+/// before reading the rows back), never for durability.
+///
+/// `timeout_millis` is a no-progress deadline (it fires only if the ack
+/// watermark fails to advance for that long); `0` waits indefinitely.
+///
+/// Returns `true` once acknowledged. Returns `false` and sets `*err_out` on
+/// the no-progress timeout (`line_sender_error_failover_retry`), a server
+/// rejection, a transport failure, an invalid `ack_level`, or NULL `sender`.
+/// With nothing published yet it succeeds immediately.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn row_sender_wait(
+    sender: *mut row_sender,
+    ack_level: u32,
+    timeout_millis: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "row_sender_wait: sender pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return false;
+    }
+    let ack_level = match ack_level {
+        0 => questdb::ingress::AckLevel::Ok,
+        1 => questdb::ingress::AckLevel::Durable,
+        other => {
+            unsafe {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!("row_sender_wait: invalid ack_level {other} (expected 0 or 1)"),
+                );
+            }
+            return false;
+        }
+    };
+    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_wait", err_out) } {
+        return false;
+    }
+    unsafe {
+        let s = (*sender).0.get_mut();
+        match s.wait(ack_level, Duration::from_millis(timeout_millis)) {
             Ok(()) => true,
             Err(err) => {
                 set_err_out_from_sender_error(err_out, s, err);

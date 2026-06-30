@@ -406,6 +406,27 @@ QUESTDB_CLIENT_API
 bool row_sender_must_close(const row_sender* sender);
 
 /**
+ * Returns the configured max_name_len for buffers created from this row
+ * sender, or 0 if `sender` is NULL.
+ */
+QUESTDB_CLIENT_API
+size_t row_sender_get_max_name_len(const row_sender* sender);
+
+/**
+ * Construct a `line_sender_buffer` matching the row sender's protocol
+ * settings (a QWP/WebSocket columnar buffer). This is the row-sender
+ * counterpart of `line_sender_buffer_new_for_sender`, and the only buffer a
+ * `row_sender` accepts: build rows with the ordinary `line_sender_buffer`
+ * API and publish them with `row_sender_flush` / `row_sender_flush_and_keep`.
+ * Returns NULL and sets `*err_out` if `sender` is NULL. The returned buffer
+ * must be released with `line_sender_buffer_free`.
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* row_sender_new_buffer(
+    const row_sender* sender,
+    line_sender_error** err_out);
+
+/**
  * Flush the buffer of rows through the borrowed row sender, then clear the
  * buffer. Returns `true` on success; on failure returns `false` and sets
  * `*err_out`. Mirrors `line_sender_flush` for the standalone sender.
@@ -425,6 +446,28 @@ QUESTDB_CLIENT_API
 bool row_sender_flush_and_keep(
     row_sender* sender,
     const line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/**
+ * Wait until every frame published so far through `sender` reaches
+ * `ack_level` (use the `column_sender_ack_level_*` values: 0 = ok,
+ * 1 = durable). Row-major counterpart of `sf_column_sender_wait`: the
+ * store-and-forward queue owns delivery, so this is needed only to *observe*
+ * the ack (e.g. before reading the rows back), never for durability.
+ *
+ * `timeout_millis` is a no-progress deadline (it fires only if the ack
+ * watermark fails to advance for that long); `0` waits indefinitely.
+ *
+ * Returns `true` once acknowledged; on the no-progress timeout, a server
+ * rejection, a transport failure, an invalid `ack_level`, or NULL `sender`
+ * returns `false` and sets `*err_out`. Succeeds immediately when nothing has
+ * been published yet.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_wait(
+    row_sender* sender,
+    uint32_t ack_level,
+    uint64_t timeout_millis,
     line_sender_error** err_out);
 
 /* -------------------------------------------------------------------------

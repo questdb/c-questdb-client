@@ -540,6 +540,23 @@ QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
     size_t max_name_len);
 
+/**
+ * Construct a QWP/WebSocket columnar `line_sender_buffer` with a fixed
+ * 127-byte name length limit. This is the buffer kind a `row_sender`
+ * borrowed from a `questdb_db` pool requires; when you hold the `row_sender`,
+ * prefer `row_sender_new_buffer` (see `column_sender.h`).
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws(void);
+
+/**
+ * Construct a QWP/WebSocket columnar `line_sender_buffer` with a max name
+ * length limit.
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws_with_max_name_len(
+    size_t max_name_len);
+
 /** Release the `line_sender_buffer` object. */
 QUESTDB_CLIENT_API
 void line_sender_buffer_free(line_sender_buffer* buffer);

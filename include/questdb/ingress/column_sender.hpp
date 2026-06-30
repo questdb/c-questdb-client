@@ -1199,6 +1199,45 @@ public:
     ~borrowed_row_sender() noexcept { release(); }
 
     /**
+     * Construct a buffer matching this sender's protocol settings: the
+     * QWP/WebSocket columnar buffer that this sender requires. Build rows
+     * with the usual `line_sender_buffer` API (`table` / `symbol` /
+     * `column_*` / `at`), then publish them with `flush()` /
+     * `flush_and_keep()`. Mirrors Rust's `Sender::new_buffer()` and the
+     * standalone `line_sender::new_buffer()`.
+     * @throws line_sender_error on failure.
+     */
+    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
+    {
+        ::line_sender_error* c_err{nullptr};
+        auto* raw = ::row_sender_new_buffer(_sender, &c_err);
+        if (!raw)
+            throw line_sender_error::from_c(c_err);
+        const size_t max_name_len = ::row_sender_get_max_name_len(_sender);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw);
+            throw;
+        }
+        // `borrowed_row_sender` is a friend of `line_sender_buffer`, so it can
+        // wrap the already-built impl directly. The protocol version is not
+        // meaningful for a QWP/WS columnar buffer; the name-length cap below
+        // only feeds the lazy re-init path (the impl already carries the
+        // sender's configured cap).
+        return line_sender_buffer{
+            raw,
+            protocol_version::v1,
+            init_buf_size,
+            max_name_len,
+            line_sender_buffer::_backend_kind::qwp_ws};
+    }
+
+    /**
      * Send the buffer of rows to QuestDB, then clear the buffer.
      * @throws line_sender_error on failure.
      */
@@ -1220,6 +1259,31 @@ public:
         if (buffer._impl)
             line_sender_error::wrapped_call(
                 ::row_sender_flush_and_keep, _sender, buffer._impl);
+    }
+
+    /**
+     * Block until every frame published so far through this sender reaches
+     * `level`. The store-and-forward queue owns delivery, so this is needed
+     * only to *observe* the ack (e.g. before reading the rows back), never
+     * for durability. `timeout` is a no-progress deadline (it fires only if
+     * the ack watermark fails to advance for that long); the default of zero
+     * waits indefinitely. Mirrors `sf_column_sender_conn::wait` and Rust's
+     * `Sender::wait`.
+     * @throws line_sender_error on failure.
+     */
+    void wait(
+        column_sender_ack_level level = column_sender_ack_level::ok,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
+    {
+        if (timeout.count() < 0)
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket wait timeout must not be negative."};
+        line_sender_error::wrapped_call(
+            ::row_sender_wait,
+            _sender,
+            static_cast<uint32_t>(level),
+            static_cast<uint64_t>(timeout.count()));
     }
 
     /**
