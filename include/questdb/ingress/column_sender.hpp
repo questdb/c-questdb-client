@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -983,7 +984,7 @@ private:
  * returned to the pool (or dropped if `drop_on_return()` was called, the
  * connection has latched terminal state, or the pool has been closed). Build
  * rows with a `questdb::ingress::line_sender_buffer` and send them via
- * `flush()` / `flush_and_keep()`.
+ * `flush()` / `flush_and_keep()` or the FSN-returning variants.
  *
  * Constructed only via `pool::borrow_row_sender()`.
  */
@@ -1020,13 +1021,18 @@ public:
 
     ~borrowed_row_sender() noexcept { release(); }
 
+    explicit operator bool() const noexcept
+    {
+        return _db && _sender;
+    }
+
     /**
      * Construct a buffer matching this sender's protocol settings: the
      * QWP/WebSocket columnar buffer that this sender requires. Build rows
      * with the usual `line_sender_buffer` API (`table` / `symbol` /
      * `column_*` / `at`), then publish them with `flush()` /
-     * `flush_and_keep()`. Mirrors Rust's `Sender::new_buffer()` and the
-     * standalone `line_sender::new_buffer()`.
+     * `flush_and_keep()` or the FSN-returning variants. Mirrors Rust's
+     * `Sender::new_buffer()` and the standalone `line_sender::new_buffer()`.
      * @throws line_sender_error on failure.
      */
     line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
@@ -1081,6 +1087,62 @@ public:
         if (buffer._impl)
             line_sender_error::wrapped_call(
                 ::row_sender_flush_and_keep, _sender, buffer._impl);
+    }
+
+    /**
+     * Publish a QWP/WebSocket buffer locally, clear it on success, and return
+     * the assigned frame sequence number. Empty buffers return `std::nullopt`.
+     */
+    std::optional<uint64_t> flush_and_get_fsn(line_sender_buffer& buffer)
+    {
+        buffer.may_init();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::row_sender_flush_and_get_fsn,
+            _sender,
+            buffer._impl,
+            &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Publish a QWP/WebSocket buffer locally without clearing it and return the
+     * assigned frame sequence number. Empty buffers return `std::nullopt`.
+     */
+    std::optional<uint64_t> flush_and_keep_and_get_fsn(
+        const line_sender_buffer& buffer)
+    {
+        ::line_sender_qwpws_fsn fsn{};
+        if (buffer._impl)
+            line_sender_error::wrapped_call(
+                ::row_sender_flush_and_keep_and_get_fsn,
+                _sender,
+                buffer._impl,
+                &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number published locally,
+     * or `std::nullopt` if no frame has been published.
+     */
+    std::optional<uint64_t> published_fsn() const
+    {
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::row_sender_published_fsn, _sender, &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK
+     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     */
+    std::optional<uint64_t> acked_fsn() const
+    {
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(::row_sender_acked_fsn, _sender, &fsn);
+        return optional_fsn(fsn);
     }
 
     /**
@@ -1144,6 +1206,14 @@ private:
     ::questdb_db* _db;
     ::row_sender* _sender;
     bool _force_drop{false};
+
+    static std::optional<uint64_t> optional_fsn(
+        const ::line_sender_qwpws_fsn& fsn)
+    {
+        if (fsn.has_value)
+            return fsn.value;
+        return std::nullopt;
+    }
 };
 
 /**

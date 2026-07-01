@@ -146,7 +146,7 @@ TEST_CASE("column_chunk flush round-trips through the mock")
     conn.drop_on_return();
 }
 
-TEST_CASE("borrowed_row_sender::new_buffer mints a flushable QWP/WS buffer")
+TEST_CASE("borrowed_row_sender exposes QWP/WS buffer and FSN helpers")
 {
     // Regression guard: a pooled row sender must be able to construct the
     // QWP/WS columnar buffer it requires (`row_sender_new_buffer`). Before
@@ -155,13 +155,21 @@ TEST_CASE("borrowed_row_sender::new_buffer mints a flushable QWP/WS buffer")
     auto mock = spawn_mock(1);
     questdb::pool db{conf_for(mock->addr())};
     auto rs = db.borrow_row_sender();
+    CHECK(rs);
+
+    auto empty = rs.new_buffer();
+    CHECK_FALSE(rs.published_fsn().has_value());
+    CHECK_FALSE(rs.acked_fsn().has_value());
+    CHECK_FALSE(rs.flush_and_keep_and_get_fsn(empty).has_value());
 
     auto buf = rs.new_buffer();
     buf.table("trades")
         .symbol("sym", "ETH-USD")
         .column("price", 2615.54)
         .at(qdb::timestamp_nanos::now());
-    rs.flush(buf);
+    const auto fsn = rs.flush_and_get_fsn(buf);
+    REQUIRE(fsn.has_value());
+    CHECK(rs.published_fsn() == fsn);
 
     // The mock graceful-closes after one frame, so wait() would hang.
     rs.drop_on_return();

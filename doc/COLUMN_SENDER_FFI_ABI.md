@@ -238,7 +238,8 @@ Validity: `pool_size <= pool_max` must hold; otherwise
 > `questdb_db`: column-major senders (`column_sender`, via
 > `questdb_db_borrow_column_sender`), row-major senders (`row_sender`, via
 > `questdb_db_borrow_row_sender` — build rows with a `line_sender_buffer`
-> and flush with `row_sender_flush`), and query readers (`reader`, in
+> and flush with `row_sender_flush` / `row_sender_flush_and_keep` or the
+> FSN-returning variants), and query readers (`reader`, in
 > `questdb/egress/reader.h`). Each has its own `_return_*` / `_drop_*`
 > (readers: `_return_reader` / `reader_close`) lifecycle.
 
@@ -332,6 +333,39 @@ QUESTDB_CLIENT_API
 void questdb_db_return_column_sender(
     questdb_db* db,
     column_sender* conn);
+```
+
+Row-major pooled senders expose the same QWP/WebSocket FSN progress shape as
+the standalone `line_sender_qwpws_*` helpers. Use the FSN-returning flush
+variants to publish without blocking for a server ACK, then poll
+`row_sender_acked_fsn` or call `row_sender_wait` when an ACK barrier is needed.
+
+```c
+QUESTDB_CLIENT_API
+bool row_sender_flush_and_get_fsn(
+    row_sender* sender,
+    line_sender_buffer* buffer,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool row_sender_flush_and_keep_and_get_fsn(
+    row_sender* sender,
+    const line_sender_buffer* buffer,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool row_sender_published_fsn(
+    const row_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool row_sender_acked_fsn(
+    const row_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
 ```
 
 ### 4.4 Connection state inspection
@@ -1126,8 +1160,9 @@ bool column_sender_flush(
  * or re-drive from source (direct). There is no separate per-call timeout
  * knob in v1; raise `request_timeout` to wait longer.
  *
- * The QWP wire `sequence` (FSN) is tracked internally and is not
- * exposed at the FFI.
+ * The QWP wire `sequence` (FSN) is tracked internally by the column-sender
+ * sync surface and is not exposed there. Row-major pooled senders expose FSN
+ * helpers in the pool row-sender API.
  */
 QUESTDB_CLIENT_API
 bool column_sender_sync(

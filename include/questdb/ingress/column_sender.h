@@ -85,8 +85,8 @@ typedef struct sf_column_sender sf_column_sender;
 /** Borrowed row-major QWP/WS sender. Not thread-safe; belongs to the
  *  borrowing thread until returned via `questdb_db_return_row_sender`.
  *  Builds rows through an ordinary `line_sender_buffer` and sends them with
- *  `row_sender_flush` / `row_sender_flush_and_keep`. Companion to the
- *  column-major sender (`sf_column_sender`) and
+ *  `row_sender_flush` / `row_sender_flush_and_keep` or the FSN-returning
+ *  variants. Companion to the column-major sender (`sf_column_sender`) and
  *  `reader` (query). */
 typedef struct row_sender row_sender;
 
@@ -343,7 +343,8 @@ size_t row_sender_get_max_name_len(const row_sender* sender);
  * settings (a QWP/WebSocket columnar buffer). This is the row-sender
  * counterpart of `line_sender_buffer_new_for_sender`, and the only buffer a
  * `row_sender` accepts: build rows with the ordinary `line_sender_buffer`
- * API and publish them with `row_sender_flush` / `row_sender_flush_and_keep`.
+ * API and publish them with `row_sender_flush` / `row_sender_flush_and_keep`
+ * or the FSN-returning variants.
  * Returns NULL and sets `*err_out` if `sender` is NULL. The returned buffer
  * must be released with `line_sender_buffer_free`.
  */
@@ -372,6 +373,51 @@ QUESTDB_CLIENT_API
 bool row_sender_flush_and_keep(
     row_sender* sender,
     const line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/**
+ * Publish a QWP/WebSocket buffer locally through the borrowed row sender,
+ * clear it on success, and return the assigned frame sequence number. Empty
+ * buffers succeed with `fsn_out->has_value == false`.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_flush_and_get_fsn(
+    row_sender* sender,
+    line_sender_buffer* buffer,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Publish a QWP/WebSocket buffer locally through the borrowed row sender
+ * without clearing it and return the assigned frame sequence number. Empty
+ * buffers succeed with `fsn_out->has_value == false`.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_flush_and_keep_and_get_fsn(
+    row_sender* sender,
+    const line_sender_buffer* buffer,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number published locally
+ * through this borrowed row sender, or no value if no frame has been
+ * published.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_published_fsn(
+    const row_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK or
+ * drop-and-continue rejection, or no value if no frame has completed.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_acked_fsn(
+    const row_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
 /**
