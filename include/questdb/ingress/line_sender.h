@@ -1925,23 +1925,22 @@ bool line_sender_qwpws_acked_fsn(
     line_sender_error** err_out);
 
 /**
- * Acknowledgement level for `line_sender_qwpws_wait`.
+ * Acknowledgement level for QWP/WebSocket wait/sync APIs.
  */
-typedef enum line_sender_qwpws_ack_level
+typedef enum qwpws_ack_level
 {
     /** Wait for the server to accept every published frame. */
-    line_sender_qwpws_ack_level_ok = 0,
+    qwpws_ack_level_ok = 0,
 
-    /**
-     * Wait for durable-ACK coverage. Falls back to ordinary acceptance when
-     * the connection did not negotiate durable acks.
-     */
-    line_sender_qwpws_ack_level_durable = 1,
-} line_sender_qwpws_ack_level;
+    /** Wait for durable-ACK coverage. Each wait/sync API documents whether
+     * unavailable durable ACKs are rejected or downgraded to ordinary
+     * acceptance. */
+    qwpws_ack_level_durable = 1,
+} qwpws_ack_level;
 
 /**
  * Wait until every QWP/WebSocket frame published so far reaches `ack_level`
- * (a `line_sender_qwpws_ack_level` value). This is the row-major counterpart
+ * (a `qwpws_ack_level` value). This is the row-major counterpart
  * to `sf_column_sender_wait`.
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack

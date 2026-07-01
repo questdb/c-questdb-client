@@ -217,7 +217,7 @@ TEST_CASE("borrowed_row_sender::wait rejects a negative timeout")
     auto rs = db.borrow_row_sender();
 
     CHECK_THROWS_AS(
-        rs.wait(qdb::column_sender_ack_level::ok, std::chrono::milliseconds{-1}),
+        rs.wait(qdb::qwpws_ack_level::ok, std::chrono::milliseconds{-1}),
         qdb::line_sender_error);
 
     rs.drop_on_return();
@@ -256,7 +256,7 @@ TEST_CASE("wait rejects durable ACK without opt-in and keeps the chunk")
     // preserves the underlying `invalid_api_call` code.
     try
     {
-        conn.wait(qdb::column_sender_ack_level::durable);
+        conn.wait(qdb::qwpws_ack_level::durable);
         FAIL("durable without opt-in must throw");
     }
     catch (const qdb::line_sender_error& e)

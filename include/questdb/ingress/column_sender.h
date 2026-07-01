@@ -113,23 +113,6 @@ typedef struct column_sender_validity
 } column_sender_validity;
 
 /* -------------------------------------------------------------------------
- * Acknowledgement level for `sf_column_sender_wait`.
- * ------------------------------------------------------------------------- */
-
-typedef enum column_sender_ack_level
-{
-    /** Wait for the server's WAL-commit ACK (spec status 0x00). Always
-     *  available. */
-    column_sender_ack_level_ok = 0,
-
-    /** Wait for the server's object-store durability ACK (spec status
-     *  0x02). Enterprise only; requires the pool to be opened with
-     *  `request_durable_ack=on` in the connect string. Sync returns
-     *  `line_sender_error_invalid_api_call` otherwise. */
-    column_sender_ack_level_durable = 1
-} column_sender_ack_level;
-
-/* -------------------------------------------------------------------------
  * Pool and sender borrow
  * ------------------------------------------------------------------------- */
 
@@ -405,7 +388,7 @@ bool row_sender_flush_and_keep(
 
 /**
  * Wait until every frame published so far through `sender` reaches
- * `ack_level` (use the `column_sender_ack_level_*` values: 0 = ok,
+ * `ack_level` (use the `qwpws_ack_level_*` values: 0 = ok,
  * 1 = durable). Row-major counterpart of `sf_column_sender_wait`: the
  * store-and-forward queue owns delivery, so this is needed only to *observe*
  * the ack (e.g. before reading the rows back), never for durability.
@@ -1286,8 +1269,8 @@ bool sf_column_sender_flush(
     line_sender_error** err_out);
 
 /**
- * `ack_level` carries a `column_sender_ack_level_*` constant. The
- * parameter is `uint32_t` rather than `enum column_sender_ack_level` so
+ * `ack_level` carries a `qwpws_ack_level_*` constant. The
+ * parameter is `uint32_t` rather than `enum qwpws_ack_level` so
  * an out-of-range value returns `line_sender_error_invalid_api_call`
  * instead of being undefined behaviour at the language boundary.
  *

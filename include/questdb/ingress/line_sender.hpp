@@ -1725,19 +1725,18 @@ private:
 };
 
 /**
- * Acknowledgement level for `line_sender::wait`. Mirrors the C
- * `line_sender_qwpws_ack_level` values.
+ * Acknowledgement level for QWP/WebSocket wait/sync APIs. Mirrors the C
+ * `qwpws_ack_level` values.
  */
 enum class qwpws_ack_level : uint32_t
 {
     /** Wait for the server to accept every published frame. */
-    ok = 0,
+    ok = ::qwpws_ack_level_ok,
 
-    /**
-     * Wait for durable-ACK coverage. Falls back to ordinary acceptance when
-     * the connection did not negotiate durable acks.
-     */
-    durable = 1,
+    /** Wait for durable-ACK coverage. Each wait/sync API documents whether
+     * unavailable durable ACKs are rejected or downgraded to ordinary
+     * acceptance. */
+    durable = ::qwpws_ack_level_durable,
 };
 
 /**

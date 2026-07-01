@@ -30,6 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
+use crate::ingress::AckLevel;
 use crate::ingress::QwpWsSenderError;
 use crate::ingress::buffer::SymbolGlobalDict;
 use crate::ingress::sender::qwp_ws::{
@@ -98,14 +99,6 @@ fn split_mid(row_count: usize) -> Option<usize> {
     }
     let mid = (row_count / 2) & !7;
     Some(if mid == 0 { 8 } else { mid })
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AckLevel {
-    #[default]
-    Ok,
-    Durable,
 }
 
 /// Whether a flush also waits for a server completion boundary at the

@@ -223,7 +223,7 @@ void handle_await_acked(const std::string& rest)
     // Durable matches the Rust AckLevel::Durable; it falls back to ordinary
     // acceptance when durable acks were not negotiated.
     if (::line_sender_qwpws_wait(
-            g_sender, line_sender_qwpws_ack_level_durable, timeout_ms, &err))
+            g_sender, qwpws_ack_level_durable, timeout_ms, &err))
     {
         reply_ok("true");
         return;

@@ -39,7 +39,8 @@
 //!   [`ColumnSender::flush_and_wait`] (the common safe shape: "send this batch
 //!   and return when it is committed"). To pipeline many batches for
 //!   throughput instead, publish each with [`ColumnSender::flush`] and drain
-//!   once at the end with [`ColumnSender::sync`] at the requested [`AckLevel`].
+//!   once at the end with [`ColumnSender::sync`] at the requested
+//!   [`crate::ingress::AckLevel`].
 //! - Drop the [`crate::SfColumnSender`] to return its connection to the pool.
 //!
 //! ```ignore
@@ -48,7 +49,7 @@
 //! chunk.column_f64("price", &prices, None)?;
 //! chunk.designated_timestamp_nanos(&timestamps_ns)?;
 //! // One call: publish + wait until the server WAL-commits this batch.
-//! sender.flush_and_wait(&mut chunk, AckLevel::Ok)?;
+//! sender.flush_and_wait(&mut chunk, crate::ingress::AckLevel::Ok)?;
 //! ```
 
 #[cfg(feature = "arrow-ingress")]
@@ -68,7 +69,7 @@ pub use chunk::Chunk;
 #[cfg(feature = "arrow-ingress")]
 pub use chunk::ImportedArrowColumn;
 pub use numpy_wire::NumpyDtype;
-pub use sender::{AckLevel, ColumnSender};
+pub use sender::ColumnSender;
 pub use validity::Validity;
 
 /// Per-flush row-count ceiling shared across every column-sender input

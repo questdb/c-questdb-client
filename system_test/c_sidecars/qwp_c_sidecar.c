@@ -233,7 +233,7 @@ static void handle_await_acked(const char* rest)
      * falls back to ordinary acceptance when the connection did not negotiate
      * durable acks, so the negative (durable-ack-off) test works too. */
     if (line_sender_qwpws_wait(
-            g_sender, line_sender_qwpws_ack_level_durable, timeout_ms, &err))
+            g_sender, qwpws_ack_level_durable, timeout_ms, &err))
     {
         reply_ok("true");
         return;

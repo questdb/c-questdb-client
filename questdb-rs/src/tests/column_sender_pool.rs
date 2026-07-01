@@ -46,7 +46,8 @@ use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::QuestDb;
-use crate::ingress::column_sender::{AckLevel, Chunk};
+use crate::ingress::AckLevel;
+use crate::ingress::column_sender::Chunk;
 use crate::tests::qwp_ws::{
     perform_server_upgrade, perform_server_upgrade_durable, read_frame,
     write_qwp_durable_ack_response, write_qwp_error_response, write_qwp_ok_response,

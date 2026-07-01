@@ -39,17 +39,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use questdb::QuestDb;
 use questdb::ffi_support::OwnedColumnSender;
-use questdb::ingress::column_sender::{AckLevel, Chunk, NumpyDtype, Validity};
+use questdb::ingress::AckLevel;
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
+use questdb::ingress::column_sender::{Chunk, NumpyDtype, Validity};
 use questdb::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use questdb::{Error, ErrorCode};
 
 #[cfg(feature = "arrow")]
 use crate::line_sender_column_name;
 use crate::{
-    line_sender_error, line_sender_table_name, set_err_out_from_error,
-    set_err_out_from_error_with_qwpws,
+    line_sender_error, line_sender_table_name, qwpws_ack_level_durable, qwpws_ack_level_ok,
+    set_err_out_from_error, set_err_out_from_error_with_qwpws,
 };
 
 // ===========================================================================
@@ -361,26 +362,23 @@ unsafe fn as_validity<'a>(
 // ===========================================================================
 // Ack level
 //
-// The C header exposes named constants (`column_sender_ack_level_ok = 0`,
-// `column_sender_ack_level_durable = 1`) but the FFI takes a `uint32_t`
+// The C header exposes named constants (`qwpws_ack_level_ok = 0`,
+// `qwpws_ack_level_durable = 1`) but the FFI takes a `uint32_t`
 // (not a `#[repr(C)] enum`) so an out-of-range value is a recoverable
 // `InvalidApiCall` error instead of immediate Rust UB.
 // ===========================================================================
 
-pub const column_sender_ack_level_ok: u32 = 0;
-pub const column_sender_ack_level_durable: u32 = 1;
-
 fn ack_level_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Option<AckLevel> {
     match value {
-        0 => Some(AckLevel::Ok),
-        1 => Some(AckLevel::Durable),
+        value if value == qwpws_ack_level_ok => Some(AckLevel::Ok),
+        value if value == qwpws_ack_level_durable => Some(AckLevel::Durable),
         other => {
             unsafe {
                 set_err_out_from_error(
                     err_out,
                     Error::new(
                         ErrorCode::InvalidApiCall,
-                        format!("column_sender ack_level: invalid value {other} (expected 0 or 1)"),
+                        format!("qwpws ack_level: invalid value {other} (expected 0 or 1)"),
                     ),
                 );
             }
@@ -2680,8 +2678,8 @@ pub unsafe extern "C" fn direct_column_sender_flush(
 /// published before or by this call reaches `ack_level` (see
 /// `column_sender_sync` for the level meanings and the no-progress timeout).
 ///
-/// `ack_level` carries a `column_sender_ack_level_*` constant; an out-of-range
-/// value, or `column_sender_ack_level_durable` without `request_durable_ack=on`,
+/// `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range
+/// value, or `qwpws_ack_level_durable` without `request_durable_ack=on`,
 /// returns `line_sender_error_invalid_api_call` **before** `chunk` is touched.
 ///
 /// Boundary: a successful return acknowledges all prior no-wait flushes plus
@@ -2911,7 +2909,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
 /// ACKing counterpart of `column_sender_flush_arrow_batch_at_now`:
 /// publish `array` as a boundary, then wait for `ack_level`.
 ///
-/// `ack_level` carries a `column_sender_ack_level_*` constant. It is validated
+/// `ack_level` carries a `qwpws_ack_level_*` constant. It is validated
 /// **before** the Arrow C Data Interface import consumes `array->release`, so a
 /// rejected level (out-of-range, or `durable` without `request_durable_ack=on`)
 /// returns `line_sender_error_invalid_api_call` and leaves `array` untouched.
@@ -3374,8 +3372,8 @@ unsafe fn reexport_record_batch_into(
 /// store-and-forward mode all data frames are already non-deferred, so sync
 /// waits for the local queue boundary published before the call.
 ///
-/// `column_sender_ack_level_ok` waits for every in-flight frame's
-/// WAL-commit ack. `column_sender_ack_level_durable` additionally waits
+/// `qwpws_ack_level_ok` waits for every in-flight frame's
+/// WAL-commit ack. `qwpws_ack_level_durable` additionally waits
 /// for the server's object-store durability watermarks.
 ///
 /// No-progress timeout: if the server stays connected but never advances the
@@ -4468,12 +4466,12 @@ mod tests {
     fn ack_level_constants_map_correctly() {
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         assert_eq!(
-            ack_level_from_u32(column_sender_ack_level_ok, &mut err),
+            ack_level_from_u32(qwpws_ack_level_ok, &mut err),
             Some(AckLevel::Ok)
         );
         assert!(err.is_null());
         assert_eq!(
-            ack_level_from_u32(column_sender_ack_level_durable, &mut err),
+            ack_level_from_u32(qwpws_ack_level_durable, &mut err),
             Some(AckLevel::Durable)
         );
         assert!(err.is_null());

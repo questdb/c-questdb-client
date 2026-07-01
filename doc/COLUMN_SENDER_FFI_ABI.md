@@ -1046,13 +1046,13 @@ per row.)
 
 ```c
 /**
- * Acknowledgement level `column_sender_sync` waits for.
+ * Acknowledgement level for QWP/WebSocket wait/sync APIs.
  */
-typedef enum column_sender_ack_level
+typedef enum qwpws_ack_level
 {
     /** Wait for the server's WAL-commit ACK (spec status 0x00).
         Always available. */
-    column_sender_ack_level_ok = 0,
+    qwpws_ack_level_ok = 0,
 
     /** Wait for the server's object-store durability ACK
         (spec status 0x02). Enterprise only. Requires the pool to be
@@ -1060,8 +1060,8 @@ typedef enum column_sender_ack_level
         (and the server's 101 response confirming
         `X-QWP-Durable-Ack: enabled`). If the connection did not opt
         in, sync returns line_sender_error_invalid_api_call. */
-    column_sender_ack_level_durable = 1,
-} column_sender_ack_level;
+    qwpws_ack_level_durable = 1,
+} qwpws_ack_level;
 
 /**
  * Encode the chunk into a QWP/WebSocket frame, publish it, and return
@@ -1132,7 +1132,7 @@ bool column_sender_flush(
 QUESTDB_CLIENT_API
 bool column_sender_sync(
     column_sender* conn,
-    column_sender_ack_level ack_level,
+    qwpws_ack_level ack_level,
     line_sender_error** err_out);
 ```
 
@@ -1193,7 +1193,7 @@ Each publish-only flush has an **ACKing** (boundary) counterpart with an
 completion boundary at a requested `ack_level` in one call — the common
 "send this batch and return when it is committed" shape, without a
 separate `column_sender_sync`. `ack_level` is a `uint32_t` (a
-`column_sender_ack_level_*` constant) rather than the enum, so an
+`qwpws_ack_level_*` constant) rather than the enum, so an
 out-of-range value returns `line_sender_error_invalid_api_call` instead of
 being undefined behaviour at the language boundary — matching
 `column_sender_sync`.
@@ -1328,9 +1328,9 @@ int send_one_chunk(questdb_db* db) {
        it is committed". On success the chunk is cleared & reusable.
        To pipeline many chunks for throughput instead, call
        column_sender_flush per chunk (publish-only) and drain once at the
-       end with column_sender_sync(conn, column_sender_ack_level_ok). */
+       end with column_sender_sync(conn, qwpws_ack_level_ok). */
     if (!column_sender_flush_and_wait(
-            conn, chunk, column_sender_ack_level_ok, &err)) goto fail;
+            conn, chunk, qwpws_ack_level_ok, &err)) goto fail;
 
     column_sender_chunk_free(chunk);
     questdb_db_return_column_sender(db, conn);

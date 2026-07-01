@@ -73,9 +73,10 @@ use crate::ingress::{Sender, SenderBuilder};
 use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
 use crate::{Result, error};
 
+use crate::ingress::AckLevel;
+use crate::ingress::column_sender::ColumnSender;
 use crate::ingress::column_sender::conf::{self, PoolReap};
 use crate::ingress::column_sender::conn::ColumnConn;
-use crate::ingress::column_sender::{AckLevel, ColumnSender};
 
 /// FFI escape-hatch surface: owned (lifetime-free) pool handles and the entry
 /// points that mint them, for the `questdb-rs-ffi` C-ABI crate. Hidden,

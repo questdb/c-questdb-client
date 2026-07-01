@@ -48,7 +48,7 @@ use crate::ws::frame::{self, FrameError, FrameHeader, Opcode, encode_client_fram
 use crate::ws::mask::{MaskKeySource, apply_mask};
 use crate::{Result, error};
 
-use super::sender::AckLevel;
+use crate::ingress::AckLevel;
 
 /// Bytes the encoder leaves untouched at the start of `write_buf` so the
 /// WS header can be prepended in place without a copy. RFC 6455 §5.2: the

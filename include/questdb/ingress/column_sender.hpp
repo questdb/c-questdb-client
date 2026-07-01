@@ -50,13 +50,6 @@ class reader;
 namespace questdb::ingress
 {
 
-/** Ack level for `sf_column_sender_conn::wait` / `borrowed_row_sender::wait`. */
-enum class column_sender_ack_level : uint32_t
-{
-    ok = ::column_sender_ack_level_ok,
-    durable = ::column_sender_ack_level_durable,
-};
-
 /**
  * Non-owning view over an Arrow-shape validity bitmap (bit = 1 means
  * VALID, LSB-first). `bit_len` must equal the chunk's row count; the
@@ -771,7 +764,7 @@ public:
      * waits indefinitely. Throws on error.
      */
     void wait(
-        column_sender_ack_level level = column_sender_ack_level::ok,
+        qwpws_ack_level level = qwpws_ack_level::ok,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
     {
         if (timeout.count() < 0)
@@ -909,7 +902,7 @@ public:
      * waits indefinitely. Throws on error.
      */
     void wait(
-        column_sender_ack_level level = column_sender_ack_level::ok,
+        qwpws_ack_level level = qwpws_ack_level::ok,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
     {
         _conn.wait(level, timeout);
@@ -1104,7 +1097,7 @@ public:
      * @throws line_sender_error on failure.
      */
     void wait(
-        column_sender_ack_level level = column_sender_ack_level::ok,
+        qwpws_ack_level level = qwpws_ack_level::ok,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
     {
         if (timeout.count() < 0)

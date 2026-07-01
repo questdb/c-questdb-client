@@ -3584,15 +3584,15 @@ pub unsafe extern "C" fn line_sender_qwpws_acked_fsn(
     }
 }
 
-/// Acknowledgement level for [`line_sender_qwpws_wait`]. These mirror the
-/// column-major `column_sender_ack_level_*` values; the FFI takes a `uint32_t`.
+/// Acknowledgement level for QWP/WebSocket wait/sync APIs. The FFI takes a
+/// `uint32_t` so invalid values can be rejected as API errors.
 #[allow(non_upper_case_globals)]
-pub const line_sender_qwpws_ack_level_ok: u32 = 0;
+pub const qwpws_ack_level_ok: u32 = 0;
 #[allow(non_upper_case_globals)]
-pub const line_sender_qwpws_ack_level_durable: u32 = 1;
+pub const qwpws_ack_level_durable: u32 = 1;
 
 /// Wait until every QWP/WebSocket frame published so far on `sender` reaches
-/// `ack_level` (a `line_sender_qwpws_ack_level_*` value). This is the
+/// `ack_level` (a `qwpws_ack_level_*` value). This is the
 /// row-major counterpart to the column-major `sf_column_sender_wait`.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
@@ -3611,8 +3611,8 @@ pub unsafe extern "C" fn line_sender_qwpws_wait(
 ) -> bool {
     unsafe {
         let ack_level = match ack_level {
-            0 => questdb::ingress::AckLevel::Ok,
-            1 => questdb::ingress::AckLevel::Durable,
+            value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
+            value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
             other => {
                 set_err_out(
                     err_out,
@@ -4080,11 +4080,10 @@ pub unsafe extern "C" fn row_sender_flush_and_keep(
 }
 
 /// Wait until every frame published so far through `sender` reaches
-/// `ack_level` (a `column_sender_ack_level_*` value, i.e. the same
-/// `0`=Ok / `1`=Durable encoding as `line_sender_qwpws_ack_level_*`). This is the
-/// row-major counterpart of `sf_column_sender_wait`: the store-and-forward
-/// queue owns delivery, so this is needed only to *observe* the ack (e.g.
-/// before reading the rows back), never for durability.
+/// `ack_level` (a `qwpws_ack_level_*` value). This is the row-major
+/// counterpart of `sf_column_sender_wait`: the store-and-forward queue owns
+/// delivery, so this is needed only to *observe* the ack (e.g. before reading
+/// the rows back), never for durability.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
@@ -4113,8 +4112,8 @@ pub unsafe extern "C" fn row_sender_wait(
         return false;
     }
     let ack_level = match ack_level {
-        0 => questdb::ingress::AckLevel::Ok,
-        1 => questdb::ingress::AckLevel::Durable,
+        value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
+        value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
         other => {
             unsafe {
                 set_err_out(

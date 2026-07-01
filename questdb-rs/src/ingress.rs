@@ -75,11 +75,16 @@ pub use decimal::DecimalView;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub mod column_sender;
 
-/// Acknowledgement level shared by the column-major and row-major senders'
-/// `wait` / `sync` APIs. Re-exported at the `ingress` root so row-major
-/// callers ([`Sender::wait`]) need not reach into [`column_sender`].
+/// Acknowledgement level shared by the column-major and row-major QWP/WebSocket
+/// senders' `wait` / `sync` APIs.
 #[cfg(feature = "sync-sender-qwp-ws")]
-pub use column_sender::AckLevel;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AckLevel {
+    #[default]
+    Ok,
+    Durable,
+}
 
 #[cfg(feature = "polars-ingress")]
 pub mod polars;

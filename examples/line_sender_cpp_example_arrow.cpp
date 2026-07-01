@@ -98,7 +98,7 @@ bool example(const std::string& host, const std::string& port)
             qdb::sf_column_sender_conn conn{raw_conn};
             conn.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
             if (!::sf_column_sender_wait(
-                    raw_conn, ::column_sender_ack_level_ok, 0, &err))
+                    raw_conn, ::qwpws_ack_level_ok, 0, &err))
             {
                 size_t err_len = 0;
                 const char* err_msg = ::line_sender_error_msg(err, &err_len);

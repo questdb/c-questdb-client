@@ -54,7 +54,8 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use questdb::QuestDb;
 use questdb::ingress::ColumnName;
-use questdb::ingress::column_sender::{AckLevel, Chunk};
+use questdb::ingress::column_sender::Chunk;
+use questdb::ingress::AckLevel;
 #[cfg(feature = "polars")]
 use questdb::ingress::polars::PolarsIngestOptions;
 

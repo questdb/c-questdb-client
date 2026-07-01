@@ -180,16 +180,16 @@ publish-only names:
 
 ```cpp
 conn.flush(chunk);                                   // publish only
-conn.flush_and_wait(chunk, column_sender_ack_level::ok);
-conn.flush_and_wait(chunk, column_sender_ack_level::durable);
+conn.flush_and_wait(chunk, qwpws_ack_level::ok);
+conn.flush_and_wait(chunk, qwpws_ack_level::durable);
 
 conn.flush_arrow_batch_at_now(table, array, schema, overrides, n);
 conn.flush_arrow_batch_at_now_and_wait(
-    table, array, schema, column_sender_ack_level::ok, overrides, n);
+    table, array, schema, qwpws_ack_level::ok, overrides, n);
 
 conn.flush_arrow_batch(table, array, schema, ts_column, overrides, n);
 conn.flush_arrow_batch_and_wait(
-    table, array, schema, ts_column, column_sender_ack_level::ok, overrides, n);
+    table, array, schema, ts_column, qwpws_ack_level::ok, overrides, n);
 ```
 
 The new methods call the new C ABI functions; existing methods remain

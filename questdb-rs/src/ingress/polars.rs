@@ -335,7 +335,7 @@ pub struct PolarsIngestOptions<'a> {
     max_rows: Option<NonZeroUsize>,
     timestamp_column: Option<crate::ingress::ColumnName<'a>>,
     overrides: &'a [crate::ingress::column_sender::ArrowColumnOverride<'a>],
-    ack_level: Option<crate::ingress::column_sender::AckLevel>,
+    ack_level: Option<crate::ingress::AckLevel>,
 }
 
 impl<'a> PolarsIngestOptions<'a> {
@@ -386,7 +386,7 @@ impl<'a> PolarsIngestOptions<'a> {
     /// without `request_durable_ack=on` is rejected with
     /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
     #[must_use]
-    pub fn ack_level(mut self, level: crate::ingress::column_sender::AckLevel) -> Self {
+    pub fn ack_level(mut self, level: crate::ingress::AckLevel) -> Self {
         self.ack_level = Some(level);
         self
     }
