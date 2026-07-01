@@ -162,7 +162,8 @@ Layering rules:
   slices.** Per-column-append functions take `ptr + len + optional
   validity bitmap`. Nothing else.
 - **The user thinks `DataFrame → Table`.** One chunk = one table = one
-  DataFrame = one QWP frame = one FSN.
+  DataFrame = one logical batch. The wire layer may split the batch into
+  multiple QWP frames; FSN-returning APIs report the last frame boundary.
 - **A `QuestDb` is shareable across threads; a borrowed `ColumnSender`
   is not.** The pool absorbs the per-connection thread-safety
   constraint.
@@ -400,7 +401,8 @@ land.
   (`questdb-rs/src/ingress/sender/qwp_ws_publisher.rs`), and blocks
   until the server ACK arrives.
 - Internally the publisher still tracks the wire `sequence` (FSN);
-  `flush` waits on that FSN. FSN is not exposed at the public API.
+  `flush` waits on that FSN. The later pooled SFA APIs expose
+  FSN-returning publish and watermark helpers for non-blocking progress.
 - Hook up `must_close`.
 - Refuse `sf_dir` (and other `sf_*` keys) at `QuestDb::connect`-time
   with `ConfigError`. Update WS-0's connect-string parser
@@ -608,7 +610,8 @@ flag a deviation rather than re-litigate silently.
 - **API shape:** new top-level types, separate from `Buffer`/`Sender`.
   Naming: `QuestDb`, `ColumnSender`, `Chunk`, `Validity`.
 - **Mental model:** `DataFrame → Table`. One chunk = one table = one
-  DataFrame = one QWP frame = one FSN.
+  DataFrame = one logical batch. The wire layer may split the batch into
+  multiple QWP frames; FSN-returning APIs report the last frame boundary.
 - **Send is synchronous.** `sender.flush(&mut chunk, ack_level)`
   blocks until the server ACK at the requested level arrives. Two
   levels: `Ok` (WAL commit, always available) and `Durable`
@@ -616,8 +619,9 @@ flag a deviation rather than re-litigate silently.
   at connect). At most one frame in flight per sender. Parallelism is
   expressed by borrowing multiple senders from the pool, one per
   thread. The wire's 128-in-flight cap is never reached. The QWP
-  `sequence` / FSN is tracked internally and not exposed at the API
-  or FFI surface.
+  `sequence` / FSN is tracked internally by synchronous waits. The later
+  pooled SFA APIs expose FSN-returning publish and watermark helpers for
+  non-blocking progress.
 - **Store-and-forward (`sf_dir`) is refused in v1.** Passing `sf_dir`
   or any other `sf_*` key to `QuestDb::connect` returns `ConfigError`.
   SF is single-writer per slot and interacts awkwardly with pool
@@ -663,4 +667,3 @@ flag a deviation rather than re-litigate silently.
   need it.
 - (Removed in this revision: durable-ack as deferred. See settled
   decisions for ack-level handling.)
-

@@ -20,8 +20,10 @@ enum discriminants, and struct layouts are defined by
 
 This ABI exposes a column-major writer that ingests **per-column typed
 buffers** into QuestDB via QWP/WebSocket. Optimised for sending
-Pandas/Polars DataFrames at maximum throughput. One submission =
-one QWP frame = one logical batch of rows for one table.
+Pandas/Polars DataFrames at maximum throughput. One submission is one
+logical batch of rows for one table; the store-and-forward sender may split
+that logical batch into multiple QWP frames to stay under the negotiated
+frame-size cap.
 
 **This is a client for the existing QuestDB server implementing the QWP
 ingress (WebSocket) v1 wire specification.** The spec is at
@@ -376,6 +378,61 @@ bool row_sender_acked_fsn(
     line_sender_error** err_out);
 ```
 
+Store-and-forward column senders expose the same progress pattern for column
+chunks and Arrow batch flushes. Use `sf_column_sender_wait` for the simple
+barrier over everything published so far; use the FSN-returning flush variants
+when a producer wants to publish locally, continue other work, and poll
+`sf_column_sender_acked_fsn` later on the same borrowed sender. When a chunk or
+Arrow batch is split into multiple QWP frames, the returned FSN is the last
+frame boundary; cumulative ACK coverage of that boundary covers the whole
+logical input.
+
+```c
+QUESTDB_CLIENT_API
+bool sf_column_sender_flush_and_get_fsn(
+    sf_column_sender* conn,
+    column_sender_chunk* chunk,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool sf_column_sender_published_fsn(
+    const sf_column_sender* conn,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool sf_column_sender_acked_fsn(
+    const sf_column_sender* conn,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+#ifdef QUESTDB_CLIENT_ENABLE_ARROW
+QUESTDB_CLIENT_API
+bool sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
+    sf_column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+QUESTDB_CLIENT_API
+bool sf_column_sender_flush_arrow_batch_at_column_and_get_fsn(
+    sf_column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+#endif
+```
+
 ### 4.4 Connection state inspection
 
 ```c
@@ -393,10 +450,11 @@ bool column_sender_must_close(const column_sender* conn);
 ## 5. Chunk lifecycle
 
 A chunk represents one DataFrame's worth of column buffers destined
-for one table. It is the "one chunk = one table = one frame = one
-FSN" unit. Chunks are caller-owned and **not bound to a particular
-sender** — build a chunk on any thread, flush it on any sender
-borrowed from the same `db`.
+for one table. It is the "one chunk = one table = one logical batch"
+unit. Store-and-forward flushes may split that batch into multiple QWP
+frames; FSN-returning APIs report the last frame boundary. Chunks are
+caller-owned and **not bound to a particular sender** — build a chunk on
+any thread, flush it on any sender borrowed from the same `db`.
 
 ```c
 /**
@@ -1168,10 +1226,9 @@ bool column_sender_flush(
  * or re-drive from source (direct). There is no separate per-call timeout
  * knob in v1; raise `request_timeout` to wait longer.
  *
- * The QWP wire `sequence` (FSN) is tracked internally by the column-sender
- * sync surface and is not exposed there. Row-major pooled senders expose FSN
- * helpers in the pool row-sender API for same-borrow, non-blocking progress
- * tracking.
+ * The QWP wire `sequence` (FSN) is tracked internally by sync/wait and is also
+ * exposed on store-and-forward row and column pooled senders for same-borrow,
+ * non-blocking progress tracking.
  */
 QUESTDB_CLIENT_API
 bool column_sender_sync(

@@ -713,6 +713,39 @@ fn store_and_forward_pool_allows_one_active_borrower() {
     let _again = db.borrow_column_sender().unwrap();
 }
 
+#[test]
+fn store_and_forward_column_sender_reports_fsn_progress() {
+    let server = MockServer::spawn_acking(8);
+    let conf = conf_for_endpoints(&[server.port()], "pool_reap=manual;");
+    let db = QuestDb::connect(&conf).unwrap();
+    let mut sender = db.borrow_column_sender().unwrap();
+
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+
+    let mut chunk = Chunk::new("trades");
+    let qty = [1_i64];
+    let ts = [1_i64];
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+
+    let fsn = sender
+        .flush_and_get_fsn(&mut chunk)
+        .expect("SFA flush should publish")
+        .expect("chunk flush publishes a frame");
+    assert_eq!(chunk.row_count(), 0);
+    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
+    assert!(
+        sender
+            .acked_fsn()
+            .unwrap()
+            .is_some_and(|acked| acked >= fsn),
+        "acked watermark must cover published FSN"
+    );
+}
+
 fn check_store_and_forward_sync_reports_drop_and_continue_once(extras: &str) {
     let server = MockServer::spawn_error_first_then_ack(1, QWP_STATUS_SCHEMA_MISMATCH);
     let conf = conf_for_endpoints(&[server.port()], extras);
@@ -952,12 +985,21 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
     chunk.designated_timestamp_nanos(&ts).unwrap();
 
     let mut sender = db.borrow_column_sender().unwrap();
-    sender
-        .flush(&mut chunk)
-        .expect("oversize chunk splits and appends");
+    let fsn = sender
+        .flush_and_get_fsn(&mut chunk)
+        .expect("oversize chunk splits and appends")
+        .expect("non-empty chunk publishes a frame");
+    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
     sender
         .wait(AckLevel::Ok, Duration::from_secs(30))
         .expect("all split frames commit");
+    assert!(
+        sender
+            .acked_fsn()
+            .unwrap()
+            .is_some_and(|acked| acked >= fsn),
+        "acked watermark must cover returned split boundary"
+    );
 
     let mut captured = Vec::new();
     while let Ok(frame) = frames.recv_timeout(Duration::from_millis(500)) {
@@ -968,6 +1010,11 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
         captured.len() > 1,
         "oversize chunk must split into multiple frames, got {}",
         captured.len()
+    );
+    assert_eq!(
+        fsn as usize,
+        captured.len() - 1,
+        "returned FSN must be the last split frame boundary"
     );
     for (i, frame) in captured.iter().enumerate() {
         assert!(
@@ -3301,6 +3348,111 @@ fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
     assert_eq!(
         got, vals,
         "split frames must cover every row of the batch exactly once"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_batch_reports_fsn_progress_and_split_boundary() {
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use std::sync::Arc;
+
+    const CAP: usize = 2048;
+    const ROWS: usize = 512;
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for(
+        server.port(),
+        &format!("max_buf_size={CAP};pool_reap=manual;"),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let vals: Vec<i64> = (0..ROWS as i64).collect();
+    let arr: ArrayRef = Arc::new(Int64Array::from(vals.clone()));
+    let batch = RecordBatch::try_from_iter([("seq", arr)]).unwrap();
+
+    let mut sender = db.borrow_column_sender().unwrap();
+    assert_eq!(sender.published_fsn().unwrap(), None);
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+
+    let fsn = sender
+        .flush_arrow_batch_at_now_and_get_fsn("trades", &batch, &[])
+        .expect("SFA Arrow flush should publish")
+        .expect("non-empty Arrow batch publishes a frame");
+    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
+    assert!(
+        sender
+            .acked_fsn()
+            .unwrap()
+            .is_some_and(|acked| acked >= fsn),
+        "acked watermark must cover returned Arrow split boundary"
+    );
+
+    let captured: Vec<Vec<u8>> = frames.try_iter().collect();
+    let data_frames = captured
+        .iter()
+        .filter(|f| f.len() >= 12 && &f[..4] == b"QWP1" && u16::from_le_bytes([f[6], f[7]]) >= 1)
+        .count();
+    assert!(
+        data_frames > 1,
+        "oversize Arrow batch must split into multiple frames, got {data_frames}"
+    );
+    assert_eq!(
+        fsn as usize,
+        data_frames - 1,
+        "returned FSN must be the last split frame boundary"
+    );
+
+    let (replay_tx, replay_rx) = mpsc::channel();
+    for f in captured {
+        replay_tx.send(f).unwrap();
+    }
+    drop(replay_tx);
+    let mut got = redriven_i64_rows(&replay_rx);
+    got.sort_unstable();
+    assert_eq!(
+        got, vals,
+        "split frames must cover every row of the batch exactly once"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_arrow_batch_at_column_reports_fsn_progress() {
+    use std::sync::Arc;
+
+    use arrow_array::{Float64Array, RecordBatch, TimestampNanosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    let server = MockServer::spawn_acking(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("price", DataType::Float64, false),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+    ]));
+    let price = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+    let ts = Arc::new(TimestampNanosecondArray::from(vec![
+        1_700_000_000_000_000_000,
+        1_700_000_000_000_000_001,
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![price, ts]).unwrap();
+
+    let mut sender = db.borrow_column_sender().unwrap();
+    let ts_col = crate::ingress::ColumnName::new("ts").unwrap();
+    let fsn = sender
+        .flush_arrow_batch_at_column_and_get_fsn("trades", &batch, ts_col, &[])
+        .expect("SFA Arrow at-column flush should publish")
+        .expect("non-empty Arrow batch publishes a frame");
+    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+    sender.wait(AckLevel::Ok, Duration::from_secs(30)).unwrap();
+    assert!(
+        sender
+            .acked_fsn()
+            .unwrap()
+            .is_some_and(|acked| acked >= fsn),
+        "acked watermark must cover Arrow at-column FSN"
     );
 }
 

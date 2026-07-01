@@ -1022,7 +1022,6 @@ impl<'a> ColumnSenderHandle<'a> {
             .expect("borrowed column sender already returned")
     }
 
-    #[cfg(test)]
     fn inner_ref(&self) -> &ColumnSender {
         self.sender
             .as_ref()
@@ -1139,6 +1138,9 @@ impl Debug for ColumnSenderHandle<'_> {
 /// requested [`AckLevel`], i.e. confirms delivery — or configure `sf_dir` for
 /// crash-durable on-disk persistence with replay. There is deliberately no
 /// `flush_and_wait` / `sync`: compose [`Self::flush`] then [`Self::wait`].
+/// Use FSNs only for non-blocking progress tracking while this borrowed sender
+/// is still held: they are stream watermarks, not portable receipts to check
+/// through an arbitrary later pool borrow.
 ///
 /// Not `Send` or `Sync`.
 pub struct SfColumnSender<'a>(ColumnSenderHandle<'a>);
@@ -1150,6 +1152,44 @@ impl<'a> SfColumnSender<'a> {
     /// is tagged [`in_doubt`](crate::Error::in_doubt).
     pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
         self.0.inner_mut().flush(chunk)
+    }
+
+    /// Encode and publish `chunk` into the store-and-forward queue and return
+    /// the highest published frame sequence number.
+    ///
+    /// This is the non-blocking progress-tracking form of [`Self::flush`]:
+    /// success means the frame was accepted locally, not that the server has
+    /// ACKed it. If the chunk is split into multiple frames, the returned FSN
+    /// is the final frame boundary; cumulative ACK coverage of that boundary
+    /// covers the whole chunk. Use [`Self::wait`] when you only need a simple
+    /// blocking barrier for everything published so far. Treat the returned
+    /// FSN as meaningful only with this sender stream while this borrow is
+    /// held.
+    pub fn flush_and_get_fsn(
+        &mut self,
+        chunk: &mut crate::ingress::column_sender::Chunk<'_>,
+    ) -> Result<Option<u64>> {
+        self.0.inner_mut().flush_and_get_fsn(chunk)
+    }
+
+    /// Return the highest frame sequence number published locally by this
+    /// sender, or `None` if no frame has been published.
+    ///
+    /// This is a stream watermark for the currently borrowed sender, not a
+    /// portable receipt to check through an arbitrary later pool borrow.
+    pub fn published_fsn(&self) -> Result<Option<u64>> {
+        self.0.inner_ref().published_fsn()
+    }
+
+    /// Return the highest frame sequence number completed by server ACK or
+    /// server-side reject-and-continue, or `None` if no frame has completed.
+    ///
+    /// In durable-ACK mode this watermark advances after durable ACK coverage;
+    /// use [`Self::wait`] when you need an explicit [`AckLevel::Ok`] or
+    /// [`AckLevel::Durable`] barrier. Compare it only with FSNs produced by
+    /// this same sender stream.
+    pub fn acked_fsn(&self) -> Result<Option<u64>> {
+        self.0.inner_ref().acked_fsn()
     }
 
     /// Wait up to `timeout` for every frame published on this handle so far to
@@ -1217,6 +1257,24 @@ impl<'a> SfColumnSender<'a> {
             .flush_arrow_batch_at_now(table, batch, overrides)
     }
 
+    /// Arrow counterpart of [`Self::flush_and_get_fsn`], letting the server
+    /// stamp each row's designated timestamp on arrival.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_now_and_get_fsn<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+    ) -> Result<Option<u64>>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_at_now_and_get_fsn(table, batch, overrides)
+    }
+
     /// Encode and publish an Arrow [`RecordBatch`](arrow_array::RecordBatch)
     /// into the queue, sourcing the designated timestamp from the named
     /// column. Publish-only; call [`Self::wait`] for an ack.
@@ -1235,6 +1293,25 @@ impl<'a> SfColumnSender<'a> {
         self.0
             .inner_mut()
             .flush_arrow_batch_at_column(table, batch, ts_column, overrides)
+    }
+
+    /// Arrow counterpart of [`Self::flush_and_get_fsn`], sourcing the
+    /// designated timestamp from the named column.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column_and_get_fsn<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow_array::RecordBatch,
+        ts_column: crate::ingress::ColumnName<'_>,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+    ) -> Result<Option<u64>>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_at_column_and_get_fsn(table, batch, ts_column, overrides)
     }
 }
 

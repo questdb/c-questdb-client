@@ -399,6 +399,23 @@ impl ColumnSender {
         .map_err(FlushFailure::into_error)
     }
 
+    /// Store-and-forward only: encode and publish `chunk` into the local SFA
+    /// queue and return the last published frame sequence number. If a chunk is
+    /// split into multiple frames, the returned FSN is the final frame boundary;
+    /// cumulative ACK coverage of that boundary covers the whole chunk.
+    pub fn flush_and_get_fsn(&mut self, chunk: &mut Chunk<'_>) -> Result<Option<u64>> {
+        match &mut self.backend {
+            ColumnSenderBackend::StoreAndForward(sfa) => sfa
+                .flush_chunk_and_get_fsn(chunk)
+                .map(Some)
+                .map_err(FlushFailure::into_error),
+            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "flush_and_get_fsn is store-and-forward only; direct column senders do not expose FSNs."
+            )),
+        }
+    }
+
     /// Publish `chunk` as a completion boundary, then wait until every frame
     /// published before or by this call on this borrowed sender reaches
     /// `ack_level` (see `doc/COLUMN_SENDER_ACK_BOUNDARY_FLUSH.md`).
@@ -453,6 +470,24 @@ impl ColumnSender {
     {
         let table: TableName<'t> = table.try_into()?;
         self.flush_arrow_batch_dispatch(table, batch, None, true, overrides, WaitForAck::No)
+            .map_err(FlushFailure::into_error)
+    }
+
+    /// Store-and-forward only: Arrow counterpart of [`Self::flush_and_get_fsn`]
+    /// for server-stamped batches.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_now_and_get_fsn<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<Option<u64>>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        self.flush_arrow_batch_dispatch_get_fsn(table, batch, None, true, overrides)
             .map_err(FlushFailure::into_error)
     }
 
@@ -513,6 +548,26 @@ impl ColumnSender {
         .map_err(FlushFailure::into_error)
     }
 
+    /// Store-and-forward only: Arrow counterpart of [`Self::flush_and_get_fsn`]
+    /// for batches whose designated timestamp is sourced from `ts_column`.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column_and_get_fsn<'t, T>(
+        &mut self,
+        table: T,
+        batch: &RecordBatch,
+        ts_column: ColumnName<'_>,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> Result<Option<u64>>
+    where
+        T: TryInto<TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        let table: TableName<'t> = table.try_into()?;
+        let ts_col_idx = arrow_batch::resolve_ts_column(batch, ts_column)?;
+        self.flush_arrow_batch_dispatch_get_fsn(table, batch, Some(ts_col_idx), false, overrides)
+            .map_err(FlushFailure::into_error)
+    }
+
     /// ACKing counterpart of [`Self::flush_arrow_batch_at_column`]: publish
     /// `batch` as a boundary, then wait for `ack_level`. The same
     /// boundary/durable/failure contract as [`Self::flush_and_wait`] applies.
@@ -565,6 +620,26 @@ impl ColumnSender {
             ColumnSenderBackend::StoreAndForward(sfa) => {
                 sfa.flush_arrow_batch(table, batch, ts_col_idx, server_stamp, overrides, wait)
             }
+        }
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    fn flush_arrow_batch_dispatch_get_fsn(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_col_idx: Option<usize>,
+        server_stamp: bool,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> std::result::Result<Option<u64>, FlushFailure> {
+        match &mut self.backend {
+            ColumnSenderBackend::StoreAndForward(sfa) => sfa
+                .flush_arrow_batch_and_get_fsn(table, batch, ts_col_idx, server_stamp, overrides)
+                .map(Some),
+            ColumnSenderBackend::Direct(_) => Err(FlushFailure::NotDelivered(error::fmt!(
+                InvalidApiCall,
+                "flush_arrow_batch_*_and_get_fsn is store-and-forward only; direct column senders do not expose FSNs."
+            ))),
         }
     }
 
@@ -646,6 +721,32 @@ impl ColumnSender {
             ColumnSenderBackend::Direct(_) => Err(error::fmt!(
                 InvalidApiCall,
                 "wait(timeout) is store-and-forward only; the direct sender uses commit()."
+            )),
+        }
+    }
+
+    /// Store-and-forward only: return the highest frame sequence number
+    /// published locally by this sender, or `None` if no frame has been
+    /// published.
+    pub fn published_fsn(&self) -> Result<Option<u64>> {
+        match &self.backend {
+            ColumnSenderBackend::StoreAndForward(sfa) => sfa.published_fsn(),
+            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "published_fsn is store-and-forward only; direct column senders do not expose FSNs."
+            )),
+        }
+    }
+
+    /// Store-and-forward only: return the highest frame sequence number
+    /// completed by server ACK or server-side reject-and-continue, or `None`
+    /// if no frame has completed.
+    pub fn acked_fsn(&self) -> Result<Option<u64>> {
+        match &self.backend {
+            ColumnSenderBackend::StoreAndForward(sfa) => sfa.acked_fsn(),
+            ColumnSenderBackend::Direct(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "acked_fsn is store-and-forward only; direct column senders do not expose FSNs."
             )),
         }
     }
@@ -989,6 +1090,21 @@ impl SfaColumnBackend {
         chunk: &mut Chunk<'_>,
         wait: WaitForAck,
     ) -> std::result::Result<(), FlushFailure> {
+        self.flush_chunk_boundary(chunk, wait).map(|_| ())
+    }
+
+    fn flush_chunk_and_get_fsn(
+        &mut self,
+        chunk: &mut Chunk<'_>,
+    ) -> std::result::Result<u64, FlushFailure> {
+        self.flush_chunk_boundary(chunk, WaitForAck::No)
+    }
+
+    fn flush_chunk_boundary(
+        &mut self,
+        chunk: &mut Chunk<'_>,
+        wait: WaitForAck,
+    ) -> std::result::Result<u64, FlushFailure> {
         // Preflight: durable opt-in is validated before encode/append, so a
         // rejected level leaves the chunk and queue untouched.
         if let WaitForAck::Yes(level) = wait {
@@ -1024,7 +1140,7 @@ impl SfaColumnBackend {
             self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
-        Ok(())
+        Ok(boundary)
     }
 
     /// Encode `range` (`None` = whole chunk, no slice allocation) as a replay
@@ -1111,6 +1227,39 @@ impl SfaColumnBackend {
         overrides: &[ArrowColumnOverride<'_>],
         wait: WaitForAck,
     ) -> std::result::Result<(), FlushFailure> {
+        self.flush_arrow_batch_boundary(table, batch, ts_col_idx, server_stamp, overrides, wait)
+            .map(|_| ())
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    fn flush_arrow_batch_and_get_fsn(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_col_idx: Option<usize>,
+        server_stamp: bool,
+        overrides: &[ArrowColumnOverride<'_>],
+    ) -> std::result::Result<u64, FlushFailure> {
+        self.flush_arrow_batch_boundary(
+            table,
+            batch,
+            ts_col_idx,
+            server_stamp,
+            overrides,
+            WaitForAck::No,
+        )
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    fn flush_arrow_batch_boundary(
+        &mut self,
+        table: TableName<'_>,
+        batch: &RecordBatch,
+        ts_col_idx: Option<usize>,
+        server_stamp: bool,
+        overrides: &[ArrowColumnOverride<'_>],
+        wait: WaitForAck,
+    ) -> std::result::Result<u64, FlushFailure> {
         if let WaitForAck::Yes(level) = wait {
             self.validate_ack_level(level)
                 .map_err(FlushFailure::NotDelivered)?;
@@ -1145,7 +1294,7 @@ impl SfaColumnBackend {
             self.wait_for_boundary(level, boundary, self.sync_timeout)
                 .map_err(FlushFailure::DeliveryUnknown)?;
         }
-        Ok(())
+        Ok(boundary)
     }
 
     /// Arrow counterpart of [`Self::publish_chunk_sfa`].
@@ -1233,6 +1382,14 @@ impl SfaColumnBackend {
             return Ok(());
         };
         self.wait_for_boundary(ack_level, boundary, timeout)
+    }
+
+    fn published_fsn(&self) -> Result<Option<u64>> {
+        qwp_ws_published_fsn_background(&self.state)
+    }
+
+    fn acked_fsn(&self) -> Result<Option<u64>> {
+        qwp_ws_acked_fsn_background(&self.state)
     }
 
     /// Block until the OK/durable watermark reaches `boundary`, then record it

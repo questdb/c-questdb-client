@@ -253,12 +253,41 @@ TEST_CASE("flush_arrow_batch_at_now: happy path marshals through to the C ABI")
     auto sch = make_schema("l", "v");
     try
     {
-        conn.flush_arrow_batch_at_now("t_at_now"_tn, arr, sch);
+        const auto fsn =
+            conn.flush_arrow_batch_at_now_and_get_fsn("t_at_now"_tn, arr, sch);
+        REQUIRE(fsn.has_value());
+        CHECK(conn.published_fsn() == fsn);
     }
     catch (const qdb::line_sender_error& e)
     {
         FAIL("flush_arrow_batch_at_now threw: " << e.what());
     }
+}
+
+TEST_CASE("borrowed_sf_column_sender exposes Arrow FSN helper")
+{
+    qm::MockServer server(std::vector<qm::Script>{
+        qm::Script{qm::ActionAwaitClientFrame{0x51}}});
+    questdb::pool db{
+        "qwpws::addr=" + server.addr() +
+        ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
+    auto conn = db.borrow_sf_column_sender();
+
+    auto col = pack_le<int64_t>({10, 20, 30});
+    auto arr = make_array(3, 0, {nullptr, col});
+    auto sch = make_schema("l", "v");
+    try
+    {
+        const auto fsn =
+            conn.flush_arrow_batch_at_now_and_get_fsn("t_borrowed"_tn, arr, sch);
+        REQUIRE(fsn.has_value());
+        CHECK(conn.published_fsn() == fsn);
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        FAIL("borrowed Arrow FSN flush threw: " << e.what());
+    }
+    conn.drop_on_return();
 }
 
 // Happy path for the second marshalling path: the designated timestamp is taken
@@ -310,7 +339,10 @@ TEST_CASE("flush_arrow_batch (at_column): happy path picks ts from named column"
     qdb::sf_column_sender_conn conn{mc.conn};
     try
     {
-        conn.flush_arrow_batch("t_at_col"_tn, outer_arr, outer_sch, "ts"_cn);
+        const auto fsn = conn.flush_arrow_batch_and_get_fsn(
+            "t_at_col"_tn, outer_arr, outer_sch, "ts"_cn);
+        REQUIRE(fsn.has_value());
+        CHECK(conn.published_fsn() == fsn);
     }
     catch (const qdb::line_sender_error& e)
     {

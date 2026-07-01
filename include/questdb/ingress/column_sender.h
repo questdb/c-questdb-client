@@ -78,8 +78,9 @@ typedef struct questdb_db questdb_db;
  *  happens-before ordering between the last use and the free (the internal
  *  latch only defers the drop for already-ordered interleavings).
  *
- *  Exposes publish-only `sf_column_sender_flush` plus the `sf_column_sender_wait`
- *  ack barrier; the store-and-forward queue owns delivery. */
+ *  Exposes publish-only `sf_column_sender_flush`, FSN-returning publish
+ *  variants, FSN progress watermarks, and the `sf_column_sender_wait` ack
+ *  barrier; the store-and-forward queue owns delivery. */
 typedef struct sf_column_sender sf_column_sender;
 
 /** Borrowed row-major QWP/WS sender. Not thread-safe; belongs to the
@@ -1321,6 +1322,49 @@ bool sf_column_sender_flush(
     line_sender_error** err_out);
 
 /**
+ * Publish a chunk locally through the borrowed store-and-forward column
+ * sender, clear it on success, and return the assigned frame sequence number.
+ * If the chunk is split into multiple QWP frames, `fsn_out` receives the last
+ * frame's FSN; cumulative ACK coverage of that FSN covers the whole chunk.
+ *
+ * Local publication means the frame was accepted by this sender's
+ * store-and-forward queue, before the server necessarily ACKs it. Use
+ * `sf_column_sender_wait` for a simple blocking barrier over everything
+ * published so far. Use FSNs for non-blocking progress tracking while the
+ * same borrowed sender is still held: publish with this function, keep doing
+ * work, and compare the saved FSN with `sf_column_sender_acked_fsn`.
+ */
+QUESTDB_CLIENT_API
+bool sf_column_sender_flush_and_get_fsn(
+    sf_column_sender* conn,
+    column_sender_chunk* chunk,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number published locally
+ * through this borrowed store-and-forward column sender, or no value if no
+ * frame has been published.
+ */
+QUESTDB_CLIENT_API
+bool sf_column_sender_published_fsn(
+    const sf_column_sender* conn,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK or
+ * drop-and-continue rejection, or no value if no frame has completed. In
+ * durable-ACK mode this watermark advances after durable ACK coverage; use
+ * `sf_column_sender_wait` when an explicit OK or durable barrier is needed.
+ */
+QUESTDB_CLIENT_API
+bool sf_column_sender_acked_fsn(
+    const sf_column_sender* conn,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
  * `ack_level` carries a `qwpws_ack_level_*` constant. The
  * parameter is `uint32_t` rather than `enum qwpws_ack_level` so
  * an out-of-range value returns `line_sender_error_invalid_api_call`
@@ -1374,8 +1418,10 @@ typedef struct column_sender_arrow_override
 
 /**
  * Encode an Arrow C Data Interface `RecordBatch` (struct-typed
- * `ArrowArray`) and publish it as one QWP frame, **without** a per-row
- * designated timestamp: the server stamps each row on arrival.
+ * `ArrowArray`) and publish it as one logical batch, **without** a per-row
+ * designated timestamp: the server stamps each row on arrival. The sender may
+ * split the batch into multiple QWP frames to stay under the negotiated
+ * frame-size cap.
  *
  * This is an explicit opt-in. If your batch carries a real event-time
  * column, use `sf_column_sender_flush_arrow_batch_at_column` instead —
@@ -1415,6 +1461,22 @@ bool sf_column_sender_flush_arrow_batch_at_now(
     line_sender_error** err_out);
 
 /**
+ * Same as `sf_column_sender_flush_arrow_batch_at_now`, but also returns the
+ * assigned frame sequence number. If the batch is split into multiple QWP
+ * frames, `fsn_out` receives the last frame's FSN.
+ */
+QUESTDB_CLIENT_API
+bool sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
+    sf_column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
  * Same as `sf_column_sender_flush_arrow_batch_at_now` but picks the
  * designated timestamp from a named column of the batch instead of
  * letting the server stamp each row. Same ownership and `overrides`
@@ -1429,6 +1491,23 @@ bool sf_column_sender_flush_arrow_batch_at_column(
     line_sender_column_name ts_column,
     const column_sender_arrow_override* overrides,
     size_t overrides_len,
+    line_sender_error** err_out);
+
+/**
+ * Same as `sf_column_sender_flush_arrow_batch_at_column`, but also returns the
+ * assigned frame sequence number. If the batch is split into multiple QWP
+ * frames, `fsn_out` receives the last frame's FSN.
+ */
+QUESTDB_CLIENT_API
+bool sf_column_sender_flush_arrow_batch_at_column_and_get_fsn(
+    sf_column_sender* conn,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */

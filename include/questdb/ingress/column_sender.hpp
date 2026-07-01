@@ -723,10 +723,10 @@ inline column_chunk& column_chunk::append_arrow_import(
 
 /**
  * Thin non-owning view over a borrowed `::sf_column_sender*`: publish-only
- * `flush` plus the `wait` ack barrier and the Arrow-batch ingest. The
- * store-and-forward queue owns delivery. Use this directly when adapting a
- * raw C-borrowed handle; `borrowed_sf_column_sender` keeps the same view
- * private so pooled leases cannot escape the guard.
+ * `flush`, FSN-returning publish/progress helpers, the `wait` ack barrier, and
+ * Arrow-batch ingest. The store-and-forward queue owns delivery. Use this
+ * directly when adapting a raw C-borrowed handle; `borrowed_sf_column_sender`
+ * keeps the same view private so pooled leases cannot escape the guard.
  */
 class sf_column_sender_conn
 {
@@ -749,6 +749,46 @@ public:
     {
         line_sender_error::wrapped_call(
             ::sf_column_sender_flush, _raw, chunk.c_ptr());
+    }
+
+    /**
+     * Publish `chunk` locally and return the assigned frame sequence number.
+     * If the chunk is split into multiple frames, the returned FSN is the last
+     * frame boundary.
+     */
+    std::optional<uint64_t> flush_and_get_fsn(column_chunk& chunk)
+    {
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::sf_column_sender_flush_and_get_fsn,
+            _raw,
+            chunk.c_ptr(),
+            &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number published locally,
+     * or `std::nullopt` if no frame has been published.
+     */
+    std::optional<uint64_t> published_fsn() const
+    {
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::sf_column_sender_published_fsn, _raw, &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK
+     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     */
+    std::optional<uint64_t> acked_fsn() const
+    {
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::sf_column_sender_acked_fsn, _raw, &fsn);
+        return optional_fsn(fsn);
     }
 
     /**
@@ -798,6 +838,30 @@ public:
     }
 
     /**
+     * FSN-returning counterpart of `flush_arrow_batch_at_now`.
+     */
+    std::optional<uint64_t> flush_arrow_batch_at_now_and_get_fsn(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        ::line_sender_table_name table_c{table.size(), table.data()};
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::sf_column_sender_flush_arrow_batch_at_now_and_get_fsn,
+            _raw,
+            table_c,
+            &array,
+            &schema,
+            overrides,
+            overrides_len,
+            &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
      * Publish-only Arrow flush sourcing the designated timestamp from a named
      * `Timestamp(_)` column of the batch. Pair with `wait()`.
      */
@@ -821,9 +885,44 @@ public:
             overrides,
             overrides_len);
     }
+
+    /**
+     * FSN-returning counterpart of `flush_arrow_batch`.
+     */
+    std::optional<uint64_t> flush_arrow_batch_and_get_fsn(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        ::line_sender_table_name table_c{table.size(), table.data()};
+        ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::sf_column_sender_flush_arrow_batch_at_column_and_get_fsn,
+            _raw,
+            table_c,
+            &array,
+            &schema,
+            ts_c,
+            overrides,
+            overrides_len,
+            &fsn);
+        return optional_fsn(fsn);
+    }
 #endif
 
 private:
+    static std::optional<uint64_t> optional_fsn(
+        const ::line_sender_qwpws_fsn& fsn)
+    {
+        if (fsn.has_value)
+            return fsn.value;
+        return std::nullopt;
+    }
+
     ::sf_column_sender* _raw;
 };
 
@@ -838,7 +937,9 @@ class pool;
  *
  * The store-and-forward queue owns delivery, so destruction does not lose
  * accepted frames; `wait()` is an ack barrier, not a commit step. The
- * destructor is non-blocking by design.
+ * destructor is non-blocking by design. Use `wait()` for a simple barrier over
+ * everything published so far; use FSNs for non-blocking progress tracking
+ * while you still hold the same borrowed sender.
  */
 class borrowed_sf_column_sender
 {
@@ -891,6 +992,34 @@ public:
     }
 
     /**
+     * Publish `chunk` locally and return the assigned frame sequence number.
+     * If the chunk is split into multiple frames, the returned FSN is the last
+     * frame boundary. Use `wait()` for a simple blocking ack barrier.
+     */
+    std::optional<uint64_t> flush_and_get_fsn(column_chunk& chunk)
+    {
+        return _conn.flush_and_get_fsn(chunk);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number published locally,
+     * or `std::nullopt` if no frame has been published.
+     */
+    std::optional<uint64_t> published_fsn() const
+    {
+        return _conn.published_fsn();
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK
+     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     */
+    std::optional<uint64_t> acked_fsn() const
+    {
+        return _conn.acked_fsn();
+    }
+
+    /**
      * Block until every frame published on this conn so far reaches `level`.
      * The SFA queue owns delivery, so this is needed only to *observe* the ack,
      * never for durability. `timeout` is a no-progress deadline (it fires only
@@ -922,6 +1051,20 @@ public:
     }
 
     /**
+     * FSN-returning counterpart of `flush_arrow_batch_at_now`.
+     */
+    std::optional<uint64_t> flush_arrow_batch_at_now_and_get_fsn(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        return _conn.flush_arrow_batch_at_now_and_get_fsn(
+            table, array, schema, overrides, overrides_len);
+    }
+
+    /**
      * Publish-only Arrow flush sourcing the designated timestamp from a named
      * `Timestamp(_)` column of the batch. Pair with `wait()`.
      */
@@ -934,6 +1077,21 @@ public:
         size_t overrides_len = 0)
     {
         _conn.flush_arrow_batch(
+            table, array, schema, ts_column, overrides, overrides_len);
+    }
+
+    /**
+     * FSN-returning counterpart of `flush_arrow_batch`.
+     */
+    std::optional<uint64_t> flush_arrow_batch_and_get_fsn(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        const ::column_sender_arrow_override* overrides = nullptr,
+        size_t overrides_len = 0)
+    {
+        return _conn.flush_arrow_batch_and_get_fsn(
             table, array, schema, ts_column, overrides, overrides_len);
     }
 #endif

@@ -139,8 +139,14 @@ TEST_CASE("column_chunk flush round-trips through the mock")
     chunk.column_i64("qty", qty, 3)
          .designated_timestamp_nanos(ts, 3);
 
-    conn.flush(chunk);
+    CHECK_FALSE(conn.published_fsn().has_value());
+    CHECK_FALSE(conn.acked_fsn().has_value());
+
+    const auto fsn = conn.flush_and_get_fsn(chunk);
+    REQUIRE(fsn.has_value());
     CHECK(chunk.row_count() == 0);
+    CHECK(conn.published_fsn() == fsn);
+    CHECK_FALSE(conn.acked_fsn().has_value());
 
     // The mock graceful-closes after one frame, so sync() would hang.
     conn.drop_on_return();

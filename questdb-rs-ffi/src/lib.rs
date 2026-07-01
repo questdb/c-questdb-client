@@ -5818,6 +5818,58 @@ mod tests {
         }
     }
 
+    fn fill_column_chunk(
+        chunk: *mut column_sender_chunk,
+        qty: i64,
+        err: &mut *mut line_sender_error,
+    ) {
+        unsafe {
+            let qtys = [qty];
+            let timestamps = [1_700_000_000_000_000_000i64];
+            assert!(column_sender_chunk_column_i64(
+                chunk,
+                b"qty".as_ptr() as *const c_char,
+                3,
+                qtys.as_ptr(),
+                qtys.len(),
+                ptr::null(),
+                err
+            ));
+            assert!(err.is_null());
+            assert!(column_sender_chunk_designated_timestamp_nanos(
+                chunk,
+                timestamps.as_ptr(),
+                timestamps.len(),
+                err
+            ));
+            assert!(err.is_null());
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    fn export_i64_arrow_array(
+        values: Vec<i64>,
+    ) -> (arrow::ffi::FFI_ArrowArray, arrow::ffi::FFI_ArrowSchema) {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field};
+        use arrow_array::{Array, ArrayRef, Int64Array, StructArray};
+
+        let column = Arc::new(Int64Array::from(values)) as ArrayRef;
+        let array = StructArray::from(vec![(
+            Arc::new(Field::new("qty", DataType::Int64, false)),
+            column,
+        )]);
+        arrow::ffi::to_ffi(&array.to_data()).expect("export Arrow array to C data interface")
+    }
+
+    #[cfg(feature = "arrow")]
+    unsafe fn release_arrow_array_if_needed(array: &mut arrow::ffi::FFI_ArrowArray) {
+        if let Some(release) = array.release {
+            unsafe { release(array) };
+        }
+    }
+
     fn assert_line_error_contains(
         err: &mut *mut line_sender_error,
         code: line_sender_error_code,
@@ -5903,6 +5955,261 @@ mod tests {
 
             questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
             column_sender_chunk_free(chunk);
+        }
+    }
+
+    #[test]
+    fn pooled_column_sender_fsn_apis_report_publication_progress() {
+        let server = PooledQwpMock::spawn(1);
+        unsafe {
+            let mut err = ptr::null_mut();
+            let conf = server.conf();
+            let db = connect_pool(&conf, &mut err);
+
+            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            let table = b"trades";
+            let chunk =
+                column_sender_chunk_new(table.as_ptr() as *const c_char, table.len(), &mut err);
+            assert!(!chunk.is_null());
+            assert!(err.is_null());
+
+            let mut fsn = line_sender_qwpws_fsn {
+                has_value: true,
+                value: u64::MAX,
+            };
+            assert!(sf_column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(err.is_null());
+            assert!(!fsn.has_value);
+            assert_eq!(fsn.value, 0);
+
+            fsn = line_sender_qwpws_fsn {
+                has_value: true,
+                value: u64::MAX,
+            };
+            assert!(sf_column_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(err.is_null());
+            assert!(!fsn.has_value);
+            assert_eq!(fsn.value, 0);
+
+            fill_column_chunk(chunk, 42, &mut err);
+
+            assert!(sf_column_sender_flush_and_get_fsn(
+                sender, chunk, &mut fsn, &mut err
+            ));
+            assert!(err.is_null());
+            assert!(fsn.has_value);
+            let first_fsn = fsn.value;
+            assert_eq!(column_sender_chunk_row_count(chunk, &mut err), 0);
+            assert!(err.is_null());
+
+            assert!(sf_column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(err.is_null());
+            assert!(fsn.has_value);
+            assert_eq!(fsn.value, first_fsn);
+
+            assert!(sf_column_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(err.is_null());
+            assert!(!fsn.has_value);
+
+            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
+            column_sender_chunk_free(chunk);
+            questdb_db_close(db);
+        }
+    }
+
+    #[test]
+    fn sf_column_sender_fsn_outputs_are_required() {
+        unsafe {
+            let mut err = ptr::null_mut();
+
+            assert!(!sf_column_sender_flush_and_get_fsn(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_flush_and_get_fsn requires non-NULL fsn_out",
+            );
+
+            assert!(!sf_column_sender_published_fsn(
+                ptr::null(),
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_published_fsn requires non-NULL fsn_out",
+            );
+
+            assert!(!sf_column_sender_acked_fsn(
+                ptr::null(),
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_acked_fsn requires non-NULL fsn_out",
+            );
+        }
+    }
+
+    #[test]
+    fn sf_column_sender_fsn_apis_reject_null_sender() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let mut fsn = line_sender_qwpws_fsn {
+                has_value: true,
+                value: u64::MAX,
+            };
+
+            assert!(!sf_column_sender_flush_and_get_fsn(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut fsn,
+                &mut err
+            ));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_flush_and_get_fsn: conn pointer is NULL",
+            );
+
+            assert!(!sf_column_sender_published_fsn(
+                ptr::null(),
+                &mut fsn,
+                &mut err
+            ));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_published_fsn: conn pointer is NULL",
+            );
+
+            assert!(!sf_column_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_acked_fsn: conn pointer is NULL",
+            );
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn pooled_column_sender_arrow_fsn_api_reports_publication_progress() {
+        let server = PooledQwpMock::spawn(1);
+        unsafe {
+            let mut err = ptr::null_mut();
+            let conf = server.conf();
+            let db = connect_pool(&conf, &mut err);
+
+            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            let (mut array, schema) = export_i64_arrow_array(vec![1, 2, 3]);
+            let mut fsn = line_sender_qwpws_fsn {
+                has_value: false,
+                value: 0,
+            };
+            let ok = sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
+                sender,
+                table_name(b"trades"),
+                &mut array,
+                &schema,
+                ptr::null(),
+                0,
+                &mut fsn,
+                &mut err,
+            );
+            if !ok {
+                let message = if err.is_null() {
+                    "<no error object>".to_string()
+                } else {
+                    read_error_message(err)
+                };
+                panic!("Arrow FSN flush failed: {message}");
+            }
+            assert!(err.is_null());
+            assert!(
+                array.release.is_none(),
+                "successful Arrow FSN flush must consume the ArrowArray"
+            );
+            assert!(fsn.has_value);
+            let first_fsn = fsn.value;
+
+            assert!(sf_column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(err.is_null());
+            assert!(fsn.has_value);
+            assert_eq!(fsn.value, first_fsn);
+
+            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
+            questdb_db_close(db);
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn sf_column_sender_arrow_fsn_output_is_required_before_import() {
+        let server = PooledQwpMock::spawn(1);
+        unsafe {
+            let mut err = ptr::null_mut();
+            let conf = server.conf();
+            let db = connect_pool(&conf, &mut err);
+
+            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            let (mut array, schema) = export_i64_arrow_array(vec![1, 2, 3]);
+            assert!(!sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
+                sender,
+                table_name(b"trades"),
+                &mut array,
+                &schema,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
+            );
+            assert!(
+                array.release.is_some(),
+                "NULL fsn_out must be rejected before ArrowArray import"
+            );
+            release_arrow_array_if_needed(&mut array);
+
+            assert!(!sf_column_sender_flush_arrow_batch_at_column_and_get_fsn(
+                sender,
+                table_name(b"trades"),
+                ptr::null_mut(),
+                ptr::null(),
+                column_name(b"ts"),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_line_error_contains(
+                &mut err,
+                line_sender_error_code::line_sender_error_invalid_api_call,
+                "sf_column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
+            );
+
+            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
+            questdb_db_close(db);
         }
     }
 

@@ -483,8 +483,10 @@ Required behavior:
 - for `Halt`, terminalize the backend and retain diagnostics;
 - make the error observable through the same surfaces used by row SFA.
 
-Columnar SFA v1 has one QWP frame per flushed chunk or dataframe batch, so the
-affected range for a server rejection should normally be one FSN.
+Columnar SFA may split one flushed chunk or dataframe batch into multiple QWP
+frames when needed to stay under the negotiated frame-size cap. Server
+rejections remain frame/FSN-scoped: the affected range for one rejection should
+normally be the rejected frame's FSN.
 
 Additional column-specific boundary rule:
 

@@ -49,8 +49,8 @@ use questdb::{Error, ErrorCode};
 #[cfg(feature = "arrow")]
 use crate::line_sender_column_name;
 use crate::{
-    line_sender_error, line_sender_table_name, qwpws_ack_level_durable, qwpws_ack_level_ok,
-    set_err_out_from_error, set_err_out_from_error_with_qwpws,
+    line_sender_error, line_sender_qwpws_fsn, line_sender_table_name, qwpws_ack_level_durable,
+    qwpws_ack_level_ok, set_err_out_from_error, set_err_out_from_error_with_qwpws,
 };
 
 // ===========================================================================
@@ -290,6 +290,27 @@ unsafe fn reject_closed_pool_cs<T: CsHandle>(
                 Error::new(
                     ErrorCode::InvalidApiCall,
                     format!("{fn_name}: QuestDb pool is closed"),
+                ),
+            );
+        }
+        true
+    } else {
+        false
+    }
+}
+
+unsafe fn reject_null_fsn_out(
+    fsn_out: *mut line_sender_qwpws_fsn,
+    fn_name: &str,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if fsn_out.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name} requires non-NULL fsn_out"),
                 ),
             );
         }
@@ -2618,6 +2639,170 @@ pub unsafe extern "C" fn sf_column_sender_flush(
     unsafe { cs_flush_body(conn, chunk, "sf_column_sender_flush", err_out) }
 }
 
+/// Publish-only store-and-forward flush that also returns the local frame
+/// sequence boundary. If a chunk is split into multiple frames, the returned
+/// FSN is the final frame boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sf_column_sender_flush_and_get_fsn(
+    conn: *mut sf_column_sender,
+    chunk: *mut column_sender_chunk,
+    fsn_out: *mut line_sender_qwpws_fsn,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let fn_name = "sf_column_sender_flush_and_get_fsn";
+    if unsafe { reject_null_fsn_out(fsn_out, fn_name, err_out) } {
+        return false;
+    }
+    if conn.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: conn pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    let _conn_guard = match unsafe {
+        InUseGuard::acquire(
+            conn,
+            sf_column_sender::latch(conn),
+            fn_name,
+            "sf_column_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if unsafe { reject_closed_pool_cs(conn, fn_name, err_out) } {
+        return false;
+    }
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _chunk_guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            fn_name,
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let sender = unsafe { sf_column_sender::owned_mut(conn).get_mut() };
+    let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    match sender.flush_and_get_fsn(chunk_inner) {
+        Ok(fsn) => {
+            unsafe {
+                *fsn_out = line_sender_qwpws_fsn::from_option(fsn);
+            }
+            true
+        }
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
+unsafe fn sf_column_sender_fsn_watermark(
+    conn: *const sf_column_sender,
+    fsn_out: *mut line_sender_qwpws_fsn,
+    fn_name: &str,
+    err_out: *mut *mut line_sender_error,
+    read: fn(&questdb::ingress::column_sender::ColumnSender) -> questdb::Result<Option<u64>>,
+) -> bool {
+    if unsafe { reject_null_fsn_out(fsn_out, fn_name, err_out) } {
+        return false;
+    }
+    if conn.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: conn pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    let handle = conn as *mut sf_column_sender;
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            handle,
+            sf_column_sender::latch(conn),
+            fn_name,
+            "sf_column_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if unsafe { reject_closed_pool_cs(conn, fn_name, err_out) } {
+        return false;
+    }
+    let sender = unsafe { sf_column_sender::owned_ref(conn).get() };
+    match read(sender) {
+        Ok(fsn) => {
+            unsafe {
+                *fsn_out = line_sender_qwpws_fsn::from_option(fsn);
+            }
+            true
+        }
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
+/// Return the highest QWP/WebSocket frame sequence number published locally
+/// through this store-and-forward column sender, or no value if no frame has
+/// been published.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sf_column_sender_published_fsn(
+    conn: *const sf_column_sender,
+    fsn_out: *mut line_sender_qwpws_fsn,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        sf_column_sender_fsn_watermark(
+            conn,
+            fsn_out,
+            "sf_column_sender_published_fsn",
+            err_out,
+            |sender| sender.published_fsn(),
+        )
+    }
+}
+
+/// Return the highest QWP/WebSocket frame sequence number completed by ACK or
+/// drop-and-continue rejection, or no value if no frame has completed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sf_column_sender_acked_fsn(
+    conn: *const sf_column_sender,
+    fsn_out: *mut line_sender_qwpws_fsn,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        sf_column_sender_fsn_watermark(
+            conn,
+            fsn_out,
+            "sf_column_sender_acked_fsn",
+            err_out,
+            |sender| sender.acked_fsn(),
+        )
+    }
+}
+
 /// Pipeline a deferred frame on a direct connection. Not committed until
 /// `direct_column_sender_commit` / `direct_column_sender_flush_and_wait`.
 #[unsafe(no_mangle)]
@@ -2773,6 +2958,36 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now(
     }
 }
 
+/// FSN-returning counterpart of `sf_column_sender_flush_arrow_batch_at_now`.
+/// Local publication semantics and Arrow ownership are the same as the
+/// non-FSN variant.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
+    conn: *mut sf_column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    fsn_out: *mut line_sender_qwpws_fsn,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl_and_get_fsn(
+            conn,
+            table,
+            array,
+            schema,
+            None,
+            overrides,
+            overrides_len,
+            fsn_out,
+            err_out,
+        )
+    }
+}
+
 /// Direct-handle publish-only Arrow flush (server-stamped). Pair with
 /// `direct_column_sender_commit`, or use
 /// `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
@@ -2827,6 +3042,36 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column(
             Some(ts_column),
             overrides,
             overrides_len,
+            err_out,
+        )
+    }
+}
+
+/// FSN-returning counterpart of
+/// `sf_column_sender_flush_arrow_batch_at_column`.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column_and_get_fsn(
+    conn: *mut sf_column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: line_sender_column_name,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    fsn_out: *mut line_sender_qwpws_fsn,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl_and_get_fsn(
+            conn,
+            table,
+            array,
+            schema,
+            Some(ts_column),
+            overrides,
+            overrides_len,
+            fsn_out,
             err_out,
         )
     }
@@ -3169,6 +3414,83 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
             // write fails mid-frame with `FailoverRetry` yet is delivery-
             // unknown (`in_doubt`), so re-exporting it would invite a duplicate-
             // causing retry. Re-export only a provably-not-delivered failure.
+            if err.code() == ErrorCode::FailoverRetry && !err.in_doubt() {
+                unsafe { reexport_record_batch_into(rb, array, schema) };
+            }
+            unsafe { set_err_out_from_error(err_out, err) };
+            false
+        }
+    }
+}
+
+#[cfg(feature = "arrow")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn arrow_batch_impl_and_get_fsn(
+    conn: *mut sf_column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: Option<line_sender_column_name>,
+    overrides_ptr: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    fsn_out: *mut line_sender_qwpws_fsn,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    const FN_NAME: &str = "sf_column_sender_flush_arrow_batch_*_and_get_fsn";
+    if unsafe { reject_null_fsn_out(fsn_out, FN_NAME, err_out) } {
+        return false;
+    }
+    if conn.is_null() {
+        crate::arrow_err_to_c_box(
+            err_out,
+            ErrorCode::InvalidApiCall,
+            format!("{FN_NAME}: conn pointer is NULL"),
+        );
+        return false;
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            conn,
+            sf_column_sender::latch(conn),
+            FN_NAME,
+            "sf_column_sender",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if unsafe { reject_closed_pool_cs(conn, FN_NAME, err_out) } {
+        return false;
+    }
+    let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let rb = match unsafe { crate::arrow_ffi_import_record_batch(array, schema, FN_NAME, err_out) }
+    {
+        Some(rb) => rb,
+        None => return false,
+    };
+    let table_name = unsafe { table.as_name() };
+    let sender = unsafe { sf_column_sender::owned_mut(conn).get_mut() };
+    let result = match ts_column {
+        Some(ts) => sender.flush_arrow_batch_at_column_and_get_fsn(
+            table_name,
+            &rb,
+            ts.as_name(),
+            &overrides,
+        ),
+        None => sender.flush_arrow_batch_at_now_and_get_fsn(table_name, &rb, &overrides),
+    };
+    match result {
+        Ok(fsn) => {
+            unsafe {
+                *fsn_out = line_sender_qwpws_fsn::from_option(fsn);
+            }
+            true
+        }
+        Err(err) => {
             if err.code() == ErrorCode::FailoverRetry && !err.in_doubt() {
                 unsafe { reexport_record_batch_into(rb, array, schema) };
             }
