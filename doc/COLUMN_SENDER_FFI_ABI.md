@@ -339,6 +339,14 @@ Row-major pooled senders expose the same QWP/WebSocket FSN progress shape as
 the standalone `line_sender_qwpws_*` helpers. Use the FSN-returning flush
 variants to publish without blocking for a server ACK, then poll
 `row_sender_acked_fsn` or call `row_sender_wait` when an ACK barrier is needed.
+`row_sender_wait` is the simple barrier for everything published so far.
+FSN polling is for non-blocking/pipelined producers that still hold the same
+borrowed row sender: keep the returned FSN and treat that publication boundary
+as completed once `row_sender_acked_fsn` returns a value greater than or equal
+to it. FSNs are sender-stream watermarks, not portable receipts to check
+through an arbitrary later pool borrow. If `row_sender_wait` times out, the
+frames remain queued; retry the wait or keep observing the watermark rather
+than re-flushing the same data.
 
 ```c
 QUESTDB_CLIENT_API
@@ -1162,7 +1170,8 @@ bool column_sender_flush(
  *
  * The QWP wire `sequence` (FSN) is tracked internally by the column-sender
  * sync surface and is not exposed there. Row-major pooled senders expose FSN
- * helpers in the pool row-sender API.
+ * helpers in the pool row-sender API for same-borrow, non-blocking progress
+ * tracking.
  */
 QUESTDB_CLIENT_API
 bool column_sender_sync(

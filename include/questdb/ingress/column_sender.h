@@ -378,7 +378,16 @@ bool row_sender_flush_and_keep(
 /**
  * Publish a QWP/WebSocket buffer locally through the borrowed row sender,
  * clear it on success, and return the assigned frame sequence number. Empty
- * buffers succeed with `fsn_out->has_value == false`.
+ * buffers succeed with `fsn_out->has_value == false`. Local publication means
+ * the frame was accepted by this sender's replay queue, before the server
+ * necessarily ACKs it.
+ *
+ * FSN progress tracking is for non-blocking pipelining while the same
+ * borrowed row sender is still held. Use `row_sender_wait` for a simple
+ * blocking barrier over everything published so far. Otherwise publish with
+ * an FSN-returning flush, keep doing work, and compare the saved FSN with
+ * `row_sender_acked_fsn`. FSNs are sender-stream watermarks, not portable
+ * receipts to check through an arbitrary later pool borrow.
  */
 QUESTDB_CLIENT_API
 bool row_sender_flush_and_get_fsn(
@@ -390,7 +399,8 @@ bool row_sender_flush_and_get_fsn(
 /**
  * Publish a QWP/WebSocket buffer locally through the borrowed row sender
  * without clearing it and return the assigned frame sequence number. Empty
- * buffers succeed with `fsn_out->has_value == false`.
+ * buffers succeed with `fsn_out->has_value == false`. The returned FSN has
+ * the same local-publication semantics as `row_sender_flush_and_get_fsn`.
  */
 QUESTDB_CLIENT_API
 bool row_sender_flush_and_keep_and_get_fsn(
@@ -402,7 +412,7 @@ bool row_sender_flush_and_keep_and_get_fsn(
 /**
  * Return the highest QWP/WebSocket frame sequence number published locally
  * through this borrowed row sender, or no value if no frame has been
- * published.
+ * published. This is a stream watermark for the currently borrowed sender.
  */
 QUESTDB_CLIENT_API
 bool row_sender_published_fsn(
@@ -412,7 +422,12 @@ bool row_sender_published_fsn(
 
 /**
  * Return the highest QWP/WebSocket frame sequence number completed by ACK or
- * drop-and-continue rejection, or no value if no frame has completed.
+ * drop-and-continue rejection, or no value if no frame has completed. After
+ * an FSN-returning flush publishes `fsn`, that publication boundary has
+ * completed once this function returns a value greater than or equal to
+ * `fsn`. In durable-ACK mode this watermark advances after durable ACK
+ * coverage; use `row_sender_wait` when an explicit OK or durable barrier is
+ * needed.
  */
 QUESTDB_CLIENT_API
 bool row_sender_acked_fsn(
@@ -429,6 +444,9 @@ bool row_sender_acked_fsn(
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
+ * On timeout the frames remain queued and the background runner keeps
+ * delivering them, so recover by calling `row_sender_wait` again, or by
+ * observing the FSN watermark, rather than re-flushing the same data.
  *
  * Returns `true` once acknowledged; on the no-progress timeout, a server
  * rejection, a transport failure, an invalid `ack_level`, or NULL `sender`

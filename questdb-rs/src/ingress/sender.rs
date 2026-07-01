@@ -564,6 +564,11 @@ impl Sender {
     /// semantics as [`Sender::flush`]: it returns after the frame is accepted
     /// by the local replay queue, before the server necessarily ACKs it. Empty
     /// buffers return `Ok(None)`.
+    ///
+    /// Use this when you need non-blocking/pipelined progress tracking on this
+    /// sender stream: keep the returned FSN and compare it with
+    /// [`Self::acked_fsn`]. Use [`Self::wait`] instead when you only need a
+    /// blocking barrier for everything published so far.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
         let fsn = self.flush_and_keep_and_get_fsn(buf)?;
@@ -573,6 +578,9 @@ impl Sender {
 
     /// Publish the QWP/WebSocket buffer without clearing it and return the
     /// highest published frame sequence number.
+    ///
+    /// The returned FSN has the same local-publication semantics as
+    /// [`Self::flush_and_get_fsn`].
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
         self.flush_qwp_ws_buffer(buf, false)
@@ -580,6 +588,8 @@ impl Sender {
 
     /// Return the highest frame sequence number published locally by this
     /// QWP/WebSocket sender, or `None` if no frame has been published.
+    ///
+    /// This is a sender-stream watermark, not a process-global receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn published_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -596,6 +606,11 @@ impl Sender {
     /// server-side reject-and-continue, or `None` if no frame has completed.
     /// In QWP/WebSocket durable ACK mode, ordinary OK frames only release send
     /// window pressure; this watermark advances after durable ACK coverage.
+    ///
+    /// After [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
+    /// boundary has completed once this method returns a value greater than or
+    /// equal to `fsn`. Use [`Self::wait`] when you need an explicit
+    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {

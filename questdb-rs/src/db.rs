@@ -1495,6 +1495,13 @@ impl Drop for OwnedColumnSender {
 /// [`Self::drop_on_return`] was called), in which case it is dropped and the
 /// next borrow opens a fresh one.
 ///
+/// Use [`Self::wait`] for the simple case: a blocking barrier for everything
+/// published so far through this borrowed sender. Use FSNs for non-blocking
+/// pipelining while you still hold the same borrowed sender: publish with
+/// [`Self::flush_and_get_fsn`], keep doing work, then compare the saved FSN
+/// with [`Self::acked_fsn`]. FSNs are stream watermarks, not portable receipts
+/// to check through an arbitrary later pool borrow.
+///
 /// `BorrowedRowSender` is **not** `Send` or `Sync`: the borrowed connection
 /// belongs to the borrowing thread for the duration of the borrow.
 pub struct BorrowedRowSender<'a> {
@@ -1552,30 +1559,58 @@ impl<'a> BorrowedRowSender<'a> {
 
     /// Publish the QWP/WebSocket buffer, clear it, and return the highest
     /// published frame sequence number.
+    ///
+    /// This is the non-blocking progress-tracking form of [`Self::flush`]:
+    /// success means the frame was accepted by this sender's local replay
+    /// queue, not that the server has ACKed it. Keep the returned FSN while
+    /// this borrowed sender is still held, then compare it with
+    /// [`Self::acked_fsn`] to observe when the publication boundary has
+    /// completed. Use [`Self::wait`] instead when you only need a simple
+    /// blocking barrier for everything published so far.
     pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
         self.sender_mut().flush_and_get_fsn(buf)
     }
 
     /// Publish the QWP/WebSocket buffer without clearing it and return the
     /// highest published frame sequence number.
+    ///
+    /// The returned FSN has the same local-publication semantics as
+    /// [`Self::flush_and_get_fsn`].
     pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
         self.sender_mut().flush_and_keep_and_get_fsn(buf)
     }
 
     /// Return the highest frame sequence number published locally by this
     /// sender, or `None` if no frame has been published.
+    ///
+    /// This is a stream watermark for the currently borrowed sender. Treat
+    /// saved FSNs as meaningful only with the sender stream that produced
+    /// them; returning the handle to the pool does not create a portable
+    /// receipt that can be checked through an arbitrary later borrow.
     pub fn published_fsn(&self) -> Result<Option<u64>> {
         self.sender_ref().published_fsn()
     }
 
     /// Return the highest frame sequence number completed by server ACK or
     /// server-side reject-and-continue, or `None` if no frame has completed.
+    ///
+    /// This is useful for non-blocking pipelining: after
+    /// [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
+    /// boundary has completed once this method returns a value greater than
+    /// or equal to `fsn`. In durable-ACK mode this watermark advances after
+    /// durable ACK coverage; use [`Self::wait`] when you need an explicit
+    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier.
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         self.sender_ref().acked_fsn()
     }
 
     /// Block until every frame published so far through this sender reaches
     /// `ack_level`.
+    ///
+    /// Prefer this over FSN polling unless you need to keep publishing or doing
+    /// other work while ACKs arrive. If it times out, the frames remain queued;
+    /// retry `wait()` or keep observing the watermark rather than re-flushing
+    /// the same data.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.sender_mut().wait(ack_level, timeout)
     }

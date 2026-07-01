@@ -986,6 +986,13 @@ private:
  * rows with a `questdb::ingress::line_sender_buffer` and send them via
  * `flush()` / `flush_and_keep()` or the FSN-returning variants.
  *
+ * Use `wait()` for the simple case: a blocking barrier for everything
+ * published so far through this borrowed sender. Use FSNs for non-blocking
+ * pipelining while you still hold the same borrowed sender: publish with
+ * `flush_and_get_fsn()`, keep doing work, then compare the saved FSN with
+ * `acked_fsn()`. FSNs are stream watermarks, not portable receipts to check
+ * through an arbitrary later pool borrow.
+ *
  * Constructed only via `pool::borrow_row_sender()`.
  */
 class borrowed_row_sender
@@ -1092,6 +1099,8 @@ public:
     /**
      * Publish a QWP/WebSocket buffer locally, clear it on success, and return
      * the assigned frame sequence number. Empty buffers return `std::nullopt`.
+     * Local publication means the frame was accepted by this sender's replay
+     * queue, before the server necessarily ACKs it.
      */
     std::optional<uint64_t> flush_and_get_fsn(line_sender_buffer& buffer)
     {
@@ -1108,6 +1117,8 @@ public:
     /**
      * Publish a QWP/WebSocket buffer locally without clearing it and return the
      * assigned frame sequence number. Empty buffers return `std::nullopt`.
+     * The returned FSN has the same local-publication semantics as
+     * `flush_and_get_fsn()`.
      */
     std::optional<uint64_t> flush_and_keep_and_get_fsn(
         const line_sender_buffer& buffer)
@@ -1125,6 +1136,7 @@ public:
     /**
      * Return the highest QWP/WebSocket frame sequence number published locally,
      * or `std::nullopt` if no frame has been published.
+     * This is a stream watermark for the currently borrowed sender.
      */
     std::optional<uint64_t> published_fsn() const
     {
@@ -1137,6 +1149,10 @@ public:
     /**
      * Return the highest QWP/WebSocket frame sequence number completed by ACK
      * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     * After `flush_and_get_fsn()` returns `fsn`, the publication boundary has
+     * completed once `acked_fsn()` returns a value greater than or equal to
+     * `fsn`. In durable-ACK mode this watermark advances after durable ACK
+     * coverage; use `wait()` when you need an explicit OK or durable barrier.
      */
     std::optional<uint64_t> acked_fsn() const
     {
@@ -1152,7 +1168,9 @@ public:
      * for durability. `timeout` is a no-progress deadline (it fires only if
      * the ack watermark fails to advance for that long); the default of zero
      * waits indefinitely. Mirrors `sf_column_sender_conn::wait` and Rust's
-     * `Sender::wait`.
+     * `Sender::wait`. If it times out, the frames remain queued; retry
+     * `wait()` or keep observing the watermark instead of re-flushing the same
+     * data.
      * @throws line_sender_error on failure.
      */
     void wait(
