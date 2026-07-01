@@ -33,7 +33,7 @@
 //!
 //! Each pool slot is handed out as a [`SfColumnSender`] which returns
 //! itself to the pool on `Drop`. Slots whose underlying connection has
-//! latched into `must_close=true` are dropped on return instead of being
+//! latched terminal state are dropped on return instead of being
 //! recycled.
 //!
 //! The same `QuestDb` can also hand out **row-major**
@@ -45,6 +45,7 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
+#[cfg(feature = "_egress")]
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,8 +56,8 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "_egress")]
 use crate::egress::Reader;
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
+use crate::ingress::{Buffer, Sender, SenderBuilder};
 use crate::ingress::{QwpWsConnector, RawQwpWsRoundStream};
-use crate::ingress::{Sender, SenderBuilder};
 // The reconnect backoff helpers are only consumed by the retry-capable borrow
 // paths: the row-major polars `reborrow_with_retry` and the FFI owned
 // `*_with_retry` entry points. Keep the import unconditional (so the shared
@@ -554,10 +555,10 @@ impl QuestDb {
     /// free list and `pool_max` cap. Borrow at the cap returns
     /// [`ErrorCode::InvalidApiCall`](crate::ErrorCode::InvalidApiCall).
     ///
-    /// The returned [`BorrowedRowSender`] derefs to `Sender`, so the usual
-    /// `Buffer` build + `flush` flow works unchanged, and returns the sender
-    /// to the pool on `Drop` (unless its connection latched `must_close`, or
-    /// [`BorrowedRowSender::mark_must_close`] was called, in which case it is
+    /// The returned [`BorrowedRowSender`] exposes the usual `Buffer` build +
+    /// `flush` flow directly, and returns the sender to the pool on `Drop`
+    /// (unless its connection latched terminal state, or
+    /// [`BorrowedRowSender::drop_on_return`] was called, in which case it is
     /// dropped and the next borrow opens a fresh one).
     pub fn borrow_row_sender(&self) -> Result<BorrowedRowSender<'_>> {
         let sender = self.pick_row_sender()?;
@@ -748,9 +749,9 @@ impl QuestDb {
                 "column sender store-and-forward manages reconnects in its background runner"
             ));
         }
-        // Same-handle replacement: the BorrowedColumnSender already owns one logical
-        // in-use slot, so this must not reserve another one or pool_max=1 would
-        // reject replacing a dead connection.
+        // Same-handle replacement: the borrowed column sender already owns one
+        // logical in-use slot, so this must not reserve another one or
+        // pool_max=1 would reject replacing a dead connection.
         if let Some(entry) = lock_state(column_pool_state(&self.inner, kind)).free.pop() {
             return Ok(entry.sender);
         }
@@ -863,10 +864,10 @@ impl QuestDb {
     /// The returned [`BorrowedReader`] derefs to `Reader`, so the usual
     /// `prepare` / `execute` cursor flow works unchanged, and returns the
     /// reader to the pool on `Drop` — unless its transport has been torn
-    /// down (or [`BorrowedReader::mark_must_close`] was called), in which
+    /// down (or [`BorrowedReader::drop_on_return`] was called), in which
     /// case it is dropped and the next borrow opens a fresh one.
     ///
-    /// Like [`BorrowedColumnSender`], [`BorrowedReader`] is **not** `Send` or
+    /// Like [`SfColumnSender`], [`BorrowedReader`] is **not** `Send` or
     /// `Sync`: borrow one reader per worker thread from the same `QuestDb`.
     #[cfg(feature = "_egress")]
     pub fn borrow_reader(&self) -> crate::egress::error::Result<BorrowedReader<'_>> {
@@ -990,7 +991,7 @@ impl Drop for QuestDb {
 /// method surface; this type is private.
 ///
 /// On `Drop` the underlying connection is returned to the pool unless it
-/// has latched into `must_close=true`, in which case it is dropped (and
+/// has latched terminal state, in which case it is dropped (and
 /// auto-grow will open a fresh one for the next borrow).
 ///
 /// Not `Send` or `Sync`: the borrowed connection belongs to the borrowing
@@ -1021,6 +1022,7 @@ impl<'a> ColumnSenderHandle<'a> {
             .expect("borrowed column sender already returned")
     }
 
+    #[cfg(test)]
     fn inner_ref(&self) -> &ColumnSender {
         self.sender
             .as_ref()
@@ -1035,7 +1037,7 @@ impl<'a> ColumnSenderHandle<'a> {
 
     /// Drop the current connection (and its paired connection-scoped
     /// `SymbolGlobalDict`) back to the pool and obtain a fresh one **behind
-    /// the same handle**, so the caller's `BorrowedColumnSender` stays valid.
+    /// the same handle**, so the caller's borrowed column sender stays valid.
     ///
     /// This is the column sender's failover primitive: after a transient
     /// (`ErrorCode::FailoverRetry`) flush/sync failure, call this to swap onto
@@ -1165,15 +1167,21 @@ impl<'a> SfColumnSender<'a> {
         self.0.inner_mut().wait(ack_level, timeout)
     }
 
-    /// `true` once the connection has latched terminally closed.
-    #[must_use]
-    pub fn must_close(&self) -> bool {
-        self.0.inner_ref().must_close()
+    /// Force this borrowed connection to be dropped (not recycled) on return.
+    ///
+    /// Use normal `Drop` for healthy connections: the return path already
+    /// retires connections that latched terminal state, or whose pool has been
+    /// closed. Call this after abandoning work or handling an error where the
+    /// next borrower must not inherit this backend. If queued
+    /// store-and-forward frames must not be lost, call [`Self::wait`] first or
+    /// configure `sf_dir` for replay.
+    pub fn drop_on_return(&mut self) {
+        self.0.inner_mut().mark_must_close()
     }
 
-    /// Force the connection to be dropped (not recycled) on return.
-    pub fn mark_must_close(&mut self) {
-        self.0.inner_mut().mark_must_close()
+    #[cfg(test)]
+    pub(crate) fn must_close_for_test(&self) -> bool {
+        self.0.inner_ref().must_close()
     }
 
     /// Always `true` for an SF handle (it wraps a store-and-forward backend).
@@ -1242,8 +1250,12 @@ impl Debug for SfColumnSender<'_> {
 ///
 /// [`Self::flush`] pipelines a deferred frame; [`Self::commit`] (or
 /// [`Self::flush_and_wait`] on the final chunk) sends the commit boundary and
-/// waits for `ack_level`. Dropping the handle with uncommitted deferred frames
-/// discards them — re-drive the source from the last successful commit.
+/// waits for `ack_level`. Normal `Drop` makes a best-effort commit of
+/// uncommitted deferred frames at the pool's default ack level. If that commit
+/// fails, or if [`Self::drop_on_return`] was requested, those frames are
+/// discarded; for deterministic error handling, call [`Self::commit`] or
+/// [`Self::flush_and_wait`] yourself and re-drive from the last successful
+/// commit after failure.
 ///
 /// Not `Send` or `Sync`.
 pub struct DirectColumnSender<'a>(ColumnSenderHandle<'a>);
@@ -1266,9 +1278,10 @@ impl<'a> DirectColumnSender<'a> {
     }
 
     /// Send the commit boundary for all pipelined frames and block until they
-    /// reach `ack_level`. The direct sender's durability checkpoint: frames
-    /// pipelined by [`Self::flush`] are lost if the handle is dropped before a
-    /// successful `commit`.
+    /// reach `ack_level`. This is the direct sender's explicit durability
+    /// checkpoint; normal `Drop` attempts the same kind of commit best-effort,
+    /// but callers that need deterministic error handling should call
+    /// `commit()` themselves.
     pub fn commit(&mut self, ack_level: AckLevel) -> Result<()> {
         self.0.inner_mut().sync(ack_level)
     }
@@ -1297,15 +1310,23 @@ impl<'a> DirectColumnSender<'a> {
         self.0.db.default_ack_level()
     }
 
-    /// `true` once the connection has latched terminally closed.
-    #[must_use]
-    pub fn must_close(&self) -> bool {
-        self.0.inner_ref().must_close()
+    /// Force this borrowed connection to be dropped (not recycled) on return.
+    ///
+    /// Use normal `Drop` for healthy connections: the return path already
+    /// retires connections that latched terminal state, or whose pool has been
+    /// closed. Call this after abandoning deferred frames or handling an error
+    /// where the next borrower must not inherit this backend. Call this only
+    /// after you are done using the handle. To preserve deferred frames, commit
+    /// them successfully with [`Self::commit`] or [`Self::flush_and_wait`]
+    /// before calling `drop_on_return()`; after this call the connection is
+    /// terminal and later commit/flush attempts may fail.
+    pub fn drop_on_return(&mut self) {
+        self.0.inner_mut().mark_must_close()
     }
 
-    /// Force the connection to be dropped (not recycled) on return.
-    pub fn mark_must_close(&mut self) {
-        self.0.inner_mut().mark_must_close()
+    #[cfg(test)]
+    pub(crate) fn must_close_for_test(&self) -> bool {
+        self.0.inner_ref().must_close()
     }
 
     /// Always `false` for a direct handle. Retained for symmetry with
@@ -1417,7 +1438,7 @@ impl Drop for ColumnSenderHandle<'_> {
     }
 }
 
-/// Owned (lifetime-free) variant of [`BorrowedColumnSender`] used by the C FFI.
+/// Owned (lifetime-free) variant of a borrowed column sender used by the C FFI.
 ///
 /// Holds an `Arc<DbInner>` so the pool's return path outlives the
 /// user-facing `QuestDb` pointer — the C ABI can free its `questdb_db*`
@@ -1467,11 +1488,12 @@ impl Drop for OwnedColumnSender {
 
 /// A row-major [`crate::ingress::Sender`] borrowed from a [`QuestDb`] pool.
 ///
-/// Companion to [`SfColumnSender`] (the column-major handle). Derefs to
-/// `Sender`, so the usual `Buffer` build + `flush` flow works unchanged. On
-/// `Drop` the sender is returned to the row-sender pool, unless its connection
-/// has latched `must_close` (or [`Self::mark_must_close`] was called), in which
-/// case it is dropped and the next borrow opens a fresh one.
+/// Companion to [`SfColumnSender`] (the column-major handle). Exposes the row
+/// ingestion and progress-tracking surface directly, except for the standalone
+/// [`Sender::must_close`] lifecycle predicate. On `Drop` the sender is returned
+/// to the row-sender pool, unless its connection has latched terminal state (or
+/// [`Self::drop_on_return`] was called), in which case it is dropped and the
+/// next borrow opens a fresh one.
 ///
 /// `BorrowedRowSender` is **not** `Send` or `Sync`: the borrowed connection
 /// belongs to the borrowing thread for the duration of the borrow.
@@ -1493,9 +1515,79 @@ impl<'a> BorrowedRowSender<'a> {
         }
     }
 
-    /// Force this sender to be dropped (not recycled) when the borrow ends.
-    /// Use after an error that may have left the connection unusable.
-    pub fn mark_must_close(&mut self) {
+    fn sender_ref(&self) -> &Sender {
+        self.sender
+            .as_ref()
+            .expect("borrowed row sender already returned")
+    }
+
+    fn sender_mut(&mut self) -> &mut Sender {
+        self.sender
+            .as_mut()
+            .expect("borrowed row sender already returned")
+    }
+
+    /// Create a new row buffer using this sender's protocol settings.
+    pub fn new_buffer(&self) -> Buffer {
+        self.sender_ref().new_buffer()
+    }
+
+    /// Send the batch of rows in the buffer to the QuestDB server, and, if
+    /// `transactional` is true, require a transactional flush.
+    #[cfg(feature = "sync-sender-http")]
+    pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
+        self.sender_mut()
+            .flush_and_keep_with_flags(buf, transactional)
+    }
+
+    /// Send the buffer of rows, then clear the buffer.
+    pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
+        self.sender_mut().flush(buf)
+    }
+
+    /// Send the buffer of rows, keeping the buffer intact.
+    pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
+        self.sender_mut().flush_and_keep(buf)
+    }
+
+    /// Publish the QWP/WebSocket buffer, clear it, and return the highest
+    /// published frame sequence number.
+    pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
+        self.sender_mut().flush_and_get_fsn(buf)
+    }
+
+    /// Publish the QWP/WebSocket buffer without clearing it and return the
+    /// highest published frame sequence number.
+    pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
+        self.sender_mut().flush_and_keep_and_get_fsn(buf)
+    }
+
+    /// Return the highest frame sequence number published locally by this
+    /// sender, or `None` if no frame has been published.
+    pub fn published_fsn(&self) -> Result<Option<u64>> {
+        self.sender_ref().published_fsn()
+    }
+
+    /// Return the highest frame sequence number completed by server ACK or
+    /// server-side reject-and-continue, or `None` if no frame has completed.
+    pub fn acked_fsn(&self) -> Result<Option<u64>> {
+        self.sender_ref().acked_fsn()
+    }
+
+    /// Block until every frame published so far through this sender reaches
+    /// `ack_level`.
+    pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
+        self.sender_mut().wait(ack_level, timeout)
+    }
+
+    /// Force this borrowed sender to be dropped (not recycled) when the borrow
+    /// ends.
+    ///
+    /// Use normal `Drop` for healthy senders: the return path already retires
+    /// senders that latched terminal state, or whose pool has been closed.
+    /// Call this after abandoning work or handling an error where the next
+    /// borrower must not inherit this connection.
+    pub fn drop_on_return(&mut self) {
         self.must_close = true;
     }
 }
@@ -1505,24 +1597,6 @@ impl Debug for BorrowedRowSender<'_> {
         f.debug_struct("BorrowedRowSender")
             .field("sender", &self.sender)
             .finish()
-    }
-}
-
-impl Deref for BorrowedRowSender<'_> {
-    type Target = Sender;
-
-    fn deref(&self) -> &Self::Target {
-        self.sender
-            .as_ref()
-            .expect("borrowed row sender already returned")
-    }
-}
-
-impl DerefMut for BorrowedRowSender<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.sender
-            .as_mut()
-            .expect("borrowed row sender already returned")
     }
 }
 
@@ -1612,11 +1686,11 @@ impl Drop for OwnedRowSender {
 
 /// A query [`Reader`] borrowed from a [`QuestDb`] pool.
 ///
-/// Egress companion to [`BorrowedColumnSender`] (column-major) and
+/// Egress companion to [`SfColumnSender`] (column-major) and
 /// [`BorrowedRowSender`] (row-major). Derefs to `Reader`, so the usual
 /// `prepare` / `execute` cursor flow works unchanged. On `Drop` the reader
 /// is returned to the reader pool, unless its transport has been torn down
-/// (or [`Self::mark_must_close`] was called), in which case it is dropped
+/// (or [`Self::drop_on_return`] was called), in which case it is dropped
 /// and the next borrow opens a fresh one.
 ///
 /// `BorrowedReader` is **not** `Send` or `Sync`: the borrowed connection
@@ -1641,9 +1715,14 @@ impl<'a> BorrowedReader<'a> {
         }
     }
 
-    /// Force this reader to be dropped (not recycled) when the borrow ends.
-    /// Use after an error that may have left the connection unusable.
-    pub fn mark_must_close(&mut self) {
+    /// Force this borrowed reader to be dropped (not recycled) when the borrow
+    /// ends.
+    ///
+    /// Use normal `Drop` for healthy readers: the return path already retires
+    /// readers whose transport was torn down, or whose pool has been closed.
+    /// Call this after abandoning work or handling an error where the next
+    /// borrower must not inherit this connection.
+    pub fn drop_on_return(&mut self) {
         self.must_close = true;
     }
 }
@@ -1845,7 +1924,7 @@ fn pick_column_sender_inner(inner: &Arc<DbInner>, kind: ColumnPoolKind) -> Resul
                 return Err(error::fmt!(
                     InvalidApiCall,
                     "Connection pool exhausted: {} sender(s) in use, pool_max={}. \
-                     Drop a BorrowedColumnSender or increase pool_max.",
+                     Drop a borrowed column sender or increase pool_max.",
                     state.in_use,
                     inner.pool_max
                 ));

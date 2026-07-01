@@ -27,11 +27,9 @@ from arrow_ffi import (
     NEXT_ARROW_BATCH_OK,
     column_sender_sync,
     conn_flush_arrow_batch,
-    conn_must_close,
     db_borrow_conn,
     db_close,
     db_connect,
-    db_drop_conn,
     db_return_conn,
     next_arrow_batch,
     pyarrow_export_record_batch,
@@ -243,10 +241,7 @@ def borrowed_column_sender(fixture, *, sync_on_exit: bool = True, **conf_extras:
                 except SenderError:
                     pass
         finally:
-            if conn_must_close(conn):
-                db_drop_conn(db, conn)
-            else:
-                db_return_conn(db, conn)
+            db_return_conn(db, conn)
     finally:
         db_close(db)
 

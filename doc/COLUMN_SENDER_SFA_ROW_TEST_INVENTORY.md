@@ -21,7 +21,7 @@ row path's live system and fuzz coverage.
 - [x] Surface a drop-and-continue rejection once:
   `store_and_forward_sync_reports_drop_and_continue_once`.
 - [x] Drop and reopen a poisoned SFA backend on the next borrow:
-  `store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow`.
+  `store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borrow`.
 - [x] Roll back symbols and keep the chunk retryable on local append timeout:
   `store_and_forward_append_timeout_rolls_back_symbols_and_keeps_chunk`.
 - [x] Live columnar SFA single-batch Arrow round trip with slot cleanup:

@@ -226,12 +226,6 @@ _db_drop_conn = _setsig(
     ctypes.POINTER(_QwpwsConn),
 )
 
-_conn_must_close = _setsig(
-    "sf_column_sender_must_close",
-    ctypes.c_bool,
-    ctypes.POINTER(_QwpwsConn),
-)
-
 class _ColumnSenderArrowOverride(ctypes.Structure):
     _fields_ = [
         ("column", ctypes.c_char_p),
@@ -393,10 +387,6 @@ def db_return_conn(db_ptr, conn_ptr) -> None:
 def db_drop_conn(db_ptr, conn_ptr) -> None:
     if db_ptr and conn_ptr:
         _db_drop_conn(db_ptr, conn_ptr)
-
-
-def conn_must_close(conn_ptr) -> bool:
-    return bool(_conn_must_close(conn_ptr))
 
 
 def column_sender_sync(

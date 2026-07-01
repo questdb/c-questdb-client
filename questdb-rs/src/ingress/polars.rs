@@ -42,15 +42,9 @@
 //!
 //! The one-call shortcut is [`QuestDb::flush_polars_dataframe`], which
 //! borrows a direct column sender from the pool internally — callers never
-//! handle the sender themselves. For full control over slicing and per-batch
-//! retry, borrow a direct sender and drive the iterator directly:
-//!
-//! ```ignore
-//! let mut sender = db.borrow_direct_column_sender()?;
-//! for rb in questdb::ingress::polars::dataframe_to_batches(&df, None) {
-//!     sender.flush_arrow_batch_at_column(table, &rb?, "ts".try_into()?, &[])?;
-//! }
-//! ```
+//! handle the sender themselves. Use [`PolarsIngestOptions`] to control
+//! slicing, timestamp selection, overrides, and ack level while leaving commit
+//! and retry ownership with the public `QuestDb` entry point.
 //!
 //! [`QuestDb::flush_polars_dataframe`]: crate::QuestDb::flush_polars_dataframe
 
@@ -484,12 +478,8 @@ impl crate::db::QuestDb {
     /// This is the recommended DataFrame ingestion entry point: it borrows a
     /// direct column sender from the pool, drives the whole frame, and returns
     /// the sender to the pool on completion (or error) — callers never handle a
-    /// sender. It is exactly equivalent to:
-    ///
-    /// ```ignore
-    /// let mut sender = db.borrow_direct_column_sender()?;
-    /// sender.flush_polars_dataframe(table, df, options)?; // crate-internal
-    /// ```
+    /// sender. Internally this uses the same direct columnar path as Arrow
+    /// ingestion, with checkpoint commits and retry owned by this method.
     ///
     /// `table` accepts anything convertible into a [`TableName`] (a bare `&str`
     /// works). `options` ([`PolarsIngestOptions`]) carries the optional

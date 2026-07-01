@@ -916,7 +916,7 @@ fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
         .expect_err("the irreducible final row must fail the flush");
     assert_eq!(err.code(), ErrorCode::BatchTooLarge);
     assert!(
-        sender.must_close(),
+        sender.must_close_for_test(),
         "connection must be torn down so the uncommitted deferred prefix is \
          discarded instead of committed on drop"
     );
@@ -988,15 +988,15 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
     );
 }
 
-fn check_store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow(extras: &str) {
+fn check_store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borrow(extras: &str) {
     let server = MockServer::spawn(4);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
 
     {
         let mut sender = db.borrow_column_sender().unwrap();
-        sender.mark_must_close();
-        assert!(sender.must_close());
+        sender.drop_on_return();
+        assert!(sender.must_close_for_test());
     }
 
     assert_eq!(db.free_count(), 0, "forced SFA backend must not recycle");
@@ -1313,15 +1313,15 @@ fn store_and_forward_sync_times_out_on_silent_but_alive_peer_memory() {
 }
 
 #[test]
-fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow_disk() {
+fn store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borrow_disk() {
     let dir = TempDir::new().unwrap();
-    check_store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow(
+    check_store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borrow(
         &sf_disk_extras(&dir, "pool_reap=manual;"),
     );
 }
 #[test]
-fn store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow_memory() {
-    check_store_and_forward_mark_must_close_drops_backend_and_reopens_on_next_borrow(
+fn store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borrow_memory() {
+    check_store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borrow(
         "pool_reap=manual;",
     );
 }
@@ -1739,9 +1739,34 @@ fn row_sender_pool_flush_round_trip() {
         .unwrap()
         .at_now()
         .unwrap();
+    let fsn = sender
+        .flush_and_get_fsn(&mut buf)
+        .expect("row-major flush over a pooled QWP/WS sender")
+        .expect("non-empty buffer publishes a frame");
+    assert_eq!(sender.published_fsn().expect("published fsn"), Some(fsn));
     sender
-        .flush(&mut buf)
-        .expect("row-major flush over a pooled QWP/WS sender");
+        .wait(AckLevel::Ok, Duration::from_secs(2))
+        .expect("row-major wait over a pooled QWP/WS sender");
+    assert!(
+        sender
+            .acked_fsn()
+            .expect("acked fsn")
+            .is_some_and(|v| v >= fsn),
+        "acked watermark must cover the published frame"
+    );
+
+    let empty = sender.new_buffer();
+    assert_eq!(
+        sender
+            .flush_and_keep_and_get_fsn(&empty)
+            .expect("empty keep flush"),
+        None
+    );
+    #[cfg(feature = "sync-sender-http")]
+    sender
+        .flush_and_keep_with_flags(&empty, false)
+        .expect("empty non-transactional flush with explicit flags");
+
     drop(sender);
 
     // The flushed sender is clean, so it returns to the pool for reuse.
@@ -1897,12 +1922,12 @@ fn row_sender_pool_grows_and_reuses_physical_connections() {
 }
 
 #[test]
-fn row_sender_mark_must_close_drops_instead_of_recycling() {
+fn row_sender_drop_on_return_drops_instead_of_recycling() {
     let server = MockServer::spawn_acking(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
     let mut sender = db.borrow_row_sender().expect("borrow");
-    sender.mark_must_close();
+    sender.drop_on_return();
     drop(sender);
 
     assert_eq!(db.row_sender_in_use_count(), 0);
@@ -2510,7 +2535,7 @@ fn flush_and_wait_ack_wait_failure_after_publish_clears_chunk() {
         "the frame was published, so the chunk is cleared even though the ACK wait failed"
     );
     assert!(
-        sender.must_close(),
+        sender.must_close_for_test(),
         "a delivery-unknown failure must latch the conn for pool discard"
     );
 }
@@ -2766,7 +2791,7 @@ fn server_error_latches_conn_and_pool_drops_it() {
         // The server's status byte and message must survive the round-trip.
         assert!(err.msg().contains("0x09"), "msg: {}", err.msg());
         assert!(err.msg().contains("injected"), "msg: {}", err.msg());
-        assert!(sender.must_close(), "errored conn must be latched");
+        assert!(sender.must_close_for_test(), "errored conn must be latched");
         assert_eq!(db.direct_in_use_count(), 1);
     }
     // The latched connection must be dropped, not returned to the free pool.
@@ -2799,7 +2824,9 @@ fn close_joins_reaper_cleanly() {
     ))
     .unwrap();
     // Borrow + return so we have something to reap eventually.
-    let _ = db.borrow_column_sender().expect("borrow").must_close();
+    {
+        let _sender = db.borrow_column_sender().expect("borrow");
+    }
     // close() must return promptly (no hang) — the join is the test.
     let start = Instant::now();
     db.close();
@@ -2975,7 +3002,10 @@ fn transient_transport_failure_maps_to_failover_retry() {
         .commit(AckLevel::Ok)
         .expect_err("server closed mid-sync must error");
     assert_eq!(err.code(), ErrorCode::FailoverRetry);
-    assert!(sender.must_close(), "transport-dead conn must be latched");
+    assert!(
+        sender.must_close_for_test(),
+        "transport-dead conn must be latched"
+    );
 }
 
 #[test]
@@ -3806,15 +3836,15 @@ mod reader_pool {
         assert_eq!(db.reader_in_use_count(), 2);
     }
 
-    /// `mark_must_close` forces the reader to be dropped (not recycled) on
+    /// `drop_on_return` forces the reader to be dropped (not recycled) on
     /// return, so the next borrow opens a brand-new connection.
     #[test]
-    fn reader_mark_must_close_drops_instead_of_recycling() {
+    fn reader_drop_on_return_drops_instead_of_recycling() {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
         let mut reader = db.borrow_reader().expect("borrow");
-        reader.mark_must_close();
+        reader.drop_on_return();
         drop(reader);
 
         assert_eq!(db.reader_in_use_count(), 0);

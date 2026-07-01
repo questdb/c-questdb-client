@@ -200,7 +200,8 @@ uint64_t questdb_db_reconnect_max_duration_ms(const questdb_db* db);
 /**
  * Return a conn to the pool. Accepts NULL `conn` and no-ops.
  * Invalidates the `conn` pointer; do not use it after this call.
- * If the pool has been closed, the conn is closed instead of recycled.
+ * If the conn has latched terminal state, or if the pool has been closed,
+ * the conn is closed instead of recycled.
  *
  * `db` is currently ignored — the conn carries its own reference to
  * the pool — but accepted for symmetry with the borrow call.
@@ -225,15 +226,17 @@ void questdb_db_return_sf_column_sender(
 
 /**
  * Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
- * (sf_column_sender_must_close becomes true) before the usual pool-return path runs.
+ * before the usual pool-return path runs.
  * Invalidates `conn`. Accepts NULL `conn` and no-ops.
  *
- * Use this in error-recovery paths where the conn may hold in-flight
- * uncommitted frames that the next borrower would otherwise commit
- * alongside their own (the round-3 dirty-sender concern). In
- * store-and-forward mode this removes the current backend from the pool and
- * releases the slot lock; unresolved frames remain in `sf_dir` for the next
- * owner to replay.
+ * Use normal return for healthy conns: the return path already closes conns
+ * that have latched terminal state, or whose pool has been closed.
+ *
+ * Use this after a failure that may have left in-doubt or uncommitted frames
+ * on the conn; otherwise a later borrower could commit those frames together
+ * with its own batch. In store-and-forward mode this removes the current
+ * backend from the pool and releases the slot lock; unresolved frames remain
+ * in `sf_dir` for the next owner to replay.
  *
  * @warning Dropping discards any queued frames not yet delivered. With `sf_dir`
  * configured they persist in the spool for the next owner to replay; on an
@@ -260,19 +263,6 @@ void questdb_db_drop_sf_column_sender(
  */
 QUESTDB_CLIENT_API
 size_t questdb_db_reap_idle(questdb_db* db);
-
-/* -------------------------------------------------------------------------
- * Connection state inspection
- * ------------------------------------------------------------------------- */
-
-/**
- * `true` if the connection is in a permanently-unusable state (latched
- * by any writer that hits a transport or protocol error), or if the
- * originating pool has been closed. On return to the pool such conns are
- * dropped, not recycled.
- */
-QUESTDB_CLIENT_API
-bool sf_column_sender_must_close(const sf_column_sender* conn);
 
 /* -------------------------------------------------------------------------
  * Row-major sender borrow
@@ -310,8 +300,10 @@ row_sender* questdb_db_borrow_row_sender_with_retry(
 
 /**
  * Return a borrowed row sender to the pool. Invalidates `sender`. Accepts
- * NULL and no-ops. `db` is ignored (the sender carries its own pool
- * back-reference) but kept in the ABI for symmetry with the borrow call.
+ * NULL and no-ops. If the sender has latched terminal state, or if the pool
+ * has been closed, it is closed instead of recycled. `db` is ignored (the
+ * sender carries its own pool back-reference) but kept in the ABI for
+ * symmetry with the borrow call.
  *
  * Mutually exclusive with `questdb_db_drop_row_sender` on the same
  * `sender`: call exactly one of the two.
@@ -326,6 +318,11 @@ void questdb_db_return_row_sender(
  * connection is closed and the next borrow opens a fresh one. Invalidates
  * `sender`. Accepts NULL and no-ops.
  *
+ * Use normal return for healthy senders: the return path already closes
+ * senders that have latched terminal state, or whose pool has been closed.
+ * Use this after abandoning work or handling an error where the next borrower
+ * must not inherit this connection.
+ *
  * Mutually exclusive with `questdb_db_return_row_sender` on the same
  * `sender`: call exactly one of the two.
  */
@@ -333,15 +330,6 @@ QUESTDB_CLIENT_API
 void questdb_db_drop_row_sender(
     questdb_db* db,
     row_sender* sender);
-
-/**
- * `true` if the row sender will be dropped rather than recycled on return
- * (it was force-marked, a flush left the connection unusable, or the
- * originating pool has been closed), or if `sender` is NULL. `false` only
- * when it is safely reusable.
- */
-QUESTDB_CLIENT_API
-bool row_sender_must_close(const row_sender* sender);
 
 /**
  * Returns the configured max_name_len for buffers created from this row

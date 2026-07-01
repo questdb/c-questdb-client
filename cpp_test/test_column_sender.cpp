@@ -104,7 +104,6 @@ TEST_CASE("borrowed_sf_column_sender returns conn to pool on destructor")
     {
         auto conn = db.borrow_sf_column_sender();
         CHECK(static_cast<bool>(conn));
-        CHECK_FALSE(conn.must_close());
     }
     int accepts_before = mock->accepts();
     {

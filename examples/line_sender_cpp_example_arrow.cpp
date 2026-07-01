@@ -118,10 +118,7 @@ bool example(const std::string& host, const std::string& port)
         std::fprintf(stderr, "Error: %s\n", e.what());
     }
 
-    if (::sf_column_sender_must_close(raw_conn))
-        ::questdb_db_drop_sf_column_sender(db, raw_conn);
-    else
-        ::questdb_db_return_sf_column_sender(db, raw_conn);
+    ::questdb_db_return_sf_column_sender(db, raw_conn);
     ::questdb_db_close(db);
     return ok;
 }

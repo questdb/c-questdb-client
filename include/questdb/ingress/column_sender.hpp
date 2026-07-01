@@ -738,12 +738,6 @@ public:
     ::sf_column_sender* c_ptr() noexcept { return _raw; }
     const ::sf_column_sender* c_ptr() const noexcept { return _raw; }
 
-    /** `true` if the conn has latched terminal must-close, or the pool closed. */
-    bool must_close() const noexcept
-    {
-        return ::sf_column_sender_must_close(_raw);
-    }
-
     /**
      * Encode `chunk` and publish it into the store-and-forward queue, returning
      * as soon as it is accepted locally. On success `chunk` is cleared; on
@@ -837,8 +831,9 @@ class pool;
 
 /**
  * RAII guard for a borrowed store-and-forward connection. On destruction the
- * conn is returned to the pool (or dropped if it has latched must-close, or if
- * the pool has been closed). Constructed only via `pool::borrow_sf_column_sender()`.
+ * conn is returned to the pool (or dropped if `drop_on_return()` was called,
+ * it has latched terminal state, or the pool has been closed). Constructed only
+ * via `pool::borrow_sf_column_sender()`.
  *
  * The store-and-forward queue owns delivery, so destruction does not lose
  * accepted frames; `wait()` is an ack barrier, not a commit step. The
@@ -942,15 +937,17 @@ public:
     }
 #endif
 
-    /** `true` if this conn will be dropped rather than recycled on return
-     * (force-marked, a flush left it must-close, or the pool has been closed).
-     * Mirrors `borrowed_row_sender::must_close()`. */
-    bool must_close() const noexcept
-    {
-        return _conn.c_ptr() && _conn.must_close();
-    }
-
-    /** Force the conn to drop on return instead of recycling. */
+    /**
+     * Force this borrowed conn to be closed instead of recycled when the guard
+     * is destroyed.
+     *
+     * Use normal destruction for healthy conns: the return path already closes
+     * conns that have latched terminal state, or whose pool has been closed.
+     * Call this after abandoning work or handling an error where the next
+     * borrower must not inherit this backend. If queued store-and-forward
+     * frames must not be lost, call `wait()` first or configure `sf_dir` for
+     * replay.
+     */
     void drop_on_return() noexcept { _force_drop = true; }
 
 private:
@@ -967,7 +964,7 @@ private:
         ::sf_column_sender* raw = _conn.c_ptr();
         if (_db && raw)
         {
-            if (_force_drop || ::sf_column_sender_must_close(raw))
+            if (_force_drop)
                 ::questdb_db_drop_sf_column_sender(_db, raw);
             else
                 ::questdb_db_return_sf_column_sender(_db, raw);
@@ -983,10 +980,10 @@ private:
 
 /**
  * RAII guard for a borrowed row-major sender. On destruction the sender is
- * returned to the pool (or dropped if `drop_on_return()` was called, or a
- * flush left it must-close, or the pool has been closed). Build rows with a
- * `questdb::ingress::line_sender_buffer` and send them via `flush()` /
- * `flush_and_keep()`.
+ * returned to the pool (or dropped if `drop_on_return()` was called, the
+ * connection has latched terminal state, or the pool has been closed). Build
+ * rows with a `questdb::ingress::line_sender_buffer` and send them via
+ * `flush()` / `flush_and_keep()`.
  *
  * Constructed only via `pool::borrow_row_sender()`.
  */
@@ -1112,16 +1109,14 @@ public:
     }
 
     /**
-     * `true` if this sender will be dropped rather than recycled on return
-     * (force-marked, a flush left the connection unusable, or the pool has
-     * been closed).
+     * Force this borrowed sender to be closed instead of recycled when the
+     * guard is destroyed.
+     *
+     * Use normal destruction for healthy senders: the return path already
+     * closes senders that have latched terminal state, or whose pool has been
+     * closed. Call this after abandoning work or handling an error where the
+     * next borrower must not inherit this connection.
      */
-    bool must_close() const noexcept
-    {
-        return _sender && ::row_sender_must_close(_sender);
-    }
-
-    /** Force the sender to drop on return instead of recycling. */
     void drop_on_return() noexcept { _force_drop = true; }
 
 private:
@@ -1137,7 +1132,7 @@ private:
     {
         if (_db && _sender)
         {
-            if (_force_drop || ::row_sender_must_close(_sender))
+            if (_force_drop)
                 ::questdb_db_drop_row_sender(_db, _sender);
             else
                 ::questdb_db_return_row_sender(_db, _sender);

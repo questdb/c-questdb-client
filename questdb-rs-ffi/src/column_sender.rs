@@ -62,29 +62,31 @@ use crate::{
 /// and must not race with other operations on the same `db`.
 pub struct questdb_db(pub(crate) QuestDb);
 
-/// Borrowed QWP/WS connection. Owns a pool slot until
-/// `questdb_db_return_column_sender` is called. Bundles the per-connection
-/// schema registry and symbol-dict state used by all writer modes.
+/// Borrowed store-and-forward QWP/WS connection. Owns a pool slot until
+/// `questdb_db_return_sf_column_sender` or `questdb_db_drop_sf_column_sender`
+/// is called. Bundles the per-connection schema registry and symbol-dict state
+/// used by all writer modes.
 ///
-/// **Not thread-safe.** A `column_sender*` must not be used from more than
-/// one thread at a time. The second tuple field is a CAS-checked latch
-/// on every FFI entry (mutation, accessor, and free); a non-blocking
-/// contending caller observes `line_sender_error_invalid_api_call`
-/// instead of a data race. When `questdb_db_return_column_sender` is observed
-/// to interleave with an in-flight call (the latch sees `IN_USE` when
-/// the free arrives), the box's drop is deferred to the in-flight
-/// call's exit path. This deferral only protects the concurrent
-/// in-flight-call-vs-free race; it does NOT make a free idempotent.
+/// **Not thread-safe.** An `sf_column_sender*` or `direct_column_sender*`
+/// handle must not be used from more than one thread at a time. The second
+/// tuple field is a CAS-checked latch on every FFI entry (mutation, accessor,
+/// and free); a non-blocking contending caller observes
+/// `line_sender_error_invalid_api_call` instead of a data race. When a
+/// return/drop entry point is observed to
+/// interleave with an in-flight call (the latch sees `IN_USE` when the free
+/// arrives), the box's drop is deferred to the in-flight call's exit path.
+/// This deferral only protects the concurrent in-flight-call-vs-free race; it
+/// does NOT make a free idempotent.
 /// Calling a free/return/drop entry point twice on the same handle (or
 /// return-then-drop) is undefined behavior — the second call performs a
 /// use-after-free atomic op on the freed box before the latch's CLOSED
 /// guard can be evaluated.
 ///
 /// Callers must still ensure happens-before ordering between the last
-/// FFI call on `conn` and `questdb_db_return_column_sender(conn)` — e.g. by
-/// confining `conn` to a single thread, or by an external barrier — so
-/// the latch's CAS sees the close intent. A true concurrent free
-/// without such ordering is undefined behavior.
+/// FFI call on `conn` and the matching return/drop call - e.g. by confining
+/// `conn` to a single thread, or by an external barrier - so the latch's CAS
+/// sees the close intent. A true concurrent free without such ordering is
+/// undefined behavior.
 pub struct sf_column_sender(OwnedColumnSender, AtomicU32);
 
 /// Direct (pipelined, non-store-and-forward) sibling of [`sf_column_sender`],
@@ -732,15 +734,16 @@ pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb
 }
 
 /// Return a borrowed conn to the pool. Invalidates `conn`. Accepts NULL
-/// and no-ops. `db` is ignored — kept in the ABI for symmetry. If the pool
-/// has been closed, the conn is closed instead of recycled.
+/// and no-ops. `db` is ignored — kept in the ABI for symmetry. If the conn
+/// has latched terminal state, or if the pool has been closed, the conn is
+/// closed instead of recycled.
 ///
 /// A racing in-flight call on the same handle defers the drop to that
 /// call's exit path, which performs the actual `Box::from_raw`. This
 /// covers only the concurrent in-flight-call-vs-free race. It is NOT a
-/// double-free guard: mutually exclusive with `questdb_db_drop_column_sender`
-/// on the same `conn` — call exactly one of the two. Calling both (or
-/// either twice) is UB.
+/// double-free guard: mutually exclusive with the matching drop entry point on
+/// the same `conn` - call exactly one of return/drop. Calling both (or either
+/// twice) is UB.
 unsafe fn return_or_drop_cs<T: CsHandle>(conn: *mut T, extra: u32) {
     if conn.is_null() {
         return;
@@ -767,13 +770,16 @@ pub unsafe extern "C" fn questdb_db_return_direct_column_sender(
 }
 
 /// Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
-/// (`column_sender_must_close` becomes `true`) so the underlying backend is
-/// removed from the pool. In store-and-forward mode unresolved frames remain in
-/// the SFA slot for replay by the next owner. Accepts NULL and no-ops. As with
-/// `questdb_db_return_column_sender`, a racing in-flight call defers the drop to that
-/// call's exit path; this covers only the concurrent in-flight-call-vs-free
-/// race. Mutually exclusive with `questdb_db_return_column_sender` on the same
-/// `conn` — call exactly one of the two. Calling both (or either twice) is UB.
+/// so the underlying backend is removed from the pool. In store-and-forward
+/// mode with `sf_dir`, unresolved frames remain in the spool for replay by the
+/// next owner; without `sf_dir`, force-dropping may discard undelivered queued
+/// frames after the bounded close drain. Call `sf_column_sender_wait` before
+/// drop if those frames must be delivered. Accepts NULL and no-ops. As with
+/// `questdb_db_return_sf_column_sender`, a racing in-flight call defers the
+/// drop to that call's exit path; this covers only the concurrent
+/// in-flight-call-vs-free race. Mutually exclusive with
+/// `questdb_db_return_sf_column_sender` on the same `conn` - call exactly one
+/// of the two. Calling both (or either twice) is UB.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_drop_sf_column_sender(
     _db: *mut questdb_db,
@@ -800,57 +806,6 @@ pub unsafe extern "C" fn questdb_db_reap_idle(db: *mut questdb_db) -> size_t {
     }
     let db_ref = unsafe { &*db };
     db_ref.0.reap_idle()
-}
-
-// ===========================================================================
-// Connection state
-// ===========================================================================
-
-/// `true` if any of the following hold; `false` only when the conn is
-/// safely reusable:
-///   * `conn` is NULL,
-///   * the conn was already closed / dropped,
-///   * the conn is in a permanently-unusable state (e.g. a flush left
-///     it with uncommitted in-flight frames),
-///   * the originating pool has been closed,
-///   * another FFI call on the same handle is currently in flight on
-///     another thread (single-handle contract violation).
-///
-/// The latch-contention case folds into the same return value because
-/// the caller cannot safely act on a contended handle anyway; if you
-/// need to distinguish "contended" from "terminal", confine `conn` to
-/// one thread so the latch can never be contended at this call.
-unsafe fn cs_must_close_body<T: CsHandle>(conn: *const T, fn_name: &str) -> bool {
-    if conn.is_null() {
-        return true;
-    }
-    let state: *const AtomicU32 = unsafe { T::latch(conn) };
-    let mut err_box: *mut line_sender_error = std::ptr::null_mut();
-    let guard =
-        unsafe { InUseGuard::acquire(conn as *mut T, state, fn_name, T::TYPE_NAME, &mut err_box) };
-    if guard.is_none() {
-        if !err_box.is_null() {
-            unsafe { crate::line_sender_error_free(err_box) };
-        }
-        return true;
-    }
-    let owned = unsafe { T::owned_ref(conn) };
-    let result = owned.pool_closed() || owned.get().must_close();
-    drop(guard);
-    result
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_must_close(conn: *const sf_column_sender) -> bool {
-    unsafe { cs_must_close_body(conn, "sf_column_sender_must_close") }
-}
-
-/// Direct-handle counterpart of `sf_column_sender_must_close`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn direct_column_sender_must_close(
-    conn: *const direct_column_sender,
-) -> bool {
-    unsafe { cs_must_close_body(conn, "direct_column_sender_must_close") }
 }
 
 // ===========================================================================

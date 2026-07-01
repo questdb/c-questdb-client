@@ -3926,7 +3926,8 @@ pub unsafe extern "C" fn questdb_db_borrow_row_sender_with_retry(
 /// Return a borrowed row sender to the pool. Invalidates `sender`. Accepts
 /// NULL and no-ops. `db` is ignored (the sender carries its own pool
 /// back-reference) but kept in the ABI for symmetry with the borrow call. If
-/// the pool has been closed, the sender is closed instead of recycled.
+/// the sender has latched terminal state, or if the pool has been closed, the
+/// sender is closed instead of recycled.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_return_row_sender(
     _db: *mut questdb_db,
@@ -3950,18 +3951,6 @@ pub unsafe extern "C" fn questdb_db_drop_row_sender(_db: *mut questdb_db, sender
         (*sender).0.mark_must_close();
         drop(Box::from_raw(sender));
     }
-}
-
-/// `true` if the row sender will be dropped rather than recycled on return
-/// (force-marked, a flush left the connection unusable, or the originating
-/// pool has been closed), or if `sender` is NULL. `false` only when it is
-/// safely reusable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn row_sender_must_close(sender: *const row_sender) -> bool {
-    if sender.is_null() {
-        return true;
-    }
-    unsafe { (*sender).0.must_close() }
 }
 
 /// Returns the configured max_name_len for buffers created from this row

@@ -1239,10 +1239,7 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 stopped = True
             finally:
                 if db is not None and conn is not None:
-                    if afc.conn_must_close(conn):
-                        afc.db_drop_conn(db, conn)
-                    else:
-                        afc.db_return_conn(db, conn)
+                    afc.db_return_conn(db, conn)
                 afc.db_close(db)
                 if proxy.is_alive():
                     proxy.close()
@@ -1564,8 +1561,6 @@ class TestColumnSenderBorrowWithRetry(unittest.TestCase):
             db_close,
             db_borrow_conn_with_retry,
             db_return_conn,
-            db_drop_conn,
-            conn_must_close,
         )
         from test import skip_if_unsupported_qwp_ws_fixture
         fixture = afc.get_live_fixture(self)  # skips when no live fixture
@@ -1582,10 +1577,7 @@ class TestColumnSenderBorrowWithRetry(unittest.TestCase):
                 skip_if_unsupported_qwp_ws_fixture(e, fixture)
                 raise
             self.assertTrue(conn)
-            if conn_must_close(conn):
-                db_drop_conn(db, conn)
-            else:
-                db_return_conn(db, conn)
+            db_return_conn(db, conn)
         finally:
             db_close(db)
 
