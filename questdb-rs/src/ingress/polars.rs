@@ -51,8 +51,8 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{Field, Schema as ArrowSchema};
+use arrow::array::{ArrayRef, RecordBatch};
+use arrow::datatypes::{Field, Schema as ArrowSchema};
 use polars::frame::DataFrame;
 use polars::prelude::{Column, CompatLevel, Series};
 
@@ -117,10 +117,8 @@ pub fn dataframe_to_batches(
 ) -> DataFrameBatches<'_> {
     let max_rows = max_rows.map_or(DEFAULT_MAX_BATCH_ROWS, NonZeroUsize::get);
     let compat = CompatLevel::newest();
-    let cursors: Vec<ColumnCursor<'_>> = df
-        .get_columns()
-        .iter()
-        .map(|c| ColumnCursor::new(c, compat))
+    let cursors: Vec<ColumnCursor<'_>> = (0..df.width())
+        .map(|i| ColumnCursor::new(df.select_at_idx(i).unwrap(), compat))
         .collect();
     DataFrameBatches {
         max_rows,
@@ -274,7 +272,7 @@ impl Iterator for DataFrameBatches<'_> {
                     true,
                 ));
             }
-            arrays.push(arrow_array::make_array(array_data));
+            arrays.push(arrow::array::make_array(array_data));
         }
         let schema = match &self.schema {
             Some(s) => s.clone(),
@@ -580,7 +578,7 @@ fn ffi_polars_to_arrow_rs(
     pa_field: &polars_arrow::datatypes::Field,
     pa_array_box: Box<dyn polars_arrow::array::Array>,
     col_name: &str,
-) -> Result<arrow_data::ArrayData> {
+) -> Result<arrow::array::ArrayData> {
     let pa_schema = polars_arrow::ffi::export_field_to_c(pa_field);
     let pa_array = polars_arrow::ffi::export_array_to_c(pa_array_box);
     let rs_schema = unsafe { pa_schema_into_rs(pa_schema) };
@@ -594,9 +592,9 @@ fn ffi_polars_to_arrow_rs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::Int64Array;
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::Int64Type;
+    use arrow::array::Int64Array;
+    use arrow::array::cast::AsArray;
+    use arrow::array::types::Int64Type;
     use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     const TWO: NonZeroUsize = NonZeroUsize::new(2).unwrap();
@@ -607,7 +605,7 @@ mod tests {
         let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3]).into_column();
         let f = Series::new(PlSmallStr::from("f"), &[1.5f64, 2.5, 3.5]).into_column();
         let s = Series::new(PlSmallStr::from("s"), &["a", "b", "c"]).into_column();
-        DataFrame::new_with_height(3, vec![i, f, s]).unwrap()
+        crate::polars_ffi::df_from_columns(vec![i, f, s]).unwrap()
     }
 
     fn collect_ok(it: DataFrameBatches<'_>) -> Vec<RecordBatch> {
@@ -650,7 +648,7 @@ mod tests {
         data.validate_full()
             .expect("valid polars export passes full validation");
 
-        let arr = arrow_array::make_array(data);
+        let arr = arrow::array::make_array(data);
         let int_arr = arr.as_primitive::<Int64Type>();
         assert_eq!(int_arr.len(), 5);
         assert_eq!(int_arr.value(0), 10);
@@ -666,7 +664,7 @@ mod tests {
         let df = make_df();
         let rb = one_batch(&df);
         let back = crate::egress::arrow::polars::record_batch_to_dataframe(rb).unwrap();
-        let series = back.get_columns()[0].as_materialized_series();
+        let series = back.select_at_idx(0).unwrap().as_materialized_series();
         let i64s = series.i64().unwrap();
         assert_eq!(i64s.get(0), Some(1));
         assert_eq!(i64s.get(1), Some(2));
@@ -679,7 +677,7 @@ mod tests {
         let df = make_df();
         let rb = one_batch(&df);
         let back = crate::egress::arrow::polars::record_batch_to_dataframe(rb).unwrap();
-        let series = back.get_columns()[2].as_materialized_series();
+        let series = back.select_at_idx(2).unwrap().as_materialized_series();
         let s = series.str().unwrap();
         assert_eq!(s.get(0), Some("a"));
         assert_eq!(s.get(1), Some("b"));
@@ -713,21 +711,19 @@ mod tests {
 
     #[test]
     fn dataframe_to_batches_chunk_aligned_is_zero_copy() {
-        let mut left = DataFrame::new_with_height(
-            2,
-            vec![Series::new(PlSmallStr::from("i"), &[10i64, 20]).into_column()],
-        )
+        let mut left = crate::polars_ffi::df_from_columns(vec![
+            Series::new(PlSmallStr::from("i"), &[10i64, 20]).into_column(),
+        ])
         .unwrap();
-        let right = DataFrame::new_with_height(
-            2,
-            vec![Series::new(PlSmallStr::from("i"), &[30i64, 40]).into_column()],
-        )
+        let right = crate::polars_ffi::df_from_columns(vec![
+            Series::new(PlSmallStr::from("i"), &[30i64, 40]).into_column(),
+        ])
         .unwrap();
         left.vstack_mut(&right).unwrap();
-        assert_eq!(left.get_columns()[0].n_chunks(), 2);
+        assert_eq!(left.select_at_idx(0).unwrap().n_chunks(), 2);
 
         let polars_chunks: Vec<*const i64> = {
-            let s = left.get_columns()[0].as_materialized_series();
+            let s = left.select_at_idx(0).unwrap().as_materialized_series();
             (0..s.n_chunks())
                 .map(|i| {
                     let arr = &s.chunks()[i];
@@ -749,15 +745,13 @@ mod tests {
 
     #[test]
     fn dataframe_to_batches_chunk_aligned_splits_within_chunk() {
-        let mut left = DataFrame::new_with_height(
-            3,
-            vec![Series::new(PlSmallStr::from("i"), &[1i64, 2, 3]).into_column()],
-        )
+        let mut left = crate::polars_ffi::df_from_columns(vec![
+            Series::new(PlSmallStr::from("i"), &[1i64, 2, 3]).into_column(),
+        ])
         .unwrap();
-        let right = DataFrame::new_with_height(
-            3,
-            vec![Series::new(PlSmallStr::from("i"), &[4i64, 5, 6]).into_column()],
-        )
+        let right = crate::polars_ffi::df_from_columns(vec![
+            Series::new(PlSmallStr::from("i"), &[4i64, 5, 6]).into_column(),
+        ])
         .unwrap();
         left.vstack_mut(&right).unwrap();
 
@@ -772,26 +766,28 @@ mod tests {
         let a2 = Series::new(PlSmallStr::from("a"), &[3i64, 4]);
         let b = Series::new(PlSmallStr::from("b"), &[10i64, 20, 30, 40]);
         let mut left =
-            DataFrame::new_with_height(2, vec![a1.into_column(), b.slice(0, 2).into_column()])
+            crate::polars_ffi::df_from_columns(vec![a1.into_column(), b.slice(0, 2).into_column()])
                 .unwrap();
         let right =
-            DataFrame::new_with_height(2, vec![a2.into_column(), b.slice(2, 2).into_column()])
+            crate::polars_ffi::df_from_columns(vec![a2.into_column(), b.slice(2, 2).into_column()])
                 .unwrap();
         left.vstack_mut(&right).unwrap();
         left.with_column(b.into_column()).unwrap();
         assert_ne!(
-            left.get_columns()[0]
+            left.select_at_idx(0)
+                .unwrap()
                 .as_materialized_series()
                 .chunk_lengths()
                 .collect::<Vec<_>>(),
-            left.get_columns()[1]
+            left.select_at_idx(1)
+                .unwrap()
                 .as_materialized_series()
                 .chunk_lengths()
                 .collect::<Vec<_>>(),
         );
 
         let b_chunk_ptr = {
-            let s = left.get_columns()[1].as_materialized_series();
+            let s = left.select_at_idx(1).unwrap().as_materialized_series();
             let arr = &s.chunks()[0];
             let prim: &polars_arrow::array::PrimitiveArray<i64> =
                 arr.as_any().downcast_ref().unwrap();
@@ -817,7 +813,7 @@ mod tests {
         use polars::prelude::Scalar;
         let values = Series::new(PlSmallStr::from("v"), &[1i64, 2, 3, 4]);
         let scalar = Column::new_scalar(PlSmallStr::from("k"), Scalar::from(7i64), 4);
-        let df = DataFrame::new_with_height(4, vec![values.into_column(), scalar]).unwrap();
+        let df = crate::polars_ffi::df_from_columns(vec![values.into_column(), scalar]).unwrap();
 
         let batches = collect_ok(dataframe_to_batches(&df, Some(TWO)));
         assert_eq!(batches.len(), 2);
@@ -828,7 +824,7 @@ mod tests {
         }
 
         let materialised_ptr = {
-            let s = df.get_columns()[1].as_materialized_series();
+            let s = df.select_at_idx(1).unwrap().as_materialized_series();
             let arr = &s.chunks()[0];
             let prim: &polars_arrow::array::PrimitiveArray<i64> =
                 arr.as_any().downcast_ref().unwrap();
@@ -842,7 +838,7 @@ mod tests {
 
     #[test]
     fn polars_categorical_routes_through_dictionary() {
-        use arrow_schema::DataType as ArrowDataType;
+        use arrow::datatypes::DataType as ArrowDataType;
         use polars::prelude::{CategoricalPhysical, Categories, DataType as PlDataType};
 
         // Polars Categorical → arrow Dictionary(UInt32, LargeUtf8). The
@@ -862,7 +858,7 @@ mod tests {
         let cat_series = strings.cast(&dtype).unwrap();
         assert!(matches!(cat_series.dtype(), PlDataType::Categorical(_, _)));
 
-        let df = DataFrame::new_with_height(4, vec![cat_series.into_column()]).unwrap();
+        let df = crate::polars_ffi::df_from_columns(vec![cat_series.into_column()]).unwrap();
         let batches = collect_ok(dataframe_to_batches(&df, None));
         assert_eq!(batches.len(), 1);
         let rb = &batches[0];

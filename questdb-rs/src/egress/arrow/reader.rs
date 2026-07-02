@@ -24,14 +24,15 @@
 
 //! Streaming `RecordBatchReader` adapter over a [`Cursor`].
 
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow::array::{RecordBatch, RecordBatchReader};
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 
 use crate::egress::Cursor;
 use crate::egress::arrow::convert::external_arrow_error;
 use crate::egress::error::{Error, ErrorCode};
 
-/// Adapter implementing [`arrow_array::RecordBatchReader`] over a
+/// Adapter implementing [`arrow::array::RecordBatchReader`] over a
 /// [`Cursor`]. Snapshots the first batch's Arrow schema at construction
 /// and poisons on mid-stream schema drift. Failover semantics inherit
 /// from [`Cursor::next_batch`](crate::egress::Cursor::next_batch).

@@ -11,8 +11,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 libc = "0.2"
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
-arrow = { version = "58", optional = true, default-features = false, features = ["ffi"] }
-arrow-array = { version = "58", optional = true, default-features = false }
+arrow = { version = ">=58, <60", optional = true, default-features = false, features = ["ffi"] }
 
 [dependencies.questdb-rs]
 path = "../questdb-rs"
@@ -64,7 +63,6 @@ arrow = [
     "questdb-rs/arrow",
     "questdb-rs/sync-sender-qwp-ws",
     "dep:arrow",
-    "dep:arrow-array",
 ]
 # Compile in support for the `tls_verify=unsafe_off` connect-string knob.
 # Off by default: a shipped C ABI binary should not silently allow

@@ -4629,7 +4629,7 @@ unsafe fn validate_arrow_schema_depth(
 }
 
 // Minimum `n_buffers` arrow-rs's `from_ffi` requires for `dt` before it
-// would read an out-of-range / NULL buffer. Mirrors `arrow_data::layout`
+// would read an out-of-range / NULL buffer. Mirrors `arrow::array::layout`
 // (validity + data buffers; view types add a variadic lengths buffer)
 // without calling it — `layout` panics on a negative `FixedSizeBinary`
 // width. The catch-all is the validity + single-data-buffer family
@@ -4657,7 +4657,7 @@ fn arrow_min_n_buffers(dt: &arrow::datatypes::DataType) -> i64 {
 
 // Reject the parsed Arrow `DataType`s whose declared size arrow-rs's
 // `from_ffi` feeds straight into an unchecked `as usize` multiply in
-// `arrow_array::ffi::bit_width`:
+// `arrow::ffi::bit_width`:
 //
 //     FixedSizeBinary(w)  -> w as usize * 8
 //     FixedSizeList(_, n) -> child_bits * (n as usize)
@@ -4919,9 +4919,9 @@ pub(crate) unsafe fn arrow_ffi_import_record_batch(
     schema: *const arrow::ffi::FFI_ArrowSchema,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
-) -> Option<arrow_array::RecordBatch> {
+) -> Option<arrow::array::RecordBatch> {
+    use arrow::array::{ArrayRef, RecordBatch, StructArray, make_array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
     use std::sync::Arc;
     unsafe {
         if array.is_null() || schema.is_null() {
@@ -5034,8 +5034,8 @@ pub(crate) unsafe fn arrow_ffi_import_array_sliced(
     row_count: usize,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
-) -> Option<arrow_array::ArrayRef> {
-    use arrow_array::make_array;
+) -> Option<arrow::array::ArrayRef> {
+    use arrow::array::make_array;
     unsafe {
         if array.is_null() || schema.is_null() {
             arrow_err_to_c_box(
@@ -5852,8 +5852,8 @@ mod tests {
     ) -> (arrow::ffi::FFI_ArrowArray, arrow::ffi::FFI_ArrowSchema) {
         use std::sync::Arc;
 
+        use arrow::array::{Array, ArrayRef, Int64Array, StructArray};
         use arrow::datatypes::{DataType, Field};
-        use arrow_array::{Array, ArrayRef, Int64Array, StructArray};
 
         let column = Arc::new(Int64Array::from(values)) as ArrayRef;
         let array = StructArray::from(vec![(

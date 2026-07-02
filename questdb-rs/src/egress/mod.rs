@@ -113,7 +113,7 @@ pub mod _bench_internals {
     pub use bytes::Bytes;
 
     /// Assemble an already-decoded [`DecodedBatch`] into an
-    /// `arrow_array::RecordBatch`, mirroring the in-crate
+    /// `arrow::array::RecordBatch`, mirroring the in-crate
     /// `Cursor::next_arrow_batch` assembly path (`batch_arrow_schema` +
     /// `batch_to_record_batch`) so a server-free decode→assemble
     /// benchmark can isolate the column-build cost on top of the raw
@@ -124,7 +124,7 @@ pub mod _bench_internals {
         schema: &Schema,
         batch: DecodedBatch,
         dict: &SymbolDict,
-    ) -> crate::egress::error::Result<arrow_array::RecordBatch> {
+    ) -> crate::egress::error::Result<arrow::array::RecordBatch> {
         use std::sync::Arc;
         let arrow_schema = Arc::new(crate::egress::arrow::batch_arrow_schema(schema, &batch)?);
         crate::egress::arrow::batch_to_record_batch(arrow_schema, schema, batch, dict)

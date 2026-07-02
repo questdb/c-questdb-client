@@ -5114,7 +5114,7 @@ struct ArrowDictSlotMemo {
     identity: Vec<(usize, usize)>,
     /// Pins the values buffers so their addresses (the `identity` key) cannot be
     /// freed and reused by a different dictionary between flushes (ABA).
-    _pin: arrow_data::ArrayData,
+    _pin: arrow::array::ArrayData,
     slot_to_gid: Vec<u64>,
 }
 
@@ -5201,7 +5201,7 @@ impl SymbolGlobalDict {
     pub(crate) fn take_arrow_dict_memo(
         &mut self,
         identity: &[(usize, usize)],
-        values_data: &arrow_data::ArrayData,
+        values_data: &arrow::array::ArrayData,
         dict_len: usize,
     ) -> (usize, Vec<u64>) {
         const MEMO_CAP: usize = 32;
@@ -9203,7 +9203,7 @@ mod tests {
         let identity = [(0x1000usize, 8usize), (0x2000usize, 24usize)];
         // The memo pins the values `ArrayData`; this test exercises only the
         // take/restore/rollback bookkeeping, so a placeholder array suffices.
-        let pin = arrow_data::ArrayData::new_empty(&arrow_schema::DataType::Null);
+        let pin = arrow::array::ArrayData::new_empty(&arrow::datatypes::DataType::Null);
 
         let (idx, mut table) = dict.take_arrow_dict_memo(&identity, &pin, 3);
         assert_eq!(table, vec![u64::MAX; 3]);

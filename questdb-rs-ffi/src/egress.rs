@@ -4144,7 +4144,7 @@ unsafe fn reader_cursor_next_arrow_batch_export(
     err_out: *mut *mut reader_error,
     compact: bool,
 ) -> reader_arrow_batch_result {
-    use arrow_array::{Array, StructArray};
+    use arrow::array::{Array, StructArray};
     unsafe {
         if cursor.is_null() {
             set_reader_err(

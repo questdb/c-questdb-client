@@ -50,7 +50,7 @@ use super::conn::{ColumnConn, PublishError};
 use super::encoder;
 
 #[cfg(feature = "arrow-ingress")]
-use arrow_array::RecordBatch;
+use arrow::array::RecordBatch;
 
 fn classify_flush_error(err: crate::Error) -> crate::Error {
     if err.code() == ErrorCode::SocketError {

@@ -4,6 +4,22 @@
 //! and the egress polars path (`Cursor` → `DataFrame`); homed here so neither
 //! direction has to reach into the other's module.
 
+use polars::prelude::{Column, DataFrame, PolarsResult};
+
+/// `DataFrame::new` changed name+signature between polars 0.52 and 0.53;
+/// `into_frame` + `with_column` are stable across 0.52–0.54.
+pub(crate) fn df_from_columns(columns: Vec<Column>) -> PolarsResult<DataFrame> {
+    let mut cols = columns.into_iter();
+    let Some(first) = cols.next() else {
+        return Ok(DataFrame::default());
+    };
+    let mut df = first.into_frame();
+    for col in cols {
+        df.with_column(col)?;
+    }
+    Ok(df)
+}
+
 #[inline]
 pub(crate) unsafe fn rs_array_into_pa(
     rs: arrow::ffi::FFI_ArrowArray,

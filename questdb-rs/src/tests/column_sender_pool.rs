@@ -3305,7 +3305,7 @@ fn redriven_i64_rows(frames: &mpsc::Receiver<Vec<u8>>) -> Vec<i64> {
 fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
     // The Arrow RecordBatch path must split an oversize batch into cap-sized
     // frames just like the chunk path; every row must land exactly once.
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
     use std::sync::Arc;
 
     const CAP: usize = 2048;
@@ -3354,7 +3354,7 @@ fn direct_flush_arrow_batch_splits_oversize_batch_into_capped_frames() {
 #[cfg(feature = "arrow-ingress")]
 #[test]
 fn store_and_forward_arrow_batch_reports_fsn_progress_and_split_boundary() {
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch};
     use std::sync::Arc;
 
     const CAP: usize = 2048;
@@ -3422,8 +3422,8 @@ fn store_and_forward_arrow_batch_reports_fsn_progress_and_split_boundary() {
 fn store_and_forward_arrow_batch_at_column_reports_fsn_progress() {
     use std::sync::Arc;
 
-    use arrow_array::{Float64Array, RecordBatch, TimestampNanosecondArray};
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow::array::{Float64Array, RecordBatch, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     let server = MockServer::spawn_acking(1);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap();
@@ -3460,7 +3460,7 @@ fn store_and_forward_arrow_batch_at_column_reports_fsn_progress() {
 #[test]
 fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     use crate::ingress::polars::PolarsIngestOptions;
-    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     // Endpoint A is the eager-open primary that dies on the checkpoint `sync`;
     // endpoint B is a live acking server. The DataFrame entry must catch the
@@ -3482,7 +3482,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
     );
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4, 5, 6]).into_column();
-    let df = DataFrame::new_with_height(6, vec![i]).unwrap();
+    let df = crate::polars_ffi::df_from_columns(vec![i]).unwrap();
 
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
@@ -3510,7 +3510,7 @@ fn flush_polars_dataframe_redrives_whole_df_onto_live_endpoint() {
 #[test]
 fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
     use crate::ingress::polars::PolarsIngestOptions;
-    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     // The primary acks one full checkpoint and then dies mid-stream. With one
     // row per batch and a 66-row df, the first 64 batches plus the checkpoint
@@ -3535,7 +3535,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
 
     let vals: Vec<i64> = (1..=66).collect();
     let i = Series::new(PlSmallStr::from("i"), vals.as_slice()).into_column();
-    let df = DataFrame::new_with_height(66, vec![i]).unwrap();
+    let df = crate::polars_ffi::df_from_columns(vec![i]).unwrap();
 
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(1))
@@ -3563,7 +3563,7 @@ fn flush_polars_dataframe_redrives_only_the_uncommitted_tail() {
 #[test]
 fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     use crate::ingress::polars::PolarsIngestOptions;
-    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     // The primary is the eager-open connection and dies during the DataFrame
     // flush. The replacement endpoint is initially unreachable but starts
@@ -3590,7 +3590,7 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
     );
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2]).into_column();
-    let df = DataFrame::new_with_height(2, vec![i]).unwrap();
+    let df = crate::polars_ffi::df_from_columns(vec![i]).unwrap();
 
     sender
         .flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new().max_rows(2))
@@ -3607,13 +3607,13 @@ fn flush_polars_dataframe_retries_reborrow_connect_until_endpoint_recovers() {
 #[test]
 fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
     use crate::ingress::polars::PolarsIngestOptions;
-    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     let (server, frames) = MockServer::spawn_acking_capturing(1);
     let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
 
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
-    let df = DataFrame::new_with_height(4, vec![i]).unwrap();
+    let df = crate::polars_ffi::df_from_columns(vec![i]).unwrap();
 
     let mut sender = db.borrow_direct_column_sender().expect("borrow");
     sender
@@ -3638,7 +3638,7 @@ fn flush_polars_dataframe_single_endpoint_commits_in_one_pass() {
 fn flush_polars_dataframe_applies_column_overrides() {
     use crate::ingress::column_sender::ArrowColumnOverride;
     use crate::ingress::polars::PolarsIngestOptions;
-    use polars::prelude::{DataFrame, IntoColumn, NamedFrom, PlSmallStr, Series};
+    use polars::prelude::{IntoColumn, NamedFrom, PlSmallStr, Series};
 
     // `ArrowColumnOverride` was documented for "Polars frames built without
     // pyarrow" yet was previously unreachable through `flush_polars_dataframe`.
@@ -3649,7 +3649,7 @@ fn flush_polars_dataframe_applies_column_overrides() {
 
     let s = Series::new(PlSmallStr::from("s"), &["a", "b", "c", "d"]).into_column();
     let i = Series::new(PlSmallStr::from("i"), &[1i64, 2, 3, 4]).into_column();
-    let df = DataFrame::new_with_height(4, vec![s, i]).unwrap();
+    let df = crate::polars_ffi::df_from_columns(vec![s, i]).unwrap();
 
     let overrides = [ArrowColumnOverride::Symbol { column: "s" }];
     let mut sender = db.borrow_direct_column_sender().expect("borrow");
@@ -3674,8 +3674,8 @@ fn flush_polars_dataframe_applies_column_overrides() {
 fn flush_arrow_batch_at_now_commits_in_one_call() {
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     // `db.flush_arrow_batch(.., None, ..)` borrows a direct sender internally,
     // publishes one server-stamped batch as a commit boundary, waits for the
@@ -3710,8 +3710,8 @@ fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
 
     use crate::ErrorCode;
     use crate::ingress::AckLevel;
-    use arrow_array::{Int64Array, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     // The connect string did not set `request_durable_ack=on`, so a
     // caller-named `Durable` level must be rejected up front rather than
@@ -3734,8 +3734,8 @@ fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
 fn flush_arrow_batch_at_column_commits_in_one_call() {
     use std::sync::Arc;
 
-    use arrow_array::{Float64Array, RecordBatch, TimestampNanosecondArray};
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow::array::{Float64Array, RecordBatch, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     // The `Some(ts)` arm sources the designated timestamp from the named
     // column and threads through to `flush_arrow_batch_at_column_and_wait`.

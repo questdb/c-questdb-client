@@ -22,20 +22,21 @@
  *
  ******************************************************************************/
 
-//! `DecodedBatch` → `arrow_array::RecordBatch` conversion.
+//! `DecodedBatch` → `arrow::array::RecordBatch` conversion.
 
 use std::sync::Arc;
 
 use aligned_vec::{AVec, ConstAlign};
-use arrow_array::{
+use arrow::array::ArrayDataBuilder;
+use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Decimal64Array, Decimal128Array, Decimal256Array,
     DictionaryArray, FixedSizeBinaryArray, Int8Array, Int16Array, Int32Array, Int64Array,
     ListArray, RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray,
 };
-use arrow_buffer::{Buffer, NullBuffer};
-use arrow_data::ArrayDataBuilder;
-use arrow_schema::{ArrowError, DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::buffer::{Buffer, NullBuffer};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::error::ArrowError;
 use bytes::Bytes;
 
 use crate::egress::arrow::schema::to_arrow_export;
@@ -272,7 +273,7 @@ fn primitive_array(buf: ColumnBuffer, row_count: usize, dtype: DataType) -> Resu
         .align_buffers(true)
         .build()
         .map_err(|e| to_arrow_export(e.to_string()))?;
-    Ok(arrow_array::make_array(data))
+    Ok(arrow::array::make_array(data))
 }
 
 fn decimal_array(buf: ColumnBuffer, row_count: usize, dtype: DataType) -> Result<ArrayRef> {
@@ -547,7 +548,7 @@ fn symbol_array(
     .build()
     .map_err(|e| to_arrow_export(e.to_string()))?;
     Ok(
-        Arc::new(DictionaryArray::<arrow_array::types::UInt32Type>::from(
+        Arc::new(DictionaryArray::<arrow::array::types::UInt32Type>::from(
             dict_data,
         )) as ArrayRef,
     )
@@ -604,7 +605,7 @@ fn symbol_array_compact(
     .build()
     .map_err(|e| to_arrow_export(e.to_string()))?;
     Ok(
-        Arc::new(DictionaryArray::<arrow_array::types::UInt32Type>::from(
+        Arc::new(DictionaryArray::<arrow::array::types::UInt32Type>::from(
             dict_data,
         )) as ArrayRef,
     )
@@ -762,8 +763,8 @@ fn array_column_to_arrow(
         .build()
         .map_err(|e| to_arrow_export(e.to_string()))?;
     let leaf_array: ArrayRef = match leaf {
-        ArrayLeaf::Float64 => Arc::new(arrow_array::Float64Array::from(leaf_data)),
-        ArrayLeaf::Int64 => Arc::new(arrow_array::Int64Array::from(leaf_data)),
+        ArrayLeaf::Float64 => Arc::new(arrow::array::Float64Array::from(leaf_data)),
+        ArrayLeaf::Int64 => Arc::new(arrow::array::Int64Array::from(leaf_data)),
     };
     let per_level_counts = compute_per_level_counts(
         &shapes,
@@ -1034,7 +1035,7 @@ fn bytes_null_buffer(validity: &Option<Bytes>, row_count: usize) -> Result<Optio
     {
         *last &= (1u8 << trailing_bits) - 1;
     }
-    Ok(Some(NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+    Ok(Some(NullBuffer::new(arrow::buffer::BooleanBuffer::new(
         Buffer::from(bytes_from_avec(inverted)),
         0,
         row_count,

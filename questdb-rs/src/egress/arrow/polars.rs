@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::types::UInt32Type;
-use arrow_array::{Array, ArrayRef, DictionaryArray, RecordBatch};
-use arrow_data::ArrayData;
-use arrow_schema::{DataType as ArrowDataType, SchemaRef};
+use arrow::array::ArrayData;
+use arrow::array::types::UInt32Type;
+use arrow::array::{Array, ArrayRef, DictionaryArray, RecordBatch};
+use arrow::datatypes::{DataType as ArrowDataType, SchemaRef};
 use polars::frame::DataFrame;
 use polars::prelude::{
     Categorical32Type, CategoricalChunked, CategoricalMapping, CategoricalPhysical, Categories,
@@ -212,7 +212,6 @@ impl Iterator for CursorPolarsIter<'_, '_> {
 /// [`ErrorCode::ArrowExport`] on handoff failure.
 pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
     let schema = rb.schema();
-    let row_count = rb.num_rows();
     let mut columns: Vec<Column> = Vec::with_capacity(rb.num_columns());
     // This standalone entry point has no per-cursor state to scope a
     // `Categories` to, so SYMBOL strings intern into the process-global
@@ -234,7 +233,7 @@ pub fn record_batch_to_dataframe(rb: RecordBatch) -> Result<DataFrame> {
         };
         columns.push(series.into_column());
     }
-    DataFrame::new_with_height(row_count, columns)
+    crate::polars_ffi::df_from_columns(columns)
         .map_err(|e| fmt!(ArrowExport, "DataFrame::new failed: {}", e))
 }
 
@@ -407,7 +406,6 @@ fn build_dataframe(
     registry: &SymbolRegistry,
 ) -> Result<DataFrame> {
     let schema = rb.schema();
-    let row_count = rb.num_rows();
     let mut columns: Vec<Column> = Vec::with_capacity(rb.num_columns());
     for (i, (col, field)) in rb.columns().iter().zip(schema.fields().iter()).enumerate() {
         let name = field.name().as_str();
@@ -422,7 +420,7 @@ fn build_dataframe(
         };
         columns.push(series.into_column());
     }
-    DataFrame::new_with_height(row_count, columns)
+    crate::polars_ffi::df_from_columns(columns)
         .map_err(|e| fmt!(ArrowExport, "DataFrame::new failed: {}", e))
 }
 
@@ -431,9 +429,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow_array::builder::{Float64Builder, Int64Builder, StringBuilder};
-    use arrow_array::{ArrayRef, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use arrow::array::builder::{Float64Builder, Int64Builder, StringBuilder};
+    use arrow::array::{ArrayRef, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 
     fn rb_mixed() -> RecordBatch {
         let mut ii = Int64Builder::new();
@@ -470,17 +468,16 @@ mod tests {
         let df = record_batch_to_dataframe(rb).unwrap();
         assert_eq!(df.width(), 3);
         assert_eq!(df.height(), 3);
-        let cols = df.get_columns();
-        assert_eq!(cols[0].name().as_str(), "i");
-        assert_eq!(cols[1].name().as_str(), "f");
-        assert_eq!(cols[2].name().as_str(), "s");
+        assert_eq!(df.select_at_idx(0).unwrap().name().as_str(), "i");
+        assert_eq!(df.select_at_idx(1).unwrap().name().as_str(), "f");
+        assert_eq!(df.select_at_idx(2).unwrap().name().as_str(), "s");
     }
 
     #[test]
     fn record_batch_to_dataframe_preserves_int_values() {
         let rb = rb_mixed();
         let df = record_batch_to_dataframe(rb).unwrap();
-        let col = &df.get_columns()[0];
+        let col = df.select_at_idx(0).unwrap();
         let series = col.as_materialized_series();
         let i64s = series.i64().unwrap();
         assert_eq!(i64s.get(0), Some(1));
@@ -492,7 +489,7 @@ mod tests {
     fn record_batch_to_dataframe_preserves_string_values() {
         let rb = rb_mixed();
         let df = record_batch_to_dataframe(rb).unwrap();
-        let col = &df.get_columns()[2];
+        let col = df.select_at_idx(2).unwrap();
         let series = col.as_materialized_series();
         let s = series.str().unwrap();
         assert_eq!(s.get(0), Some("a"));
@@ -524,7 +521,7 @@ mod tests {
     /// would hit). See the `polars` feature in `Cargo.toml`.
     #[test]
     fn record_batch_to_dataframe_preserves_tz_timestamp() {
-        use arrow_array::TimestampMicrosecondArray;
+        use arrow::array::TimestampMicrosecondArray;
         let ts: ArrayRef = Arc::new(
             TimestampMicrosecondArray::from(vec![1_700_000_000_000_000i64, 1_700_000_000_000_001])
                 .with_timezone("UTC"),
@@ -539,7 +536,7 @@ mod tests {
         assert_eq!(df.height(), 2);
         assert_eq!(df.width(), 1);
         // The column must round-trip as a polars Datetime, not error out.
-        let series = df.get_columns()[0].as_materialized_series();
+        let series = df.select_at_idx(0).unwrap().as_materialized_series();
         assert!(
             matches!(series.dtype(), polars::prelude::DataType::Datetime(_, _)),
             "expected polars Datetime, got {:?}",
@@ -549,8 +546,8 @@ mod tests {
 
     #[test]
     fn record_batch_to_dataframe_symbol_dictionary_to_categorical() {
-        use arrow_array::types::UInt32Type;
-        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::array::types::UInt32Type;
+        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
 
         let values: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "z"]));
         let keys = UInt32Array::from(vec![Some(2u32), Some(0), None, Some(1)]);
@@ -565,7 +562,7 @@ mod tests {
         let df = record_batch_to_dataframe(rb).unwrap();
         assert_eq!(df.width(), 1);
         assert_eq!(df.height(), 4);
-        let col = &df.get_columns()[0];
+        let col = df.select_at_idx(0).unwrap();
         assert_eq!(col.name().as_str(), "sym");
         assert!(
             matches!(col.dtype(), PlDataType::Categorical(_, _)),
@@ -592,8 +589,8 @@ mod tests {
         // batch must build against the same one. Building each batch against a
         // fresh `Categories::random()` broke this: vstack failed with
         // "Categories name mismatch" the moment a result spanned >1 batch.
-        use arrow_array::types::UInt32Type;
-        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::array::types::UInt32Type;
+        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
 
         fn sym_batch(values: &[&str], keys: &[Option<u32>]) -> RecordBatch {
             let values: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
@@ -618,7 +615,9 @@ mod tests {
             .expect("SYMBOL Categoricals from different batches must vstack");
 
         assert_eq!(df.height(), 5);
-        let as_str = df.get_columns()[0]
+        let as_str = df
+            .select_at_idx(0)
+            .unwrap()
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();
@@ -638,8 +637,8 @@ mod tests {
         // cursors converting interleaved. Strings are deliberately reused across
         // columns and streams ("x", "p") to show the shared string<->id mapping
         // never crosswires them.
-        use arrow_array::types::UInt32Type;
-        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::array::types::UInt32Type;
+        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
 
         fn sym(vals: &[&str], keys: &[Option<u32>]) -> ArrayRef {
             let values: ArrayRef = Arc::new(StringArray::from(vals.to_vec()));
@@ -660,7 +659,9 @@ mod tests {
             RecordBatch::try_new(schema, cols).unwrap()
         }
         fn vals(df: &DataFrame, i: usize) -> Vec<Option<String>> {
-            let s = df.get_columns()[i]
+            let s = df
+                .select_at_idx(i)
+                .unwrap()
                 .as_materialized_series()
                 .cast(&PlDataType::String)
                 .unwrap();
@@ -703,8 +704,8 @@ mod tests {
     }
 
     fn sym_batch(values: &[&str], keys: &[Option<u32>]) -> RecordBatch {
-        use arrow_array::types::UInt32Type;
-        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::array::types::UInt32Type;
+        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
         let values: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
         let dict = DictionaryArray::<UInt32Type>::new(UInt32Array::from(keys.to_vec()), values);
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -716,7 +717,9 @@ mod tests {
     }
 
     fn cat_strings(df: &DataFrame) -> Vec<Option<String>> {
-        let s = df.get_columns()[0]
+        let s = df
+            .select_at_idx(0)
+            .unwrap()
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();
@@ -756,7 +759,7 @@ mod tests {
         df.vstack_mut_owned(df2)
             .expect("registry Categoricals from different batches must vstack");
         assert!(matches!(
-            df.get_columns()[0].dtype(),
+            df.select_at_idx(0).unwrap().dtype(),
             PlDataType::Categorical(_, _)
         ));
         assert_eq!(
@@ -801,7 +804,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            df.get_columns()[0].dtype(),
+            df.select_at_idx(0).unwrap().dtype(),
             PlDataType::Categorical(_, _)
         ));
         assert_eq!(cat_strings(&df), vec![Some("L1".into()), Some("L0".into())]);
@@ -846,8 +849,8 @@ mod tests {
             Field::new("delta", dict_ty.clone(), true),
             Field::new("local", dict_ty, true),
         ]));
-        use arrow_array::types::UInt32Type;
-        use arrow_array::{DictionaryArray, StringArray, UInt32Array};
+        use arrow::array::types::UInt32Type;
+        use arrow::array::{DictionaryArray, StringArray, UInt32Array};
         let delta_col: ArrayRef = Arc::new(DictionaryArray::<UInt32Type>::new(
             UInt32Array::from(vec![Some(1u32), Some(0)]),
             Arc::new(StringArray::from(vec!["d0", "d1"])) as ArrayRef,
@@ -859,11 +862,15 @@ mod tests {
         let rb = RecordBatch::try_new(schema, vec![delta_col, local_col]).unwrap();
         let df = build_dataframe(rb, &[true, false], &reg).unwrap();
 
-        let delta = df.get_columns()[0]
+        let delta = df
+            .select_at_idx(0)
+            .unwrap()
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();
-        let local = df.get_columns()[1]
+        let local = df
+            .select_at_idx(1)
+            .unwrap()
             .as_materialized_series()
             .cast(&PlDataType::String)
             .unwrap();

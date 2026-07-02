@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use arrow_array::Array;
-use arrow_schema::{DataType, TimeUnit};
+use arrow::array::Array;
+use arrow::datatypes::{DataType, TimeUnit};
 use bytes::Bytes;
 
 use super::*;
@@ -53,7 +53,7 @@ fn long_column_roundtrip() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::Int64Array>()
+        .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
     assert_eq!(col.value(0), 1);
     assert_eq!(col.value(1), -2);
@@ -74,7 +74,7 @@ fn validity_inversion_runs_on_export() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::Int64Array>()
+        .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
     assert!(col.is_valid(0));
     assert!(col.is_null(1));
@@ -93,7 +93,7 @@ fn boolean_bit_packs_on_export() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::BooleanArray>()
+        .downcast_ref::<arrow::array::BooleanArray>()
         .unwrap();
     assert!(!col.value(0));
     assert!(col.value(1));
@@ -144,7 +144,7 @@ fn varchar_zero_copy_path_under_2gb() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
+        .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     assert_eq!(col.value(0), "hi");
     assert_eq!(col.value(1), "");
@@ -177,7 +177,7 @@ fn varchar_multibyte_and_nulls_round_trip() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
+        .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     assert_eq!(col.value(0), "café");
     assert_eq!(col.value(1), "日本");
@@ -209,7 +209,7 @@ fn binary_zero_copy_path_under_2gb() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::BinaryArray>()
+        .downcast_ref::<arrow::array::BinaryArray>()
         .unwrap();
     assert_eq!(col.value(0), &[1, 2, 3]);
     assert_eq!(col.value(1), &[] as &[u8]);
@@ -273,12 +273,12 @@ fn symbol_uses_global_codes_against_full_dict() {
     let dict_arr = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::array::types::UInt32Type>>()
         .unwrap();
     let values = dict_arr
         .values()
         .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
+        .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     // Full dict, in dict order — not a first-seen compaction.
     let dict_strs: Vec<&str> = (0..values.len()).map(|i| values.value(i)).collect();
@@ -325,12 +325,12 @@ fn symbol_carries_full_dict_with_unused_entries_and_nulls() {
     let dict_arr = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::array::types::UInt32Type>>()
         .unwrap();
     let values = dict_arr
         .values()
         .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
+        .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     assert_eq!(values.len(), 4); // full dict, including unused "zero"/"two"
     assert!(dict_arr.is_valid(0));
@@ -342,8 +342,8 @@ fn symbol_carries_full_dict_with_unused_entries_and_nulls() {
 
 #[test]
 fn symbol_values_cache_reuses_then_rebuilds_on_growth() {
-    use arrow_array::types::UInt32Type;
-    use arrow_array::{DictionaryArray, RecordBatch, StringArray};
+    use arrow::array::types::UInt32Type;
+    use arrow::array::{DictionaryArray, RecordBatch, StringArray};
 
     fn resolve(rb: &RecordBatch) -> Vec<String> {
         let d = rb
@@ -400,8 +400,8 @@ fn symbol_values_cache_reuses_then_rebuilds_on_growth() {
 
 #[test]
 fn symbol_compact_keeps_only_referenced_values() {
-    use arrow_array::types::UInt32Type;
-    use arrow_array::{DictionaryArray, StringArray};
+    use arrow::array::types::UInt32Type;
+    use arrow::array::{DictionaryArray, StringArray};
 
     let s = schema_of(&[("sym", ColumnKind::Symbol)]);
     let mut dict = SymbolDict::new();
@@ -550,7 +550,7 @@ fn byte_column_passes_through_int8() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::Int8Array>()
+        .downcast_ref::<arrow::array::Int8Array>()
         .unwrap();
     assert_eq!(col.values(), &[1i8, -1, 127, -128]);
 }
@@ -840,7 +840,7 @@ fn array_with_null_row_skips_shape() {
     let col = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::ListArray>()
+        .downcast_ref::<arrow::array::ListArray>()
         .unwrap();
     assert!(col.is_valid(0));
     assert!(col.is_null(1));
@@ -868,21 +868,21 @@ fn array_2d_with_leading_null_row_preserves_values() {
     let outer = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::ListArray>()
+        .downcast_ref::<arrow::array::ListArray>()
         .unwrap();
     assert!(outer.is_null(0));
     assert!(outer.is_valid(1));
     let row1 = outer.value(1);
     let inner = row1
         .as_any()
-        .downcast_ref::<arrow_array::ListArray>()
+        .downcast_ref::<arrow::array::ListArray>()
         .unwrap();
     assert_eq!(inner.len(), 2);
     let first = inner.value(0);
     assert_eq!(
         first
             .as_any()
-            .downcast_ref::<arrow_array::Float64Array>()
+            .downcast_ref::<arrow::array::Float64Array>()
             .unwrap()
             .values(),
         &[1.0, 2.0, 3.0]
@@ -891,7 +891,7 @@ fn array_2d_with_leading_null_row_preserves_values() {
     assert_eq!(
         second
             .as_any()
-            .downcast_ref::<arrow_array::Float64Array>()
+            .downcast_ref::<arrow::array::Float64Array>()
             .unwrap()
             .values(),
         &[4.0, 5.0, 6.0]
@@ -919,12 +919,12 @@ fn symbol_with_local_dict_overrides_connection_dict() {
     let dict_arr = rb
         .column(0)
         .as_any()
-        .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
+        .downcast_ref::<arrow::array::DictionaryArray<arrow::array::types::UInt32Type>>()
         .unwrap();
     let values = dict_arr
         .values()
         .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
+        .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     assert_eq!(values.len(), 2);
 }
@@ -949,11 +949,11 @@ fn ffi_round_trip_preserves_record_batch() {
     let batch = decoded_of(3, vec![DecodedColumn::Long(buf(data, None))]);
     let arrow_schema = Arc::new(batch_arrow_schema(&s, &batch).unwrap());
     let rb = batch_to_record_batch(arrow_schema.clone(), &s, batch, &SymbolDict::new()).unwrap();
-    let struct_array: arrow_array::StructArray = rb.into();
+    let struct_array: arrow::array::StructArray = rb.into();
     let data = struct_array.into_data();
     let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&data).unwrap();
     let imported = unsafe { arrow::ffi::from_ffi(ffi_array, &ffi_schema) }.unwrap();
-    let restored: arrow_array::StructArray = imported.into();
+    let restored: arrow::array::StructArray = imported.into();
     assert_eq!(restored.len(), 3);
     assert_eq!(restored.num_columns(), 1);
 }

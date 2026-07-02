@@ -1300,7 +1300,7 @@ mod tests {
     #[test]
     fn slice_rows_subrange_arrow_matches_freshly_built_subchunk() {
         use crate::ingress::column_sender::arrow_batch;
-        use arrow_array::{ArrayRef, Int64Array};
+        use arrow::array::{ArrayRef, Int64Array};
         use std::sync::Arc;
 
         let values: Vec<i64> = (0..16).map(|i| i * 13 - 7).collect();
@@ -1614,7 +1614,7 @@ mod tests {
     #[test]
     fn arrow_deferred_i64_column_matches_row_by_row() {
         use crate::ingress::column_sender::arrow_batch;
-        use arrow_array::{ArrayRef, Int64Array};
+        use arrow::array::{ArrayRef, Int64Array};
         use std::sync::Arc;
 
         let values = [10i64, 20, 30];
@@ -1642,7 +1642,7 @@ mod tests {
     #[test]
     fn arrow_deferred_symbol_column_interns_into_shared_dict() {
         use crate::ingress::column_sender::arrow_batch;
-        use arrow_array::{ArrayRef, StringArray};
+        use arrow::array::{ArrayRef, StringArray};
         use std::sync::Arc;
 
         let sym = StringArray::from(vec!["AAPL", "MSFT", "AAPL"]);
@@ -1667,11 +1667,11 @@ mod tests {
     #[test]
     fn arrow_deferred_symbol_failure_rolls_back_dict() {
         use crate::ingress::column_sender::arrow_batch;
-        use arrow_array::types::UInt32Type;
-        use arrow_array::{ArrayRef, DictionaryArray, UInt32Array};
+        use arrow::array::types::UInt32Type;
+        use arrow::array::{ArrayRef, DictionaryArray, UInt32Array};
         use std::sync::Arc;
 
-        let mut vb = arrow_array::builder::StringBuilder::new();
+        let mut vb = arrow::array::builder::StringBuilder::new();
         vb.append_value("alpha");
         vb.append_null();
         let values = vb.finish();

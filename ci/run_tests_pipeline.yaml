@@ -72,6 +72,18 @@ stages:
           #   inputs:
           #     pathToPublish: ./build
           #   displayName: "Publish build directory"
+      - job: VersionMatrix
+        displayName: "arrow/polars version matrix (linux)"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: python3 ci/run_version_matrix.py
+            displayName: "questdb-rs arrow/polars version matrix"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:

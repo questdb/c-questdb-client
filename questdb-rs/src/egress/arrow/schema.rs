@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 
 use crate::egress::arrow::metadata::*;
 use crate::egress::column_kind::ColumnKind;

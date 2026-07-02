@@ -31,7 +31,8 @@
 //! (`resolve_arrow_symbols`) are factored so a follow-up patch can drive
 //! the per-column chunk appender from the same code.
 
-use arrow_array::{
+use arrow::array::ByteView;
+use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
     DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
@@ -44,9 +45,8 @@ use arrow_array::{
     UInt16Array, UInt32Array, UInt64Array,
     types::{ByteViewType, UInt8Type, UInt16Type, UInt32Type},
 };
-use arrow_buffer::NullBuffer;
-use arrow_data::{ByteView, MAX_INLINE_VIEW_LEN};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
+use arrow::buffer::NullBuffer;
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use std::sync::Arc;
 
 use crate::error::{Error, ErrorCode};
@@ -1597,8 +1597,8 @@ fn write_decimal256_payload(
         Ok(())
     } else if cfg!(target_endian = "little") {
         const _: () = {
-            assert!(std::mem::size_of::<arrow_buffer::i256>() == 32);
-            assert!(std::mem::align_of::<arrow_buffer::i256>() <= 32);
+            assert!(std::mem::size_of::<arrow::datatypes::i256>() == 32);
+            assert!(std::mem::align_of::<arrow::datatypes::i256>() <= 32);
         };
         extend_le_bytes_checked(out, unsafe { typed_slice_as_le_bytes(arr.values()) })
     } else {
@@ -2313,6 +2313,10 @@ fn checked_offset_bytes<'a, O: OffsetSizeTrait>(
     })
 }
 
+/// Spec-fixed at 12; defined locally because arrow only re-exports
+/// `MAX_INLINE_VIEW_LEN` from 58.2 onward.
+const MAX_INLINE_VIEW_LEN: u32 = 12;
+
 /// Bounds-checked byte read for a view array row. Inline views reuse arrow's
 /// own `inline_value` (the bytes live in the views buffer); buffer-backed
 /// views validate the buffer index and slice range before reading. Same
@@ -2644,20 +2648,20 @@ fn resolve_symbol_dict(
 }
 
 trait DictKeyTag {
-    type ArrowType: arrow_array::types::ArrowDictionaryKeyType;
+    type ArrowType: arrow::array::types::ArrowDictionaryKeyType;
 }
 
 struct I8KeyTag;
 impl DictKeyTag for I8KeyTag {
-    type ArrowType = arrow_array::types::Int8Type;
+    type ArrowType = arrow::array::types::Int8Type;
 }
 struct I16KeyTag;
 impl DictKeyTag for I16KeyTag {
-    type ArrowType = arrow_array::types::Int16Type;
+    type ArrowType = arrow::array::types::Int16Type;
 }
 struct I32KeyTag;
 impl DictKeyTag for I32KeyTag {
-    type ArrowType = arrow_array::types::Int32Type;
+    type ArrowType = arrow::array::types::Int32Type;
 }
 struct U8KeyTag;
 impl DictKeyTag for U8KeyTag {
@@ -3776,15 +3780,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use arrow_array::builder::{
+    use arrow::array::builder::{
         BinaryBuilder, Decimal64Builder, Decimal128Builder, FixedSizeBinaryBuilder, Float64Builder,
         Int8Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
         StringDictionaryBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
         TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
         UInt32Builder, UInt64Builder,
     };
-    use arrow_array::types::UInt32Type as DictU32;
-    use arrow_schema::{Field, Schema as ArrowSchema};
+    use arrow::array::types::UInt32Type as DictU32;
+    use arrow::datatypes::{Field, Schema as ArrowSchema};
 
     fn tbl(name: &str) -> TableName<'_> {
         TableName::new(name).unwrap()
@@ -3796,8 +3800,8 @@ mod tests {
 
     #[test]
     fn malformed_varlen_offsets_reject_at_emit_not_oob() {
-        use arrow_buffer::Buffer;
-        use arrow_data::ArrayDataBuilder;
+        use arrow::array::ArrayDataBuilder;
+        use arrow::buffer::Buffer;
 
         // Utf8 with offsets [0, 1000, 3]: first/last land inside the 3-byte
         // values buffer (cheap `validate()` passes), but row 0's [0, 1000)
@@ -3828,8 +3832,8 @@ mod tests {
         validity: u8,
         null_count: usize,
     ) -> StringArray {
-        use arrow_buffer::Buffer;
-        use arrow_data::ArrayDataBuilder;
+        use arrow::array::ArrayDataBuilder;
+        use arrow::buffer::Buffer;
         let data = unsafe {
             ArrayDataBuilder::new(DataType::Utf8)
                 .len(len)
@@ -4099,7 +4103,7 @@ mod tests {
 
     #[test]
     fn classify_rejects_unsupported_type() {
-        let arr: ArrayRef = Arc::new(arrow_array::NullArray::new(3));
+        let arr: ArrayRef = Arc::new(arrow::array::NullArray::new(3));
         let f = Field::new("c", DataType::Null, true);
         let rb = RecordBatch::try_new(arrow_schema_with(f), vec![arr]).unwrap();
         assert_classify_rejects(&rb);
@@ -4359,8 +4363,8 @@ mod tests {
 
     #[test]
     fn decimal256_payload_is_le_twos_complement() {
-        use arrow_array::builder::Decimal256Builder;
-        use arrow_buffer::i256;
+        use arrow::array::builder::Decimal256Builder;
+        use arrow::datatypes::i256;
         let mut b = Decimal256Builder::new();
         b.append_value(i256::from_i128(67890));
         b.append_value(i256::from_i128(-3));
@@ -4375,7 +4379,7 @@ mod tests {
 
     #[test]
     fn decimal32_widens_to_le_i64_payload() {
-        use arrow_array::builder::Decimal32Builder;
+        use arrow::array::builder::Decimal32Builder;
         let mut b = Decimal32Builder::new();
         b.append_value(-5_i32);
         let arr = b.finish().with_precision_and_scale(9, 2).unwrap();
@@ -4552,7 +4556,7 @@ mod tests {
 
     #[test]
     fn qwp_bitmap_aligned_trailing_bits() {
-        use arrow_buffer::BooleanBuffer;
+        use arrow::buffer::BooleanBuffer;
         // 13 rows, byte-aligned offset → word/byte NOT path plus the
         // trailing-bit mask (13 % 8 == 5).
         let valid: Vec<bool> = vec![
@@ -4570,7 +4574,7 @@ mod tests {
 
     #[test]
     fn qwp_bitmap_unaligned_sliced_fallback() {
-        use arrow_buffer::BooleanBuffer;
+        use arrow::buffer::BooleanBuffer;
         // Slice at a non-byte-aligned offset with a non-multiple-of-8
         // length to drive the shift+OR fallback and its trailing mask.
         let valid: Vec<bool> = vec![
@@ -4590,7 +4594,7 @@ mod tests {
 
     #[test]
     fn qwp_bitmap_unaligned_all_null_and_all_valid() {
-        use arrow_buffer::BooleanBuffer;
+        use arrow::buffer::BooleanBuffer;
         let all_valid = vec![true; 12];
         let nulls = NullBuffer::new(BooleanBuffer::from(all_valid).slice(3, 6));
         let mut out = Vec::new();
@@ -4910,7 +4914,7 @@ mod tests {
     #[test]
     fn uint8_widens_to_int_classifier() {
         let field = Field::new("v", DataType::UInt8, true);
-        let arr = arrow_array::UInt8Array::from(vec![0u8, 1, u8::MAX]);
+        let arr = arrow::array::UInt8Array::from(vec![0u8, 1, u8::MAX]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::U8WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
@@ -4919,7 +4923,7 @@ mod tests {
     #[test]
     fn uint16_widens_to_int_classifier() {
         let field = Field::new("v", DataType::UInt16, true);
-        let arr = arrow_array::UInt16Array::from(vec![0u16, 1, u16::MAX]);
+        let arr = arrow::array::UInt16Array::from(vec![0u16, 1, u16::MAX]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::U16WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
@@ -4928,7 +4932,7 @@ mod tests {
     #[test]
     fn int8_widens_to_int_classifier() {
         let field = Field::new("v", DataType::Int8, true);
-        let arr = arrow_array::Int8Array::from(vec![0i8, -1, 127]);
+        let arr = arrow::array::Int8Array::from(vec![0i8, -1, 127]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I8WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
@@ -4937,7 +4941,7 @@ mod tests {
     #[test]
     fn int16_widens_to_int_classifier() {
         let field = Field::new("v", DataType::Int16, true);
-        let arr = arrow_array::Int16Array::from(vec![0i16, -1, i16::MAX]);
+        let arr = arrow::array::Int16Array::from(vec![0i16, -1, i16::MAX]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I16WidenToI32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
@@ -4946,7 +4950,7 @@ mod tests {
     #[test]
     fn int32_widens_to_long_classifier() {
         let field = Field::new("v", DataType::Int32, true);
-        let arr = arrow_array::Int32Array::from(vec![0i32, -1, i32::MAX]);
+        let arr = arrow::array::Int32Array::from(vec![0i32, -1, i32::MAX]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I32WidenToI64));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_LONG);
@@ -4956,7 +4960,7 @@ mod tests {
     fn int8_byte_metadata_override_preserves_byte_wire() {
         let field = Field::new("v", DataType::Int8, true)
             .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "byte")]));
-        let arr = arrow_array::Int8Array::from(vec![1i8, 2, 3]);
+        let arr = arrow::array::Int8Array::from(vec![1i8, 2, 3]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I8));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_BYTE);
@@ -4966,7 +4970,7 @@ mod tests {
     fn int16_short_metadata_override_preserves_short_wire() {
         let field = Field::new("v", DataType::Int16, true)
             .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "short")]));
-        let arr = arrow_array::Int16Array::from(vec![1i16, 2, 3]);
+        let arr = arrow::array::Int16Array::from(vec![1i16, 2, 3]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I16));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_SHORT);
@@ -4976,7 +4980,7 @@ mod tests {
     fn int32_int_metadata_override_preserves_int_wire() {
         let field = Field::new("v", DataType::Int32, true)
             .with_metadata(metadata(&[(crate::arrow_meta::COLUMN_TYPE, "int")]));
-        let arr = arrow_array::Int32Array::from(vec![1i32, 2, 3]);
+        let arr = arrow::array::Int32Array::from(vec![1i32, 2, 3]);
         let kind = classify(&field, &arr).unwrap();
         assert!(matches!(kind, ColumnKind::I32));
         assert_eq!(wire_type_byte(kind, false), QWP_TYPE_INT);
@@ -5038,8 +5042,8 @@ mod tests {
 
     #[test]
     fn dict_u32_large_utf8_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
         let dict = DictionaryArray::<UInt32Type>::from_iter(
             ["AAPL", "MSFT", "AAPL"].into_iter().map(Some),
         );
@@ -5058,8 +5062,8 @@ mod tests {
 
     #[test]
     fn dict_u8_utf8_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt8Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt8Type;
         let dict = DictionaryArray::<UInt8Type>::from_iter(
             ["red", "green", "blue", "red"].into_iter().map(Some),
         );
@@ -5074,8 +5078,8 @@ mod tests {
 
     #[test]
     fn dict_u32_utf8_view_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
         let dict = DictionaryArray::<UInt32Type>::from_iter(
             ["AAPL", "MSFT", "AAPL"].into_iter().map(Some),
         );
@@ -5094,8 +5098,8 @@ mod tests {
 
     #[test]
     fn dict_u16_utf8_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt16Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt16Type;
         let dict =
             DictionaryArray::<UInt16Type>::from_iter(["x", "y", "x", "z"].into_iter().map(Some));
         let field = Field::new(
@@ -5109,9 +5113,9 @@ mod tests {
 
     #[test]
     fn dict_u8_large_utf8_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt8Type;
-        let keys = arrow_array::UInt8Array::from(vec![0u8, 1, 0, 1]);
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt8Type;
+        let keys = arrow::array::UInt8Array::from(vec![0u8, 1, 0, 1]);
         let values = LargeStringArray::from(vec!["alpha", "beta"]);
         let dict = DictionaryArray::<UInt8Type>::try_new(keys, Arc::new(values)).unwrap();
         let field = Field::new(
@@ -5125,8 +5129,8 @@ mod tests {
 
     #[test]
     fn symbol_dict_with_metadata_still_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
         let dict = DictionaryArray::<UInt32Type>::from_iter(["A", "B", "A"].into_iter().map(Some));
         let field = Field::new(
             "s",
@@ -5144,9 +5148,9 @@ mod tests {
 
     #[test]
     fn dict_i8_utf8_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::Int8Type;
-        let keys = arrow_array::Int8Array::from(vec![0i8, 1, 0, 1]);
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::Int8Type;
+        let keys = arrow::array::Int8Array::from(vec![0i8, 1, 0, 1]);
         let values = StringArray::from(vec!["red", "green"]);
         let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
         let field = Field::new(
@@ -5160,9 +5164,9 @@ mod tests {
 
     #[test]
     fn dict_i16_large_utf8_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::Int16Type;
-        let keys = arrow_array::Int16Array::from(vec![0i16, 1, 1]);
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::Int16Type;
+        let keys = arrow::array::Int16Array::from(vec![0i16, 1, 1]);
         let values = LargeStringArray::from(vec!["AAPL", "MSFT"]);
         let dict = DictionaryArray::<Int16Type>::try_new(keys, Arc::new(values)).unwrap();
         let field = Field::new(
@@ -5176,9 +5180,9 @@ mod tests {
 
     #[test]
     fn dict_i32_utf8_view_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::Int32Type;
-        let keys = arrow_array::Int32Array::from(vec![0i32, 1, 0]);
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::Int32Type;
+        let keys = arrow::array::Int32Array::from(vec![0i32, 1, 0]);
         let values = StringViewArray::from(vec!["x", "y"]);
         let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
         let field = Field::new(
@@ -5192,10 +5196,10 @@ mod tests {
 
     #[test]
     fn dict_i8_dedups_and_assigns_gids() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::Int8Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::Int8Type;
         // 4 rows reference 2 distinct slots → exactly 2 global ids.
-        let keys = arrow_array::Int8Array::from(vec![1i8, 0, 1, 0]);
+        let keys = arrow::array::Int8Array::from(vec![1i8, 0, 1, 0]);
         let values = StringArray::from(vec!["A", "B"]);
         let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
         let field = Field::new(
@@ -5222,10 +5226,10 @@ mod tests {
 
     #[test]
     fn dict_i16_null_keys_skip_intern() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::Int16Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::Int16Type;
         // Null rows must not be interned; only the one referenced slot is.
-        let keys = arrow_array::Int16Array::from(vec![Some(0i16), None, Some(0)]);
+        let keys = arrow::array::Int16Array::from(vec![Some(0i16), None, Some(0)]);
         let values = StringArray::from(vec!["only"]);
         let dict = DictionaryArray::<Int16Type>::try_new(keys, Arc::new(values)).unwrap();
         let field = Field::new(
@@ -5290,7 +5294,7 @@ mod tests {
 
     #[test]
     fn time32_seconds_appends() {
-        use arrow_array::builder::Time32SecondBuilder;
+        use arrow::array::builder::Time32SecondBuilder;
         let mut t = Time32SecondBuilder::new();
         t.append_value(0);
         t.append_value(86_399);
@@ -5303,7 +5307,7 @@ mod tests {
 
     #[test]
     fn time32_milliseconds_appends() {
-        use arrow_array::builder::Time32MillisecondBuilder;
+        use arrow::array::builder::Time32MillisecondBuilder;
         let mut t = Time32MillisecondBuilder::new();
         t.append_value(0);
         t.append_value(86_399_999);
@@ -5317,7 +5321,7 @@ mod tests {
 
     #[test]
     fn time64_microseconds_appends() {
-        use arrow_array::builder::Time64MicrosecondBuilder;
+        use arrow::array::builder::Time64MicrosecondBuilder;
         let mut t = Time64MicrosecondBuilder::new();
         t.append_value(0);
         t.append_value(86_399_999_999);
@@ -5330,7 +5334,7 @@ mod tests {
 
     #[test]
     fn time64_nanoseconds_appends() {
-        use arrow_array::builder::Time64NanosecondBuilder;
+        use arrow::array::builder::Time64NanosecondBuilder;
         let mut t = Time64NanosecondBuilder::new();
         t.append_value(0);
         t.append_value(86_399 * 1_000_000_000);
@@ -5343,7 +5347,7 @@ mod tests {
 
     #[test]
     fn duration_seconds_appends() {
-        use arrow_array::builder::DurationSecondBuilder;
+        use arrow::array::builder::DurationSecondBuilder;
         let mut d = DurationSecondBuilder::new();
         d.append_value(0);
         d.append_value(-3600);
@@ -5357,7 +5361,7 @@ mod tests {
 
     #[test]
     fn duration_milliseconds_appends() {
-        use arrow_array::builder::DurationMillisecondBuilder;
+        use arrow::array::builder::DurationMillisecondBuilder;
         let mut d = DurationMillisecondBuilder::new();
         d.append_value(1_500);
         d.append_value(0);
@@ -5370,7 +5374,7 @@ mod tests {
 
     #[test]
     fn duration_microseconds_appends() {
-        use arrow_array::builder::DurationMicrosecondBuilder;
+        use arrow::array::builder::DurationMicrosecondBuilder;
         let mut d = DurationMicrosecondBuilder::new();
         d.append_value(1_000_000);
         d.append_value(-1);
@@ -5384,7 +5388,7 @@ mod tests {
 
     #[test]
     fn duration_nanoseconds_appends() {
-        use arrow_array::builder::DurationNanosecondBuilder;
+        use arrow::array::builder::DurationNanosecondBuilder;
         let mut d = DurationNanosecondBuilder::new();
         d.append_value(0);
         d.append_value(1_500_000_000);
@@ -5397,7 +5401,7 @@ mod tests {
 
     #[test]
     fn duration_units_normalize_to_distinct_nanoseconds() {
-        use arrow_array::builder::{DurationMicrosecondBuilder, DurationMillisecondBuilder};
+        use arrow::array::builder::{DurationMicrosecondBuilder, DurationMillisecondBuilder};
         let mut ms = DurationMillisecondBuilder::new();
         ms.append_value(1);
         let ms_rb = single_col_batch(
@@ -5422,7 +5426,7 @@ mod tests {
 
     #[test]
     fn duration_seconds_overflowing_nanos_are_rejected() {
-        use arrow_array::builder::DurationSecondBuilder;
+        use arrow::array::builder::DurationSecondBuilder;
         let mut d = DurationSecondBuilder::new();
         d.append_value(i64::MAX / 1_000_000_000 + 1);
         let rb = single_col_batch(
@@ -5439,7 +5443,7 @@ mod tests {
 
     #[test]
     fn float16_appends_as_double() {
-        use arrow_array::builder::Float16Builder;
+        use arrow::array::builder::Float16Builder;
         use half::f16;
         let mut b = Float16Builder::new();
         b.append_value(f16::from_f32(1.5));
@@ -5451,7 +5455,7 @@ mod tests {
 
     #[test]
     fn date32_days_appends_as_date_ms() {
-        use arrow_array::builder::Date32Builder;
+        use arrow::array::builder::Date32Builder;
         let mut d = Date32Builder::new();
         d.append_value(0);
         d.append_value(19_675);
@@ -5462,7 +5466,7 @@ mod tests {
 
     #[test]
     fn date32_all_null_appends() {
-        use arrow_array::builder::Date32Builder;
+        use arrow::array::builder::Date32Builder;
         let mut d = Date32Builder::new();
         d.append_null();
         d.append_null();
@@ -5472,7 +5476,7 @@ mod tests {
 
     #[test]
     fn date64_ms_appends_as_date() {
-        use arrow_array::builder::Date64Builder;
+        use arrow::array::builder::Date64Builder;
         let mut d = Date64Builder::new();
         d.append_value(0);
         d.append_value(1_700_000_000_000);
@@ -5483,7 +5487,7 @@ mod tests {
 
     #[test]
     fn time64_ns_all_null_appends() {
-        use arrow_array::builder::Time64NanosecondBuilder;
+        use arrow::array::builder::Time64NanosecondBuilder;
         let mut t = Time64NanosecondBuilder::new();
         t.append_null();
         t.append_null();
@@ -5501,7 +5505,7 @@ mod tests {
 
     #[test]
     fn decimal32_widens_to_decimal64() {
-        use arrow_array::builder::Decimal32Builder;
+        use arrow::array::builder::Decimal32Builder;
         let mut b = Decimal32Builder::new();
         b.append_value(12345);
         b.append_value(-678);
@@ -5513,7 +5517,7 @@ mod tests {
 
     #[test]
     fn decimal32_negative_scale_errors() {
-        use arrow_array::builder::Decimal32Builder;
+        use arrow::array::builder::Decimal32Builder;
         let mut b = Decimal32Builder::new();
         b.append_value(1);
         let arr = b.finish().with_precision_and_scale(9, -2).unwrap();
@@ -5560,8 +5564,8 @@ mod tests {
 
     #[test]
     fn decimal256_negative_scale_rejected() {
-        use arrow_array::builder::Decimal256Builder;
-        use arrow_buffer::i256;
+        use arrow::array::builder::Decimal256Builder;
+        use arrow::datatypes::i256;
         let mut b = Decimal256Builder::new()
             .with_precision_and_scale(76, -1)
             .unwrap();
@@ -5592,8 +5596,8 @@ mod tests {
 
     #[test]
     fn interval_year_month_rejected_as_unsupported() {
-        use arrow_array::builder::IntervalYearMonthBuilder;
-        use arrow_schema::IntervalUnit;
+        use arrow::array::builder::IntervalYearMonthBuilder;
+        use arrow::datatypes::IntervalUnit;
         let mut b = IntervalYearMonthBuilder::new();
         b.append_value(12);
         assert_unsupported_column_with(
@@ -5604,9 +5608,9 @@ mod tests {
 
     #[test]
     fn interval_day_time_rejected_as_unsupported() {
-        use arrow_array::builder::IntervalDayTimeBuilder;
-        use arrow_array::types::IntervalDayTime;
-        use arrow_schema::IntervalUnit;
+        use arrow::array::builder::IntervalDayTimeBuilder;
+        use arrow::array::types::IntervalDayTime;
+        use arrow::datatypes::IntervalUnit;
         let mut b = IntervalDayTimeBuilder::new();
         b.append_value(IntervalDayTime::new(1, 0));
         assert_unsupported_column_with(
@@ -5617,9 +5621,9 @@ mod tests {
 
     #[test]
     fn interval_month_day_nano_rejected_as_unsupported() {
-        use arrow_array::builder::IntervalMonthDayNanoBuilder;
-        use arrow_array::types::IntervalMonthDayNano;
-        use arrow_schema::IntervalUnit;
+        use arrow::array::builder::IntervalMonthDayNanoBuilder;
+        use arrow::array::types::IntervalMonthDayNano;
+        use arrow::datatypes::IntervalUnit;
         let mut b = IntervalMonthDayNanoBuilder::new();
         b.append_value(IntervalMonthDayNano::new(1, 1, 1));
         assert_unsupported_column_with(
@@ -5640,7 +5644,7 @@ mod tests {
 
     #[test]
     fn null_column_rejected_as_unsupported() {
-        let arr = arrow_array::NullArray::new(3);
+        let arr = arrow::array::NullArray::new(3);
         assert_unsupported_column_with(
             Field::new("c", DataType::Null, true),
             Arc::new(arr) as ArrayRef,
@@ -5649,7 +5653,7 @@ mod tests {
 
     #[test]
     fn struct_column_rejected_as_unsupported() {
-        use arrow_array::StructArray;
+        use arrow::array::StructArray;
         let mut inner = Int32Builder::new();
         inner.append_value(1);
         let inner_arr = Arc::new(inner.finish()) as ArrayRef;
@@ -5663,7 +5667,7 @@ mod tests {
 
     #[test]
     fn map_column_rejected_as_unsupported() {
-        use arrow_array::builder::MapBuilder;
+        use arrow::array::builder::MapBuilder;
         let mut b = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
         b.keys().append_value("k");
         b.values().append_value(1);
@@ -5675,8 +5679,8 @@ mod tests {
 
     #[test]
     fn run_end_encoded_column_rejected_as_unsupported() {
-        use arrow_array::builder::PrimitiveRunBuilder;
-        use arrow_array::types::{Int32Type, Int64Type};
+        use arrow::array::builder::PrimitiveRunBuilder;
+        use arrow::array::types::{Int32Type, Int64Type};
         let mut b = PrimitiveRunBuilder::<Int32Type, Int64Type>::new();
         b.append_value(42);
         b.append_value(42);
@@ -5692,14 +5696,14 @@ mod tests {
 
     #[test]
     fn referenced_null_dict_entry_rejected_for_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
         let mut vb = StringBuilder::new();
         vb.append_value("a");
         vb.append_null();
         vb.append_value("c");
         let values = vb.finish();
-        let keys = arrow_array::UInt32Array::from(vec![0u32, 1, 2]);
+        let keys = arrow::array::UInt32Array::from(vec![0u32, 1, 2]);
         let dict =
             DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
         let field = Field::new(
@@ -5716,13 +5720,13 @@ mod tests {
 
     #[test]
     fn referenced_null_dict_entry_rejected() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
         let mut vb = StringBuilder::new();
         vb.append_value("a");
         vb.append_null();
         let values = vb.finish();
-        let keys = arrow_array::UInt32Array::from(vec![0u32, 1]);
+        let keys = arrow::array::UInt32Array::from(vec![0u32, 1]);
         let dict =
             DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
         let field = Field::new(
@@ -5737,14 +5741,14 @@ mod tests {
 
     #[test]
     fn unreferenced_null_dict_entry_accepted_for_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
         let mut vb = StringBuilder::new();
         vb.append_value("a");
         vb.append_null();
         vb.append_value("c");
         let values = vb.finish();
-        let keys = arrow_array::UInt32Array::from(vec![0u32, 2, 0]);
+        let keys = arrow::array::UInt32Array::from(vec![0u32, 2, 0]);
         let dict =
             DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
         let field = Field::new(
@@ -5759,13 +5763,13 @@ mod tests {
 
     #[test]
     fn unreferenced_null_dict_entry_accepted() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
         let mut vb = StringBuilder::new();
         vb.append_value("a");
         vb.append_null();
         let values = vb.finish();
-        let keys = arrow_array::UInt32Array::from(vec![0u32, 0]);
+        let keys = arrow::array::UInt32Array::from(vec![0u32, 0]);
         let dict =
             DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values) as ArrayRef).unwrap();
         let field = Field::new(
@@ -5890,7 +5894,7 @@ mod tests {
 
     #[test]
     fn encode_error_rolls_back_out_and_dict() {
-        use arrow_array::builder::MapBuilder;
+        use arrow::array::builder::MapBuilder;
         // First column: valid Int64. Second column: Map (unsupported).
         // Encoder must reject and leave `out` truncated to its original
         // length, dict at its mark.
@@ -5946,7 +5950,7 @@ mod tests {
         let inner_field = Arc::new(Field::new("x", DataType::Int32, true));
         let mut b = Int32Builder::new();
         b.append_value(1);
-        let struct_arr = arrow_array::StructArray::from(vec![(
+        let struct_arr = arrow::array::StructArray::from(vec![(
             inner_field.clone(),
             Arc::new(b.finish()) as ArrayRef,
         )]);
@@ -6041,7 +6045,7 @@ mod tests {
 
     #[test]
     fn sliced_bool_array_with_offset_emits_sliced_window() {
-        use arrow_array::builder::BooleanBuilder;
+        use arrow::array::builder::BooleanBuilder;
         let mut b = BooleanBuilder::new();
         for v in [true, false, true, false, true, false, true, false, true] {
             b.append_value(v);
@@ -6071,7 +6075,7 @@ mod tests {
 
     #[test]
     fn sliced_bool_aligned_offset_emits_sliced_window() {
-        use arrow_array::builder::BooleanBuilder;
+        use arrow::array::builder::BooleanBuilder;
         let mut b = BooleanBuilder::new();
         // Deliberately NON-periodic so the window [8,13) differs from the
         // pre-slice prefix [0,5); a regression that ignored the
@@ -6341,7 +6345,7 @@ mod tests {
 
     #[test]
     fn fixed_size_list_float64_appends_as_array_1d() {
-        use arrow_array::builder::FixedSizeListBuilder;
+        use arrow::array::builder::FixedSizeListBuilder;
         let mut b = FixedSizeListBuilder::new(Float64Builder::new(), 3);
         b.values().append_value(1.0);
         b.values().append_value(2.0);
@@ -6359,7 +6363,7 @@ mod tests {
 
     #[test]
     fn large_list_nested_float64_appends_as_array_2d() {
-        use arrow_array::builder::LargeListBuilder;
+        use arrow::array::builder::LargeListBuilder;
         let mut outer = LargeListBuilder::new(LargeListBuilder::new(Float64Builder::new()));
         for v in [1.0, 2.0] {
             outer.values().values().append_value(v);
@@ -6436,7 +6440,7 @@ mod tests {
 
     #[test]
     fn large_list_ragged_inner_three_lists_summing_to_rectangle_errors() {
-        use arrow_array::builder::LargeListBuilder;
+        use arrow::array::builder::LargeListBuilder;
         let mut outer = LargeListBuilder::new(LargeListBuilder::new(Float64Builder::new()));
         for v in [1.0, 2.0] {
             outer.values().values().append_value(v);
@@ -6464,11 +6468,11 @@ mod tests {
     /// Build a single-row column nested `levels` deep (`List` repeated over a
     /// `Float64` leaf), so `walk_list_leaf` reports `ndim == levels`.
     fn nested_list_batch(levels: usize) -> RecordBatch {
-        let mut values: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![1.0f64]));
+        let mut values: ArrayRef = Arc::new(arrow::array::Float64Array::from(vec![1.0f64]));
         let mut item_field = Arc::new(Field::new("item", DataType::Float64, true));
         for _ in 0..levels {
-            let offsets = arrow_buffer::OffsetBuffer::from_lengths([values.len()]);
-            let list = arrow_array::ListArray::new(item_field.clone(), offsets, values, None);
+            let offsets = arrow::buffer::OffsetBuffer::from_lengths([values.len()]);
+            let list = arrow::array::ListArray::new(item_field.clone(), offsets, values, None);
             item_field = Arc::new(Field::new("item", DataType::List(item_field), true));
             values = Arc::new(list);
         }
@@ -6694,8 +6698,8 @@ mod tests {
 
     #[test]
     fn not_symbol_override_decodes_dict_to_varchar_u8_utf8() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt8Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt8Type;
         let dict = DictionaryArray::<UInt8Type>::from_iter(
             ["foo", "bar", "foo", "baz"].into_iter().map(Some),
         );
@@ -6718,9 +6722,9 @@ mod tests {
 
     #[test]
     fn not_symbol_override_decodes_dict_to_varchar_u32_large_utf8() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt32Type;
-        let keys = arrow_array::UInt32Array::from(vec![0u32, 1, 0]);
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt32Type;
+        let keys = arrow::array::UInt32Array::from(vec![0u32, 1, 0]);
         let values = LargeStringArray::from(vec!["alpha", "beta"]);
         let dict = DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values)).unwrap();
         let f = Field::new(
@@ -6739,8 +6743,8 @@ mod tests {
 
     #[test]
     fn not_symbol_override_decodes_dict_with_nulls() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::Int16Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::Int16Type;
         let dict = DictionaryArray::<Int16Type>::from_iter([Some("x"), None, Some("y"), Some("x")]);
         let f = Field::new(
             "s",
@@ -6770,8 +6774,8 @@ mod tests {
 
     #[test]
     fn dict_without_not_symbol_override_still_routes_to_symbol() {
-        use arrow_array::DictionaryArray;
-        use arrow_array::types::UInt8Type;
+        use arrow::array::DictionaryArray;
+        use arrow::array::types::UInt8Type;
         let dict = DictionaryArray::<UInt8Type>::from_iter(["a", "b", "a"].into_iter().map(Some));
         let f = Field::new(
             "s",

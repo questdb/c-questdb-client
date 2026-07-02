@@ -472,7 +472,7 @@ impl QuestDb {
         )))
     }
 
-    /// Flush a single Arrow [`RecordBatch`](arrow_array::RecordBatch) to
+    /// Flush a single Arrow [`RecordBatch`](arrow::array::RecordBatch) to
     /// `table` in one call.
     ///
     /// This is the recommended entry point for one-off Arrow ingestion: it
@@ -512,7 +512,7 @@ impl QuestDb {
     pub fn flush_arrow_batch<'t, T>(
         &self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         timestamp_column: Option<crate::ingress::ColumnName<'_>>,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
         ack_level: Option<AckLevel>,
@@ -1238,14 +1238,14 @@ impl<'a> SfColumnSender<'a> {
         self.0.inner_ref().in_flight()
     }
 
-    /// Encode and publish an Arrow [`RecordBatch`](arrow_array::RecordBatch)
+    /// Encode and publish an Arrow [`RecordBatch`](arrow::array::RecordBatch)
     /// into the queue, letting the server stamp each row's designated
     /// timestamp on arrival. Publish-only; call [`Self::wait`] for an ack.
     #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_at_now<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
     ) -> Result<()>
     where
@@ -1263,7 +1263,7 @@ impl<'a> SfColumnSender<'a> {
     pub fn flush_arrow_batch_at_now_and_get_fsn<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
     ) -> Result<Option<u64>>
     where
@@ -1275,14 +1275,14 @@ impl<'a> SfColumnSender<'a> {
             .flush_arrow_batch_at_now_and_get_fsn(table, batch, overrides)
     }
 
-    /// Encode and publish an Arrow [`RecordBatch`](arrow_array::RecordBatch)
+    /// Encode and publish an Arrow [`RecordBatch`](arrow::array::RecordBatch)
     /// into the queue, sourcing the designated timestamp from the named
     /// column. Publish-only; call [`Self::wait`] for an ack.
     #[cfg(feature = "arrow-ingress")]
     pub fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         ts_column: crate::ingress::ColumnName<'_>,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
     ) -> Result<()>
@@ -1301,7 +1301,7 @@ impl<'a> SfColumnSender<'a> {
     pub fn flush_arrow_batch_at_column_and_get_fsn<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         ts_column: crate::ingress::ColumnName<'_>,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
     ) -> Result<Option<u64>>
@@ -1427,7 +1427,7 @@ impl<'a> DirectColumnSender<'a> {
     pub(crate) fn flush_arrow_batch_at_now<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
     ) -> Result<()>
     where
@@ -1446,7 +1446,7 @@ impl<'a> DirectColumnSender<'a> {
     pub(crate) fn flush_arrow_batch_at_column<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         ts_column: crate::ingress::ColumnName<'_>,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
     ) -> Result<()>
@@ -1465,7 +1465,7 @@ impl<'a> DirectColumnSender<'a> {
     pub(crate) fn flush_arrow_batch_at_now_and_wait<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
         ack_level: AckLevel,
     ) -> Result<()>
@@ -1484,7 +1484,7 @@ impl<'a> DirectColumnSender<'a> {
     pub(crate) fn flush_arrow_batch_at_column_and_wait<'t, T>(
         &mut self,
         table: T,
-        batch: &arrow_array::RecordBatch,
+        batch: &arrow::array::RecordBatch,
         ts_column: crate::ingress::ColumnName<'_>,
         overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
         ack_level: AckLevel,

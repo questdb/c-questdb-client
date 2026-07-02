@@ -60,8 +60,8 @@ use super::wire::{
 
 #[cfg(feature = "arrow-ingress")]
 pub struct ImportedArrowColumn {
-    field: arrow_schema::Field,
-    array: arrow_array::ArrayRef,
+    field: arrow::datatypes::Field,
+    array: arrow::array::ArrayRef,
     kind: arrow_batch::ColumnKind,
 }
 
@@ -83,12 +83,12 @@ impl ImportedArrowColumn {
         schema: &arrow::ffi::FFI_ArrowSchema,
         symbol: Option<bool>,
     ) -> Result<Self> {
-        use arrow_array::make_array;
+        use arrow::array::make_array;
 
         let imported_array = unsafe { std::ptr::read(array) };
         array.release = None;
 
-        let mut field = arrow_schema::Field::try_from(schema)
+        let mut field = arrow::datatypes::Field::try_from(schema)
             .map_err(|err| error::fmt!(ArrowIngest, "schema conversion failed: {}", err))?;
         if let Some(want_symbol) = symbol {
             let mut metadata = field.metadata().clone();
@@ -125,11 +125,11 @@ impl ImportedArrowColumn {
         self.array.is_empty()
     }
 
-    pub fn field(&self) -> &arrow_schema::Field {
+    pub fn field(&self) -> &arrow::datatypes::Field {
         &self.field
     }
 
-    fn slice(&self, row_offset: usize, row_count: usize) -> Result<arrow_array::ArrayRef> {
+    fn slice(&self, row_offset: usize, row_count: usize) -> Result<arrow::array::ArrayRef> {
         let array_len = self.array.len();
         let slice_end = row_offset.checked_add(row_count).ok_or_else(|| {
             error::fmt!(
@@ -326,7 +326,7 @@ pub(crate) enum ColumnKind {
     #[cfg(feature = "arrow-ingress")]
     ArrowDeferred {
         arrow_kind: arrow_batch::ColumnKind,
-        arr: arrow_array::ArrayRef,
+        arr: arrow::array::ArrayRef,
     },
 
     /// Raw numpy buffer + dtype tag, encoded at flush via
@@ -1406,8 +1406,8 @@ impl<'a> Chunk<'a> {
     pub fn push_arrow_column(
         &mut self,
         name: &str,
-        field: &arrow_schema::Field,
-        arr: arrow_array::ArrayRef,
+        field: &arrow::datatypes::Field,
+        arr: arrow::array::ArrayRef,
     ) -> Result<&mut Self> {
         if field.data_type() != arr.data_type() {
             return Err(error::fmt!(
@@ -1441,13 +1441,13 @@ impl<'a> Chunk<'a> {
     ///
     /// Used by `column_sender_chunk_append_arrow_column` (FFI) after
     /// the caller's `ArrowArray` / `ArrowSchema` has been imported into
-    /// an `arrow_array::ArrayRef` and classified.
+    /// an `arrow::array::ArrayRef` and classified.
     #[cfg(feature = "arrow-ingress")]
     pub(crate) fn push_arrow_deferred(
         &mut self,
         name: &str,
         arrow_kind: arrow_batch::ColumnKind,
-        arr: arrow_array::ArrayRef,
+        arr: arrow::array::ArrayRef,
     ) -> Result<&mut Self> {
         validate_column_name(name)?;
         self.guard_unique_name(name)?;

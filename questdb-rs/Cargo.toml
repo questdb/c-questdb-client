@@ -67,11 +67,7 @@ zstd = { version = "0.13", optional = true }
 # Apache Arrow integration. `ffi` feature enables Arrow C Data Interface
 # export. Pinned to a single major to match DataFusion's current major;
 # bump deliberately per release notes.
-arrow = { version = "58", optional = true, default-features = false, features = ["ffi"] }
-arrow-array = { version = "58", optional = true, default-features = false }
-arrow-schema = { version = "58", optional = true, default-features = false }
-arrow-buffer = { version = "58", optional = true, default-features = false }
-arrow-data = { version = "58", optional = true, default-features = false }
+arrow = { version = ">=58, <60", optional = true, default-features = false, features = ["ffi"] }
 # 64-byte aligned allocations for build-pass Arrow buffers (validity,
 # BOOLEAN bit-pack, ARRAY offsets, SYMBOL union dict).
 aligned-vec = { version = "0.6", optional = true }
@@ -83,14 +79,15 @@ aligned-vec = { version = "0.6", optional = true }
 # `next_polars` / `iter_polars`) fails at runtime on the timestamp
 # column. `dtype-date` covers QuestDB DATE columns symmetrically.
 #
-# Exact-pinned (in lockstep with polars-arrow): polars makes breaking API
-# changes at every 0.x minor, and `questdb-rs/Cargo.lock` is gitignored —
-# a version range would let an unrelated build float onto an incompatible
-# polars. The source targets this release's APIs (`DataFrame::new_with_height`,
-# `DataFrame::get_columns`, the `Categories` categorical surface); bump in
-# lockstep with the call sites.
-polars = { version = "=0.52.0", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "timezones"] }
-polars-arrow = { version = "=0.52.0", optional = true, default-features = false, features = ["compute"] }
+# Range 0.52–0.54 (in lockstep with polars-arrow): polars renames APIs at
+# every 0.x minor, so the source deliberately uses only the subset stable
+# across this range (`DataFrame::new`, `select_at_idx`, the `Categories`
+# categorical surface) instead of per-release names like `new_with_height` /
+# `get_columns`. CI exercises 0.52, 0.53 and 0.54. `questdb-rs/Cargo.lock` is
+# gitignored, so the `<0.55` ceiling keeps an unrelated build from floating
+# onto an untested polars.
+polars = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["dtype-categorical", "dtype-datetime", "dtype-date", "timezones"] }
+polars-arrow = { version = ">=0.52, <0.55", optional = true, default-features = false, features = ["compute"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
@@ -257,7 +254,7 @@ _egress = ["dep:bytes"]
 _keystore-roots = ["dep:jks", "dep:p12-keystore"]
 # Shared Arrow / Polars dependency bundles, enabled by both directional
 # features. Don't use directly.
-_arrow = ["dep:arrow", "dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer", "dep:arrow-data", "dep:aligned-vec", "dep:bytes"]
+_arrow = ["dep:arrow", "dep:aligned-vec", "dep:bytes"]
 _polars = ["dep:polars", "dep:polars-arrow"]
 
 # -----------------------------------------------------------------------------

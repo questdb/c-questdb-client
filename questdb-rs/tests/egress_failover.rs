@@ -5159,7 +5159,7 @@ fn fetch_all_polars_failover_after_batch_yields_complete_result() {
 
     assert_eq!(cursor.failover_resets(), 1, "exactly one reset to server B");
     assert_eq!(df.height(), 3, "A's partial batch must be discarded");
-    let col = &df.get_columns()[0];
+    let col = df.select_at_idx(0).unwrap();
     assert_eq!(col.name().as_str(), "v");
     let series = col.as_materialized_series();
     let vals = series.i64().expect("LONG column");
@@ -5289,9 +5289,9 @@ fn fetch_all_arrow_failover_after_batch_yields_complete_result() {
 /// `Dictionary<UInt32, Utf8>`; the value at row `i` is
 /// `values[keys[i]]`.
 #[cfg(feature = "arrow")]
-fn symbol_rows(rb: &arrow_array::RecordBatch) -> Vec<String> {
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt32Type;
+fn symbol_rows(rb: &arrow::array::RecordBatch) -> Vec<String> {
+    use arrow::array::cast::AsArray;
+    use arrow::array::types::UInt32Type;
     let dict = rb.column(0).as_dictionary::<UInt32Type>();
     let values = dict.values().as_string::<i32>();
     dict.keys()

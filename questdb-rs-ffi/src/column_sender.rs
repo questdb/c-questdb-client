@@ -3618,12 +3618,12 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
 /// caller already must tolerate per the documented ownership contract.
 #[cfg(feature = "arrow")]
 unsafe fn reexport_record_batch_into(
-    rb: arrow_array::RecordBatch,
+    rb: arrow::array::RecordBatch,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
 ) {
+    use arrow::array::{Array, StructArray};
     use arrow::datatypes::DataType;
-    use arrow_array::{Array, StructArray};
 
     // A non-Struct top-level schema means the caller passed a bare
     // single-column array; mirror that shape so the re-exported array pairs
@@ -4801,7 +4801,7 @@ mod tests {
     #[cfg(feature = "arrow")]
     #[test]
     fn reexport_bare_single_column_round_trips_for_retry() {
-        use arrow_array::{Array, Int64Array};
+        use arrow::array::{Array, Int64Array};
 
         let col = Int64Array::from(vec![1_i64, 2, 3]);
         let (mut ffi_array, ffi_schema) =
@@ -4847,8 +4847,8 @@ mod tests {
     #[cfg(feature = "arrow")]
     #[test]
     fn reexport_struct_round_trips_for_retry() {
+        use arrow::array::{Array, ArrayRef, Int64Array, StructArray};
         use arrow::datatypes::{DataType, Field};
-        use arrow_array::{Array, ArrayRef, Int64Array, StructArray};
         use std::sync::Arc;
 
         let col = Arc::new(Int64Array::from(vec![10_i64, 20])) as ArrayRef;

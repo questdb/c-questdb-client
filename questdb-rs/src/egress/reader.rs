@@ -1689,7 +1689,7 @@ impl<'r> Cursor<'r> {
     /// Returns [`ErrorCode::NoSchema`] if the stream terminates before
     /// any batch is produced.
     ///
-    /// [`RecordBatchReader`]: arrow_array::RecordBatchReader
+    /// [`RecordBatchReader`]: arrow::array::RecordBatchReader
     /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
     #[cfg(feature = "arrow-egress")]
     pub fn as_arrow_reader<'c>(
@@ -1710,7 +1710,7 @@ impl<'r> Cursor<'r> {
     #[cfg(feature = "arrow-egress")]
     pub fn fetch_all_arrow(
         &mut self,
-    ) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>)> {
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>)> {
         // Materialise-whole: nothing leaves the library until the full
         // result is built, so a mid-query failover can re-read it
         // transparently. Opt into replay and discard the partial
@@ -1718,7 +1718,7 @@ impl<'r> Cursor<'r> {
         self.enable_internal_replay();
         let mut reader = self.as_arrow_reader()?;
         let mut resets_seen = reader.failover_resets();
-        let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        let mut batches: Vec<arrow::array::RecordBatch> = Vec::new();
         loop {
             // Manual drive (not `for`/`by_ref`) so the reset counter can be
             // polled between batches without holding an iterator borrow.
@@ -1751,12 +1751,12 @@ impl<'r> Cursor<'r> {
         crate::egress::arrow::CursorPolarsIter::new(self)
     }
 
-    /// Next batch as an Arrow [`RecordBatch`](arrow_array::RecordBatch).
+    /// Next batch as an Arrow [`RecordBatch`](arrow::array::RecordBatch).
     /// `Ok(None)` on stream end; replays terminal errors like
     /// [`Cursor::next_batch`]. No drift check — use
     /// [`Cursor::as_arrow_reader`] for that.
     #[cfg(feature = "arrow-egress")]
-    pub fn next_arrow_batch(&mut self) -> Result<Option<arrow_array::RecordBatch>> {
+    pub fn next_arrow_batch(&mut self) -> Result<Option<arrow::array::RecordBatch>> {
         self.next_arrow_batch_inner(None, false)
     }
 
@@ -1764,9 +1764,9 @@ impl<'r> Cursor<'r> {
     #[doc(hidden)]
     pub fn next_arrow_batch_inner(
         &mut self,
-        expected_schema: Option<&arrow_schema::SchemaRef>,
+        expected_schema: Option<&arrow::datatypes::SchemaRef>,
         compact: bool,
-    ) -> Result<Option<arrow_array::RecordBatch>> {
+    ) -> Result<Option<arrow::array::RecordBatch>> {
         use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch_with, schemas_equal};
         use std::sync::Arc;
 
