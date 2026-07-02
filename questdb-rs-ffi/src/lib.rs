@@ -6079,7 +6079,7 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_flush_and_get_fsn: conn pointer is NULL",
+                "column_sender_flush_and_get_fsn: sender pointer is NULL",
             );
 
             assert!(!column_sender_published_fsn(
@@ -6090,14 +6090,14 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_published_fsn: conn pointer is NULL",
+                "column_sender_published_fsn: sender pointer is NULL",
             );
 
             assert!(!column_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_acked_fsn: conn pointer is NULL",
+                "column_sender_acked_fsn: sender pointer is NULL",
             );
         }
     }
@@ -6183,7 +6183,7 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
+                "column_sender_flush_arrow_batch_at_now_and_get_fsn requires non-NULL fsn_out",
             );
             assert!(
                 array.release.is_some(),
@@ -6205,7 +6205,7 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
+                "column_sender_flush_arrow_batch_at_column_and_get_fsn requires non-NULL fsn_out",
             );
 
             questdb_db_return_column_sender(ptr::null_mut(), sender);

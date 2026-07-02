@@ -1513,7 +1513,7 @@ public:
         return ::questdb_db_reconnect_max_duration_ms(_raw);
     }
 
-    /** Close + drop idle senders beyond `pool_size`. Returns count closed. */
+    /** Close idle connections beyond `pool_size`. Returns count closed. */
     size_t reap_idle() noexcept
     {
         return ::questdb_db_reap_idle(_raw);

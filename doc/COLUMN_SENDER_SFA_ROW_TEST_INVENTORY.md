@@ -6,7 +6,7 @@ columnar sender SFA test gap.
 
 The row path means `Sender` / `Buffer` line-protocol ingestion over
 `qwpws::...` with `sf_dir` and `sender_id`. The columnar gap means
-`questdb_db` / `column_sender_conn`, Arrow C Data Interface ingestion, and
+`questdb_db` / `column_sender`, Arrow C Data Interface ingestion, and
 Python `Client.dataframe()` when the client is opened with `sf_dir`.
 
 ## Current Columnar Baseline

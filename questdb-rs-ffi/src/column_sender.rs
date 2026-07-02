@@ -62,12 +62,12 @@ use crate::{
 /// and must not race with other operations on the same `db`.
 pub struct questdb_db(pub(crate) QuestDb);
 
-/// Borrowed store-and-forward QWP/WS connection. Owns a pool slot until
+/// Borrowed store-and-forward column-major QWP/WS sender. Owns a pool slot until
 /// `questdb_db_return_column_sender` or `questdb_db_drop_column_sender`
 /// is called. Bundles the per-connection schema registry and symbol-dict state
 /// used by all writer modes.
 ///
-/// **Not thread-safe.** An `column_sender*` or `direct_column_sender*`
+/// **Not thread-safe.** A `column_sender*` or `direct_column_sender*`
 /// handle must not be used from more than one thread at a time. The second
 /// tuple field is a CAS-checked latch on every FFI entry (mutation, accessor,
 /// and free); a non-blocking contending caller observes
@@ -2275,7 +2275,7 @@ unsafe fn resolve_numpy_dtype(
 /// This call parks the raw `data` (and `validity->bits`, if any) pointer
 /// and walks it later, at flush time. The caller therefore MUST keep the
 /// backing buffer **alive and unmodified** until the next
-/// `column_sender_flush` / `column_sender_sync` on this chunk **returns**.
+/// `column_sender_flush` / `column_sender_wait` on this chunk **returns**.
 /// Freeing, reallocating, or letting a GC move the buffer before then is
 /// undefined behaviour (use-after-free). No length or liveness can be
 /// re-checked at flush time — only at append.
@@ -2562,7 +2562,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
 ///
 /// In direct mode, ready acks are drained non-blocking before the write.
 /// Deferred flushes keep one in-flight slot reserved for the later
-/// `column_sender_sync` commit frame; if that reserve would be consumed, the
+/// `direct_column_sender_commit` frame; if that reserve would be consumed, the
 /// call fails and the caller must sync before flushing more chunks. In SFA mode
 /// frames are non-deferred and `flush` success means local queue acceptance.
 ///
@@ -2577,7 +2577,8 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
 /// [`line_sender_error_in_doubt`](crate::line_sender_error_in_doubt) on
 /// `*err_out` to detect this delivery-unknown case before retrying.
 ///
-/// Call [`column_sender_sync`] after the last flush to drain all
+/// Call `column_sender_wait` (store-and-forward) or
+/// `direct_column_sender_commit` (direct) after the last flush to drain all
 /// remaining in-flight acks.
 unsafe fn cs_flush_body<T: CsHandle>(
     sender: *mut T,
@@ -2816,14 +2817,14 @@ pub unsafe extern "C" fn direct_column_sender_flush(
 
 /// Publish `chunk` as a completion boundary, then **wait** until every frame
 /// published before or by this call reaches `ack_level` (see
-/// `column_sender_sync` for the level meanings and the no-progress timeout).
+/// `column_sender_wait` for the level meanings and the no-progress timeout).
 ///
 /// `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range
 /// value, or `qwpws_ack_level_durable` without `request_durable_ack=on`,
 /// returns `line_sender_error_invalid_api_call` **before** `chunk` is touched.
 ///
 /// Boundary: a successful return acknowledges all prior no-wait flushes plus
-/// this one. An empty `chunk` behaves like `column_sender_sync`.
+/// this one. An empty `chunk` behaves like `direct_column_sender_commit`.
 ///
 /// Failure contract: if the call fails before publication, `chunk` is left
 /// untouched and retryable. Once the frame is published `chunk` is cleared even
@@ -2946,6 +2947,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_now(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
+            "column_sender_flush_arrow_batch_at_now",
             sender,
             table,
             array,
@@ -2975,6 +2977,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_now_and_get_fsn(
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_get_fsn(
+            "column_sender_flush_arrow_batch_at_now_and_get_fsn",
             sender,
             table,
             array,
@@ -3004,6 +3007,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
+            "direct_column_sender_flush_arrow_batch_at_now",
             sender,
             table,
             array,
@@ -3035,6 +3039,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
+            "column_sender_flush_arrow_batch_at_column",
             sender,
             table,
             array,
@@ -3064,6 +3069,7 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_and_get_fsn(
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_get_fsn(
+            "column_sender_flush_arrow_batch_at_column_and_get_fsn",
             sender,
             table,
             array,
@@ -3094,6 +3100,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
+            "direct_column_sender_flush_arrow_batch_at_column",
             sender,
             table,
             array,
@@ -3139,6 +3146,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now_and_wait(
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_wait(
+            "direct_column_sender_flush_arrow_batch_at_now_and_wait",
             sender,
             table,
             array,
@@ -3171,6 +3179,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column_and_wa
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_wait(
+            "direct_column_sender_flush_arrow_batch_at_column_and_wait",
             sender,
             table,
             array,
@@ -3228,6 +3237,7 @@ const MAX_ARROW_OVERRIDE_COLUMN_NAME_LEN: usize = 65_536;
 
 #[cfg(feature = "arrow")]
 unsafe fn arrow_overrides_from_c<'a>(
+    fn_name: &str,
     overrides: *const column_sender_arrow_override,
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
@@ -3239,7 +3249,7 @@ unsafe fn arrow_overrides_from_c<'a>(
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch_*: overrides pointer is NULL".to_string(),
+            format!("{fn_name}: overrides pointer is NULL"),
         );
         return None;
     }
@@ -3346,6 +3356,7 @@ unsafe fn arrow_overrides_from_c<'a>(
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl<T: CsHandle>(
+    fn_name: &'static str,
     sender: *mut T,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -3359,37 +3370,26 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch_*: sender pointer is NULL".to_string(),
+            format!("{fn_name}: sender pointer is NULL"),
         );
         return false;
     }
     let _guard = match unsafe {
-        InUseGuard::acquire(
-            sender,
-            T::latch(sender),
-            "column_sender_flush_arrow_batch_*",
-            T::TYPE_NAME,
-            err_out,
-        )
+        InUseGuard::acquire(sender, T::latch(sender), fn_name, T::TYPE_NAME, err_out)
     } {
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(sender, "column_sender_flush_arrow_batch_*", err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
-    let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
-        Some(v) => v,
-        None => return false,
-    };
-    let rb = match unsafe {
-        crate::arrow_ffi_import_record_batch(
-            array,
-            schema,
-            "column_sender_flush_arrow_batch_*",
-            err_out,
-        )
-    } {
+    let overrides =
+        match unsafe { arrow_overrides_from_c(fn_name, overrides_ptr, overrides_len, err_out) } {
+            Some(v) => v,
+            None => return false,
+        };
+    let rb = match unsafe { crate::arrow_ffi_import_record_batch(array, schema, fn_name, err_out) }
+    {
         Some(rb) => rb,
         None => return false,
     };
@@ -3426,6 +3426,7 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl_and_get_fsn(
+    fn_name: &'static str,
     sender: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -3436,15 +3437,14 @@ unsafe fn arrow_batch_impl_and_get_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    const FN_NAME: &str = "column_sender_flush_arrow_batch_*_and_get_fsn";
-    if unsafe { reject_null_fsn_out(fsn_out, FN_NAME, err_out) } {
+    if unsafe { reject_null_fsn_out(fsn_out, fn_name, err_out) } {
         return false;
     }
     if sender.is_null() {
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            format!("{FN_NAME}: sender pointer is NULL"),
+            format!("{fn_name}: sender pointer is NULL"),
         );
         return false;
     }
@@ -3452,7 +3452,7 @@ unsafe fn arrow_batch_impl_and_get_fsn(
         InUseGuard::acquire(
             sender,
             column_sender::latch(sender),
-            FN_NAME,
+            fn_name,
             "column_sender",
             err_out,
         )
@@ -3460,14 +3460,15 @@ unsafe fn arrow_batch_impl_and_get_fsn(
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(sender, FN_NAME, err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
-    let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
-        Some(v) => v,
-        None => return false,
-    };
-    let rb = match unsafe { crate::arrow_ffi_import_record_batch(array, schema, FN_NAME, err_out) }
+    let overrides =
+        match unsafe { arrow_overrides_from_c(fn_name, overrides_ptr, overrides_len, err_out) } {
+            Some(v) => v,
+            None => return false,
+        };
+    let rb = match unsafe { crate::arrow_ffi_import_record_batch(array, schema, fn_name, err_out) }
     {
         Some(rb) => rb,
         None => return false,
@@ -3511,6 +3512,7 @@ unsafe fn arrow_batch_impl_and_get_fsn(
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
+    fn_name: &'static str,
     sender: *mut T,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
@@ -3531,35 +3533,24 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch_*_and_wait: sender pointer is NULL".to_string(),
+            format!("{fn_name}: sender pointer is NULL"),
         );
         return false;
     }
     let _guard = match unsafe {
-        InUseGuard::acquire(
-            sender,
-            T::latch(sender),
-            "column_sender_flush_arrow_batch_*_and_wait",
-            T::TYPE_NAME,
-            err_out,
-        )
+        InUseGuard::acquire(sender, T::latch(sender), fn_name, T::TYPE_NAME, err_out)
     } {
         Some(g) => g,
         None => return false,
     };
-    if unsafe {
-        reject_closed_pool_cs(
-            sender,
-            "column_sender_flush_arrow_batch_*_and_wait",
-            err_out,
-        )
-    } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
-    let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
-        Some(v) => v,
-        None => return false,
-    };
+    let overrides =
+        match unsafe { arrow_overrides_from_c(fn_name, overrides_ptr, overrides_len, err_out) } {
+            Some(v) => v,
+            None => return false,
+        };
     let sender = unsafe { T::owned_mut(sender).get_mut() };
     // Durable opt-in preflight: reject before the import consumes
     // `array->release`, so a rejected level leaves the caller's array intact.
@@ -3567,14 +3558,8 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
         unsafe { set_err_out_from_error(err_out, err) };
         return false;
     }
-    let rb = match unsafe {
-        crate::arrow_ffi_import_record_batch(
-            array,
-            schema,
-            "column_sender_flush_arrow_batch_*_and_wait",
-            err_out,
-        )
-    } {
+    let rb = match unsafe { crate::arrow_ffi_import_record_batch(array, schema, fn_name, err_out) }
+    {
         Some(rb) => rb,
         None => return false,
     };

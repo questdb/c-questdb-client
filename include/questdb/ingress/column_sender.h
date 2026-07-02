@@ -128,7 +128,7 @@ typedef struct column_sender_validity
  *   `pool_size`            (default 1)   warm/min connections;
  *   `pool_max`             (default 64)  hard cap on auto-grow;
  *   `pool_idle_timeout_ms` (default 60000)
- *                                       reap above-pool_size idle senders;
+ *                                       reap above-pool_size idle connections;
  *   `pool_reap`            (`auto`|`manual`, default `auto`)
  *                                       background reaper opt-in.
  *

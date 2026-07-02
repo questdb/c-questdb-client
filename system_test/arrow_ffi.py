@@ -262,8 +262,8 @@ _flush_arrow_batch_at_column = _setsig(
 )
 
 
-# Sync after deferred flushes (mirrors `column_sender_sync` in
-# `column_sender.h`). Acknowledgement levels:
+# Ack barrier over everything published so far (mirrors
+# `column_sender_wait` in `column_sender.h`). Acknowledgement levels:
 #   0 → wait for WAL-commit
 #   1 → wait for object-store durability watermarks
 _column_sender_sync = _setsig(

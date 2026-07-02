@@ -1,6 +1,12 @@
 # Column Sender ACK Boundary Flush Design
 
-**Status:** draft
+**Status:** historical design record — implemented with post-split names.
+The `*_and_wait` entry points below shipped as the `direct_column_sender_*`
+FFI family (kept out of the public C headers); the pooled store-and-forward
+barrier shipped as `column_sender_wait` (the `column_sender_sync` named below
+was renamed). Function names in this document predate the sf/direct handle
+split and the later `sf_` prefix removal; consult
+`include/questdb/ingress/column_sender.h` for the live API.
 **Audience:** Rust core, C FFI, C++ wrapper, Python dataframe integration
 engineers
 **Scope:** move common ACK boundaries closer to column-sender `flush*` calls
