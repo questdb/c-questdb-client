@@ -105,7 +105,7 @@ pub(crate) const QWP_TYPE_BINARY: u8 = 0x17;
 pub(crate) const QWP_TYPE_IPV4: u8 = 0x18;
 const QWP_LONG256_BYTES: usize = 32;
 pub(crate) const QWP_VERSION_1: u8 = 1;
-const QWP_DECIMAL_MAX_SCALE: u8 = 76;
+pub(crate) const QWP_DECIMAL_MAX_SCALE: u8 = 76;
 const QWP_DECIMAL_SCALE_UNSET: u8 = u8::MAX;
 const QWP_DECIMAL_MAG_LIMBS: usize = 4;
 const QWP_DECIMAL_MAG_BYTES: usize = QWP_DECIMAL_MAG_LIMBS * 8;
@@ -561,7 +561,7 @@ impl DecimalValue {
 // --- Column kind ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColumnKind {
+pub(crate) enum ColumnKind {
     Bool,
     Symbol,
     I8,
@@ -2240,13 +2240,11 @@ impl QwpSendScratch {
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
-struct QwpWsMarker {
-    snapshot_idx: u32,
-}
+struct QwpWsMarker;
 
 #[cfg(feature = "_sender-qwp-ws")]
 type QwpWsSymbolHashMap<V> =
-    std::collections::HashMap<Vec<u8>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
+    std::collections::HashMap<std::sync::Arc<[u8]>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
 
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_WS_SYMBOL_HASH_OFFSET: u64 = 0xcbf29ce484222325;
@@ -2270,7 +2268,7 @@ fn qwp_ws_symbol_hash_with_seed(mut hash: u64, bytes: &[u8]) -> u64 {
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Debug)]
-struct QwpWsSymbolHasher(u64);
+pub(crate) struct QwpWsSymbolHasher(u64);
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl Default for QwpWsSymbolHasher {
@@ -2419,7 +2417,7 @@ struct QwpWsTableBuffer {
     in_progress_column_count: usize,
     column_access_cursor: usize,
     columns: Vec<QwpWsColumnBuffer>,
-    column_lookup: std::collections::HashMap<String, usize>,
+    column_lookup: std::collections::HashMap<Box<[u8]>, usize>,
     row_mark: Option<QwpWsRowRollbackMark>,
 }
 
@@ -2427,8 +2425,9 @@ struct QwpWsTableBuffer {
 #[derive(Clone, Debug)]
 struct QwpWsColumnBuffer {
     name: Vec<u8>,
-    lower_ascii_name: Vec<u8>,
+    lower_name: Vec<u8>,
     packed_lower_ascii_name: u64,
+    name_is_ascii: bool,
     kind: ColumnKind,
     last_written_row: Option<u32>,
     non_null_count: u32,
@@ -2622,7 +2621,7 @@ pub(crate) struct QwpWsColumnarBuffer {
     state: BufferState,
     bookmark_meta: BufferBookmarkMeta,
     bookmark: StoredBookmark<QwpWsMarker>,
-    snapshots: Vec<QwpWsSnapshot>,
+    snapshot: Option<QwpWsSnapshot>,
     max_name_len: usize,
 }
 
@@ -2639,7 +2638,7 @@ impl Clone for QwpWsColumnarBuffer {
             // bookmarks from the source buffer fail on the clone.
             bookmark_meta: BufferBookmarkMeta::new(),
             bookmark: self.bookmark,
-            snapshots: self.snapshots.clone(),
+            snapshot: self.snapshot.clone(),
             max_name_len: self.max_name_len,
         }
     }
@@ -2655,7 +2654,7 @@ impl QwpWsColumnarBuffer {
             state: BufferState::new(),
             bookmark_meta: BufferBookmarkMeta::new(),
             bookmark: StoredBookmark::new(),
-            snapshots: Vec::new(),
+            snapshot: None,
             max_name_len,
         }
     }
@@ -2716,8 +2715,7 @@ impl QwpWsColumnarBuffer {
             cap += table.table_name.capacity();
             cap += table.columns.capacity() * std::mem::size_of::<QwpWsColumnBuffer>();
             for column in &table.columns {
-                cap +=
-                    column.name.capacity() + column.lower_ascii_name.capacity() + column.capacity();
+                cap += column.name.capacity() + column.lower_name.capacity() + column.capacity();
             }
         }
         cap
@@ -2752,8 +2750,12 @@ impl QwpWsColumnarBuffer {
     }
 
     pub(crate) fn clear_bookmark(&mut self, bookmark: Bookmark) {
-        self.bookmark
-            .clear_if_matches(self.bookmark_meta.origin(), bookmark);
+        if self
+            .bookmark
+            .clear_if_matches(self.bookmark_meta.origin(), bookmark)
+        {
+            self.snapshot = None;
+        }
     }
 
     pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
@@ -2766,6 +2768,7 @@ impl QwpWsColumnarBuffer {
 
     pub(crate) fn clear_marker(&mut self) {
         self.bookmark.clear();
+        self.snapshot = None;
     }
 
     pub(crate) fn clear(&mut self) {
@@ -2775,24 +2778,23 @@ impl QwpWsColumnarBuffer {
         self.current_table_idx = None;
         self.state = BufferState::new();
         self.bookmark.clear();
+        self.snapshot = None;
     }
 
     fn capture_snapshot(&mut self) -> crate::Result<QwpWsMarker> {
-        let snapshot_idx = checked_qwp_push_index(self.snapshots.len(), "QWP/WS snapshot count")?;
-        self.snapshots.push(QwpWsSnapshot {
+        self.snapshot = Some(QwpWsSnapshot {
             tables: self.tables.clone(),
             table_lookup: self.table_lookup.clone(),
             current_table_idx: self.current_table_idx,
             state: self.state,
         });
-        Ok(QwpWsMarker { snapshot_idx })
+        Ok(QwpWsMarker)
     }
 
-    fn restore_snapshot(&mut self, marker: QwpWsMarker) -> crate::Result<()> {
+    fn restore_snapshot(&mut self, _marker: QwpWsMarker) -> crate::Result<()> {
         let snapshot = self
-            .snapshots
-            .get(marker.snapshot_idx as usize)
-            .cloned()
+            .snapshot
+            .take()
             .ok_or_else(|| error::fmt!(InvalidApiCall, "Can't rewind to stale QWP/WS marker."))?;
         self.tables = snapshot.tables;
         self.table_lookup = snapshot.table_lookup;
@@ -3554,6 +3556,16 @@ impl QwpWsColumnarBuffer {
         global_dict: &mut SymbolGlobalDict,
         version: u8,
     ) -> crate::Result<()> {
+        self.encode_ws_replay_message_with_defer(scratch, global_dict, version, false)
+    }
+
+    pub(crate) fn encode_ws_replay_message_with_defer(
+        &self,
+        scratch: &mut QwpWsEncodeScratch,
+        global_dict: &mut SymbolGlobalDict,
+        version: u8,
+        defer_commit: bool,
+    ) -> crate::Result<()> {
         self.check_can_flush()?;
         let out = &mut scratch.message;
         out.clear();
@@ -3579,7 +3591,7 @@ impl QwpWsColumnarBuffer {
                     for entry in dict {
                         let bytes =
                             &data[entry.offset as usize..(entry.offset + entry.len) as usize];
-                        let (gid, _) = global_dict.intern(bytes);
+                        let (gid, _) = global_dict.intern(bytes)?;
                         highest_referenced_symbol_id = Some(
                             highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
                         );
@@ -3639,7 +3651,11 @@ impl QwpWsColumnarBuffer {
         let header = QwpMessageHeader {
             magic: *b"QWP1",
             version,
-            flags: QWP_FLAG_DELTA_SYMBOL_DICT,
+            flags: if defer_commit {
+                QWP_FLAG_DELTA_SYMBOL_DICT | QWP_FLAG_DEFER_COMMIT
+            } else {
+                QWP_FLAG_DELTA_SYMBOL_DICT
+            },
             table_count,
             payload_len: checked_qwp_u32(
                 out.len() - payload_start,
@@ -3703,9 +3719,12 @@ impl QwpWsTableBuffer {
 
     #[inline(always)]
     fn lookup_column(&mut self, name: &[u8]) -> crate::Result<Option<usize>> {
-        if self.column_access_cursor < self.columns.len()
+        let name_is_ascii = name.is_ascii();
+        if name_is_ascii
+            && self.column_access_cursor < self.columns.len()
+            && self.columns[self.column_access_cursor].name_is_ascii
             && names_equal_lower_ascii(
-                &self.columns[self.column_access_cursor].lower_ascii_name,
+                &self.columns[self.column_access_cursor].lower_name,
                 self.columns[self.column_access_cursor].packed_lower_ascii_name,
                 name,
             )
@@ -3713,11 +3732,22 @@ impl QwpWsTableBuffer {
             return Ok(Some(self.column_access_cursor));
         }
 
+        if name_is_ascii {
+            let mut stack: [u8; 128] = [0; 128];
+            if name.len() <= stack.len() {
+                for (dst, src) in stack[..name.len()].iter_mut().zip(name.iter()) {
+                    *dst = src.to_ascii_lowercase();
+                }
+                if let Some(&idx) = self.column_lookup.get(&stack[..name.len()]) {
+                    return Ok(Some(idx));
+                }
+                return Ok(None);
+            }
+        }
         let lookup_key = column_lookup_key(name)?;
-        if let Some(&idx) = self.column_lookup.get(&lookup_key) {
+        if let Some(&idx) = self.column_lookup.get(&lookup_key[..]) {
             return Ok(Some(idx));
         }
-
         Ok(None)
     }
 
@@ -3743,10 +3773,16 @@ impl QwpWsTableBuffer {
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsColumnBuffer {
     fn new(name: &[u8], kind: ColumnKind) -> Self {
+        let name_is_ascii = name.is_ascii();
         Self {
             name: name.to_vec(),
-            lower_ascii_name: lowercase_ascii_bytes(name),
-            packed_lower_ascii_name: packed_lower_ascii_name(name),
+            lower_name: lowercase_name_bytes(name, name_is_ascii),
+            packed_lower_ascii_name: if name_is_ascii {
+                packed_lower_ascii_name(name)
+            } else {
+                0
+            },
+            name_is_ascii,
             kind,
             last_written_row: None,
             non_null_count: 0,
@@ -4195,7 +4231,14 @@ impl QwpWsColumnBuffer {
                 precision_bits
             ));
         }
-        if *col_precision == 0 {
+        // The first value of a batch (re)pins the column precision. The
+        // column structure is retained across flushes (`clear_rows` keeps it
+        // but empties `cells`), so `cells.is_empty()` — not `*col_precision
+        // == 0` — marks the start of a fresh batch. Keying off the sentinel
+        // `0` instead would leave a reused, fully-omitted geohash column
+        // encoding precision 0, which the server rejects with
+        // "invalid GeoHash precision: 0".
+        if cells.is_empty() {
             *col_precision = precision_bits;
         } else if *col_precision != precision_bits {
             return Err(error::fmt!(
@@ -4318,7 +4361,14 @@ impl QwpWsColumnValues {
             Self::Ipv4 { cells } => cells.clear(),
             Self::Date { cells } => cells.clear(),
             Self::Char { cells } => cells.clear(),
-            Self::Geohash { cells, .. } => cells.clear(),
+            Self::Geohash { cells, .. } => {
+                // Keep the pinned precision across clears. The next batch's
+                // first value re-pins it (see `append_geohash`); if the reused
+                // column is omitted entirely, the retained precision keeps the
+                // all-null column's wire encoding valid (precision 0 is
+                // rejected by the server).
+                cells.clear();
+            }
             Self::Symbol {
                 cells,
                 dict,
@@ -4330,10 +4380,20 @@ impl QwpWsColumnValues {
                 lookup.clear();
                 data.clear();
             }
-            Self::Decimal { cells, .. }
-            | Self::Decimal64 { cells, .. }
-            | Self::Decimal128 { cells, .. } => {
+            Self::Decimal {
+                cells,
+                decimal_scale,
+            }
+            | Self::Decimal64 {
+                cells,
+                decimal_scale,
+            }
+            | Self::Decimal128 {
+                cells,
+                decimal_scale,
+            } => {
                 cells.clear();
+                *decimal_scale = QWP_DECIMAL_SCALE_UNSET;
             }
         }
     }
@@ -4415,7 +4475,13 @@ impl QwpWsColumnValues {
                     false
                 }
             }
-            Self::Geohash { cells, .. } => pop_value_cell_for_row(cells, row_idx),
+            Self::Geohash { cells, .. } => {
+                // Rolling back the last value leaves `cells` empty; the pinned
+                // precision is retained so a reused or partially-rolled-back
+                // column keeps a valid precision. The next value re-pins via
+                // `cells.is_empty()` in `append_geohash`.
+                pop_value_cell_for_row(cells, row_idx)
+            }
             Self::LongArray { cells, data } => {
                 if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
                     data.truncate(cell.offset as usize);
@@ -4458,15 +4524,11 @@ impl QwpWsColumnValues {
                     return false;
                 };
                 if cell.value.is_some() {
-                    if cells.is_empty() {
-                        *decimal_scale = 0;
-                    } else {
-                        *decimal_scale = cells
-                            .iter()
-                            .filter_map(|cell| cell.value.map(|value| value.scale))
-                            .max()
-                            .unwrap_or(0);
-                    }
+                    *decimal_scale = cells
+                        .iter()
+                        .filter_map(|cell| cell.value.map(|value| value.scale))
+                        .max()
+                        .unwrap_or(QWP_DECIMAL_SCALE_UNSET);
                     true
                 } else {
                     false
@@ -4923,8 +4985,14 @@ impl QwpWsColumnValues {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn lowercase_ascii_bytes(name: &[u8]) -> Vec<u8> {
-    name.iter().map(|byte| byte.to_ascii_lowercase()).collect()
+fn lowercase_name_bytes(name: &[u8], is_ascii: bool) -> Vec<u8> {
+    if is_ascii {
+        return name.iter().map(|b| b.to_ascii_lowercase()).collect();
+    }
+    match std::str::from_utf8(name) {
+        Ok(s) => s.to_lowercase().into_bytes(),
+        Err(_) => name.iter().map(|b| b.to_ascii_lowercase()).collect(),
+    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -4981,15 +5049,8 @@ fn names_equal_lower_ascii(left_lower: &[u8], packed_left_lower: u64, right: &[u
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn column_lookup_key(name: &[u8]) -> crate::Result<String> {
-    let name = std::str::from_utf8(name).map_err(|err| {
-        error::fmt!(
-            InvalidApiCall,
-            "internal QWP/WS column name is not UTF-8: {}",
-            err
-        )
-    })?;
-    Ok(name.to_lowercase())
+fn column_lookup_key(name: &[u8]) -> crate::Result<Box<[u8]>> {
+    Ok(lowercase_name_bytes(name, name.is_ascii()).into_boxed_slice())
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -5017,6 +5078,8 @@ fn type_mismatch_error_ws(entry_name: &[u8]) -> crate::Error {
 
 #[cfg(feature = "_sender-qwp-ws")]
 const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_FLAG_DEFER_COMMIT: u8 = 0x01;
 
 /// Connection-scoped global symbol dictionary used by the QWP/WebSocket
 /// transport's delta-symbol-dict mode.
@@ -5025,13 +5088,50 @@ const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 /// WebSocket connection. New symbols added during a flush are recorded in the
 /// per-message delta section so the server can rebuild the same global
 /// dictionary; on reconnect both sides reset.
+///
+/// Capped at [`MAX_CONN_SYMBOL_DICT_SIZE`] to mirror the server's
+/// connection-scoped dictionary ceiling and the Java reference client.
 #[cfg(feature = "_sender-qwp-ws")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SymbolGlobalDict {
     map: QwpWsSymbolHashMap<u64>,
-    entries: Vec<Vec<u8>>,
+    entries: Vec<std::sync::Arc<[u8]>>,
     next_id: u64,
+    cap: usize,
+    #[cfg(feature = "arrow-ingress")]
+    arrow_dict_memo: Vec<ArrowDictSlotMemo>,
 }
+
+/// Memoised `local dict slot -> global id` table for one Arrow dictionary
+/// (categorical) values array. Keyed by the array's buffer pointers+lengths:
+/// every batch sliced from the same chunk shares those buffers, so the costly
+/// per-string `intern` runs once per chunk instead of once per batch. The
+/// stored ids are only valid against the current dict contents, so
+/// [`SymbolGlobalDict::rollback`] drops the whole memo.
+#[cfg(feature = "arrow-ingress")]
+#[derive(Debug)]
+struct ArrowDictSlotMemo {
+    identity: Vec<(usize, usize)>,
+    /// Pins the values buffers so their addresses (the `identity` key) cannot be
+    /// freed and reused by a different dictionary between flushes (ABA).
+    _pin: arrow::array::ArrayData,
+    slot_to_gid: Vec<u64>,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Default for SymbolGlobalDict {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-connection cap on the QWP/WS global symbol dictionary. Matches
+/// `MAX_CONN_DICT_SIZE` in the egress reader (`egress/symbol_dict.rs`)
+/// and the Java reference client. When the cap is reached the encoder
+/// surfaces an `InvalidApiCall` error and the caller is expected to
+/// reconnect (which resets both sides).
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const MAX_CONN_SYMBOL_DICT_SIZE: usize = 8_388_608;
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
@@ -5047,11 +5147,29 @@ impl SymbolGlobalDict {
             map: QwpWsSymbolHashMap::default(),
             entries: Vec::new(),
             next_id: 0,
+            cap: MAX_CONN_SYMBOL_DICT_SIZE,
+            #[cfg(feature = "arrow-ingress")]
+            arrow_dict_memo: Vec::new(),
         }
+    }
+
+    /// Same as [`new`](Self::new) but with a smaller entry cap so the
+    /// cap-rejection path can be exercised without interning millions of
+    /// symbols.
+    #[cfg(test)]
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self { cap, ..Self::new() }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Number of global ids assigned so far. The column-sender encoder
+    /// uses this as the `delta_start` field of the delta-symbol-dict
+    /// prefix.
+    pub(crate) fn next_id(&self) -> u64 {
         self.next_id
     }
 
@@ -5065,28 +5183,90 @@ impl SymbolGlobalDict {
     pub(crate) fn rollback(&mut self, mark: SymbolGlobalDictMark) {
         while self.entries.len() > mark.entries_len {
             if let Some(entry) = self.entries.pop() {
-                self.map.remove(entry.as_slice());
+                self.map.remove(entry.as_ref());
             }
         }
         self.next_id = mark.next_id;
+        #[cfg(feature = "arrow-ingress")]
+        self.arrow_dict_memo.clear();
     }
 
-    fn entry(&self, id: u64) -> Option<&[u8]> {
-        let index = usize::try_from(id).ok()?;
-        self.entries.get(index).map(Vec::as_slice)
-    }
-
-    /// Returns `(global_id, is_new)`.
-    fn intern(&mut self, bytes: &[u8]) -> (u64, bool) {
-        if let Some(&id) = self.map.get(bytes) {
-            return (id, false);
+    /// Borrow out the memoised `slot -> global id` table for an Arrow
+    /// dictionary values array with the given buffer `identity` and length.
+    /// An identity or length not seen since the last [`rollback`](Self::rollback)
+    /// yields a fresh `u64::MAX`-filled table. The caller fills any `u64::MAX`
+    /// slot via [`intern`](Self::intern) and must hand the table back with
+    /// [`restore_arrow_dict_memo`](Self::restore_arrow_dict_memo).
+    #[cfg(feature = "arrow-ingress")]
+    pub(crate) fn take_arrow_dict_memo(
+        &mut self,
+        identity: &[(usize, usize)],
+        values_data: &arrow::array::ArrayData,
+        dict_len: usize,
+    ) -> (usize, Vec<u64>) {
+        const MEMO_CAP: usize = 32;
+        if let Some(idx) = self
+            .arrow_dict_memo
+            .iter()
+            .position(|m| m.identity == identity)
+        {
+            let mut slot_to_gid = std::mem::take(&mut self.arrow_dict_memo[idx].slot_to_gid);
+            if slot_to_gid.len() != dict_len {
+                slot_to_gid.clear();
+                slot_to_gid.resize(dict_len, u64::MAX);
+            }
+            return (idx, slot_to_gid);
         }
+        if self.arrow_dict_memo.len() >= MEMO_CAP {
+            self.arrow_dict_memo.clear();
+        }
+        self.arrow_dict_memo.push(ArrowDictSlotMemo {
+            identity: identity.to_vec(),
+            _pin: values_data.clone(),
+            slot_to_gid: Vec::new(),
+        });
+        (self.arrow_dict_memo.len() - 1, vec![u64::MAX; dict_len])
+    }
+
+    #[cfg(feature = "arrow-ingress")]
+    pub(crate) fn restore_arrow_dict_memo(&mut self, idx: usize, slot_to_gid: Vec<u64>) {
+        if let Some(memo) = self.arrow_dict_memo.get_mut(idx) {
+            memo.slot_to_gid = slot_to_gid;
+        }
+    }
+
+    pub(crate) fn entry(&self, id: u64) -> Option<&[u8]> {
+        let index = usize::try_from(id).ok()?;
+        self.entries.get(index).map(|a| a.as_ref())
+    }
+
+    /// Returns `(global_id, is_new)`. Errors with `InvalidApiCall` if
+    /// the dictionary has reached [`MAX_CONN_SYMBOL_DICT_SIZE`].
+    pub(crate) fn intern(&mut self, bytes: &[u8]) -> crate::Result<(u64, bool)> {
+        if let Some(&id) = self.map.get(bytes) {
+            return Ok((id, false));
+        }
+        if self.entries.len() >= self.cap {
+            return Err(crate::error::fmt!(
+                InvalidApiCall,
+                "QWP/WS connection-scoped symbol dictionary reached its \
+                 {}-entry cap; drop and reopen the connection to reset \
+                 the dictionary",
+                self.cap
+            ));
+        }
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
+        self.map
+            .try_reserve(1)
+            .map_err(|_| crate::error::fmt!(InvalidApiCall, "symbol dict allocation failed"))?;
+        let owned: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        let owned = bytes.to_vec();
-        self.entries.push(owned.clone());
+        self.entries.push(std::sync::Arc::clone(&owned));
         self.map.insert(owned, id);
-        (id, true)
+        self.next_id += 1;
+        Ok((id, true))
     }
 }
 
@@ -5170,7 +5350,7 @@ impl QwpBuffer {
                         let entry = &planner.symbol_dict[cursor as usize];
                         let range = entry.value.0.as_range();
                         let bytes = &self.value_bytes[range.clone()];
-                        let (gid, is_new) = global_dict.intern(bytes);
+                        let (gid, is_new) = global_dict.intern(bytes)?;
                         globals_for_col.push(gid);
                         if is_new {
                             new_symbol_ranges.push(range);
@@ -5299,7 +5479,7 @@ impl QwpBuffer {
                         let entry = &planner.symbol_dict[cursor as usize];
                         let range = entry.value.0.as_range();
                         let bytes = &self.value_bytes[range];
-                        let (gid, _) = global_dict.intern(bytes);
+                        let (gid, _) = global_dict.intern(bytes)?;
                         highest_referenced_symbol_id = Some(
                             highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
                         );
@@ -6668,7 +6848,10 @@ fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn cell_value_is_null(value: ValueRef) -> bool {
-    matches!(value, ValueRef::DecimalNull)
+    matches!(
+        value,
+        ValueRef::DecimalNull | ValueRef::Decimal64Null | ValueRef::Decimal128Null
+    )
 }
 
 fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
@@ -8976,6 +9159,85 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn symbol_dict_enforces_entry_cap() {
+        let mut dict = SymbolGlobalDict::with_cap(3);
+        assert!(dict.intern(b"a").unwrap().1);
+        assert!(dict.intern(b"b").unwrap().1);
+        assert!(dict.intern(b"c").unwrap().1);
+        assert_eq!(dict.len(), 3);
+
+        // A fourth distinct symbol is rejected once the cap is reached.
+        let err = dict.intern(b"d").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("cap"), "{}", err.msg());
+
+        // An already-interned symbol still resolves at the cap.
+        let (id_a, is_new) = dict.intern(b"a").unwrap();
+        assert!(!is_new);
+        assert_eq!(id_a, 0);
+        assert_eq!(dict.len(), 3);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_rollback_restores_below_cap() {
+        let mut dict = SymbolGlobalDict::with_cap(2);
+        assert!(dict.intern(b"a").unwrap().1);
+        let mark = dict.mark();
+        assert!(dict.intern(b"b").unwrap().1);
+        // At the cap now; a new symbol is rejected.
+        assert!(dict.intern(b"c").is_err());
+        // Rolling back the second insert frees a slot.
+        dict.rollback(mark);
+        assert_eq!(dict.len(), 1);
+        let (_, is_new) = dict.intern(b"c").unwrap();
+        assert!(is_new);
+        assert_eq!(dict.len(), 2);
+    }
+
+    #[cfg(all(feature = "_sender-qwp-ws", feature = "arrow-ingress"))]
+    #[test]
+    fn arrow_dict_memo_reuses_table_and_clears_on_rollback() {
+        let mut dict = SymbolGlobalDict::new();
+        let mark = dict.mark();
+        let identity = [(0x1000usize, 8usize), (0x2000usize, 24usize)];
+        // The memo pins the values `ArrayData`; this test exercises only the
+        // take/restore/rollback bookkeeping, so a placeholder array suffices.
+        let pin = arrow::array::ArrayData::new_empty(&arrow::datatypes::DataType::Null);
+
+        let (idx, mut table) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        assert_eq!(table, vec![u64::MAX; 3]);
+        table[0] = 5;
+        table[2] = 7;
+        dict.restore_arrow_dict_memo(idx, table);
+
+        // Same identity → cache hit: the stored table comes back verbatim.
+        let (idx2, table2) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        assert_eq!(idx2, idx);
+        assert_eq!(table2, vec![5, u64::MAX, 7]);
+        dict.restore_arrow_dict_memo(idx2, table2);
+
+        // A different values array → miss → fresh table.
+        let other = [(0x9000usize, 8usize), (0x2000usize, 24usize)];
+        let (_, fresh) = dict.take_arrow_dict_memo(&other, &pin, 2);
+        assert_eq!(fresh, vec![u64::MAX; 2]);
+
+        // Rollback drops every memoised id.
+        dict.rollback(mark);
+        let (_, after_rollback) = dict.take_arrow_dict_memo(&identity, &pin, 3);
+        assert_eq!(after_rollback, vec![u64::MAX; 3]);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn symbol_dict_cap_matches_server_ceiling() {
+        // Mirrors the egress reader cap and the Java reference client; a
+        // drift here would silently change the reconnect threshold.
+        assert_eq!(MAX_CONN_SYMBOL_DICT_SIZE, 8 * 1024 * 1024);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_replay_dense_prefix_includes_lower_symbol_ids() {
         let mut buf = QwpBuffer::new(127);
         let mut scratch = QwpWsEncodeScratch::new();
@@ -9000,6 +9262,285 @@ mod tests {
             vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
             "a frame referencing id 2 must carry the dense 0..=2 prefix"
         );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_replacing_rewind_point_drops_previous_snapshot() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.set_marker().unwrap();
+        assert!(buf.snapshot.is_some());
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.set_marker().unwrap();
+        assert!(
+            buf.snapshot.is_some(),
+            "capturing a new rewind point must keep exactly one active QWP/WS snapshot"
+        );
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "SOL-USD")
+            .unwrap()
+            .column_i64("qty", 3)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(
+            buf.row_count(),
+            2,
+            "rewind must restore the replacement marker, not the older snapshot"
+        );
+        assert!(
+            buf.snapshot.is_none(),
+            "successful rewind must release the consumed QWP/WS snapshot"
+        );
+
+        buf.set_marker().unwrap();
+        assert!(buf.snapshot.is_some());
+        buf.clear_marker();
+        assert!(
+            buf.snapshot.is_none(),
+            "clearing the rewind point must release the QWP/WS snapshot"
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_clear_bookmark_drops_only_current_snapshot() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let stale = buf.bookmark().unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let current = buf.bookmark().unwrap();
+
+        buf.clear_bookmark(stale);
+        assert!(
+            buf.snapshot.is_some(),
+            "clearing a stale bookmark must not release the current QWP/WS snapshot"
+        );
+
+        buf.clear_bookmark(current);
+        assert!(
+            buf.snapshot.is_none(),
+            "clearing the current bookmark must release the QWP/WS snapshot"
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_clear_resets_decimal_scale_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.2")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        buf.clear();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.23")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("clear() must let the next batch repin the decimal scale");
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rollback_last_decimal_resets_scale_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "NaN")
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.2")
+            .unwrap();
+        let err = buf.column_i64("price", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.23")
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("rollback must let the next value repin the decimal scale");
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_clear_resets_geohash_precision_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 7, 5)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        buf.clear();
+
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 7, 6)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("clear() must let the next batch repin the geohash precision");
+    }
+
+    /// Parse a single-table WS replay message whose first column is a GEOHASH
+    /// and return `(row_count, precision_bits)` read straight off the wire.
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn ws_first_geohash_precision(message: &[u8]) -> (u64, u64) {
+        let (_, _, mut pos) = ws_delta_entries(message);
+        let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
+        assert_eq!(table_count, 1, "helper expects exactly one table");
+        let _table_name = read_test_bytes(message, &mut pos);
+        let row_count = read_test_varint(message, &mut pos);
+        let column_count = read_test_varint(message, &mut pos);
+        assert!(column_count >= 1);
+        // Inline schema: (name, wire-type byte) per column, all up front.
+        let mut types = Vec::with_capacity(column_count as usize);
+        for _ in 0..column_count {
+            let _name = read_test_bytes(message, &mut pos);
+            types.push(message[pos]);
+            pos += 1;
+        }
+        assert_eq!(types[0], QWP_TYPE_GEOHASH, "first column must be a geohash");
+        // Data section, column 0: null-flag, optional bitmap, precision varint.
+        let uses_null_bitmap = message[pos];
+        pos += 1;
+        if uses_null_bitmap == 1 {
+            pos += row_count.div_ceil(8) as usize;
+        }
+        let precision = read_test_varint(message, &mut pos);
+        (row_count, precision)
+    }
+
+    /// Regression for the QWP/WS fuzz failure "invalid GeoHash precision: 0".
+    ///
+    /// The column-major buffer retains columns across flushes. A geohash
+    /// column pinned in one batch and then omitted from a later batch (reused
+    /// buffer) must still encode a *valid* precision for its all-null rows —
+    /// resetting the pinned precision to the sentinel `0` made the server
+    /// reject the frame.
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_reused_geohash_omitted_in_next_batch_keeps_valid_precision() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        // Batch 1: pin the geohash precision (25) on table "pos".
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 0x1AB_CDEF, 25)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        // Reuse the buffer: clear() retains the geohash column but empties rows.
+        buf.clear();
+
+        // Batch 2: same table, geohash omitted (only an i64 column is set). The
+        // retained, all-null geohash column is still serialized.
+        buf.table("pos")
+            .unwrap()
+            .column_i64("n", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        let (row_count, precision) = ws_first_geohash_precision(&scratch.message);
+        assert_eq!(row_count, 1);
+        assert_eq!(
+            precision, 25,
+            "retained all-null geohash column must keep a valid precision, not reset to 0"
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rollback_last_geohash_resets_precision_for_reused_column() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("pos").unwrap().column_geohash("g", 7, 5).unwrap();
+        let err = buf.column_i64("g", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+
+        buf.table("pos")
+            .unwrap()
+            .column_geohash("g", 7, 6)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .expect("rollback must let the next value repin the geohash precision");
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -9238,6 +9779,37 @@ mod tests {
         assert_eq!(
             decode_single_i64_column_ws_replay(&scratch.message),
             vec![("trades".to_owned(), "Qty".to_owned(), vec![7, 8])]
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_column_identity_is_case_insensitive_unicode() {
+        // Uppercase É (U+00C9) and lowercase é (U+00E9) are non-ASCII, so the
+        // lookup must Unicode-case-fold rather than byte-level ASCII-fold to
+        // resolve both spellings to the same column.
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .column_i64("CAFÉ", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("café", 8)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        assert_eq!(
+            decode_single_i64_column_ws_replay(&scratch.message),
+            vec![("trades".to_owned(), "CAFÉ".to_owned(), vec![7, 8])]
         );
     }
 
@@ -11380,6 +11952,43 @@ mod tests {
             })
             .collect();
         assert_eq!(strs, vec!["0.00", "1.25", "-1.25", "92233720368547.75"]);
+    }
+
+    #[test]
+    fn qwp_column_dec64_nan_roundtrip_preserves_following_column() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("trades")
+            .unwrap()
+            .column_dec64("price", "NaN")
+            .unwrap()
+            .column_i64("qty", 10)
+            .unwrap();
+        buf.at_now().unwrap();
+        buf.table("trades")
+            .unwrap()
+            .column_dec64("price", "1.25")
+            .unwrap()
+            .column_i64("qty", 20)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let datagrams = buf.encode_datagrams(64 * 1024).unwrap();
+        assert_eq!(datagrams.len(), 1);
+
+        let decoded = decode_datagram(&datagrams[0])
+            .expect("DECIMAL64 NaN followed by another column must produce a valid datagram");
+        let table = first_table(&decoded);
+        assert_eq!(table.columns[0].type_code, QWP_TYPE_DECIMAL64);
+        assert!(table.columns[0].nullable);
+        assert_eq!(table.rows[0][0], DecodedValue::Null);
+        match &table.rows[1][0] {
+            DecodedValue::Decimal { scale, unscaled_be } => {
+                assert_eq!(decimal_to_string(*scale, unscaled_be), "1.25");
+            }
+            other => panic!("unexpected DECIMAL64 value {:?}", other),
+        }
+        assert_eq!(table.rows[0][1], DecodedValue::I64(10));
+        assert_eq!(table.rows[1][1], DecodedValue::I64(20));
     }
 
     #[test]

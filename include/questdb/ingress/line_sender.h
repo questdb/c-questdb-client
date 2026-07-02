@@ -79,53 +79,150 @@ extern "C" {
 /** An error that occurred when using the line sender. */
 typedef struct line_sender_error line_sender_error;
 
-/** Category of error. */
+/** Category of error.
+ *
+ * Append-only: reordering or inserting in the middle breaks ABI. */
 typedef enum line_sender_error_code
 {
     /** The host, port, or interface was incorrect. */
-    line_sender_error_could_not_resolve_addr,
+    line_sender_error_could_not_resolve_addr = 0,
 
     /** Called methods in the wrong order. E.g. `symbol` after `column`. */
-    line_sender_error_invalid_api_call,
+    line_sender_error_invalid_api_call = 1,
 
     /** A network error connecting or flushing data out. */
-    line_sender_error_socket_error,
+    line_sender_error_socket_error = 2,
 
     /** The string or symbol field is not encoded in valid UTF-8. */
-    line_sender_error_invalid_utf8,
+    line_sender_error_invalid_utf8 = 3,
 
     /** The table name or column name contains bad characters. */
-    line_sender_error_invalid_name,
+    line_sender_error_invalid_name = 4,
 
     /** The supplied timestamp is invalid. */
-    line_sender_error_invalid_timestamp,
+    line_sender_error_invalid_timestamp = 5,
 
     /** Error during the authentication process. */
-    line_sender_error_auth_error,
+    line_sender_error_auth_error = 6,
 
     /** Error during TLS handshake. */
-    line_sender_error_tls_error,
+    line_sender_error_tls_error = 7,
 
     /** The server does not support ILP over HTTP. */
-    line_sender_error_http_not_supported,
+    line_sender_error_http_not_supported = 8,
 
     /** Error sent back from the server during flush. */
-    line_sender_error_server_flush_error,
+    line_sender_error_server_flush_error = 9,
 
     /** Bad configuration. */
-    line_sender_error_config_error,
+    line_sender_error_config_error = 10,
 
     /** There was an error serializing an array. */
-    line_sender_error_array_error,
+    line_sender_error_array_error = 11,
 
     /**  Line sender protocol version error. */
-    line_sender_error_protocol_version_error,
+    line_sender_error_protocol_version_error = 12,
 
     /** The supplied decimal is invalid. */
-    line_sender_error_invalid_decimal,
+    line_sender_error_invalid_decimal = 13,
 
     /** QWP/WebSocket server rejection or terminal protocol violation. */
-    line_sender_error_server_rejection,
+    line_sender_error_server_rejection = 14,
+
+    /** Arrow column whose kind cannot be persisted (e.g.
+     *  `FixedSizeBinary(16)` without `arrow.uuid` extension metadata;
+     *  `ARRAY(LONG, N-D)` is egress-only; nested-list leaf must be
+     *  `Float64`). `arrow` feature only. */
+    line_sender_error_arrow_unsupported_column_kind = 15,
+
+    /** RecordBatch failed client-side structural validation
+     *  (column count, name encoding, C Data Interface contract).
+     *  `arrow` feature only. */
+    line_sender_error_arrow_ingest = 16,
+
+    /** Reconnectable failure on the column-major sender's flush/sync
+     *  path (transport error, EOF, closed connection). The operation
+     *  has not committed: drop the connection with `questdb_db_drop_column_sender`,
+     *  re-acquire one with `questdb_db_borrow_column_sender_with_retry` (row-aligned
+     *  reconnect backoff, bounded by `reconnect_max_duration`), and re-drive
+     *  from your source. */
+    line_sender_error_failover_retry = 17,
+
+    /** Every reachable endpoint handshook but none matched the configured
+     *  `target=` role filter (e.g. `target=primary` against an all-replica
+     *  address list). Distinct from `line_sender_error_socket_error`
+     *  ("all endpoints unreachable") so callers can tell "no primary
+     *  elected" from "all down". */
+    line_sender_error_role_mismatch = 18,
+    /** The TCP connect (dial) to the server exceeded the configured
+     *  `connect_timeout`. Distinct from `line_sender_error_socket_error` so a
+     *  caller can tell a timed-out dial apart from a refused / reset
+     *  connection. Produced by the QWP/WebSocket transport. */
+    line_sender_error_connect_timeout = 19,
+
+    /* Query / reader (egress) categories. The error model is unified across
+     * ingest and query: these are emitted by the reader. Appended at 20..34
+     * so the ingress discriminants 0..19 stay frozen. The reader aliases
+     * (`reader_error_*` in <questdb/egress/reader.h>) map onto these. */
+
+    /** HTTP-upgrade or WebSocket handshake failure. */
+    line_sender_error_handshake_error = 20,
+
+    /** Server returned an unsupported QWP version, encoding, or capability. */
+    line_sender_error_unsupported_server = 21,
+
+    /** Wire-format violation: bad magic, truncated frame, unknown
+     *  discriminant, invalid varint, symbol-dict reference miss, etc. */
+    line_sender_error_protocol_error = 22,
+
+    /** Bind parameter index, count, or value rejected client-side (covers
+     *  timestamp / decimal / geohash range failures on the query path too). */
+    line_sender_error_invalid_bind = 23,
+
+    /** Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`). */
+    line_sender_error_server_schema_mismatch = 24,
+
+    /** Server-reported QWP `PARSE_ERROR` (status `0x05`). */
+    line_sender_error_server_parse_error = 25,
+
+    /** Server-reported QWP `INTERNAL_ERROR` (status `0x06`). */
+    line_sender_error_server_internal_error = 26,
+
+    /** Server-reported QWP `SECURITY_ERROR` (status `0x08`). */
+    line_sender_error_server_security_error = 27,
+
+    /** Client-side limit hit (e.g. an array row exceeds the configured cap). */
+    line_sender_error_limit_exceeded = 28,
+
+    /** Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`). */
+    line_sender_error_server_limit_exceeded = 29,
+
+    /** Query was cancelled (locally or via server `CANCELLED` status `0x0A`). */
+    line_sender_error_cancelled = 30,
+
+    /** Mid-query failover was eligible but a batch had already been delivered
+     *  and no `on_failover_reset` callback was installed; the cursor
+     *  terminated rather than silently double-deliver rows. */
+    line_sender_error_failover_would_duplicate = 31,
+
+    /** Streaming Arrow adapter saw a mid-stream schema change. `arrow`
+     *  feature only. */
+    line_sender_error_schema_drift = 32,
+
+    /** A streaming Arrow adapter was asked for a schema on a stream that
+     *  ended before any batch was produced. `arrow` feature only. */
+    line_sender_error_no_schema = 33,
+
+    /** Arrow C Data Interface export failed. `arrow` feature only. */
+    line_sender_error_arrow_export = 34,
+
+    /** An irreducible QWP/WebSocket unit (the table schema plus a single row
+     *  block) exceeds the negotiated per-batch cap. The column sender splits
+     *  oversize chunks into smaller frames automatically, so this only surfaces
+     *  when splitting cannot make a frame fit. Distinct from
+     *  `line_sender_error_invalid_api_call` so callers can recognise it without
+     *  matching on the error message text. */
+    line_sender_error_batch_too_large = 35,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -221,6 +318,21 @@ line_sender_error_code line_sender_error_get_code(const line_sender_error*);
  */
 QUESTDB_CLIENT_API
 const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
+
+/**
+ * Whether the failed operation is *delivery-unknown* ("in doubt"): the current
+ * input's bytes may already have reached the server even though the call
+ * returned an error (e.g. a socket write that failed mid-frame, or a
+ * post-publish ACK wait that failed).
+ *
+ * Independent of `line_sender_error_get_code`: a delivery-unknown failure
+ * typically reports `line_sender_error_failover_retry`, yet that code alone
+ * does NOT mean the input is safe to resend. When this returns `true`, only
+ * replay the same input if table-level dedup/upsert keys make duplicate rows
+ * harmless. NULL-safe: passing NULL returns `false`.
+ */
+QUESTDB_CLIENT_API
+bool line_sender_error_in_doubt(const line_sender_error*);
 
 /** Clean up the error. */
 QUESTDB_CLIENT_API
@@ -426,6 +538,23 @@ line_sender_buffer* line_sender_buffer_new_qwp(void);
  */
 QUESTDB_CLIENT_API
 line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
+    size_t max_name_len);
+
+/**
+ * Construct a QWP/WebSocket columnar `line_sender_buffer` with a fixed
+ * 127-byte name length limit. This is the buffer kind a `row_sender`
+ * borrowed from a `questdb_db` pool requires; when you hold the `row_sender`,
+ * prefer `row_sender_new_buffer` (see `column_sender.h`).
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws(void);
+
+/**
+ * Construct a QWP/WebSocket columnar `line_sender_buffer` with a max name
+ * length limit.
+ */
+QUESTDB_CLIENT_API
+line_sender_buffer* line_sender_buffer_new_qwp_ws_with_max_name_len(
     size_t max_name_len);
 
 /** Release the `line_sender_buffer` object. */
@@ -1796,15 +1925,37 @@ bool line_sender_qwpws_acked_fsn(
     line_sender_error** err_out);
 
 /**
- * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
- * Timeout is a normal successful result with `*reached_out == false`.
+ * Acknowledgement level for QWP/WebSocket wait/sync APIs.
+ */
+typedef enum qwpws_ack_level
+{
+    /** Wait for the server to accept every published frame. */
+    qwpws_ack_level_ok = 0,
+
+    /** Wait for durable-ACK coverage. Each wait/sync API documents whether
+     * unavailable durable ACKs are rejected or downgraded to ordinary
+     * acceptance. */
+    qwpws_ack_level_durable = 1,
+} qwpws_ack_level;
+
+/**
+ * Wait until every QWP/WebSocket frame published so far reaches `ack_level`
+ * (a `qwpws_ack_level` value). This is the row-major counterpart
+ * to `sf_column_sender_wait`.
+ *
+ * `timeout_millis` is a no-progress deadline (it fires only if the ack
+ * watermark fails to advance for that long); `0` waits indefinitely.
+ *
+ * Returns `false` and sets `err_out` on the no-progress timeout
+ * (`line_sender_error_failover_retry`), a server rejection, a transport
+ * failure, or an invalid `ack_level`. With nothing published yet it succeeds
+ * immediately.
  */
 QUESTDB_CLIENT_API
-bool line_sender_qwpws_await_acked_fsn(
+bool line_sender_qwpws_wait(
     line_sender* sender,
-    uint64_t fsn,
+    uint32_t ack_level,
     uint64_t timeout_millis,
-    bool* reached_out,
     line_sender_error** err_out);
 
 /**

@@ -50,10 +50,10 @@
 //!
 //! ```text
 //! QDB_LIVE_BROKER_AUTH=admin:quest \
-//!   cargo test --features sync-reader-ws --test egress_live_auth -- --nocapture
+//!   cargo test --features sync-reader-qwp-ws --test egress_live_auth -- --nocapture
 //! ```
 
-#![cfg(feature = "sync-reader-ws")]
+#![cfg(feature = "sync-reader-qwp-ws")]
 
 use std::env;
 

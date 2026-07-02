@@ -54,6 +54,9 @@ mod qwp_ws_publication_probe;
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws_java_golden;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod column_sender_pool;
+
 mod sender;
 
 mod decimal;
@@ -61,7 +64,7 @@ mod ndarr;
 
 mod buffer_opt;
 
-#[cfg(feature = "json_tests")]
+#[cfg(feature = "json-tests")]
 mod json_tests {
     include!(concat!(env!("OUT_DIR"), "/json_tests.rs"));
 }

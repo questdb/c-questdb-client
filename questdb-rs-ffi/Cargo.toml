@@ -11,6 +11,7 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 libc = "0.2"
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
+arrow = { version = ">=58, <60", optional = true, default-features = false, features = ["ffi"] }
 
 [dependencies.questdb-rs]
 path = "../questdb-rs"
@@ -20,26 +21,49 @@ features = [
     "tls-webpki-certs",
     "tls-native-certs",
     "sync-sender",
+    # QWP/UDP is no longer part of the `sync-sender` umbrella (best-effort,
+    # no auth/TLS) — the C ABI exposes every transport, so request it here.
+    "sync-sender-qwp-udp",
+    # Owned (lifetime-free) pool handles + their borrow entry points. C / Python
+    # cannot express Rust lifetimes, so the C ABI hands out owned handles via
+    # `questdb::ffi_support` instead of the lifetime-bound `Borrowed*` handles.
+    "ffi-support",
 ]
 
 [features]
 # No default features. Existing consumers who only want the line sender
 # get exactly that — the egress reader is opt-in. Enable
-# `sync-reader-ws` explicitly (in Cargo.toml or via `--features`) to
-# bring the `line_reader_*` symbols back in.
+# `sync-reader-qwp-ws` explicitly (in Cargo.toml or via `--features`) to
+# bring the `reader_*` symbols back in.
 default = []
 # Expose the config parsing C API.
 # This used by `py-questdb-client` to parse the config file.
 # It is exposed here to avoid having multiple copies of the `questdb-confstr`
 # crate in the final binary.
 confstr-ffi = ["dep:questdb-confstr-ffi"]
-# Expose the synchronous WebSocket egress reader API (`line_reader_*`).
+# Expose the synchronous WebSocket egress reader API (`reader_*`).
 # Forwarded to the upstream `questdb-rs` feature of the same name.
 # Opt-in (NOT a default feature) so existing builds of `questdb-rs-ffi`
 # don't silently grow ~70 new exported symbols + a WebSocket transport
 # dependency. The in-tree CMake build enables it via
-# `corrosion_import_crate(FEATURES sync-reader-ws ...)`.
-sync-reader-ws = ["questdb-rs/sync-reader-ws", "questdb-rs/compression-zstd"]
+# `corrosion_import_crate(FEATURES sync-reader-qwp-ws ...)`.
+sync-reader-qwp-ws = ["questdb-rs/sync-reader-qwp-ws", "questdb-rs/sync-reader-zstd"]
+
+# DEPRECATED back-compat alias for the pre-rename feature name. Slated for
+# removal in the next major; migrate to `sync-reader-qwp-ws`.
+sync-reader-ws = ["sync-reader-qwp-ws"]
+
+# Apache Arrow integration (egress + ingress over QWP/WS). Adds the
+# `reader_cursor_next_arrow_batch` C export (egress) and the
+# `column_sender_chunk_append_arrow_column` / `column_sender_flush_arrow_batch[_at_column]`
+# exports (ingress), plus the Arrow C Data Interface struct
+# declarations. See `doc/QUESTDB_ARROW_INTEGRATION_DESIGN.md`.
+arrow = [
+    "sync-reader-qwp-ws",
+    "questdb-rs/arrow",
+    "questdb-rs/sync-sender-qwp-ws",
+    "dep:arrow",
+]
 # Compile in support for the `tls_verify=unsafe_off` connect-string knob.
 # Off by default: a shipped C ABI binary should not silently allow
 # downstream callers to disable certificate verification. Distributions
@@ -59,3 +83,9 @@ panic = "abort"
 
 [profile.dev]
 panic = "abort"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false

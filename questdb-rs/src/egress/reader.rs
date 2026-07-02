@@ -34,7 +34,7 @@
 //! returns `None`) before drop if you want to keep the existing
 //! connection alive.
 //!
-//! The `sync-reader-ws` feature gate is applied at the module
+//! The `sync-reader-qwp-ws` feature gate is applied at the module
 //! declaration in `egress/mod.rs`; an inner `#![cfg(...)]` here would
 //! duplicate that gate (clippy::duplicated_attributes) without
 //! changing what's compiled.
@@ -52,12 +52,15 @@ use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::decoder::ZstdScratch;
 use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
-use crate::egress::query_request::{QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET};
+use crate::egress::query_request::{
+    QUERY_FLAG_RESET_DICT, QueryRequest, QueryRequestBuilder, REQUEST_ID_OFFSET,
+};
 use crate::egress::schema::Schema;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::tracker::HostHealthTracker;
 use crate::egress::transport::{CLOSE_TIMEOUT, WRITE_TIMEOUT, WsTransport};
+use crate::egress::wire::capabilities::has_query_flags;
 use crate::egress::wire::header::HEADER_LEN;
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
@@ -105,7 +108,7 @@ pub struct Reader {
     /// Wrapped in [`Arc`] so reconnect attempts share a single
     /// allocation: each attempt would otherwise deep-clone the addr
     /// vec, the path string, and the boxed auth payload — with
-    /// `failover_max_attempts` up to `1024`, that's thousands of
+    /// `failover_max_attempts` up to `1024`, that's hundreds of
     /// allocations per failure event. Reference-count bumps are free
     /// in comparison.
     cfg: Arc<ReaderConfig>,
@@ -199,6 +202,25 @@ const _: fn() = || {
     assert_send_sync::<HostHealthTracker>();
 };
 
+// Two blanket impls of the same trait force method-resolution ambiguity
+// iff the target type IS `Send`; the call thus compiles only when the
+// type is `!Send`.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn _disambiguate() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    fn assert_not_send<T: ?Sized>() {
+        let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
+    }
+    assert_not_send::<crate::egress::Cursor<'_>>();
+    #[cfg(feature = "arrow-egress")]
+    assert_not_send::<crate::egress::arrow::CursorRecordBatchReader<'_, '_>>();
+    #[cfg(feature = "polars-egress")]
+    assert_not_send::<crate::egress::arrow::polars::CursorPolarsIter<'_, '_>>();
+};
+
 impl Reader {
     /// Open a new connection from a connect string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
@@ -235,10 +257,10 @@ impl Reader {
     ///   (refused / timed out / TLS error / etc.).
     /// - whatever the last attempt returned otherwise.
     ///
-    /// The initial connect deliberately does **not** apply the failover
-    /// backoff schedule — it walks every address once and reports back.
-    /// Mid-query failover (via [`Cursor::next_batch`]) is what uses
-    /// `failover_backoff_*` to space retries.
+    /// The initial connect deliberately does **not** apply the egress
+    /// failover backoff schedule — it walks every address once and
+    /// reports back. Mid-query failover (via [`Cursor::next_batch`]) is
+    /// what uses `failover_backoff_*` to space retries.
     ///
     /// The tracker is constructed fresh here, so every host starts at
     /// `Unknown` state and the priority-based pick degenerates to the
@@ -410,32 +432,26 @@ impl Reader {
     /// — `record_mid_stream_failure` demotes it from `Healthy` to
     /// `TransportError` so the tracker won't reach for it first on the
     /// next walk.
-    /// `on_attempt` is invoked once per outer-loop iteration right
-    /// before the `walk_via_tracker` dial runs (after the inter-attempt
-    /// backoff sleep, so the wall-clock cost of the backoff is included
-    /// in the elapsed measurement the caller derives). Passed by `&mut
-    /// dyn` instead of generic `impl FnMut` so adding the hook doesn't
-    /// monomorphise this large function per call site — there is one
-    /// non-trivial caller (`Cursor::failover_reconnect_and_replay`).
+    /// `budget` is cursor-owned and spans the whole `Execute()` call:
+    /// reconnect rounds, backoff growth, and the wall-clock deadline do
+    /// not reset after a successful replay.
+    ///
+    /// `on_attempt` is invoked once per reconnect round right before
+    /// the `walk_via_tracker` dial runs (after the configured
+    /// post-failure backoff sleep, so the wall-clock cost of the
+    /// backoff is included in the elapsed measurement the caller
+    /// derives). Passed by `&mut dyn` instead of generic `impl FnMut`
+    /// so adding the hook doesn't monomorphise this large function per
+    /// call site — there is one non-trivial caller
+    /// (`Cursor::failover_reconnect_and_replay`).
     fn reconnect_with_failover(
         &mut self,
         failed_idx: usize,
+        budget: &mut FailoverBudget,
         on_attempt: &mut dyn FnMut(u32),
     ) -> Result<u32> {
         let cfg = Arc::clone(&self.cfg);
-        // Mid-query path: `failover_max_attempts` counts reconnect
-        // rounds (no initial connect to subtract — we already had one).
-        let attempts_total = cfg.failover_max_attempts.max(1);
-        let mut backoff_ms = cfg.failover_backoff_initial_ms;
         let mut last_err: Option<Error> = None;
-        // Failover.md §11.9.1 wall-clock budget. `0` is the documented
-        // "unbounded" sentinel — translate to `None` so the inner
-        // arithmetic doesn't have to deal with a special case.
-        let deadline: Option<std::time::Instant> = if cfg.failover_max_duration_ms == 0 {
-            None
-        } else {
-            Some(std::time::Instant::now() + Duration::from_millis(cfg.failover_max_duration_ms))
-        };
         let mut deadline_exhausted = false;
         // Spec invariant (failover.md §2.3): mid-stream demote MUST run
         // before the next `begin_round(forget=true)` — reversing the
@@ -460,52 +476,31 @@ impl Reader {
         // long-running diagnostics see real dial pressure, not just the
         // attempt index that landed.
         let mut total_dials: u32 = 0;
-        // Outer-attempt counter — i.e. how many `walk_via_tracker` rounds
-        // actually fired. Distinct from `attempts_total` (the configured
-        // cap) because the deadline branch below can break out of the
-        // loop before issuing a walk, leaving the configured value
-        // misleadingly higher than reality. Used by both exhaustion
-        // error messages so diagnostics report real effort, not policy.
+        // Per-failure reconnect counter — i.e. how many
+        // `walk_via_tracker` rounds this call fired. Distinct from the
+        // cursor-level budget because this call can enter with only
+        // part of the original per-Execute budget left.
         let mut attempts_made: u32 = 0;
-        for attempt in 0..attempts_total {
-            if attempt > 0 {
-                // Failover.md §11.9 + §3.1: full-jitter `[0, base)`.
-                // Single-user egress benefits from the lowest expected
-                // recovery time; thundering-herd damping isn't a
-                // concern at one client per workload.
-                let jittered_ms = self.failover_rng.full_jitter_ms(backoff_ms);
-                // §11.9.1 deadline interplay: the sleep is clamped to
-                // `deadline - now`. If `now >= deadline`, the failover
-                // budget is exhausted — exit without sleeping or
-                // walking again. Per spec, the deadline check gates
-                // failover eligibility (not total Execute wall-clock).
-                let sleep_dur = match deadline {
-                    Some(dl) => match dl.checked_duration_since(std::time::Instant::now()) {
-                        Some(remaining) if !remaining.is_zero() => {
-                            std::cmp::min(Duration::from_millis(jittered_ms), remaining)
-                        }
-                        _ => {
-                            deadline_exhausted = true;
-                            break;
-                        }
-                    },
-                    None => Duration::from_millis(jittered_ms),
-                };
-                std::thread::sleep(sleep_dur);
-                backoff_ms = backoff_ms
-                    .saturating_mul(2)
-                    .min(cfg.failover_backoff_max_ms);
+        loop {
+            match budget.before_reconnect_round(&cfg, &mut self.failover_rng) {
+                Ok(()) => {}
+                Err(FailoverBudgetStop::AttemptsExhausted) => break,
+                Err(FailoverBudgetStop::DeadlineExhausted) => {
+                    deadline_exhausted = true;
+                    break;
+                }
             }
-            // Count the attempt only after the deadline gate above has
-            // let us through; otherwise we'd over-report attempts in
-            // the wall-clock-exhausted message.
+            // Count the attempt only after the shared budget gate above
+            // has let us through; otherwise we'd over-report attempts
+            // in exhaustion messages.
             attempts_made = attempts_made.saturating_add(1);
             // Fire the per-attempt hook *after* the deadline gate (so
             // the count we report matches the one the exhaustion errors
             // report) and *before* the dial (so observers see "about
-            // to dial attempt N" rather than retroactive "dial N
-            // finished"). Pass the 1-based attempt number; the caller
-            // already knows the trigger and start time.
+            // to dial attempt N for this failure" rather than
+            // retroactive "dial N finished"). Pass the 1-based attempt
+            // number; the caller already knows the trigger and start
+            // time.
             on_attempt(attempts_made);
             match walk_via_tracker(
                 &mut self.tracker,
@@ -566,11 +561,9 @@ impl Reader {
             ));
         }
         Err(last_err.unwrap_or_else(|| {
-            // `attempts_made` rather than `attempts_total` (the
-            // configured cap): the two are equal on natural exhaustion,
-            // but a future change to the loop's break conditions
-            // shouldn't quietly turn this into a lie about how many
-            // attempts actually ran.
+            // Report the attempts this call actually ran; the
+            // cursor-level cap may have been partly spent by earlier
+            // successful failovers in the same Execute.
             fmt!(
                 SocketError,
                 "failover exhausted after {} attempts",
@@ -588,18 +581,24 @@ impl Reader {
     }
 
     /// Mutable access to the live transport. Returns `SocketError`
-    /// when the transport is `None`, which happens after a mid-query
-    /// failover exhausted its retry budget — the Reader is left in
-    /// a "poisoned" state and the user must open a fresh Reader to
-    /// recover. Inside `reconnect_with_failover` the transport is
-    /// only briefly absent (between dropping the dead one and
-    /// splicing in a new one); that path uses `self.transport`
-    /// directly and never goes through this accessor.
+    /// when the transport is `None`, which happens after the connection
+    /// was torn down: either a cursor was dropped before being fully
+    /// read (drop closes the WebSocket — see [`Cursor`]'s docs), or a
+    /// mid-query failover exhausted its retry budget. Either way the
+    /// Reader is "poisoned"; the fix is to drain cursors (`next_batch()`
+    /// until `None`) or `Cursor::cancel()` before dropping them, or to
+    /// open a fresh Reader. Inside `reconnect_with_failover` the transport
+    /// is only briefly absent (between dropping the dead one and splicing
+    /// in a new one); that path uses `self.transport` directly and never
+    /// goes through this accessor.
     fn transport_mut(&mut self) -> Result<&mut WsTransport> {
         self.transport.as_mut().ok_or_else(|| {
             fmt!(
                 SocketError,
-                "Reader transport is closed after a failed mid-query failover; open a fresh Reader to recover"
+                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
+                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
+                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
+                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
             )
         })
     }
@@ -609,7 +608,10 @@ impl Reader {
         self.transport.as_ref().ok_or_else(|| {
             fmt!(
                 SocketError,
-                "Reader transport is closed after a failed mid-query failover; open a fresh Reader to recover"
+                "Reader connection is closed and cannot be reused: a cursor was dropped before being \
+                 fully read, or a mid-query failover exhausted its retry budget. To keep the \
+                 connection reusable, drain each cursor (call next_batch() until it returns None) or \
+                 call cursor.cancel() before dropping it; otherwise open a fresh Reader."
             )
         })
     }
@@ -629,6 +631,14 @@ impl Reader {
     /// effective throughput a query produces.
     pub fn bytes_received(&self) -> u64 {
         self.stats.bytes_received.load(Ordering::Relaxed)
+    }
+
+    /// `true` when the underlying transport has been torn down (mid-stream
+    /// cursor abandonment, fatal socket error, role-mismatch failover that
+    /// couldn't find a replacement). Pool return paths should treat such a
+    /// reader as must-close.
+    pub fn transport_torn_down(&self) -> bool {
+        self.transport.is_none()
     }
 
     /// Total bytes granted to the server via CREDIT (`0x15`) frames
@@ -659,7 +669,7 @@ impl Reader {
     }
 
     /// Borrow the shared diagnostic counters. The FFI clones this at
-    /// `line_reader_from_conf` time so its stat getters can read the
+    /// `reader_from_conf` time so its stat getters can read the
     /// counters without touching the `UnsafeCell<Reader>` that holds
     /// this Reader — eliminating the aliasing question of "what
     /// happens when a stat getter synthesises a `&Reader` while a
@@ -693,6 +703,7 @@ impl Reader {
         ReaderQuery {
             reader: self,
             builder: QueryRequest::builder(sql),
+            reset_symbol_dict: false,
             on_failover_reset: None,
             on_failover_progress: None,
             _not_send: std::marker::PhantomData,
@@ -739,14 +750,13 @@ pub struct FailoverEvent {
     /// from now on. Different from `Cursor::request_id` *before* the
     /// failover.
     pub new_request_id: i64,
-    /// Count of reconnect attempts the failover machinery burned
-    /// before this success — every dial inside the single
-    /// `reconnect_with_failover` walk that landed. `1` means the
-    /// first reconnect attempt succeeded and its replay write went
-    /// through cleanly. Larger values mean earlier reconnects in
-    /// this walk missed (rotating through endpoints) before one
-    /// landed. Pairs with [`elapsed`](Self::elapsed) — both measure
-    /// the same failover event.
+    /// Count of reconnect dials the current failover cycle burned
+    /// before this success. `1` means the first reconnect dial
+    /// succeeded and its replay write went through cleanly. Larger
+    /// values mean earlier dials in this cycle missed (rotating
+    /// through endpoints) before one landed. Pairs with
+    /// [`elapsed`](Self::elapsed) — both measure the same failover
+    /// event.
     pub attempts: u32,
     /// The error that triggered this failover (the failure of the
     /// previous connection). The full error — code + message — is
@@ -869,6 +879,10 @@ type FailoverProgressCallback<'r> = Box<dyn FnMut(&FailoverProgressEvent) + 'r>;
 pub struct ReaderQuery<'r> {
     reader: &'r mut Reader,
     builder: QueryRequestBuilder,
+    /// Request a query-scoped SYMBOL dict reset; translated to a
+    /// `query_flags` trailer at [`Self::execute`] iff the server advertised
+    /// `CAP_QUERY_FLAGS`.
+    reset_symbol_dict: bool,
     /// Optional handler called every time the cursor reconnects after a
     /// transport-level failure (see [`FailoverEvent`]).
     on_failover_reset: Option<FailoverResetCallback<'r>>,
@@ -894,6 +908,15 @@ impl<'r> ReaderQuery<'r> {
     /// Override the `initial_credit` (bytes; `0` = unbounded).
     pub fn initial_credit(mut self, credit: u64) -> Self {
         self.builder = self.builder.initial_credit(credit);
+        self
+    }
+
+    /// Request a query-scoped SYMBOL dict: the server resets the connection
+    /// dict before streaming this query so it never inherits symbols from
+    /// earlier queries on the same connection. Silently no-op against a server
+    /// that does not advertise `CAP_QUERY_FLAGS`.
+    pub fn reset_symbol_dict(mut self, reset: bool) -> Self {
+        self.reset_symbol_dict = reset;
         self
     }
 
@@ -1110,7 +1133,24 @@ impl<'r> ReaderQuery<'r> {
         // query; clear any schema left from the prior query so a stray
         // continuation batch can't bind rows to a stale schema.
         self.reader.query_schema = None;
-        let req = self.builder.request_id(request_id).build()?;
+        // Cap-gate the query_flags trailer: only emit it when the server
+        // advertised CAP_QUERY_FLAGS, so an older server sees the baseline
+        // QUERY_REQUEST layout and the reset request silently degrades.
+        let server_supports_query_flags = self
+            .reader
+            .server_info()
+            .map(|info| has_query_flags(info.capabilities))
+            .unwrap_or(false);
+        let query_flags = if self.reset_symbol_dict && server_supports_query_flags {
+            QUERY_FLAG_RESET_DICT
+        } else {
+            0
+        };
+        let req = self
+            .builder
+            .request_id(request_id)
+            .query_flags(query_flags)
+            .build()?;
         let credit_enabled = req.initial_credit() > 0;
         // Encode the QUERY_REQUEST once and stash the bytes on the
         // cursor. Mid-query failover replays the query by patching
@@ -1164,6 +1204,7 @@ impl<'r> ReaderQuery<'r> {
             .write_message(encoded_request.clone())?;
 
         self.reader.cursor_active = true;
+        let failover_budget = FailoverBudget::new(&self.reader.cfg);
         Ok(Cursor {
             reader: self.reader,
             request_id,
@@ -1176,8 +1217,21 @@ impl<'r> ReaderQuery<'r> {
             encoded_request,
             on_failover_reset: self.on_failover_reset,
             on_failover_progress: self.on_failover_progress,
+            failover_budget,
             failover_resets: 0,
+            decode_failover_rounds: 0,
+            stale_plan_retries: 0,
             data_delivered: false,
+            #[cfg(feature = "arrow-egress")]
+            drifted_batch: None,
+            #[cfg(feature = "arrow-egress")]
+            sym_values: crate::egress::arrow::SymbolValuesCache::default(),
+            #[cfg(feature = "arrow-egress")]
+            sym_scratch: crate::egress::arrow::SymbolBuildScratch::default(),
+            #[cfg(feature = "polars-egress")]
+            symbol_registry: None,
+            #[cfg(feature = "polars-egress")]
+            symbol_delta_modes: Vec::new(),
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1219,9 +1273,136 @@ fn patch_request_id(buf: Bytes, new_rid: i64) -> Bytes {
 /// peer surfaces a clear error rather than appearing to hang.
 const CANCEL_DRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Dedicated per-Execute cap on failover rounds triggered by a *frame
+/// decode* failure, as opposed to a raw transport (socket / TLS / WS)
+/// read failure.
+///
+/// A decode failure is ambiguous: it can be transient wire corruption
+/// (a truncated WS frame, a malformed varint emitted by a dying
+/// endpoint) — which a single reconnect to a fresh connection cures —
+/// or a *deterministic* protocol violation (unknown `MsgKind`,
+/// mismatched lengths, a version-mismatched frame) that every replay
+/// reproduces byte-for-byte. Both surface as `ProtocolError`, so they
+/// are indistinguishable at the [`ErrorCode`] level.
+///
+/// Routing decode failures through the *full* per-Execute failover
+/// budget lets a deterministically-corrupting server drive a
+/// reconnect -> replay -> re-corrupt loop that drains every reconnect
+/// round (`failover_max_attempts - 1`, up to 1023) — burning the
+/// backoff schedule and emitting one warning per round — before the
+/// identical decode error is finally surfaced. Capping decode-driven
+/// replays at a small constant preserves recovery from a one-off
+/// transient blip (one reconnect rules it out) while failing fast on
+/// deterministic corruption. Raw read failures are unaffected and keep
+/// the full budget.
+const MAX_DECODE_FAILOVER_ROUNDS: u32 = 1;
+
+/// Bound on transparent re-issues of a query the server rejected with the
+/// transient stale-cached-plan `INTERNAL_ERROR` (see [`is_stale_plan_error`]).
+///
+/// Each retry is a same-connection resend that makes the server recompile
+/// the query against the table's *current* metadata; a single retry clears
+/// the realistic one-`ALTER`-in-flight race. The cap stops a table under
+/// relentless concurrent schema churn from looping forever — once spent, the
+/// stale-plan error surfaces like any other server error. Retries are
+/// naturally paced by the server's recompile + round-trip latency, so the
+/// loop never busy-spins and no client-side sleep is needed.
+const MAX_STALE_PLAN_RETRIES: u32 = 15;
+
+/// Classifies the origin of a mid-query stream failure routed through
+/// [`Cursor::failover_after_stream_failure`]. Decode failures get a
+/// small dedicated replay cap ([`MAX_DECODE_FAILOVER_ROUNDS`]); raw
+/// transport read failures keep the full per-Execute budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFailureKind {
+    /// A raw transport read failed (socket closed, TLS reset, truncated
+    /// WS frame at the transport layer).
+    Read,
+    /// A complete frame was read but `decode_frame` rejected it.
+    Decode,
+}
+
+impl StreamFailureKind {
+    /// Human-readable context for the failover warning.
+    fn context(self) -> &'static str {
+        match self {
+            StreamFailureKind::Read => "mid-query frame read",
+            StreamFailureKind::Decode => "mid-query frame decode",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cursor + BatchView
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailoverBudgetStop {
+    AttemptsExhausted,
+    DeadlineExhausted,
+}
+
+/// Mutable per-Execute failover budget.
+///
+/// A cursor may fail over, replay, then fail again before the query
+/// reaches its terminal frame. The public knobs are per Execute, not
+/// per outage, so reconnect rounds, backoff growth, and the wall-clock
+/// deadline all live here on the cursor rather than inside
+/// `Reader::reconnect_with_failover`.
+struct FailoverBudget {
+    reconnect_rounds_remaining: u32,
+    next_backoff_ms: u64,
+    deadline: Option<std::time::Instant>,
+}
+
+impl FailoverBudget {
+    fn new(cfg: &ReaderConfig) -> Self {
+        let deadline = if cfg.failover_max_duration_ms == 0 {
+            None
+        } else {
+            Some(std::time::Instant::now() + Duration::from_millis(cfg.failover_max_duration_ms))
+        };
+        Self {
+            reconnect_rounds_remaining: cfg.failover_reconnect_rounds(),
+            next_backoff_ms: cfg.failover_backoff_initial_ms,
+            deadline,
+        }
+    }
+
+    fn before_reconnect_round(
+        &mut self,
+        cfg: &ReaderConfig,
+        rng: &mut FailoverRng,
+    ) -> std::result::Result<(), FailoverBudgetStop> {
+        if self.reconnect_rounds_remaining == 0 {
+            return Err(FailoverBudgetStop::AttemptsExhausted);
+        }
+
+        // Failover.md §11.9 + §3.1: the first reconnect sleeps the
+        // configured initial backoff, then subsequent rounds grow the
+        // base exponentially up to the configured max. A zero initial
+        // backoff is the documented "no sleeps" sentinel.
+        let jittered_ms = rng.full_jitter_ms(self.next_backoff_ms);
+        let sleep_dur = match self.deadline {
+            Some(dl) => match dl.checked_duration_since(std::time::Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => {
+                    std::cmp::min(Duration::from_millis(jittered_ms), remaining)
+                }
+                _ => return Err(FailoverBudgetStop::DeadlineExhausted),
+            },
+            None => Duration::from_millis(jittered_ms),
+        };
+        std::thread::sleep(sleep_dur);
+        if self.next_backoff_ms > 0 {
+            self.next_backoff_ms = self
+                .next_backoff_ms
+                .saturating_mul(2)
+                .min(cfg.failover_backoff_max_ms);
+        }
+        self.reconnect_rounds_remaining = self.reconnect_rounds_remaining.saturating_sub(1);
+        Ok(())
+    }
+}
 
 /// Reason the stream ended. Surfaced via [`Cursor::terminal`] once
 /// `next_batch` returns `None`.
@@ -1273,10 +1454,28 @@ pub struct Cursor<'r> {
     /// User callback fired at every phase of a mid-query failover
     /// lifecycle. See [`ReaderQuery::on_failover_progress`].
     on_failover_progress: Option<FailoverProgressCallback<'r>>,
+    /// Shared per-Execute budget for mid-query failover. This spans
+    /// every reconnect in the cursor's life; it must not reset after a
+    /// successful replay.
+    failover_budget: FailoverBudget,
     /// Number of successful failover resets observed by this cursor
     /// since `execute()`. Useful for tests and for asserting the
     /// query did not silently restart under the user's feet.
     failover_resets: u32,
+    /// Count of failover rounds this cursor has triggered specifically
+    /// from a *frame decode* failure (as opposed to a raw transport
+    /// read failure). Capped at [`MAX_DECODE_FAILOVER_ROUNDS`] so a
+    /// deterministically-corrupting server can't drive a
+    /// reconnect/replay loop that drains the whole per-Execute budget;
+    /// once the cap is hit the decode error is surfaced terminally.
+    decode_failover_rounds: u32,
+    /// Count of transparent same-connection query re-issues this cursor has
+    /// performed in response to the server's transient stale-cached-plan
+    /// `INTERNAL_ERROR` (see [`Cursor::next_batch`] and
+    /// [`is_stale_plan_error`]). Capped at [`MAX_STALE_PLAN_RETRIES`]; stays
+    /// `0` on the happy path. Distinct from `failover_resets` — no reconnect
+    /// is involved, the recompile happens on the existing healthy connection.
+    stale_plan_retries: u32,
     /// Sticky: set the first time a `RESULT_BATCH` is yielded to the
     /// caller and never reset. Drives the safety check in
     /// [`Cursor::next_batch`] that refuses mid-query failover when no
@@ -1326,6 +1525,25 @@ pub struct Cursor<'r> {
     /// Captured at most once (the first error wins) so a follow-up
     /// failure during teardown can't overwrite the originating cause.
     terminal_error: Option<Error>,
+    /// A batch decoded but not handed out because its Arrow schema drifted
+    /// from the pinned one, parked for replay on the next `next_arrow_batch*`
+    /// call so the rows are recoverable rather than dropped.
+    #[cfg(feature = "arrow-egress")]
+    drifted_batch: Option<DecodedBatch>,
+    /// Connection-dict SYMBOL values array, interned once per cursor and reused
+    /// across batches until the dict grows (see [`SymbolValuesCache`]).
+    #[cfg(feature = "arrow-egress")]
+    sym_values: crate::egress::arrow::SymbolValuesCache,
+    #[cfg(feature = "arrow-egress")]
+    sym_scratch: crate::egress::arrow::SymbolBuildScratch,
+    /// Per-cursor SYMBOL → polars `Categories`, interned once and grown
+    /// incrementally across batches (see [`SymbolRegistry`]).
+    #[cfg(feature = "polars-egress")]
+    symbol_registry: Option<crate::egress::arrow::polars::SymbolRegistry>,
+    /// `[i]` = column `i` is a delta-mode SYMBOL, captured per batch from the
+    /// `DecodedBatch` before it is assembled.
+    #[cfg(feature = "polars-egress")]
+    symbol_delta_modes: Vec<bool>,
     /// Pin `!Send` regardless of whether the callback is installed.
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -1388,10 +1606,11 @@ impl<'r> Cursor<'r> {
     /// happens before the first batch is yielded — including initial
     /// connect failover — is unaffected and remains transparent.
     ///
-    /// Decode errors (malformed payload, missing batch-0 schema, zstd
-    /// corruption) are NOT routed through failover — they bubble up
-    /// immediately and terminate the cursor, since reconnecting
-    /// won't fix a wire-state bug.
+    /// Failover-eligible decode errors (malformed payload, bad varint,
+    /// zstd corruption) use the same reconnect-and-replay path as
+    /// transport failures. Replaying after rows were already yielded is
+    /// still blocked unless the caller installed a replay-aware callback,
+    /// since the server restarts streaming from `batch_seq=0`.
     ///
     /// **Blocking time during failover.** When failover is engaged,
     /// this method blocks the calling thread for the duration of the
@@ -1399,14 +1618,13 @@ impl<'r> Cursor<'r> {
     /// (capped by `failover_backoff_max_ms`), then dials, handshakes,
     /// and reads `SERVER_INFO` against the next endpoint. The
     /// worst-case wall-clock blocking time is approximately
-    /// `2 × failover_max_attempts × failover_backoff_max_ms` plus
-    /// per-attempt connect+handshake overhead — with the parse-time
-    /// caps that's up to ~2 hours. There is no per-call timeout, no
-    /// AtomicBool cancel hook, and no progress callback today; if
-    /// you need bounded latency, set `failover_max_attempts` and
-    /// `failover_backoff_max_ms` to values appropriate for your SLA,
-    /// or set `failover=off` and handle reconnect at the
-    /// application layer.
+    /// `2 × (failover_max_attempts - 1) × failover_backoff_max_ms`
+    /// plus per-attempt connect+handshake overhead — with the
+    /// parse-time caps that's up to ~2 hours. There is no per-call timeout or
+    /// AtomicBool cancel hook; use `on_failover_progress` for observability.
+    /// If you need bounded latency, set `failover_max_attempts` and
+    /// `failover_backoff_max_ms` to values appropriate for your SLA, or set
+    /// `failover=off` and handle reconnect at the application layer.
     pub fn next_batch(&mut self) -> Result<Option<BatchView<'_>>> {
         // Replay-on-terminal guard. If the cursor previously terminated
         // with an error, surface that error on every subsequent call
@@ -1465,6 +1683,229 @@ impl<'r> Cursor<'r> {
         }
     }
 
+    /// Wrap this cursor as an Arrow [`RecordBatchReader`]. Blocks until
+    /// the first `RESULT_BATCH` is decoded, then snapshots its schema.
+    /// Mid-stream schema drift poisons the adapter; re-wrap to resume.
+    /// Returns [`ErrorCode::NoSchema`] if the stream terminates before
+    /// any batch is produced.
+    ///
+    /// [`RecordBatchReader`]: arrow::array::RecordBatchReader
+    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
+    #[cfg(feature = "arrow-egress")]
+    pub fn as_arrow_reader<'c>(
+        &'c mut self,
+    ) -> Result<crate::egress::arrow::CursorRecordBatchReader<'r, 'c>> {
+        crate::egress::arrow::CursorRecordBatchReader::new(self)
+    }
+
+    /// Eagerly drain every batch and return them together with the
+    /// pinned Arrow schema. Symmetric with
+    /// [`Cursor::fetch_all_polars`](crate::egress::Cursor::fetch_all_polars).
+    /// Errors as [`ErrorCode::NoSchema`] if the stream ends without
+    /// producing a batch; surfaces drift as
+    /// [`ErrorCode::SchemaDrift`].
+    ///
+    /// [`ErrorCode::NoSchema`]: crate::egress::ErrorCode::NoSchema
+    /// [`ErrorCode::SchemaDrift`]: crate::egress::ErrorCode::SchemaDrift
+    #[cfg(feature = "arrow-egress")]
+    pub fn fetch_all_arrow(
+        &mut self,
+    ) -> Result<(arrow::datatypes::SchemaRef, Vec<arrow::array::RecordBatch>)> {
+        // Materialise-whole: nothing leaves the library until the full
+        // result is built, so a mid-query failover can re-read it
+        // transparently. Opt into replay and discard the partial
+        // accumulation when the cursor reports a reset.
+        self.enable_internal_replay();
+        let mut reader = self.as_arrow_reader()?;
+        let mut resets_seen = reader.failover_resets();
+        let mut batches: Vec<arrow::array::RecordBatch> = Vec::new();
+        loop {
+            // Manual drive (not `for`/`by_ref`) so the reset counter can be
+            // polled between batches without holding an iterator borrow.
+            let Some(item) = reader.next() else { break };
+            let rb = item.map_err(|e| {
+                crate::egress::arrow::try_downcast_questdb(&e)
+                    .cloned()
+                    .unwrap_or_else(|| fmt!(ArrowExport, "{}", e))
+            })?;
+            let resets_now = reader.failover_resets();
+            if resets_now != resets_seen {
+                resets_seen = resets_now;
+                batches.clear();
+            }
+            batches.push(rb);
+        }
+        Ok((reader.schema(), batches))
+    }
+
+    /// Drift-checked iterator over Polars [`DataFrame`](polars::frame::DataFrame)s,
+    /// one per QWP batch. Snapshots the first batch's Arrow schema
+    /// and yields `Err(SchemaDrift)` then terminates if a
+    /// later batch diverges. Returns `Err(NoSchema)` if the stream
+    /// ends before any batch is produced.
+    ///
+    /// Use this in preference to a `while let Some(df) = cursor.next_polars()?`
+    /// loop when you care about schema consistency mid-stream.
+    #[cfg(feature = "polars-egress")]
+    pub fn iter_polars<'c>(&'c mut self) -> Result<crate::egress::arrow::CursorPolarsIter<'r, 'c>> {
+        crate::egress::arrow::CursorPolarsIter::new(self)
+    }
+
+    /// Next batch as an Arrow [`RecordBatch`](arrow::array::RecordBatch).
+    /// `Ok(None)` on stream end; replays terminal errors like
+    /// [`Cursor::next_batch`]. No drift check — use
+    /// [`Cursor::as_arrow_reader`] for that.
+    #[cfg(feature = "arrow-egress")]
+    pub fn next_arrow_batch(&mut self) -> Result<Option<arrow::array::RecordBatch>> {
+        self.next_arrow_batch_inner(None, false)
+    }
+
+    #[cfg(feature = "arrow-egress")]
+    #[doc(hidden)]
+    pub fn next_arrow_batch_inner(
+        &mut self,
+        expected_schema: Option<&arrow::datatypes::SchemaRef>,
+        compact: bool,
+    ) -> Result<Option<arrow::array::RecordBatch>> {
+        use crate::egress::arrow::{batch_arrow_schema, batch_to_record_batch_with, schemas_equal};
+        use std::sync::Arc;
+
+        if self.done {
+            return match self.terminal_error.as_ref() {
+                Some(e) => Err(e.clone()),
+                None => Ok(None),
+            };
+        }
+        // Replay a batch that drifted on a previous call before reading a new
+        // frame; its transport side effects already ran, so skip
+        // `next_batch_inner`.
+        let decoded = if let Some(stashed) = self.drifted_batch.take() {
+            stashed
+        } else {
+            let outcome = match self.next_batch_inner() {
+                Ok(o) => o,
+                Err(e) => {
+                    if self.done && self.terminal_error.is_none() {
+                        self.terminal_error = Some(e.clone());
+                    }
+                    return Err(e);
+                }
+            };
+            match outcome {
+                NextOutcome::Done => return Ok(None),
+                // `next_batch_inner` populates `last_batch` before returning
+                // `HaveBatch`; re-check softly rather than `.expect()`, since a
+                // panic would abort the whole process across the FFI boundary
+                // (`panic=abort`) if a future refactor broke the invariant.
+                NextOutcome::HaveBatch => match self.last_batch.take() {
+                    Some(b) => b,
+                    None => {
+                        let e = fmt!(
+                            ProtocolError,
+                            "internal invariant: next_batch produced a batch without a decoded view"
+                        );
+                        self.stash_arrow_terminal_error(&e);
+                        return Err(e);
+                    }
+                },
+            }
+        };
+        let egress_schema = match self.reader.query_schema.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                let e = fmt!(
+                    ProtocolError,
+                    "internal invariant: next_batch produced a batch without a decoded schema"
+                );
+                self.stash_arrow_terminal_error(&e);
+                return Err(e);
+            }
+        };
+        let arrow_schema = match batch_arrow_schema(&egress_schema, &decoded) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                self.stash_arrow_terminal_error(&e);
+                return Err(e);
+            }
+        };
+        if let Some(expected) = expected_schema
+            && !schemas_equal(expected.as_ref(), arrow_schema.as_ref())
+        {
+            let e = fmt!(
+                SchemaDrift,
+                "mid-stream Arrow schema drift: expected schema differs from batch_seq={}",
+                decoded.batch_seq
+            );
+            // Keep the batch so its rows stay retrievable via
+            // `Cursor::next_arrow_batch` rather than dropped.
+            self.drifted_batch = Some(decoded);
+            return Err(e);
+        }
+        #[cfg(feature = "polars-egress")]
+        {
+            self.symbol_delta_modes.clear();
+            self.symbol_delta_modes
+                .extend(decoded.columns.iter().map(|c| {
+                    matches!(
+                        c,
+                        crate::egress::decoder::DecodedColumn::Symbol {
+                            local_dict: None,
+                            ..
+                        }
+                    )
+                }));
+        }
+        match batch_to_record_batch_with(
+            arrow_schema,
+            &egress_schema,
+            decoded,
+            &self.reader.dict,
+            &mut self.sym_values,
+            if compact {
+                Some(&mut self.sym_scratch)
+            } else {
+                None
+            },
+        ) {
+            Ok(rb) => Ok(Some(rb)),
+            Err(e) => {
+                self.stash_arrow_terminal_error(&e);
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(feature = "polars-egress")]
+    pub(crate) fn symbol_registry_synced(
+        &mut self,
+    ) -> Result<&crate::egress::arrow::polars::SymbolRegistry> {
+        let reg = self
+            .symbol_registry
+            .get_or_insert_with(crate::egress::arrow::polars::SymbolRegistry::new);
+        reg.sync(&self.reader.dict)?;
+        Ok(reg)
+    }
+
+    #[cfg(feature = "polars-egress")]
+    pub(crate) fn symbol_delta_modes(&self) -> &[bool] {
+        &self.symbol_delta_modes
+    }
+
+    // Replay-contract stash for fatal errors that bypass `next_batch_inner`
+    // (missing/invalid Arrow schema, `batch_to_record_batch`): marks the
+    // cursor terminal so the error replays on every later call instead of
+    // silently advancing. Schema drift is NOT terminal — it leaves the cursor
+    // live and parks the drifted batch in `drifted_batch` so the caller can
+    // re-snapshot and retrieve those rows on the next call (see
+    // `next_arrow_batch_inner`).
+    #[cfg(feature = "arrow-egress")]
+    fn stash_arrow_terminal_error(&mut self, err: &Error) {
+        self.done = true;
+        if self.terminal_error.is_none() {
+            self.terminal_error = Some(err.clone());
+        }
+    }
+
     fn next_batch_inner(&mut self) -> Result<NextOutcome> {
         loop {
             // Transport read: a failure here (socket closed, TLS
@@ -1472,58 +1913,22 @@ impl<'r> Cursor<'r> {
             let (header, payload) = match self.read_frame_raw() {
                 Ok(hp) => hp,
                 Err(e) => {
-                    if self.cancelling
-                        || !self.reader.cfg.failover
-                        || !is_failover_eligible(e.code())
-                    {
-                        // Match every other terminal path in this loop:
-                        // tear down the WS so the cursor's flags stay
-                        // coherent with the transport state, no half-cooked
-                        // cursors that defer cleanup to `Reader::Drop`.
-                        self.terminate_with_close();
-                        return Err(e);
-                    }
-                    // Silent-duplicate guard. If at least one batch was
-                    // already yielded to the caller and they didn't
-                    // install an `on_failover_reset` callback, replay
-                    // would deliver those rows again with no signal —
-                    // see `ErrorCode::FailoverWouldDuplicate`. The
-                    // exact-once contract is "rows surface to the
-                    // caller at most once unless they explicitly
-                    // opt in to seeing replays."
-                    //
-                    // The trigger error `e` is preserved in the message
-                    // so the caller still learns *why* the cursor died;
-                    // diagnostics shouldn't get worse just because we
-                    // re-classified the surface.
-                    if would_silently_duplicate(
-                        self.data_delivered,
-                        self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
-                    ) {
-                        let err = fmt!(
-                            FailoverWouldDuplicate,
-                            "mid-query failover would replay rows already delivered to the caller \
-                             (install on_failover_reset or on_failover_progress to opt in to replays); \
-                             cursor terminated. Trigger: {} ({:?})",
-                            e.msg(),
-                            e.code()
-                        );
-                        self.terminate_with_close();
-                        return Err(err);
-                    }
-                    warn_on_protocol_error_failover(&e, "mid-query frame read");
-                    self.failover_reconnect_and_replay(e)?;
+                    self.failover_after_stream_failure(e, StreamFailureKind::Read)?;
                     continue;
                 }
             };
             // Capture wire size BEFORE the decode consumes the header.
             let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
-            // Decode is **not** failover-eligible. Anything that comes
-            // out as an error here (bad varint, unknown discriminant,
-            // missing batch-0 schema, symbol-dict miss, zstd corruption) is
-            // a wire/state bug that won't be fixed by reconnecting —
-            // and silently retrying would mask it from the user. Bubble
-            // it up as a hard failure with the cursor terminated.
+            // Decode failures can be the symptom of a dying endpoint that
+            // managed to emit one complete-but-corrupt WS frame. Route
+            // failover-eligible errors through the same replay machinery as
+            // raw read failures; deterministic codes such as
+            // UnsupportedServer remain terminal via `is_failover_eligible`.
+            // Unlike a raw read failure, a decode failure gets only a small
+            // dedicated replay cap (`MAX_DECODE_FAILOVER_ROUNDS`) so a
+            // deterministically-corrupting server can't drive a
+            // reconnect/replay loop that drains the whole per-Execute budget
+            // — see `failover_after_stream_failure`.
             let t1 = std::time::Instant::now();
             let decode_result = decode_frame(
                 header,
@@ -1542,13 +1947,8 @@ impl<'r> Cursor<'r> {
             let event = match decode_result {
                 Ok(ev) => ev,
                 Err(e) => {
-                    // Tear the WS down: the server is still streaming
-                    // RESULT_BATCH frames for this `request_id`, and
-                    // leaving the transport open would let a subsequent
-                    // `Reader::prepare()` on this Reader read those stale
-                    // frames and trip the cursor's `request_id` check.
-                    self.terminate_with_close();
-                    return Err(e);
+                    self.failover_after_stream_failure(e, StreamFailureKind::Decode)?;
+                    continue;
                 }
             };
             match event {
@@ -1657,11 +2057,52 @@ impl<'r> Cursor<'r> {
                         self.terminate_with_close();
                         return Err(e);
                     }
+                    // Transparent recovery from the transient stale-cached-plan
+                    // fault. An async `ALTER COLUMN TYPE` bumps the table's
+                    // metadata version between this query's server-side
+                    // compilation and its execution, so the server rejects its
+                    // own cached plan with `INTERNAL_ERROR`. The recompile on
+                    // the very next execution succeeds — this is exactly how
+                    // QuestDB's PGWire / REST endpoints self-heal, and that
+                    // friction must never leak to the caller (it is not
+                    // something a user can act on, so surfacing it is pure
+                    // noise).
+                    //
+                    // Replaying is safe only before any row was handed to the
+                    // caller (`!data_delivered`): the fault is a compile-time
+                    // error that fires before `batch_seq == 0`, so in practice
+                    // the guard always holds — but it is load-bearing, because
+                    // replaying after delivery would re-stream rows the caller
+                    // already consumed. The connection is healthy (the
+                    // `QUERY_ERROR` is terminal only for *this* request_id), so
+                    // unlike failover we re-issue on the same connection with a
+                    // fresh request_id instead of reconnecting. `cancelling`
+                    // suppresses the retry so a concurrent `cancel()` wins.
+                    if !self.cancelling
+                        && !self.data_delivered
+                        && self.stale_plan_retries < MAX_STALE_PLAN_RETRIES
+                        && is_stale_plan_error(status, &message)
+                    {
+                        self.stale_plan_retries = self.stale_plan_retries.saturating_add(1);
+                        match self.replay_query_same_connection() {
+                            Ok(()) => continue,
+                            Err(e) => {
+                                self.reader.cursor_active = false;
+                                self.done = true;
+                                return Err(e);
+                            }
+                        }
+                    }
                     self.reader.cursor_active = false;
                     self.done = true;
                     return Err(map_server_status(status, message));
                 }
-                ServerEvent::CacheReset { .. } | ServerEvent::ServerInfo(_) => {
+                ServerEvent::CacheReset { .. } => {
+                    // `decode_frame` already cleared the connection dict.
+                    self.reset_symbol_caches();
+                    continue;
+                }
+                ServerEvent::ServerInfo(_) => {
                     // State already mutated by decode_frame; keep reading.
                     continue;
                 }
@@ -1674,6 +2115,37 @@ impl<'r> Cursor<'r> {
     /// query did or did not silently restart.
     pub fn failover_resets(&self) -> u32 {
         self.failover_resets
+    }
+
+    /// Number of times this cursor transparently re-issued its query on the
+    /// current connection after the server reported the transient
+    /// stale-cached-plan `INTERNAL_ERROR` (see [`Cursor::next_batch`]).
+    /// Stays `0` on the happy path; exposed for tests and diagnostics that
+    /// want to confirm the self-heal fired (and how often) without the
+    /// caller ever seeing the underlying error.
+    pub fn stale_plan_retries(&self) -> u32 {
+        self.stale_plan_retries
+    }
+
+    /// Opt this cursor into transparent mid-query replay from the
+    /// materialise-whole adapters (`fetch_all_polars`, `fetch_all_arrow`).
+    /// Those adapters hold the entire result internally and discard their
+    /// accumulator on a reset (tracked via [`Cursor::failover_resets`]), so
+    /// replay-from-`batch_seq 0` re-reads the whole result exactly once —
+    /// nothing has left the library. Installing a no-op reset callback is
+    /// what clears the silent-duplicate guard in `next_batch_inner` (see
+    /// [`would_silently_duplicate`]); the streaming entry points
+    /// (`iter_polars`, `next_polars`, `next_arrow_batch`) deliberately do
+    /// **not** call this, so a batch already yielded to the caller still
+    /// surfaces [`ErrorCode::FailoverWouldDuplicate`].
+    ///
+    /// Leaves a user-installed callback in place: if the caller already
+    /// opted into replays, that contract wins.
+    #[cfg(feature = "arrow-egress")]
+    pub(crate) fn enable_internal_replay(&mut self) {
+        if self.on_failover_reset.is_none() && self.on_failover_progress.is_none() {
+            self.on_failover_reset = Some(Box::new(|_: &FailoverEvent| {}));
+        }
     }
 
     /// The endpoint the cursor's underlying connection is currently
@@ -1708,10 +2180,9 @@ impl<'r> Cursor<'r> {
 
     /// Read one raw frame (header + payload) off the transport, with
     /// no decode. Errors here are transport-level (socket closed,
-    /// truncated WS frame, TLS reset, etc.) and are the only failures
-    /// that should drive failover. Decoding is deliberately NOT done
-    /// here — the caller decides whether decode failures bubble up as
-    /// hard errors or get routed through reconnect.
+    /// truncated WS frame, TLS reset, etc.). Decoding is deliberately
+    /// NOT done here — the caller decides whether decode failures are
+    /// failover-eligible too.
     fn read_frame_raw(
         &mut self,
     ) -> Result<(crate::egress::wire::header::FrameHeader, bytes::Bytes)> {
@@ -1729,6 +2200,114 @@ impl<'r> Cursor<'r> {
         Ok((header, payload))
     }
 
+    /// Shared failover gate for failures observed while consuming a query
+    /// stream. This covers raw transport reads and failover-eligible decode
+    /// errors so both surfaces obey the same cancellation, duplicate-delivery,
+    /// callback, budget, and endpoint-tracker rules.
+    fn failover_after_stream_failure(&mut self, e: Error, kind: StreamFailureKind) -> Result<()> {
+        if self.cancelling || !self.reader.cfg.failover || !is_failover_eligible(e.code()) {
+            // Match every other terminal path in this loop: tear down the
+            // WS so the cursor's flags stay coherent with the transport
+            // state, with no half-cooked cursors that defer cleanup to
+            // `Reader::Drop`.
+            self.terminate_with_close();
+            return Err(e);
+        }
+        // Silent-duplicate guard. If at least one batch was already yielded
+        // to the caller and they didn't install a replay-aware callback,
+        // replay would deliver those rows again with no signal — see
+        // `ErrorCode::FailoverWouldDuplicate`. The exact-once contract is
+        // "rows surface to the caller at most once unless they explicitly
+        // opt in to seeing replays."
+        //
+        // The trigger error `e` is preserved in the message so the caller
+        // still learns *why* the cursor died; diagnostics shouldn't get
+        // worse just because we re-classified the surface.
+        if would_silently_duplicate(
+            self.data_delivered,
+            self.on_failover_reset.is_some() || self.on_failover_progress.is_some(),
+        ) {
+            let err = fmt!(
+                FailoverWouldDuplicate,
+                "mid-query failover would replay rows already delivered to the caller \
+                 (install on_failover_reset or on_failover_progress to opt in to replays); \
+                 cursor terminated. Trigger: {} ({:?})",
+                e.msg(),
+                e.code()
+            );
+            self.terminate_with_close();
+            return Err(err);
+        }
+        // Decode-driven replays get a small dedicated cap. A decode
+        // failure can be transient wire corruption (one reconnect to a
+        // fresh connection cures it) or a deterministic protocol
+        // violation (every replay reproduces it byte-for-byte). The two
+        // are indistinguishable at the `ErrorCode` level, so we allow a
+        // bounded number of decode-triggered replays to recover the
+        // transient case, then surface the decode error terminally
+        // rather than draining the full per-Execute failover budget
+        // (and emitting one warning per round) against a server that
+        // will just re-corrupt the replayed query forever. Raw transport
+        // read failures are unaffected and keep the full budget.
+        if kind == StreamFailureKind::Decode {
+            if self.decode_failover_rounds >= MAX_DECODE_FAILOVER_ROUNDS {
+                self.terminate_with_close();
+                return Err(e);
+            }
+            self.decode_failover_rounds = self.decode_failover_rounds.saturating_add(1);
+        }
+        warn_on_protocol_error_failover(&e, kind.context());
+        self.failover_reconnect_and_replay(e)
+    }
+
+    /// Re-issue the stashed `QUERY_REQUEST` on the *current* connection with
+    /// a fresh `request_id`. Used to transparently recover from the
+    /// transient stale-cached-plan `INTERNAL_ERROR`: the connection is
+    /// healthy (the `QUERY_ERROR` was terminal only for the old
+    /// request_id), so unlike [`Cursor::failover_reconnect_and_replay`] this
+    /// does NOT reconnect. It patches the 8-byte request_id span in place,
+    /// clears the per-query schema (mirroring [`ReaderQuery::execute`] so a
+    /// stale schema can't bind the replayed rows), drops any half-built
+    /// batch view, and resends the same bytes verbatim — no builder/bind
+    /// clone, no re-encode. The server recompiles against the table's
+    /// current metadata and streams afresh from `batch_seq == 0`.
+    ///
+    /// The connection-scoped symbol dict is deliberately *not* reset: this
+    /// is a sequential query on the same connection (just like a second
+    /// `execute()`), so the dict — and the per-cursor caches keyed on it —
+    /// remain valid. `cursor_active` stays `true`; the cursor is still live.
+    fn replay_query_same_connection(&mut self) -> Result<()> {
+        let new_rid = self.reader.alloc_request_id();
+        self.request_id = new_rid;
+        self.encoded_request = patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
+        // Mirror execute(): the schema rides batch_seq==0 of the new query.
+        self.reader.query_schema = None;
+        self.last_batch = None;
+        // Any parked drift-replay batch belonged to the rejected attempt.
+        #[cfg(feature = "arrow-egress")]
+        {
+            self.drifted_batch = None;
+        }
+        self.reader
+            .transport_mut()
+            .and_then(|t| t.write_message(self.encoded_request.clone()))
+    }
+
+    /// Drop the per-cursor SYMBOL caches keyed on the connection dict.
+    /// Must be called whenever `self.dict` is replaced, otherwise a
+    /// re-grown dict can alias stale interned values/codes.
+    fn reset_symbol_caches(&mut self) {
+        #[cfg(feature = "arrow-egress")]
+        {
+            self.sym_values = crate::egress::arrow::SymbolValuesCache::default();
+            self.sym_scratch = crate::egress::arrow::SymbolBuildScratch::default();
+        }
+        #[cfg(feature = "polars-egress")]
+        {
+            self.symbol_registry = None;
+        }
+    }
+
     /// Mid-query failover: the underlying connection just died with
     /// `trigger`. Walk the address list (skipping the failed endpoint
     /// first), with exponential backoff, until a fresh connection is
@@ -1738,213 +2317,213 @@ impl<'r> Cursor<'r> {
     /// discard accumulated rows. On exhausted budget or hard error,
     /// the cursor is marked terminal and the failure is propagated.
     fn failover_reconnect_and_replay(&mut self, trigger: Error) -> Result<()> {
-        let started = std::time::Instant::now();
-        let failed_idx = self.reader.addr_idx;
-        // Snapshot the failing endpoint before reconnect mutates
-        // `addr_idx` — `FailoverEvent` reports it back to the user.
-        let failed_addr = self.reader.cfg.addrs[failed_idx].clone();
+        let mut trigger = trigger;
+        loop {
+            let started = std::time::Instant::now();
+            let failed_idx = self.reader.addr_idx;
+            // Snapshot the failing endpoint before reconnect mutates
+            // `addr_idx` — `FailoverEvent` reports it back to the user.
+            let failed_addr = self.reader.cfg.addrs[failed_idx].clone();
 
-        // Phase: Disconnected. Fires before the retry loop runs so an
-        // SLO dashboard sees the outage *now*, not retroactively when
-        // a reconnect lands or the budget exhausts.
-        if let Some(cb) = self.on_failover_progress.as_mut() {
-            let event = FailoverProgressEvent {
-                phase: FailoverPhase::Disconnected,
-                failed_addr: failed_addr.clone(),
-                new_addr: None,
-                new_server_info: None,
-                new_request_id: None,
-                attempt: 0,
-                trigger: trigger.clone(),
-                elapsed: started.elapsed(),
-                final_error: None,
+            // Phase: Disconnected. Fires before the retry loop runs so an
+            // SLO dashboard sees the outage *now*, not retroactively when
+            // a reconnect lands or the budget exhausts.
+            if let Some(cb) = self.on_failover_progress.as_mut() {
+                let event = FailoverProgressEvent {
+                    phase: FailoverPhase::Disconnected,
+                    failed_addr: failed_addr.clone(),
+                    new_addr: None,
+                    new_server_info: None,
+                    new_request_id: None,
+                    attempt: 0,
+                    trigger: trigger.clone(),
+                    elapsed: started.elapsed(),
+                    final_error: None,
+                };
+                cb(&event);
+            }
+
+            // Phase: Retrying. The closure fires once per outer-loop
+            // iteration of `reconnect_with_failover`. We split the borrow
+            // on `self` so the closure can mutate the progress callback
+            // while `reader.reconnect_with_failover` holds a `&mut Reader`.
+            // `last_attempt` is tracked outside the closure so the GaveUp
+            // event can report the final attempt count even when the
+            // reconnect loop breaks out via the wall-clock-deadline path
+            // (which doesn't surface the count in its `Err`).
+            let mut last_attempt: u32 = 0;
+            let reconnect_result = {
+                let Self {
+                    reader,
+                    on_failover_progress,
+                    failover_budget,
+                    ..
+                } = self;
+                let failed_addr_ref = &failed_addr;
+                let trigger_ref = &trigger;
+                reader.reconnect_with_failover(failed_idx, failover_budget, &mut |attempt: u32| {
+                    last_attempt = attempt;
+                    if let Some(cb) = on_failover_progress.as_mut() {
+                        let event = FailoverProgressEvent {
+                            phase: FailoverPhase::Retrying,
+                            failed_addr: failed_addr_ref.clone(),
+                            new_addr: None,
+                            new_server_info: None,
+                            new_request_id: None,
+                            attempt,
+                            trigger: trigger_ref.clone(),
+                            elapsed: started.elapsed(),
+                            final_error: None,
+                        };
+                        cb(&event);
+                    }
+                })
             };
-            cb(&event);
-        }
-
-        // Phase: Retrying. The closure fires once per outer-loop
-        // iteration of `reconnect_with_failover`. We split the borrow
-        // on `self` so the closure can mutate the progress callback
-        // while `reader.reconnect_with_failover` holds a `&mut Reader`.
-        // `last_attempt` is tracked outside the closure so the GaveUp
-        // event can report the final attempt count even when the
-        // reconnect loop breaks out via the wall-clock-deadline path
-        // (which doesn't surface the count in its `Err`).
-        let mut last_attempt: u32 = 0;
-        let reconnect_result = {
-            let Self {
-                reader,
-                on_failover_progress,
-                ..
-            } = self;
-            let failed_addr_ref = &failed_addr;
-            let trigger_ref = &trigger;
-            reader.reconnect_with_failover(failed_idx, &mut |attempt: u32| {
-                last_attempt = attempt;
-                if let Some(cb) = on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::Retrying,
-                        failed_addr: failed_addr_ref.clone(),
-                        new_addr: None,
-                        new_server_info: None,
-                        new_request_id: None,
-                        attempt,
-                        trigger: trigger_ref.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: None,
-                    };
-                    cb(&event);
+            let attempts = match reconnect_result {
+                Ok(n) => n,
+                Err(e) => {
+                    // Phase: GaveUp. Fire before mutating state / returning
+                    // so the callback sees the cursor in its
+                    // about-to-be-terminal form and can correlate against
+                    // the error the caller is about to receive via
+                    // `next_batch`.
+                    if let Some(cb) = self.on_failover_progress.as_mut() {
+                        let event = FailoverProgressEvent {
+                            phase: FailoverPhase::GaveUp,
+                            failed_addr: failed_addr.clone(),
+                            new_addr: None,
+                            new_server_info: None,
+                            new_request_id: None,
+                            attempt: last_attempt,
+                            trigger: trigger.clone(),
+                            elapsed: started.elapsed(),
+                            final_error: Some(e.clone()),
+                        };
+                        cb(&event);
+                    }
+                    self.reader.cursor_active = false;
+                    self.done = true;
+                    // Surface the most diagnostic error. The original
+                    // `trigger` is almost always a generic transport
+                    // failure (socket close, decode error). Anything
+                    // specific the reconnect saw — auth rejected, role
+                    // mismatched on every endpoint, config-level issue —
+                    // tells the user *what to fix* and should win over
+                    // the original cause-of-death.
+                    return Err(if prefer_over_trigger(e.code()) {
+                        e
+                    } else {
+                        trigger
+                    });
                 }
-            })
-        };
-        let attempts = match reconnect_result {
-            Ok(n) => n,
-            Err(e) => {
-                // Phase: GaveUp. Fire before mutating state / returning
-                // so the callback sees the cursor in its
-                // about-to-be-terminal form and can correlate against
-                // the error the caller is about to receive via
-                // `next_batch`.
-                if let Some(cb) = self.on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::GaveUp,
-                        failed_addr: failed_addr.clone(),
-                        new_addr: None,
-                        new_server_info: None,
-                        new_request_id: None,
-                        attempt: last_attempt,
-                        trigger: trigger.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: Some(e.clone()),
-                    };
-                    cb(&event);
-                }
-                self.reader.cursor_active = false;
-                self.done = true;
-                // Surface the most diagnostic error. The original
-                // `trigger` is almost always a generic transport
-                // failure (socket close, decode error). Anything
-                // specific the reconnect saw — auth rejected, role
-                // mismatched on every endpoint, config-level issue —
-                // tells the user *what to fix* and should win over
-                // the original cause-of-death.
-                return Err(if prefer_over_trigger(e.code()) {
-                    e
-                } else {
-                    trigger
-                });
+            };
+            // Reset connection-scoped state. The new connection has its
+            // own (empty) dict and per-query schema already (set up by
+            // `connect_endpoint`). Drop any in-flight batch buffer so we
+            // don't accidentally surface a stale view.
+            self.last_batch = None;
+            // The parked drift-replay batch belongs to the old stream.
+            #[cfg(feature = "arrow-egress")]
+            {
+                self.drifted_batch = None;
             }
-        };
-        // Reset connection-scoped state. The new connection has its
-        // own (empty) dict and per-query schema already (set up by
-        // `connect_endpoint`). Drop any in-flight batch buffer so we
-        // don't accidentally surface a stale view.
-        self.last_batch = None;
-        // Allocate a fresh request_id and re-issue the same
-        // QUERY_REQUEST bytes. The cursor stashed the encoded
-        // payload at `execute()` time; here we patch the 8-byte
-        // request_id span in place and write the buffer
-        // verbatim. No builder clone, no Bind clone, no
-        // re-encode — and crucially no memcpy of the body
-        // either: the previous `write_message` call has dropped
-        // its `Bytes` clone, so this clone is uniquely owned and
-        // `try_into_mut` recovers the underlying `BytesMut`
-        // zero-copy. With `failover_max_attempts` up to `1024`
-        // and queries that may carry multi-MB `Bind::Binary`
-        // payloads, this is the difference between a few bytes
-        // and gigabytes of churn per failure event.
-        let new_rid = self.reader.alloc_request_id();
-        self.request_id = new_rid;
-        self.encoded_request = patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
-        match self
-            .reader
-            .transport_mut()
-            .and_then(|t| t.write_message(self.encoded_request.clone()))
-        {
-            Ok(()) => {
-                self.failover_resets = self.failover_resets.saturating_add(1);
-                let new_addr = self.reader.cfg.addrs[self.reader.addr_idx].clone();
-                let new_server_info = self.reader.server_info.clone();
-                // Phase: Reset. Fire BEFORE the legacy on_failover_reset
-                // so a single sink that subscribes to both sees a
-                // consistent ordering. The two callbacks carry the same
-                // logical event; on_failover_progress is the modern
-                // surface and on_failover_reset is preserved for
-                // backward compat.
-                if let Some(cb) = self.on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::Reset,
-                        failed_addr: failed_addr.clone(),
-                        new_addr: Some(new_addr.clone()),
-                        new_server_info: new_server_info.clone(),
-                        new_request_id: Some(new_rid),
-                        attempt: attempts,
-                        trigger: trigger.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: None,
-                    };
-                    cb(&event);
+            // The new connection installed a fresh empty dict; the SYMBOL
+            // caches keyed on the old one would otherwise alias stale values.
+            self.reset_symbol_caches();
+            // Allocate a fresh request_id and re-issue the same
+            // QUERY_REQUEST bytes. The cursor stashed the encoded
+            // payload at `execute()` time; here we patch the 8-byte
+            // request_id span in place and write the buffer
+            // verbatim. No builder clone, no Bind clone, no
+            // re-encode — and crucially no memcpy of the body
+            // either: the previous `write_message` call has dropped
+            // its `Bytes` clone, so this clone is uniquely owned and
+            // `try_into_mut` recovers the underlying `BytesMut`
+            // zero-copy. With `failover_max_attempts` up to `1024`
+            // and queries that may carry multi-MB `Bind::Binary`
+            // payloads, this is the difference between a few bytes
+            // and gigabytes of churn per failure event.
+            let new_rid = self.reader.alloc_request_id();
+            self.request_id = new_rid;
+            self.encoded_request =
+                patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
+            match self
+                .reader
+                .transport_mut()
+                .and_then(|t| t.write_message(self.encoded_request.clone()))
+            {
+                Ok(()) => {
+                    self.failover_resets = self.failover_resets.saturating_add(1);
+                    let new_addr = self.reader.cfg.addrs[self.reader.addr_idx].clone();
+                    let new_server_info = self.reader.server_info.clone();
+                    // Phase: Reset. Fire BEFORE the legacy on_failover_reset
+                    // so a single sink that subscribes to both sees a
+                    // consistent ordering. The two callbacks carry the same
+                    // logical event; on_failover_progress is the modern
+                    // surface and on_failover_reset is preserved for
+                    // backward compat.
+                    if let Some(cb) = self.on_failover_progress.as_mut() {
+                        let event = FailoverProgressEvent {
+                            phase: FailoverPhase::Reset,
+                            failed_addr: failed_addr.clone(),
+                            new_addr: Some(new_addr.clone()),
+                            new_server_info: new_server_info.clone(),
+                            new_request_id: Some(new_rid),
+                            attempt: attempts,
+                            trigger: trigger.clone(),
+                            elapsed: started.elapsed(),
+                            final_error: None,
+                        };
+                        cb(&event);
+                    }
+                    if let Some(cb) = self.on_failover_reset.as_mut() {
+                        let event = FailoverEvent {
+                            failed_addr,
+                            new_addr,
+                            new_server_info,
+                            new_request_id: new_rid,
+                            attempts,
+                            trigger,
+                            elapsed: started.elapsed(),
+                        };
+                        cb(&event);
+                    }
+                    return Ok(());
                 }
-                if let Some(cb) = self.on_failover_reset.as_mut() {
-                    let event = FailoverEvent {
-                        failed_addr,
-                        new_addr,
-                        new_server_info,
-                        new_request_id: new_rid,
-                        attempts,
-                        trigger,
-                        elapsed: started.elapsed(),
-                    };
-                    cb(&event);
+                Err(e) => {
+                    // The freshly reconnected socket died while sending the
+                    // replayed QUERY_REQUEST. That failed replay is the next
+                    // Execute attempt in Java's model, so it has already spent
+                    // the reconnect round that got us here. If the same
+                    // cursor-owned budget still has room, feed the write error
+                    // back through the same reconnect loop; do not invent a
+                    // separate write-retry schedule.
+                    warn_on_protocol_error_failover(&e, "replay query write");
+                    if !self.reader.cfg.failover || !is_failover_eligible(e.code()) {
+                        if let Some(cb) = self.on_failover_progress.as_mut() {
+                            let event = FailoverProgressEvent {
+                                phase: FailoverPhase::GaveUp,
+                                failed_addr: failed_addr.clone(),
+                                new_addr: None,
+                                new_server_info: None,
+                                new_request_id: None,
+                                attempt: attempts,
+                                trigger: trigger.clone(),
+                                elapsed: started.elapsed(),
+                                final_error: Some(e.clone()),
+                            };
+                            cb(&event);
+                        }
+                        if let Some(dead) = self.reader.transport.take() {
+                            drop(dead);
+                        }
+                        self.reader.cursor_active = false;
+                        self.done = true;
+                        return Err(e);
+                    }
+                    trigger = e;
+                    continue;
                 }
-                Ok(())
-            }
-            Err(e) => {
-                // Write (or build/encode) failed on the freshly-
-                // connected socket — typically a TCP RST landing
-                // between `accept` and our first write. Tear down the
-                // new transport: no QUERY_REQUEST was sent, so the
-                // server is sitting idle waiting for one. Letting it
-                // linger until `Reader` drops would hold the FD and
-                // leave the server's per-connection resources
-                // allocated longer than necessary. Once
-                // `cursor_active=false`, `Drop for Cursor` skips its
-                // `close_in_place`, so this is the last chance to
-                // close the WS cleanly. Take the transport out so the
-                // FD is released here rather than at the eventual
-                // Reader drop. The original `trigger` already burned
-                // one `failover_max_duration_ms` budget through
-                // `reconnect_with_failover`; surfacing the write
-                // failure (rather than spinning another inner cycle)
-                // keeps that budget honest as a per-Execute bound and
-                // mirrors the Java reference client.
-                //
-                // Phase: GaveUp. From the observer's perspective this
-                // is also a terminal exhaustion — the reconnect itself
-                // succeeded but the replay write failed, and we will
-                // not loop again. Fire the same terminal phase so a
-                // dashboard that watches GaveUp gets a single
-                // consistent event for "cursor is dead, won't recover."
-                if let Some(cb) = self.on_failover_progress.as_mut() {
-                    let event = FailoverProgressEvent {
-                        phase: FailoverPhase::GaveUp,
-                        failed_addr: failed_addr.clone(),
-                        new_addr: None,
-                        new_server_info: None,
-                        new_request_id: None,
-                        attempt: attempts,
-                        trigger: trigger.clone(),
-                        elapsed: started.elapsed(),
-                        final_error: Some(e.clone()),
-                    };
-                    cb(&event);
-                }
-                if let Some(dead) = self.reader.transport.take() {
-                    drop(dead);
-                }
-                self.reader.cursor_active = false;
-                self.done = true;
-                Err(e)
             }
         }
     }
@@ -2236,11 +2815,12 @@ impl Drop for Cursor<'_> {
         // paths clear `cursor_active` whenever they leave the
         // transport `None`), `Drop` should never panic.
         if self.reader.cursor_active {
-            if let Some(t) = self.reader.transport.as_mut() {
+            if let Some(mut t) = self.reader.transport.take() {
                 if !self.cancelling {
                     t.try_write_cancel(self.request_id);
                 }
                 t.close_in_place();
+                drop(t);
             }
             self.reader.cursor_active = false;
         }
@@ -2325,6 +2905,7 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
     matches!(
         code,
         ErrorCode::SocketError
+            | ErrorCode::ConnectTimeout
             | ErrorCode::HandshakeError
             | ErrorCode::TlsError
             | ErrorCode::ProtocolError
@@ -2346,12 +2927,19 @@ fn is_failover_eligible(code: ErrorCode) -> bool {
 /// `on_failover_reset` callback is installed. With a callback set,
 /// replay proceeds even for deterministic violations.
 ///
-/// Emit a stderr warning whenever a `ProtocolError` actually triggers
-/// failover so operators can spot masked corruption in logs.
+/// Emit a warning whenever a `ProtocolError` actually triggers failover
+/// so operators can spot masked corruption. Routed through the `log`
+/// facade (level `warn`) rather than unconditional `eprintln!`: with no
+/// logger installed this is a no-op, so a deterministically-corrupting
+/// server can't spam the process's stderr, while operators who want the
+/// signal install a logger and filter by target/level. The
+/// decode-replay cap (`MAX_DECODE_FAILOVER_ROUNDS`) independently bounds
+/// how many times this can fire per Execute for decode-triggered
+/// failover.
 fn warn_on_protocol_error_failover(err: &Error, context: &str) {
     if err.code() == ErrorCode::ProtocolError {
-        eprintln!(
-            "questdb-rs: warning: ProtocolError triggered failover ({}): {} — \
+        log::warn!(
+            "ProtocolError triggered failover ({}): {} — \
              reconnecting may mask transient wire-frame corruption \
              (truncated frames, malformed varints) or a deterministic \
              protocol violation; check server logs if this recurs.",
@@ -2391,7 +2979,7 @@ fn prefer_over_trigger(code: ErrorCode) -> bool {
 /// `Reader`; each instance gets a distinct seed at construction time.
 /// Splitmix64 is the simplest non-trivial 64-bit generator with good
 /// statistical properties for this use case (uniform draws over small
-/// integer ranges); avoids pulling `rand` into the `sync-reader-ws`
+/// integer ranges); avoids pulling `rand` into the `sync-reader-qwp-ws`
 /// feature.
 ///
 /// The state is mutated on every draw. Splitmix64 is full-period
@@ -2637,6 +3225,34 @@ fn read_server_info_frame(transport: &mut WsTransport, timeout: Duration) -> Res
     }
 }
 
+/// Substrings QuestDB uses for the transient "the cached query plan no
+/// longer matches the table's current metadata version" condition. The
+/// server raises it (as `INTERNAL_ERROR`, `0x06`) when an async
+/// `ALTER TABLE ... ALTER COLUMN TYPE` bumps a table's metadata version
+/// between a SELECT's compilation and its execution. The wire has no
+/// dedicated "retryable" status — every transient server fault is folded
+/// into `INTERNAL_ERROR` — so the condition is identified by message text,
+/// matched case-insensitively. Kept lowercase so the match is a plain
+/// `contains` against the lowercased server message.
+const STALE_PLAN_PATTERNS: [&str; 2] = [
+    "cached query plan cannot be used",
+    "table schema has changed",
+];
+
+/// True when a server `QUERY_ERROR` is the transient stale-cached-plan
+/// fault that [`Cursor::next_batch`] recovers from by transparently
+/// re-issuing the query. Gated on `INTERNAL_ERROR` so a genuinely
+/// different error that merely echoes the text in its message can't be
+/// silently swallowed.
+fn is_stale_plan_error(status: crate::egress::wire::msg_kind::StatusCode, message: &str) -> bool {
+    use crate::egress::wire::msg_kind::StatusCode as S;
+    if status != S::InternalError {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    STALE_PLAN_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 fn map_server_status(
     status: crate::egress::wire::msg_kind::StatusCode,
     message: String,
@@ -2677,7 +3293,7 @@ mod tests {
         assert_eq!(alias.read_ns.load(Ordering::Relaxed), 1_000);
         assert_eq!(alias.decode_ns.load(Ordering::Relaxed), 500);
         // Reset via the inner Reader's API is visible through the
-        // FFI's clone too (the contract of `line_reader_reset_timing`).
+        // FFI's clone too (the contract of `reader_reset_timing`).
         alias.read_ns.store(0, Ordering::Relaxed);
         alias.decode_ns.store(0, Ordering::Relaxed);
         assert_eq!(stats.read_ns.load(Ordering::Relaxed), 0);
@@ -2771,6 +3387,7 @@ mod tests {
         // between endpoints, plus RoleMismatch (soft skip).
         for code in [
             SocketError,
+            ConnectTimeout,
             HandshakeError,
             TlsError,
             ProtocolError,

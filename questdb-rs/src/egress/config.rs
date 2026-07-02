@@ -38,14 +38,14 @@
 //! | `addr`             | required; `host:port` or `host`                          |
 //! | `path`             | endpoint path (`/read/v1`)                               |
 //! | `max_version`      | QWP version to advertise (`1`)                           |
-//! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
+//! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `sync-reader-zstd` feature (`raw`) |
 //! | `compression_level`| `zstd` level advertised in `X-QWP-Accept-Encoding` as `zstd;level=N`; `[1,22]`, default `1` (server clamps to `[1,9]`); ignored when `compression=raw` |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
 //! | `client_id`        | optional; sent only when set                             |
 //! | `target`           | `any`/`primary`/`replica` (default `any`)                |
 //! | `failover`         | `true`/`false` — mid-query reconnect on transport failure (`true`) |
-//! | `failover_max_attempts`        | retry attempts after a transport failure (`8`, must be `>= 1`); ignored when `failover=off` |
-//! | `failover_backoff_initial_ms`  | initial backoff between attempts (`50`); ignored when `failover=off` |
+//! | `failover_max_attempts`        | total Execute attempts, including the initial attempt (`8`, must be `>= 1`); ignored when `failover=off` |
+//! | `failover_backoff_initial_ms`  | first post-failure sleep (`50`; `0` disables sleeps); ignored when `failover=off` |
 //! | `failover_backoff_max_ms`      | max backoff between attempts (`1000`); ignored when `failover=off` |
 //! | `username`         | basic auth                                               |
 //! | `password`         | basic auth                                               |
@@ -100,7 +100,7 @@ const DEFAULT_TLS_PORT: &str = "9000";
 /// frames are tagged with `FLAG_ZSTD` (or not) accordingly.
 ///
 /// All three variants are usable end-to-end when the client is built
-/// with the `compression-zstd` feature (which `almost-all-features`
+/// with the `sync-reader-zstd` feature (which `almost-all-features`
 /// turns on by default). Without that feature, `Zstd` / `Auto` still
 /// compile but the decoder rejects any `FLAG_ZSTD` batch the server
 /// sends back with [`ErrorCode::UnsupportedServer`] — surface the
@@ -113,15 +113,15 @@ const DEFAULT_TLS_PORT: &str = "9000";
 pub enum Compression {
     /// Advertise `raw` only — every `RESULT_BATCH` body is
     /// uncompressed wire bytes. Works on every client build (no
-    /// `compression-zstd` dependency).
+    /// `sync-reader-zstd` dependency).
     Raw,
     /// Advertise `zstd` only — the server must send compressed
     /// batches and the client must be built with the
-    /// `compression-zstd` feature to decode them.
+    /// `sync-reader-zstd` feature to decode them.
     Zstd,
     /// Advertise both `zstd,raw` — the server picks. The decoder
     /// handles either path. If the client was built without the
-    /// `compression-zstd` feature and the server still selects
+    /// `sync-reader-zstd` feature and the server still selects
     /// `zstd`, the decoder rejects the first `FLAG_ZSTD` batch with
     /// `UnsupportedServer`; the operator's recovery is to enable the
     /// feature or pin `Compression::Raw`.
@@ -330,6 +330,12 @@ pub const DEFAULT_FAILOVER_MAX_DURATION_MS: u64 = 30_000;
 /// circuit breaking, not transport retry.
 pub const MAX_FAILOVER_MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 
+/// Hard upper bound on `connect_timeout` (the per-endpoint TCP dial
+/// budget), in milliseconds. Same 1-hour cap as the other timeouts;
+/// beyond it the user wants application-level circuit breaking, not a
+/// single dial that pins a thread for an hour.
+pub const MAX_CONNECT_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
 /// Default `zstd` compression level advertised in `X-QWP-Accept-Encoding`
 /// as `zstd;level=N`.
 ///
@@ -436,24 +442,23 @@ pub struct ReaderConfig {
     /// the parser (so configs aren't rejected on a partial enable/disable
     /// flip) but have no effect — transport failures surface immediately.
     pub failover: bool,
-    /// Cap on the number of mid-stream reconnect rounds after a
-    /// transport failure (default `8`). The initial connect is counted
-    /// separately; the total connect rounds before a failure is
-    /// propagated is `1` initial connect plus `failover_max_attempts`
-    /// reconnect rounds. Must be `>= 1`. Ignored when
+    /// Cap on total `Execute()` attempts for one query (default `8`):
+    /// the initial attempt plus at most `failover_max_attempts - 1`
+    /// reconnect/replay rounds. Must be `>= 1`. Ignored when
     /// [`failover`](Self::failover) is `false`.
     pub failover_max_attempts: u32,
-    /// Initial backoff between failover attempts, in milliseconds.
+    /// First post-failure sleep, in milliseconds. `0` disables
+    /// failover sleeps entirely.
     /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_backoff_initial_ms: u64,
     /// Maximum (capped) backoff between failover attempts, in milliseconds.
     /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_backoff_max_ms: u64,
-    /// Wall-clock budget per `Execute()` once failover has been triggered,
-    /// in milliseconds. `0` means unbounded. Bounds failover eligibility,
-    /// not total Execute wall-clock — a single `WalkTracker` round can run
-    /// up to `host_count × auth_timeout_ms` after the deadline check
-    /// passes. Failover.md §11.9.1 / §7.
+    /// Wall-clock budget per `Execute()`, in milliseconds. `0` means
+    /// unbounded. Bounds failover eligibility, not total Execute
+    /// wall-clock — a single `WalkTracker` round can run up to
+    /// `host_count × auth_timeout_ms` after the deadline check passes.
+    /// Failover.md §11.9.1 / §7.
     ///
     /// Ignored when [`failover`](Self::failover) is `false`.
     pub failover_max_duration_ms: u64,
@@ -473,6 +478,17 @@ pub struct ReaderConfig {
     /// programmatic-only (not a connect-string key) so it tracks the
     /// Java reference's `withServerInfoTimeout` surface.
     pub server_info_timeout_ms: u64,
+    /// Per-endpoint TCP connect (dial) budget, in milliseconds. `0`
+    /// (the default) means "no client-imposed connect timeout": the dial
+    /// uses the OS default, which can hang for tens of seconds against a
+    /// black-holed host that silently drops SYNs. When `> 0`, each dial is
+    /// a `TcpStream::connect_timeout` bounded by this value (per resolved
+    /// address); exceeding it surfaces [`ErrorCode::ConnectTimeout`] and,
+    /// under failover, advances to the next endpoint. Connect-string key:
+    /// `connect_timeout`. Does NOT bound name resolution, the TLS
+    /// handshake, the WS upgrade (see `auth_timeout_ms`), or the
+    /// `SERVER_INFO` read (see `server_info_timeout_ms`).
+    pub connect_timeout_ms: u64,
     /// Client's zone identifier — opaque case-insensitive string (e.g.
     /// `eu-west-1a`, `dc-amsterdam`). When set, the host-health tracker
     /// prefers endpoints whose server-advertised `zone_id` matches
@@ -558,6 +574,15 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "drain_orphans",
     "max_background_drainers",
     "error_inbox_capacity",
+    // Connection-pool knobs owned by `questdb_db` (the column-sender
+    // pool). The reader doesn't pool itself — `questdb_db` pools
+    // readers on the reader's behalf — but a Client that holds both
+    // a sender and a reader pool is configured by one conf-string,
+    // so the reader's parser accepts and ignores these.
+    "pool_size",
+    "pool_max",
+    "pool_idle_timeout_ms",
+    "pool_reap",
 ];
 
 impl ReaderConfig {
@@ -586,12 +611,13 @@ impl ReaderConfig {
             .map_err(|e| fmt!(ConfigError, "Config parse error: {}", e))?;
         let scheme = conf.service();
         let tls = match scheme {
-            "ws" => false,
-            "wss" => true,
+            "ws" | "qwpws" => false,
+            "wss" | "qwpwss" => true,
             other => {
                 return Err(fmt!(
                     ConfigError,
-                    "Unknown scheme \"{}\" — expected \"ws\" or \"wss\"",
+                    "Unknown scheme \"{}\" — expected \"ws\", \"wss\", \
+                     \"qwpws\", or \"qwpwss\"",
                     other
                 ));
             }
@@ -739,6 +765,7 @@ impl ReaderConfig {
         let mut failover_max_duration_ms: u64 = DEFAULT_FAILOVER_MAX_DURATION_MS;
         let mut auth_timeout_ms: u64 = DEFAULT_AUTH_TIMEOUT_MS;
         let server_info_timeout_ms: u64 = DEFAULT_SERVER_INFO_TIMEOUT_MS;
+        let mut connect_timeout_ms: u64 = 0;
         let mut zone: Option<String> = None;
         let mut tls_verify = TlsVerify::On;
         let mut tls_ca = default_tls_ca();
@@ -880,6 +907,9 @@ impl ReaderConfig {
                 "auth_timeout_ms" => {
                     auth_timeout_ms = parse_value("auth_timeout_ms", val)?;
                 }
+                "connect_timeout" => {
+                    connect_timeout_ms = parse_value("connect_timeout", val)?;
+                }
                 "zone" => {
                     // Empty / whitespace-only is treated as unset
                     // (zone-blind). Reject CR/LF — these are headers /
@@ -926,8 +956,8 @@ impl ReaderConfig {
             }
         }
 
-        // zstd / auto require the compression-zstd feature.
-        #[cfg(not(feature = "compression-zstd"))]
+        // zstd / auto require the sync-reader-zstd feature.
+        #[cfg(not(feature = "sync-reader-zstd"))]
         {
             if !matches!(compression, Compression::Raw) {
                 let user_token = match compression {
@@ -937,7 +967,7 @@ impl ReaderConfig {
                 };
                 return Err(fmt!(
                     ConfigError,
-                    "\"compression={}\" requires the `compression-zstd` crate feature; \
+                    "\"compression={}\" requires the `sync-reader-zstd` crate feature; \
                      either enable it or use \"raw\"",
                     user_token
                 ));
@@ -1009,6 +1039,7 @@ impl ReaderConfig {
             failover_max_duration_ms,
             auth_timeout_ms,
             server_info_timeout_ms,
+            connect_timeout_ms,
             zone,
             auth,
             tls_verify,
@@ -1072,12 +1103,6 @@ impl ReaderConfig {
                 MAX_FAILOVER_MAX_ATTEMPTS
             ));
         }
-        if self.failover_backoff_initial_ms == 0 {
-            return Err(fmt!(
-                ConfigError,
-                "\"failover_backoff_initial_ms\" must be > 0"
-            ));
-        }
         if self.failover_backoff_max_ms < self.failover_backoff_initial_ms {
             return Err(fmt!(
                 ConfigError,
@@ -1132,6 +1157,17 @@ impl ReaderConfig {
                 MAX_SERVER_INFO_TIMEOUT_MS
             ));
         }
+        // `connect_timeout = 0` is the documented "OS default" sentinel —
+        // don't reject it. Cap the upper bound so a typo can't pin a dialing
+        // thread for an hour.
+        if self.connect_timeout_ms > MAX_CONNECT_TIMEOUT_MS {
+            return Err(fmt!(
+                ConfigError,
+                "\"connect_timeout\" {} exceeds the hard cap of {} (1 hour)",
+                self.connect_timeout_ms,
+                MAX_CONNECT_TIMEOUT_MS
+            ));
+        }
         // String fields & auth aren't covered by the numeric/range
         // checks above. Without these re-checks, a caller who built
         // `cfg` via `from_conf` (clean) and then mutated `client_id`,
@@ -1160,6 +1196,10 @@ impl ReaderConfig {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn failover_reconnect_rounds(&self) -> u32 {
+        self.failover_max_attempts.saturating_sub(1)
     }
 
     /// Read-only view of the parsed endpoint list. The list is populated
@@ -1330,6 +1370,20 @@ mod tests {
     }
 
     #[test]
+    fn qwpws_scheme_alias_is_plain_ws() {
+        let c = ReaderConfig::from_conf("qwpws::addr=localhost:9000").unwrap();
+        assert!(!c.tls);
+        assert_eq!(c.url(), "ws://localhost:9000/read/v1");
+    }
+
+    #[test]
+    fn qwpwss_scheme_alias_is_tls_wss() {
+        let c = ReaderConfig::from_conf("qwpwss::addr=h:8443").unwrap();
+        assert!(c.tls);
+        assert_eq!(c.url(), "wss://h:8443/read/v1");
+    }
+
+    #[test]
     fn unknown_scheme_rejected() {
         let err = ReaderConfig::from_conf("http::addr=h:1").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -1369,7 +1423,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
-    #[cfg(not(feature = "compression-zstd"))]
+    #[cfg(not(feature = "sync-reader-zstd"))]
     #[test]
     fn compression_zstd_rejected_without_feature() {
         let err = ReaderConfig::from_conf("ws::addr=h:1;compression=zstd").unwrap_err();
@@ -1378,7 +1432,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn compression_zstd_accepted_with_feature() {
         let c = ReaderConfig::from_conf("ws::addr=h:1;compression=zstd").unwrap();
@@ -1400,7 +1454,7 @@ mod tests {
         assert_eq!(c.compression_level, 1);
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn compression_level_parses_and_is_emitted() {
         let c =
@@ -1414,7 +1468,7 @@ mod tests {
         assert_eq!(accept.1, "zstd;level=9");
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn compression_level_emitted_for_auto() {
         let c =
@@ -1740,10 +1794,10 @@ mod tests {
     }
 
     #[test]
-    fn failover_backoff_initial_zero_rejected() {
-        let err =
-            ReaderConfig::from_conf("ws::addr=h:1;failover_backoff_initial_ms=0").unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ConfigError);
+    fn failover_backoff_initial_zero_disables_sleep() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_backoff_initial_ms=0").unwrap();
+        assert_eq!(c.failover_backoff_initial_ms, 0);
+        assert_eq!(c.failover_backoff_max_ms, DEFAULT_FAILOVER_BACKOFF_MAX_MS);
     }
 
     #[test]
@@ -1885,6 +1939,47 @@ mod tests {
         let conf = format!("ws::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS);
         let c = ReaderConfig::from_conf(&conf).unwrap();
         assert_eq!(c.auth_timeout_ms, MAX_AUTH_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn connect_timeout_defaults_to_os_default() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
+        assert_eq!(
+            c.connect_timeout_ms, 0,
+            "default is the OS-default dial (0)"
+        );
+    }
+
+    #[test]
+    fn connect_timeout_parses_from_connect_string() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1;connect_timeout=250").unwrap();
+        assert_eq!(c.connect_timeout_ms, 250);
+    }
+
+    #[test]
+    fn connect_timeout_zero_is_os_default() {
+        // `0` is the documented sentinel for "no client connect timeout";
+        // must not be rejected.
+        let c = ReaderConfig::from_conf("ws::addr=h:1;connect_timeout=0").unwrap();
+        assert_eq!(c.connect_timeout_ms, 0);
+    }
+
+    #[test]
+    fn connect_timeout_at_cap_accepted() {
+        let conf = format!("ws::addr=h:1;connect_timeout={}", MAX_CONNECT_TIMEOUT_MS);
+        let c = ReaderConfig::from_conf(&conf).unwrap();
+        assert_eq!(c.connect_timeout_ms, MAX_CONNECT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn connect_timeout_above_cap_rejected() {
+        let conf = format!(
+            "ws::addr=h:1;connect_timeout={}",
+            MAX_CONNECT_TIMEOUT_MS + 1
+        );
+        let err = ReaderConfig::from_conf(&conf).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("connect_timeout"), "msg: {}", err.msg());
     }
 
     #[test]
@@ -2196,6 +2291,15 @@ mod tests {
     }
 
     #[test]
+    fn failover_max_attempts_counts_initial_execute_attempt() {
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_max_attempts=1").unwrap();
+        assert_eq!(c.failover_reconnect_rounds(), 0);
+
+        let c = ReaderConfig::from_conf("ws::addr=h:1;failover_max_attempts=8").unwrap();
+        assert_eq!(c.failover_reconnect_rounds(), 7);
+    }
+
+    #[test]
     fn endpoint_display_common_cases() {
         // Hostnames and IPv4 literals format unbracketed — `host:port`
         // is the path users will actually see in connect strings,
@@ -2344,11 +2448,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_post_parse_backoff_zero_initial() {
+    fn validate_accepts_post_parse_backoff_zero_initial() {
         let mut c = ReaderConfig::from_conf("ws::addr=h:9000").unwrap();
         c.failover_backoff_initial_ms = 0;
-        let err = c.validate().unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ConfigError);
+        c.validate().unwrap();
     }
 
     #[test]

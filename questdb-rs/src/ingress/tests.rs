@@ -234,6 +234,7 @@ fn qwpws_config_accepts_java_in_flight_window_alias() {
 /// branch — this list pins the behavior with a regression test so a
 /// future tightening of the catch-all can't break cross-role
 /// portability of a shared connect string.
+#[cfg(feature = "sync-sender-http")]
 const EGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     // Egress-only protocol / decoder knobs
     "path",
@@ -1357,6 +1358,33 @@ fn qwpws_defaults_leave_initial_connect_retry_off() {
         &qwp_ws.initial_connect_retry,
         conf::QwpWsInitialConnectMode::Off,
     );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_connect_timeout_defaults_to_unset() {
+    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    // Default: OS-default dial (no client-imposed connect timeout).
+    assert_defaulted_eq(&qwp_ws.connect_timeout, None);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_connect_timeout_parses() {
+    let builder =
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;connect_timeout=250;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.connect_timeout, Some(Duration::from_millis(250)));
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_connect_timeout_zero_rejected() {
+    let err =
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;connect_timeout=0;").unwrap_err();
+    assert_eq!(err.code(), crate::ErrorCode::ConfigError);
+    assert!(err.msg().contains("connect_timeout"), "msg: {}", err.msg());
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]

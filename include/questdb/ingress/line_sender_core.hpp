@@ -41,6 +41,111 @@
 #    include <span>
 #endif
 
+namespace questdb
+{
+
+/**
+ * Category of error. Single, unified enum for the whole client: it spans both
+ * ingest and query. Pinned to the C ABI enum `::line_sender_error_code`
+ * (include/questdb/ingress/line_sender.h), which the Rust test
+ * `c_header_line_sender_enum_matches_rust` cross-checks against the library.
+ * `questdb::ingress::line_sender_error_code` and `questdb::egress::error_code`
+ * are aliases of this type.
+ */
+enum class error_code : int
+{
+    could_not_resolve_addr = ::line_sender_error_could_not_resolve_addr,
+    invalid_api_call = ::line_sender_error_invalid_api_call,
+    socket_error = ::line_sender_error_socket_error,
+    invalid_utf8 = ::line_sender_error_invalid_utf8,
+    invalid_name = ::line_sender_error_invalid_name,
+    invalid_timestamp = ::line_sender_error_invalid_timestamp,
+    auth_error = ::line_sender_error_auth_error,
+    tls_error = ::line_sender_error_tls_error,
+    http_not_supported = ::line_sender_error_http_not_supported,
+    server_flush_error = ::line_sender_error_server_flush_error,
+    config_error = ::line_sender_error_config_error,
+    array_error = ::line_sender_error_array_error,
+    protocol_version_error = ::line_sender_error_protocol_version_error,
+    invalid_decimal = ::line_sender_error_invalid_decimal,
+    server_rejection = ::line_sender_error_server_rejection,
+    arrow_unsupported_column_kind = ::line_sender_error_arrow_unsupported_column_kind,
+    arrow_ingest = ::line_sender_error_arrow_ingest,
+    failover_retry = ::line_sender_error_failover_retry,
+    role_mismatch = ::line_sender_error_role_mismatch,
+    connect_timeout = ::line_sender_error_connect_timeout,
+    // Query / reader (egress) categories.
+    handshake_error = ::line_sender_error_handshake_error,
+    unsupported_server = ::line_sender_error_unsupported_server,
+    protocol_error = ::line_sender_error_protocol_error,
+    invalid_bind = ::line_sender_error_invalid_bind,
+    server_schema_mismatch = ::line_sender_error_server_schema_mismatch,
+    server_parse_error = ::line_sender_error_server_parse_error,
+    server_internal_error = ::line_sender_error_server_internal_error,
+    server_security_error = ::line_sender_error_server_security_error,
+    limit_exceeded = ::line_sender_error_limit_exceeded,
+    server_limit_exceeded = ::line_sender_error_server_limit_exceeded,
+    cancelled = ::line_sender_error_cancelled,
+    failover_would_duplicate = ::line_sender_error_failover_would_duplicate,
+    schema_drift = ::line_sender_error_schema_drift,
+    no_schema = ::line_sender_error_no_schema,
+    arrow_export = ::line_sender_error_arrow_export,
+    batch_too_large = ::line_sender_error_batch_too_large,
+};
+
+// Bridge equality between the C++ `questdb::error_code` and the C ABI enum
+// `::line_sender_error_code` (identical `int` values), so existing comparisons
+// like `e.code() == line_sender_error_socket_error` — and, via the
+// `reader_error_*` aliases, `e.code() == reader_error_cancelled` — keep
+// compiling. Lives in `namespace questdb` so ADL on `error_code` finds it from
+// both `questdb::ingress` and `questdb::egress`.
+inline bool operator==(error_code l, ::line_sender_error_code r) noexcept
+{
+    return static_cast<int>(l) == static_cast<int>(r);
+}
+inline bool operator==(::line_sender_error_code l, error_code r) noexcept
+{
+    return r == l;
+}
+inline bool operator!=(error_code l, ::line_sender_error_code r) noexcept
+{
+    return !(l == r);
+}
+inline bool operator!=(::line_sender_error_code l, error_code r) noexcept
+{
+    return !(l == r);
+}
+
+/**
+ * Base class for every QuestDB client error, ingest or query.
+ *
+ * `catch (const questdb::error&)` handles a failure from either direction.
+ * `questdb::ingress::line_sender_error` (which additionally exposes
+ * `in_doubt()` / `qwp_ws_diagnostic()`) and `questdb::egress::reader_error`
+ * are subclasses for direction-specific `catch` sites.
+ */
+class error : public std::runtime_error
+{
+public:
+    /** Error code categorising the error. */
+    error_code code() const noexcept
+    {
+        return _code;
+    }
+
+protected:
+    error(error_code code, const std::string& what)
+        : std::runtime_error{what}
+        , _code{code}
+    {
+    }
+
+private:
+    error_code _code;
+};
+
+} // namespace questdb
+
 namespace questdb::ingress
 {
 constexpr const char* inaddr_any = "0.0.0.0";
@@ -49,54 +154,9 @@ class line_sender;
 class line_sender_buffer;
 class opts;
 
-/** Category of error. */
-enum class line_sender_error_code
-{
-    /** The host, port, or interface was incorrect. */
-    could_not_resolve_addr,
-
-    /** Called methods in the wrong order. E.g. `symbol` after `column`. */
-    invalid_api_call,
-
-    /** A network error connecting or flushing data out. */
-    socket_error,
-
-    /** The string or symbol field is not encoded in valid UTF-8. */
-    invalid_utf8,
-
-    /** The table name or column name contains bad characters. */
-    invalid_name,
-
-    /** The supplied timestamp is invalid. */
-    invalid_timestamp,
-
-    /** Error during the authentication process. */
-    auth_error,
-
-    /** Error during TLS handshake. */
-    tls_error,
-
-    /** The server does not support ILP over HTTP. */
-    http_not_supported,
-
-    /** Error sent back from the server during flush. */
-    server_flush_error,
-
-    /** Bad configuration. */
-    config_error,
-
-    /** There was an error serializing an array. */
-    array_error,
-
-    /**  Line sender protocol version error. */
-    protocol_version_error,
-
-    /** The supplied decimal is invalid. */
-    invalid_decimal,
-
-    /** QWP/WebSocket server rejection or terminal protocol violation. */
-    server_rejection,
-};
+/** Category of error. Alias of the unified `questdb::error_code`
+ *  (`line_sender_error_code` is the sender-facing spelling). */
+using line_sender_error_code = ::questdb::error_code;
 
 /** The protocol used to connect with. */
 enum class protocol
@@ -232,23 +292,34 @@ enum class ca
  * For QWP/WebSocket terminal diagnostics, `.qwp_ws_diagnostic()` returns the
  * structured server or protocol error that halted the sender.
  */
-class line_sender_error : public std::runtime_error
+class line_sender_error : public ::questdb::error
 {
 public:
     line_sender_error(
         line_sender_error_code code,
         const std::string& what,
+        bool in_doubt = false,
         std::optional<qwp_ws_error> qwp_ws_diagnostic = std::nullopt)
-        : std::runtime_error{what}
-        , _code{code}
+        : ::questdb::error{code, what}
+        , _in_doubt{in_doubt}
         , _qwp_ws_diagnostic{std::move(qwp_ws_diagnostic)}
     {
     }
 
-    /** Error code categorizing the error. */
-    line_sender_error_code code() const noexcept
+    // `code()` is inherited from `questdb::error` (returns the unified
+    // `error_code`, aliased here as `line_sender_error_code`).
+
+    /**
+     * Whether the failed operation is *delivery-unknown* ("in doubt"): the
+     * current input may already have reached the server even though the call
+     * failed. Independent of `code()` — a delivery-unknown failure typically
+     * reports `failover_retry`, yet that code alone does not make the input
+     * safe to resend. When `true`, only replay the same input if table-level
+     * dedup/upsert keys make duplicate rows harmless.
+     */
+    bool in_doubt() const noexcept
     {
-        return _code;
+        return _in_doubt;
     }
 
     /** Structured diagnostic for a QWP/WebSocket HALT error, if available. */
@@ -269,6 +340,7 @@ private:
         size_t c_len{0};
         const char* c_msg{::line_sender_error_msg(owned_err.get(), &c_len)};
         std::string msg{c_msg, c_len};
+        const bool in_doubt{::line_sender_error_in_doubt(owned_err.get())};
 
         std::optional<qwp_ws_error> qwp_ws_diagnostic;
         line_sender_qwpws_error_view view{};
@@ -277,7 +349,8 @@ private:
             qwp_ws_diagnostic = qwp_ws_error_from_view(view);
         }
 
-        return line_sender_error{code, msg, std::move(qwp_ws_diagnostic)};
+        return line_sender_error{
+            code, msg, in_doubt, std::move(qwp_ws_diagnostic)};
     }
 
     template <typename F, typename... Args>
@@ -294,13 +367,19 @@ private:
     friend class line_sender;
     friend class line_sender_buffer;
     friend class opts;
+    friend class sf_column_sender_conn;
+    friend class column_chunk;
+    friend class arrow_import;
+    friend class pool;
+    friend class borrowed_sf_column_sender;
+    friend class borrowed_row_sender;
 
     template <
         typename T,
         bool (*F)(T*, size_t, const char*, ::line_sender_error**)>
     friend class basic_view;
 
-    line_sender_error_code _code;
+    bool _in_doubt;
     std::optional<qwp_ws_error> _qwp_ws_diagnostic;
 };
 

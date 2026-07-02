@@ -116,7 +116,7 @@ The crate provides several optional features to enable additional functionality.
 
 ### Optional features
 
-- **chrono_timestamp**: Allows specifying timestamps as `chrono::DateTime` objects. Depends on the `chrono` crate.
+- **chrono-timestamp**: Allows specifying timestamps as `chrono::DateTime` objects. Depends on the `chrono` crate.
 - **tls-native-certs**: Uses OS-provided root TLS certificates for secure connections. Depends on the `rustls-native-certs` crate.
 - **insecure-skip-verify**: Allows skipping verification of insecure certificates (not recommended for production).
 - **ndarray**: Enables integration with the `ndarray` crate for working with n-dimensional arrays. Without this feature, you can still send slices or implement custom array types via the `NdArrayView` trait.

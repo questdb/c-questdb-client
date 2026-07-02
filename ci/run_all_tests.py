@@ -33,10 +33,14 @@ def main():
     # unconditionally in CI.
     cpp_tests = [
         'test_line_sender',
-        'test_line_reader_offline',
-        'test_line_reader_mock',
-        'line_reader_c_smoke',
-        'test_line_reader',  # live-broker; skips per-test when no broker reachable
+        'test_reader_offline',
+        'test_reader_mock',
+        'reader_c_smoke',
+        'test_reader',  # live-broker; skips per-test when no broker reachable
+        'test_arrow_c',
+        'test_arrow_egress',
+        'test_arrow_ingress',
+        'test_column_sender',
     ]
     test_paths = [
         (d, find_binary(d, name, exe_suffix))
@@ -45,7 +49,6 @@ def main():
     ]
 
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    qdb_v = '9.2.0'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
@@ -64,11 +67,24 @@ def main():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test',
+            '--features=almost-all-features,arrow,polars',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-qwp-ws,sync-reader-qwp-ws,arrow',
+            '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
+    run_cmd('cargo', 'test', '--features=arrow', cwd='questdb-rs-ffi')
     for _, path in test_paths:
         run_cmd(str(path))
-    run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
-    # run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
+    # Test against a from-source build of QuestDB master (--repo): master is
+    # ahead of the latest release, so this catches server-side regressions
+    # before they ship. QWP/Arrow is released as of 9.4.3, so the `--versions`
+    # alternative below now exercises the same features against a fixed
+    # release; swap to it to test a release instead of master.
+    run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
+    # qdb_v = '9.4.3'  # first release shipping QWP/Arrow; QWP/WS needs >= this
+    # run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
 
 
 if __name__ == '__main__':

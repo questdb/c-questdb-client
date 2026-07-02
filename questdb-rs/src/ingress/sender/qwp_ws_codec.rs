@@ -217,13 +217,13 @@ pub(super) fn classify_qwp_handshake_reject(
         let role_reject = QwpWsRoleReject::new(role, zone);
         let err = match zone {
             Some(zone) => error::fmt!(
-                SocketError,
+                RoleMismatch,
                 "QWP/WebSocket upgrade rejected by role={} zone={}",
                 role,
                 zone
             ),
             None => error::fmt!(
-                SocketError,
+                RoleMismatch,
                 "QWP/WebSocket upgrade rejected by role={}",
                 role
             ),
@@ -706,7 +706,7 @@ mod tests {
             body: vec![],
         };
         let err = classify_qwp_handshake_reject(reject);
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(err.code(), crate::ErrorCode::RoleMismatch);
         assert!(err.msg().contains("role=PRIMARY_CATCHUP"));
         assert!(err.msg().contains("zone=az-a"));
         let role_reject = err.qwp_ws_role_reject().unwrap();
@@ -723,7 +723,7 @@ mod tests {
             body: vec![],
         };
         let err = classify_qwp_handshake_reject(reject);
-        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert_eq!(err.code(), crate::ErrorCode::RoleMismatch);
         assert!(err.msg().contains("role=PRIMARY_CATCHUP"));
         assert!(!err.msg().contains("zone="));
         let role_reject = err.qwp_ws_role_reject().unwrap();

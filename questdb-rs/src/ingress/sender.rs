@@ -37,6 +37,8 @@
 )]
 
 use crate::error::{self, Result};
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::AckLevel;
 #[cfg(feature = "_sync-sender")]
 use crate::ingress::SenderBuilder;
 use crate::ingress::{Buffer, Protocol, ProtocolVersion};
@@ -57,6 +59,11 @@ mod qwp_ws_codec;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_driver;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use qwp_ws_driver::{
+    ReconnectPolicy, reconnect_backoff_step, reconnect_error_is_terminal,
+};
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_ownership;
@@ -85,7 +92,7 @@ pub(crate) use qwp_ws_ownership::QwpWsRoleReject;
 pub use qwp_ws_ownership::*;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-mod qwp_ws;
+pub(crate) mod qwp_ws;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws::*;
@@ -535,7 +542,7 @@ impl Sender {
     /// the default background progress mode, a sender-owned runner sends,
     /// receives ACKs, reconnects, and replays as needed. In manual progress
     /// mode, the caller must use `Sender::drive_once` or
-    /// `Sender::await_acked_fsn` to advance WebSocket progress. Server or
+    /// `Sender::wait` to advance WebSocket progress. Server or
     /// transport failures observed later are reported by subsequent sender
     /// calls.
     ///
@@ -557,6 +564,11 @@ impl Sender {
     /// semantics as [`Sender::flush`]: it returns after the frame is accepted
     /// by the local replay queue, before the server necessarily ACKs it. Empty
     /// buffers return `Ok(None)`.
+    ///
+    /// Use this when you need non-blocking/pipelined progress tracking on this
+    /// sender stream: keep the returned FSN and compare it with
+    /// [`Self::acked_fsn`]. Use [`Self::wait`] instead when you only need a
+    /// blocking barrier for everything published so far.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
         let fsn = self.flush_and_keep_and_get_fsn(buf)?;
@@ -566,6 +578,9 @@ impl Sender {
 
     /// Publish the QWP/WebSocket buffer without clearing it and return the
     /// highest published frame sequence number.
+    ///
+    /// The returned FSN has the same local-publication semantics as
+    /// [`Self::flush_and_get_fsn`].
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
         self.flush_qwp_ws_buffer(buf, false)
@@ -573,6 +588,8 @@ impl Sender {
 
     /// Return the highest frame sequence number published locally by this
     /// QWP/WebSocket sender, or `None` if no frame has been published.
+    ///
+    /// This is a sender-stream watermark, not a process-global receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn published_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -589,6 +606,11 @@ impl Sender {
     /// server-side reject-and-continue, or `None` if no frame has completed.
     /// In QWP/WebSocket durable ACK mode, ordinary OK frames only release send
     /// window pressure; this watermark advances after durable ACK coverage.
+    ///
+    /// After [`Self::flush_and_get_fsn`] returns `Some(fsn)`, that publication
+    /// boundary has completed once this method returns a value greater than or
+    /// equal to `fsn`. Use [`Self::wait`] when you need an explicit
+    /// [`AckLevel::Ok`] or [`AckLevel::Durable`] barrier.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -601,45 +623,102 @@ impl Sender {
         }
     }
 
-    /// Wait until the QWP/WebSocket cumulative completion watermark reaches
-    /// `fsn`.
+    /// Wait until every QWP/WebSocket frame published so far on this sender
+    /// reaches `ack_level`, or until the wait makes no progress for `timeout`.
     ///
-    /// The watermark advances on server ACKs and server-side
-    /// reject-and-continue responses. In QWP/WebSocket durable ACK mode,
-    /// ordinary OK frames only release send window pressure; this waits for
-    /// durable ACK coverage. Returns `Ok(true)` if the watermark is reached
-    /// before `timeout`, and `Ok(false)` on timeout. In manual progress mode
-    /// this method also drives WebSocket progress while waiting.
+    /// This is the row-major counterpart to the column-major
+    /// [`crate::SfColumnSender::wait`]: it takes the cumulative publication
+    /// boundary ([`Self::published_fsn`]) and blocks until the requested
+    /// completion watermark covers it.
+    ///
+    /// * [`AckLevel::Ok`] waits for the server to accept every published
+    ///   frame.
+    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. When the
+    ///   connection did not negotiate durable acks this watermark advances on
+    ///   ordinary acceptance, so it behaves like [`AckLevel::Ok`].
+    ///
+    /// `timeout` is a **no-progress** deadline: it fires only if the ack
+    /// watermark fails to advance for that long, so a steadily-progressing
+    /// large batch keeps waiting. `Duration::ZERO` waits indefinitely. On
+    /// expiry it returns an
+    /// [`ErrorCode::FailoverRetry`](crate::error::ErrorCode::FailoverRetry)
+    /// error and the published frames are retained for replay.
+    ///
+    /// A server rejection of a frame in the pending range, or a terminal
+    /// transport/protocol failure, is returned as an error (a non-fatal
+    /// drop-and-continue rejection advances the watermark and is reported
+    /// separately by [`Self::poll_qwp_ws_error`]). When nothing has been
+    /// published yet it returns immediately. QWP/WebSocket only; other
+    /// protocols return `InvalidApiCall`. In manual progress mode this also
+    /// drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
-    pub fn await_acked_fsn(&mut self, fsn: u64, timeout: Duration) -> Result<bool> {
+    pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         if !matches!(
             &self.handler,
             SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
         ) {
             return Err(error::fmt!(
                 InvalidApiCall,
-                "await_acked_fsn is only supported for QWP/WebSocket senders."
+                "wait is only supported for QWP/WebSocket senders."
             ));
         }
 
-        let deadline = Instant::now().checked_add(timeout);
+        let Some(boundary) = self.published_fsn()? else {
+            return Ok(());
+        };
+
+        // No-progress deadline: reset whenever the completion watermark
+        // advances, so it only fires when the peer stays alive yet silent.
+        let mut deadline_anchor = Instant::now();
+        let mut last_completed: Option<u64> = None;
+
         loop {
-            if self.acked_fsn()?.is_some_and(|acked| acked >= fsn) {
-                return Ok(true);
+            let completed = self.qwp_ws_completed_fsn(ack_level)?;
+            if completed.is_some_and(|fsn| fsn >= boundary) {
+                return Ok(());
             }
-            if qwp_ws_deadline_expired(deadline) {
-                return Ok(false);
+            if completed != last_completed {
+                last_completed = completed;
+                deadline_anchor = Instant::now();
+            }
+            if !timeout.is_zero() && deadline_anchor.elapsed() >= timeout {
+                return Err(qwp_ws_wait_timeout(ack_level, timeout, boundary, completed));
             }
 
             match &mut self.handler {
                 SyncProtocolHandler::ManualQwpWs(state) => {
                     if !qwp_ws_drive_once(state)? {
-                        qwp_ws_sleep_until(deadline);
+                        qwp_ws_sleep_until(None);
                     }
                 }
-                SyncProtocolHandler::SyncQwpWs(_) => qwp_ws_sleep_until(deadline),
+                SyncProtocolHandler::SyncQwpWs(_) => qwp_ws_sleep_until(None),
                 _ => unreachable!("QWP/WebSocket handler was checked above"),
             }
+        }
+    }
+
+    /// Completion watermark for `ack_level` across both QWP/WebSocket progress
+    /// modes. `Ok` tracks server acceptance; `Durable` tracks durable-ACK
+    /// coverage (which collapses onto acceptance in manual progress mode and
+    /// on connections without durable acks). Terminal failures surface here as
+    /// an `Err`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
+        match (&self.handler, ack_level) {
+            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Ok) => {
+                qwp_ws_ok_fsn_background(state)
+            }
+            (SyncProtocolHandler::SyncQwpWs(state), AckLevel::Durable) => {
+                qwp_ws_acked_fsn_background(state)
+            }
+            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Ok) => qwp_ws_ok_fsn_manual(state),
+            (SyncProtocolHandler::ManualQwpWs(state), AckLevel::Durable) => {
+                qwp_ws_acked_fsn_manual(state)
+            }
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "wait is only supported for QWP/WebSocket senders."
+            )),
         }
     }
 
@@ -872,4 +951,39 @@ fn qwp_ws_sleep_until(deadline: Option<Instant>) {
     if !sleep_for.is_zero() {
         std::thread::sleep(sleep_for);
     }
+}
+
+/// Error for a [`Sender::wait`] that made no ack progress within its
+/// no-progress `timeout`. Classified [`ErrorCode::FailoverRetry`]: the
+/// published frames are retained and the background runner keeps delivering
+/// them, so recover by retrying `wait()` until it returns `Ok` — not by
+/// re-flushing, which would duplicate the rows. Mirrors the column-major
+/// store-and-forward wait.
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn qwp_ws_wait_timeout(
+    ack_level: AckLevel,
+    timeout: Duration,
+    boundary: u64,
+    completed: Option<u64>,
+) -> crate::Error {
+    let level = match ack_level {
+        AckLevel::Ok => "ok",
+        AckLevel::Durable => "durable",
+    };
+    let progress = match completed {
+        Some(fsn) => format!("reached FSN {fsn}"),
+        None => "reached no frame".to_string(),
+    };
+    error::Error::new(
+        error::ErrorCode::FailoverRetry,
+        format!(
+            "QWP/WebSocket wait({level}) timed out after {timeout:?} with no ack \
+             progress (target FSN {boundary}, {progress}); the connection is alive \
+             but the server is not advancing the watermark. The published frames \
+             remain queued and the background runner keeps delivering them: retry \
+             wait() to keep awaiting the ack, or close the pool to drain. Do not \
+             re-flush the same data, which is already accepted and would be \
+             delivered twice."
+        ),
+    )
 }

@@ -55,9 +55,9 @@ use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::roles;
 use crate::egress::ws::client::{Stream, WsClient, WsReadError};
-use crate::egress::ws::nosigpipe::NoSigpipeTcp;
 use crate::ws::handshake::{self, HandshakeError as WsHandshakeError, Headers, HttpReject};
 use crate::ws::mask::MaskKeySource;
+use crate::ws::nosigpipe::NoSigpipeTcp;
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
 /// successful handshake. Caps any single `write()` syscall — including
@@ -153,7 +153,15 @@ impl WsTransport {
             let mut last_err: Option<std::io::Error> = None;
             let mut connected: Option<TcpStream> = None;
             for addr in &resolved {
-                match TcpStream::connect(addr) {
+                // `connect_timeout = 0` keeps the OS-default blocking dial;
+                // `> 0` uses the native non-blocking connect + poll +
+                // SO_ERROR check that `connect_timeout` implements per
+                // platform, bounded per resolved address.
+                let res = match config.connect_timeout_ms {
+                    0 => TcpStream::connect(addr),
+                    ms => TcpStream::connect_timeout(addr, Duration::from_millis(ms)),
+                };
+                match res {
                     Ok(s) => {
                         connected = Some(s);
                         break;
@@ -165,13 +173,21 @@ impl WsTransport {
                 Some(s) => s,
                 None => {
                     let e = last_err.expect("non-empty addrs but no last_err");
-                    return Err(fmt!(
-                        SocketError,
+                    let msg = format!(
                         "could not connect to {} (tried {} address(es)): {}",
                         endpoint,
                         resolved.len(),
                         e
-                    ));
+                    );
+                    // A dial that burned its `connect_timeout` budget
+                    // surfaces as a distinct, failover-eligible
+                    // `ConnectTimeout` so callers can tell a timed-out dial
+                    // apart from refused / reset.
+                    return Err(if e.kind() == std::io::ErrorKind::TimedOut {
+                        fmt!(ConnectTimeout, "{}", msg)
+                    } else {
+                        fmt!(SocketError, "{}", msg)
+                    });
                 }
             }
         };
@@ -496,7 +512,7 @@ fn read_version_header(headers: &Headers) -> Result<u8> {
 ///
 /// The check fails fast at handshake when the server selected a codec
 /// this client build can't handle (e.g. `zstd` against a binary built
-/// without the `compression-zstd` feature) so the operator sees a
+/// without the `sync-reader-zstd` feature) so the operator sees a
 /// clear "this build can't talk to that server" error before any
 /// query runs. Parameters attached to a recognised codec are
 /// tolerated and ignored: they're server-side state, and the
@@ -531,16 +547,16 @@ fn validate_content_encoding(headers: &Headers) -> Result<()> {
         // `raw` and `identity` are spec-aliases for no compression.
         Ok(())
     } else if name.eq_ignore_ascii_case("zstd") {
-        #[cfg(feature = "compression-zstd")]
+        #[cfg(feature = "sync-reader-zstd")]
         {
             Ok(())
         }
-        #[cfg(not(feature = "compression-zstd"))]
+        #[cfg(not(feature = "sync-reader-zstd"))]
         {
             Err(fmt!(
                 HandshakeError,
                 "server selected X-QWP-Content-Encoding {:?} but this client was built \
-                 without the `compression-zstd` feature",
+                 without the `sync-reader-zstd` feature",
                 raw
             ))
         }
@@ -732,7 +748,7 @@ mod tests {
 
     #[test]
     fn module_is_compilable() {
-        // Sanity check: the `cfg(feature = "sync-reader-ws")` gate is open
+        // Sanity check: the `cfg(feature = "sync-reader-qwp-ws")` gate is open
         // when this test runs.
     }
 
@@ -747,13 +763,13 @@ mod tests {
         validate_content_encoding(&header_map("identity")).unwrap();
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn content_encoding_zstd_bare_is_ok() {
         validate_content_encoding(&header_map("zstd")).unwrap();
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn content_encoding_zstd_with_level_parameter_is_ok() {
         // Spec §3 example: server echoes `zstd;level=3`. The `level`
@@ -766,7 +782,7 @@ mod tests {
         validate_content_encoding(&header_map("zstd;level=9")).unwrap();
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn content_encoding_zstd_with_unknown_parameter_is_ok() {
         // Future-compat: parameters not defined at this spec revision
@@ -780,7 +796,7 @@ mod tests {
         validate_content_encoding(&header_map("zstd;level=99")).unwrap();
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn content_encoding_trailing_semicolon_is_ok() {
         // Empty post-`;` segments are tolerated (whitespace / accidental
@@ -809,7 +825,7 @@ mod tests {
         validate_content_encoding(&header_map("Identity")).unwrap();
     }
 
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(feature = "sync-reader-zstd")]
     #[test]
     fn content_encoding_zstd_case_insensitive() {
         validate_content_encoding(&header_map("ZSTD")).unwrap();
@@ -820,10 +836,10 @@ mod tests {
         validate_content_encoding(&header_map("Zstd;level=3")).unwrap();
     }
 
-    #[cfg(not(feature = "compression-zstd"))]
+    #[cfg(not(feature = "sync-reader-zstd"))]
     #[test]
     fn content_encoding_zstd_case_insensitive_rejected_without_feature() {
-        // A client built without `compression-zstd` must reject `Zstd`
+        // A client built without `sync-reader-zstd` must reject `Zstd`
         // / `ZSTD` the same way it rejects `zstd` — the rejection
         // logic must not silently accept the mixed-case form.
         let err = validate_content_encoding(&header_map("ZSTD")).unwrap_err();

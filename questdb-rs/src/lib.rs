@@ -44,10 +44,57 @@ mod keystore_roots;
 
 pub mod ingress;
 
+// Transport-neutral Arrow field-metadata keys, shared by the ingress encoder
+// and the egress adapter. Homed here so a sender-only `arrow-ingress` build
+// can use them without compiling the egress reader.
+#[cfg(feature = "_arrow")]
+#[doc(hidden)]
+pub mod arrow_meta;
+
+// Transport-neutral arrow<->polars_arrow FFI bridges, shared by both polars
+// directions.
+#[cfg(feature = "_polars")]
+#[doc(hidden)]
+pub(crate) mod polars_ffi;
+
 #[cfg(feature = "_egress")]
 pub mod egress;
 
 pub use error::*;
+
+// --- Primary entry point -------------------------------------------------
+//
+// `QuestDb` is the connection/pool handle for a QuestDB instance. It spans
+// both directions — it hands out column-major and row-major senders (write)
+// *and* query readers (read) — so it lives in its own top-level `db` module,
+// a peer of `ingress` and `egress` rather than a child of either. Those
+// modules remain the home of the specialised, direction-specific types
+// (`Chunk`, `AckLevel`, `ColumnView`, `Cursor`, `Bind`, …); the common entry
+// path is `use questdb::QuestDb`.
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod db;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub use db::{BorrowedRowSender, QuestDb, SfColumnSender};
+// Internal transport behind `QuestDb::flush_arrow_batch` /
+// `QuestDb::flush_polars_dataframe`. Not part of the public API: hidden from
+// the docs and has no documented constructor. Kept reachable only so the
+// crate's own ingestion entry points can name it.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[doc(hidden)]
+pub use db::DirectColumnSender;
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "_egress"))]
+pub use db::BorrowedReader;
+
+// FFI escape-hatch surface. Hidden and not semver-stable: it exists so the
+// `questdb-rs-ffi` C-ABI crate can borrow owned (lifetime-free) pool handles
+// that C / Python cannot express as Rust lifetimes. Normal Rust users borrow
+// the lifetime-bound handles re-exported above. The `ffi-support` feature
+// implies `sync-sender-qwp-ws`, so the module is always available when enabled.
+#[cfg(feature = "ffi-support")]
+#[doc(hidden)]
+pub use db::ffi_support;
 
 #[cfg(test)]
 mod alloc_counter {

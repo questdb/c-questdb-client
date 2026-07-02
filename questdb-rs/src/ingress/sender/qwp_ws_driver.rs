@@ -154,6 +154,7 @@ pub(crate) enum QwpWsHotSendProgress {
 pub(crate) struct QwpWsHotResponseProgress {
     pub(crate) outcome: DriveOutcome,
     pub(crate) events: Vec<DriverEvent>,
+    pub(crate) ok_fsn: Option<u64>,
 }
 
 impl QwpWsHotResponseProgress {
@@ -161,12 +162,22 @@ impl QwpWsHotResponseProgress {
         Self {
             outcome: DriveOutcome::Idle,
             events: Vec::new(),
+            ok_fsn: None,
         }
     }
 
     fn from_optional_event(outcome: DriveOutcome, event: Option<DriverEvent>) -> Self {
         let events = event.into_iter().collect();
-        Self { outcome, events }
+        Self {
+            outcome,
+            events,
+            ok_fsn: None,
+        }
+    }
+
+    fn with_ok_fsn(mut self, fsn: u64) -> Self {
+        self.ok_fsn = Some(fsn);
+        self
     }
 }
 
@@ -625,6 +636,19 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.terminal_sender_error.as_ref()
     }
 
+    pub(crate) fn poll_sender_error_overlapping(
+        &mut self,
+        from_fsn: u64,
+        to_fsn: u64,
+    ) -> Option<QwpWsSenderError> {
+        if let Some(error) = self.terminal_sender_error.as_ref()
+            && sender_error_overlaps(error, from_fsn, to_fsn)
+        {
+            return Some(error.clone());
+        }
+        self.sender_errors.poll_overlapping(from_fsn, to_fsn)
+    }
+
     pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {
         self.last_server_error.as_ref()
     }
@@ -1032,7 +1056,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 wire_seq: ack_wire_seq,
             },
             event,
-        ))
+        )
+        .with_ok_fsn(fsn))
     }
 
     pub(crate) fn finish_durable_ok_response_sfa(
@@ -1054,7 +1079,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
         {
             self.send_cursor.ack_through(fsn);
-            return Ok(QwpWsHotResponseProgress::idle());
+            return Ok(QwpWsHotResponseProgress::idle().with_ok_fsn(fsn));
         }
         if progress
             .completed_fsn()
@@ -1066,13 +1091,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     wire_seq: ack_wire_seq,
                 },
                 events: Vec::new(),
+                ok_fsn: Some(fsn),
             });
         }
 
         self.send_cursor.ack_through(fsn);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
         tracker.enqueue_ok(ack_wire_seq, fsn, table_seq_txns);
-        self.complete_ready_durable_sfa(progress)
+        Ok(self.complete_ready_durable_sfa(progress)?.with_ok_fsn(fsn))
     }
 
     pub(crate) fn finish_durable_ack_response_sfa(
@@ -1116,6 +1142,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 DriveOutcome::Acked { wire_seq }
             }),
             events,
+            ok_fsn: None,
         })
     }
 
@@ -1889,6 +1916,28 @@ pub(super) fn reconnect_sleep_duration(
     } else {
         centered_jitter_duration(backoff)
     }
+}
+
+/// One reconnect backoff step for the column-sender re-borrow loop, matching the
+/// row runner's discipline: returns the delay to sleep before the next attempt
+/// (role-reject → fixed `initial_backoff`; else centered-jittered `backoff`) and
+/// the updated `backoff` state (role-reject resets to `initial_backoff`; else
+/// doubles, capped at `max_backoff`).
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) fn reconnect_backoff_step(
+    err: &Error,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    backoff: Duration,
+) -> (Duration, Duration) {
+    let role_reject = is_qwp_ws_role_reject_error(err);
+    let sleep_for = reconnect_sleep_duration(role_reject, initial_backoff, backoff);
+    let next_backoff = if role_reject {
+        initial_backoff
+    } else {
+        double_duration(backoff).min(max_backoff)
+    };
+    (sleep_for, next_backoff)
 }
 
 pub(super) fn retry_budget_exhausted_error(
@@ -2925,6 +2974,35 @@ impl SenderErrorLog {
         }
     }
 
+    fn poll_overlapping(&mut self, from_fsn: u64, to_fsn: u64) -> Option<QwpWsSenderError> {
+        let mut next_seq = self.poll_next_seq.max(self.first_seq);
+        while next_seq < self.next_seq {
+            let index = (next_seq - self.first_seq) as usize;
+            let Some(error) = self.errors.get(index) else {
+                self.poll_next_seq = self.next_seq;
+                self.discard_consumed_prefix();
+                return None;
+            };
+            if error.from_fsn > to_fsn {
+                self.poll_next_seq = next_seq;
+                self.discard_consumed_prefix();
+                return None;
+            }
+
+            next_seq = next_seq.saturating_add(1);
+            if sender_error_overlaps(error, from_fsn, to_fsn) {
+                let error = error.clone();
+                self.poll_next_seq = next_seq;
+                self.discard_consumed_prefix();
+                return Some(error);
+            }
+        }
+
+        self.poll_next_seq = next_seq;
+        self.discard_consumed_prefix();
+        None
+    }
+
     fn discard_consumed_prefix(&mut self) {
         let keep_from = self.poll_next_seq.min(self.notification_next_seq);
         while self.first_seq < keep_from && !self.errors.is_empty() {
@@ -2940,6 +3018,10 @@ impl SenderErrorLog {
     fn dropped_total(&self) -> u64 {
         self.dropped_total
     }
+}
+
+fn sender_error_overlaps(error: &QwpWsSenderError, from_fsn: u64, to_fsn: u64) -> bool {
+    error.from_fsn <= to_fsn && error.to_fsn >= from_fsn
 }
 
 impl DriverEventRing {
@@ -6642,6 +6724,23 @@ mod tests {
         assert_eq!(log.poll_notification(), None);
         assert_eq!(log.poll(), None);
         assert_eq!(log.dropped_total(), 0);
+    }
+
+    #[test]
+    fn sender_error_log_range_poll_consumes_stale_and_overlapping_not_future() {
+        let mut log = SenderErrorLog::new(4);
+        let stale = sender_error(0);
+        let overlapping = sender_error(1);
+        let future = sender_error(3);
+
+        log.push(stale);
+        log.push(overlapping.clone());
+        log.push(future.clone());
+
+        assert_eq!(log.poll_overlapping(1, 1), Some(overlapping));
+        assert_eq!(log.poll_overlapping(1, 1), None);
+        assert_eq!(log.poll(), Some(future));
+        assert_eq!(log.poll(), None);
     }
 
     #[test]

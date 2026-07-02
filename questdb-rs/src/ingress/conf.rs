@@ -196,6 +196,11 @@ pub(crate) enum QwpWsInitialConnectMode {
 pub(crate) struct QwpWsConfig {
     pub(crate) endpoints: ConfigSetting<Vec<QwpWsEndpoint>>,
     pub(crate) auth_timeout: ConfigSetting<std::time::Duration>,
+    /// Per-endpoint TCP connect (dial) budget. `None` (the default) keeps the
+    /// OS-default blocking dial; `Some` bounds each `TcpStream::connect_timeout`
+    /// attempt and surfaces [`crate::ErrorCode::ConnectTimeout`] on expiry.
+    /// Connect-string key: `connect_timeout` (milliseconds).
+    pub(crate) connect_timeout: ConfigSetting<Option<std::time::Duration>>,
     pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) client_id: ConfigSetting<Option<String>>,
     pub(crate) max_protocol_version: ConfigSetting<u32>,
@@ -235,6 +240,7 @@ impl Default for QwpWsConfig {
         Self {
             endpoints: ConfigSetting::new_default(Vec::new()),
             auth_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(15)),
+            connect_timeout: ConfigSetting::new_default(None),
             request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             client_id: ConfigSetting::new_default(None),
             max_protocol_version: ConfigSetting::new_default(1),

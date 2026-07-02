@@ -41,6 +41,7 @@ use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::QwpWsColumnarBuffer;
 use crate::ingress::conf::{QwpWsConfig, QwpWsEndpoint, QwpWsInitialConnectMode, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
+use crate::ws::nosigpipe::NoSigpipeTcp;
 
 use super::qwp_ws_codec::{
     self as codec, MAX_INBOUND_FRAME_BYTES, Opcode, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
@@ -60,28 +61,29 @@ use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
-use super::qwp_ws_publisher::QwpWsReplayEncoder;
+use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::OutboundFrame;
 use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
 // ---------- transport ----------
 
-type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, NoSigpipeTcp>;
 
 const QWP_WS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) enum WsStream {
-    Plain(TcpStream),
+    Plain(NoSigpipeTcp),
     Tls(Box<TlsStream>),
 }
 
 impl WsStream {
-    fn set_timeouts(&self, read: Option<Duration>, write: Option<Duration>) -> std::io::Result<()> {
-        let sock = match self {
-            WsStream::Plain(s) => s,
-            WsStream::Tls(s) => s.get_ref(),
-        };
+    pub(crate) fn set_timeouts(
+        &self,
+        read: Option<Duration>,
+        write: Option<Duration>,
+    ) -> std::io::Result<()> {
+        let sock = self.tcp_stream();
         sock.set_read_timeout(read)?;
         sock.set_write_timeout(write)?;
         Ok(())
@@ -99,8 +101,20 @@ impl WsStream {
 
     fn tcp_stream(&self) -> &TcpStream {
         match self {
-            WsStream::Plain(sock) => sock,
-            WsStream::Tls(stream) => stream.get_ref(),
+            WsStream::Plain(sock) => sock.tcp(),
+            WsStream::Tls(stream) => stream.get_ref().tcp(),
+        }
+    }
+
+    /// Emit a TLS `close_notify` and try to flush it. No-op for plain
+    /// sockets. `rustls::ClientConnection` does NOT auto-send
+    /// `close_notify` on `Drop`, so callers issuing a clean shutdown
+    /// (after writing the WS Close frame) must invoke this explicitly to
+    /// satisfy RFC 8446 §6.1 and avoid server-side truncation warnings.
+    pub(crate) fn shutdown_tls(&mut self) {
+        if let WsStream::Tls(stream) = self {
+            stream.conn.send_close_notify();
+            let _ = stream.conn.complete_io(&mut stream.sock);
         }
     }
 }
@@ -189,6 +203,7 @@ pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     append_deadline: Duration,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -199,6 +214,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     progress: SfaProgressView,
     cold_effects: VecDeque<RunnerColdEffect>,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -207,6 +223,7 @@ struct SyncQwpWsPendingRunnerCore {
     pending_connect: QwpWsPendingConnect,
     progress: SfaProgressView,
     backpressure: Arc<BackpressureNotifier>,
+    ok_completed_upper: Arc<AtomicU64>,
     lifecycle: PublicationLifecycle,
 }
 
@@ -277,9 +294,11 @@ where
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
+        let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -288,6 +307,7 @@ where
                 progress,
                 cold_effects: VecDeque::new(),
                 backpressure: thread_backpressure,
+                ok_completed_upper: thread_ok_completed_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -304,6 +324,7 @@ where
             producer,
             lifecycle,
             backpressure,
+            ok_completed_upper,
             append_deadline,
             stop,
             thread: Some(thread),
@@ -322,9 +343,11 @@ where
         let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
+        let thread_ok_completed_upper = Arc::clone(&ok_completed_upper);
         let thread_stop = Arc::clone(&stop);
         let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
@@ -333,6 +356,7 @@ where
                 pending_connect,
                 progress,
                 backpressure: thread_backpressure,
+                ok_completed_upper: thread_ok_completed_upper,
                 lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
@@ -349,6 +373,7 @@ where
             producer,
             lifecycle,
             backpressure,
+            ok_completed_upper,
             append_deadline,
             stop,
             thread: Some(thread),
@@ -451,6 +476,33 @@ where
         Ok(store.completed_fsn())
     }
 
+    fn ok_fsn(&self) -> crate::Result<Option<u64>> {
+        self.check_error()?;
+        let completed_upper = if let Some(producer) = self.producer.as_ref() {
+            producer
+                .completed_fsn()
+                .map_or(0, |fsn| fsn.saturating_add(1))
+        } else {
+            let store = self.lock_shared()?;
+            check_store_error(&store)?;
+            store.completed_fsn().map_or(0, |fsn| fsn.saturating_add(1))
+        };
+        let upper = self
+            .ok_completed_upper
+            .load(Ordering::Acquire)
+            .max(completed_upper);
+        Ok(upper.checked_sub(1))
+    }
+
+    fn poll_sender_error_overlapping(
+        &self,
+        from_fsn: u64,
+        to_fsn: u64,
+    ) -> crate::Result<Option<QwpWsSenderError>> {
+        let mut store = self.lock_shared()?;
+        Ok(store.poll_sender_error_overlapping(from_fsn, to_fsn))
+    }
+
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
         let mut store = self.lock_shared()?;
         Ok(store.poll_sender_error())
@@ -481,23 +533,29 @@ where
     }
 
     fn close_drain(&self, timeout: Duration) -> crate::Result<()> {
-        let deadline = Instant::now().checked_add(timeout);
-        self.lifecycle.begin_close();
-        self.backpressure.notify_all();
+        self.begin_close();
         if timeout.is_zero() {
             return Ok(());
         }
-        {
-            let mut store = self.lock_shared()?;
-            check_store_error(&store)?;
-            if store.all_published_receipts_resolved() {
-                store
-                    .close_queue()
-                    .map_err(driver_error_to_error_without_state)?;
-                return Ok(());
-            }
-        }
+        self.drain_to_deadline(Instant::now().checked_add(timeout))
+    }
 
+    /// Stop accepting new publications and wake the background runner so it
+    /// flushes whatever is already queued. Non-blocking and idempotent; pairs
+    /// with [`Self::drain_to_deadline`]. The column-sender pool calls this on
+    /// every connection being retired *before* waiting on any of them, so a
+    /// multi-connection close drains in parallel rather than serially.
+    fn begin_close(&self) {
+        self.lifecycle.begin_close();
+        self.backpressure.notify_all();
+    }
+
+    /// Block until every published frame has resolved its receipt, then close
+    /// the queue; give up with a `SocketError` once `deadline` passes (an
+    /// already-elapsed deadline fails fast, which is what bounds a batched pool
+    /// close). `deadline == None` waits indefinitely. Assumes
+    /// [`Self::begin_close`] has already run.
+    fn drain_to_deadline(&self, deadline: Option<Instant>) -> crate::Result<()> {
         loop {
             let backpressure_generation = self.backpressure.generation();
             {
@@ -582,6 +640,16 @@ impl BackpressureNotifier {
         match self.lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+fn update_atomic_max(cell: &AtomicU64, value: u64) {
+    let mut current = cell.load(Ordering::Acquire);
+    while value > current {
+        match cell.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
         }
     }
 }
@@ -715,6 +783,7 @@ impl SyncQwpWsPendingRunnerCore {
                     progress: self.progress.clone(),
                     cold_effects: VecDeque::new(),
                     backpressure: Arc::clone(&self.backpressure),
+                    ok_completed_upper: Arc::clone(&self.ok_completed_upper),
                     lifecycle: self.lifecycle.clone(),
                 });
                 RunnerStep::Continue
@@ -927,6 +996,9 @@ where
     where
         Q: PublicationLog,
     {
+        if let Some(fsn) = progress.ok_fsn {
+            update_atomic_max(&self.ok_completed_upper, fsn.saturating_add(1));
+        }
         self.enqueue_hot_response_events(progress.events);
         if self.flush_cold_effects(shared) == RunnerStep::Stop {
             return RunnerStep::Stop;
@@ -2022,7 +2094,7 @@ fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::
 /// connect paths use below, but in a single call so the probes don't need
 /// to thread the extras-builder + validate-headers + error-mapper boilerplate
 /// through every test harness.
-#[cfg(test)]
+#[cfg(all(test, feature = "_sender-http"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn perform_upgrade<S: Read + Write>(
     stream: &mut S,
@@ -2047,7 +2119,7 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
 
 fn complete_qwp_ws_tls_handshake(
     conn: &mut rustls::ClientConnection,
-    tcp: &mut TcpStream,
+    tcp: &mut NoSigpipeTcp,
     tls_timeout: Duration,
 ) -> crate::Result<()> {
     while conn.wants_write() || conn.is_handshaking() {
@@ -2099,9 +2171,10 @@ fn connect_qwp_ws_tcp(
     host: &str,
     port: &str,
     request_timeout: Duration,
-) -> crate::Result<TcpStream> {
+    connect_timeout: Option<Duration>,
+) -> crate::Result<NoSigpipeTcp> {
     let addrs = resolve_qwp_ws_addrs(host, port)?;
-    connect_tcp_to_any_addr(host, port, &addrs, request_timeout)
+    connect_tcp_to_any_addr(host, port, &addrs, request_timeout, connect_timeout)
 }
 
 fn connect_tcp_to_any_addr(
@@ -2109,26 +2182,60 @@ fn connect_tcp_to_any_addr(
     port: &str,
     addrs: &[SocketAddr],
     request_timeout: Duration,
-) -> crate::Result<TcpStream> {
+    connect_timeout: Option<Duration>,
+) -> crate::Result<NoSigpipeTcp> {
     let mut failures = Vec::new();
+    // Stays true only while *every* attempted address failed specifically with
+    // a connect timeout — lets us surface a distinct, retryable `ConnectTimeout`
+    // rather than burying it under the generic `SocketError`.
+    let mut all_timed_out = true;
     for addr in addrs {
-        match TcpStream::connect(addr) {
+        // `connect_timeout = None` keeps the OS-default blocking dial; `Some`
+        // uses the native non-blocking connect + poll + SO_ERROR check that
+        // `connect_timeout` implements per platform, bounded per address.
+        let res = match connect_timeout {
+            Some(d) => TcpStream::connect_timeout(addr, d),
+            None => TcpStream::connect(addr),
+        };
+        match res {
             Ok(tcp) => {
                 tcp.set_nodelay(true).ok();
                 tcp.set_read_timeout(Some(request_timeout)).ok();
                 tcp.set_write_timeout(Some(request_timeout)).ok();
-                return Ok(tcp);
+                let sock = socket2::SockRef::from(&tcp);
+                sock.set_send_buffer_size(4 * 1024 * 1024).ok();
+                sock.set_recv_buffer_size(4 * 1024 * 1024).ok();
+                match NoSigpipeTcp::new(tcp) {
+                    Ok(wrapped) => return Ok(wrapped),
+                    Err(err) => {
+                        all_timed_out = false;
+                        failures.push(format!("{addr}: SO_NOSIGPIPE setup failed: {err}"));
+                        continue;
+                    }
+                }
             }
-            Err(io) => failures.push(format!("{addr}: {io}")),
+            Err(io) => {
+                if io.kind() != std::io::ErrorKind::TimedOut {
+                    all_timed_out = false;
+                }
+                failures.push(format!("{addr}: {io}"));
+            }
         }
     }
-    Err(error::fmt!(
-        SocketError,
+    let msg = format!(
         "Could not connect to {}:{}; tried {}",
         host,
         port,
         failures.join(", ")
-    ))
+    );
+    // A dial that burned its `connect_timeout` on every candidate surfaces as a
+    // distinct `ConnectTimeout` (still retryable in the reconnect loop) so
+    // callers can tell a timed-out dial apart from refused / reset.
+    Err(if connect_timeout.is_some() && all_timed_out {
+        error::fmt!(ConnectTimeout, "{}", msg)
+    } else {
+        error::fmt!(SocketError, "{}", msg)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2148,7 +2255,7 @@ enum QwpWsZoneTier {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct QwpWsHostHealthTracker {
+pub(crate) struct QwpWsHostHealthTracker {
     states: Vec<QwpWsHostState>,
     attempted_this_round: Vec<bool>,
     zone_tiers: Vec<QwpWsZoneTier>,
@@ -2157,7 +2264,7 @@ pub(super) struct QwpWsHostHealthTracker {
 }
 
 impl QwpWsHostHealthTracker {
-    pub(super) fn new(host_count: usize) -> Self {
+    pub(crate) fn new(host_count: usize) -> Self {
         assert!(host_count > 0, "host_count must be > 0");
         Self {
             states: vec![QwpWsHostState::HealthUnknown; host_count],
@@ -2225,6 +2332,31 @@ impl QwpWsHostHealthTracker {
         None
     }
 
+    /// Like [`Self::pick_next`] but also marks the chosen endpoint
+    /// `attempted_this_round` before returning. The pool drives the connect
+    /// round through [`QwpWsHealthAccess`], releasing the health lock during
+    /// the blocking `establish_connection`; claiming the endpoint while the
+    /// lock is still held means concurrent borrows rotate to a *different*
+    /// peer instead of piling onto the same slow / black-holed endpoint. The
+    /// real outcome is still recorded by the matching `record_*` call once the
+    /// attempt finishes (those also set `attempted_this_round`, so the early
+    /// claim is idempotent).
+    pub(super) fn pick_next_and_claim(&mut self) -> Option<usize> {
+        let idx = self.pick_next()?;
+        self.attempted_this_round[idx] = true;
+        Some(idx)
+    }
+
+    pub(super) fn pick_next_and_claim_connect_round(
+        &mut self,
+        reset_if_exhausted: bool,
+    ) -> Option<usize> {
+        if reset_if_exhausted && self.is_round_exhausted() {
+            self.begin_round(true);
+        }
+        self.pick_next_and_claim()
+    }
+
     pub(super) fn record_success(&mut self, idx: usize) {
         self.states[idx] = QwpWsHostState::Healthy;
         self.attempted_this_round[idx] = true;
@@ -2246,7 +2378,7 @@ impl QwpWsHostHealthTracker {
         self.attempted_this_round[idx] = true;
     }
 
-    pub(super) fn record_mid_stream_failure(&mut self, idx: usize) {
+    pub(crate) fn record_mid_stream_failure(&mut self, idx: usize) {
         if self.states[idx] == QwpWsHostState::Healthy {
             self.states[idx] = QwpWsHostState::FailedThisRound;
         }
@@ -2258,15 +2390,60 @@ impl QwpWsHostHealthTracker {
     }
 }
 
-pub(super) struct QwpWsConnectRoundSuccess {
-    pub(super) endpoint_idx: usize,
-    pub(super) stream: WsStream,
-    pub(super) negotiated_version: u8,
-    pub(super) server_max_batch_size: usize,
-    pub(super) leftover: Vec<u8>,
+/// How [`connect_qwp_ws_endpoint_round`] reaches the health tracker.
+///
+/// Every tracker mutation/read goes through [`Self::with_tracker`], so an
+/// implementation backed by a `Mutex` (the connection pool) acquires and
+/// releases the lock *per operation*. The blocking `establish_connection`
+/// between those operations therefore runs with **no** health lock held —
+/// the fix for the pool's head-of-line blocking, where a single slow /
+/// black-holed connect used to stall every other borrow and every dead-sender
+/// return that needed the same lock. Single-connection drivers that own the
+/// tracker by value implement this as a direct in-place mutation with no
+/// locking.
+pub(crate) trait QwpWsHealthAccess {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R;
 }
 
-pub(super) fn qwp_ws_configured_endpoints(
+/// Owned-tracker accessor: the single-connection background / SFA / reconnect
+/// drivers hold the tracker by value, so there is no lock to take.
+impl QwpWsHealthAccess for &mut QwpWsHostHealthTracker {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R {
+        f(self)
+    }
+}
+
+/// Pool accessor: locks the shared tracker for the duration of a single
+/// tracker operation only, never across the blocking connect.
+pub(crate) struct LockedQwpWsHealth<'a> {
+    mutex: &'a Mutex<QwpWsHostHealthTracker>,
+}
+
+impl<'a> LockedQwpWsHealth<'a> {
+    pub(crate) fn new(mutex: &'a Mutex<QwpWsHostHealthTracker>) -> Self {
+        Self { mutex }
+    }
+}
+
+impl QwpWsHealthAccess for LockedQwpWsHealth<'_> {
+    fn with_tracker<R>(&mut self, f: impl FnOnce(&mut QwpWsHostHealthTracker) -> R) -> R {
+        // Poison-tolerant like the pool's other lock helpers: a panic in
+        // another thread's short locked region must not turn every subsequent
+        // borrow/return into a panic.
+        let mut guard = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut guard)
+    }
+}
+
+pub(crate) struct QwpWsConnectRoundSuccess {
+    pub(crate) endpoint_idx: usize,
+    pub(crate) stream: WsStream,
+    pub(crate) negotiated_version: u8,
+    pub(crate) server_max_batch_size: usize,
+    pub(crate) leftover: Vec<u8>,
+}
+
+pub(crate) fn qwp_ws_configured_endpoints(
     host: &str,
     port: &str,
     qwp_ws: &QwpWsConfig,
@@ -2327,8 +2504,9 @@ pub(crate) fn establish_connection(
 ) -> crate::Result<(WsStream, codec::QwpWsHandshakeResult, Vec<u8>)> {
     let auth_timeout = *qwp_ws.auth_timeout;
     let request_timeout = *qwp_ws.request_timeout;
+    let connect_timeout = *qwp_ws.connect_timeout;
 
-    let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout)?;
+    let mut tcp = connect_qwp_ws_tcp(host, port, request_timeout, connect_timeout)?;
 
     let host_header = if (use_tls && port == "443") || (!use_tls && port == "80") {
         host.to_string()
@@ -2351,18 +2529,22 @@ pub(crate) fn establish_connection(
             .map_err(|e| error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e))?;
         let mut conn = rustls::ClientConnection::new(cfg, server_name)
             .map_err(|e| error::fmt!(TlsError, "TLS handshake setup failed: {}", e))?;
-        tcp.set_read_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
+        tcp.tcp()
+            .set_read_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
             .ok();
-        tcp.set_write_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
+        tcp.tcp()
+            .set_write_timeout(Some(QWP_WS_TLS_HANDSHAKE_TIMEOUT))
             .ok();
         complete_qwp_ws_tls_handshake(&mut conn, &mut tcp, QWP_WS_TLS_HANDSHAKE_TIMEOUT)?;
         let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
         tls_stream
             .get_ref()
+            .tcp()
             .set_read_timeout(Some(request_timeout))
             .ok();
         tls_stream
             .get_ref()
+            .tcp()
             .set_write_timeout(Some(request_timeout))
             .ok();
         // The shared `upgrade()` does both the request write and the
@@ -2371,6 +2553,7 @@ pub(crate) fn establish_connection(
         // read_timeout), and the response read is what auth_timeout bounds.
         tls_stream
             .get_ref()
+            .tcp()
             .set_read_timeout(Some(auth_timeout))
             .ok();
         let extras =
@@ -2391,7 +2574,7 @@ pub(crate) fn establish_connection(
         )
     } else {
         let mut plain_stream = tcp;
-        plain_stream.set_read_timeout(Some(auth_timeout)).ok();
+        plain_stream.tcp().set_read_timeout(Some(auth_timeout)).ok();
         let extras =
             codec::qwp_extra_headers(auth_header, max_version, client_id, request_durable_ack);
         let handshake =
@@ -2413,9 +2596,9 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
-pub(super) fn connect_qwp_ws_endpoint_round(
+pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     endpoints: &Arc<[QwpWsEndpoint]>,
-    tracker: &mut QwpWsHostHealthTracker,
+    mut health: A,
     previous_idx: &mut Option<usize>,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
@@ -2423,19 +2606,24 @@ pub(super) fn connect_qwp_ws_endpoint_round(
     auth_header: Option<&str>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
     if let Some(idx) = previous_idx.take() {
-        tracker.record_mid_stream_failure(idx);
+        health.with_tracker(|t| t.record_mid_stream_failure(idx));
     }
-    if tracker.is_round_exhausted() {
-        tracker.begin_round(true);
-    }
-
-    let mut last_endpoint_idx = None;
-    let mut last_error = None;
+    let mut last_transport_endpoint_idx = None;
+    let mut last_role_mismatch = None;
+    let mut last_transport_err = None;
     let mut role_reject_count = 0usize;
     let mut latched_typed_error = None;
 
-    while let Some(idx) = tracker.pick_next() {
-        last_endpoint_idx = Some(idx);
+    // Pick + claim under the lock, then drop it for the blocking connect, then
+    // re-acquire only to record the outcome. The lock is never held across
+    // `establish_connection`.
+    //
+    // Reset and claim under one tracker lock. Otherwise a single-endpoint
+    // contender can claim the just-reset round before this caller does.
+    // Do this only for the first pick so failed attempts terminate normally.
+    let mut first_pick = true;
+    while let Some(idx) = health.with_tracker(|t| t.pick_next_and_claim_connect_round(first_pick)) {
+        first_pick = false;
         let endpoint = &endpoints[idx];
         match establish_connection(
             &endpoint.host,
@@ -2446,7 +2634,7 @@ pub(super) fn connect_qwp_ws_endpoint_round(
             auth_header,
         ) {
             Ok((stream, handshake_result, leftover)) => {
-                tracker.record_success(idx);
+                health.with_tracker(|t| t.record_success(idx));
                 *previous_idx = Some(idx);
                 return Ok(QwpWsConnectRoundSuccess {
                     endpoint_idx: idx,
@@ -2460,10 +2648,14 @@ pub(super) fn connect_qwp_ws_endpoint_round(
             Err(err) if is_qwp_ws_role_reject_error(&err) => {
                 role_reject_count += 1;
                 let role_reject = err.qwp_ws_role_reject().cloned();
-                tracker.record_zone(idx, qwp_ws_role_reject_zone(&err));
-                tracker.record_role_reject(idx, qwp_ws_role_reject_is_transient(&err));
+                let zone = qwp_ws_role_reject_zone(&err).map(str::to_string);
+                let transient = qwp_ws_role_reject_is_transient(&err);
+                health.with_tracker(|t| {
+                    t.record_zone(idx, zone.as_deref());
+                    t.record_role_reject(idx, transient);
+                });
                 let mut err = error::fmt!(
-                    SocketError,
+                    RoleMismatch,
                     "QWP/WebSocket role mismatch at {}:{}: {}",
                     endpoint.host,
                     endpoint.port,
@@ -2472,14 +2664,15 @@ pub(super) fn connect_qwp_ws_endpoint_round(
                 if let Some(role_reject) = role_reject {
                     err = err.with_qwp_ws_role_reject(role_reject);
                 }
-                last_error = Some(err);
+                last_role_mismatch = Some(err);
             }
             Err(err) => {
-                tracker.record_transport_error(idx);
+                health.with_tracker(|t| t.record_transport_error(idx));
                 if err.code() == crate::ErrorCode::ProtocolVersionError {
                     latched_typed_error = Some(err.clone());
                 }
-                last_error = Some(err);
+                last_transport_endpoint_idx = Some(idx);
+                last_transport_err = Some(err);
             }
         }
     }
@@ -2488,7 +2681,7 @@ pub(super) fn connect_qwp_ws_endpoint_round(
         return Err(err);
     }
     if *qwp_ws.request_durable_ack && role_reject_count == endpoints.len() {
-        let role_reject = last_error
+        let role_reject = last_role_mismatch
             .as_ref()
             .and_then(|err| err.qwp_ws_role_reject().cloned());
         let mut err = error::fmt!(
@@ -2500,19 +2693,19 @@ pub(super) fn connect_qwp_ws_endpoint_round(
         }
         return Err(err);
     }
-    if let Some(err) = last_error {
-        if is_qwp_ws_role_reject_error(&err) {
-            return Err(err);
-        }
+    if let Some(err) = last_role_mismatch {
+        return Err(err);
+    }
+    if let Some(err) = last_transport_err {
         return Err(qwp_ws_all_endpoints_unreachable_error(
             endpoints,
-            last_endpoint_idx,
+            last_transport_endpoint_idx,
             Some(err),
         ));
     }
     Err(qwp_ws_all_endpoints_unreachable_error(
         endpoints,
-        last_endpoint_idx,
+        last_transport_endpoint_idx,
         None,
     ))
 }
@@ -2526,6 +2719,19 @@ pub(crate) fn connect_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<SyncProtocolHandler> {
+    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
+        connect_qwp_ws_background_state(host, port, use_tls, tls_settings, qwp_ws, auth_header)?,
+    )))
+}
+
+pub(crate) fn connect_qwp_ws_background_state(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<String>,
+) -> crate::Result<SyncQwpWsHandlerState> {
     let orphan_config = OrphanDrainerConfig::new(
         host,
         port,
@@ -2583,15 +2789,13 @@ pub(crate) fn connect_qwp_ws(
         orphan_config,
     );
 
-    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
-        SyncQwpWsHandlerState {
-            encoder,
-            runner,
-            server_max_batch_size,
-            orphan_pool,
-            close_drain_timeout: *qwp_ws.close_flush_timeout,
-        },
-    )))
+    Ok(SyncQwpWsHandlerState {
+        encoder,
+        runner,
+        server_max_batch_size,
+        orphan_pool,
+        close_drain_timeout: *qwp_ws.close_flush_timeout,
+    })
 }
 
 fn orphan_candidates(qwp_ws: &QwpWsConfig) -> Vec<std::path::PathBuf> {
@@ -2819,6 +3023,26 @@ pub(crate) fn flush_qwp_ws(
     })
 }
 
+pub(crate) fn publish_qwp_ws_payload_background(
+    state: &mut SyncQwpWsHandlerState,
+    payload: &[u8],
+    max_buf_size: usize,
+) -> crate::Result<u64> {
+    if payload.is_empty() {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "Could not flush buffer: QWP/WebSocket encoded message is empty."
+        ));
+    }
+    if payload.len() > max_buf_size {
+        return Err(qwp_ws_encoded_message_size_error(
+            payload.len(),
+            max_buf_size,
+        ));
+    }
+    state.runner.publish_replay_payload(payload)
+}
+
 pub(crate) fn flush_qwp_ws_manual(
     state: &mut ManualQwpWsHandlerState,
     buffer: &QwpWsColumnarBuffer,
@@ -2886,6 +3110,20 @@ pub(crate) fn qwp_ws_acked_fsn_background(
     state.runner.acked_fsn()
 }
 
+pub(crate) fn qwp_ws_ok_fsn_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    state.runner.ok_fsn()
+}
+
+pub(crate) fn qwp_ws_poll_sender_error_in_range_background(
+    state: &SyncQwpWsHandlerState,
+    from_fsn: u64,
+    to_fsn: u64,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    state.runner.poll_sender_error_overlapping(from_fsn, to_fsn)
+}
+
 pub(crate) fn qwp_ws_published_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
@@ -2896,6 +3134,14 @@ pub(crate) fn qwp_ws_published_fsn_manual(
 pub(crate) fn qwp_ws_acked_fsn_manual(
     state: &ManualQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
+    check_manual_driver_error(state)?;
+    Ok(state.store.completed_fsn())
+}
+
+/// Manual-mode OK watermark. Manual progress has no background durable-ACK
+/// runner, so server acceptance and completion coincide: the OK watermark is
+/// the completed watermark.
+pub(crate) fn qwp_ws_ok_fsn_manual(state: &ManualQwpWsHandlerState) -> crate::Result<Option<u64>> {
     check_manual_driver_error(state)?;
     Ok(state.store.completed_fsn())
 }
@@ -2980,6 +3226,28 @@ pub(crate) fn qwp_ws_close_drain_background(
     state: &mut SyncQwpWsHandlerState,
 ) -> crate::Result<()> {
     let result = state.runner.close_drain(state.close_drain_timeout);
+    if let Some(mut orphan_pool) = state.orphan_pool.take() {
+        orphan_pool.close();
+    }
+    result
+}
+
+/// Non-blocking: stop accepting new publications and wake the runner to flush
+/// what is queued. The column-sender pool signals every connection being
+/// retired before waiting on any, so a batched close drains in parallel.
+pub(crate) fn qwp_ws_begin_close_background(state: &SyncQwpWsHandlerState) {
+    state.runner.begin_close();
+}
+
+/// Wait (until `deadline`) for the background runner to deliver every published
+/// frame, then close the queue and the orphan-drainer pool. A `None` deadline
+/// waits indefinitely; an already-elapsed deadline fails fast. Pairs with
+/// [`qwp_ws_begin_close_background`].
+pub(crate) fn qwp_ws_drain_to_deadline_background(
+    state: &mut SyncQwpWsHandlerState,
+    deadline: Option<Instant>,
+) -> crate::Result<()> {
+    let result = state.runner.drain_to_deadline(deadline);
     if let Some(mut orphan_pool) = state.orphan_pool.take() {
         orphan_pool.close();
     }
@@ -3243,6 +3511,88 @@ mod tests {
     }
 
     #[test]
+    fn locked_health_access_never_holds_lock_between_operations() {
+        // The pool's head-of-line fix relies on this: the connect round only
+        // touches the shared tracker inside `with_tracker`, and the blocking
+        // `establish_connection` runs *between* those calls. So the lock must
+        // be fully released the instant each `with_tracker` returns — a
+        // returning sender recording a transport failure, or a concurrent
+        // cold-start borrow, must never stall behind one slow / black-holed
+        // connect.
+        let mutex = std::sync::Mutex::new(QwpWsHostHealthTracker::new(2));
+        let mut access = LockedQwpWsHealth::new(&mutex);
+
+        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+        assert!(
+            mutex.try_lock().is_ok(),
+            "health lock must be released after pick+claim, not held across the connect"
+        );
+
+        access.with_tracker(|t| t.record_success(idx));
+        assert!(
+            mutex.try_lock().is_ok(),
+            "health lock must be released after recording the outcome"
+        );
+    }
+
+    #[test]
+    fn locked_health_access_lets_another_thread_lock_between_operations() {
+        // Concrete proof that a second actor (a returning sender / another
+        // borrow) can take `inner.health` while a connect round is mid-flight
+        // between its pick and its record steps.
+        let mutex = Arc::new(std::sync::Mutex::new(QwpWsHostHealthTracker::new(2)));
+        let mut access = LockedQwpWsHealth::new(&mutex);
+
+        let idx = access.with_tracker(|t| t.pick_next_and_claim()).unwrap();
+
+        // Simulates the gap during which `establish_connection` blocks: no
+        // health lock is held here, so another thread grabs it freely.
+        let other = Arc::clone(&mutex);
+        std::thread::spawn(move || {
+            other
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_mid_stream_failure(1);
+        })
+        .join()
+        .unwrap();
+
+        access.with_tracker(|t| t.record_transport_error(idx));
+    }
+
+    #[test]
+    fn pick_next_and_claim_rotates_concurrent_picks_off_the_same_endpoint() {
+        // Claiming the endpoint *while the lock is still held* means a second
+        // borrow that picks before the first has recorded its outcome rotates
+        // to a different peer instead of piling onto the same slow endpoint.
+        let mut tracker = QwpWsHostHealthTracker::new(2);
+        let a = tracker.pick_next_and_claim().unwrap();
+        let b = tracker.pick_next_and_claim().unwrap();
+        assert_ne!(a, b, "concurrent claims must target distinct endpoints");
+        assert!(tracker.is_round_exhausted());
+        assert_eq!(tracker.pick_next_and_claim(), None);
+
+        // A fresh round re-probes from scratch.
+        tracker.begin_round(true);
+        assert!(tracker.pick_next_and_claim().is_some());
+    }
+
+    #[test]
+    fn connect_round_start_resets_and_claims_single_endpoint_atomically() {
+        let mut tracker = QwpWsHostHealthTracker::new(1);
+        tracker.record_success(0);
+        assert!(tracker.is_round_exhausted());
+
+        assert_eq!(tracker.pick_next_and_claim(), None);
+        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
+        assert!(tracker.is_round_exhausted());
+
+        tracker.record_transport_error(0);
+        assert_eq!(tracker.pick_next_and_claim_connect_round(false), None);
+        assert_eq!(tracker.pick_next_and_claim_connect_round(true), Some(0));
+    }
+
+    #[test]
     fn role_reject_helpers_use_structured_error_not_message_prefix() {
         let string_only = crate::Error::new(
             crate::ErrorCode::SocketError,
@@ -3295,11 +3645,43 @@ mod tests {
             &port.to_string(),
             &[bad_v6, good_v4],
             Duration::from_secs(1),
+            None,
         )
         .unwrap();
 
         drop(tcp);
         let _ = accepted.join().unwrap();
+    }
+
+    #[test]
+    fn connect_tcp_to_any_addr_times_out_against_blackhole() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+        // 192.0.2.1 is RFC 5737 TEST-NET-1: globally unrouted, so the SYN is
+        // dropped and the dial blocks until connect_timeout fires (instead of
+        // the OS default, which is tens of seconds).
+        let blackhole = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 19009));
+        let start = std::time::Instant::now();
+        let err = match connect_tcp_to_any_addr(
+            "192.0.2.1",
+            "19009",
+            &[blackhole],
+            Duration::from_secs(1),
+            Some(Duration::from_millis(300)),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("dialing a blackhole endpoint must not succeed"),
+        };
+        assert_eq!(
+            err.code(),
+            crate::ErrorCode::ConnectTimeout,
+            "expected ConnectTimeout, got {:?}: {}",
+            err.code(),
+            err.msg()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the dial must be bounded by connect_timeout (~300ms)"
+        );
     }
 
     #[test]
@@ -3311,10 +3693,10 @@ mod tests {
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let io_timeout = Duration::from_millis(250);
 
-        let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout).unwrap();
+        let tcp = connect_qwp_ws_tcp("127.0.0.1", &port.to_string(), io_timeout, None).unwrap();
 
-        assert_eq!(tcp.read_timeout().unwrap(), Some(io_timeout));
-        assert_eq!(tcp.write_timeout().unwrap(), Some(io_timeout));
+        assert_eq!(tcp.tcp().read_timeout().unwrap(), Some(io_timeout));
+        assert_eq!(tcp.tcp().write_timeout().unwrap(), Some(io_timeout));
         drop(tcp);
         let _ = accepted.join().unwrap();
     }
@@ -3968,6 +4350,7 @@ mod tests {
             progress,
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -4019,6 +4402,7 @@ mod tests {
             progress: progress.clone(),
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::new(AtomicU64::new(0)),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
@@ -4074,16 +4458,19 @@ mod tests {
         let lifecycle = store.lifecycle();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
+        let ok_completed_upper = Arc::new(AtomicU64::new(0));
         let mut core = SyncQwpWsRunnerCore {
             send_core,
             progress: progress.clone(),
             cold_effects: VecDeque::new(),
             backpressure,
+            ok_completed_upper: Arc::clone(&ok_completed_upper),
             lifecycle,
         };
         let stop = AtomicBool::new(false);
 
         assert_eq!(core.drive_step(&shared, &stop), RunnerStep::Continue);
+        assert_eq!(ok_completed_upper.load(Ordering::Acquire), 1);
         assert_eq!(progress.completed_fsn(), None);
 
         let mut guard = Some(shared.lock().unwrap());
@@ -4104,6 +4491,27 @@ mod tests {
             let _ = step_thread.join();
             panic!("durable ACK progress waited for shared-store mutex");
         });
+    }
+
+    #[test]
+    fn threaded_sfa_ok_fsn_uses_completed_fsn_lower_bound() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let mut driver = QwpWsCoreTestHarness::from_queue(queue, FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"sfa-completed").unwrap();
+        let (store, send_core) = driver.into_parts();
+        let progress = store.progress_view();
+        progress.complete_through_fsn(receipt.fsn).unwrap();
+        let runner =
+            SyncQwpWsRunner::start_with_append_deadline(store, send_core, Duration::from_secs(5));
+
+        assert_eq!(runner.ok_fsn().unwrap(), Some(receipt.fsn));
     }
 
     #[test]

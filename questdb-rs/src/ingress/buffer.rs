@@ -37,12 +37,21 @@ pub(crate) use self::ilp::Buffer as IlpBuffer;
 #[allow(unused_imports)]
 pub(crate) use self::ilp::F64Serializer;
 
+#[cfg(all(feature = "_sender-qwp-ws", feature = "arrow-ingress"))]
+pub(crate) use self::qwp::QWP_DECIMAL_MAX_SCALE;
 #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
 pub(crate) use self::qwp::QwpBuffer;
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) use self::qwp::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
+pub(crate) use self::qwp::{
+    MAX_CONN_SYMBOL_DICT_SIZE, QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict,
+};
+// `QwpWsSymbolHasher`'s only re-export consumer is the `arrow`-gated
+// `column_sender::arrow_batch`, so it is gated identically: a `_sender-qwp-ws`
+// build without `arrow` would otherwise carry an unused import.
+#[cfg(feature = "arrow-ingress")]
+pub(crate) use self::qwp::QwpWsSymbolHasher;
 
 static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
@@ -149,9 +158,9 @@ impl<S: Copy> StoredBookmark<S> {
         }
     }
 
-    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) {
+    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) -> bool {
         if bookmark.origin() == 0 {
-            return;
+            return false;
         }
         if bookmark.origin() != origin {
             // `clear_bookmark()` is intentionally a no-op in release builds so
@@ -162,11 +171,13 @@ impl<S: Copy> StoredBookmark<S> {
                 origin,
                 "attempted to clear a bookmark from a different buffer"
             );
-            return;
+            return false;
         }
         if self.state.is_some() && self.generation == bookmark.generation() {
             self.state = None;
+            return true;
         }
+        false
     }
 
     pub(super) fn clear(&mut self) {
@@ -413,21 +424,31 @@ impl Buffer {
     }
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-    /// Creates a new QWP/UDP buffer with default parameters.
     pub fn new_qwp() -> Self {
         Self::qwp_with_max_name_len(127)
     }
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
-    /// Creates a new QWP/UDP buffer with a custom maximum name length.
+    /// Like [`Buffer::new_qwp`] with an explicit maximum name length.
     pub fn qwp_with_max_name_len(max_name_len: usize) -> Self {
         Self {
             inner: BufferInner::Qwp(Box::new(QwpBuffer::new(max_name_len))),
         }
     }
 
+    /// Creates a new QWP/WebSocket columnar buffer with a 127-byte name
+    /// length limit. Accepts the row-by-row `table` / `symbol` /
+    /// `column_*` / `at` API; consumed by [`Sender::flush`].
+    ///
+    /// [`Sender::flush`]: crate::ingress::Sender::flush
     #[cfg(feature = "_sender-qwp-ws")]
-    pub(crate) fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
+    pub fn new_qwp_ws() -> Self {
+        Self::qwp_ws_with_max_name_len(127)
+    }
+
+    /// Like [`Buffer::new_qwp_ws`] with an explicit maximum name length.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
         Self {
             inner: BufferInner::QwpWs(Box::new(QwpWsColumnarBuffer::new(max_name_len))),
         }
@@ -443,7 +464,10 @@ impl Buffer {
         }
     }
 
-    #[cfg(any(feature = "_sender-qwp-udp", all(test, feature = "_sender-qwp-ws")))]
+    #[cfg(any(
+        feature = "_sender-qwp-udp",
+        all(test, feature = "_sender-qwp-ws", feature = "_sender-http")
+    ))]
     pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
         match &self.inner {
             BufferInner::Ilp(_) => None,

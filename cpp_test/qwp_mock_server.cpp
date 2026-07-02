@@ -682,8 +682,8 @@ bool ws_handshake(socket_t fd, bool reject_401)
         return false;
     }
 
-    // Find Sec-WebSocket-Key (case-insensitive).
     std::string key;
+    int client_max_version = 2;
     {
         size_t p = 0;
         while (p < buf.size())
@@ -693,29 +693,41 @@ bool ws_handshake(socket_t fd, bool reject_401)
                 break;
             std::string line = buf.substr(p, eol - p);
             p = eol + 2;
-            // Lowercase the header name portion before the colon.
             size_t colon = line.find(':');
             if (colon == std::string::npos)
                 continue;
             std::string name = line.substr(0, colon);
             std::transform(name.begin(), name.end(), name.begin(),
                            [](char c) { return char(std::tolower(c)); });
+            std::string value = line.substr(colon + 1);
+            size_t vs = value.find_first_not_of(" \t");
+            size_t ve = value.find_last_not_of(" \t");
+            if (vs == std::string::npos)
+                value.clear();
+            else
+                value = value.substr(vs, ve - vs + 1);
             if (name == "sec-websocket-key")
             {
-                key = line.substr(colon + 1);
-                // Trim whitespace.
-                size_t s = key.find_first_not_of(" \t");
-                size_t e = key.find_last_not_of(" \t");
-                if (s == std::string::npos)
-                    key.clear();
-                else
-                    key = key.substr(s, e - s + 1);
-                break;
+                key = value;
+            }
+            else if (name == "x-qwp-max-version")
+            {
+                try
+                {
+                    client_max_version = std::stoi(value);
+                }
+                catch (...)
+                {
+                }
             }
         }
     }
     if (key.empty())
         return false;
+
+    int negotiated = client_max_version < 2 ? client_max_version : 2;
+    if (negotiated < 1)
+        negotiated = 1;
 
     std::string accept = compute_ws_accept(key);
     std::string resp =

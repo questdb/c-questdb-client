@@ -79,7 +79,7 @@ PR CI runs the offline / mock-based suites only. The `questdb` submodule is
 do **not** run on every PR:
 
 - The 79 `live-server-tests` Rust tests in `questdb-rs/`
-- The C++ `test_line_reader` live suite
+- The C++ `test_reader` live suite
 - The Python failover system test (`system_test/test_egress_failover.py`)
 - The Python ingestion integration test (`system_test/test.py`)
 

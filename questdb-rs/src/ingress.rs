@@ -60,13 +60,34 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
-mod sender;
+pub(crate) mod sender;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) use sender::QwpWsRoleReject;
+#[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
+pub(crate) use sender::ReconnectPolicy;
 pub use sender::*;
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use sender::{reconnect_backoff_step, reconnect_error_is_terminal};
 
 mod decimal;
 pub use decimal::DecimalView;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub mod column_sender;
+
+/// Acknowledgement level shared by the column-major and row-major QWP/WebSocket
+/// senders' `wait` / `sync` APIs.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AckLevel {
+    #[default]
+    Ok,
+    Durable,
+}
+
+#[cfg(feature = "polars-ingress")]
+pub mod polars;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -74,6 +95,13 @@ const MAX_NAME_LEN_DEFAULT: usize = 127;
 pub const MAX_ARRAY_DIMS: usize = 32;
 pub const MAX_ARRAY_BUFFER_SIZE: usize = 512 * 1024 * 1024; // 512MiB
 pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
+
+/// Maximum element count of a single ndarray row payload (`prod(shape)`).
+/// Bounds the per-row reservation (`leaf_count * 8` bytes) well below
+/// `isize::MAX` so allocator-OOM cannot abort the host under
+/// `panic = "abort"`. Enforced on both the FFI and pure-Rust entry
+/// points to keep the contract uniform across API surfaces.
+pub const MAX_NDARRAY_LEAF_ELEMS: usize = 1 << 24;
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
@@ -387,6 +415,143 @@ impl Protocol {
 pub(crate) struct QwpWsAddrScan {
     pub(crate) addr_values: Vec<String>,
     pub(crate) sanitized_conf: String,
+}
+
+/// Resolved, reusable ingredients for opening QWP/WebSocket connections to a
+/// rotating set of endpoints. Built once by
+/// [`SenderBuilder::build_qwp_ws_connector`] and held by the column-sender
+/// pool ([`crate::ingress::column_sender`]), which drives it through a
+/// shared [`sender::qwp_ws::QwpWsHostHealthTracker`] so every borrow lands on
+/// a live, writable endpoint (skipping unhealthy / role-rejecting ones)
+/// without re-parsing the connect string.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) struct QwpWsConnector {
+    host: String,
+    port: String,
+    endpoints: std::sync::Arc<[conf::QwpWsEndpoint]>,
+    use_tls: bool,
+    tls_settings: Option<tls::TlsSettings>,
+    qwp_ws: conf::QwpWsConfig,
+    auth_header: Option<String>,
+    max_buf_size: usize,
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl QwpWsConnector {
+    /// Number of configured endpoints — the pool sizes its shared health
+    /// tracker to this.
+    pub(crate) fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    pub(crate) fn max_buf_size(&self) -> usize {
+        self.max_buf_size
+    }
+
+    pub(crate) fn request_durable_ack(&self) -> bool {
+        *self.qwp_ws.request_durable_ack
+    }
+
+    /// Per-call request timeout parsed from the connect string. The direct
+    /// column backend arms this as the socket read/write timeout; the
+    /// store-and-forward backend uses it as the no-progress deadline in its
+    /// `sync` poll loop so a silent-but-alive peer cannot block the caller
+    /// forever.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        *self.qwp_ws.request_timeout
+    }
+
+    /// Bound on how long the store-and-forward column-sender pool waits for a
+    /// connection's background runner to deliver its queued frames before the
+    /// connection is dropped (pool close / shutdown return). `Duration::ZERO`
+    /// disables the wait. Parsed from `close_flush_timeout_millis`.
+    pub(crate) fn close_flush_timeout(&self) -> Duration {
+        *self.qwp_ws.close_flush_timeout
+    }
+
+    /// Reconnect backoff budget parsed from the connect string's
+    /// `reconnect_*` keys. Only the retry-capable borrow paths consume it
+    /// (the polars `reborrow_with_retry` and the FFI owned `*_with_retry`
+    /// entry points); keep it compiled (so the `ReconnectPolicy` re-export it
+    /// returns stays live) but quiet the dead-code lint when neither is built.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[cfg_attr(
+        not(any(
+            feature = "polars-ingress",
+            feature = "polars-egress",
+            feature = "ffi-support"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn reconnect_policy(&self) -> sender::ReconnectPolicy {
+        sender::ReconnectPolicy::bounded(
+            *self.qwp_ws.reconnect_max_duration,
+            *self.qwp_ws.reconnect_initial_backoff,
+            *self.qwp_ws.reconnect_max_backoff,
+        )
+    }
+
+    /// Pool path: drive the connect round against the *shared* health tracker
+    /// behind `health`, locking it only per tracker operation. The health lock
+    /// is **never** held across
+    /// the blocking TCP/TLS/WS-upgrade handshake, so concurrent cold-start
+    /// borrows no longer serialize end-to-end and dead-sender returns that
+    /// need the same lock are not stalled behind one slow / black-holed
+    /// connect.
+    pub(crate) fn connect_round_pooled(
+        &self,
+        health: &std::sync::Mutex<sender::qwp_ws::QwpWsHostHealthTracker>,
+    ) -> Result<RawQwpWsRoundStream> {
+        self.connect_round_with(sender::qwp_ws::LockedQwpWsHealth::new(health))
+    }
+
+    fn connect_round_with<A: sender::qwp_ws::QwpWsHealthAccess>(
+        &self,
+        health: A,
+    ) -> Result<RawQwpWsRoundStream> {
+        let mut previous_idx = None;
+        let connected = sender::qwp_ws::connect_qwp_ws_endpoint_round(
+            &self.endpoints,
+            health,
+            &mut previous_idx,
+            self.use_tls,
+            self.tls_settings.clone(),
+            &self.qwp_ws,
+            self.auth_header.as_deref(),
+        )?;
+        Ok(RawQwpWsRoundStream {
+            endpoint_idx: connected.endpoint_idx,
+            stream: connected.stream,
+            leftover: connected.leftover,
+            max_buf_size: self.max_buf_size,
+            request_timeout: *self.qwp_ws.request_timeout,
+            durable_ack_opt_in: *self.qwp_ws.request_durable_ack,
+        })
+    }
+
+    pub(crate) fn connect_sfa_background(&self) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
+        sender::qwp_ws::connect_qwp_ws_background_state(
+            self.host.as_str(),
+            self.port.as_str(),
+            self.use_tls,
+            self.tls_settings.clone(),
+            &self.qwp_ws,
+            self.auth_header.clone(),
+        )
+    }
+}
+
+/// One connection opened by `QwpWsConnector::connect_round_pooled`, tagged with the
+/// endpoint index it landed on so the pool can mark that endpoint unhealthy if
+/// the connection later dies.
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) struct RawQwpWsRoundStream {
+    pub(crate) endpoint_idx: usize,
+    pub(crate) stream: sender::qwp_ws::WsStream,
+    pub(crate) leftover: Vec<u8>,
+    pub(crate) max_buf_size: usize,
+    pub(crate) request_timeout: Duration,
+    pub(crate) durable_ack_opt_in: bool,
 }
 
 /// Pre-scan a raw connect string for repeated `addr=...` params. Returns the
@@ -738,11 +903,14 @@ impl SenderBuilder {
 
         // Connect-string keys valid on a `ws::` / `wss::` string that are not
         // matched by an arm below: `addr` (consumed before this loop), the
-        // auto-flush keys (validated by `validate_auto_flush_params`), and the
+        // auto-flush keys (validated by `validate_auto_flush_params`), the
         // egress query-client keys (a single connect string drives both the
-        // sender and the `QwpQueryClient`). Any other key on a QWP/WebSocket
-        // connect string is rejected as unknown. Keys added to either direction
-        // MUST be reflected here or a shared connect string breaks.
+        // sender and the `QwpQueryClient`), and the column-sender pool keys
+        // (`pool_*`, consumed by `QuestDb::connect` before it opens each
+        // per-slot `SenderBuilder::from_conf` connection). Any other key on a
+        // QWP/WebSocket connect string is rejected as unknown. Keys added to
+        // any of these directions MUST be reflected here or a shared connect
+        // string breaks.
         #[cfg(feature = "_sender-qwp-ws")]
         const QWP_WS_PORTABLE_CONFIG_KEYS: &[&str] = &[
             "addr",
@@ -769,6 +937,10 @@ impl SenderBuilder {
             "on_server_error",
             "on_write_error",
             "path",
+            "pool_idle_timeout_ms",
+            "pool_max",
+            "pool_reap",
+            "pool_size",
             "target",
             "zone",
         ];
@@ -827,6 +999,8 @@ impl SenderBuilder {
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
                 "auth_timeout_ms" => builder.qwp_ws_auth_timeout_millis(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "connect_timeout" => builder.qwp_ws_connect_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "close_flush_timeout_millis" => builder.close_flush_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1620,6 +1794,29 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    fn qwp_ws_connect_timeout_millis(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"connect_timeout\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        let millis: i64 = parse_conf_value("connect_timeout", value)?;
+        if millis <= 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "connect_timeout must be > 0: {}",
+                millis
+            ));
+        }
+        qwp_ws.connect_timeout.set_specified(
+            "connect_timeout",
+            Some(Duration::from_millis(millis as u64)),
+        )?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     fn close_flush_timeout_millis(mut self, value: &str) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
@@ -2402,6 +2599,115 @@ impl SenderBuilder {
         );
 
         Ok(sender)
+    }
+
+    /// Resolve the QWP/WebSocket connect ingredients used by
+    /// [`Self::build_qwp_ws_connector`]: validate the protocol / buffer / TLS
+    /// settings, build the TLS config and auth header, and clone the
+    /// (reconnect-promoted, SF-vetted) `QwpWsConfig`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn resolve_qwp_ws_ingredients(
+        &self,
+    ) -> Result<(
+        bool,
+        Option<tls::TlsSettings>,
+        conf::QwpWsConfig,
+        Option<String>,
+    )> {
+        if self.init_buf_size.is_specified() && *self.init_buf_size > *self.max_buf_size {
+            return Err(error::fmt!(
+                ConfigError,
+                "init_buf_size ({}) cannot exceed max_buf_size ({})",
+                *self.init_buf_size,
+                *self.max_buf_size
+            ));
+        }
+
+        if !matches!(self.protocol, Protocol::QwpWs | Protocol::QwpWss) {
+            return Err(error::fmt!(
+                ConfigError,
+                "Column-sender requires a QWP/WebSocket connect string \
+                 (got protocol {:?})",
+                self.protocol
+            ));
+        }
+        if self.net_interface.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "net_interface is not supported for QWP over WebSocket."
+            ));
+        }
+        let Some(qwp_ws) = self.qwp_ws.as_ref() else {
+            return Err(error::fmt!(
+                ConfigError,
+                "QWP/WebSocket configuration is missing."
+            ));
+        };
+
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+        let tls_roots_password = self.tls_roots_password.deref().as_deref();
+
+        if tls_roots_password.is_some() && self.tls_roots.deref().is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"tls_roots_password\" requires \"tls_roots\" \
+                 (the password unlocks the keystore at that path)"
+            ));
+        }
+
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+            tls_roots_password,
+        )?;
+
+        let auth = self.build_auth()?;
+        let auth_header = qwp_ws_auth_header(&auth)?;
+        let mut qwp_ws = qwp_ws.clone();
+        qwp_ws.apply_reconnect_implies_initial_retry();
+        reject_unsupported_qwp_ws_sf_config(&qwp_ws)?;
+        if *qwp_ws.progress == QwpWsProgress::Manual
+            && *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async
+        {
+            return Err(error::fmt!(
+                ConfigError,
+                "initial_connect_retry=async requires QWP/WebSocket background progress; use qwp_ws_progress=background or initial_connect_retry=sync"
+            ));
+        }
+
+        let use_tls = matches!(self.protocol, Protocol::QwpWss);
+        Ok((use_tls, tls_settings, qwp_ws, auth_header))
+    }
+
+    /// Build a reusable [`QwpWsConnector`] capturing the full configured
+    /// endpoint list — the column-major sender's sole entry point into the
+    /// network. The pool drives it through a shared health tracker so each
+    /// connect rotates across endpoints, skips unhealthy ones, and follows
+    /// the writable primary on a role reject; the resulting `WsStream` does
+    /// its own synchronous frame I/O and never touches the row-API publisher
+    /// / driver / queue stack. See `doc/COLUMN_SENDER_PLAN.md`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub(crate) fn build_qwp_ws_connector(&self) -> Result<QwpWsConnector> {
+        let (use_tls, tls_settings, qwp_ws, auth_header) = self.resolve_qwp_ws_ingredients()?;
+        let endpoints = sender::qwp_ws::qwp_ws_configured_endpoints(
+            self.host.as_str(),
+            self.port.as_str(),
+            &qwp_ws,
+        );
+        Ok(QwpWsConnector {
+            host: self.host.to_string(),
+            port: self.port.to_string(),
+            endpoints,
+            use_tls,
+            tls_settings,
+            qwp_ws,
+            auth_header,
+            max_buf_size: *self.max_buf_size,
+        })
     }
 
     #[cfg(any(feature = "_sender-tcp", feature = "_sender-qwp-udp"))]

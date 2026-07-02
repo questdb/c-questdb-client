@@ -114,15 +114,17 @@ Server rejections fall into two categories:
 `flush()` returns once the frame has been appended to the local publication
 log; the FSN is also available via
 [`flush_and_get_fsn()`](Sender::flush_and_get_fsn). To wait for the server
-to durably acknowledge a specific FSN, call
-[`sender.await_acked_fsn()`](Sender::await_acked_fsn).
+to acknowledge every frame published so far, call
+[`sender.wait()`](Sender::wait) with the desired
+[`AckLevel`](crate::ingress::AckLevel) — the row-major counterpart to the
+column-major store-and-forward `wait`.
 [`sender.published_fsn()`](Sender::published_fsn) and
 [`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
 
 In `manual` progress mode no background thread observes the transport.
 Server-side state — including halts — only becomes visible when the user
 calls [`sender.drive_once()`](Sender::drive_once) or any sender method
-that drives the transport (such as `flush` or `await_acked_fsn`). As a
+that drives the transport (such as `flush` or `wait`). As a
 consequence, `must_close()` on an otherwise-idle manual sender does not
 reflect a halt until the next drive.
 

@@ -98,7 +98,38 @@ public:
             protocol_version::v1,
             init_buf_size,
             max_name_len,
-            true};
+            _backend_kind::qwp_udp};
+    }
+
+    /**
+     * Construct a standalone QWP/WebSocket columnar buffer.
+     *
+     * This is the buffer kind a `borrowed_row_sender` requires. When you hold
+     * the row sender, prefer `borrowed_row_sender::new_buffer()`, which
+     * matches the sender's configured name-length cap automatically.
+     */
+    static line_sender_buffer qwp_ws(
+        size_t init_buf_size = 64 * 1024,
+        size_t max_name_len = 127)
+    {
+        auto* raw_buffer =
+            ::line_sender_buffer_new_qwp_ws_with_max_name_len(max_name_len);
+        try
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_reserve, raw_buffer, init_buf_size);
+        }
+        catch (...)
+        {
+            ::line_sender_buffer_free(raw_buffer);
+            throw;
+        }
+        return line_sender_buffer{
+            raw_buffer,
+            protocol_version::v1,
+            init_buf_size,
+            max_name_len,
+            _backend_kind::qwp_ws};
     }
 
     line_sender_buffer(const line_sender_buffer& other)
@@ -110,7 +141,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
     }
@@ -120,7 +151,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _is_qwp{other._is_qwp}
+        , _backend{other._backend}
 
     {
         other._impl = nullptr;
@@ -142,7 +173,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
         }
         return *this;
     }
@@ -156,7 +187,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
-            _is_qwp = other._is_qwp;
+            _backend = other._backend;
             other._impl = nullptr;
         }
         return *this;
@@ -1137,17 +1168,24 @@ public:
     }
 
 private:
+    enum class _backend_kind
+    {
+        ilp,
+        qwp_udp,
+        qwp_ws
+    };
+
     line_sender_buffer(
         ::line_sender_buffer* impl,
         protocol_version version,
         size_t init_buf_size,
         size_t max_name_len,
-        bool is_qwp = false) noexcept
+        _backend_kind backend = _backend_kind::ilp) noexcept
         : _impl{impl}
         , _protocol_version{version}
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
-        , _is_qwp{is_qwp}
+        , _backend{backend}
     {
     }
 
@@ -1156,17 +1194,22 @@ private:
         if (!_impl)
         {
             ::line_sender_buffer* tmp = nullptr;
-            if (_is_qwp)
+            switch (_backend)
             {
+            case _backend_kind::qwp_udp:
                 tmp = ::line_sender_buffer_new_qwp_with_max_name_len(
                     _max_name_len);
-            }
-            else
-            {
+                break;
+            case _backend_kind::qwp_ws:
+                tmp = ::line_sender_buffer_new_qwp_ws_with_max_name_len(
+                    _max_name_len);
+                break;
+            case _backend_kind::ilp:
                 tmp = ::line_sender_buffer_with_max_name_len(
                     static_cast<::line_sender_protocol_version>(
                         static_cast<int>(_protocol_version)),
                     _max_name_len);
+                break;
             }
             try
             {
@@ -1186,9 +1229,13 @@ private:
     protocol_version _protocol_version;
     size_t _init_buf_size;
     size_t _max_name_len;
-    bool _is_qwp{false};
+    _backend_kind _backend{_backend_kind::ilp};
 
     friend class line_sender;
+    // Pool-borrowed row sender (defined in column_sender.hpp); flushes this
+    // buffer through `row_sender_flush`, so it needs the same `_impl` access
+    // as `line_sender`.
+    friend class borrowed_row_sender;
 };
 
 class _user_agent
@@ -1678,6 +1725,21 @@ private:
 };
 
 /**
+ * Acknowledgement level for QWP/WebSocket wait/sync APIs. Mirrors the C
+ * `qwpws_ack_level` values.
+ */
+enum class qwpws_ack_level : uint32_t
+{
+    /** Wait for the server to accept every published frame. */
+    ok = ::qwpws_ack_level_ok,
+
+    /** Wait for durable-ACK coverage. Each wait/sync API documents whether
+     * unavailable durable ACKs are rejected or downgraded to ordinary
+     * acceptance. */
+    durable = ::qwpws_ack_level_durable,
+};
+
+/**
  * Inserts data into QuestDB via the InfluxDB Line Protocol.
  *
  * Batch up rows in a `line_sender_buffer` object, then call
@@ -1791,9 +1853,11 @@ public:
     /**
      * Construct a new line buffer with the sender's configured settings.
      *
-     * This is the preferred protocol-neutral constructor. It may produce a
-     * different buffer implementation than `line_sender_buffer{protocol_version()}`
-     * when the sender uses QWP-over-UDP or QWP-over-WebSocket.
+     * Returns an ILP buffer for the ILP/TCP and ILP/HTTP transports, and a
+     * QWP/UDP buffer for the QWP-over-UDP transport. Throws
+     * `invalid_api_call` for QWP-over-WebSocket transports — those senders
+     * publish through the column-major `column_sender` chunk API instead;
+     * see `<questdb/ingress/column_sender.hpp>`.
      */
     line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {
@@ -1801,9 +1865,17 @@ public:
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto sender_protocol = this->protocol();
-        bool is_qwp = sender_protocol == protocol::qwpudp ||
-            sender_protocol == protocol::qwpws ||
-            sender_protocol == protocol::qwpwss;
+        if (sender_protocol == protocol::qwpws ||
+            sender_protocol == protocol::qwpwss)
+        {
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket senders do not produce row-by-row buffers; "
+                "use the column_sender chunk API instead."};
+        }
+        auto backend = line_sender_buffer::_backend_kind::ilp;
+        if (sender_protocol == protocol::qwpudp)
+            backend = line_sender_buffer::_backend_kind::qwp_udp;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         try
         {
@@ -1816,11 +1888,7 @@ public:
             throw;
         }
         return line_sender_buffer{
-            raw_buffer,
-            version,
-            init_buf_size,
-            max_name_len,
-            is_qwp};
+            raw_buffer, version, init_buf_size, max_name_len, backend};
     }
 
     /**
@@ -1885,6 +1953,13 @@ public:
         }
         else
         {
+            ensure_impl();
+            auto sender_protocol = this->protocol();
+            // A WebSocket sender has no row buffer (new_buffer() rejects it),
+            // so an absent buffer here is simply nothing to flush.
+            if (sender_protocol == protocol::qwpws ||
+                sender_protocol == protocol::qwpwss)
+                return;
             line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep, _impl, buffer2._impl);
@@ -1928,6 +2003,13 @@ public:
         }
         else
         {
+            ensure_impl();
+            auto sender_protocol = this->protocol();
+            // A WebSocket sender has no row buffer (new_buffer() rejects it),
+            // so an absent buffer here is simply nothing to flush.
+            if (sender_protocol == protocol::qwpws ||
+                sender_protocol == protocol::qwpwss)
+                return;
             line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep_with_flags,
@@ -1973,7 +2055,13 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2 = this->new_buffer(0);
+            // Mirror flush_and_get_fsn's may_init path; new_buffer() rejects
+            // WebSocket senders.
+            line_sender_buffer buffer2{
+                this->protocol_version(),
+                0,
+                ::line_sender_get_max_name_len(_impl)};
+            buffer2.may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_qwpws_flush_and_keep_and_get_fsn,
                 _impl,
@@ -2010,22 +2098,28 @@ public:
     }
 
     /**
-     * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
-     * Returns false on timeout.
+     * Wait until every QWP/WebSocket frame published so far reaches
+     * `ack_level`. Row-major counterpart to the column-major
+     * store-and-forward wait. `timeout` is a no-progress deadline (it fires
+     * only if the ack watermark fails to advance for that long); the default
+     * of zero waits indefinitely. Throws on the no-progress timeout, a server
+     * rejection, or a transport failure; returns immediately when nothing has
+     * been published yet.
      */
-    bool await_acked_fsn(
-        uint64_t fsn, std::chrono::milliseconds timeout)
+    void wait(
+        qwpws_ack_level ack_level = qwpws_ack_level::ok,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
     {
         ensure_impl();
-        const auto timeout_millis = checked_timeout_millis(timeout);
-        bool reached = false;
+        if (timeout.count() < 0)
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket wait timeout must not be negative."};
         line_sender_error::wrapped_call(
-            ::line_sender_qwpws_await_acked_fsn,
+            ::line_sender_qwpws_wait,
             _impl,
-            fsn,
-            timeout_millis,
-            &reached);
-        return reached;
+            static_cast<uint32_t>(ack_level),
+            static_cast<uint64_t>(timeout.count()));
     }
 
     /**
@@ -2133,16 +2227,6 @@ private:
         if (fsn.has_value)
             return fsn.value;
         return std::nullopt;
-    }
-
-    static uint64_t checked_timeout_millis(
-        std::chrono::milliseconds timeout)
-    {
-        if (timeout.count() < 0)
-            throw line_sender_error{
-                line_sender_error_code::invalid_api_call,
-                "QWP/WebSocket ACK timeout must not be negative."};
-        return static_cast<uint64_t>(timeout.count());
     }
 
     void ensure_impl() const

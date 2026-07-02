@@ -43,7 +43,7 @@ stages:
         pool:
           name: $(poolName)
           vmImage: $(imageName)
-        timeoutInMinutes: 60
+        timeoutInMinutes: 90
         steps:
           - checkout: self
             fetchDepth: 1
@@ -52,27 +52,38 @@ stages:
           - template: templates/compile.yaml
           - script: |
               cd questdb-rs
-              cargo build --examples --features almost-all-features
+              cargo build --examples --features almost-all-features,arrow,polars
             displayName: "Build Rust examples"
-          ############################# temp for test begin #####################
-          #- script: |
-          #    git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
-          #  displayName: git clone questdb
-          #- task: Maven@3
-          #  displayName: "Compile QuestDB"
-          #  inputs:
-          #    mavenPOMFile: "questdb/pom.xml"
-          #    jdkVersionOption: "1.17"
-          #    options: "-DskipTests -Pbuild-web-console"
-          ############################# temp for test end #####################
+          # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
+          # Drop once QWP/Arrow ships in a release (revert to `--versions`).
+          - template: templates/clone_questdb.yaml
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME_25_X64)"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
           - script: python3 ci/run_all_tests.py
             env:
-              JAVA_HOME: $(JAVA_HOME_17_X64)
+              JAVA_HOME: $(JAVA_HOME_25_X64)
             displayName: "Tests"
           # - task: PublishBuildArtifacts@1
           #   inputs:
           #     pathToPublish: ./build
           #   displayName: "Publish build directory"
+      - job: VersionMatrix
+        displayName: "arrow/polars version-range tests (linux)"
+        pool:
+          vmImage: "ubuntu-latest"
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: python3 ci/run_version_matrix.py
+            displayName: "questdb-rs: pinned arrow/polars versions"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:
@@ -171,9 +182,9 @@ stages:
       #
       # Scope note: the nightly image is Linux/amd64 only, so the
       # mac/windows fuzz legs stay from-source, as does any run that must
-      # test a specific commit not yet in nightly. QWP UDP is not
-      # exercised here (it is gated on `--repo` in test.py); that
-      # coverage still runs in the from-source jobs.
+      # test a specific commit not yet in nightly. QWP/UDP runs here too:
+      # the matrix enables the server's qwp.udp receiver (qwp_udp=True in
+      # test.py), and the from-source jobs cover it as well.
       - job: TestVsQuestDBNightly
         displayName: "Vs QuestDB nightly (docker)"
         pool:
@@ -270,6 +281,9 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowIngressSfa TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
+            displayName: "TestArrowWsFuzz"
           # Mirrors ci/run_fuzz_pipeline.yaml: on failure, archive and
           # publish the QuestDB server log so PR reviewers don't have to
           # repro locally. Path comes from system_test/fixture.py:_log_path.
@@ -317,7 +331,8 @@ stages:
           - bash: |
               set -eux
               sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cmake python3-numpy
+              sudo apt-get install -y --no-install-recommends cmake python3-numpy python3-pip
+              sudo python3 -m pip install --break-system-packages pyarrow polars
               JAVA_PATH_17="/usr/lib/jvm/java-17-openjdk-amd64"
               JAVA_PATH_25="/usr/lib/jvm/java-25-openjdk-amd64"
               for p in "$JAVA_PATH_17" "$JAVA_PATH_25"; do
@@ -367,6 +382,9 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb TestQwpWsFuzz -v
             displayName: "TestQwpWsFuzz"
+          - script: |
+              python3 system_test/test.py run --repo ./questdb TestArrowEgressFuzz TestArrowEgressPerKind TestArrowEgressEmpty TestArrowIngressFuzz TestArrowIngressPerKind TestArrowIngressDesignatedTs TestArrowIngressErrors TestArrowIngressMultiBatch TestArrowIngressExtraTypes TestArrowIngressUnsupportedTypes TestArrowIngressSfa TestArrowRoundTripFuzz TestArrowRoundTripPerKind TestArrowAlignment TestArrowPolarsFuzz TestArrowPolarsRoundTripPerKind TestArrowPolarsPerDtype -v
+            displayName: "TestArrowWsFuzz"
           - task: ArchiveFiles@2
             displayName: "Compress QuestDB server log on failure"
             condition: failed()
@@ -396,6 +414,8 @@ stages:
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 30
+        variables:
+          imageName: ubuntu-latest
         steps:
           - checkout: self
             fetchDepth: 1
