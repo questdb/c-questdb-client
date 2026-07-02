@@ -3956,6 +3956,42 @@ mod tests {
     }
 
     #[test]
+    fn normal_close_is_reconnectable_role_movement_shape() {
+        let mut frames = Vec::new();
+        append_server_frame(&mut frames, true, WS_OPCODE_CLOSE, &1000u16.to_be_bytes());
+        let mut stream = InMemoryWs::new(frames);
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+
+        let err = read_message_with_close(&mut stream, &mut scratch, &mut out).unwrap_err();
+
+        match err {
+            WsMessageError::Close(close) => {
+                assert_eq!(close.code, Some(1000));
+                assert!(close.reason.is_empty());
+                assert!(!is_terminal_ws_close_code(1000));
+            }
+            other => panic!("expected normal close, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_protocol_terminal_close_codes_halt_sender() {
+        for code in [1002, 1003, 1007, 1008, 1009, 1010] {
+            assert!(
+                is_terminal_ws_close_code(code),
+                "close code {code} must stay terminal"
+            );
+        }
+        for code in [1000, 1001, 1011, 1012, 1013, 1014] {
+            assert!(
+                !is_terminal_ws_close_code(code),
+                "close code {code} must remain reconnectable"
+            );
+        }
+    }
+
+    #[test]
     fn read_message_preserves_fragment_across_ping() {
         let mut frames = Vec::new();
         append_server_frame(&mut frames, false, WS_OPCODE_BINARY, b"hello ");
