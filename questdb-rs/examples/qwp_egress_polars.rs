@@ -150,7 +150,10 @@ fn build_dataframe(
             );
         }
     }
-    Ok(DataFrame::new_with_height(rows, columns)?)
+    // Height-explicit DataFrame constructor. On polars >=0.53 it's the two-arg
+    // `DataFrame::new(height, columns)`; on 0.52 it was `new_with_height` (0.52's
+    // `new` took columns only).
+    Ok(DataFrame::new(rows, columns)?)
 }
 
 // ---------------------------------------------------------------------------

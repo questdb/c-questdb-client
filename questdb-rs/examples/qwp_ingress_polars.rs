@@ -229,7 +229,10 @@ fn build_dataframe(kind: SchemaKind, data: &BenchData) -> Result<DataFrame, Box<
             columns.push(symbol_series(S_NAMES[i], sc)?.into_column());
         }
     }
-    Ok(DataFrame::new_with_height(data.rows, columns)?)
+    // Height-explicit DataFrame constructor. On polars >=0.53 it's the two-arg
+    // `DataFrame::new(height, columns)`; on 0.52 it was `new_with_height` (0.52's
+    // `new` took columns only).
+    Ok(DataFrame::new(data.rows, columns)?)
 }
 
 /// Build the matching column-sender [`Chunk`] for the encode floor. Same

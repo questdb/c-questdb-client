@@ -28,7 +28,10 @@ fn build_df() -> DataFrame {
         PlSmallStr::from("amount"),
         &[0.00044, 0.0012, 0.00050, 0.0008],
     );
-    DataFrame::new_with_height(
+    // Height-explicit DataFrame constructor. On polars >=0.53 it's the two-arg
+    // `DataFrame::new(height, columns)`; on 0.52 it was `new_with_height` (0.52's
+    // `new` took columns only).
+    DataFrame::new(
         4,
         vec![
             symbol.into_column(),
@@ -83,7 +86,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("shape:  {:?} (rows × cols)", back.shape());
     println!("schema: {:?}", back.schema());
     println!("n_chunks per column:");
-    for col in back.get_columns() {
+    // `DataFrame::columns()` returns the column slice on polars >=0.53; 0.52
+    // named it `get_columns()`.
+    for col in back.columns() {
         println!("  {:>8} → {} chunk(s)", col.name(), col.n_chunks());
     }
     println!("{back}");
