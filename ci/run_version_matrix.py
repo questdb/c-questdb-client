@@ -46,7 +46,8 @@ def pin_and_test(label, pins):
     LOCK.unlink(missing_ok=True)
     try:
         sys.stderr.write(f'=== version matrix: {label} ===\n')
-        run('cargo', 'test', FEATURES, '--', '--nocapture')
+        # `--lib --tests` skips examples: they target the newest polars only.
+        run('cargo', 'test', '--lib', '--tests', FEATURES, '--', '--nocapture')
     finally:
         TOML.write_text(original)
         LOCK.unlink(missing_ok=True)
