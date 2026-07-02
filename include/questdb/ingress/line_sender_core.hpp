@@ -367,11 +367,11 @@ private:
     friend class line_sender;
     friend class line_sender_buffer;
     friend class opts;
-    friend class sf_column_sender_conn;
+    friend class column_sender_view;
     friend class column_chunk;
     friend class arrow_import;
     friend class pool;
-    friend class borrowed_sf_column_sender;
+    friend class borrowed_column_sender;
     friend class borrowed_row_sender;
 
     template <

@@ -55,13 +55,13 @@ bool example(const std::string& host, const std::string& port)
         ::line_sender_error_free(err);
         return false;
     }
-    ::sf_column_sender* raw_conn = ::questdb_db_borrow_sf_column_sender(db, &err);
-    if (!raw_conn)
+    ::column_sender* raw_sender = ::questdb_db_borrow_column_sender(db, &err);
+    if (!raw_sender)
     {
         size_t err_len = 0;
         const char* err_msg = ::line_sender_error_msg(err, &err_len);
         std::fprintf(
-            stderr, "questdb_db_borrow_sf_column_sender: %.*s\n",
+            stderr, "questdb_db_borrow_column_sender: %.*s\n",
             static_cast<int>(err_len), err_msg);
         ::line_sender_error_free(err);
         ::questdb_db_close(db);
@@ -95,15 +95,15 @@ bool example(const std::string& host, const std::string& port)
         else
         {
             arrow_c_guard guard{c_arr, c_sch};
-            qdb::sf_column_sender_conn conn{raw_conn};
-            conn.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
-            if (!::sf_column_sender_wait(
-                    raw_conn, ::qwpws_ack_level_ok, 0, &err))
+            qdb::column_sender_view sender_view{raw_sender};
+            sender_view.flush_arrow_batch("cpp_arrow_trades"_tn, c_arr, c_sch, "ts"_cn);
+            if (!::column_sender_wait(
+                    raw_sender, ::qwpws_ack_level_ok, 0, &err))
             {
                 size_t err_len = 0;
                 const char* err_msg = ::line_sender_error_msg(err, &err_len);
                 std::fprintf(
-                    stderr, "sf_column_sender_wait: %.*s\n",
+                    stderr, "column_sender_wait: %.*s\n",
                     static_cast<int>(err_len), err_msg);
                 ::line_sender_error_free(err);
             }
@@ -118,7 +118,7 @@ bool example(const std::string& host, const std::string& port)
         std::fprintf(stderr, "Error: %s\n", e.what());
     }
 
-    ::questdb_db_return_sf_column_sender(db, raw_conn);
+    ::questdb_db_return_column_sender(db, raw_sender);
     ::questdb_db_close(db);
     return ok;
 }

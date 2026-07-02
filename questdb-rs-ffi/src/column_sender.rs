@@ -63,11 +63,11 @@ use crate::{
 pub struct questdb_db(pub(crate) QuestDb);
 
 /// Borrowed store-and-forward QWP/WS connection. Owns a pool slot until
-/// `questdb_db_return_sf_column_sender` or `questdb_db_drop_sf_column_sender`
+/// `questdb_db_return_column_sender` or `questdb_db_drop_column_sender`
 /// is called. Bundles the per-connection schema registry and symbol-dict state
 /// used by all writer modes.
 ///
-/// **Not thread-safe.** An `sf_column_sender*` or `direct_column_sender*`
+/// **Not thread-safe.** An `column_sender*` or `direct_column_sender*`
 /// handle must not be used from more than one thread at a time. The second
 /// tuple field is a CAS-checked latch on every FFI entry (mutation, accessor,
 /// and free); a non-blocking contending caller observes
@@ -83,19 +83,19 @@ pub struct questdb_db(pub(crate) QuestDb);
 /// guard can be evaluated.
 ///
 /// Callers must still ensure happens-before ordering between the last
-/// FFI call on `conn` and the matching return/drop call - e.g. by confining
-/// `conn` to a single thread, or by an external barrier - so the latch's CAS
+/// FFI call on `sender` and the matching return/drop call - e.g. by confining
+/// `sender` to a single thread, or by an external barrier - so the latch's CAS
 /// sees the close intent. A true concurrent free without such ordering is
 /// undefined behavior.
-pub struct sf_column_sender(OwnedColumnSender, AtomicU32);
+pub struct column_sender(OwnedColumnSender, AtomicU32);
 
-/// Direct (pipelined, non-store-and-forward) sibling of [`sf_column_sender`],
+/// Direct (pipelined, non-store-and-forward) sibling of [`column_sender`],
 /// borrowed from the always-direct pool via
 /// `questdb_db_borrow_direct_column_sender`. Same single-threaded /
-/// reentrancy-latch contract as [`sf_column_sender`]; it exposes
+/// reentrancy-latch contract as [`column_sender`]; it exposes
 /// `direct_column_sender_flush` + `direct_column_sender_flush_and_wait` +
 /// `direct_column_sender_commit` instead of the store-and-forward
-/// `sf_column_sender_flush` + `sf_column_sender_wait`.
+/// `column_sender_flush` + `column_sender_wait`.
 pub struct direct_column_sender(OwnedColumnSender, AtomicU32);
 
 /// Shared accessor over the two structurally-identical column-sender handle
@@ -114,8 +114,8 @@ trait CsHandle: FfiHandle + Sized {
     unsafe fn latch<'a>(this: *const Self) -> &'a AtomicU32;
 }
 
-impl CsHandle for sf_column_sender {
-    const TYPE_NAME: &'static str = "sf_column_sender";
+impl CsHandle for column_sender {
+    const TYPE_NAME: &'static str = "column_sender";
     unsafe fn owned_mut<'a>(this: *mut Self) -> &'a mut OwnedColumnSender {
         unsafe { &mut (*this).0 }
     }
@@ -185,7 +185,7 @@ impl FfiHandle for column_sender_arrow_import {
     unsafe fn on_deferred_close(_handle: *mut Self, _latch_prev: u32) {}
 }
 
-impl FfiHandle for sf_column_sender {
+impl FfiHandle for column_sender {
     unsafe fn on_deferred_close(handle: *mut Self, latch_prev: u32) {
         if latch_prev & LATCH_DROP != 0 {
             unsafe { (*handle).0.get_mut().mark_must_close() };
@@ -279,11 +279,11 @@ unsafe fn finalize_or_defer<T: FfiHandle>(handle: *mut T, state: *const AtomicU3
 }
 
 unsafe fn reject_closed_pool_cs<T: CsHandle>(
-    conn: *const T,
+    sender: *const T,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    if unsafe { T::owned_ref(conn).pool_closed() } {
+    if unsafe { T::owned_ref(sender).pool_closed() } {
         unsafe {
             set_err_out_from_error(
                 err_out,
@@ -622,7 +622,7 @@ pub unsafe extern "C" fn questdb_db_close(db: *mut questdb_db) {
 
 /// Shared borrow body for both handle flavors: NULL-checks `db`, runs the
 /// owned-borrow closure, and boxes the result into the right opaque handle
-/// (`make` is the tuple-struct constructor, e.g. `sf_column_sender`).
+/// (`make` is the tuple-struct constructor, e.g. `column_sender`).
 unsafe fn borrow_cs<T>(
     db: *mut questdb_db,
     fn_name: &str,
@@ -656,17 +656,17 @@ unsafe fn borrow_cs<T>(
 /// `doc/COLUMN_SENDER_FFI_ABI.md` §4.3 for the selection rules. Returns
 /// NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_sf_column_sender(
+pub unsafe extern "C" fn questdb_db_borrow_column_sender(
     db: *mut questdb_db,
     err_out: *mut *mut line_sender_error,
-) -> *mut sf_column_sender {
+) -> *mut column_sender {
     unsafe {
         borrow_cs(
             db,
-            "questdb_db_borrow_sf_column_sender",
+            "questdb_db_borrow_column_sender",
             err_out,
             questdb::ffi_support::borrow_column_sender_owned,
-            sf_column_sender,
+            column_sender,
         )
     }
 }
@@ -689,21 +689,21 @@ pub unsafe extern "C" fn questdb_db_borrow_direct_column_sender(
     }
 }
 
-/// Like `questdb_db_borrow_sf_column_sender` but retries the connect within
+/// Like `questdb_db_borrow_column_sender` but retries the connect within
 /// `budget_ms` using the row sender's reconnect backoff (centered-jittered
 /// exponential with a role-reject reset; `AuthError` / protocol-version errors
 /// are terminal). `budget_ms == 0` makes a single attempt (no retry). Returns
 /// NULL on failure; sets `*err_out` if provided.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_borrow_sf_column_sender_with_retry(
+pub unsafe extern "C" fn questdb_db_borrow_column_sender_with_retry(
     db: *mut questdb_db,
     budget_ms: u64,
     err_out: *mut *mut line_sender_error,
-) -> *mut sf_column_sender {
+) -> *mut column_sender {
     unsafe {
         borrow_cs(
             db,
-            "questdb_db_borrow_sf_column_sender_with_retry",
+            "questdb_db_borrow_column_sender_with_retry",
             err_out,
             |q| {
                 questdb::ffi_support::borrow_column_sender_owned_with_retry(
@@ -711,7 +711,7 @@ pub unsafe extern "C" fn questdb_db_borrow_sf_column_sender_with_retry(
                     std::time::Duration::from_millis(budget_ms),
                 )
             },
-            sf_column_sender,
+            column_sender,
         )
     }
 }
@@ -754,68 +754,68 @@ pub unsafe extern "C" fn questdb_db_reconnect_max_duration_ms(db: *const questdb
         .unwrap_or(u64::MAX)
 }
 
-/// Return a borrowed conn to the pool. Invalidates `conn`. Accepts NULL
-/// and no-ops. `db` is ignored — kept in the ABI for symmetry. If the conn
-/// has latched terminal state, or if the pool has been closed, the conn is
+/// Return a borrowed sender to the pool. Invalidates `sender`. Accepts NULL
+/// and no-ops. `db` is ignored — kept in the ABI for symmetry. If the sender
+/// has latched terminal state, or if the pool has been closed, the sender is
 /// closed instead of recycled.
 ///
 /// A racing in-flight call on the same handle defers the drop to that
 /// call's exit path, which performs the actual `Box::from_raw`. This
 /// covers only the concurrent in-flight-call-vs-free race. It is NOT a
 /// double-free guard: mutually exclusive with the matching drop entry point on
-/// the same `conn` - call exactly one of return/drop. Calling both (or either
+/// the same `sender` - call exactly one of return/drop. Calling both (or either
 /// twice) is UB.
-unsafe fn return_or_drop_cs<T: CsHandle>(conn: *mut T, extra: u32) {
-    if conn.is_null() {
+unsafe fn return_or_drop_cs<T: CsHandle>(sender: *mut T, extra: u32) {
+    if sender.is_null() {
         return;
     }
-    let state: *const AtomicU32 = unsafe { T::latch(conn) };
-    unsafe { finalize_or_defer(conn, state, extra) };
+    let state: *const AtomicU32 = unsafe { T::latch(sender) };
+    unsafe { finalize_or_defer(sender, state, extra) };
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_return_sf_column_sender(
+pub unsafe extern "C" fn questdb_db_return_column_sender(
     _db: *mut questdb_db,
-    conn: *mut sf_column_sender,
+    sender: *mut column_sender,
 ) {
-    unsafe { return_or_drop_cs(conn, 0) };
+    unsafe { return_or_drop_cs(sender, 0) };
 }
 
-/// Direct-handle counterpart of `questdb_db_return_sf_column_sender`.
+/// Direct-handle counterpart of `questdb_db_return_column_sender`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_return_direct_column_sender(
     _db: *mut questdb_db,
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
 ) {
-    unsafe { return_or_drop_cs(conn, 0) };
+    unsafe { return_or_drop_cs(sender, 0) };
 }
 
-/// Force-drop a borrowed conn instead of recycling it. Marks the conn terminal
+/// Force-drop a borrowed sender instead of recycling it. Marks the sender terminal
 /// so the underlying backend is removed from the pool. In store-and-forward
 /// mode with `sf_dir`, unresolved frames remain in the spool for replay by the
 /// next owner; without `sf_dir`, force-dropping may discard undelivered queued
-/// frames after the bounded close drain. Call `sf_column_sender_wait` before
+/// frames after the bounded close drain. Call `column_sender_wait` before
 /// drop if those frames must be delivered. Accepts NULL and no-ops. As with
-/// `questdb_db_return_sf_column_sender`, a racing in-flight call defers the
+/// `questdb_db_return_column_sender`, a racing in-flight call defers the
 /// drop to that call's exit path; this covers only the concurrent
 /// in-flight-call-vs-free race. Mutually exclusive with
-/// `questdb_db_return_sf_column_sender` on the same `conn` - call exactly one
+/// `questdb_db_return_column_sender` on the same `sender` - call exactly one
 /// of the two. Calling both (or either twice) is UB.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn questdb_db_drop_sf_column_sender(
+pub unsafe extern "C" fn questdb_db_drop_column_sender(
     _db: *mut questdb_db,
-    conn: *mut sf_column_sender,
+    sender: *mut column_sender,
 ) {
-    unsafe { return_or_drop_cs(conn, LATCH_DROP) };
+    unsafe { return_or_drop_cs(sender, LATCH_DROP) };
 }
 
-/// Direct-handle counterpart of `questdb_db_drop_sf_column_sender`.
+/// Direct-handle counterpart of `questdb_db_drop_column_sender`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn questdb_db_drop_direct_column_sender(
     _db: *mut questdb_db,
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
 ) {
-    unsafe { return_or_drop_cs(conn, LATCH_DROP) };
+    unsafe { return_or_drop_cs(sender, LATCH_DROP) };
 }
 
 /// Manually reap idle connections. Returns the number of connections
@@ -2580,30 +2580,30 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
 /// Call [`column_sender_sync`] after the last flush to drain all
 /// remaining in-flight acks.
 unsafe fn cs_flush_body<T: CsHandle>(
-    conn: *mut T,
+    sender: *mut T,
     chunk: *mut column_sender_chunk,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    if conn.is_null() {
+    if sender.is_null() {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    format!("{fn_name}: conn pointer is NULL"),
+                    format!("{fn_name}: sender pointer is NULL"),
                 ),
             );
         }
         return false;
     }
     let _conn_guard = match unsafe {
-        InUseGuard::acquire(conn, T::latch(conn), fn_name, T::TYPE_NAME, err_out)
+        InUseGuard::acquire(sender, T::latch(sender), fn_name, T::TYPE_NAME, err_out)
     } {
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, fn_name, err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
     if chunk.is_null() {
@@ -2621,45 +2621,45 @@ unsafe fn cs_flush_body<T: CsHandle>(
         Some(g) => g,
         None => return false,
     };
-    let sender = unsafe { T::owned_mut(conn).get_mut() };
+    let sender = unsafe { T::owned_mut(sender).get_mut() };
     let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(err_out, sender.flush(chunk_inner));
     true
 }
 
 /// Publish-only flush into the store-and-forward queue. Returns as soon as the
-/// frame is accepted locally; call `sf_column_sender_wait` to block for the
+/// frame is accepted locally; call `column_sender_wait` to block for the
 /// server ack.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_flush(
-    conn: *mut sf_column_sender,
+pub unsafe extern "C" fn column_sender_flush(
+    sender: *mut column_sender,
     chunk: *mut column_sender_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { cs_flush_body(conn, chunk, "sf_column_sender_flush", err_out) }
+    unsafe { cs_flush_body(sender, chunk, "column_sender_flush", err_out) }
 }
 
 /// Publish-only store-and-forward flush that also returns the local frame
 /// sequence boundary. If a chunk is split into multiple frames, the returned
 /// FSN is the final frame boundary.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_flush_and_get_fsn(
-    conn: *mut sf_column_sender,
+pub unsafe extern "C" fn column_sender_flush_and_get_fsn(
+    sender: *mut column_sender,
     chunk: *mut column_sender_chunk,
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let fn_name = "sf_column_sender_flush_and_get_fsn";
+    let fn_name = "column_sender_flush_and_get_fsn";
     if unsafe { reject_null_fsn_out(fsn_out, fn_name, err_out) } {
         return false;
     }
-    if conn.is_null() {
+    if sender.is_null() {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    format!("{fn_name}: conn pointer is NULL"),
+                    format!("{fn_name}: sender pointer is NULL"),
                 ),
             );
         }
@@ -2667,17 +2667,17 @@ pub unsafe extern "C" fn sf_column_sender_flush_and_get_fsn(
     }
     let _conn_guard = match unsafe {
         InUseGuard::acquire(
-            conn,
-            sf_column_sender::latch(conn),
+            sender,
+            column_sender::latch(sender),
             fn_name,
-            "sf_column_sender",
+            "column_sender",
             err_out,
         )
     } {
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, fn_name, err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
     if chunk.is_null() {
@@ -2695,7 +2695,7 @@ pub unsafe extern "C" fn sf_column_sender_flush_and_get_fsn(
         Some(g) => g,
         None => return false,
     };
-    let sender = unsafe { sf_column_sender::owned_mut(conn).get_mut() };
+    let sender = unsafe { column_sender::owned_mut(sender).get_mut() };
     let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     match sender.flush_and_get_fsn(chunk_inner) {
         Ok(fsn) => {
@@ -2711,8 +2711,8 @@ pub unsafe extern "C" fn sf_column_sender_flush_and_get_fsn(
     }
 }
 
-unsafe fn sf_column_sender_fsn_watermark(
-    conn: *const sf_column_sender,
+unsafe fn column_sender_fsn_watermark(
+    sender: *const column_sender,
     fsn_out: *mut line_sender_qwpws_fsn,
     fn_name: &str,
     err_out: *mut *mut line_sender_error,
@@ -2721,35 +2721,35 @@ unsafe fn sf_column_sender_fsn_watermark(
     if unsafe { reject_null_fsn_out(fsn_out, fn_name, err_out) } {
         return false;
     }
-    if conn.is_null() {
+    if sender.is_null() {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    format!("{fn_name}: conn pointer is NULL"),
+                    format!("{fn_name}: sender pointer is NULL"),
                 ),
             );
         }
         return false;
     }
-    let handle = conn as *mut sf_column_sender;
+    let handle = sender as *mut column_sender;
     let _guard = match unsafe {
         InUseGuard::acquire(
             handle,
-            sf_column_sender::latch(conn),
+            column_sender::latch(sender),
             fn_name,
-            "sf_column_sender",
+            "column_sender",
             err_out,
         )
     } {
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, fn_name, err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
-    let sender = unsafe { sf_column_sender::owned_ref(conn).get() };
+    let sender = unsafe { column_sender::owned_ref(sender).get() };
     match read(sender) {
         Ok(fsn) => {
             unsafe {
@@ -2768,16 +2768,16 @@ unsafe fn sf_column_sender_fsn_watermark(
 /// through this store-and-forward column sender, or no value if no frame has
 /// been published.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_published_fsn(
-    conn: *const sf_column_sender,
+pub unsafe extern "C" fn column_sender_published_fsn(
+    sender: *const column_sender,
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
-        sf_column_sender_fsn_watermark(
-            conn,
+        column_sender_fsn_watermark(
+            sender,
             fsn_out,
-            "sf_column_sender_published_fsn",
+            "column_sender_published_fsn",
             err_out,
             |sender| sender.published_fsn(),
         )
@@ -2787,16 +2787,16 @@ pub unsafe extern "C" fn sf_column_sender_published_fsn(
 /// Return the highest QWP/WebSocket frame sequence number completed by ACK or
 /// drop-and-continue rejection, or no value if no frame has completed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_acked_fsn(
-    conn: *const sf_column_sender,
+pub unsafe extern "C" fn column_sender_acked_fsn(
+    sender: *const column_sender,
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
-        sf_column_sender_fsn_watermark(
-            conn,
+        column_sender_fsn_watermark(
+            sender,
             fsn_out,
-            "sf_column_sender_acked_fsn",
+            "column_sender_acked_fsn",
             err_out,
             |sender| sender.acked_fsn(),
         )
@@ -2807,11 +2807,11 @@ pub unsafe extern "C" fn sf_column_sender_acked_fsn(
 /// `direct_column_sender_commit` / `direct_column_sender_flush_and_wait`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush(
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
     chunk: *mut column_sender_chunk,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { cs_flush_body(conn, chunk, "direct_column_sender_flush", err_out) }
+    unsafe { cs_flush_body(sender, chunk, "direct_column_sender_flush", err_out) }
 }
 
 /// Publish `chunk` as a completion boundary, then **wait** until every frame
@@ -2828,17 +2828,17 @@ pub unsafe extern "C" fn direct_column_sender_flush(
 /// Failure contract: if the call fails before publication, `chunk` is left
 /// untouched and retryable. Once the frame is published `chunk` is cleared even
 /// if the ACK wait then fails — delivery of that frame is **unknown** and the
-/// conn should be dropped/re-borrowed per the error class. There is no internal
+/// sender should be dropped/re-borrowed per the error class. There is no internal
 /// failover retry.
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 /// Direct-only combined publish+commit. Publishes `chunk` as a non-deferred
 /// commit boundary and waits for `ack_level`. (The store-and-forward handle
-/// has no combined form: use `sf_column_sender_flush` then
-/// `sf_column_sender_wait`.)
+/// has no combined form: use `column_sender_flush` then
+/// `column_sender_wait`.)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
     chunk: *mut column_sender_chunk,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
@@ -2848,13 +2848,13 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
         None => return false,
     };
     let fn_name = "direct_column_sender_flush_and_wait";
-    if conn.is_null() {
+    if sender.is_null() {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    format!("{fn_name}: conn pointer is NULL"),
+                    format!("{fn_name}: sender pointer is NULL"),
                 ),
             );
         }
@@ -2862,8 +2862,8 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
     }
     let _conn_guard = match unsafe {
         InUseGuard::acquire(
-            conn,
-            direct_column_sender::latch(conn),
+            sender,
+            direct_column_sender::latch(sender),
             fn_name,
             "direct_column_sender",
             err_out,
@@ -2872,7 +2872,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, fn_name, err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
     if chunk.is_null() {
@@ -2890,14 +2890,14 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
         Some(g) => g,
         None => return false,
     };
-    let sender = unsafe { direct_column_sender::owned_mut(conn).get_mut() };
+    let sender = unsafe { direct_column_sender::owned_mut(sender).get_mut() };
     let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(err_out, sender.flush_and_wait(chunk_inner, ack_level));
     true
 }
 
 /// Encode an Apache Arrow `RecordBatch` (Arrow C Data Interface) as a
-/// single QWP/WebSocket frame for `table` and publish it through `conn`
+/// single QWP/WebSocket frame for `table` and publish it through `sender`
 /// in one pass — no intermediate buffer staging, no per-column copy.
 ///
 /// `array` may be either a Struct array (one child per column, standard
@@ -2916,7 +2916,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
 /// provably-not-delivered** (`line_sender_error_failover_retry` with
 /// `line_sender_error_in_doubt == false`) failure `array` is left intact
 /// (re-exported back into `*array` with a fresh `release`) so the caller
-/// can drop+re-borrow a live conn and retry with the same array. A
+/// can drop+re-borrow a live sender and retry with the same array. A
 /// delivery-unknown failure (a partial write that fails mid-frame: also
 /// `line_sender_error_failover_retry` but with `line_sender_error_in_doubt ==
 /// true`) is **not** re-exported, since replaying it could duplicate rows. On
@@ -2935,8 +2935,8 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
 /// `_geohash` — carries `arg` outside `1..=60`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now(
-    conn: *mut sf_column_sender,
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_now(
+    sender: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -2946,7 +2946,7 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -2958,13 +2958,13 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now(
     }
 }
 
-/// FSN-returning counterpart of `sf_column_sender_flush_arrow_batch_at_now`.
+/// FSN-returning counterpart of `column_sender_flush_arrow_batch_at_now`.
 /// Local publication semantics and Arrow ownership are the same as the
 /// non-FSN variant.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
-    conn: *mut sf_column_sender,
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_now_and_get_fsn(
+    sender: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -2975,7 +2975,7 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_get_fsn(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -2994,7 +2994,7 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now(
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3004,7 +3004,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -3023,8 +3023,8 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now(
 /// the Unix epoch. Same ownership and `overrides` contract.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column(
-    conn: *mut sf_column_sender,
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column(
+    sender: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3035,7 +3035,7 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -3048,11 +3048,11 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column(
 }
 
 /// FSN-returning counterpart of
-/// `sf_column_sender_flush_arrow_batch_at_column`.
+/// `column_sender_flush_arrow_batch_at_column`.
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column_and_get_fsn(
-    conn: *mut sf_column_sender,
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_and_get_fsn(
+    sender: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3064,7 +3064,7 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column_and_get_fs
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_get_fsn(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -3083,7 +3083,7 @@ pub unsafe extern "C" fn sf_column_sender_flush_arrow_batch_at_column_and_get_fs
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3094,7 +3094,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
 ) -> bool {
     unsafe {
         arrow_batch_impl(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -3128,7 +3128,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column(
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now_and_wait(
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3139,7 +3139,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now_and_wait(
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_wait(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -3159,7 +3159,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_now_and_wait(
 #[cfg(feature = "arrow")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column_and_wait(
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3171,7 +3171,7 @@ pub unsafe extern "C" fn direct_column_sender_flush_arrow_batch_at_column_and_wa
 ) -> bool {
     unsafe {
         arrow_batch_impl_and_wait(
-            conn,
+            sender,
             table,
             array,
             schema,
@@ -3346,7 +3346,7 @@ unsafe fn arrow_overrides_from_c<'a>(
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl<T: CsHandle>(
-    conn: *mut T,
+    sender: *mut T,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3355,18 +3355,18 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
     overrides_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    if conn.is_null() {
+    if sender.is_null() {
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch_*: conn pointer is NULL".to_string(),
+            "column_sender_flush_arrow_batch_*: sender pointer is NULL".to_string(),
         );
         return false;
     }
     let _guard = match unsafe {
         InUseGuard::acquire(
-            conn,
-            T::latch(conn),
+            sender,
+            T::latch(sender),
             "column_sender_flush_arrow_batch_*",
             T::TYPE_NAME,
             err_out,
@@ -3375,7 +3375,7 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, "column_sender_flush_arrow_batch_*", err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, "column_sender_flush_arrow_batch_*", err_out) } {
         return false;
     }
     let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
@@ -3394,7 +3394,7 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
         None => return false,
     };
     let table_name = unsafe { table.as_name() };
-    let sender = unsafe { T::owned_mut(conn).get_mut() };
+    let sender = unsafe { T::owned_mut(sender).get_mut() };
     let result = match ts_column {
         Some(ts) => sender.flush_arrow_batch_at_column(table_name, &rb, ts.as_name(), &overrides),
         None => sender.flush_arrow_batch_at_now(table_name, &rb, &overrides),
@@ -3403,12 +3403,12 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
         Ok(()) => true,
         Err(err) => {
             // A transient (reconnectable) failure must leave the caller's
-            // `array` intact so it can drop+re-borrow a live conn and retry
+            // `array` intact so it can drop+re-borrow a live sender and retry
             // with the same data. The import already consumed `array->release`,
             // so we re-export the still-live `RecordBatch` back into `*array`
             // (matching the caller's retained `schema` shape), restoring a
             // valid release. A terminal error consumes the array as before (the
-            // data is unusable on any conn).
+            // data is unusable on any sender).
             //
             // `FailoverRetry` alone is not sufficient: a direct-mode partial
             // write fails mid-frame with `FailoverRetry` yet is delivery-
@@ -3426,7 +3426,7 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl_and_get_fsn(
-    conn: *mut sf_column_sender,
+    sender: *mut column_sender,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3436,31 +3436,31 @@ unsafe fn arrow_batch_impl_and_get_fsn(
     fsn_out: *mut line_sender_qwpws_fsn,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    const FN_NAME: &str = "sf_column_sender_flush_arrow_batch_*_and_get_fsn";
+    const FN_NAME: &str = "column_sender_flush_arrow_batch_*_and_get_fsn";
     if unsafe { reject_null_fsn_out(fsn_out, FN_NAME, err_out) } {
         return false;
     }
-    if conn.is_null() {
+    if sender.is_null() {
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            format!("{FN_NAME}: conn pointer is NULL"),
+            format!("{FN_NAME}: sender pointer is NULL"),
         );
         return false;
     }
     let _guard = match unsafe {
         InUseGuard::acquire(
-            conn,
-            sf_column_sender::latch(conn),
+            sender,
+            column_sender::latch(sender),
             FN_NAME,
-            "sf_column_sender",
+            "column_sender",
             err_out,
         )
     } {
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, FN_NAME, err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, FN_NAME, err_out) } {
         return false;
     }
     let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
@@ -3473,7 +3473,7 @@ unsafe fn arrow_batch_impl_and_get_fsn(
         None => return false,
     };
     let table_name = unsafe { table.as_name() };
-    let sender = unsafe { sf_column_sender::owned_mut(conn).get_mut() };
+    let sender = unsafe { column_sender::owned_mut(sender).get_mut() };
     let result = match ts_column {
         Some(ts) => sender.flush_arrow_batch_at_column_and_get_fsn(
             table_name,
@@ -3511,7 +3511,7 @@ unsafe fn arrow_batch_impl_and_get_fsn(
 #[cfg(feature = "arrow")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
-    conn: *mut T,
+    sender: *mut T,
     table: line_sender_table_name,
     array: *mut arrow::ffi::FFI_ArrowArray,
     schema: *const arrow::ffi::FFI_ArrowSchema,
@@ -3527,18 +3527,18 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
         Some(l) => l,
         None => return false,
     };
-    if conn.is_null() {
+    if sender.is_null() {
         crate::arrow_err_to_c_box(
             err_out,
             ErrorCode::InvalidApiCall,
-            "column_sender_flush_arrow_batch_*_and_wait: conn pointer is NULL".to_string(),
+            "column_sender_flush_arrow_batch_*_and_wait: sender pointer is NULL".to_string(),
         );
         return false;
     }
     let _guard = match unsafe {
         InUseGuard::acquire(
-            conn,
-            T::latch(conn),
+            sender,
+            T::latch(sender),
             "column_sender_flush_arrow_batch_*_and_wait",
             T::TYPE_NAME,
             err_out,
@@ -3547,15 +3547,20 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, "column_sender_flush_arrow_batch_*_and_wait", err_out) }
-    {
+    if unsafe {
+        reject_closed_pool_cs(
+            sender,
+            "column_sender_flush_arrow_batch_*_and_wait",
+            err_out,
+        )
+    } {
         return false;
     }
     let overrides = match unsafe { arrow_overrides_from_c(overrides_ptr, overrides_len, err_out) } {
         Some(v) => v,
         None => return false,
     };
-    let sender = unsafe { T::owned_mut(conn).get_mut() };
+    let sender = unsafe { T::owned_mut(sender).get_mut() };
     // Durable opt-in preflight: reject before the import consumes
     // `array->release`, so a rejected level leaves the caller's array intact.
     if let Err(err) = sender.validate_ack_level(ack_level) {
@@ -3590,7 +3595,7 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
         Ok(()) => true,
         Err(flush_failure) => {
             // Phase-aware re-export: `NotDelivered` is safe to retry on a fresh
-            // conn, so restore the caller's array; `DeliveryUnknown` is not.
+            // sender, so restore the caller's array; `DeliveryUnknown` is not.
             let reexport = flush_failure.is_not_delivered();
             let err = flush_failure.into_error();
             if reexport {
@@ -3603,7 +3608,7 @@ unsafe fn arrow_batch_impl_and_wait<T: CsHandle>(
 }
 
 /// Re-export `rb` back into the caller's `*array`, restoring the `release`
-/// consumed during import so the caller can retry on a fresh conn. The shape
+/// consumed during import so the caller can retry on a fresh sender. The shape
 /// must match the caller's **retained** `schema` (which is borrowed and never
 /// consumed): a Struct schema → a Struct array (one child per column); a bare
 /// single-column non-Struct schema → that one column's array directly.
@@ -3658,7 +3663,7 @@ unsafe fn reexport_record_batch_into(
 /// returns `line_sender_error_failover_retry`. The deadline resets on every
 /// watermark advance, so a slow-but-progressing wait (e.g. a `durable` upload
 /// under pressure) is not cut off. The unacked frames are retained: drop the
-/// conn and re-borrow to replay (store-and-forward) or re-drive from source
+/// sender and re-borrow to replay (store-and-forward) or re-drive from source
 /// (direct).
 ///
 /// `timeout` selects the bound: `Some` is the store-and-forward `wait`'s
@@ -3667,7 +3672,7 @@ unsafe fn reexport_record_batch_into(
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 unsafe fn cs_wait_body<T: CsHandle>(
-    conn: *mut T,
+    sender: *mut T,
     ack_level: u32,
     timeout: Option<std::time::Duration>,
     fn_name: &str,
@@ -3677,28 +3682,28 @@ unsafe fn cs_wait_body<T: CsHandle>(
         Some(l) => l,
         None => return false,
     };
-    if conn.is_null() {
+    if sender.is_null() {
         unsafe {
             set_err_out_from_error(
                 err_out,
                 Error::new(
                     ErrorCode::InvalidApiCall,
-                    format!("{fn_name}: conn pointer is NULL"),
+                    format!("{fn_name}: sender pointer is NULL"),
                 ),
             );
         }
         return false;
     }
     let _guard = match unsafe {
-        InUseGuard::acquire(conn, T::latch(conn), fn_name, T::TYPE_NAME, err_out)
+        InUseGuard::acquire(sender, T::latch(sender), fn_name, T::TYPE_NAME, err_out)
     } {
         Some(g) => g,
         None => return false,
     };
-    if unsafe { reject_closed_pool_cs(conn, fn_name, err_out) } {
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
         return false;
     }
-    let sender = unsafe { T::owned_mut(conn).get_mut() };
+    let sender = unsafe { T::owned_mut(sender).get_mut() };
     match timeout {
         Some(timeout) => bubble!(err_out, sender.wait(ack_level, timeout)),
         None => bubble!(err_out, sender.sync(ack_level)),
@@ -3706,25 +3711,25 @@ unsafe fn cs_wait_body<T: CsHandle>(
     true
 }
 
-/// Store-and-forward ack barrier: block until every frame published on `conn`
+/// Store-and-forward ack barrier: block until every frame published on `sender`
 /// so far reaches `ack_level`. The SFA queue owns delivery, so this is needed
 /// only to *observe* the ack, never for durability.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sf_column_sender_wait(
-    conn: *mut sf_column_sender,
+pub unsafe extern "C" fn column_sender_wait(
+    sender: *mut column_sender,
     ack_level: u32,
     timeout_millis: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
         cs_wait_body(
-            conn,
+            sender,
             ack_level,
             Some(std::time::Duration::from_millis(timeout_millis)),
-            "sf_column_sender_wait",
+            "column_sender_wait",
             err_out,
         )
     }
@@ -3734,13 +3739,13 @@ pub unsafe extern "C" fn sf_column_sender_wait(
 /// until they reach `ack_level`. The direct sender's durability checkpoint.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_commit(
-    conn: *mut direct_column_sender,
+    sender: *mut direct_column_sender,
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
         cs_wait_body(
-            conn,
+            sender,
             ack_level,
             None,
             "direct_column_sender_commit",
@@ -3818,7 +3823,7 @@ mod tests {
         for budget in [0u64, 50] {
             let mut err_sf: *mut line_sender_error = std::ptr::null_mut();
             let sf = unsafe {
-                questdb_db_borrow_sf_column_sender_with_retry(
+                questdb_db_borrow_column_sender_with_retry(
                     std::ptr::null_mut(),
                     budget,
                     &mut err_sf,
@@ -3867,8 +3872,9 @@ mod tests {
 
         // Non-zero budget: the retry loop makes a few attempts, then gives up
         // once the budget is spent.
-        let conn = unsafe { questdb_db_borrow_direct_column_sender_with_retry(db, 150, &mut err) };
-        assert!(conn.is_null(), "borrow against a closed port must fail");
+        let sender =
+            unsafe { questdb_db_borrow_direct_column_sender_with_retry(db, 150, &mut err) };
+        assert!(sender.is_null(), "borrow against a closed port must fail");
         assert!(!err.is_null(), "a failed borrow must populate err_out");
         unsafe { line_sender_error_free(err) };
 

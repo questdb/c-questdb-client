@@ -3593,7 +3593,7 @@ pub const qwpws_ack_level_durable: u32 = 1;
 
 /// Wait until every QWP/WebSocket frame published so far on `sender` reaches
 /// `ack_level` (a `qwpws_ack_level_*` value). This is the
-/// row-major counterpart to the column-major `sf_column_sender_wait`.
+/// row-major counterpart to the column-major `column_sender_wait`.
 ///
 /// `timeout_millis` is a no-progress deadline (it fires only if the ack
 /// watermark fails to advance for that long); `0` waits indefinitely.
@@ -4270,7 +4270,7 @@ pub unsafe extern "C" fn row_sender_acked_fsn(
 
 /// Wait until every frame published so far through `sender` reaches
 /// `ack_level` (a `qwpws_ack_level_*` value). This is the row-major
-/// counterpart of `sf_column_sender_wait`: the store-and-forward queue owns
+/// counterpart of `column_sender_wait`: the store-and-forward queue owns
 /// delivery, so this is needed only to *observe* the ack (e.g. before reading
 /// the rows back), never for durability.
 ///
@@ -5934,7 +5934,7 @@ mod tests {
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_column_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
@@ -5946,14 +5946,14 @@ mod tests {
 
             questdb_db_close(db);
 
-            assert!(!sf_column_sender_flush(sender, chunk, &mut err));
+            assert!(!column_sender_flush(sender, chunk, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
                 "QuestDb pool is closed",
             );
 
-            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_column_sender(ptr::null_mut(), sender);
             column_sender_chunk_free(chunk);
         }
     }
@@ -5966,7 +5966,7 @@ mod tests {
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_column_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
@@ -5980,7 +5980,7 @@ mod tests {
                 has_value: true,
                 value: u64::MAX,
             };
-            assert!(sf_column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(column_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
             assert_eq!(fsn.value, 0);
@@ -5989,14 +5989,14 @@ mod tests {
                 has_value: true,
                 value: u64::MAX,
             };
-            assert!(sf_column_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(column_sender_acked_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
             assert_eq!(fsn.value, 0);
 
             fill_column_chunk(chunk, 42, &mut err);
 
-            assert!(sf_column_sender_flush_and_get_fsn(
+            assert!(column_sender_flush_and_get_fsn(
                 sender, chunk, &mut fsn, &mut err
             ));
             assert!(err.is_null());
@@ -6005,27 +6005,27 @@ mod tests {
             assert_eq!(column_sender_chunk_row_count(chunk, &mut err), 0);
             assert!(err.is_null());
 
-            assert!(sf_column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(column_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(fsn.has_value);
             assert_eq!(fsn.value, first_fsn);
 
-            assert!(sf_column_sender_acked_fsn(sender, &mut fsn, &mut err));
+            assert!(column_sender_acked_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(!fsn.has_value);
 
-            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_column_sender(ptr::null_mut(), sender);
             column_sender_chunk_free(chunk);
             questdb_db_close(db);
         }
     }
 
     #[test]
-    fn sf_column_sender_fsn_outputs_are_required() {
+    fn column_sender_fsn_outputs_are_required() {
         unsafe {
             let mut err = ptr::null_mut();
 
-            assert!(!sf_column_sender_flush_and_get_fsn(
+            assert!(!column_sender_flush_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -6034,10 +6034,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_flush_and_get_fsn requires non-NULL fsn_out",
+                "column_sender_flush_and_get_fsn requires non-NULL fsn_out",
             );
 
-            assert!(!sf_column_sender_published_fsn(
+            assert!(!column_sender_published_fsn(
                 ptr::null(),
                 ptr::null_mut(),
                 &mut err
@@ -6045,10 +6045,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_published_fsn requires non-NULL fsn_out",
+                "column_sender_published_fsn requires non-NULL fsn_out",
             );
 
-            assert!(!sf_column_sender_acked_fsn(
+            assert!(!column_sender_acked_fsn(
                 ptr::null(),
                 ptr::null_mut(),
                 &mut err
@@ -6056,13 +6056,13 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_acked_fsn requires non-NULL fsn_out",
+                "column_sender_acked_fsn requires non-NULL fsn_out",
             );
         }
     }
 
     #[test]
-    fn sf_column_sender_fsn_apis_reject_null_sender() {
+    fn column_sender_fsn_apis_reject_null_sender() {
         unsafe {
             let mut err = ptr::null_mut();
             let mut fsn = line_sender_qwpws_fsn {
@@ -6070,7 +6070,7 @@ mod tests {
                 value: u64::MAX,
             };
 
-            assert!(!sf_column_sender_flush_and_get_fsn(
+            assert!(!column_sender_flush_and_get_fsn(
                 ptr::null_mut(),
                 ptr::null_mut(),
                 &mut fsn,
@@ -6079,10 +6079,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_flush_and_get_fsn: conn pointer is NULL",
+                "column_sender_flush_and_get_fsn: conn pointer is NULL",
             );
 
-            assert!(!sf_column_sender_published_fsn(
+            assert!(!column_sender_published_fsn(
                 ptr::null(),
                 &mut fsn,
                 &mut err
@@ -6090,14 +6090,14 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_published_fsn: conn pointer is NULL",
+                "column_sender_published_fsn: conn pointer is NULL",
             );
 
-            assert!(!sf_column_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
+            assert!(!column_sender_acked_fsn(ptr::null(), &mut fsn, &mut err));
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_acked_fsn: conn pointer is NULL",
+                "column_sender_acked_fsn: conn pointer is NULL",
             );
         }
     }
@@ -6111,7 +6111,7 @@ mod tests {
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_column_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
@@ -6120,7 +6120,7 @@ mod tests {
                 has_value: false,
                 value: 0,
             };
-            let ok = sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
+            let ok = column_sender_flush_arrow_batch_at_now_and_get_fsn(
                 sender,
                 table_name(b"trades"),
                 &mut array,
@@ -6146,31 +6146,31 @@ mod tests {
             assert!(fsn.has_value);
             let first_fsn = fsn.value;
 
-            assert!(sf_column_sender_published_fsn(sender, &mut fsn, &mut err));
+            assert!(column_sender_published_fsn(sender, &mut fsn, &mut err));
             assert!(err.is_null());
             assert!(fsn.has_value);
             assert_eq!(fsn.value, first_fsn);
 
-            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_column_sender(ptr::null_mut(), sender);
             questdb_db_close(db);
         }
     }
 
     #[cfg(feature = "arrow")]
     #[test]
-    fn sf_column_sender_arrow_fsn_output_is_required_before_import() {
+    fn column_sender_arrow_fsn_output_is_required_before_import() {
         let server = PooledQwpMock::spawn(1);
         unsafe {
             let mut err = ptr::null_mut();
             let conf = server.conf();
             let db = connect_pool(&conf, &mut err);
 
-            let sender = questdb_db_borrow_sf_column_sender(db, &mut err);
+            let sender = questdb_db_borrow_column_sender(db, &mut err);
             assert!(!sender.is_null());
             assert!(err.is_null());
 
             let (mut array, schema) = export_i64_arrow_array(vec![1, 2, 3]);
-            assert!(!sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
+            assert!(!column_sender_flush_arrow_batch_at_now_and_get_fsn(
                 sender,
                 table_name(b"trades"),
                 &mut array,
@@ -6183,7 +6183,7 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
+                "column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
             );
             assert!(
                 array.release.is_some(),
@@ -6191,7 +6191,7 @@ mod tests {
             );
             release_arrow_array_if_needed(&mut array);
 
-            assert!(!sf_column_sender_flush_arrow_batch_at_column_and_get_fsn(
+            assert!(!column_sender_flush_arrow_batch_at_column_and_get_fsn(
                 sender,
                 table_name(b"trades"),
                 ptr::null_mut(),
@@ -6205,10 +6205,10 @@ mod tests {
             assert_line_error_contains(
                 &mut err,
                 line_sender_error_code::line_sender_error_invalid_api_call,
-                "sf_column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
+                "column_sender_flush_arrow_batch_*_and_get_fsn requires non-NULL fsn_out",
             );
 
-            questdb_db_return_sf_column_sender(ptr::null_mut(), sender);
+            questdb_db_return_column_sender(ptr::null_mut(), sender);
             questdb_db_close(db);
         }
     }

@@ -79,7 +79,7 @@ private:
 };
 
 /** Forward decl. */
-class sf_column_sender_conn;
+class column_sender_view;
 
 /**
  * RAII wrapper around `::column_sender_chunk*`. Move-only.
@@ -722,22 +722,22 @@ inline column_chunk& column_chunk::append_arrow_import(
 #endif
 
 /**
- * Thin non-owning view over a borrowed `::sf_column_sender*`: publish-only
+ * Thin non-owning view over a borrowed `::column_sender*`: publish-only
  * `flush`, FSN-returning publish/progress helpers, the `wait` ack barrier, and
  * Arrow-batch ingest. The store-and-forward queue owns delivery. Use this
- * directly when adapting a raw C-borrowed handle; `borrowed_sf_column_sender`
+ * directly when adapting a raw C-borrowed handle; `borrowed_column_sender`
  * keeps the same view private so pooled leases cannot escape the guard.
  */
-class sf_column_sender_conn
+class column_sender_view
 {
 public:
-    explicit sf_column_sender_conn(::sf_column_sender* raw) noexcept
+    explicit column_sender_view(::column_sender* raw) noexcept
         : _raw{raw}
     {
     }
 
-    ::sf_column_sender* c_ptr() noexcept { return _raw; }
-    const ::sf_column_sender* c_ptr() const noexcept { return _raw; }
+    ::column_sender* c_ptr() noexcept { return _raw; }
+    const ::column_sender* c_ptr() const noexcept { return _raw; }
 
     /**
      * Encode `chunk` and publish it into the store-and-forward queue, returning
@@ -748,7 +748,7 @@ public:
     void flush(column_chunk& chunk)
     {
         line_sender_error::wrapped_call(
-            ::sf_column_sender_flush, _raw, chunk.c_ptr());
+            ::column_sender_flush, _raw, chunk.c_ptr());
     }
 
     /**
@@ -760,7 +760,7 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_flush_and_get_fsn,
+            ::column_sender_flush_and_get_fsn,
             _raw,
             chunk.c_ptr(),
             &fsn);
@@ -775,7 +775,7 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_published_fsn, _raw, &fsn);
+            ::column_sender_published_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
@@ -787,12 +787,12 @@ public:
     {
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_acked_fsn, _raw, &fsn);
+            ::column_sender_acked_fsn, _raw, &fsn);
         return optional_fsn(fsn);
     }
 
     /**
-     * Block until every frame published on this conn so far reaches `level`.
+     * Block until every frame published on this sender so far reaches `level`.
      * The SFA queue owns delivery, so this is needed only to *observe* the ack,
      * never for durability. `timeout` is a no-progress deadline (it fires only
      * if the ack watermark fails to advance for that long); the default of zero
@@ -807,7 +807,7 @@ public:
                 line_sender_error_code::invalid_api_call,
                 "QWP/WebSocket wait timeout must not be negative."};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_wait,
+            ::column_sender_wait,
             _raw,
             static_cast<uint32_t>(level),
             static_cast<uint64_t>(timeout.count()));
@@ -828,7 +828,7 @@ public:
     {
         ::line_sender_table_name table_c{table.size(), table.data()};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_flush_arrow_batch_at_now,
+            ::column_sender_flush_arrow_batch_at_now,
             _raw,
             table_c,
             &array,
@@ -850,7 +850,7 @@ public:
         ::line_sender_table_name table_c{table.size(), table.data()};
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_flush_arrow_batch_at_now_and_get_fsn,
+            ::column_sender_flush_arrow_batch_at_now_and_get_fsn,
             _raw,
             table_c,
             &array,
@@ -876,7 +876,7 @@ public:
         ::line_sender_table_name table_c{table.size(), table.data()};
         ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_flush_arrow_batch_at_column,
+            ::column_sender_flush_arrow_batch_at_column,
             _raw,
             table_c,
             &array,
@@ -901,7 +901,7 @@ public:
         ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
         ::line_sender_qwpws_fsn fsn{};
         line_sender_error::wrapped_call(
-            ::sf_column_sender_flush_arrow_batch_at_column_and_get_fsn,
+            ::column_sender_flush_arrow_batch_at_column_and_get_fsn,
             _raw,
             table_c,
             &array,
@@ -923,17 +923,17 @@ private:
         return std::nullopt;
     }
 
-    ::sf_column_sender* _raw;
+    ::column_sender* _raw;
 };
 
 /** Forward decl. */
 class pool;
 
 /**
- * RAII guard for a borrowed store-and-forward connection. On destruction the
- * conn is returned to the pool (or dropped if `drop_on_return()` was called,
+ * RAII guard for a borrowed store-and-forward column sender. On destruction the
+ * sender is returned to the pool (or dropped if `drop_on_return()` was called,
  * it has latched terminal state, or the pool has been closed). Constructed only
- * via `pool::borrow_sf_column_sender()`.
+ * via `pool::borrow_column_sender()`.
  *
  * The store-and-forward queue owns delivery, so destruction does not lose
  * accepted frames; `wait()` is an ack barrier, not a commit step. The
@@ -941,43 +941,43 @@ class pool;
  * everything published so far; use FSNs for non-blocking progress tracking
  * while you still hold the same borrowed sender.
  */
-class borrowed_sf_column_sender
+class borrowed_column_sender
 {
 public:
-    borrowed_sf_column_sender(const borrowed_sf_column_sender&) = delete;
-    borrowed_sf_column_sender& operator=(const borrowed_sf_column_sender&) = delete;
+    borrowed_column_sender(const borrowed_column_sender&) = delete;
+    borrowed_column_sender& operator=(const borrowed_column_sender&) = delete;
 
-    borrowed_sf_column_sender(borrowed_sf_column_sender&& other) noexcept
+    borrowed_column_sender(borrowed_column_sender&& other) noexcept
         : _db{other._db}
-        , _conn{std::move(other._conn)}
+        , _view{std::move(other._view)}
         , _force_drop{other._force_drop}
     {
         other._db = nullptr;
-        other._conn = sf_column_sender_conn{nullptr};
+        other._view = column_sender_view{nullptr};
         other._force_drop = false;
     }
 
-    borrowed_sf_column_sender& operator=(borrowed_sf_column_sender&& other) noexcept
+    borrowed_column_sender& operator=(borrowed_column_sender&& other) noexcept
     {
         if (this != &other)
         {
             release();
             _db = other._db;
-            _conn = std::move(other._conn);
+            _view = std::move(other._view);
             _force_drop = other._force_drop;
             other._db = nullptr;
-            other._conn = sf_column_sender_conn{nullptr};
+            other._view = column_sender_view{nullptr};
             other._force_drop = false;
         }
         return *this;
     }
 
-    ~borrowed_sf_column_sender() noexcept { release(); }
+    ~borrowed_column_sender() noexcept { release(); }
 
-    /** `true` if this guard currently owns a borrowed conn. */
+    /** `true` if this guard currently owns a borrowed sender. */
     explicit operator bool() const noexcept
     {
-        return _db && _conn.c_ptr();
+        return _db && _view.c_ptr();
     }
 
     /**
@@ -988,7 +988,7 @@ public:
      */
     void flush(column_chunk& chunk)
     {
-        _conn.flush(chunk);
+        _view.flush(chunk);
     }
 
     /**
@@ -998,7 +998,7 @@ public:
      */
     std::optional<uint64_t> flush_and_get_fsn(column_chunk& chunk)
     {
-        return _conn.flush_and_get_fsn(chunk);
+        return _view.flush_and_get_fsn(chunk);
     }
 
     /**
@@ -1007,7 +1007,7 @@ public:
      */
     std::optional<uint64_t> published_fsn() const
     {
-        return _conn.published_fsn();
+        return _view.published_fsn();
     }
 
     /**
@@ -1016,11 +1016,11 @@ public:
      */
     std::optional<uint64_t> acked_fsn() const
     {
-        return _conn.acked_fsn();
+        return _view.acked_fsn();
     }
 
     /**
-     * Block until every frame published on this conn so far reaches `level`.
+     * Block until every frame published on this sender so far reaches `level`.
      * The SFA queue owns delivery, so this is needed only to *observe* the ack,
      * never for durability. `timeout` is a no-progress deadline (it fires only
      * if the ack watermark fails to advance for that long); the default of zero
@@ -1030,7 +1030,7 @@ public:
         qwpws_ack_level level = qwpws_ack_level::ok,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::zero())
     {
-        _conn.wait(level, timeout);
+        _view.wait(level, timeout);
     }
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
@@ -1046,7 +1046,7 @@ public:
         const ::column_sender_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
-        _conn.flush_arrow_batch_at_now(
+        _view.flush_arrow_batch_at_now(
             table, array, schema, overrides, overrides_len);
     }
 
@@ -1060,7 +1060,7 @@ public:
         const ::column_sender_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
-        return _conn.flush_arrow_batch_at_now_and_get_fsn(
+        return _view.flush_arrow_batch_at_now_and_get_fsn(
             table, array, schema, overrides, overrides_len);
     }
 
@@ -1076,7 +1076,7 @@ public:
         const ::column_sender_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
-        _conn.flush_arrow_batch(
+        _view.flush_arrow_batch(
             table, array, schema, ts_column, overrides, overrides_len);
     }
 
@@ -1091,17 +1091,17 @@ public:
         const ::column_sender_arrow_override* overrides = nullptr,
         size_t overrides_len = 0)
     {
-        return _conn.flush_arrow_batch_and_get_fsn(
+        return _view.flush_arrow_batch_and_get_fsn(
             table, array, schema, ts_column, overrides, overrides_len);
     }
 #endif
 
     /**
-     * Force this borrowed conn to be closed instead of recycled when the guard
+     * Force this borrowed sender to be closed instead of recycled when the guard
      * is destroyed.
      *
-     * Use normal destruction for healthy conns: the return path already closes
-     * conns that have latched terminal state, or whose pool has been closed.
+     * Use normal destruction for healthy senders: the return path already closes
+     * senders that have latched terminal state, or whose pool has been closed.
      * Call this after abandoning work or handling an error where the next
      * borrower must not inherit this backend. If queued store-and-forward
      * frames must not be lost, call `wait()` first or configure `sf_dir` for
@@ -1112,28 +1112,28 @@ public:
 private:
     friend class pool;
 
-    borrowed_sf_column_sender(::questdb_db* db, ::sf_column_sender* raw) noexcept
+    borrowed_column_sender(::questdb_db* db, ::column_sender* raw) noexcept
         : _db{db}
-        , _conn{raw}
+        , _view{raw}
     {
     }
 
     void release() noexcept
     {
-        ::sf_column_sender* raw = _conn.c_ptr();
+        ::column_sender* raw = _view.c_ptr();
         if (_db && raw)
         {
             if (_force_drop)
-                ::questdb_db_drop_sf_column_sender(_db, raw);
+                ::questdb_db_drop_column_sender(_db, raw);
             else
-                ::questdb_db_return_sf_column_sender(_db, raw);
+                ::questdb_db_return_column_sender(_db, raw);
         }
         _db = nullptr;
-        _conn = sf_column_sender_conn{nullptr};
+        _view = column_sender_view{nullptr};
     }
 
     ::questdb_db* _db;
-    sf_column_sender_conn _conn;
+    column_sender_view _view;
     bool _force_drop{false};
 };
 
@@ -1325,7 +1325,7 @@ public:
      * only to *observe* the ack (e.g. before reading the rows back), never
      * for durability. `timeout` is a no-progress deadline (it fires only if
      * the ack watermark fails to advance for that long); the default of zero
-     * waits indefinitely. Mirrors `sf_column_sender_conn::wait` and Rust's
+     * waits indefinitely. Mirrors `column_sender_view::wait` and Rust's
      * `Sender::wait`. If it times out, the frames remain queued; retry
      * `wait()` or keep observing the watermark instead of re-flushing the same
      * data.
@@ -1439,27 +1439,27 @@ public:
     ::questdb_db* c_ptr() noexcept { return _raw; }
     const ::questdb_db* c_ptr() const noexcept { return _raw; }
 
-    /** Borrow a store-and-forward conn. Throws on cap exhaustion or transport
+    /** Borrow a store-and-forward sender. Throws on cap exhaustion or transport
      * failure. */
-    borrowed_sf_column_sender borrow_sf_column_sender()
+    borrowed_column_sender borrow_column_sender()
     {
         auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_sf_column_sender, _raw);
-        return borrowed_sf_column_sender{_raw, raw};
+            ::questdb_db_borrow_column_sender, _raw);
+        return borrowed_column_sender{_raw, raw};
     }
 
     /**
-     * Borrow a store-and-forward conn, retrying the connect within `budget_ms`
+     * Borrow a store-and-forward sender, retrying the connect within `budget_ms`
      * using the row sender's reconnect backoff. On a transient `failover_retry`,
-     * drop the dead conn then call this with `reconnect_max_duration_ms()` (or
+     * drop the dead sender then call this with `reconnect_max_duration_ms()` (or
      * your tracked remaining budget). Throws on a terminal error or budget
      * exhaustion.
      */
-    borrowed_sf_column_sender borrow_sf_column_sender_with_retry(uint64_t budget_ms)
+    borrowed_column_sender borrow_column_sender_with_retry(uint64_t budget_ms)
     {
         auto* raw = line_sender_error::wrapped_call(
-            ::questdb_db_borrow_sf_column_sender_with_retry, _raw, budget_ms);
-        return borrowed_sf_column_sender{_raw, raw};
+            ::questdb_db_borrow_column_sender_with_retry, _raw, budget_ms);
+        return borrowed_column_sender{_raw, raw};
     }
 
     /**
@@ -1513,7 +1513,7 @@ public:
         return ::questdb_db_reconnect_max_duration_ms(_raw);
     }
 
-    /** Close + drop idle conns beyond `pool_size`. Returns count closed. */
+    /** Close + drop idle senders beyond `pool_size`. Returns count closed. */
     size_t reap_idle() noexcept
     {
         return ::questdb_db_reap_idle(_raw);
@@ -1538,7 +1538,7 @@ namespace questdb
 {
 // `questdb::pool` is the canonical, top-level spelling of the connection
 // pool. The pool is cross-cutting — it hands out write-side senders
-// (`borrow_sf_column_sender`) and read-side query readers (`borrow_reader`) — so it
+// (`borrow_column_sender`) and read-side query readers (`borrow_reader`) — so it
 // belongs at the top-level `questdb` namespace rather than under `ingress`.
 // This re-export is the C++ analogue of the Rust `questdb::QuestDb`
 // re-export; `questdb::ingress::pool` remains valid for back-compat.

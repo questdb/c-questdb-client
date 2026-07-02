@@ -379,38 +379,38 @@ bool row_sender_acked_fsn(
 ```
 
 Store-and-forward column senders expose the same progress pattern for column
-chunks and Arrow batch flushes. Use `sf_column_sender_wait` for the simple
+chunks and Arrow batch flushes. Use `column_sender_wait` for the simple
 barrier over everything published so far; use the FSN-returning flush variants
 when a producer wants to publish locally, continue other work, and poll
-`sf_column_sender_acked_fsn` later on the same borrowed sender. When a chunk or
+`column_sender_acked_fsn` later on the same borrowed sender. When a chunk or
 Arrow batch is split into multiple QWP frames, the returned FSN is the last
 frame boundary; cumulative ACK coverage of that boundary covers the whole
 logical input.
 
 ```c
 QUESTDB_CLIENT_API
-bool sf_column_sender_flush_and_get_fsn(
-    sf_column_sender* conn,
+bool column_sender_flush_and_get_fsn(
+    column_sender* conn,
     column_sender_chunk* chunk,
     line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool sf_column_sender_published_fsn(
-    const sf_column_sender* conn,
+bool column_sender_published_fsn(
+    const column_sender* conn,
     line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool sf_column_sender_acked_fsn(
-    const sf_column_sender* conn,
+bool column_sender_acked_fsn(
+    const column_sender* conn,
     line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 QUESTDB_CLIENT_API
-bool sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
-    sf_column_sender* conn,
+bool column_sender_flush_arrow_batch_at_now_and_get_fsn(
+    column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
@@ -420,8 +420,8 @@ bool sf_column_sender_flush_arrow_batch_at_now_and_get_fsn(
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool sf_column_sender_flush_arrow_batch_at_column_and_get_fsn(
-    sf_column_sender* conn,
+bool column_sender_flush_arrow_batch_at_column_and_get_fsn(
+    column_sender* conn,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,

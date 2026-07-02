@@ -190,14 +190,14 @@ _db_close = _setsig(
 )
 
 _db_borrow_conn = _setsig(
-    "questdb_db_borrow_sf_column_sender",
+    "questdb_db_borrow_column_sender",
     ctypes.POINTER(_QwpwsConn),
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(ctypes.POINTER(_LineSenderError)),
 )
 
 _db_borrow_conn_with_retry = _setsig(
-    "questdb_db_borrow_sf_column_sender_with_retry",
+    "questdb_db_borrow_column_sender_with_retry",
     ctypes.POINTER(_QwpwsConn),
     ctypes.POINTER(_QuestdbDb),
     ctypes.c_uint64,
@@ -213,14 +213,14 @@ _db_borrow_direct_conn_with_retry = _setsig(
 )
 
 _db_return_conn = _setsig(
-    "questdb_db_return_sf_column_sender",
+    "questdb_db_return_column_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(_QwpwsConn),
 )
 
 _db_drop_conn = _setsig(
-    "questdb_db_drop_sf_column_sender",
+    "questdb_db_drop_column_sender",
     None,
     ctypes.POINTER(_QuestdbDb),
     ctypes.POINTER(_QwpwsConn),
@@ -237,7 +237,7 @@ class _ColumnSenderArrowOverride(ctypes.Structure):
 
 # Conn-level Arrow batch flush.
 _flush_arrow_batch = _setsig(
-    "sf_column_sender_flush_arrow_batch_at_now",
+    "column_sender_flush_arrow_batch_at_now",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
     _LineSenderTableName,
@@ -249,7 +249,7 @@ _flush_arrow_batch = _setsig(
 )
 
 _flush_arrow_batch_at_column = _setsig(
-    "sf_column_sender_flush_arrow_batch_at_column",
+    "column_sender_flush_arrow_batch_at_column",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
     _LineSenderTableName,
@@ -267,7 +267,7 @@ _flush_arrow_batch_at_column = _setsig(
 #   0 → wait for WAL-commit
 #   1 → wait for object-store durability watermarks
 _column_sender_sync = _setsig(
-    "sf_column_sender_wait",
+    "column_sender_wait",
     ctypes.c_bool,
     ctypes.POINTER(_QwpwsConn),
     ctypes.c_uint32,

@@ -1941,7 +1941,7 @@ typedef enum qwpws_ack_level
 /**
  * Wait until every QWP/WebSocket frame published so far reaches `ack_level`
  * (a `qwpws_ack_level` value). This is the row-major counterpart
- * to `sf_column_sender_wait`.
+ * to `column_sender_wait`.
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
