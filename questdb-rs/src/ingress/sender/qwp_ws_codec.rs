@@ -52,6 +52,7 @@ pub(super) const WS_STATUS_PARSE_ERROR: u8 = 0x05;
 pub(super) const WS_STATUS_INTERNAL_ERROR: u8 = 0x06;
 pub(super) const WS_STATUS_SECURITY_ERROR: u8 = 0x08;
 pub(super) const WS_STATUS_WRITE_ERROR: u8 = 0x09;
+pub(super) const WS_STATUS_NOT_WRITABLE: u8 = 0x0C;
 
 /// 256 MiB cap on a single inbound frame -- well above QWP's 16 MB batch limit
 /// but small enough to refuse obviously bogus declared lengths early.
@@ -273,7 +274,7 @@ pub(super) fn handshake_error_to_ingress(e: crate::ws::handshake::HandshakeError
 /// human-readable message when the payload is malformed: reserved or
 /// out-of-range close code, or non-UTF-8 reason bytes. Callers translate the
 /// Err into a WsMessageError::ProtocolViolation, which routes through the
-/// driver as a terminal Halt.
+/// driver as a terminal protocol violation.
 ///
 /// A zero-byte payload is valid (no code, empty reason). A 1-byte payload is
 /// already rejected upstream by validate_control_frame_header, but is

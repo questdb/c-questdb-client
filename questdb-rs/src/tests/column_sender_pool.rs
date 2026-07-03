@@ -65,8 +65,6 @@ enum MockMode {
     AckEachFrame,
     /// Reply to every QWP frame with an error ack carrying `status`.
     ErrorEachFrame(u8),
-    /// Reject the first QWP frame with `status`, then ACK later frames.
-    ErrorFirstThenAck(u8),
     /// Capture every binary frame but delay ACKs until the flag is set.
     AckWhenReleased(Arc<AtomicBool>),
     /// Complete the WS upgrade, then immediately close the socket. A client
@@ -112,10 +110,6 @@ impl MockServer {
 
     fn spawn_erroring(max_accepts: usize, status: u8) -> Self {
         Self::spawn_with_mode(max_accepts, MockMode::ErrorEachFrame(status))
-    }
-
-    fn spawn_error_first_then_ack(max_accepts: usize, status: u8) -> Self {
-        Self::spawn_with_mode(max_accepts, MockMode::ErrorFirstThenAck(status))
     }
 
     fn spawn_ack_when_released_capturing(
@@ -286,9 +280,6 @@ fn run_mock_server_accept_loop(
                             MockMode::ErrorEachFrame(status) => {
                                 error_each_frame(&mut stream, &stop, status)
                             }
-                            MockMode::ErrorFirstThenAck(status) => {
-                                error_first_then_ack(&mut stream, &stop, status)
-                            }
                             MockMode::AckWhenReleased(release) => {
                                 ack_when_released(&mut stream, &stop, &release, capture)
                             }
@@ -452,39 +443,6 @@ fn error_each_frame(stream: &mut std::net::TcpStream, stop: &AtomicBool, status:
                     continue;
                 }
                 if write_qwp_error_response(stream, status, next_wire_seq, b"injected").is_err() {
-                    break;
-                }
-                next_wire_seq += 1;
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn error_first_then_ack(stream: &mut std::net::TcpStream, stop: &AtomicBool, status: u8) {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-    let mut next_wire_seq: u64 = 0;
-    while !stop.load(Ordering::SeqCst) {
-        match read_frame(stream) {
-            Ok((_fin, opcode, _payload)) => {
-                if opcode == 0x8 {
-                    break;
-                }
-                if opcode != 0x2 {
-                    continue;
-                }
-                let result = if next_wire_seq == 0 {
-                    write_qwp_error_response(stream, status, next_wire_seq, b"injected")
-                } else {
-                    write_qwp_ok_response(stream, next_wire_seq)
-                };
-                if result.is_err() {
                     break;
                 }
                 next_wire_seq += 1;
@@ -746,8 +704,33 @@ fn store_and_forward_column_sender_reports_fsn_progress() {
     );
 }
 
-fn check_store_and_forward_sync_reports_drop_and_continue_once(extras: &str) {
-    let server = MockServer::spawn_error_first_then_ack(1, QWP_STATUS_SCHEMA_MISMATCH);
+#[test]
+fn store_and_forward_pool_borrow_buffers_with_no_server() {
+    let port = unused_local_port();
+    let conf = conf_for_endpoints(&[port], "pool_reap=manual;close_flush_timeout_millis=0;");
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut sender = db
+        .borrow_column_sender()
+        .expect("lazy SF pool borrow must not require a live server");
+    let mut chunk = Chunk::new("trades");
+    let qty = [1_i64];
+    let ts = [1_i64];
+    chunk.column_i64("qty", &qty, None).unwrap();
+    chunk.designated_timestamp_nanos(&ts).unwrap();
+
+    let fsn = sender
+        .flush_and_get_fsn(&mut chunk)
+        .expect("SF flush must publish to the local queue without a server")
+        .expect("non-empty chunk publishes a frame");
+
+    assert_eq!(chunk.row_count(), 0);
+    assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+}
+
+fn check_store_and_forward_sync_reports_terminal_schema_rejection(extras: &str) {
+    let server = MockServer::spawn_erroring(1, QWP_STATUS_SCHEMA_MISMATCH);
     let conf = conf_for_endpoints(&[server.port()], extras);
     let db = QuestDb::connect(&conf).unwrap();
     let mut sender = db.borrow_column_sender().unwrap();
@@ -767,14 +750,7 @@ fn check_store_and_forward_sync_reports_drop_and_continue_once(extras: &str) {
         Some(QWP_STATUS_SCHEMA_MISMATCH)
     );
 
-    let qty2 = [2_i64];
-    let ts2 = [2_i64];
-    chunk.column_i64("qty", &qty2, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts2).unwrap();
-    sender.flush(&mut chunk).unwrap();
-    sender
-        .wait(AckLevel::Ok, Duration::from_secs(30))
-        .expect("old drop-and-continue rejection must not poison later sync");
+    assert!(sender.must_close_for_test());
 }
 
 fn check_store_and_forward_sync_times_out_on_silent_but_alive_peer(extras: &str) {
@@ -1042,6 +1018,11 @@ fn check_store_and_forward_drop_on_return_drops_backend_and_reopens_on_next_borr
 
     {
         let mut sender = db.borrow_column_sender().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(2), || server.accepted() == 1),
+            "first SFA borrow should start its background connection; accepted={}",
+            server.accepted()
+        );
         sender.drop_on_return();
         assert!(sender.must_close_for_test());
     }
@@ -1334,16 +1315,16 @@ fn sf_disk_extras(dir: &TempDir, extra: &str) -> String {
 }
 
 #[test]
-fn store_and_forward_sync_reports_drop_and_continue_once_disk() {
+fn store_and_forward_sync_reports_terminal_schema_rejection_disk() {
     let dir = TempDir::new().unwrap();
-    check_store_and_forward_sync_reports_drop_and_continue_once(&sf_disk_extras(
+    check_store_and_forward_sync_reports_terminal_schema_rejection(&sf_disk_extras(
         &dir,
         "pool_reap=manual;",
     ));
 }
 #[test]
-fn store_and_forward_sync_reports_drop_and_continue_once_memory() {
-    check_store_and_forward_sync_reports_drop_and_continue_once("pool_reap=manual;");
+fn store_and_forward_sync_reports_terminal_schema_rejection_memory() {
+    check_store_and_forward_sync_reports_terminal_schema_rejection("pool_reap=manual;");
 }
 
 #[test]
@@ -1497,6 +1478,11 @@ fn borrow_and_return_reuses_connection() {
         let _borrow = db.borrow_column_sender().expect("borrow");
         assert_eq!(db.free_count(), 0);
         assert_eq!(db.in_use_count(), 1);
+        assert!(
+            wait_until(Duration::from_secs(2), || server.accepted() == 1),
+            "first borrow should start one background connection; accepted={}",
+            server.accepted()
+        );
     }
     // Drop returns the sender to the pool.
     assert_eq!(db.free_count(), 1);

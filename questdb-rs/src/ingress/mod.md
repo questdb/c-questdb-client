@@ -94,17 +94,20 @@ errors and reconnects are absorbed by the driver and do not surface to the
 caller; only server rejections and terminal protocol violations are
 reported.
 
-Server rejections fall into two categories:
+Server rejections are classified as `Retriable`, `RetriableOther`, or
+`Terminal`. Retriable rejections (e.g. write error, internal error, unknown
+future status) reconnect and replay from the local store-and-forward
+watermark. `RetriableOther` is reserved for server states such as
+`NOT_WRITABLE`; it uses the same replay path but immediately rotates away
+from the read-only endpoint when another configured endpoint is available.
+Structured diagnostics are available with
+[`sender.poll_qwp_ws_error()`](Sender::poll_qwp_ws_error), or through a
+callback installed with
+[`SenderBuilder::qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler).
 
-- *Drop-and-continue* rejections (e.g. schema mismatch, write error) affect
-  only the rejected frame; the sender continues processing subsequent frames.
-  Retrieve structured diagnostics with
-  [`sender.poll_qwp_ws_error()`](Sender::poll_qwp_ws_error), or install a
-  callback via [`SenderBuilder::qwp_ws_error_handler`](SenderBuilder::qwp_ws_error_handler).
-
-- *Halt* rejections (e.g. parse error, internal error, security error) and
-  terminal WebSocket protocol violations latch the sender into a
-  permanently-unusable state. The next `flush()` call returns
+Terminal rejections (e.g. schema mismatch, parse error, security error) and
+terminal WebSocket protocol violations latch the sender into a
+permanently-unusable state. The next `flush()` call returns
   `ErrorCode::ServerRejection` carrying the structured diagnostic, and
   [`sender.must_close()`](Sender::must_close) returns `true`. The sender
   must be dropped and a new one constructed. The buffer passed to that
@@ -122,11 +125,11 @@ column-major store-and-forward `wait`.
 [`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
 
 In `manual` progress mode no background thread observes the transport.
-Server-side state — including halts — only becomes visible when the user
+Server-side state — including terminal diagnostics — only becomes visible when the user
 calls [`sender.drive_once()`](Sender::drive_once) or any sender method
 that drives the transport (such as `flush` or `wait`). As a
 consequence, `must_close()` on an otherwise-idle manual sender does not
-reflect a halt until the next drive.
+reflect a terminal diagnostic until the next drive.
 
 ## HTTP
 

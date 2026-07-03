@@ -1,318 +1,529 @@
 """
-Graceful role-switch e2e suite, driven by the c-questdb-client Rust sender.
+Graceful role-switch e2e coverage for c-questdb-client QWP-WS senders.
 
-Port of the ingress-driven subset of the Enterprise harness's
-``test_switch.py``. The server-side role-switch machinery (min-http
-control plane, /lifecycle/switch, the read-only gate) is identical; the
-binding-specific part is the QWP ingress sender, which here is the Rust
-``qwp_sidecar`` (``username=`` keyword).
+These tests target the Enterprise PR-1105 server contract:
 
-Scope vs the Enterprise original
---------------------------------
-The Enterprise file has four tests. Two of them -- ``test_characterize``
-and ``test_reads_not_frozen`` -- probe the server's read paths (HTTP /
-pg-wire / QWeP) for switch-window latency, and the QWeP probe needs a
-read-side ``QwpQueryClient`` egress sidecar that c-questdb-client does
-not ship. Those are server-read-path guards, not Rust-*sender* scenarios,
-so they are intentionally out of scope here (they belong with a future
-egress query sidecar). The two tests below are the ones where the Rust
-*sender* is the system under test:
+* demoting a node closes QWP ingress with a reconnectable close instead of
+  streaming read-only NACKs forever;
+* store-and-forward producers do not see transient role state as user-visible
+  write errors;
+* rows published while the node is a settled replica remain buffered and drain
+  after the node becomes primary again.
 
-  * ``test_write_path_across_switch_c_client_rust`` -- the Rust sender's
-    writes are CLEAN-rejected on the demoted replica (not frozen), the
-    connection survives (reconn_succ flat), and the pre-switch rows stay
-    dense after switch-back.
-  * ``test_disturbance_honesty_guard_c_client_rust`` -- proves the switch
-    really happened (lifecycle flip + write rejections), so nothing passes
-    vacuously on a no-op switch.
-
-CRITICAL: a graceful switch destroys nothing -- never wipe the object
-store here (unlike the kill-9 fuzz, which wipes to simulate disk loss).
+The same body runs against the Rust, C, and C++ row-major sidecars. The C and
+C++ sidecars intentionally do not expose reconnect counters, so the assertions
+use producer-visible OK/ERR behavior, pg-wire role evidence, server-side row
+counts, durable ACK, and the final dense sequence oracle.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 
+import psycopg
 import pytest
 
 from lib.lifecycle import lifecycle, submit_switch
-from lib.pg_query import count_rows, wait_for_dense_sequence
-from lib.sidecar import SidecarError
-
-from c_client_sidecar import CClientRustSidecar
+from lib.pg_query import count_rows, fetch_column_sorted, wait_for_dense_sequence
 
 LOG = logging.getLogger(__name__)
 
-TABLE = "switch_test_c_client_rust"
+_INITIAL_ROWS = 40
+_REPLICA_WINDOW_ROWS = 12
+_DURABLE_ACK_AWAIT_TIMEOUT_MS = 60_000
+_UNCOORDINATED_INITIAL_ROWS = 10
+_UNCOORDINATED_REPLICA_OBSERVATION_S = 1.0
 
 
-def _connect_string(http_port: int, sf_dir: Path) -> str:
+def _binding_cases():
+    return [
+        pytest.param(
+            "c_client_rust_sidecar",
+            "c_client_rust",
+            marks=pytest.mark.c_client_rust,
+            id="rust",
+        ),
+        pytest.param(
+            "c_client_c_sidecar",
+            "c_client_c",
+            marks=pytest.mark.c_client_c,
+            id="c",
+        ),
+        pytest.param(
+            "c_client_cpp_sidecar",
+            "c_client_cpp",
+            marks=pytest.mark.c_client_cpp,
+            id="cpp",
+        ),
+    ]
+
+
+def _connect_string(http_port: int, sf_dir: Path, *, sender_id: str) -> str:
     return (
         f"ws::addr=127.0.0.1:{http_port}"
         ";username=admin;password=quest"
         f";sf_dir={sf_dir}"
+        f";sender_id={sender_id}"
         ";request_durable_ack=on"
         ";reconnect_max_duration_millis=60000"
         ";close_flush_timeout_millis=5000;"
     )
 
 
-def _await_role_tolerant(min_http_port: int, role: str, *, timeout_s: float = 60.0,
-                         poll_interval_s: float = 0.5, label: str = "") -> bool:
-    """Poll lifecycle until ``role`` is settled, tolerating transient HTTP
-    errors (the min-http server may drop connections mid-switch). Returns
-    True if confirmed, False on timeout (does not raise)."""
+def _await_role_tolerant(
+    min_http_port: int,
+    role: str,
+    *,
+    timeout_s: float = 60.0,
+    poll_interval_s: float = 0.5,
+    label: str = "",
+) -> dict:
     target = role.upper()
     deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
             snap = lifecycle(min_http_port)
             if not snap.get("switchInFlight") and snap.get("currentRole") == target:
-                LOG.info("%s: await_role_tolerant(%s) settled", label, role)
-                return True
+                LOG.info("%s: role %s settled", label, target)
+                return snap
         except Exception as exc:
-            LOG.debug("%s: await_role_tolerant transient error: %s", label, exc)
+            last_error = exc
+            LOG.debug("%s: lifecycle poll transient error: %s", label, exc)
         time.sleep(min(poll_interval_s, max(0.0, deadline - time.monotonic())))
-    LOG.warning("%s: await_role_tolerant(%s) did not settle within %.0fs", label, role, timeout_s)
-    return False
+    raise AssertionError(
+        f"{label}: role {target} did not settle within {timeout_s:.0f}s "
+        f"(last lifecycle error: {last_error!r})"
+    )
 
 
-def _submit_switch_tolerant(min_http_port: int, role: str, *, max_attempts: int = 5,
-                            retry_sleep_s: float = 1.0, label: str = "") -> bool:
-    """Submit a switch, retrying on transient connection errors."""
+def _submit_switch_tolerant(
+    min_http_port: int,
+    role: str,
+    *,
+    max_attempts: int = 5,
+    retry_sleep_s: float = 1.0,
+    label: str = "",
+) -> None:
     for attempt in range(1, max_attempts + 1):
         try:
             submit_switch(min_http_port, role, wait=False)
-            LOG.info("%s: submit_switch(%s) accepted (attempt %d)", label, role, attempt)
-            return True
+            LOG.info("%s: submit_switch(%s) accepted on attempt %d", label, role, attempt)
+            return
         except Exception as exc:
             LOG.debug("%s: submit_switch(%s) attempt %d failed: %s", label, role, attempt, exc)
             if attempt < max_attempts:
                 time.sleep(retry_sleep_s)
-    LOG.warning("%s: submit_switch(%s) failed after %d attempts", label, role, max_attempts)
-    return False
+    raise AssertionError(f"{label}: submit_switch({role}) failed after {max_attempts} attempts")
 
 
-@pytest.mark.c_client
-@pytest.mark.c_client_rust
-def test_write_path_across_switch_c_client_rust(
-    server_factory,
-    c_client_rust_sidecar: CClientRustSidecar,
-    scenario_dir: Path,
-) -> None:
-    """During Rust-sender ingest, drive a P->R->P round-trip. Asserts:
+def _assert_write_rejected_pg(*, pg_port: int, table: str) -> None:
+    """A settled replica must reject ordinary pg-wire writes cleanly."""
+    try:
+        with psycopg.connect(
+            host="127.0.0.1",
+            port=pg_port,
+            user="admin",
+            password="quest",
+            dbname="qdb",
+            connect_timeout=5,
+            autocommit=True,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'INSERT INTO "{table}" ("timestamp", v) VALUES (now(), 99999);'
+                )
+        raise AssertionError(
+            f"pg-wire INSERT was accepted on settled REPLICA for {table}; "
+            "expected a clean read-only rejection"
+        )
+    except (psycopg.OperationalError, psycopg.errors.ConnectionTimeout) as exc:
+        raise AssertionError(
+            f"pg-wire INSERT raised a connection error on settled REPLICA: {exc!r}; "
+            "expected a clean read-only rejection"
+        ) from exc
+    except psycopg.DatabaseError as exc:
+        msg = str(exc).lower()
+        assert "read-only" in msg, (
+            "pg-wire INSERT rejected on settled REPLICA, but the error was not "
+            f"role-specific: {exc!r}"
+        )
+        LOG.info("pg-wire read-only rejection confirmed: %s", exc)
 
-    1. Writes are CLEAN-rejected ('replica access is read-only') in the
-       REPLICA window -- not frozen/hung.
-    2. ``reconn_succ`` stays flat -- the connection survives the switch.
-    3. Exactly the pre-switch rows committed on the settled replica (no
-       boundary-race rows), and after switch-back the dense oracle holds
-       ``[0..N)`` with no gaps, duplicates, or shifts.
 
-    Port of Java ``test_write_path_across_switch``.
-    """
-    sf_dir = scenario_dir / "sf"
-    sf_dir.mkdir(parents=True, exist_ok=True)
-
-    p1 = server_factory("p1")
-    p1_ports = p1.start(min_http=True)
-    assert p1_ports.min_http is not None, "min_http port not reported"
-    LOG.info("write_path: server ready http=%d pg=%d min_http=%d",
-             p1_ports.http, p1_ports.pg, p1_ports.min_http)
-
-    c_client_rust_sidecar.connect(_connect_string(p1_ports.http, sf_dir))
-
-    # Phase 1: pre-switch ingestion.
-    PRE_SWITCH_ROWS = 100
-    c_client_rust_sidecar.send(TABLE, count=PRE_SWITCH_ROWS, start_index=0)
-    c_client_rust_sidecar.flush()
-    time.sleep(0.5)
-
-    reconn_succ_before = c_client_rust_sidecar.stats().reconn_succ
-
-    LOG.info("write_path: submit_switch(replica) non-blocking")
-    assert _submit_switch_tolerant(p1_ports.min_http, "replica", label="write_path"), \
-        "submit_switch(replica) failed after retries"
-
-    # Wait for REPLICA to settle, THEN probe write rejection (avoid
-    # flooding the partially-switched WAL path with accepted writes).
-    assert _await_role_tolerant(p1_ports.min_http, "replica", timeout_s=60.0,
-                                label="write_path"), \
-        "write_path: REPLICA role did not settle within 60s"
-    LOG.info("write_path: REPLICA settled -- now probing write rejection")
-
-    write_rejections: list[str] = []
-    write_index = PRE_SWITCH_ROWS
-    for attempt in range(5):
+def _stable_row_count(
+    *,
+    pg_port: int,
+    table: str,
+    stable_window_s: float = 1.0,
+    timeout_s: float = 20.0,
+) -> int:
+    deadline = time.monotonic() + timeout_s
+    stable_since: float | None = None
+    last = -1
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
         try:
-            c_client_rust_sidecar.send(TABLE, count=1, start_index=write_index)
-            c_client_rust_sidecar.flush()
-            write_index += 1
-            LOG.debug("write_path: write accepted in settled REPLICA (attempt %d) -- retry",
-                      attempt)
-        except SidecarError as exc:
-            write_rejections.append(str(exc))
-            LOG.info("write_path: write rejected in REPLICA (attempt %d): %s", attempt, exc)
-            break
-        except Exception as exc:
-            LOG.warning("write_path: unexpected write error (attempt %d): %s", attempt, exc)
-        time.sleep(0.5)
+            current = count_rows(port=pg_port, table=table, timeout_s=3.0)
+        except (TimeoutError, psycopg.DatabaseError) as exc:
+            last_error = exc
+            time.sleep(0.2)
+            continue
 
-    stats_mid = c_client_rust_sidecar.stats()
-    server_errors_at_replica = stats_mid.server_errors
-
-    # Exact-count invariant: ZERO boundary rows commit on the settled
-    # REPLICA (the QWP ingress gate re-checks the live read-only mode per
-    # batch). count==PRE_SWITCH_ROWS, not ">=".
-    replica_count = count_rows(port=p1_ports.pg, table=TABLE)
-    assert replica_count == PRE_SWITCH_ROWS, (
-        f"BOUNDARY-RACE: {replica_count - PRE_SWITCH_ROWS} boundary row(s) committed on the "
-        f"settled REPLICA (expected exactly {PRE_SWITCH_ROWS} pre-switch rows). A QWP "
-        f"connection's cached PRIMARY context landed writes on a read-only replica."
-    )
-
-    # Phase 3: switch back to PRIMARY.
-    LOG.info("write_path: submit_switch(primary)")
-    assert _submit_switch_tolerant(p1_ports.min_http, "primary", label="write_path"), \
-        "submit_switch(primary) failed after retries"
-    _await_role_tolerant(p1_ports.min_http, "primary", timeout_s=60.0, label="write_path")
-
-    reconn_succ_after = c_client_rust_sidecar.stats().reconn_succ
-
-    # Phase 4: data-integrity oracle on the pre-switch rows. A graceful
-    # switch does NOT destroy local WAL data -- no object-store wipe.
-    wait_for_dense_sequence(port=p1_ports.pg, table=TABLE,
-                            expected_count=PRE_SWITCH_ROWS, timeout_s=90.0)
-
-    # (a) Writes were cleanly rejected in the REPLICA window (not frozen).
-    assert len(write_rejections) > 0 or server_errors_at_replica > 0, (
-        "WRITE-PATH: no write rejections recorded during the REPLICA window. "
-        "Expected 'replica access is read-only'. "
-        f"write_rejections={len(write_rejections)}, server_errors={server_errors_at_replica}."
-    )
-    # (b) The original connection survived the switch (no reconnect).
-    assert reconn_succ_after == reconn_succ_before, (
-        f"CONNECTION SURVIVAL: reconn_succ changed from {reconn_succ_before} to "
-        f"{reconn_succ_after}. The QWP ingress connection dropped and reconnected during the "
-        f"switch -- expected it to survive the P->R->P window."
-    )
-    LOG.info("write_path: PASSED -- dense [0..%d) verified; %d rejection(s); reconn_succ flat at %d",
-             PRE_SWITCH_ROWS, len(write_rejections) + server_errors_at_replica, reconn_succ_before)
-
-
-@pytest.mark.c_client
-@pytest.mark.c_client_rust
-def test_disturbance_honesty_guard_c_client_rust(
-    server_factory,
-    c_client_rust_sidecar: CClientRustSidecar,
-    scenario_dir: Path,
-) -> None:
-    """Honesty guard: nothing must pass on a no-op switch.
-
-    Asserts via ``lifecycle()`` that the role actually flipped to REPLICA
-    (``currentRole == 'REPLICA'`` and ``switchInFlight == False`` at the
-    apex) AND that the Rust sender's writes were actually rejected in that
-    window. Port of Java ``test_disturbance_honesty_guard``.
-    """
-    sf_dir = scenario_dir / "sf"
-    sf_dir.mkdir(parents=True, exist_ok=True)
-
-    p1 = server_factory("p1")
-    p1_ports = p1.start(min_http=True)
-    assert p1_ports.min_http is not None, "min_http port not reported"
-
-    c_client_rust_sidecar.connect(_connect_string(p1_ports.http, sf_dir))
-    c_client_rust_sidecar.send(TABLE, count=30, start_index=0)
-    c_client_rust_sidecar.flush()
-    time.sleep(0.5)
-
-    # Must START as PRIMARY else the guard is vacuous.
-    initial_snap = lifecycle(p1_ports.min_http)
-    assert initial_snap.get("currentRole") == "PRIMARY", (
-        f"HONESTY GUARD: server did not start as PRIMARY. "
-        f"Got currentRole={initial_snap.get('currentRole')!r}."
-    )
-    assert not initial_snap.get("switchInFlight"), (
-        "HONESTY GUARD: switchInFlight=True at test start -- unexpected."
-    )
-
-    LOG.info("honesty_guard: submit_switch(replica) non-blocking")
-    assert _submit_switch_tolerant(p1_ports.min_http, "replica", label="honesty_guard"), \
-        "submit_switch(replica) failed after retries"
-
-    replica_snap: dict | None = None
-    write_rejections_during_switch: list[str] = []
-    write_idx = 30
-    poll_deadline = time.monotonic() + 30.0
-    while time.monotonic() < poll_deadline:
-        try:
-            c_client_rust_sidecar.send(TABLE, count=1, start_index=write_idx)
-            c_client_rust_sidecar.flush()
-            write_idx += 1
-        except SidecarError as exc:
-            write_rejections_during_switch.append(str(exc))
-            LOG.info("honesty_guard: write rejected in switch window: %s", exc)
-        except Exception as exc:
-            LOG.warning("honesty_guard: unexpected write error: %s", exc)
-
-        try:
-            snap = lifecycle(p1_ports.min_http)
-            if not snap.get("switchInFlight") and snap.get("currentRole") == "REPLICA":
-                replica_snap = snap
-                LOG.info("honesty_guard: REPLICA confirmed")
-                break
-        except Exception as exc:
-            LOG.debug("honesty_guard: lifecycle poll transient error: %s", exc)
+        if current != last:
+            last = current
+            stable_since = time.monotonic()
+        elif stable_since is not None and time.monotonic() - stable_since >= stable_window_s:
+            return current
         time.sleep(0.2)
 
-    _await_role_tolerant(p1_ports.min_http, "replica", timeout_s=60.0, label="honesty_guard")
+    raise AssertionError(
+        f"row count for {table} did not become stable within {timeout_s:.0f}s "
+        f"(last={last}, last_error={last_error!r})"
+    )
 
-    if replica_snap is None:
+
+def _assert_count_frozen(
+    *,
+    pg_port: int,
+    table: str,
+    expected: int,
+    duration_s: float = 2.0,
+) -> None:
+    deadline = time.monotonic() + duration_s
+    observations: list[int] = []
+    while time.monotonic() < deadline:
+        observed = count_rows(port=pg_port, table=table, timeout_s=3.0)
+        observations.append(observed)
+        assert observed == expected, (
+            f"{table}: row count changed on settled REPLICA; expected {expected}, "
+            f"observed {observed}. observations={observations}"
+        )
+        time.sleep(0.2)
+
+
+def _wait_for_published_rows_above(
+    *,
+    get_published_rows,
+    threshold: int,
+    timeout_s: float,
+    label: str,
+) -> int:
+    deadline = time.monotonic() + timeout_s
+    last = get_published_rows()
+    while time.monotonic() < deadline:
+        last = get_published_rows()
+        if last > threshold:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(
+        f"{label}: background producer did not publish beyond {threshold} "
+        f"within {timeout_s:.1f}s (last={last})"
+    )
+
+
+def _wait_for_no_extra_dense_sequence(
+    *,
+    pg_port: int,
+    table: str,
+    expected_count: int,
+    timeout_s: float,
+) -> list[int]:
+    deadline = time.monotonic() + timeout_s
+    expected = list(range(expected_count))
+    observed: list[int] = []
+    while time.monotonic() < deadline:
         try:
-            replica_snap = lifecycle(p1_ports.min_http)
-        except Exception as exc:
-            LOG.warning("honesty_guard: could not fetch lifecycle snapshot post-await: %s", exc)
+            observed = fetch_column_sorted(
+                port=pg_port,
+                table=table,
+                timeout_s=3.0,
+            )
+        except TimeoutError:
+            observed = []
+
+        if observed == expected:
+            return observed
+        if len(observed) >= expected_count:
+            break
+        time.sleep(0.25)
+
+    observed_set = set(observed)
+    expected_set = set(expected)
+    missing = sorted(expected_set - observed_set)[:10]
+    extra = sorted(observed_set - expected_set)[:10]
+    raise AssertionError(
+        f"{table}.v: expected dense values [0..{expected_count}), "
+        f"observed {len(observed)} rows; first missing={missing}; first extra={extra}"
+    )
+
+
+@pytest.mark.c_client
+@pytest.mark.parametrize("sidecar_fixture,suffix", _binding_cases())
+def test_qwp_store_and_forward_survives_graceful_role_switch(
+    request: pytest.FixtureRequest,
+    server_factory,
+    scenario_dir: Path,
+    sidecar_fixture: str,
+    suffix: str,
+) -> None:
+    table = f"switch_test_{suffix}"
+    sf_dir = scenario_dir / f"sf-{suffix}"
+    sf_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = request.getfixturevalue(sidecar_fixture)
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start(min_http=True)
+    assert p1_ports.min_http is not None, "min_http port not reported"
+    LOG.info("%s: server ready http=%d pg=%d min_http=%d",
+             suffix, p1_ports.http, p1_ports.pg, p1_ports.min_http)
+
+    initial_snap = lifecycle(p1_ports.min_http)
+    assert initial_snap.get("currentRole") == "PRIMARY", (
+        f"{suffix}: server did not start as PRIMARY: {initial_snap!r}"
+    )
+    assert not initial_snap.get("switchInFlight"), (
+        f"{suffix}: switchInFlight=True before the test starts: {initial_snap!r}"
+    )
+
+    sidecar.connect(_connect_string(p1_ports.http, sf_dir, sender_id=suffix))
+
+    sidecar.send(table, count=_INITIAL_ROWS, start_index=0)
+    initial_fsn = sidecar.flush()
+    assert initial_fsn >= 0, f"{suffix}: initial flush did not publish an FSN"
+    assert sidecar.await_acked(initial_fsn, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
+        f"{suffix}: initial frame fsn={initial_fsn} was not durably acked before demotion"
+    )
+    wait_for_dense_sequence(
+        port=p1_ports.pg,
+        table=table,
+        expected_count=_INITIAL_ROWS,
+        timeout_s=60.0,
+    )
+
+    stats_before = sidecar.stats()
+
+    LOG.info("%s: demoting PRIMARY to REPLICA", suffix)
+    _submit_switch_tolerant(p1_ports.min_http, "replica", label=suffix)
+    replica_snap = _await_role_tolerant(p1_ports.min_http, "replica", label=suffix)
+    assert replica_snap.get("currentRole") == "REPLICA"
+    assert not replica_snap.get("switchInFlight")
+
+    _assert_write_rejected_pg(pg_port=p1_ports.pg, table=table)
+
+    replica_count = _stable_row_count(pg_port=p1_ports.pg, table=table)
+    assert replica_count == _INITIAL_ROWS, (
+        f"{suffix}: settled REPLICA count should contain only pre-switch rows; "
+        f"expected {_INITIAL_ROWS}, observed {replica_count}"
+    )
+
+    LOG.info("%s: publishing rows while server is a settled REPLICA", suffix)
+    sidecar.send(table, count=_REPLICA_WINDOW_ROWS, start_index=_INITIAL_ROWS)
+    replica_fsn = sidecar.flush()
+    assert replica_fsn > initial_fsn, (
+        f"{suffix}: replica-window flush returned invalid fsn {replica_fsn} "
+        f"(initial fsn {initial_fsn})"
+    )
+
+    _assert_count_frozen(
+        pg_port=p1_ports.pg,
+        table=table,
+        expected=_INITIAL_ROWS,
+        duration_s=2.0,
+    )
+
+    LOG.info("%s: promoting REPLICA back to PRIMARY", suffix)
+    _submit_switch_tolerant(p1_ports.min_http, "primary", label=suffix)
+    primary_snap = _await_role_tolerant(p1_ports.min_http, "primary", label=suffix)
+    assert primary_snap.get("currentRole") == "PRIMARY"
+    assert not primary_snap.get("switchInFlight")
+
+    assert sidecar.await_acked(replica_fsn, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
+        f"{suffix}: replica-window frame fsn={replica_fsn} was not durably acked "
+        "after the node became PRIMARY again"
+    )
+
+    expected_total = _INITIAL_ROWS + _REPLICA_WINDOW_ROWS
+    wait_for_dense_sequence(
+        port=p1_ports.pg,
+        table=table,
+        expected_count=expected_total,
+        timeout_s=90.0,
+    )
+
+    stats_after = sidecar.stats()
+    LOG.info(
+        "%s: PASS initial=%d buffered=%d final=%d acked=%d reconn_succ_delta=%d",
+        suffix,
+        _INITIAL_ROWS,
+        _REPLICA_WINDOW_ROWS,
+        expected_total,
+        stats_after.acked,
+        stats_after.reconn_succ - stats_before.reconn_succ,
+    )
+
+
+@pytest.mark.c_client
+@pytest.mark.xfail(
+    reason=(
+        "future-state mid-stream role-switch invariant: current PR-1105 path "
+        "can replay one duplicate row without STATUS_NOT_WRITABLE/idempotent "
+        "NACK semantics"
+    ),
+    strict=True,
+)
+@pytest.mark.parametrize("sidecar_fixture,suffix", _binding_cases())
+def test_qwp_store_and_forward_uncoordinated_role_switch(
+    request: pytest.FixtureRequest,
+    server_factory,
+    scenario_dir: Path,
+    sidecar_fixture: str,
+    suffix: str,
+) -> None:
+    table = f"switch_uncoord_{suffix}"
+    sf_dir = scenario_dir / f"sf-uncoord-{suffix}"
+    sf_dir.mkdir(parents=True, exist_ok=True)
+    sidecar = request.getfixturevalue(sidecar_fixture)
+    label = f"{suffix}-uncoord"
+
+    p1 = server_factory("p1")
+    p1_ports = p1.start(min_http=True)
+    assert p1_ports.min_http is not None, "min_http port not reported"
+
+    initial_snap = lifecycle(p1_ports.min_http)
+    assert initial_snap.get("currentRole") == "PRIMARY", (
+        f"{label}: server did not start as PRIMARY: {initial_snap!r}"
+    )
+    assert not initial_snap.get("switchInFlight"), (
+        f"{label}: switchInFlight=True before the test starts: {initial_snap!r}"
+    )
+
+    sidecar.connect(_connect_string(p1_ports.http, sf_dir, sender_id=label))
+    sidecar.send(table, count=_UNCOORDINATED_INITIAL_ROWS, start_index=0)
+    seed_fsn = sidecar.flush()
+    assert seed_fsn >= 0, f"{label}: seed flush did not publish an FSN"
+    assert sidecar.await_acked(seed_fsn, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
+        f"{label}: seed frame fsn={seed_fsn} was not durably acked"
+    )
+    wait_for_dense_sequence(
+        port=p1_ports.pg,
+        table=table,
+        expected_count=_UNCOORDINATED_INITIAL_ROWS,
+        timeout_s=60.0,
+    )
+
+    state_lock = threading.Lock()
+    stop_event = threading.Event()
+    published_fsn = [seed_fsn]
+    published_rows = [_UNCOORDINATED_INITIAL_ROWS]
+    ingest_errors: list[str] = []
+
+    def current_published_rows() -> int:
+        with state_lock:
+            return published_rows[0]
+
+    def ingest_loop() -> None:
+        while not stop_event.is_set():
+            with state_lock:
+                start = published_rows[0]
+            try:
+                sidecar.send(table, count=1, start_index=start)
+                fsn = sidecar.flush()
+                if fsn < 0:
+                    raise AssertionError(f"flush returned invalid fsn {fsn}")
+            except Exception as exc:
+                ingest_errors.append(repr(exc))
+                stop_event.set()
+                return
+            with state_lock:
+                published_rows[0] = start + 1
+                published_fsn[0] = fsn
+            time.sleep(0.1)
+
+    ingest_thread = threading.Thread(target=ingest_loop, name=f"{label}-ingest")
+    ingest_thread.start()
 
     try:
-        server_errors_evidence = c_client_rust_sidecar.stats().server_errors
-    except Exception:
-        server_errors_evidence = 0
-
-    # Switch back to PRIMARY.
-    LOG.info("honesty_guard: submit_switch(primary)")
-    assert _submit_switch_tolerant(p1_ports.min_http, "primary", label="honesty_guard"), \
-        "submit_switch(primary) failed after retries"
-    _await_role_tolerant(p1_ports.min_http, "primary", timeout_s=60.0, label="honesty_guard")
-
-    # (a) lifecycle confirmed REPLICA at the apex.
-    assert replica_snap is not None, (
-        "HONESTY GUARD: lifecycle() snapshot was never captured confirming REPLICA. "
-        f"write_rejections={len(write_rejections_during_switch)}, "
-        f"server_errors={server_errors_evidence}."
-    )
-    assert replica_snap.get("currentRole") == "REPLICA", (
-        f"HONESTY GUARD: lifecycle snapshot at apex has currentRole="
-        f"{replica_snap.get('currentRole')!r}, expected 'REPLICA'."
-    )
-    assert not replica_snap.get("switchInFlight"), (
-        f"HONESTY GUARD: lifecycle snapshot at apex has switchInFlight=True. Snapshot: {replica_snap!r}"
-    )
-
-    # (b) Writes were actually rejected -- the REPLICA window was live.
-    write_evidence_total = len(write_rejections_during_switch) + server_errors_evidence
-    assert write_evidence_total > 0, (
-        "HONESTY GUARD: no write rejections observed during the REPLICA window. "
-        "Expected 'replica access is read-only'. A test that passes without write "
-        "rejections would be vacuous."
-    )
-    if write_rejections_during_switch:
-        first = write_rejections_during_switch[0]
-        assert "read-only" in first.lower() or "security_error" in first.lower(), (
-            f"HONESTY GUARD: write rejection message lacks 'read-only'/'SECURITY_ERROR'. Got: {first!r}"
+        _wait_for_published_rows_above(
+            get_published_rows=current_published_rows,
+            threshold=_UNCOORDINATED_INITIAL_ROWS,
+            timeout_s=10.0,
+            label=label,
         )
+        assert not ingest_errors, f"{label}: ingest failed before role switch: {ingest_errors}"
 
-    LOG.info("honesty_guard: PASSED -- lifecycle confirmed REPLICA; %d write rejection(s)",
-             write_evidence_total)
+        rows_before_demote = current_published_rows()
+        LOG.info("%s: demoting PRIMARY -> REPLICA while producer is active", label)
+        _submit_switch_tolerant(p1_ports.min_http, "replica", label=label)
+        replica_snap = _await_role_tolerant(p1_ports.min_http, "replica", label=label)
+        assert replica_snap.get("currentRole") == "REPLICA"
+        assert not replica_snap.get("switchInFlight")
+        _wait_for_published_rows_above(
+            get_published_rows=current_published_rows,
+            threshold=rows_before_demote,
+            timeout_s=10.0,
+            label=label,
+        )
+        assert not ingest_errors, f"{label}: ingest failed during demotion: {ingest_errors}"
+
+        _assert_write_rejected_pg(pg_port=p1_ports.pg, table=table)
+        frozen = _stable_row_count(pg_port=p1_ports.pg, table=table)
+        rows_before_frozen_window = current_published_rows()
+        _assert_count_frozen(
+            pg_port=p1_ports.pg,
+            table=table,
+            expected=frozen,
+            duration_s=_UNCOORDINATED_REPLICA_OBSERVATION_S,
+        )
+        _wait_for_published_rows_above(
+            get_published_rows=current_published_rows,
+            threshold=rows_before_frozen_window,
+            timeout_s=0.5,
+            label=label,
+        )
+        assert not ingest_errors, f"{label}: ingest failed on settled REPLICA: {ingest_errors}"
+
+        LOG.info("%s: promoting REPLICA -> PRIMARY while producer is active", label)
+        rows_before_promote = current_published_rows()
+        _submit_switch_tolerant(p1_ports.min_http, "primary", label=label)
+        primary_snap = _await_role_tolerant(p1_ports.min_http, "primary", label=label)
+        assert primary_snap.get("currentRole") == "PRIMARY"
+        assert not primary_snap.get("switchInFlight")
+        _wait_for_published_rows_above(
+            get_published_rows=current_published_rows,
+            threshold=rows_before_promote,
+            timeout_s=10.0,
+            label=label,
+        )
+    finally:
+        stop_event.set()
+        ingest_thread.join(timeout=70.0)
+
+    assert not ingest_thread.is_alive(), f"{label}: ingest thread did not stop"
+    assert not ingest_errors, f"{label}: ingest failed: {ingest_errors}"
+
+    with state_lock:
+        final_fsn = published_fsn[0]
+        final_rows = published_rows[0]
+
+    assert sidecar.await_acked(final_fsn, _DURABLE_ACK_AWAIT_TIMEOUT_MS), (
+        f"{label}: final fsn={final_fsn} for {final_rows} rows was not durably acked"
+    )
+    _wait_for_no_extra_dense_sequence(
+        pg_port=p1_ports.pg,
+        table=table,
+        expected_count=final_rows,
+        timeout_s=30.0,
+    )
+
+    LOG.info(
+        "%s: PASS initial=%d final=%d final_fsn=%d frozen=%d",
+        label,
+        _UNCOORDINATED_INITIAL_ROWS,
+        final_rows,
+        final_fsn,
+        frozen,
+    )

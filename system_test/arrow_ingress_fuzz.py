@@ -1136,27 +1136,25 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
                 )
                 self.assertEqual(
                     diagnostic.applied_policy,
-                    QwpWsErrorPolicy.DROP_AND_CONTINUE,
+                    QwpWsErrorPolicy.TERMINAL,
                 )
                 self.assertEqual(diagnostic.status, 0x03)
                 self.assertEqual(diagnostic.from_fsn, 1)
                 self.assertEqual(diagnostic.to_fsn, 1)
 
-                afc.column_sender_sync(conn, 0)
-
-            self.assertEqual(
+            self.assertGreater(
                 afc.sfa_file_count(sf_dir, sender_id),
                 0,
-                self.label("SFA files left after rejection recovery"),
+                self.label("Terminal rejection should preserve SFA files"),
             )
 
-        afc.wait_for_rows(self._fixture, table, 2)
+        afc.wait_for_rows(self._fixture, table, 1)
         resp = self._fixture.http_sql_query(
             f"select id, px from '{table}' order by id"
         )
         self.assertEqual(
             resp["dataset"],
-            [[0, 10.5], [2, 20.5]],
+            [[0, 10.5]],
             self.label(),
         )
 

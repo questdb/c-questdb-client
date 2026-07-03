@@ -291,6 +291,7 @@ impl ManualOrphanDrainers {
             | OrphanOpenOutcome::Stopped => true,
             OrphanOpenOutcome::RetryLater(reason) => {
                 let _ = record_last_error(&slot_dir, &reason);
+                self.pending.push_back(slot_dir);
                 true
             }
             OrphanOpenOutcome::Unrecoverable(reason) => {
@@ -433,7 +434,7 @@ impl OrphanDrainer {
         }
         let max_in_flight = queue.max_in_flight();
         let store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
-        let send_core = QwpWsSendCore::new_with_durable_ack(
+        let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
             transport,
             max_in_flight,
             ReconnectPolicy::bounded(
@@ -448,6 +449,7 @@ impl OrphanDrainer {
             // and is lost when the primary fails over before the WAL upload,
             // instead of surviving in the slot and replaying to the successor.
             *config.qwp_ws.request_durable_ack,
+            *config.qwp_ws.max_frame_rejections,
         );
         OrphanOpenOutcome::Drainer(Box::new(Self {
             slot_dir,
@@ -564,19 +566,27 @@ fn sleep_before_orphan_reconnect(
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 fn drain_orphan_to_completion(slot_dir: PathBuf, config: &OrphanDrainerConfig, stop: &AtomicBool) {
-    let mut drainer = match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop) {
-        OrphanOpenOutcome::Drainer(drainer) => drainer,
-        OrphanOpenOutcome::AlreadyDrained
-        | OrphanOpenOutcome::FailedSentinel
-        | OrphanOpenOutcome::Locked
-        | OrphanOpenOutcome::Stopped => return,
-        OrphanOpenOutcome::RetryLater(reason) => {
-            record_last_error_unless_stopped(&slot_dir, &reason, stop);
-            return;
-        }
-        OrphanOpenOutcome::Unrecoverable(reason) => {
-            mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
-            return;
+    let mut drainer = loop {
+        match OrphanDrainer::open_with_stop(slot_dir.clone(), config, stop) {
+            OrphanOpenOutcome::Drainer(drainer) => break drainer,
+            OrphanOpenOutcome::AlreadyDrained
+            | OrphanOpenOutcome::FailedSentinel
+            | OrphanOpenOutcome::Locked
+            | OrphanOpenOutcome::Stopped => return,
+            OrphanOpenOutcome::RetryLater(reason) => {
+                record_last_error_unless_stopped(&slot_dir, &reason, stop);
+                if !sleep_before_orphan_reconnect(
+                    None,
+                    *config.qwp_ws.reconnect_initial_backoff,
+                    Some(stop),
+                ) {
+                    return;
+                }
+            }
+            OrphanOpenOutcome::Unrecoverable(reason) => {
+                mark_orphan_failed_unless_stopped(&slot_dir, &reason, stop);
+                return;
+            }
         }
     };
     while !stop.load(Ordering::Acquire) {
@@ -589,7 +599,13 @@ fn drain_orphan_to_completion(slot_dir: PathBuf, config: &OrphanDrainerConfig, s
                 if !stop.load(Ordering::Acquire) {
                     drainer.record_last_error(&reason);
                 }
-                return;
+                if !sleep_before_orphan_reconnect(
+                    None,
+                    *config.qwp_ws.reconnect_initial_backoff,
+                    Some(stop),
+                ) {
+                    return;
+                }
             }
             OrphanDriveOutcome::Stopped => return,
             OrphanDriveOutcome::Progress => {}

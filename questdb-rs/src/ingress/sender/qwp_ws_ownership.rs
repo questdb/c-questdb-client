@@ -113,7 +113,7 @@ fn default_qwp_ws_error_handler(error: &QwpWsSenderError) {
         .map(|sequence| sequence.to_string())
         .unwrap_or_else(|| "none".to_string());
     let message = error.message.as_deref().unwrap_or("");
-    if error.applied_policy == QwpWsErrorPolicy::Halt {
+    if error.applied_policy == QwpWsErrorPolicy::Terminal {
         log::error!(
             target: "questdb::ingress",
             "QWP/WebSocket server rejected batch [category={:?}, policy={:?}, status={}, fsn=[{},{}], seq={}, msg={}]",
@@ -161,8 +161,8 @@ pub struct QwpWsTotals {
     pub reconnect_attempts: u64,
     /// Reconnect cycles that completed successfully and resumed publication.
     pub reconnects_succeeded: u64,
-    /// Server-sent Reject responses (any policy: terminal, drop-and-continue,
-    /// durable, presend).
+    /// Server-sent Reject responses (any policy: retriable, terminal, durable,
+    /// presend).
     pub server_errors: u64,
 }
 
@@ -181,8 +181,9 @@ pub enum QwpWsErrorCategory {
     SecurityError,
     /// Non-critical server write failure.
     WriteError,
-    /// Terminal WebSocket close code that indicates replaying the same bytes
-    /// would fail again.
+    /// Server reports that the endpoint is temporarily not writable.
+    NotWritable,
+    /// WebSocket protocol violation, including poison-frame escalation.
     ProtocolViolation,
     /// Unknown QWP status byte.
     Unknown,
@@ -192,11 +193,15 @@ pub enum QwpWsErrorCategory {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QwpWsErrorPolicy {
-    /// Drop the affected batch from the sender's perspective and continue
-    /// draining subsequent batches.
-    DropAndContinue,
-    /// Latch the error as terminal. The sender must be closed and rebuilt.
-    Halt,
+    /// Tear down the connection, reconnect, and replay from the unresolved
+    /// store-and-forward watermark.
+    Retriable,
+    /// Tear down and replay, but classify separately for diagnostics because
+    /// another endpoint/role may be required.
+    RetriableOther,
+    /// Latch the error as terminal. The bytes remain in store-and-forward
+    /// storage for inspection or a later compatible client/server.
+    Terminal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2974,15 +2974,17 @@ pub enum line_sender_qwpws_error_category {
     LINE_SENDER_QWPWS_ERROR_INTERNAL_ERROR = 2,
     LINE_SENDER_QWPWS_ERROR_SECURITY_ERROR = 3,
     LINE_SENDER_QWPWS_ERROR_WRITE_ERROR = 4,
-    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 5,
-    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 6,
+    LINE_SENDER_QWPWS_ERROR_NOT_WRITABLE = 5,
+    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 6,
+    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 7,
 }
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum line_sender_qwpws_error_policy {
-    LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE = 0,
-    LINE_SENDER_QWPWS_ERROR_HALT = 1,
+    LINE_SENDER_QWPWS_ERROR_RETRIABLE = 0,
+    LINE_SENDER_QWPWS_ERROR_RETRIABLE_OTHER = 1,
+    LINE_SENDER_QWPWS_ERROR_TERMINAL = 2,
 }
 
 pub struct line_sender_qwpws_error {
@@ -3028,6 +3030,9 @@ impl From<RustQwpWsErrorCategory> for line_sender_qwpws_error_category {
             RustQwpWsErrorCategory::WriteError => {
                 line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_WRITE_ERROR
             }
+            RustQwpWsErrorCategory::NotWritable => {
+                line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_NOT_WRITABLE
+            }
             RustQwpWsErrorCategory::ProtocolViolation => {
                 line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION
             }
@@ -3042,13 +3047,16 @@ impl From<RustQwpWsErrorCategory> for line_sender_qwpws_error_category {
 impl From<RustQwpWsErrorPolicy> for line_sender_qwpws_error_policy {
     fn from(policy: RustQwpWsErrorPolicy) -> Self {
         match policy {
-            RustQwpWsErrorPolicy::DropAndContinue => {
-                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE
+            RustQwpWsErrorPolicy::Retriable => {
+                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_RETRIABLE
             }
-            RustQwpWsErrorPolicy::Halt => {
-                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_HALT
+            RustQwpWsErrorPolicy::RetriableOther => {
+                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_RETRIABLE_OTHER
             }
-            _ => line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_HALT,
+            RustQwpWsErrorPolicy::Terminal => {
+                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_TERMINAL
+            }
+            _ => line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_TERMINAL,
         }
     }
 }
@@ -3113,7 +3121,7 @@ fn qwp_ws_sender_error_view(error: &QwpWsSenderError) -> line_sender_qwpws_error
 }
 
 fn c_default_qwp_ws_error_handler(error: &QwpWsSenderError) {
-    let level = if error.applied_policy == RustQwpWsErrorPolicy::Halt {
+    let level = if error.applied_policy == RustQwpWsErrorPolicy::Terminal {
         "ERROR"
     } else {
         "WARN"
@@ -3676,7 +3684,7 @@ pub unsafe extern "C" fn line_sender_qwpws_error_get_view(
     let Some(error) = (unsafe { error.as_ref() }) else {
         return line_sender_qwpws_error_view {
             category: line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_UNKNOWN,
-            applied_policy: line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_HALT,
+            applied_policy: line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_TERMINAL,
             has_status: false,
             status: 0,
             has_message_sequence: false,
@@ -5414,7 +5422,7 @@ mod tests {
     fn blank_qwpws_error_view() -> line_sender_qwpws_error_view {
         line_sender_qwpws_error_view {
             category: line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_UNKNOWN,
-            applied_policy: line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_HALT,
+            applied_policy: line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_TERMINAL,
             has_status: false,
             status: 0,
             has_message_sequence: false,
@@ -5426,14 +5434,14 @@ mod tests {
         }
     }
 
-    fn assert_parse_halt_diagnostic(view: line_sender_qwpws_error_view) {
+    fn assert_parse_terminal_diagnostic(view: line_sender_qwpws_error_view) {
         assert_eq!(
             view.category,
             line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_PARSE_ERROR
         );
         assert_eq!(
             view.applied_policy,
-            line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_HALT
+            line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_TERMINAL
         );
         assert!(view.has_status);
         assert_eq!(view.status, QWP_STATUS_PARSE_ERROR);
@@ -6601,10 +6609,9 @@ mod tests {
     #[test]
     fn qwpws_poll_error_uses_owned_object_view() {
         let owned = Box::new(line_sender_qwpws_error {
-            category: line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_SCHEMA_MISMATCH,
-            applied_policy:
-                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE,
-            status: Some(3),
+            category: line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_NOT_WRITABLE,
+            applied_policy: line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_RETRIABLE_OTHER,
+            status: Some(0x0c),
             message_sequence: Some(42),
             from_fsn: 7,
             to_fsn: 9,
@@ -6616,14 +6623,14 @@ mod tests {
             let view = line_sender_qwpws_error_get_view(raw);
             assert_eq!(
                 view.category,
-                line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_SCHEMA_MISMATCH
+                line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_NOT_WRITABLE
             );
             assert_eq!(
                 view.applied_policy,
-                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE
+                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_RETRIABLE_OTHER
             );
             assert!(view.has_status);
-            assert_eq!(view.status, 3);
+            assert_eq!(view.status, 0x0c);
             assert!(view.has_message_sequence);
             assert_eq!(view.message_sequence, 42);
             assert_eq!(view.from_fsn, 7);
@@ -6712,7 +6719,7 @@ mod tests {
                 assert!(err.is_null());
                 if !qwp_error.is_null() {
                     let view = line_sender_qwpws_error_get_view(qwp_error);
-                    assert_parse_halt_diagnostic(view);
+                    assert_parse_terminal_diagnostic(view);
                     line_sender_qwpws_error_free(qwp_error);
                     polled = true;
                     break;
@@ -6730,13 +6737,13 @@ mod tests {
             );
             assert_eq!(
                 callback_state.policy.load(Ordering::SeqCst),
-                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_HALT as u64
+                line_sender_qwpws_error_policy::LINE_SENDER_QWPWS_ERROR_TERMINAL as u64
             );
             assert_eq!(callback_state.from_fsn.load(Ordering::SeqCst), 0);
             assert_eq!(callback_state.to_fsn.load(Ordering::SeqCst), 0);
             let mut view = blank_qwpws_error_view();
             assert!(line_sender_error_qwpws_get_view(err, &mut view));
-            assert_parse_halt_diagnostic(view);
+            assert_parse_terminal_diagnostic(view);
             free_err(&mut err);
 
             assert!(line_sender_buffer_table(
@@ -6765,7 +6772,7 @@ mod tests {
             );
             let mut view = blank_qwpws_error_view();
             assert!(line_sender_error_qwpws_get_view(err, &mut view));
-            assert_parse_halt_diagnostic(view);
+            assert_parse_terminal_diagnostic(view);
             free_err(&mut err);
 
             line_sender_buffer_free(buffer);

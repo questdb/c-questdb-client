@@ -706,6 +706,7 @@ impl QwpWsPendingConnect {
                 &endpoints,
                 &mut tracker,
                 &mut previous_idx,
+                None,
                 self.use_tls,
                 self.tls_settings.clone(),
                 &self.qwp_ws,
@@ -772,11 +773,12 @@ impl SyncQwpWsPendingRunnerCore {
 
         match self.pending_connect.connect_with_retry(stop) {
             Ok(Some(transport)) => {
-                let send_core = QwpWsSendCore::new_with_durable_ack(
+                let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
                     transport,
                     self.pending_connect.max_in_flight,
                     self.pending_connect.reconnect_policy,
                     self.pending_connect.durable_ack,
+                    *self.pending_connect.qwp_ws.max_frame_rejections,
                 );
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
@@ -790,6 +792,10 @@ impl SyncQwpWsPendingRunnerCore {
             }
             Ok(None) => RunnerStep::Stop,
             Err(err) => {
+                if !reconnect_error_is_terminal(&err) {
+                    thread::sleep(self.pending_connect.reconnect_policy.initial_backoff());
+                    return RunnerStep::Continue;
+                }
                 let mut store = match shared.lock() {
                     Ok(store) => store,
                     Err(_) => return RunnerStep::Stop,
@@ -1211,11 +1217,24 @@ where
                 }
                 Ok(QwpWsReconnectStep::RetryAfter { sleep_for }) => {
                     if !sleep_before_runner_reconnect(reconnect.deadline(), sleep_for, stop) {
-                        break;
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let err = reconnect.retry_budget_exhausted_error();
+                        reconnect =
+                            self.send_core
+                                .begin_reconnect("QWP/WebSocket reconnect", reason, err);
+                        continue;
                     }
                 }
                 Ok(QwpWsReconnectStep::Terminal(err)) => {
-                    return self.mark_store_terminal(shared, err);
+                    if reconnect_error_is_terminal(&err) {
+                        return self.mark_store_terminal(shared, err);
+                    }
+                    thread::sleep(reconnect.initial_backoff());
+                    reconnect =
+                        self.send_core
+                            .begin_reconnect("QWP/WebSocket reconnect", reason, err);
                 }
                 Err(err) => {
                     let mut store = match shared.lock() {
@@ -1230,7 +1249,7 @@ where
         if stop.load(Ordering::Acquire) {
             RunnerStep::Stop
         } else {
-            self.mark_store_terminal(shared, reconnect.retry_budget_exhausted_error())
+            RunnerStep::Continue
         }
     }
 
@@ -1912,10 +1931,6 @@ struct BufferedFrameHeader {
     frame_end: usize,
 }
 
-pub(crate) fn is_terminal_ws_close_code(code: u16) -> bool {
-    matches!(code, 1002 | 1003 | 1007 | 1008 | 1009 | 1010)
-}
-
 #[derive(Debug, Clone, Copy)]
 #[cfg(test)]
 struct FrameHeader {
@@ -2378,8 +2393,14 @@ impl QwpWsHostHealthTracker {
         self.attempted_this_round[idx] = true;
     }
 
-    pub(crate) fn record_mid_stream_failure(&mut self, idx: usize) {
-        if self.states[idx] == QwpWsHostState::Healthy {
+    pub(crate) fn record_mid_stream_failure(
+        &mut self,
+        idx: usize,
+        reason: Option<ReconnectReason>,
+    ) {
+        if reason == Some(ReconnectReason::NotWritable) {
+            self.states[idx] = QwpWsHostState::RoleRejected;
+        } else if self.states[idx] == QwpWsHostState::Healthy {
             self.states[idx] = QwpWsHostState::FailedThisRound;
         }
     }
@@ -2600,13 +2621,14 @@ pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     endpoints: &Arc<[QwpWsEndpoint]>,
     mut health: A,
     previous_idx: &mut Option<usize>,
+    previous_failure: Option<ReconnectReason>,
     use_tls: bool,
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
 ) -> crate::Result<QwpWsConnectRoundSuccess> {
     if let Some(idx) = previous_idx.take() {
-        health.with_tracker(|t| t.record_mid_stream_failure(idx));
+        health.with_tracker(|t| t.record_mid_stream_failure(idx, previous_failure));
     }
     let mut last_transport_endpoint_idx = None;
     let mut last_role_mismatch = None;
@@ -2874,7 +2896,7 @@ fn open_qwp_ws_parts(
     let negotiated_version = transport.negotiated_version();
     let max_in_flight = queue.max_in_flight();
     let store = QwpWsPublicationStore::new(queue, *qwp_ws.error_inbox_capacity);
-    let send_core = QwpWsSendCore::new_with_durable_ack(
+    let send_core = QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
         transport,
         max_in_flight,
         ReconnectPolicy::bounded(
@@ -2883,6 +2905,7 @@ fn open_qwp_ws_parts(
             *qwp_ws.reconnect_max_backoff,
         ),
         *qwp_ws.request_durable_ack,
+        *qwp_ws.max_frame_rejections,
     );
 
     Ok(QwpWsConnectedParts {
@@ -2949,6 +2972,7 @@ fn connect_blocking_transport_with_retry(
             &endpoints,
             &mut tracker,
             &mut previous_idx,
+            None,
             use_tls,
             tls_settings.clone(),
             qwp_ws,
@@ -3485,9 +3509,22 @@ mod tests {
         tracker.record_success(0);
         tracker.begin_round(true);
 
-        tracker.record_mid_stream_failure(0);
+        tracker.record_mid_stream_failure(0, Some(ReconnectReason::RetryableFailure));
 
         assert_eq!(tracker.states[0], QwpWsHostState::FailedThisRound);
+        assert!(!tracker.attempted_this_round[0]);
+        assert_eq!(tracker.pick_next(), Some(1));
+    }
+
+    #[test]
+    fn host_tracker_marks_midstream_not_writable_as_role_reject_without_marking_attempted() {
+        let mut tracker = QwpWsHostHealthTracker::new(2);
+        tracker.record_success(0);
+        tracker.begin_round(true);
+
+        tracker.record_mid_stream_failure(0, Some(ReconnectReason::NotWritable));
+
+        assert_eq!(tracker.states[0], QwpWsHostState::RoleRejected);
         assert!(!tracker.attempted_this_round[0]);
         assert_eq!(tracker.pick_next(), Some(1));
     }
@@ -3552,7 +3589,7 @@ mod tests {
             other
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .record_mid_stream_failure(1);
+                .record_mid_stream_failure(1, Some(ReconnectReason::RetryableFailure));
         })
         .join()
         .unwrap();
@@ -3969,25 +4006,8 @@ mod tests {
             WsMessageError::Close(close) => {
                 assert_eq!(close.code, Some(1000));
                 assert!(close.reason.is_empty());
-                assert!(!is_terminal_ws_close_code(1000));
             }
             other => panic!("expected normal close, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn only_protocol_terminal_close_codes_halt_sender() {
-        for code in [1002, 1003, 1007, 1008, 1009, 1010] {
-            assert!(
-                is_terminal_ws_close_code(code),
-                "close code {code} must stay terminal"
-            );
-        }
-        for code in [1000, 1001, 1011, 1012, 1013, 1014] {
-            assert!(
-                !is_terminal_ws_close_code(code),
-                "close code {code} must remain reconnectable"
-            );
         }
     }
 

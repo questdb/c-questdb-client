@@ -2085,8 +2085,8 @@ public:
     }
 
     /**
-     * Return the highest QWP/WebSocket frame sequence number completed by ACK
-     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK,
+     * or `std::nullopt` if none has completed.
      */
     std::optional<uint64_t> acked_fsn() const
     {

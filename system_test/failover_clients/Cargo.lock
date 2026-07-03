@@ -2682,10 +2682,6 @@ version = "7.0.0"
 dependencies = [
  "aligned-vec",
  "arrow",
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
  "base64ct",
  "bytes",
  "crc32c",

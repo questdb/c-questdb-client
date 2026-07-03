@@ -24,12 +24,15 @@
 
 //! Column-sender connection pool.
 //!
-//! `QuestDb` is a thread-safe pool of [`crate::ingress::Sender`] handles to
-//! a single QuestDB QWP/WebSocket endpoint. The pool is lazy: `connect`
-//! opens no connections, the first borrow opens one, it auto-grows up to
-//! `pool_max` on demand, and (under `pool_reap=auto`) runs a background
-//! thread that closes above-`pool_size` connections after they have been
-//! idle for `pool_idle_timeout_ms`.
+//! `QuestDb` is a thread-safe pool of store-and-forward producer handles to a
+//! single QuestDB QWP/WebSocket endpoint. The pool is lazy: `connect` opens no
+//! sockets. Borrowing [`QuestDb::borrow_column_sender`] creates a local
+//! store-and-forward producer immediately and lets its background runner connect
+//! later, so callers can buffer while the server is absent. Direct column
+//! senders, readers, and row senders still open their transport on first borrow.
+//! The pools auto-grow up to `pool_max` on demand and (under `pool_reap=auto`)
+//! run a background thread that closes above-`pool_size` idle entries after
+//! `pool_idle_timeout_ms`.
 //!
 //! Each pool slot is handed out as a [`SfColumnSender`] which returns
 //! itself to the pool on `Drop`. Slots whose underlying connection has
@@ -57,7 +60,7 @@ use std::time::{Duration, Instant};
 use crate::egress::Reader;
 use crate::ingress::sender::qwp_ws::QwpWsHostHealthTracker;
 use crate::ingress::{Buffer, Sender, SenderBuilder};
-use crate::ingress::{QwpWsConnector, RawQwpWsRoundStream};
+use crate::ingress::{QwpWsConnector, RawQwpWsRoundStream, ReconnectReason};
 // The reconnect backoff helpers are only consumed by the retry-capable borrow
 // paths: the row-major polars `reborrow_with_retry` and the FFI owned
 // `*_with_retry` entry points. Keep the import unconditional (so the shared
@@ -376,7 +379,7 @@ impl QuestDb {
     ///
     /// | Key                    | Default | Meaning                                                        |
     /// |------------------------|---------|----------------------------------------------------------------|
-    /// | `pool_size`            | 1       | Warm / minimum connections (lazy: opened on first borrow, not at connect). |
+    /// | `pool_size`            | 1       | Warm / minimum entries once opened; `connect` opens no sockets. |
     /// | `pool_max`             | 64      | Hard cap on auto-grow. Borrow at the cap returns `InvalidApiCall`. |
     /// | `pool_idle_timeout_ms` | 60000   | Above-`pool_size` idle connections are closed after this long. |
     /// | `pool_reap`            | `auto`  | `auto` runs a background reaper; `manual` requires `reap_idle`. |
@@ -389,9 +392,12 @@ impl QuestDb {
     /// `pool_max`. For a plain pipelined (non-SF) connection — used by DataFrame
     /// ingestion — see [`Self::borrow_direct_column_sender`].
     ///
-    /// Both pools are **lazy**, like the row-major sender pool: `connect` opens
-    /// no connections; the first borrow opens one. `pool_size` is the warm
-    /// minimum the reaper keeps once connections have been opened.
+    /// Pools are **lazy**: `connect` opens no sockets. The store-and-forward
+    /// column pool creates a local producer on first borrow and starts its
+    /// initial connect in the background, so the borrower can buffer immediately
+    /// even while the server is absent. Direct column senders, readers, and row
+    /// senders still open their transport on first borrow. `pool_size` is the
+    /// warm minimum the reaper keeps once entries have been opened.
     ///
     pub fn connect(conf: &str) -> Result<Self> {
         let parsed = conf::parse(conf)?;
@@ -2277,7 +2283,8 @@ fn record_sender_transport_failure(inner: &Arc<DbInner>, sender: &ColumnSender) 
     if sender.transport_dead()
         && let Some(idx) = sender.endpoint_idx()
     {
-        lock_health(&inner.health).record_mid_stream_failure(idx);
+        lock_health(&inner.health)
+            .record_mid_stream_failure(idx, Some(ReconnectReason::RetryableFailure));
     }
 }
 

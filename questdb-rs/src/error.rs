@@ -221,7 +221,7 @@ struct ErrorInner {
     code: ErrorCode,
     msg: String,
     in_doubt: bool,
-    /// Structured QWP/WebSocket sender rejection (terminal HALT diagnostic).
+    /// Structured QWP/WebSocket sender rejection diagnostic.
     /// Sender-only.
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,

@@ -1971,7 +1971,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 ['r3', None, 'three'],
             ])
 
-    def test_write_rejection_drops_and_sender_continues(self):
+    def test_schema_rejection_terminalizes_and_preserves_store(self):
         table_name = 'qwp_ws_reject_' + uuid.uuid4().hex[:8]
         sql_query(
             f'CREATE TABLE "{table_name}" '
@@ -2004,34 +2004,25 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 final_fsn = sender.flush_and_get_fsn()
 
                 self.assertEqual((first_fsn, rejected_fsn, final_fsn), (0, 1, 2))
-                sender.wait(1)  # AckLevel::Durable
-                diagnostic = self._retry_poll_qwp_ws_error(sender)
+                with self.assertRaises(qls.SenderError) as ctx:
+                    sender.wait(1)  # AckLevel::Durable
+                diagnostic = ctx.exception.qwp_ws_error
+                if diagnostic is None:
+                    diagnostic = self._retry_poll_qwp_ws_error(sender)
                 self.assertEqual(diagnostic.category, qls.QwpWsErrorCategory.SCHEMA_MISMATCH)
-                self.assertEqual(diagnostic.applied_policy, qls.QwpWsErrorPolicy.DROP_AND_CONTINUE)
+                self.assertEqual(diagnostic.applied_policy, qls.QwpWsErrorPolicy.TERMINAL)
                 self.assertEqual(diagnostic.status, QWP_WS_STATUS_SCHEMA_MISMATCH)
                 self.assertEqual(diagnostic.from_fsn, rejected_fsn)
                 self.assertEqual(diagnostic.to_fsn, rejected_fsn)
-                self.assertIsNone(sender.poll_qwp_ws_error())
+                self.assertIsNotNone(sender.poll_qwp_ws_error())
                 self.assertEqual(sender.qwp_ws_errors_dropped(), 0)
-                sender.close_drain()
             finally:
                 sender.close(False)
 
-            self.assertEqual(
+            self.assertGreater(
                 self._sfa_file_count(sf_dir, sender_id),
                 0,
-                'close-drained rejection sender left SFA frame files behind')
-
-        resp = self._retry_query_rows(
-            f"select id, px from '{table_name}' order by id",
-            2,
-            timeout_sec=30)
-        self.assertEqual(
-            resp['dataset'],
-            [
-                [0, 10.5],
-                [2, 20.5],
-            ])
+                'terminal rejection should preserve SFA frame files')
 
 
 class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):

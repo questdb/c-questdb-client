@@ -62,7 +62,7 @@ mod qwp_ws_driver;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws_driver::{
-    ReconnectPolicy, reconnect_backoff_step, reconnect_error_is_terminal,
+    ReconnectPolicy, ReconnectReason, reconnect_backoff_step, reconnect_error_is_terminal,
 };
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -644,11 +644,11 @@ impl Sender {
     /// [`ErrorCode::FailoverRetry`](crate::error::ErrorCode::FailoverRetry)
     /// error and the published frames are retained for replay.
     ///
-    /// A server rejection of a frame in the pending range, or a terminal
-    /// transport/protocol failure, is returned as an error (a non-fatal
-    /// drop-and-continue rejection advances the watermark and is reported
-    /// separately by [`Self::poll_qwp_ws_error`]). When nothing has been
-    /// published yet it returns immediately. QWP/WebSocket only; other
+    /// A terminal server rejection of a frame in the pending range, or a
+    /// terminal transport/protocol failure, is returned as an error. Retriable
+    /// server rejections reconnect and replay until the frame is acknowledged or
+    /// the sender is stopped. When nothing has been published yet it returns
+    /// immediately. QWP/WebSocket only; other
     /// protocols return `InvalidApiCall`. In manual progress mode this also
     /// drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -725,8 +725,8 @@ impl Sender {
     /// Poll the next structured QWP/WebSocket server error observed by this
     /// sender.
     ///
-    /// This reports QWP server non-OK responses and terminal WebSocket
-    /// protocol violations. It remains usable after the sender has halted so
+    /// This reports QWP server non-OK responses and WebSocket protocol
+    /// violations. It remains usable after the sender has halted so
     /// callers can inspect the error that made it terminal.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn poll_qwp_ws_error(&mut self) -> Result<Option<QwpWsSenderError>> {

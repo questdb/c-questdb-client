@@ -68,6 +68,7 @@ use super::qwp_ws_sfa_queue::{
 };
 
 pub(crate) const DEFAULT_EVENT_CAPACITY: usize = 1024;
+pub(crate) const DEFAULT_MAX_FRAME_REJECTIONS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReconnectPolicy {
@@ -110,6 +111,30 @@ impl ReconnectPolicy {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PoisonFrameTracker {
+    fsn: Option<u64>,
+    completed_fsn: Option<u64>,
+    rejection_count: usize,
+}
+
+impl PoisonFrameTracker {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn record_failure(&mut self, fsn: u64, completed_fsn: Option<u64>, limit: usize) -> bool {
+        if self.fsn == Some(fsn) && self.completed_fsn == completed_fsn {
+            self.rejection_count = self.rejection_count.saturating_add(1);
+        } else {
+            self.fsn = Some(fsn);
+            self.completed_fsn = completed_fsn;
+            self.rejection_count = 1;
+        }
+        self.rejection_count >= limit
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct QwpWsCoreTestHarness<Q, T> {
@@ -127,6 +152,8 @@ pub(crate) struct QwpWsSendCore<T> {
     durable_ack: Option<DurableAckTracker>,
     reconnect_policy: ReconnectPolicy,
     pending_reconnect: Option<QwpWsReconnectState>,
+    poison_tracker: PoisonFrameTracker,
+    max_frame_rejections: usize,
 }
 
 #[derive(Debug)]
@@ -231,6 +258,10 @@ impl QwpWsReconnectState {
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    pub(crate) fn initial_backoff(&self) -> Duration {
+        self.policy.initial_backoff
     }
 
     fn deadline_expired(&self) -> bool {
@@ -507,20 +538,21 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
-    ) {
+    ) -> QwpWsSenderError {
         self.last_server_error = Some(error.clone());
-        self.push_sender_error(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
-        if self.sender_errors.capacity() == 0 {
-            return;
+        let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+        self.push_sender_error(sender_error.clone());
+        if self.sender_errors.capacity() != 0 {
+            if self.rejected_frames.len() == self.sender_errors.capacity() {
+                self.rejected_frames.pop_front();
+            }
+            self.rejected_frames.push_back(QwpRejectedFrame {
+                fsn,
+                wire_seq,
+                error,
+            });
         }
-        if self.rejected_frames.len() == self.sender_errors.capacity() {
-            self.rejected_frames.pop_front();
-        }
-        self.rejected_frames.push_back(QwpRejectedFrame {
-            fsn,
-            wire_seq,
-            error,
-        });
+        sender_error
     }
 
     fn record_reject_error(
@@ -529,9 +561,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
-    ) {
-        self.push_sender_error(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
+    ) -> QwpWsSenderError {
+        let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+        self.push_sender_error(sender_error.clone());
         self.last_server_error = Some(error);
+        sender_error
     }
 
     fn delivery_status(
@@ -592,7 +626,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         };
         let sender_error = QwpWsSenderError {
             category: QwpWsErrorCategory::ProtocolViolation,
-            applied_policy: QwpWsErrorPolicy::Halt,
+            applied_policy: QwpWsErrorPolicy::Terminal,
             status: None,
             message: Some(message.clone()),
             message_sequence: None,
@@ -683,12 +717,30 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         reconnect_policy: ReconnectPolicy,
         durable_ack: bool,
     ) -> Self {
+        Self::new_with_durable_ack_and_rejection_limit(
+            transport,
+            max_in_flight,
+            reconnect_policy,
+            durable_ack,
+            DEFAULT_MAX_FRAME_REJECTIONS,
+        )
+    }
+
+    pub(crate) fn new_with_durable_ack_and_rejection_limit(
+        transport: T,
+        max_in_flight: usize,
+        reconnect_policy: ReconnectPolicy,
+        durable_ack: bool,
+        max_frame_rejections: usize,
+    ) -> Self {
         Self {
             transport,
             send_cursor: SendCursor::new(max_in_flight),
             durable_ack: durable_ack.then(DurableAckTracker::new),
             reconnect_policy,
             pending_reconnect: None,
+            poison_tracker: PoisonFrameTracker::default(),
+            max_frame_rejections,
         }
     }
 
@@ -724,22 +776,11 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             TransportResponse::Reject { wire_seq, error } => {
                 store.counters.total_server_errors += 1;
                 let policy = server_error_policy(error.status);
-                let Some((fsn, effect_wire_seq)) =
+                let Some((fsn, _effect_wire_seq)) =
                     self.send_cursor.reject_fsn_for_wire_seq(wire_seq)?
                 else {
-                    return Ok(self.record_presend_reject(store, wire_seq, error, policy));
+                    return self.record_presend_reject(store, wire_seq, error, policy);
                 };
-                if policy == QwpWsErrorPolicy::Halt {
-                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
-                    store.terminal_sender_error = Some(sender_error.clone());
-                    store.push_sender_error(sender_error.clone());
-                    store.last_server_error = Some(error.clone());
-                    store.mark_terminal(Some(server_rejection_error(
-                        error.error.clone(),
-                        sender_error,
-                    )));
-                    return Ok(DriveOutcome::Terminal);
-                }
                 if self.reject_target_already_accounted(store, fsn) {
                     store.record_reject_error(fsn, wire_seq, error, policy);
                     return Ok(DriveOutcome::Idle);
@@ -750,21 +791,41 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     store.mark_terminal(Some(err));
                     return Ok(DriveOutcome::Terminal);
                 }
-                if self.durable_ack.is_some() {
-                    return self.apply_durable_reject(
-                        store,
-                        wire_seq,
-                        effect_wire_seq,
-                        fsn,
-                        error,
-                        policy,
-                    );
+
+                if policy == QwpWsErrorPolicy::Terminal {
+                    let sender_error =
+                        store.record_reject_error(fsn, wire_seq, error.clone(), policy);
+                    store.terminal_sender_error = Some(sender_error.clone());
+                    store.mark_terminal(Some(server_rejection_error(
+                        error.error.clone(),
+                        sender_error,
+                    )));
+                    return Ok(DriveOutcome::Terminal);
                 }
 
-                self.complete_through(store, fsn, wire_seq)?;
-                store.record_rejected_frame(fsn, wire_seq, error, policy);
+                if self.rejected_head_is_poison(store, fsn) {
+                    let err = store.record_protocol_violation(
+                        None,
+                        format!(
+                            "QWP/WebSocket frame fsn {fsn} was rejected {} times without ACK progress",
+                            self.max_frame_rejections
+                        ),
+                    );
+                    store.mark_terminal(Some(err));
+                    return Ok(DriveOutcome::Terminal);
+                }
+
+                let error_for_reconnect = error.error.clone();
+                let reconnect_reason = reconnect_reason_for_policy(policy);
+                let sender_error = store.record_rejected_frame(fsn, wire_seq, error, policy);
                 store.push_event(DriverEvent::Rejected { fsn, wire_seq });
-                Ok(DriveOutcome::Rejected { fsn, wire_seq })
+                let initial_error = server_rejection_error(error_for_reconnect, sender_error);
+                self.pending_reconnect = Some(self.begin_reconnect(
+                    "QWP/WebSocket reconnect after server rejection",
+                    reconnect_reason,
+                    initial_error,
+                ));
+                self.continue_reconnect(store)
             }
         }
     }
@@ -818,13 +879,28 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         )
     }
 
+    fn rejected_head_is_poison<Q: PublicationLog>(
+        &mut self,
+        store: &QwpWsPublicationStore<Q>,
+        fsn: u64,
+    ) -> bool {
+        if store.queue.oldest_unresolved_fsn() != Some(fsn) {
+            return false;
+        }
+        self.poison_tracker.record_failure(
+            fsn,
+            store.queue.completed_fsn(),
+            self.max_frame_rejections,
+        )
+    }
+
     fn record_presend_reject<Q: PublicationLog>(
-        &self,
+        &mut self,
         store: &mut QwpWsPublicationStore<Q>,
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
-    ) -> DriveOutcome {
+    ) -> Result<DriveOutcome, DriverError> {
         let from_fsn = store
             .queue
             .completed_fsn()
@@ -836,7 +912,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .max(from_fsn);
         let sender_error =
             sender_error_for_qwp_error_span(&error, wire_seq, from_fsn, to_fsn, policy);
-        if policy == QwpWsErrorPolicy::Halt {
+        if policy == QwpWsErrorPolicy::Terminal {
             store.terminal_sender_error = Some(sender_error.clone());
             store.push_sender_error(sender_error.clone());
             store.last_server_error = Some(error.clone());
@@ -844,11 +920,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 error.error.clone(),
                 sender_error,
             )));
-            DriveOutcome::Terminal
+            Ok(DriveOutcome::Terminal)
         } else {
+            let initial_error = server_rejection_error(error.error.clone(), sender_error.clone());
             store.push_sender_error(sender_error);
             store.last_server_error = Some(error);
-            DriveOutcome::Idle
+            self.pending_reconnect = Some(self.begin_reconnect(
+                "QWP/WebSocket reconnect after server rejection",
+                reconnect_reason_for_policy(policy),
+                initial_error,
+            ));
+            self.continue_reconnect(store)
         }
     }
 
@@ -896,24 +978,6 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         self.complete_ready_durable(store)
     }
 
-    fn apply_durable_reject<Q: PublicationLog>(
-        &mut self,
-        store: &mut QwpWsPublicationStore<Q>,
-        wire_seq: u64,
-        effect_wire_seq: u64,
-        fsn: u64,
-        error: QwpServerError,
-        policy: QwpWsErrorPolicy,
-    ) -> Result<DriveOutcome, DriverError> {
-        self.send_cursor.ack_through(fsn);
-        let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
-        tracker.enqueue_rejected(effect_wire_seq, fsn);
-        self.complete_ready_durable(store)?;
-        store.record_rejected_frame(fsn, wire_seq, error, policy);
-        store.push_event(DriverEvent::Rejected { fsn, wire_seq });
-        Ok(DriveOutcome::Rejected { fsn, wire_seq })
-    }
-
     fn complete_ready_durable<Q: PublicationLog>(
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
@@ -924,16 +988,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
-            match resolved {
-                DurableResolvedFrame::Ok(completion) => {
-                    self.complete_through(store, completion.fsn, completion.wire_seq)?;
-                    highest_resolved_wire_seq = Some(completion.wire_seq);
-                }
-                DurableResolvedFrame::Rejected { wire_seq, fsn } => {
-                    self.complete_through(store, fsn, wire_seq)?;
-                    highest_resolved_wire_seq = Some(wire_seq);
-                }
-            }
+            self.complete_through(store, resolved.fsn, resolved.wire_seq)?;
+            highest_resolved_wire_seq = Some(resolved.wire_seq);
         }
         Ok(
             highest_resolved_wire_seq.map_or(DriveOutcome::Idle, |wire_seq| DriveOutcome::Acked {
@@ -954,6 +1010,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(fsn);
         if advanced {
+            self.poison_tracker.clear();
             store.record_completed_through_event(fsn, wire_seq);
         }
         Ok(DriveOutcome::Acked { wire_seq })
@@ -1047,6 +1104,9 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .complete_through_fsn(fsn)
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(fsn);
+        if advanced {
+            self.poison_tracker.clear();
+        }
         let event = advanced.then_some(DriverEvent::CompletedThrough {
             fsn,
             wire_seq: ack_wire_seq,
@@ -1124,18 +1184,18 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
-            let (wire_seq, fsn) = match resolved {
-                DurableResolvedFrame::Ok(completion) => (completion.wire_seq, completion.fsn),
-                DurableResolvedFrame::Rejected { wire_seq, fsn } => (wire_seq, fsn),
-            };
             let advanced = progress
-                .complete_through_fsn(fsn)
+                .complete_through_fsn(resolved.fsn)
                 .map_err(DriverError::from)?;
-            self.send_cursor.ack_through(fsn);
+            self.send_cursor.ack_through(resolved.fsn);
             if advanced {
-                events.push(DriverEvent::CompletedThrough { fsn, wire_seq });
+                self.poison_tracker.clear();
+                events.push(DriverEvent::CompletedThrough {
+                    fsn: resolved.fsn,
+                    wire_seq: resolved.wire_seq,
+                });
             }
-            highest_resolved_wire_seq = Some(wire_seq);
+            highest_resolved_wire_seq = Some(resolved.wire_seq);
         }
         Ok(QwpWsHotResponseProgress {
             outcome: highest_resolved_wire_seq.map_or(DriveOutcome::Idle, |wire_seq| {
@@ -1178,6 +1238,17 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 reason: ReconnectReason::Disconnect,
                 initial_error,
             },
+            TransportFailure::ServerClose(initial_error) => {
+                if let Some(error) = self.server_close_poison_error(store) {
+                    store.mark_terminal(Some(error.clone()));
+                    QwpWsTransportFailureAction::Terminal(error)
+                } else {
+                    QwpWsTransportFailureAction::Reconnect {
+                        reason: ReconnectReason::Disconnect,
+                        initial_error,
+                    }
+                }
+            }
             TransportFailure::Retryable(initial_error) => QwpWsTransportFailureAction::Reconnect {
                 reason: ReconnectReason::RetryableFailure,
                 initial_error,
@@ -1192,6 +1263,27 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 QwpWsTransportFailureAction::Terminal(error)
             }
         }
+    }
+
+    fn server_close_poison_error<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+    ) -> Option<Error> {
+        let fsn = store.queue.oldest_unresolved_fsn()?;
+        if self.poison_tracker.record_failure(
+            fsn,
+            store.queue.completed_fsn(),
+            self.max_frame_rejections,
+        ) {
+            return Some(store.record_protocol_violation(
+                None,
+                format!(
+                    "QWP/WebSocket frame fsn {fsn} was closed {} times without ACK progress",
+                    self.max_frame_rejections
+                ),
+            ));
+        }
+        None
     }
 
     pub(crate) fn restart_connection(
@@ -1280,8 +1372,24 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 })
             }
             QwpWsReconnectStep::Terminal(error) => {
-                store.mark_terminal(Some(error));
-                Ok(DriveOutcome::Terminal)
+                if reconnect_error_is_terminal(&error) {
+                    store.mark_terminal(Some(error));
+                    Ok(DriveOutcome::Terminal)
+                } else {
+                    let sleep_for = reconnect.policy.initial_backoff();
+                    let next = QwpWsReconnectState::new(
+                        reconnect.policy,
+                        reconnect.context,
+                        reconnect.reason,
+                        error,
+                    );
+                    let deadline = next.deadline();
+                    self.pending_reconnect = Some(next);
+                    Ok(DriveOutcome::ReconnectDelay {
+                        sleep_for,
+                        deadline,
+                    })
+                }
             }
         }
     }
@@ -1868,6 +1976,9 @@ pub(super) fn reconnect_attempt_error(err: DriverError) -> Result<Error, DriverE
 }
 
 pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
+    if is_qwp_ws_role_reject_error(err) {
+        return false;
+    }
     matches!(
         err.code(),
         ErrorCode::AuthError | ErrorCode::ProtocolVersionError
@@ -2205,6 +2316,7 @@ impl BlockingQwpWsTransport {
             &endpoints,
             &mut tracker,
             &mut previous_idx,
+            None,
             use_tls,
             tls_settings.clone(),
             &qwp_ws,
@@ -2256,11 +2368,12 @@ impl BlockingQwpWsTransport {
         self.negotiated_version
     }
 
-    fn reconnect(&mut self) -> Result<(), DriverError> {
+    fn reconnect(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
         let connected = connect_qwp_ws_endpoint_round(
             &self.endpoints,
             &mut self.tracker,
             &mut self.previous_idx,
+            Some(reason),
             self.use_tls,
             self.tls_settings.clone(),
             &self.qwp_ws,
@@ -2351,15 +2464,7 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
             .try_read_one(&mut self.stream, &mut self.send_buf)
             .map_err(|err| match err {
                 super::qwp_ws::WsMessageError::Close(close) => {
-                    if let Some(close_code) = close.code
-                        && super::qwp_ws::is_terminal_ws_close_code(close_code)
-                    {
-                        return TransportFailure::ProtocolViolation {
-                            close_code: Some(close_code),
-                            reason: close.reason,
-                        };
-                    }
-                    TransportFailure::Disconnect(close.into_error())
+                    TransportFailure::ServerClose(close.into_error())
                 }
                 super::qwp_ws::WsMessageError::ProtocolViolation(reason) => {
                     TransportFailure::ProtocolViolation {
@@ -2468,8 +2573,8 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
         Ok(TransportSendResult::NoResponse)
     }
 
-    fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
-        self.reconnect()
+    fn restart_connection(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
+        self.reconnect(reason)
     }
 }
 
@@ -2521,19 +2626,29 @@ fn server_error_category(status: u8) -> QwpWsErrorCategory {
         codec::WS_STATUS_INTERNAL_ERROR => QwpWsErrorCategory::InternalError,
         codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorCategory::SecurityError,
         codec::WS_STATUS_WRITE_ERROR => QwpWsErrorCategory::WriteError,
+        codec::WS_STATUS_NOT_WRITABLE => QwpWsErrorCategory::NotWritable,
         _ => QwpWsErrorCategory::Unknown,
     }
 }
 
 fn server_error_policy(status: u8) -> QwpWsErrorPolicy {
     match status {
-        codec::WS_STATUS_SCHEMA_MISMATCH | codec::WS_STATUS_WRITE_ERROR => {
-            QwpWsErrorPolicy::DropAndContinue
+        codec::WS_STATUS_WRITE_ERROR | codec::WS_STATUS_INTERNAL_ERROR => {
+            QwpWsErrorPolicy::Retriable
         }
-        codec::WS_STATUS_PARSE_ERROR
-        | codec::WS_STATUS_INTERNAL_ERROR
-        | codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorPolicy::Halt,
-        _ => QwpWsErrorPolicy::Halt,
+        codec::WS_STATUS_NOT_WRITABLE => QwpWsErrorPolicy::RetriableOther,
+        codec::WS_STATUS_SCHEMA_MISMATCH
+        | codec::WS_STATUS_PARSE_ERROR
+        | codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorPolicy::Terminal,
+        _ => QwpWsErrorPolicy::Retriable,
+    }
+}
+
+fn reconnect_reason_for_policy(policy: QwpWsErrorPolicy) -> ReconnectReason {
+    match policy {
+        QwpWsErrorPolicy::Retriable => ReconnectReason::RetryableFailure,
+        QwpWsErrorPolicy::RetriableOther => ReconnectReason::NotWritable,
+        QwpWsErrorPolicy::Terminal => ReconnectReason::RetryableFailure,
     }
 }
 
@@ -2648,6 +2763,7 @@ fn sleep_until_drive_deadline(deadline: Option<Instant>) {
 pub(crate) enum ReconnectReason {
     Disconnect,
     RetryableFailure,
+    NotWritable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2690,6 +2806,7 @@ pub(crate) enum TransportSendResult {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TransportFailure {
     Disconnect(Error),
+    ServerClose(Error),
     Retryable(Error),
     Terminal(Error),
     ProtocolViolation {
@@ -2763,22 +2880,12 @@ enum PendingDurableFrame {
         fsn: u64,
         table_seq_txns: Vec<TableSeqTxn>,
     },
-    Rejected {
-        wire_seq: u64,
-        fsn: u64,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DurableCompletion {
     wire_seq: u64,
     fsn: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DurableResolvedFrame {
-    Ok(DurableCompletion),
-    Rejected { wire_seq: u64, fsn: u64 },
 }
 
 impl DurableAckTracker {
@@ -2804,11 +2911,6 @@ impl DurableAckTracker {
             fsn,
             table_seq_txns,
         });
-    }
-
-    fn enqueue_rejected(&mut self, wire_seq: u64, fsn: u64) {
-        self.pending
-            .push_back(PendingDurableFrame::Rejected { wire_seq, fsn });
     }
 
     fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>) {
@@ -2838,34 +2940,19 @@ impl DurableAckTracker {
             if next_fsn >= end_before_fsn {
                 return true;
             }
-            match entry {
-                PendingDurableFrame::Ok { fsn, .. } => {
-                    if *fsn < next_fsn {
-                        continue;
-                    }
-                    next_fsn = match fsn.checked_add(1) {
-                        Some(next_fsn) => next_fsn,
-                        None => return false,
-                    };
-                }
-                PendingDurableFrame::Rejected { fsn, .. } => {
-                    if *fsn < next_fsn {
-                        continue;
-                    }
-                    if *fsn != next_fsn {
-                        return false;
-                    }
-                    next_fsn = match next_fsn.checked_add(1) {
-                        Some(next_fsn) => next_fsn,
-                        None => return false,
-                    };
-                }
+            let PendingDurableFrame::Ok { fsn, .. } = entry;
+            if *fsn < next_fsn {
+                continue;
+            }
+            next_fsn = match fsn.checked_add(1) {
+                Some(next_fsn) => next_fsn,
+                None => return false,
             }
         }
         next_fsn >= end_before_fsn
     }
 
-    fn pop_ready(&mut self) -> Option<DurableResolvedFrame> {
+    fn pop_ready(&mut self) -> Option<DurableCompletion> {
         if !self
             .pending
             .front()
@@ -2875,13 +2962,7 @@ impl DurableAckTracker {
         }
         match self.pending.pop_front().unwrap() {
             PendingDurableFrame::Ok { wire_seq, fsn, .. } => {
-                Some(DurableResolvedFrame::Ok(DurableCompletion {
-                    wire_seq,
-                    fsn,
-                }))
-            }
-            PendingDurableFrame::Rejected { wire_seq, fsn } => {
-                Some(DurableResolvedFrame::Rejected { wire_seq, fsn })
+                Some(DurableCompletion { wire_seq, fsn })
             }
         }
     }
@@ -2895,20 +2976,18 @@ impl PendingDurableFrame {
                     .get(&entry.table)
                     .is_some_and(|watermark| *watermark >= entry.seq_txn)
             }),
-            PendingDurableFrame::Rejected { .. } => true,
         }
     }
 
     fn fsn(&self) -> u64 {
         match self {
-            PendingDurableFrame::Ok { fsn, .. } | PendingDurableFrame::Rejected { fsn, .. } => *fsn,
+            PendingDurableFrame::Ok { fsn, .. } => *fsn,
         }
     }
 
     fn wire_seq(&self) -> u64 {
         match self {
-            PendingDurableFrame::Ok { wire_seq, .. }
-            | PendingDurableFrame::Rejected { wire_seq, .. } => *wire_seq,
+            PendingDurableFrame::Ok { wire_seq, .. } => *wire_seq,
         }
     }
 }
@@ -3129,9 +3208,9 @@ impl QwpWsCoreTransport for FakeOrderedServer {
                 TransportSendResult::Response(TransportResponse::Reject {
                     wire_seq,
                     error: QwpServerError {
-                        status: codec::WS_STATUS_SCHEMA_MISMATCH,
-                        message: "fake schema mismatch".to_string(),
-                        error: Error::new(ErrorCode::InvalidApiCall, "fake schema mismatch"),
+                        status: codec::WS_STATUS_WRITE_ERROR,
+                        message: "fake write error".to_string(),
+                        error: Error::new(ErrorCode::ServerFlushError, "fake write error"),
                     },
                 })
             }
@@ -3320,9 +3399,9 @@ mod tests {
 
     fn sender_error(fsn: u64) -> QwpWsSenderError {
         QwpWsSenderError {
-            category: QwpWsErrorCategory::SchemaMismatch,
-            applied_policy: QwpWsErrorPolicy::DropAndContinue,
-            status: Some(codec::WS_STATUS_SCHEMA_MISMATCH),
+            category: QwpWsErrorCategory::WriteError,
+            applied_policy: QwpWsErrorPolicy::Retriable,
+            status: Some(codec::WS_STATUS_WRITE_ERROR),
             message: Some(format!("error {fsn}")),
             message_sequence: Some(fsn),
             from_fsn: fsn,
@@ -3444,6 +3523,22 @@ mod tests {
         }
     }
 
+    fn write_error(message: &str) -> QwpServerError {
+        QwpServerError {
+            status: codec::WS_STATUS_WRITE_ERROR,
+            message: message.to_string(),
+            error: Error::new(ErrorCode::ServerFlushError, message),
+        }
+    }
+
+    fn not_writable_error(message: &str) -> QwpServerError {
+        QwpServerError {
+            status: codec::WS_STATUS_NOT_WRITABLE,
+            message: message.to_string(),
+            error: Error::new(ErrorCode::ServerFlushError, message),
+        }
+    }
+
     fn drain_events<Q: PublicationLog, T: QwpWsCoreTransport>(
         driver: &mut QwpWsCoreTestHarness<Q, T>,
     ) -> Vec<DriverEvent> {
@@ -3463,6 +3558,7 @@ mod tests {
         keepalive_attempts: usize,
         keepalive_pending_args: Vec<bool>,
         restart_attempts: usize,
+        restart_reasons: Vec<ReconnectReason>,
         sent_frames: Vec<SentFrame>,
         sent_payloads: Vec<Vec<u8>>,
     }
@@ -3479,6 +3575,7 @@ mod tests {
                 keepalive_attempts: 0,
                 keepalive_pending_args: Vec::new(),
                 restart_attempts: 0,
+                restart_reasons: Vec::new(),
                 sent_frames: Vec::new(),
                 sent_payloads: Vec::new(),
             }
@@ -3554,8 +3651,9 @@ mod tests {
                 .unwrap_or(Ok(TransportSendResult::NoResponse))
         }
 
-        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+        fn restart_connection(&mut self, reason: ReconnectReason) -> Result<(), DriverError> {
             self.restart_attempts += 1;
+            self.restart_reasons.push(reason);
             self.restart_results.pop_front().unwrap_or(Ok(()))
         }
     }
@@ -4308,6 +4406,17 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_terminal_classification_retries_structured_role_rejects() {
+        let all_role_rejected = Error::new(
+            ErrorCode::ProtocolVersionError,
+            "server did not enable durable ACK; all endpoints rejected by role",
+        )
+        .with_qwp_ws_role_reject(crate::ingress::QwpWsRoleReject::new("REPLICA", None));
+
+        assert!(!reconnect_error_is_terminal(&all_role_rejected));
+    }
+
+    #[test]
     fn transport_write_failure_does_not_commit_sent_receipt() {
         let transport = TestTransport::scripted([Err(TransportFailure::Disconnect(
             fake_transport_error("write failed"),
@@ -4377,7 +4486,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_qwp_schema_and_write_errors_reject_and_continue_like_java() {
+    fn raw_qwp_schema_and_write_errors_decode_as_rejections() {
         for (status, expected_code) in [
             (codec::WS_STATUS_SCHEMA_MISMATCH, ErrorCode::InvalidApiCall),
             (codec::WS_STATUS_WRITE_ERROR, ErrorCode::ServerFlushError),
@@ -4750,7 +4859,7 @@ mod tests {
     }
 
     #[test]
-    fn future_durable_reject_wire_sequence_clamps_tracker_to_highest_sent_like_java() {
+    fn future_durable_reject_wire_sequence_reconnects_from_highest_sent_like_java_v2() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -4770,48 +4879,22 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
 
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 99
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0
-            }
+            QwpReceiptStatus::Published { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
 
         let error = driver.poll_sender_error().unwrap();
@@ -4858,7 +4941,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("late schema mismatch"),
+                error: write_error("late write failure"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -4867,7 +4950,7 @@ mod tests {
         );
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -4903,7 +4986,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("late schema mismatch"),
+                error: write_error("late write failure"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
@@ -4915,7 +4998,7 @@ mod tests {
         );
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -5284,22 +5367,18 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
 
         assert_eq!(
@@ -5372,7 +5451,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_reconnect_clears_unresolved_reject_so_replayed_reject_can_complete() {
+    fn durable_reconnect_clears_unresolved_reject_so_replayed_reject_retries_again() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5391,14 +5470,13 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
 
@@ -5437,7 +5515,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed again"),
+                error: write_error("write failed again"),
             });
 
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
@@ -5447,9 +5525,8 @@ mod tests {
         );
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
@@ -5458,13 +5535,13 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
-        assert_eq!(driver.acked_fsn(), Some(1));
+        assert_eq!(driver.acked_fsn(), Some(0));
     }
 
     #[test]
-    fn durable_reject_placeholder_waits_for_prior_durable_ok() {
+    fn durable_retryable_reject_preserves_prior_pending_ok_for_replay() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5486,92 +5563,33 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
 
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0
-            }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Sent {
-                fsn: 2,
-                wire_seq: 2
-            }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.receipt_status(third).is_pending());
         assert_eq!(driver.acked_fsn(), None);
         assert_eq!(
             driver
                 .last_server_error()
                 .map(|err| (err.status, err.message.as_str())),
-            Some((codec::WS_STATUS_SCHEMA_MISMATCH, "schema changed"))
+            Some((codec::WS_STATUS_WRITE_ERROR, "write failed"))
         );
         assert_eq!(
             driver.poll_sender_error().map(|err| err.applied_policy),
-            Some(QwpWsErrorPolicy::DropAndContinue)
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableOk {
-                wire_seq: 2,
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
-            });
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
-            });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
-        assert_eq!(driver.acked_fsn(), None);
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
+            Some(QwpWsErrorPolicy::Retriable)
         );
     }
 
     #[test]
-    fn durable_reject_after_cumulative_pending_ok_is_not_a_gap_violation() {
+    fn durable_reject_after_cumulative_pending_ok_reconnects_without_gap_violation() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5594,13 +5612,12 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 2,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 2,
-                wire_seq: 2
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert!(!driver.is_terminal());
@@ -5609,35 +5626,12 @@ mod tests {
         assert!(driver.receipt_status(third).is_pending());
         assert_eq!(
             driver.poll_sender_error().map(|err| err.applied_policy),
-            Some(QwpWsErrorPolicy::DropAndContinue)
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
+            Some(QwpWsErrorPolicy::Retriable)
         );
     }
 
     #[test]
-    fn durable_consecutive_rejected_placeholders_drain_after_prior_ok() {
+    fn durable_consecutive_retryable_rejects_preserve_replay_tail() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5660,87 +5654,24 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: schema_mismatch_error("schema changed"),
-            });
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::Reject {
-                wire_seq: 2,
-                error: schema_mismatch_error("write failed"),
-            });
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableOk {
-                wire_seq: 3,
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+                error: write_error("write failed"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert!(matches!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         ));
-        assert!(matches!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 2,
-                wire_seq: 2
-            }
-        ));
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("trades", 10)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
-        );
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
-        );
-        assert_eq!(
-            driver.receipt_status(fourth),
-            QwpReceiptStatus::Sent {
-                fsn: 3,
-                wire_seq: 3
-            }
-        );
-
-        driver
-            .send_core
-            .transport
-            .push_response(TransportResponse::DurableAck {
-                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
-            });
-        assert_eq!(
-            driver.drive_receive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 3 }
-        );
-        assert_eq!(
-            driver.receipt_status(fourth),
-            QwpReceiptStatus::Completed { fsn: 3 }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.receipt_status(third).is_pending());
+        assert!(driver.receipt_status(fourth).is_pending());
+        assert_eq!(driver.acked_fsn(), None);
     }
 
     #[test]
-    fn stale_durable_ok_for_rejected_frame_does_not_reblock_tracker() {
+    fn stale_durable_ok_after_retryable_reject_does_not_complete_before_replay() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5752,22 +5683,19 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 0,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 0,
-                wire_seq: 0
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
         let first_error = driver.poll_sender_error().unwrap();
         assert_eq!(first_error.message_sequence, Some(0));
-        assert_eq!(first_error.message.as_deref(), Some("schema changed"));
+        assert_eq!(first_error.message.as_deref(), Some("write failed"));
         assert_eq!(
             drain_events(&mut driver),
             vec![
@@ -5781,13 +5709,12 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::CompletedThrough {
-                    fsn: 0,
-                    wire_seq: 0,
-                },
                 DriverEvent::Rejected {
                     fsn: 0,
                     wire_seq: 0,
+                },
+                DriverEvent::Reconnected {
+                    reason: ReconnectReason::RetryableFailure,
                 },
             ]
         );
@@ -5798,6 +5725,31 @@ mod tests {
             .push_response(TransportResponse::DurableOk {
                 wire_seq: 0,
                 table_seq_txns: table_seq_txns(&[("trades", 99)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 1, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
         driver
             .send_core
@@ -5812,6 +5764,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
             });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 0 }
@@ -5832,7 +5785,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_durable_reject_for_resolved_frame_does_not_reblock_tracker() {
+    fn stale_durable_reject_before_replay_reconnects_without_completion() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
@@ -5844,39 +5797,60 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 0,
-                error: schema_mismatch_error("schema changed"),
+                error: write_error("write failed"),
             });
         assert_eq!(
             driver.drive_receive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 0,
-                wire_seq: 0
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
-        );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
         let first_error = driver.poll_sender_error().unwrap();
         assert_eq!(first_error.message_sequence, Some(0));
-        assert_eq!(first_error.message.as_deref(), Some("schema changed"));
+        assert_eq!(first_error.message.as_deref(), Some("write failed"));
 
         driver
             .send_core
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 0,
-                error: schema_mismatch_error("schema changed again"),
+                error: write_error("write failed again"),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Completed { fsn: 0 }
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
         );
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
         let stale_error = driver.poll_sender_error().unwrap();
         assert_eq!(stale_error.message_sequence, Some(0));
-        assert_eq!(stale_error.message.as_deref(), Some("schema changed again"));
+        assert_eq!(stale_error.message.as_deref(), Some("write failed again"));
 
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 1, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
         driver
             .send_core
             .transport
@@ -5893,7 +5867,16 @@ mod tests {
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Completed { fsn: 0 }
         );
         assert_eq!(
             driver.receipt_status(second),
@@ -5902,11 +5885,95 @@ mod tests {
     }
 
     #[test]
-    fn raw_qwp_parse_internal_security_and_unknown_errors_are_terminal_like_java() {
+    fn server_error_policy_matches_java_v2_defaults() {
+        for (status, category, policy) in [
+            (
+                codec::WS_STATUS_SCHEMA_MISMATCH,
+                QwpWsErrorCategory::SchemaMismatch,
+                QwpWsErrorPolicy::Terminal,
+            ),
+            (
+                codec::WS_STATUS_PARSE_ERROR,
+                QwpWsErrorCategory::ParseError,
+                QwpWsErrorPolicy::Terminal,
+            ),
+            (
+                codec::WS_STATUS_SECURITY_ERROR,
+                QwpWsErrorCategory::SecurityError,
+                QwpWsErrorPolicy::Terminal,
+            ),
+            (
+                codec::WS_STATUS_WRITE_ERROR,
+                QwpWsErrorCategory::WriteError,
+                QwpWsErrorPolicy::Retriable,
+            ),
+            (
+                codec::WS_STATUS_INTERNAL_ERROR,
+                QwpWsErrorCategory::InternalError,
+                QwpWsErrorPolicy::Retriable,
+            ),
+            (
+                codec::WS_STATUS_NOT_WRITABLE,
+                QwpWsErrorCategory::NotWritable,
+                QwpWsErrorPolicy::RetriableOther,
+            ),
+            (
+                0x7f,
+                QwpWsErrorCategory::Unknown,
+                QwpWsErrorPolicy::Retriable,
+            ),
+        ] {
+            assert_eq!(server_error_category(status), category);
+            assert_eq!(server_error_policy(status), policy);
+        }
+    }
+
+    #[test]
+    fn not_writable_reject_uses_role_reconnect_reason_and_preserves_receipt() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: not_writable_error("replica access is read-only"),
+            },
+        ))]);
+        let mut driver =
+            QwpWsCoreTestHarness::from_queue(memory_queue(options(8, 1024, 4)), transport);
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once(),
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::NotWritable
+            })
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+        assert_eq!(
+            driver.send_core.transport.restart_reasons,
+            [ReconnectReason::NotWritable]
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::NotWritable);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::RetriableOther);
+        assert_eq!(error.status, Some(codec::WS_STATUS_NOT_WRITABLE));
+        assert_eq!(
+            error.message.as_deref(),
+            Some("replica access is read-only")
+        );
+    }
+
+    #[test]
+    fn raw_qwp_error_statuses_decode_with_expected_error_codes() {
         for (status, expected_code) in [
             (codec::WS_STATUS_PARSE_ERROR, ErrorCode::InvalidApiCall),
             (codec::WS_STATUS_INTERNAL_ERROR, ErrorCode::ServerFlushError),
             (codec::WS_STATUS_SECURITY_ERROR, ErrorCode::AuthError),
+            (codec::WS_STATUS_NOT_WRITABLE, ErrorCode::ServerFlushError),
             (0x7f, ErrorCode::ServerFlushError),
         ] {
             let payload = qwp_error_payload(status, 7, "fatal server error");
@@ -5940,7 +6007,7 @@ mod tests {
     }
 
     #[test]
-    fn future_reject_wire_sequence_clamps_to_highest_sent_like_java() {
+    fn future_reject_wire_sequence_reconnects_from_highest_sent_like_java_v2() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 99,
         }]));
@@ -5948,19 +6015,18 @@ mod tests {
 
         assert_eq!(
             driver.drive_once(),
-            Ok(DriveOutcome::Rejected {
-                fsn: 0,
-                wire_seq: 99,
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             })
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Completed { fsn: 0 }
+            QwpReceiptStatus::Published { fsn: 0 }
         );
-        assert_eq!(driver.acked_fsn(), Some(0));
+        assert_eq!(driver.acked_fsn(), None);
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -5994,7 +6060,7 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 99,
-                error: schema_mismatch_error("late schema mismatch"),
+                error: write_error("late write failure"),
             });
         assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
@@ -6005,7 +6071,7 @@ mod tests {
         assert_eq!(driver.acked_fsn(), Some(0));
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
         assert_eq!(error.message_sequence, Some(99));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -6279,7 +6345,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_policy_exhaustion_terminalizes_current_unresolved_receipts() {
+    fn reconnect_policy_exhaustion_keeps_sf_receipts_replayable() {
         let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
             TransportFailure::Retryable(fake_transport_error("retryable outage")),
         ))])
@@ -6304,28 +6370,15 @@ mod tests {
             DriveOutcome::ReconnectDelay { .. }
         ));
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::ReconnectDelay { .. }
+        ));
         assert_eq!(driver.send_core.transport.restart_attempts, 1);
-        let terminal_msg = driver.terminal_error().unwrap().msg();
-        assert!(
-            terminal_msg.contains("QWP/WebSocket reconnect retry budget exhausted"),
-            "got: {terminal_msg}"
-        );
-        assert!(terminal_msg.contains("attempts=1"), "got: {terminal_msg}");
-        assert!(terminal_msg.contains("elapsed_ms="), "got: {terminal_msg}");
-        assert!(
-            terminal_msg.contains("last_error=reconnect failed once"),
-            "got: {terminal_msg}"
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Terminal { fsn: 0 }
-        );
-        assert_eq!(
-            driver.receipt_status(second),
-            QwpReceiptStatus::Terminal { fsn: 1 }
-        );
-        assert_eq!(driver.try_submit(b"third"), Err(DriverError::Terminal));
+        assert_eq!(driver.terminal_error(), None);
+        assert!(driver.receipt_status(first).is_pending());
+        assert!(driver.receipt_status(second).is_pending());
+        assert!(driver.try_submit(b"third").is_ok());
     }
 
     #[test]
@@ -6491,7 +6544,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_after_prior_ack_completes_rejected_frame_and_leaves_later_frame_unresolved() {
+    fn retriable_reject_after_prior_ack_reconnects_and_preserves_replay_tail() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -6506,9 +6559,8 @@ mod tests {
         );
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
 
@@ -6518,13 +6570,13 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
         assert_eq!(
             driver
                 .last_server_error()
                 .map(|err| (err.status, err.message.as_str())),
-            Some((codec::WS_STATUS_SCHEMA_MISMATCH, "fake schema mismatch"))
+            Some((codec::WS_STATUS_WRITE_ERROR, "fake write error"))
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -6566,7 +6618,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_event_agrees_with_completed_receipt_status() {
+    fn retriable_rejection_event_agrees_with_pending_replay_status() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -6580,10 +6632,7 @@ mod tests {
             DriveOutcome::Acked { wire_seq: 0 }
         );
         driver.drive_once().unwrap();
-        assert_eq!(
-            driver.delivery_status(second).unwrap(),
-            Some(DeliveryOutcome::Completed)
-        );
+        assert_eq!(driver.delivery_status(second).unwrap(), None);
 
         assert_eq!(
             drain_events(&mut driver),
@@ -6603,13 +6652,12 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
-                DriverEvent::CompletedThrough {
-                    fsn: 1,
-                    wire_seq: 1,
-                },
                 DriverEvent::Rejected {
                     fsn: 1,
                     wire_seq: 1,
+                },
+                DriverEvent::Reconnected {
+                    reason: ReconnectReason::RetryableFailure,
                 },
             ]
         );
@@ -6619,7 +6667,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Completed { fsn: 1 }
+            QwpReceiptStatus::Published { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -6628,7 +6676,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_after_ordered_reject_completes_later_receipt() {
+    fn retriable_reject_replays_from_rejected_frame_before_later_receipt() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::AckWire { wire_seq: 0 },
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -6644,14 +6692,13 @@ mod tests {
         );
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected {
-                fsn: 1,
-                wire_seq: 1
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
             }
         );
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 2 }
+            DriveOutcome::Acked { wire_seq: 0 }
         );
 
         assert_eq!(
@@ -6664,12 +6711,12 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(third),
-            QwpReceiptStatus::Completed { fsn: 2 }
+            QwpReceiptStatus::Published { fsn: 2 }
         );
     }
 
     #[test]
-    fn wait_reports_completed_receipt_after_reject_and_continue() {
+    fn wait_keeps_receipt_pending_after_retriable_reject_until_replay_ack() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 0,
         }]));
@@ -6677,34 +6724,28 @@ mod tests {
 
         driver.drive_once().unwrap();
 
-        assert_eq!(
-            driver.delivery_status(receipt).unwrap(),
-            Some(DeliveryOutcome::Completed)
-        );
+        assert_eq!(driver.delivery_status(receipt).unwrap(), None);
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Completed { fsn: 0 }
+            QwpReceiptStatus::Published { fsn: 0 }
         );
     }
 
     #[test]
-    fn reject_and_continue_server_error_is_pollable() {
+    fn retriable_server_error_is_pollable() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 0,
         }]));
         let receipt = driver.try_submit(b"payload").unwrap();
 
         driver.drive_once().unwrap();
-        assert_eq!(
-            driver.delivery_status(receipt).unwrap(),
-            Some(DeliveryOutcome::Completed)
-        );
+        assert_eq!(driver.delivery_status(receipt).unwrap(), None);
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
-        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
-        assert_eq!(error.message.as_deref(), Some("fake schema mismatch"));
+        assert_eq!(error.category, QwpWsErrorCategory::WriteError);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
+        assert_eq!(error.status, Some(codec::WS_STATUS_WRITE_ERROR));
+        assert_eq!(error.message.as_deref(), Some("fake write error"));
         assert_eq!(error.message_sequence, Some(0));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
@@ -6787,7 +6828,7 @@ mod tests {
 
         let terminal_error = driver.terminal_sender_error().unwrap();
         assert_eq!(terminal_error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(terminal_error.status, Some(codec::WS_STATUS_PARSE_ERROR));
         assert_eq!(terminal_error.message.as_deref(), Some("bad payload"));
         assert_eq!(terminal_error.message_sequence, Some(0));
@@ -6800,7 +6841,7 @@ mod tests {
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(error.status, Some(codec::WS_STATUS_PARSE_ERROR));
         assert_eq!(error.message.as_deref(), Some("bad payload"));
         assert_eq!(error.message_sequence, Some(0));
@@ -6834,7 +6875,7 @@ mod tests {
             terminal_error.category,
             QwpWsErrorCategory::ProtocolViolation
         );
-        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(terminal_error.status, None);
         assert_eq!(terminal_error.message_sequence, None);
         assert_eq!(terminal_error.from_fsn, 0);
@@ -6849,7 +6890,7 @@ mod tests {
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ProtocolViolation);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(error.status, None);
         assert_eq!(error.message_sequence, None);
         assert_eq!(error.from_fsn, 0);
@@ -6871,16 +6912,20 @@ mod tests {
 
         assert!(matches!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected { fsn: 0, .. }
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
         ));
         assert!(matches!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Rejected { fsn: 1, .. }
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
         ));
 
         assert_eq!(driver.sender_errors_dropped_total(), 1);
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.from_fsn, 1);
+        assert_eq!(error.from_fsn, 0);
         assert_eq!(driver.poll_sender_error(), None);
     }
 
@@ -6954,7 +6999,7 @@ mod tests {
     }
 
     #[test]
-    fn drive_receive_once_reports_presend_drop_reject_without_ack_advance_like_java() {
+    fn drive_receive_once_terminalizes_presend_schema_reject_without_ack_advance() {
         let mut server = FakeOrderedServer::no_response();
         server.push_response(FakeServerResponse::Reject {
             wire_seq: 42,
@@ -6963,7 +7008,41 @@ mod tests {
         let mut driver = driver(server);
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Progress));
+        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Terminal));
+
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+        assert!(driver.terminal_sender_error().is_some());
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Terminal);
+        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
+        assert_eq!(error.message.as_deref(), Some("pre-send schema mismatch"));
+        assert_eq!(error.message_sequence, Some(42));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+    }
+
+    #[test]
+    fn drive_receive_once_reconnects_presend_retryable_reject_without_ack_advance() {
+        let mut server = FakeOrderedServer::no_response();
+        server.push_response(FakeServerResponse::Reject {
+            wire_seq: 42,
+            error: write_error("pre-send write failure"),
+        });
+        let mut driver = driver(server);
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_receive_once(),
+            Ok(DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            })
+        );
 
         assert_eq!(
             driver.receipt_status(receipt),
@@ -6973,17 +7052,17 @@ mod tests {
         assert_eq!(driver.terminal_sender_error(), None);
 
         let error = driver.poll_sender_error().unwrap();
-        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
-        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
-        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
-        assert_eq!(error.message.as_deref(), Some("pre-send schema mismatch"));
+        assert_eq!(error.category, QwpWsErrorCategory::WriteError);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Retriable);
+        assert_eq!(error.status, Some(codec::WS_STATUS_WRITE_ERROR));
+        assert_eq!(error.message.as_deref(), Some("pre-send write failure"));
         assert_eq!(error.message_sequence, Some(42));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
     }
 
     #[test]
-    fn drive_receive_once_terminalizes_presend_halt_reject_without_ack_advance_like_java() {
+    fn drive_receive_once_terminalizes_presend_terminal_reject_without_ack_advance_like_java() {
         let mut server = FakeOrderedServer::no_response();
         server.push_response(FakeServerResponse::Reject {
             wire_seq: 7,
@@ -7006,7 +7085,7 @@ mod tests {
 
         let terminal_error = driver.terminal_sender_error().unwrap();
         assert_eq!(terminal_error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(terminal_error.message_sequence, Some(7));
         assert_eq!(terminal_error.from_fsn, 0);
         assert_eq!(terminal_error.to_fsn, 0);

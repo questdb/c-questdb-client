@@ -1343,14 +1343,16 @@ typedef enum line_sender_qwpws_error_category
     LINE_SENDER_QWPWS_ERROR_INTERNAL_ERROR = 2,
     LINE_SENDER_QWPWS_ERROR_SECURITY_ERROR = 3,
     LINE_SENDER_QWPWS_ERROR_WRITE_ERROR = 4,
-    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 5,
-    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 6,
+    LINE_SENDER_QWPWS_ERROR_NOT_WRITABLE = 5,
+    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 6,
+    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 7,
 } line_sender_qwpws_error_category;
 
 typedef enum line_sender_qwpws_error_policy
 {
-    LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE = 0,
-    LINE_SENDER_QWPWS_ERROR_HALT = 1,
+    LINE_SENDER_QWPWS_ERROR_RETRIABLE = 0,
+    LINE_SENDER_QWPWS_ERROR_RETRIABLE_OTHER = 1,
+    LINE_SENDER_QWPWS_ERROR_TERMINAL = 2,
 } line_sender_qwpws_error_policy;
 
 typedef struct line_sender_qwpws_error line_sender_qwpws_error;
@@ -1915,8 +1917,8 @@ bool line_sender_qwpws_published_fsn(
     line_sender_error** err_out);
 
 /**
- * Return the highest QWP/WebSocket frame sequence number completed by ACK or
- * drop-and-continue rejection, or no value if no frame has completed.
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK, or
+ * no value if no frame has completed.
  */
 QUESTDB_CLIENT_API
 bool line_sender_qwpws_acked_fsn(

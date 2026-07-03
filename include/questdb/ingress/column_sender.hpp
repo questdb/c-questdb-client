@@ -780,8 +780,8 @@ public:
     }
 
     /**
-     * Return the highest QWP/WebSocket frame sequence number completed by ACK
-     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK,
+     * or `std::nullopt` if none has completed.
      */
     std::optional<uint64_t> acked_fsn() const
     {
@@ -1011,8 +1011,8 @@ public:
     }
 
     /**
-     * Return the highest QWP/WebSocket frame sequence number completed by ACK
-     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK,
+     * or `std::nullopt` if none has completed.
      */
     std::optional<uint64_t> acked_fsn() const
     {
@@ -1305,8 +1305,8 @@ public:
     }
 
     /**
-     * Return the highest QWP/WebSocket frame sequence number completed by ACK
-     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK,
+     * or `std::nullopt` if none has completed.
      * After `flush_and_get_fsn()` returns `fsn`, the publication boundary has
      * completed once `acked_fsn()` returns a value greater than or equal to
      * `fsn`. In durable-ACK mode this watermark advances after durable ACK

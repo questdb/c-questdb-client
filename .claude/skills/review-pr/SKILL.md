@@ -27,6 +27,8 @@ You are a senior QuestDB engineer performing a blocking code review. The QuestDB
 - **Read the full context of changed files** when the diff alone is ambiguous. Use Read/Grep/Glob to inspect surrounding code, callers, and related tests.
 - **Assess reachability before reporting.** For every potential bug, trace the actual callers and inputs. If a problem requires physically impossible conditions (buffer larger than `usize::MAX`, NUL-byte injection through an API that already rejects it, panics behind validation guards), it is not a real finding — drop it. Focus on bugs that real workloads can trigger, not theoretical edge cases.
 - **`debug_assert!` and `assert!` are valid guards for invariants** that indicate library-internal bugs. Do NOT flag them as insufficient — they are the preferred mechanism for conditions that should never occur given the FFI contracts. Only flag an `assert!`/`debug_assert!` if the condition can plausibly be triggered by callers honoring the documented contract.
+- **Store-and-forward must be outage-tolerant.** Any PR touching QWP/WebSocket store-and-forward, background drainers, orphan drainers, reconnect, close-drain, SFA slots, or sender-error classification must preserve this invariant: server downtime, transient connect failures, replica/read-only role rejects, retry-budget exhaustion, and close/join time budgets must not permanently abandon recoverable queued data. Time budgets may bound a caller wait or background-thread join only if the queued frames/slot remain persisted and recoverable by a later sender/drainer. Retryable failures should record diagnostics (for example `.last_error` or an error inbox), not write `.failed`, delete SFA files, or mark the slot permanently dead. Only proven local unrecoverability, such as corrupt SFA segments, may poison an orphan slot.
+- **Graceful role switch is not a protocol violation.** Enterprise primary-to-replica or replica-to-primary switch can happen without a process restart and with existing client connections still open. A write to an old primary after it becomes read-only must be handled as an expected server-side rejection / role-state transition according to the surface's documented contract, not as a WebSocket protocol violation, panic, drainer exit, or unrecoverable SFA failure. Reviews must look for tests that exercise in-place `/lifecycle/switch` with an already-open connection, not only kill/restart failover.
 
 ## Review level
 
@@ -310,6 +312,12 @@ Anything that aborts the Rust side aborts the host process. The first check is t
 - Thread-safety of types passed across `Send` boundaries
 - For every changed symbol, check whether it is now reachable from a thread or context (per 2.5d) where the previous concurrency assumptions don't hold
 
+### QWP store-and-forward, failover, and role switch
+- **Drainers do not give up recoverable data.** For background and orphan drainers, verify every exit condition: explicit stop, queue drained, unrecoverable local corruption, retry-budget exhaustion, close-drain timeout, join timeout, connect failure, server reject, role reject, and poisoned locks. Any exit caused by server downtime, retry budget, or time budget must leave queued frames persisted and future-drainable; it must not mark `.failed`, delete SFA files, or convert a transient outage into permanent data loss.
+- **Timeouts bound waits, not durability.** A close/drain/join timeout may return control to the caller, but the persisted SFA state must remain recoverable. Check that tests assert both sides: the call is bounded and the slot/frame can later be replayed.
+- **In-place role changes are first-class.** A node can become a read-only replica while an existing QWP connection remains open. Verify read-only/role-reject responses are classified as server/role outcomes under the public contract, not as WebSocket protocol violations, panics, or unrecoverable SFA poison.
+- **Graceful switch tests are required for relevant changes.** If a PR touches QWP role detection, server-error classification, reconnect, store-and-forward replay, close drain, background progress, or Enterprise harness integration, require coverage for `/lifecycle/switch` primary-to-replica and back without process restart, with at least one already-open client connection.
+
 ### Performance
 - Performance regressions: changes that make hot paths slower
 - Unnecessary allocations in buffer building, column writes, or flushing paths
@@ -356,6 +364,8 @@ Mission-critical for a client library: a confusing or inconsistent public API ca
 - **Coverage gaps:** For every new or changed code path, verify a corresponding test exists. If not, flag it explicitly as "missing test for X".
 - **Cross-context coverage:** For every entry in the cross-context exposure list (2.5d), verify a test exercises the changed symbol from that context. Missing cross-context tests are high-priority findings.
 - **Error path coverage:** Are failure cases, partial writes, connection drops, TLS failures, auth failures, and edge conditions tested — not just the happy path?
+- **SFA outage coverage:** For QWP store-and-forward changes, tests must prove retryable server outage, connect failure, timeout, and role-reject paths keep queued data recoverable instead of poisoning or silently deleting it.
+- **Graceful role-switch coverage:** For QWP reconnect/error-classification changes, tests must include Enterprise in-place primary/replica switch with no process restart and an already-open connection; kill/restart failover alone is not sufficient.
 - **NULL/edge-case tests:** Are NULL inputs, empty buffers, zero-length strings, max-length symbols, and boundary values tested?
 - **FFI tests:** Are C/C++ API changes covered by tests in `cpp_test/`?
 - **Integration tests:** Are protocol-level changes covered by system tests in `system_test/`?

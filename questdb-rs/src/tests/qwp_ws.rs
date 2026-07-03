@@ -579,9 +579,6 @@ fn spawn_one_response_server(response: MockQwpResponse) -> (u16, mpsc::Receiver<
 
 #[derive(Clone, Copy)]
 enum MockQwpResponse {
-    Ok {
-        wire_seq: u64,
-    },
     Error {
         status: u8,
         wire_seq: u64,
@@ -594,45 +591,12 @@ fn write_mock_qwp_response(
     response: MockQwpResponse,
 ) -> std::io::Result<()> {
     match response {
-        MockQwpResponse::Ok { wire_seq } => write_qwp_ok_response(stream, wire_seq),
         MockQwpResponse::Error {
             status,
             wire_seq,
             message,
         } => write_qwp_error_response(stream, status, wire_seq, message),
     }
-}
-
-fn spawn_two_response_server(
-    first_response: MockQwpResponse,
-    second_response: MockQwpResponse,
-) -> (u16, mpsc::Receiver<MockResult>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let request_lines = perform_server_upgrade(&mut stream).unwrap();
-
-        let mut received_frames = Vec::new();
-        if let Ok((_fin, _opcode, first)) = read_frame(&mut stream) {
-            received_frames.push(first);
-            let _ = write_mock_qwp_response(&mut stream, first_response);
-            if let Ok((_fin, _opcode, second)) = read_frame(&mut stream) {
-                received_frames.push(second);
-                let _ = write_mock_qwp_response(&mut stream, second_response);
-            }
-        }
-
-        let _ = tx.send(MockResult {
-            request_lines,
-            received_frames,
-        });
-        thread::sleep(Duration::from_millis(50));
-    });
-
-    (port, rx)
 }
 
 fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
@@ -1240,18 +1204,13 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
 }
 
 #[test]
-fn qwp_ws_drop_reject_reports_error_and_continues_in_all_progress_modes() {
+fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
-        let (port, rx) = spawn_two_response_server(
-            MockQwpResponse::Error {
-                status: QWP_STATUS_SCHEMA_MISMATCH,
-                wire_seq: FIRST_WIRE_SEQUENCE,
-                message: b"bad schema",
-            },
-            MockQwpResponse::Ok {
-                wire_seq: FIRST_WIRE_SEQUENCE + 1,
-            },
-        );
+        let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
+            status: QWP_STATUS_SCHEMA_MISMATCH,
+            wire_seq: FIRST_WIRE_SEQUENCE,
+            message: b"bad schema",
+        });
         let mut sender = build_qwp_ws_sender(progress, port);
 
         let mut buf = sender.new_buffer();
@@ -1261,45 +1220,48 @@ fn qwp_ws_drop_reject_reports_error_and_continues_in_all_progress_modes() {
             .unwrap()
             .at_now()
             .unwrap();
-        let first_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(fsn, 0, "mode={}", progress.name());
 
-        buf.table("trades")
-            .unwrap()
-            .column_i64("qty", 2)
-            .unwrap()
-            .at_now()
-            .unwrap();
-        let second_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-
-        assert_eq!(first_fsn, 0, "mode={}", progress.name());
-        assert_eq!(second_fsn, 1, "mode={}", progress.name());
-        sender
+        let err = sender
             .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
-            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
-        assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ServerRejection);
+        assert!(
+            err.msg().contains("bad schema"),
+            "mode={}, got: {}",
+            progress.name(),
+            err.msg()
+        );
+        assert_eq!(
+            err.qwp_ws_rejection().map(|error| error.category),
+            Some(QwpWsErrorCategory::SchemaMismatch),
+            "mode={}",
+            progress.name()
+        );
 
         let received = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
             received.received_frames.len(),
-            2,
+            1,
             "mode={}",
             progress.name()
         );
 
         let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
         assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
-        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(qwp_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
         assert_eq!(qwp_error.message.as_deref(), Some("bad schema"));
         assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
-        assert_eq!(qwp_error.from_fsn, first_fsn);
-        assert_eq!(qwp_error.to_fsn, first_fsn);
+        assert_eq!(qwp_error.from_fsn, fsn);
+        assert_eq!(qwp_error.to_fsn, fsn);
         assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     }
 }
 
 #[test]
-fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
+fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
         let (port, rx) = spawn_one_response_server(MockQwpResponse::Error {
             status: QWP_STATUS_PARSE_ERROR,
@@ -1340,7 +1302,7 @@ fn qwp_ws_halt_reject_terminalizes_in_all_progress_modes() {
 
         let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
         assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
-        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
         assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
         assert_eq!(qwp_error.message.as_deref(), Some("bad column"));
         assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
@@ -1827,7 +1789,7 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
 }
 
 #[test]
-fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
+fn qwp_ws_manual_sender_schema_rejection_terminalizes_without_ack_advance() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -1855,7 +1817,6 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
         stream.write_all(response.as_bytes()).unwrap();
 
         let (_fin, _opcode, _first) = read_frame(&mut stream).unwrap();
-        let (_fin, _opcode, _second) = read_frame(&mut stream).unwrap();
         write_qwp_error_response(
             &mut stream,
             QWP_STATUS_SCHEMA_MISMATCH,
@@ -1863,19 +1824,10 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
             b"first bad",
         )
         .unwrap();
-        write_qwp_error_response(
-            &mut stream,
-            QWP_STATUS_SCHEMA_MISMATCH,
-            FIRST_WIRE_SEQUENCE + 1,
-            b"second bad",
-        )
-        .unwrap();
         thread::sleep(Duration::from_millis(50));
     });
 
     let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .max_in_flight(2)
-        .unwrap()
         .qwp_ws_progress(QwpWsProgress::Manual)
         .unwrap()
         .build()
@@ -1891,48 +1843,34 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
         .unwrap();
     let first_fsn = sender.flush_and_get_fsn(&mut first).unwrap().unwrap();
 
-    let mut second = sender.new_buffer();
-    second
-        .table("trades")
-        .unwrap()
-        .column_i64("qty", 2)
-        .unwrap()
-        .at_now()
-        .unwrap();
-    let second_fsn = sender.flush_and_get_fsn(&mut second).unwrap().unwrap();
-
     assert_eq!(first_fsn, 0);
-    assert_eq!(second_fsn, 1);
     assert!(sender.drive_once().unwrap());
-    assert!(sender.drive_once().unwrap());
-    sender
-        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
-        .unwrap();
-    assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
-
+    assert_eq!(sender.acked_fsn().unwrap(), None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let err = loop {
+        match sender.drive_once() {
+            Ok(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(progressed) => {
+                panic!("schema rejection did not terminalize sender; last progressed={progressed}")
+            }
+            Err(err) => break err,
+        }
+    };
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        err.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::SchemaMismatch)
+    );
     let first_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(first_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        first_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
+    assert_eq!(first_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(first_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
     assert_eq!(first_error.message.as_deref(), Some("first bad"));
     assert_eq!(first_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
     assert_eq!(first_error.from_fsn, first_fsn);
     assert_eq!(first_error.to_fsn, first_fsn);
-
-    let second_error = sender.poll_qwp_ws_error().unwrap().unwrap();
-    assert_eq!(second_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        second_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
-    assert_eq!(second_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
-    assert_eq!(second_error.message.as_deref(), Some("second bad"));
-    assert_eq!(second_error.message_sequence, Some(FIRST_WIRE_SEQUENCE + 1));
-    assert_eq!(second_error.from_fsn, second_fsn);
-    assert_eq!(second_error.to_fsn, second_fsn);
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     assert_eq!(sender.qwp_ws_errors_dropped().unwrap(), 0);
 }
@@ -2608,12 +2546,12 @@ fn qwp_ws_server_error_response_is_surfaced() {
 
     let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(callback_error.category, QwpWsErrorCategory::ParseError);
-    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(callback_error.from_fsn, first_fsn);
 
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
-    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(qwp_error.status, Some(QWP_STATUS_PARSE_ERROR));
     assert_eq!(qwp_error.message.as_deref(), Some("bad column"));
     assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
@@ -2624,7 +2562,7 @@ fn qwp_ws_server_error_response_is_surfaced() {
 }
 
 #[test]
-fn qwp_ws_schema_rejection_drops_and_sender_continues() {
+fn qwp_ws_schema_rejection_terminalizes_and_notifies_handler() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -2664,10 +2602,6 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
         )
         .unwrap();
 
-        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
-        received_frames.push(second);
-        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1).unwrap();
-
         tx.send(received_frames).unwrap();
         thread::sleep(Duration::from_millis(50));
     });
@@ -2691,24 +2625,19 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     assert!(buf.is_empty());
     assert_eq!(first_fsn, 0);
 
-    buf.table("trades")
-        .unwrap()
-        .column_i64("qty", 2)
-        .unwrap()
-        .at_now()
-        .unwrap();
-    let second_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
-    assert!(buf.is_empty());
-    assert_eq!(second_fsn, 1);
-
     let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(received_frames.len(), 2);
-    sender
+    assert_eq!(received_frames.len(), 1);
+    let err = sender
         .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
+    assert_eq!(
+        err.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::SchemaMismatch)
+    );
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(qwp_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
     assert_eq!(qwp_error.message.as_deref(), Some("bad schema"));
     assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
@@ -2717,18 +2646,15 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     assert_eq!(sender.qwp_ws_errors_dropped().unwrap(), 0);
 
-    sender.flush(&mut buf).unwrap();
+    let _ = sender.flush(&mut buf);
     let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(callback_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        callback_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
+    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(callback_error.from_fsn, first_fsn);
 }
 
 #[test]
-fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
+fn qwp_ws_repeated_head_close_poison_is_pollable_as_protocol_violation() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (frame_tx, frame_rx) = mpsc::channel();
@@ -2750,6 +2676,8 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     });
 
     let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_frame_rejections(1)
+        .unwrap()
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -2775,15 +2703,14 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let close_error = observed.expect("expected terminal close diagnostic");
+    let close_error = observed.expect("expected close poison diagnostic");
     assert_eq!(close_error.category, QwpWsErrorCategory::ProtocolViolation);
-    assert_eq!(close_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(close_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(close_error.status, None);
     assert_eq!(close_error.message_sequence, None);
-    assert_eq!(
-        close_error.message.as_deref(),
-        Some("ws-close[1002]: bad frame")
-    );
+    assert!(close_error.message.as_deref().is_some_and(|message| {
+        message.contains("QWP/WebSocket frame fsn 0 was closed 1 times without ACK progress")
+    }));
     assert_eq!(close_error.from_fsn, fsn);
     assert_eq!(close_error.to_fsn, fsn);
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
@@ -2791,8 +2718,8 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
 
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
-        err.msg().contains("ws-close[1002]: bad frame"),
-        "expected terminal close in empty flush message, got: {}",
+        err.msg().contains("closed 1 times without ACK progress"),
+        "expected close poison in empty flush message, got: {}",
         err.msg()
     );
     assert!(
@@ -2803,13 +2730,13 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
-        err.msg().contains("ws-close[1002]: bad frame"),
-        "expected terminal close to dominate incomplete-row validation, got: {}",
+        err.msg().contains("closed 1 times without ACK progress"),
+        "expected close poison to dominate incomplete-row validation, got: {}",
         err.msg()
     );
     assert!(
         !err.msg().contains("Bad call to `flush`"),
-        "local buffer validation must not mask terminal close: {}",
+        "local buffer validation must not mask close poison: {}",
         err.msg()
     );
     assert!(
@@ -2820,8 +2747,8 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     buf.at_now().unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
-        err.msg().contains("ws-close[1002]: bad frame"),
-        "expected terminal close in message, got: {}",
+        err.msg().contains("closed 1 times without ACK progress"),
+        "expected close poison in message, got: {}",
         err.msg()
     );
     assert!(
@@ -2883,7 +2810,7 @@ where
         protocol_error.category,
         QwpWsErrorCategory::ProtocolViolation
     );
-    assert_eq!(protocol_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(protocol_error.applied_policy, QwpWsErrorPolicy::Terminal);
     assert_eq!(protocol_error.status, None);
     assert_eq!(protocol_error.message_sequence, None);
     assert_eq!(protocol_error.message.as_deref(), Some(expected_message));
@@ -4036,7 +3963,7 @@ fn qwp_ws_initial_connect_durable_ack_mismatch_tries_next_endpoint() {
 }
 
 #[test]
-fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_terminalize() {
+fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_retry_until_budget() {
     let (first_port, first_handle) = spawn_role_reject_upgrade_server(1, "REPLICA");
     let (second_port, second_handle) = spawn_role_reject_upgrade_server(1, "REPLICA");
 
@@ -4053,9 +3980,10 @@ fn qwp_ws_sync_initial_retry_durable_ack_all_role_rejects_terminalize() {
         .build()
         .unwrap_err();
 
-    assert_eq!(err.code(), ErrorCode::ProtocolVersionError);
+    assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(
-        err.msg().contains("server did not enable durable ACK"),
+        err.msg()
+            .contains("QWP/WebSocket initial connect retry budget exhausted"),
         "got: {}",
         err.msg()
     );

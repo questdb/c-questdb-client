@@ -28,6 +28,7 @@ import pytest
 # server.wait_port_free and pg_query helpers come from the Enterprise
 # harness on PYTHONPATH (set up by conftest.py).
 from lib.lifecycle import submit_switch
+from lib.obj_store import ObjStore
 from lib.pg_query import count_rows, execute_ddl, wait_for_count, wait_for_dense_sequence
 from lib.server import wait_port_free
 
@@ -41,6 +42,11 @@ LOG = logging.getLogger(__name__)
 
 ZONE_A = "zone-A"
 ZONE_B = "zone-B"
+
+_REQUIRES_OBJ_STORE_FREEZE = pytest.mark.skipif(
+    not all(hasattr(ObjStore, name) for name in ("freeze", "thaw", "frozen")),
+    reason="requires questdb-enterprise PR #1094 ObjStore durability gate",
+)
 
 
 def _connect_string(http_port: int, sf_dir: Optional[Path], *,
@@ -959,6 +965,7 @@ def test_partial_ack_sealed_segment_replay_dedup_collapses_c_client_rust(
 
 @pytest.mark.c_client
 @pytest.mark.c_client_rust
+@_REQUIRES_OBJ_STORE_FREEZE
 def test_orphan_drainer_durable_ack_trim_timing_c_client_rust(
     server_factory,
     c_client_rust_sidecar: CClientRustSidecar,
@@ -1090,6 +1097,7 @@ def test_orphan_drainer_durable_ack_trim_timing_c_client_rust(
 
 @pytest.mark.c_client
 @pytest.mark.c_client_rust
+@_REQUIRES_OBJ_STORE_FREEZE
 def test_orphan_drainer_partial_durability_at_kill_c_client_rust(
     server_factory,
     c_client_rust_sidecar: CClientRustSidecar,
@@ -1234,6 +1242,7 @@ def test_orphan_drainer_partial_durability_at_kill_c_client_rust(
 
 @pytest.mark.c_client
 @pytest.mark.c_client_rust
+@_REQUIRES_OBJ_STORE_FREEZE
 def test_orphan_drainer_multi_slot_durable_ack_survives_kill_c_client_rust(
     server_factory,
     c_client_rust_sidecar: CClientRustSidecar,
@@ -1366,6 +1375,7 @@ def test_orphan_drainer_multi_slot_durable_ack_survives_kill_c_client_rust(
 
 @pytest.mark.c_client
 @pytest.mark.c_client_rust
+@_REQUIRES_OBJ_STORE_FREEZE
 def test_orphan_drainer_durable_ack_survives_drain_reconnect_c_client_rust(
     server_factory,
     c_client_rust_sidecar: CClientRustSidecar,

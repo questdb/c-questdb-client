@@ -65,6 +65,8 @@ pub(crate) mod sender;
 pub(crate) use sender::QwpWsRoleReject;
 #[cfg(any(feature = "polars-ingress", feature = "polars-egress"))]
 pub(crate) use sender::ReconnectPolicy;
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use sender::ReconnectReason;
 pub use sender::*;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use sender::{reconnect_backoff_step, reconnect_error_is_terminal};
@@ -514,6 +516,7 @@ impl QwpWsConnector {
             &self.endpoints,
             health,
             &mut previous_idx,
+            None,
             self.use_tls,
             self.tls_settings.clone(),
             &self.qwp_ws,
@@ -530,12 +533,14 @@ impl QwpWsConnector {
     }
 
     pub(crate) fn connect_sfa_background(&self) -> Result<sender::qwp_ws::SyncQwpWsHandlerState> {
+        let mut qwp_ws = self.qwp_ws.clone();
+        qwp_ws.force_async_initial_connect();
         sender::qwp_ws::connect_qwp_ws_background_state(
             self.host.as_str(),
             self.port.as_str(),
             self.use_tls,
             self.tls_settings.clone(),
-            &self.qwp_ws,
+            &qwp_ws,
             self.auth_header.clone(),
         )
     }
@@ -1015,6 +1020,10 @@ impl SenderBuilder {
                 "max_background_drainers" => builder.max_background_drainers(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "error_inbox_capacity" => builder.error_inbox_capacity(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "max_frame_rejections" => {
+                    builder.max_frame_rejections(parse_conf_value(key, val)?)?
+                }
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -1679,6 +1688,29 @@ impl SenderBuilder {
         qwp_ws
             .reconnect_max_duration
             .set_specified("reconnect_max_duration_millis", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Maximum repeated same-head-FSN rejects or server close frames tolerated
+    /// without ACK progress before the sender treats the frame as poison.
+    /// Default 4, matching the Java QWP/WebSocket sender.
+    pub fn max_frame_rejections(mut self, value: usize) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"max_frame_rejections\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"max_frame_rejections\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .max_frame_rejections
+            .set_specified("max_frame_rejections", value)?;
         Ok(self)
     }
 

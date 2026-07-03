@@ -205,14 +205,16 @@ enum class qwp_ws_error_category
     internal_error,
     security_error,
     write_error,
+    not_writable,
     protocol_violation,
     unknown,
 };
 
 enum class qwp_ws_error_policy
 {
-    drop_and_continue,
-    halt,
+    retriable,
+    retriable_other,
+    terminal,
 };
 
 struct qwp_ws_error
@@ -322,7 +324,7 @@ public:
         return _in_doubt;
     }
 
-    /** Structured diagnostic for a QWP/WebSocket HALT error, if available. */
+    /** Structured diagnostic for a QWP/WebSocket server error, if available. */
     const std::optional<qwp_ws_error>& qwp_ws_diagnostic() const noexcept
     {
         return _qwp_ws_diagnostic;

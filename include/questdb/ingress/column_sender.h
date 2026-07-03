@@ -422,8 +422,8 @@ bool row_sender_published_fsn(
     line_sender_error** err_out);
 
 /**
- * Return the highest QWP/WebSocket frame sequence number completed by ACK or
- * drop-and-continue rejection, or no value if no frame has completed. After
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK, or
+ * no value if no frame has completed. After
  * an FSN-returning flush publishes `fsn`, that publication boundary has
  * completed once this function returns a value greater than or equal to
  * `fsn`. In durable-ACK mode this watermark advances after durable ACK
@@ -1353,8 +1353,8 @@ bool column_sender_published_fsn(
     line_sender_error** err_out);
 
 /**
- * Return the highest QWP/WebSocket frame sequence number completed by ACK or
- * drop-and-continue rejection, or no value if no frame has completed. In
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK, or
+ * no value if no frame has completed. In
  * durable-ACK mode this watermark advances after durable ACK coverage; use
  * `column_sender_wait` when an explicit OK or durable barrier is needed.
  */

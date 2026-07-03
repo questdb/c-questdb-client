@@ -2785,8 +2785,8 @@ pub unsafe extern "C" fn column_sender_published_fsn(
     }
 }
 
-/// Return the highest QWP/WebSocket frame sequence number completed by ACK or
-/// drop-and-continue rejection, or no value if no frame has completed.
+/// Return the highest QWP/WebSocket frame sequence number completed by ACK, or
+/// no value if no frame has completed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_acked_fsn(
     sender: *const column_sender,

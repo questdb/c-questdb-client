@@ -139,8 +139,9 @@ class QwpWsErrorCategory(Enum):
     INTERNAL_ERROR = 2
     SECURITY_ERROR = 3
     WRITE_ERROR = 4
-    PROTOCOL_VIOLATION = 5
-    UNKNOWN = 6
+    NOT_WRITABLE = 5
+    PROTOCOL_VIOLATION = 6
+    UNKNOWN = 7
 
     @classmethod
     def from_int(cls, value: int):
@@ -151,15 +152,16 @@ class QwpWsErrorCategory(Enum):
 
 
 class QwpWsErrorPolicy(Enum):
-    DROP_AND_CONTINUE = 0
-    HALT = 1
+    RETRIABLE = 0
+    RETRIABLE_OTHER = 1
+    TERMINAL = 2
 
     @classmethod
     def from_int(cls, value: int):
         for member in cls:
             if member.value == value:
                 return member
-        return cls.HALT
+        return cls.TERMINAL
 
 
 class c_line_sender_opts(ctypes.Structure):
