@@ -47,6 +47,9 @@ pub mod ingress;
 #[cfg(feature = "_egress")]
 pub mod egress;
 
+#[cfg(feature = "_oidc")]
+pub mod oidc;
+
 pub use error::*;
 
 #[cfg(test)]

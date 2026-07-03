@@ -192,6 +192,34 @@ let mut sender = Sender::from_conf(
 
 * `token`: the authentication token
 
+### HTTP Bearer Token via a Provider (rotating / OIDC)
+
+For a token that rotates — such as one obtained by interactive OIDC sign-in —
+pass a **token provider** to the builder instead of a fixed `token=` string. The
+sender pulls a freshly refreshed token on every request, so a long-lived sender
+keeps working as the token rotates:
+
+```ignore
+use std::sync::Arc;
+use questdb::oidc::OidcDeviceAuth;
+use questdb::ingress::{Protocol, SenderBuilder};
+
+// Interactive OIDC device-flow sign-in (requires the `oidc` feature):
+let auth = Arc::new(
+    OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?);
+auth.sign_in()?;
+
+let mut sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000)
+    .http_token_provider({ let auth = Arc::clone(&auth); move || auth.token() })?
+    .build()?;
+```
+
+The provider is any `Fn() -> Result<String, E>`; see
+[`SenderBuilder::http_token_provider`](crate::ingress::SenderBuilder::http_token_provider)
+and the [`oidc`](crate::oidc) module. Prefer this over embedding a token in a
+`from_conf(...)` string, which is easily logged or persisted. Mutually exclusive
+with `username`/`password`/`token`.
+
 ### HTTP Basic Authentication
 
 ```no_run

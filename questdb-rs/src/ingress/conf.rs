@@ -341,6 +341,25 @@ impl TokenAuthParams {
     }
 }
 
+/// A caller-supplied source of a fresh HTTP Bearer token, pulled on each
+/// request. Enables a long-lived sender to keep working as the token rotates
+/// (e.g. from [`oidc::OidcDeviceAuth`](crate::oidc::OidcDeviceAuth)). Mirrors the
+/// callback newtype used for QWP/WebSocket error handling.
+#[cfg(feature = "_sender-http")]
+pub(crate) type HttpTokenProviderFn =
+    std::sync::Arc<dyn Fn() -> crate::Result<String> + Send + Sync>;
+
+#[cfg(feature = "_sender-http")]
+#[derive(Clone)]
+pub(crate) struct HttpTokenProvider(pub(crate) HttpTokenProviderFn);
+
+#[cfg(feature = "_sender-http")]
+impl std::fmt::Debug for HttpTokenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HttpTokenProvider { .. }")
+    }
+}
+
 #[cfg(feature = "_sender-tcp")]
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) struct EcdsaAuthParams {

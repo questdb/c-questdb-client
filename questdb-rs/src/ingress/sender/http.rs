@@ -51,11 +51,52 @@ pub(crate) struct SyncHttpHandlerState {
     /// The URL of the HTTP endpoint.
     pub(crate) url: String,
 
-    /// The content of the `Authorization` HTTP header.
-    pub(crate) auth: Option<String>,
+    /// How to produce the `Authorization` HTTP header.
+    pub(crate) auth: HttpAuth,
 
     /// HTTP params configured via the `SenderBuilder`.
     pub(crate) config: HttpConfig,
+}
+
+/// The source of the `Authorization` header value on each flush.
+///
+/// A static value (Basic / a fixed Bearer token) is precomputed once; a provider
+/// is called per flush so a rotating token (e.g. OIDC) stays fresh for a
+/// long-lived sender.
+#[cfg(feature = "sync-sender-http")]
+pub(crate) enum HttpAuth {
+    None,
+    Static(String),
+    Provider(crate::ingress::conf::HttpTokenProviderFn),
+}
+
+#[cfg(feature = "sync-sender-http")]
+impl HttpAuth {
+    /// Resolve the `Authorization` header value for one flush, calling the token
+    /// provider if present. A `Static` value is borrowed (no per-flush
+    /// allocation on the hot path); only the `Provider` case allocates.
+    pub(crate) fn resolve(&self) -> Result<Option<std::borrow::Cow<'_, str>>, Error> {
+        use std::borrow::Cow;
+        match self {
+            HttpAuth::None => Ok(None),
+            HttpAuth::Static(value) => Ok(Some(Cow::Borrowed(value.as_str()))),
+            HttpAuth::Provider(provider) => {
+                let token = provider()?;
+                // The token goes verbatim into an `Authorization: Bearer` header;
+                // a control / non-ASCII byte (a decoded CR/LF is a header-injection
+                // vector) or an empty value must never reach the wire.
+                if token.is_empty() || !token.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                    return Err(fmt!(
+                        AuthError,
+                        "The HTTP token provider returned an empty token or one \
+                         containing a non-printable-ASCII character; refusing to \
+                         send it as a Bearer header."
+                    ));
+                }
+                Ok(Some(Cow::Owned(format!("Bearer {token}"))))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "sync-sender-http")]
@@ -64,6 +105,7 @@ impl SyncHttpHandlerState {
         &self,
         buf: &[u8],
         request_timeout: Duration,
+        auth: Option<&str>,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
         let request = self
             .agent
@@ -74,7 +116,7 @@ impl SyncHttpHandlerState {
             .query_pairs([("precision", "n")])
             .content_type("text/plain; charset=utf-8");
 
-        let request = match self.auth.as_ref() {
+        let request = match auth {
             Some(auth) => request.header("Authorization", auth),
             None => request,
         };
@@ -339,6 +381,7 @@ fn retry_http_send(
     request_timeout: Duration,
     retry_timeout: Duration,
     retry_max_backoff: Duration,
+    auth: Option<&str>,
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
@@ -358,7 +401,7 @@ fn retry_http_send(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.send_request(buf, request_timeout);
+        (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
         if !need_retry {
             return last_rep;
         }
@@ -387,8 +430,9 @@ pub(super) fn http_send_with_retries(
     request_timeout: Duration,
     retry_timeout: Duration,
     retry_max_backoff: Duration,
+    auth: Option<&str>,
 ) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.send_request(buf, request_timeout);
+    let (need_retry, last_rep) = state.send_request(buf, request_timeout, auth);
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }
@@ -399,6 +443,7 @@ pub(super) fn http_send_with_retries(
         request_timeout,
         retry_timeout,
         retry_max_backoff,
+        auth,
         last_rep,
     )
 }

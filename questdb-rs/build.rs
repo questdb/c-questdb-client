@@ -301,7 +301,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         any(
             feature = "_sender-tcp",
             feature = "_sender-http",
-            feature = "_sender-qwp-ws"
+            feature = "_sender-qwp-ws",
+            feature = "_oidc"
         ),
         not(any(feature = "tls-webpki-certs", feature = "tls-native-certs"))
     ))]
@@ -309,6 +310,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "At least one of `tls-webpki-certs` or `tls-native-certs` features must be enabled."
     );
 
+    // Note: `oidc` reuses the ILP transports' TLS/crypto stack and the `ingress`
+    // module, and its Cargo feature pulls in `sync-sender-http` (so the acquired
+    // token can be wired into a sender via `http_token_provider`, and so the
+    // `ingress` module always has at least one `Protocol` variant to compile
+    // against). It is therefore never enabled without a sender feature.
     #[cfg(not(any(
         feature = "_sender-tcp",
         feature = "_sender-http",
@@ -323,7 +329,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         any(
             feature = "_sender-tcp",
             feature = "_sender-http",
-            feature = "_sender-qwp-ws"
+            feature = "_sender-qwp-ws",
+            feature = "_oidc"
         ),
         not(any(feature = "aws-lc-crypto", feature = "ring-crypto"))
     ))]
@@ -335,7 +342,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         any(
             feature = "_sender-tcp",
             feature = "_sender-http",
-            feature = "_sender-qwp-ws"
+            feature = "_sender-qwp-ws",
+            feature = "_oidc"
         ),
         feature = "aws-lc-crypto",
         feature = "ring-crypto"

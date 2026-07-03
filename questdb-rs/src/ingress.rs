@@ -40,7 +40,10 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-mod tls;
+// `pub(crate)` so the `oidc` module can reuse `configure_tls` / `TlsSettings`
+// for its IdP HTTPS calls (see `oidc::http`). The items themselves stay
+// `pub(crate)`, so this widens visibility only within the crate.
+pub(crate) mod tls;
 
 #[cfg(all(feature = "_sender-tcp", feature = "aws-lc-crypto"))]
 use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
@@ -618,6 +621,11 @@ pub struct SenderBuilder {
     #[cfg(feature = "_sender-http")]
     http: Option<conf::HttpConfig>,
 
+    /// Per-request Bearer-token source for ILP/HTTP; mutually exclusive with
+    /// `username`/`password`/`token`. See [`SenderBuilder::http_token_provider`].
+    #[cfg(feature = "_sender-http")]
+    http_token_provider: Option<conf::HttpTokenProvider>,
+
     #[cfg(feature = "_sender-qwp-udp")]
     qwp_udp: Option<conf::QwpUdpConfig>,
 
@@ -1090,6 +1098,9 @@ impl SenderBuilder {
                 None
             },
 
+            #[cfg(feature = "_sender-http")]
+            http_token_provider: None,
+
             #[cfg(feature = "_sender-qwp-udp")]
             qwp_udp: if protocol.is_qwp_udp() {
                 Some(conf::QwpUdpConfig::default())
@@ -1182,6 +1193,69 @@ impl SenderBuilder {
         self.reject_if_qwp_udp("token")?;
         self.token
             .set_specified("token", Some(validate_value(token.to_string())?))?;
+        Ok(self)
+    }
+
+    /// Supply a fresh HTTP Bearer token on every request via a callback.
+    ///
+    /// Unlike [`token`](Self::token), which captures a fixed token once, the
+    /// provider is called on each flush, so a long-lived sender keeps working as
+    /// the token silently refreshes / rotates. Pass
+    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token) here for
+    /// interactive OIDC sign-in:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "oidc")] {
+    /// use std::sync::Arc;
+    /// use questdb::oidc::OidcDeviceAuth;
+    /// use questdb::ingress::{Protocol, SenderBuilder};
+    ///
+    /// # fn run() -> questdb::Result<()> {
+    /// let auth = Arc::new(OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?);
+    /// auth.sign_in()?;
+    /// let sender = SenderBuilder::new(Protocol::Https, "questdb.example.com", 9000)
+    ///     .http_token_provider({ let auth = Arc::clone(&auth); move || auth.token() })?
+    ///     .build()?;
+    /// # let _ = sender; Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// The returned token is sent as `Authorization: Bearer <token>`; a token
+    /// with a non-printable-ASCII character (a header-injection vector) is
+    /// rejected at flush time. A provider error fails that flush (and is
+    /// retriable). Mutually exclusive with [`username`](Self::username) /
+    /// [`password`](Self::password) / [`token`](Self::token); ILP/HTTP only.
+    ///
+    /// The provider runs **synchronously on the flush path**, so it must not
+    /// block indefinitely. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)
+    /// returns the cached token without blocking once signed in, but will run an
+    /// interactive re-prompt if the token expires with no refresh token
+    /// available — for unattended senders, request the `offline_access` scope so
+    /// it refreshes silently instead (see the [`oidc`](crate::oidc) module docs).
+    #[cfg(feature = "_sender-http")]
+    pub fn http_token_provider<F, E>(mut self, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        if !self.protocol.is_httpx() {
+            return Err(fmt!(
+                ConfigError,
+                "\"http_token_provider\" is only supported for ILP over HTTP."
+            ));
+        }
+        if self.username.is_specified() || self.password.is_specified() || self.token.is_specified()
+        {
+            return Err(fmt!(
+                ConfigError,
+                "\"http_token_provider\" is mutually exclusive with \
+                 username/password and token authentication."
+            ));
+        }
+        self.http_token_provider = Some(conf::HttpTokenProvider(std::sync::Arc::new(move || {
+            provider().map_err(Into::into)
+        })));
         Ok(self)
     }
 
@@ -2233,9 +2307,20 @@ impl SenderBuilder {
 
                 let connector = connector.chain(TlsConnector::new(tls_config));
 
+                if self.http_token_provider.is_some() && auth.is_some() {
+                    return Err(fmt!(
+                        ConfigError,
+                        "\"http_token_provider\" is mutually exclusive with \
+                         username/password and token authentication."
+                    ));
+                }
                 let auth = match auth {
-                    Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
-                    Some(conf::AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+                    Some(conf::AuthParams::Basic(ref auth)) => {
+                        HttpAuth::Static(auth.to_header_string())
+                    }
+                    Some(conf::AuthParams::Token(ref auth)) => {
+                        HttpAuth::Static(auth.to_header_string()?)
+                    }
 
                     #[cfg(feature = "sync-sender-tcp")]
                     Some(conf::AuthParams::Ecdsa(_)) => {
@@ -2245,7 +2330,10 @@ impl SenderBuilder {
                             Please use basic or token authentication instead."
                         ));
                     }
-                    None => None,
+                    None => match self.http_token_provider {
+                        Some(ref provider) => HttpAuth::Provider(provider.0.clone()),
+                        None => HttpAuth::None,
+                    },
                 };
                 let agent_builder = agent_builder
                     .timeout_connect(Some(*http_config.request_timeout.deref()))
