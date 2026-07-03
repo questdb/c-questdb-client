@@ -144,7 +144,7 @@ fn encode_chunk_into_mode(
         return Err(error::fmt!(
             InvalidApiCall,
             "Chunk has no designated timestamp; \
-             call designated_timestamp_micros or designated_timestamp_nanos before flush."
+             call at_micros or at_nanos before flush."
         ));
     }
     validate_table_name(&chunk.table)?;
@@ -1154,12 +1154,12 @@ fn is_valid_row(validity: Option<&ValidityDescriptor>, i: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingress::column_sender::Validity;
+    use crate::ingress::column_sender::{TimestampUnit, Validity};
 
     fn make_chunk_i64(name: &str, data: &[i64]) -> Vec<u8> {
         let mut chunk = Chunk::new("trades");
         chunk.column_i64(name, data, None).unwrap();
-        chunk.designated_timestamp_nanos(data).unwrap();
+        chunk.at_nanos(data).unwrap();
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
@@ -1195,7 +1195,7 @@ mod tests {
         chunk.column_i64("a", &i64s, Some(&validity)).unwrap();
         chunk.column_f64("b", &f64s, None).unwrap();
         chunk.column_bool("c", &bool_bytes, n, None).unwrap();
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
 
         let whole = encode_fresh(&chunk);
         let view = unsafe { chunk.slice_rows(0, n) };
@@ -1216,13 +1216,13 @@ mod tests {
 
         let mut src = Chunk::new("trades");
         src.column_i64("v", &vals, None).unwrap();
-        src.designated_timestamp_nanos(&ts).unwrap();
+        src.at_nanos(&ts).unwrap();
         let view = unsafe { src.slice_rows(8, 8) };
         let sliced = encode_fresh(&view);
 
         let mut fresh = Chunk::new("trades");
         fresh.column_i64("v", &vals[8..16], None).unwrap();
-        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        fresh.at_nanos(&ts[8..16]).unwrap();
         let direct = encode_fresh(&fresh);
 
         assert_eq!(sliced, direct);
@@ -1251,15 +1251,15 @@ mod tests {
         let ts: Vec<i64> = (0..16).collect();
 
         let mut src = Chunk::new("trades");
-        src.column_varchar("v", &offsets, &bytes, None).unwrap();
-        src.designated_timestamp_nanos(&ts).unwrap();
+        src.column_str("v", &offsets, &bytes, None).unwrap();
+        src.at_nanos(&ts).unwrap();
         let view = unsafe { src.slice_rows(8, 8) };
         let sliced = encode_fresh(&view);
 
         let (foffsets, fbytes) = build_varchar(&strs[8..16]);
         let mut fresh = Chunk::new("trades");
-        fresh.column_varchar("v", &foffsets, &fbytes, None).unwrap();
-        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        fresh.column_str("v", &foffsets, &fbytes, None).unwrap();
+        fresh.at_nanos(&ts[8..16]).unwrap();
         let direct = encode_fresh(&fresh);
 
         assert_eq!(sliced, direct);
@@ -1276,17 +1276,17 @@ mod tests {
         let ts: Vec<i64> = (0..16).collect();
 
         let mut src = Chunk::new("trades");
-        src.symbol_dict_i32("s", &codes, &dict_offsets, dict_bytes, None)
+        src.symbol_i32("s", &codes, &dict_offsets, dict_bytes, None)
             .unwrap();
-        src.designated_timestamp_nanos(&ts).unwrap();
+        src.at_nanos(&ts).unwrap();
         let view = unsafe { src.slice_rows(8, 8) };
         let sliced = encode_fresh(&view);
 
         let mut fresh = Chunk::new("trades");
         fresh
-            .symbol_dict_i32("s", &codes[8..16], &dict_offsets, dict_bytes, None)
+            .symbol_i32("s", &codes[8..16], &dict_offsets, dict_bytes, None)
             .unwrap();
-        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        fresh.at_nanos(&ts[8..16]).unwrap();
         let direct = encode_fresh(&fresh);
 
         assert_eq!(sliced, direct);
@@ -1310,7 +1310,7 @@ mod tests {
         let mut src = Chunk::new("trades");
         src.push_arrow_deferred("v", arrow_batch::ColumnKind::I64, arr)
             .unwrap();
-        src.designated_timestamp_nanos(&ts).unwrap();
+        src.at_nanos(&ts).unwrap();
         let view = unsafe { src.slice_rows(8, 8) };
         let sliced = encode_fresh(&view);
 
@@ -1319,7 +1319,7 @@ mod tests {
         fresh
             .push_arrow_deferred("v", arrow_batch::ColumnKind::I64, fresh_arr)
             .unwrap();
-        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        fresh.at_nanos(&ts[8..16]).unwrap();
         let direct = encode_fresh(&fresh);
 
         assert_eq!(sliced, direct);
@@ -1341,7 +1341,7 @@ mod tests {
             src.push_numpy_deferred("v", NumpyDtype::I64Direct, bytes.as_ptr(), 16, None)
                 .unwrap();
         }
-        src.designated_timestamp_nanos(&ts).unwrap();
+        src.at_nanos(&ts).unwrap();
         let view = unsafe { src.slice_rows(8, 8) };
         let sliced = encode_fresh(&view);
 
@@ -1352,7 +1352,7 @@ mod tests {
                 .push_numpy_deferred("v", NumpyDtype::I64Direct, fresh_bytes.as_ptr(), 8, None)
                 .unwrap();
         }
-        fresh.designated_timestamp_nanos(&ts[8..16]).unwrap();
+        fresh.at_nanos(&ts[8..16]).unwrap();
         let direct = encode_fresh(&fresh);
 
         assert_eq!(sliced, direct);
@@ -1375,7 +1375,7 @@ mod tests {
             // is exactly what `ColumnSender::flush` does at flush time.
             let mut chunk = Chunk::new(name);
             let ts = [1i64];
-            chunk.designated_timestamp_micros(&ts).unwrap();
+            chunk.at_micros(&ts).unwrap();
             let col = [10i64];
             chunk.column_i64("v", &col, None).unwrap();
             let mut out = Vec::new();
@@ -1440,14 +1440,14 @@ mod tests {
         let p1 = [1i64, 2];
         let mut c1 = Chunk::new("trades");
         c1.column_i64("price", &p1, None).unwrap();
-        c1.designated_timestamp_nanos(&p1).unwrap();
+        c1.at_nanos(&p1).unwrap();
         let mut out1 = Vec::new();
         encode_chunk_into(&mut out1, &c1, &mut dict, &mut scratch, false).unwrap();
 
         let p2 = [3i64, 4];
         let mut c2 = Chunk::new("trades");
         c2.column_i64("price", &p2, None).unwrap();
-        c2.designated_timestamp_nanos(&p2).unwrap();
+        c2.at_nanos(&p2).unwrap();
         let mut out2 = Vec::new();
         encode_chunk_into(&mut out2, &c2, &mut dict, &mut scratch, false).unwrap();
 
@@ -1470,7 +1470,7 @@ mod tests {
         let v = Validity::from_bitmap(&bits, 4).unwrap();
         let mut chunk = Chunk::new("trades");
         chunk.column_i64("price", &p, Some(&v)).unwrap();
-        chunk.designated_timestamp_nanos(&p).unwrap();
+        chunk.at_nanos(&p).unwrap();
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
@@ -1486,9 +1486,9 @@ mod tests {
         let ts = [1i64, 2, 3, 4];
         let mut chunk = Chunk::new("trades");
         chunk
-            .symbol_dict_i32("sym", &codes, &dict_offsets, dict_bytes, None)
+            .symbol_i32("sym", &codes, &dict_offsets, dict_bytes, None)
             .unwrap();
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
@@ -1504,9 +1504,9 @@ mod tests {
         let ts = [1i64, 2, 3, 4];
         let mut chunk = Chunk::new("trades");
         chunk
-            .symbol_dict_large_i32("sym", &codes, &dict_offsets, dict_bytes, None)
+            .symbol_large_i32("sym", &codes, &dict_offsets, dict_bytes, None)
             .unwrap();
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
@@ -1524,9 +1524,9 @@ mod tests {
         let codes1 = [0i32, 1];
         let ts1 = [1i64, 2];
         let mut c1 = Chunk::new("trades");
-        c1.symbol_dict_i32("sym", &codes1, &dict_offsets, dict_bytes, None)
+        c1.symbol_i32("sym", &codes1, &dict_offsets, dict_bytes, None)
             .unwrap();
-        c1.designated_timestamp_nanos(&ts1).unwrap();
+        c1.at_nanos(&ts1).unwrap();
         let mut out1 = Vec::new();
         encode_chunk_into(&mut out1, &c1, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2);
@@ -1534,9 +1534,9 @@ mod tests {
         let codes2 = [0i32, 2];
         let ts2 = [3i64, 4];
         let mut c2 = Chunk::new("trades");
-        c2.symbol_dict_i32("sym", &codes2, &dict_offsets, dict_bytes, None)
+        c2.symbol_i32("sym", &codes2, &dict_offsets, dict_bytes, None)
             .unwrap();
-        c2.designated_timestamp_nanos(&ts2).unwrap();
+        c2.at_nanos(&ts2).unwrap();
         let mut out2 = Vec::new();
         encode_chunk_into(&mut out2, &c2, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 3, "gamma added on second frame");
@@ -1552,9 +1552,9 @@ mod tests {
         let codes1 = [0i32, 1];
         let ts1 = [1i64, 2];
         let mut c1 = Chunk::new("trades");
-        c1.symbol_dict_i32("sym", &codes1, &dict_offsets, dict_bytes, None)
+        c1.symbol_i32("sym", &codes1, &dict_offsets, dict_bytes, None)
             .unwrap();
-        c1.designated_timestamp_nanos(&ts1).unwrap();
+        c1.at_nanos(&ts1).unwrap();
         let mut out1 = Vec::new();
         encode_chunk_into(&mut out1, &c1, &mut dict, &mut scratch, false).unwrap();
         assert_eq!(dict.next_id(), 2);
@@ -1562,9 +1562,9 @@ mod tests {
         let codes2 = [0i32, 2];
         let ts2 = [3i64, 4];
         let mut c2 = Chunk::new("trades");
-        c2.symbol_dict_i32("sym", &codes2, &dict_offsets, dict_bytes, None)
+        c2.symbol_i32("sym", &codes2, &dict_offsets, dict_bytes, None)
             .unwrap();
-        c2.designated_timestamp_nanos(&ts2).unwrap();
+        c2.at_nanos(&ts2).unwrap();
 
         let mut replay = Vec::new();
         encode_chunk_replay_into(&mut replay, &c2, &mut dict, &mut scratch).unwrap();
@@ -1626,7 +1626,7 @@ mod tests {
         chunk
             .push_arrow_deferred("price", arrow_batch::ColumnKind::I64, arr)
             .unwrap();
-        chunk.designated_timestamp_nanos(&values).unwrap();
+        chunk.at_nanos(&values).unwrap();
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
@@ -1652,7 +1652,7 @@ mod tests {
         chunk
             .push_arrow_deferred("sym", arrow_batch::ColumnKind::SymbolUtf8, arr)
             .unwrap();
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
 
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
@@ -1687,7 +1687,7 @@ mod tests {
         let ts = [1i64, 2];
         let mut chunk = Chunk::new("trades");
         chunk.push_arrow_deferred("sym", kind, arr).unwrap();
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
 
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
@@ -1705,7 +1705,7 @@ mod tests {
     fn make_chunk_uuid(rows: &[[u8; 16]], validity: Option<&Validity>, ts: &[i64]) -> Vec<u8> {
         let mut chunk = Chunk::new("trades");
         chunk.column_uuid("id", rows, validity).unwrap();
-        chunk.designated_timestamp_nanos(ts).unwrap();
+        chunk.at_nanos(ts).unwrap();
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();
@@ -1715,8 +1715,10 @@ mod tests {
 
     fn make_chunk_ts_micros(vals: &[i64], validity: Option<&Validity>, ts: &[i64]) -> Vec<u8> {
         let mut chunk = Chunk::new("trades");
-        chunk.column_ts_micros("t", vals, validity).unwrap();
-        chunk.designated_timestamp_nanos(ts).unwrap();
+        chunk
+            .column_ts("t", vals, TimestampUnit::Micros, validity)
+            .unwrap();
+        chunk.at_nanos(ts).unwrap();
         let mut out = Vec::new();
         let mut dict = SymbolGlobalDict::new();
         let mut scratch = EncodeScratch::new();

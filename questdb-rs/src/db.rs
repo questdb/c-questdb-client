@@ -34,7 +34,7 @@
 //! run a background thread that closes above-`pool_size` idle entries after
 //! `pool_idle_timeout_ms`.
 //!
-//! Each pool slot is handed out as a [`SfColumnSender`] which returns
+//! Each pool slot is handed out as a [`BorrowedColumnSender`] which returns
 //! itself to the pool on `Drop`. Slots whose underlying connection has
 //! latched terminal state are dropped on return instead of being
 //! recycled.
@@ -114,7 +114,7 @@ fn lock_state(m: &Mutex<PoolState>) -> std::sync::MutexGuard<'_, PoolState> {
 ///   disk-backed and capped to a single active borrower when it is. A parked
 ///   connection's background runner keeps delivering, and pool close / reap
 ///   flush queued frames best-effort within `close_flush_timeout`; for a hard
-///   delivery guarantee on an in-memory queue, call [`SfColumnSender::wait`]
+///   delivery guarantee on an in-memory queue, call [`BorrowedColumnSender::wait`]
 ///   before close (or use `sf_dir`). `wait` is an ack-wait barrier (block until
 ///   the published frame reaches the requested [`AckLevel`]), not a
 ///   commit-or-lose-data step.
@@ -231,7 +231,7 @@ impl Drop for RowSenderInUseSlot<'_> {
 /// internal state is `Mutex`-guarded so [`QuestDb::borrow_column_sender`] /
 /// [`QuestDb::reap_idle`] / Drop-driven returns are safe to interleave.
 ///
-/// Each borrow ([`SfColumnSender`] / the internal direct sender) is **not** `Send` — it belongs to the
+/// Each borrow ([`BorrowedColumnSender`] / the internal direct sender) is **not** `Send` — it belongs to the
 /// thread that borrowed it. To ingest in parallel, borrow one sender per
 /// worker thread from the same `QuestDb`.
 pub struct QuestDb {
@@ -452,9 +452,9 @@ impl QuestDb {
     /// Selection: pop the most-recently-returned slot from the free list;
     /// failing that, open a new connection if we are below `pool_max`;
     /// failing that, return `InvalidApiCall` (fail-fast at cap).
-    pub fn borrow_column_sender(&self) -> Result<SfColumnSender<'_>> {
+    pub fn borrow_column_sender(&self) -> Result<BorrowedColumnSender<'_>> {
         let cs = self.pick_column_sender()?;
-        Ok(SfColumnSender(ColumnSenderHandle::new(
+        Ok(BorrowedColumnSender(ColumnSenderHandle::new(
             self,
             cs,
             ColumnPoolKind::Main,
@@ -469,9 +469,9 @@ impl QuestDb {
     /// their own commit + replay. Hidden from the docs; callers ingest through
     /// those entry points rather than handling a sender.
     #[doc(hidden)]
-    pub fn borrow_direct_column_sender(&self) -> Result<DirectColumnSender<'_>> {
+    pub fn borrow_direct_column_sender(&self) -> Result<BorrowedDirectColumnSender<'_>> {
         let cs = pick_column_sender_inner(&self.inner, ColumnPoolKind::Direct)?;
-        Ok(DirectColumnSender(ColumnSenderHandle::new(
+        Ok(BorrowedDirectColumnSender(ColumnSenderHandle::new(
             self,
             cs,
             ColumnPoolKind::Direct,
@@ -873,7 +873,7 @@ impl QuestDb {
     /// down (or [`BorrowedReader::drop_on_return`] was called), in which
     /// case it is dropped and the next borrow opens a fresh one.
     ///
-    /// Like [`SfColumnSender`], [`BorrowedReader`] is **not** `Send` or
+    /// Like [`BorrowedColumnSender`], [`BorrowedReader`] is **not** `Send` or
     /// `Sync`: borrow one reader per worker thread from the same `QuestDb`.
     #[cfg(feature = "_egress")]
     pub fn borrow_reader(&self) -> crate::egress::error::Result<BorrowedReader<'_>> {
@@ -991,7 +991,7 @@ impl Drop for QuestDb {
 }
 
 /// Shared pool plumbing behind the two public column-sender handles
-/// ([`SfColumnSender`] and [`DirectColumnSender`]). Holds the borrowed
+/// ([`BorrowedColumnSender`] and [`BorrowedDirectColumnSender`]). Holds the borrowed
 /// [`ColumnSender`] plus the bookkeeping needed to return it to the pool on
 /// drop / reborrow. The public wrappers expose only the mode-appropriate
 /// method surface; this type is private.
@@ -1149,9 +1149,9 @@ impl Debug for ColumnSenderHandle<'_> {
 /// through an arbitrary later pool borrow.
 ///
 /// Not `Send` or `Sync`.
-pub struct SfColumnSender<'a>(ColumnSenderHandle<'a>);
+pub struct BorrowedColumnSender<'a>(ColumnSenderHandle<'a>);
 
-impl<'a> SfColumnSender<'a> {
+impl<'a> BorrowedColumnSender<'a> {
     /// Encode and publish `chunk` into the store-and-forward queue, returning
     /// as soon as the frame is accepted locally (no server round-trip). On
     /// success `chunk` is cleared; on a delivery-uncertain failure the error
@@ -1231,7 +1231,7 @@ impl<'a> SfColumnSender<'a> {
     }
 
     /// Always `true` for an SF handle (it wraps a store-and-forward backend).
-    /// Retained for symmetry with [`DirectColumnSender`] and test assertions.
+    /// Retained for symmetry with [`BorrowedDirectColumnSender`] and test assertions.
     #[cfg(test)]
     pub(crate) fn is_store_and_forward(&self) -> bool {
         self.0.inner_ref().is_store_and_forward()
@@ -1321,9 +1321,11 @@ impl<'a> SfColumnSender<'a> {
     }
 }
 
-impl Debug for SfColumnSender<'_> {
+impl Debug for BorrowedColumnSender<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("SfColumnSender").field(&self.0).finish()
+        f.debug_tuple("BorrowedColumnSender")
+            .field(&self.0)
+            .finish()
     }
 }
 
@@ -1341,9 +1343,9 @@ impl Debug for SfColumnSender<'_> {
 /// commit after failure.
 ///
 /// Not `Send` or `Sync`.
-pub struct DirectColumnSender<'a>(ColumnSenderHandle<'a>);
+pub struct BorrowedDirectColumnSender<'a>(ColumnSenderHandle<'a>);
 
-impl<'a> DirectColumnSender<'a> {
+impl<'a> BorrowedDirectColumnSender<'a> {
     /// Encode and pipeline `chunk` as a deferred frame without waiting. The
     /// frame is not committed until [`Self::commit`] / [`Self::flush_and_wait`].
     pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
@@ -1413,7 +1415,7 @@ impl<'a> DirectColumnSender<'a> {
     }
 
     /// Always `false` for a direct handle. Retained for symmetry with
-    /// [`SfColumnSender`] and test assertions.
+    /// [`BorrowedColumnSender`] and test assertions.
     #[cfg(test)]
     pub(crate) fn is_store_and_forward(&self) -> bool {
         self.0.inner_ref().is_store_and_forward()
@@ -1505,9 +1507,11 @@ impl<'a> DirectColumnSender<'a> {
     }
 }
 
-impl Debug for DirectColumnSender<'_> {
+impl Debug for BorrowedDirectColumnSender<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("DirectColumnSender").field(&self.0).finish()
+        f.debug_tuple("BorrowedDirectColumnSender")
+            .field(&self.0)
+            .finish()
     }
 }
 
@@ -1571,7 +1575,7 @@ impl Drop for OwnedColumnSender {
 
 /// A row-major [`crate::ingress::Sender`] borrowed from a [`QuestDb`] pool.
 ///
-/// Companion to [`SfColumnSender`] (the column-major handle). Exposes the row
+/// Companion to [`BorrowedColumnSender`] (the column-major handle). Exposes the row
 /// ingestion and progress-tracking surface directly, except for the standalone
 /// [`Sender::must_close`] lifecycle predicate. On `Drop` the sender is returned
 /// to the row-sender pool, unless its connection has latched terminal state (or
@@ -1591,7 +1595,7 @@ pub struct BorrowedRowSender<'a> {
     db: &'a QuestDb,
     sender: Option<Sender>,
     must_close: bool,
-    /// !Send / !Sync marker, mirroring [`SfColumnSender`].
+    /// !Send / !Sync marker, mirroring [`BorrowedColumnSender`].
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -1804,7 +1808,7 @@ impl Drop for OwnedRowSender {
 
 /// A query [`Reader`] borrowed from a [`QuestDb`] pool.
 ///
-/// Egress companion to [`SfColumnSender`] (column-major) and
+/// Egress companion to [`BorrowedColumnSender`] (column-major) and
 /// [`BorrowedRowSender`] (row-major). Derefs to `Reader`, so the usual
 /// `prepare` / `execute` cursor flow works unchanged. On `Drop` the reader
 /// is returned to the reader pool, unless its transport has been torn down
@@ -1818,7 +1822,7 @@ pub struct BorrowedReader<'a> {
     db: &'a QuestDb,
     reader: Option<Reader>,
     must_close: bool,
-    /// !Send / !Sync marker, mirroring [`SfColumnSender`].
+    /// !Send / !Sync marker, mirroring [`BorrowedColumnSender`].
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -2529,8 +2533,8 @@ const _: fn() = || {
     fn assert_not_send<T: ?Sized>() {
         let _: fn() = <T as AmbiguousIfSend<_>>::_disambiguate;
     }
-    assert_not_send::<SfColumnSender<'_>>();
-    assert_not_send::<DirectColumnSender<'_>>();
+    assert_not_send::<BorrowedColumnSender<'_>>();
+    assert_not_send::<BorrowedDirectColumnSender<'_>>();
     assert_not_send::<BorrowedRowSender<'_>>();
     #[cfg(feature = "_egress")]
     assert_not_send::<BorrowedReader<'_>>();

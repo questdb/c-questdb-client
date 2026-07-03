@@ -590,9 +590,9 @@ fn append_one_symbol_row<'a>(chunk: &mut Chunk<'a>, symbol: &'a [u8], timestamp:
         "test helper expects fixed-width symbol payloads"
     );
     chunk
-        .symbol_dict_i32("sym", &CODES, &OFFSETS, symbol, None)
+        .symbol_i32("sym", &CODES, &OFFSETS, symbol, None)
         .unwrap();
-    chunk.designated_timestamp_nanos(timestamp).unwrap();
+    chunk.at_nanos(timestamp).unwrap();
 }
 
 fn read_test_varint(bytes: &[u8], pos: &mut usize) -> u64 {
@@ -685,7 +685,7 @@ fn store_and_forward_column_sender_reports_fsn_progress() {
     let qty = [1_i64];
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
 
     let fsn = sender
         .flush_and_get_fsn(&mut chunk)
@@ -717,7 +717,7 @@ fn store_and_forward_pool_borrow_buffers_with_no_server() {
     let qty = [1_i64];
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
 
     let fsn = sender
         .flush_and_get_fsn(&mut chunk)
@@ -739,7 +739,7 @@ fn check_store_and_forward_sync_reports_terminal_schema_rejection(extras: &str) 
     let qty1 = [1_i64];
     let ts1 = [1_i64];
     chunk.column_i64("qty", &qty1, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts1).unwrap();
+    chunk.at_nanos(&ts1).unwrap();
     sender.flush(&mut chunk).unwrap();
     let err = sender
         .wait(AckLevel::Ok, Duration::from_secs(30))
@@ -768,7 +768,7 @@ fn check_store_and_forward_sync_times_out_on_silent_but_alive_peer(extras: &str)
     let qty = [1_i64];
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
     sender.flush(&mut chunk).unwrap();
 
     let start = Instant::now();
@@ -809,12 +809,12 @@ fn drop_with_in_flight_best_effort_commits_and_recycles() {
         let ts = [1_i64];
         let mut c1 = Chunk::new("trades");
         c1.column_i64("qty", &qty, None).unwrap();
-        c1.designated_timestamp_nanos(&ts).unwrap();
+        c1.at_nanos(&ts).unwrap();
         sender.flush(&mut c1).unwrap(); // first frame: committed inline
 
         let mut c2 = Chunk::new("trades");
         c2.column_i64("qty", &qty, None).unwrap();
-        c2.designated_timestamp_nanos(&ts).unwrap();
+        c2.at_nanos(&ts).unwrap();
         sender.flush(&mut c2).unwrap(); // deferred: published but uncommitted
         assert!(sender.in_flight() > 0, "deferred flush must be in-flight");
     }
@@ -848,7 +848,7 @@ fn direct_flush_splits_oversize_chunk_into_capped_deferred_frames() {
         .collect();
     let mut chunk = Chunk::new("trades");
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
 
     {
         let mut sender = db.borrow_direct_column_sender().unwrap();
@@ -916,8 +916,8 @@ fn direct_flush_split_floor_marks_must_close_to_discard_uncommitted_prefix() {
     let ts: Vec<i64> = (0..=PREFIX_ROWS as i64).collect();
 
     let mut chunk = Chunk::new("trades");
-    chunk.column_varchar("v", &offsets, &bytes, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.column_str("v", &offsets, &bytes, None).unwrap();
+    chunk.at_nanos(&ts).unwrap();
 
     let mut sender = db.borrow_direct_column_sender().unwrap();
     let err = sender
@@ -958,7 +958,7 @@ fn store_and_forward_flush_splits_oversize_chunk_into_self_sufficient_frames() {
         .collect();
     let mut chunk = Chunk::new("trades");
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
 
     let mut sender = db.borrow_column_sender().unwrap();
     let fsn = sender
@@ -1101,7 +1101,7 @@ fn check_store_and_forward_flush_and_wait_waits_for_ok_boundary(extras: &str) {
     let qty = [1_i64];
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
     sender
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
@@ -1135,7 +1135,7 @@ fn store_and_forward_flush_and_wait_durable_without_opt_in_keeps_chunk() {
     let qty = [1_i64];
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
     // Durable is validated by `wait`, the ack barrier; with no `flush` the
     // chunk is never published and stays replayable.
     let err = sender
@@ -1166,7 +1166,7 @@ fn check_store_and_forward_flush_and_wait_timeout_after_append_clears_chunk(extr
     let qty = [1_i64];
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
     sender
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
@@ -1195,7 +1195,7 @@ fn check_store_and_forward_flush_and_wait_surfaces_server_rejection(extras: &str
     let qty = [1_i64];
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
-    chunk.designated_timestamp_nanos(&ts).unwrap();
+    chunk.at_nanos(&ts).unwrap();
     sender
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
@@ -1223,7 +1223,7 @@ fn check_store_and_forward_flush_and_wait_durable_succeeds_with_opt_in(extras: &
 
     let mut chunk = Chunk::new("trades");
     chunk.column_i64("qty", &[7_i64], None).unwrap();
-    chunk.designated_timestamp_nanos(&[1_i64]).unwrap();
+    chunk.at_nanos(&[1_i64]).unwrap();
     sender
         .flush(&mut chunk)
         .expect("publish to the local SFA queue");
@@ -1274,7 +1274,7 @@ fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
 
     let mut chunk = Chunk::new("trades");
     chunk.column_i64("qty", &[7_i64], None).unwrap();
-    chunk.designated_timestamp_nanos(&[1_i64]).unwrap();
+    chunk.at_nanos(&[1_i64]).unwrap();
     sender.flush(&mut chunk).unwrap();
 
     // Retry `sync` until the runner has reconnected to the live endpoint and
@@ -2333,7 +2333,7 @@ fn deferred_flush_reserves_slot_for_sync_commit() {
 
     chunk.column_i64("qty", &[42], None).expect("column_i64");
     chunk
-        .designated_timestamp_nanos(&[1_700_000_000_000_000_000])
+        .at_nanos(&[1_700_000_000_000_000_000])
         .expect("designated timestamp");
     let err = sender
         .flush(&mut chunk)
@@ -2373,7 +2373,7 @@ fn flush_clears_chunk_for_reuse_and_can_repeat() {
 fn one_i64_row<'a>(table: &'a str, val: &'a [i64; 1], ts: &'a [i64; 1]) -> Chunk<'a> {
     let mut chunk = Chunk::new(table);
     chunk.column_i64("qty", val, None).unwrap();
-    chunk.designated_timestamp_nanos(ts).unwrap();
+    chunk.at_nanos(ts).unwrap();
     chunk
 }
 
@@ -2609,7 +2609,7 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
         .column_uuid("id", &[[0x10; 16], [0; 16], [0x20; 16]], Some(&v))
         .unwrap();
     chunk
-        .designated_timestamp_nanos(&[
+        .at_nanos(&[
             1_700_000_000_000_000_000,
             1_700_000_000_000_001_000,
             1_700_000_000_000_002_000,
@@ -2632,7 +2632,7 @@ fn non_empty_chunk_with_numeric_columns_round_trips() {
         .column_uuid("id", &[[0x30; 16], [0x40; 16]], None)
         .unwrap();
     chunk
-        .designated_timestamp_nanos(&[1_700_000_000_000_003_000, 1_700_000_000_000_004_000])
+        .at_nanos(&[1_700_000_000_000_003_000, 1_700_000_000_000_004_000])
         .unwrap();
     sender.flush(&mut chunk).unwrap();
     sender
@@ -2657,14 +2657,12 @@ fn varchar_chunk_round_trips() {
     let offsets: [i32; 5] = [0, 5, 5, 10, 12];
     let bits = [0b0000_1101]; // 0,2,3 valid; 1 null
     let v = Validity::from_bitmap(&bits, 4).unwrap();
-    chunk
-        .column_varchar("msg", &offsets, bytes, Some(&v))
-        .unwrap();
+    chunk.column_str("msg", &offsets, bytes, Some(&v)).unwrap();
     chunk
         .column_i64("seq", &[100, 101, 102, 103], None)
         .unwrap();
     chunk
-        .designated_timestamp_nanos(&[
+        .at_nanos(&[
             1_700_000_000_000_000_000,
             1_700_000_000_000_001_000,
             1_700_000_000_000_002_000,
@@ -2692,9 +2690,9 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
 
     let mut chunk = Chunk::new("trades");
     chunk
-        .symbol_dict_i32("sym", &[0, 2, 0, 2], &dict_offsets, dict_bytes, None)
-        .expect("symbol_dict_i32 first flush");
-    chunk.designated_timestamp_nanos(&[1, 2, 3, 4]).unwrap();
+        .symbol_i32("sym", &[0, 2, 0, 2], &dict_offsets, dict_bytes, None)
+        .expect("symbol_i32 first flush");
+    chunk.at_nanos(&[1, 2, 3, 4]).unwrap();
     sender.flush(&mut chunk).unwrap();
     sender
         .wait(AckLevel::Ok, Duration::from_secs(30))
@@ -2704,9 +2702,9 @@ fn symbol_chunk_round_trips_and_reuses_global_dict() {
     // and adds entry 1 ("beta"). With the connection-scoped dict the
     // wire prefix only resends "beta"; the round-trip must still succeed.
     chunk
-        .symbol_dict_i32("sym", &[1, 0, 1, 0], &dict_offsets, dict_bytes, None)
-        .expect("symbol_dict_i32 second flush");
-    chunk.designated_timestamp_nanos(&[5, 6, 7, 8]).unwrap();
+        .symbol_i32("sym", &[1, 0, 1, 0], &dict_offsets, dict_bytes, None)
+        .expect("symbol_i32 second flush");
+    chunk.at_nanos(&[5, 6, 7, 8]).unwrap();
     sender.flush(&mut chunk).unwrap();
     sender
         .wait(AckLevel::Ok, Duration::from_secs(30))
@@ -2757,16 +2755,16 @@ fn symbol_dict_reuse_resends_only_new_symbols_on_the_wire() {
 
     let mut chunk = Chunk::new("trades");
     chunk
-        .symbol_dict_i32("sym", &[0, 2, 0, 2], &dict_offsets, dict_bytes, None)
+        .symbol_i32("sym", &[0, 2, 0, 2], &dict_offsets, dict_bytes, None)
         .unwrap();
-    chunk.designated_timestamp_nanos(&[1, 2, 3, 4]).unwrap();
+    chunk.at_nanos(&[1, 2, 3, 4]).unwrap();
     sender.flush(&mut chunk).unwrap();
     sender.commit(AckLevel::Ok).expect("symbol flush 1");
 
     chunk
-        .symbol_dict_i32("sym", &[1, 0, 1, 0], &dict_offsets, dict_bytes, None)
+        .symbol_i32("sym", &[1, 0, 1, 0], &dict_offsets, dict_bytes, None)
         .unwrap();
-    chunk.designated_timestamp_nanos(&[5, 6, 7, 8]).unwrap();
+    chunk.at_nanos(&[5, 6, 7, 8]).unwrap();
     sender.flush(&mut chunk).unwrap();
     sender.commit(AckLevel::Ok).expect("symbol flush 2");
 
@@ -2877,7 +2875,7 @@ fn close_joins_reaper_cleanly() {
 // ---------------------------------------------------------------------------
 // Store-and-forward durability on pool close / reap (in-memory queue).
 //
-// The SfColumnSender contract is that a parked connection's background runner
+// The BorrowedColumnSender contract is that a parked connection's background runner
 // keeps delivering, and that pool close / reap do not silently drop frames the
 // runner has accepted but not yet delivered. These tests pin the three teardown
 // paths that enforce it. The mock captures a frame when it is *sent* (eagerly,

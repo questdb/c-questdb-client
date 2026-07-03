@@ -384,7 +384,7 @@ impl<'a> PolarsIngestOptions<'a> {
     }
 }
 
-impl crate::db::DirectColumnSender<'_> {
+impl crate::db::BorrowedDirectColumnSender<'_> {
     /// Slice `df` into [`RecordBatch`]es of at most `options.max_rows` rows
     /// each (defaults to [`DEFAULT_MAX_BATCH_ROWS`]), publish every slice, and
     /// commit at checkpoint boundaries — re-driving transparently across a
@@ -398,10 +398,10 @@ impl crate::db::DirectColumnSender<'_> {
     /// (server-assigned timestamps, schema-derived wire types).
     ///
     /// Unlike the lower-level `flush` / `flush_arrow_batch_*`, which leave rows
-    /// uncommitted until you call [`DirectColumnSender::commit`], this entry
+    /// uncommitted until you call [`BorrowedDirectColumnSender::commit`], this entry
     /// owns the commit (and the failover replay boundary).
     ///
-    /// [`DirectColumnSender::commit`]: crate::db::DirectColumnSender::commit
+    /// [`BorrowedDirectColumnSender::commit`]: crate::db::BorrowedDirectColumnSender::commit
     ///
     /// [`TableName`]: crate::ingress::TableName
     ///
@@ -519,7 +519,7 @@ impl crate::db::QuestDb {
 /// durable by each successful checkpoint, so on a transient error the caller
 /// re-drives only the uncommitted tail.
 fn drive_from_checkpoint(
-    sender: &mut crate::db::DirectColumnSender<'_>,
+    sender: &mut crate::db::BorrowedDirectColumnSender<'_>,
     table: crate::ingress::TableName<'_>,
     df: &DataFrame,
     options: &PolarsIngestOptions<'_>,

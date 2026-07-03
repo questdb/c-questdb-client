@@ -1331,7 +1331,7 @@ unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescript
 #[cfg(test)]
 mod tests {
     use super::super::Validity;
-    use super::super::chunk::Chunk;
+    use super::super::chunk::{Chunk, TimestampUnit};
     use super::super::encoder::{EncodeScratch, encode_chunk_into};
     use super::*;
     use crate::ingress::buffer::SymbolGlobalDict;
@@ -1471,12 +1471,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i8("v", &src, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1501,12 +1501,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i16("v", &src, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1531,12 +1531,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i32("v", &src, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1558,12 +1558,12 @@ mod tests {
             a.push_numpy_deferred("v", NumpyDtype::U8WidenToI32, src.as_ptr(), src.len(), None)
                 .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i32("v", &widened, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1589,12 +1589,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i32("v", &widened, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1622,12 +1622,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i32("v", &widened, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1653,12 +1653,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i32("v", &widened, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1686,12 +1686,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i64("v", &widened, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1717,12 +1717,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_i64("v", &widened, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1748,7 +1748,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         let err = encode_err(&chunk);
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(
@@ -1777,7 +1777,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         let err = encode_err(&chunk);
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(
@@ -1803,12 +1803,12 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
         b.column_f32("v", &src, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1830,7 +1830,7 @@ mod tests {
             a.push_numpy_deferred("b", NumpyDtype::Bool, raw.as_ptr(), raw.len(), Some(&v))
                 .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut packed = vec![0u8; raw.len().div_ceil(8)];
@@ -1841,7 +1841,7 @@ mod tests {
         }
         let mut b = Chunk::new("t");
         b.column_bool("b", &packed, raw.len(), Some(&v)).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
@@ -1866,17 +1866,17 @@ mod tests {
             )
             .unwrap();
         }
-        a.designated_timestamp_nanos(&ts).unwrap();
+        a.at_nanos(&ts).unwrap();
         let bytes_a = encode(&a);
 
         let mut b = Chunk::new("t");
-        b.column_ts_nanos("ts", &src, None).unwrap();
-        b.designated_timestamp_nanos(&ts).unwrap();
+        b.column_ts("ts", &src, TimestampUnit::Nanos, None).unwrap();
+        b.at_nanos(&ts).unwrap();
         let bytes_b = encode(&b);
 
         assert_eq!(
             bytes_a, bytes_b,
-            "TimestampNanosDirect must produce byte-identical wire to column_ts_nanos"
+            "TimestampNanosDirect must produce byte-identical wire to column_ts(Nanos)"
         );
     }
 
@@ -1889,16 +1889,18 @@ mod tests {
                 .push_numpy_deferred("v", dtype, src_le_bytes.as_ptr(), row_count, None)
                 .unwrap();
         }
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         encode(&chunk)
     }
 
-    /// Helper: encode `column_ts_micros(values)` + fixed ts, return wire bytes.
+    /// Helper: encode `column_ts(values, Micros)` + fixed ts, return wire bytes.
     fn encode_micros_col(values: &[i64]) -> Vec<u8> {
         let ts: Vec<i64> = (0..values.len() as i64).collect();
         let mut chunk = Chunk::new("t");
-        chunk.column_ts_micros("v", values, None).unwrap();
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk
+            .column_ts("v", values, TimestampUnit::Micros, None)
+            .unwrap();
+        chunk.at_nanos(&ts).unwrap();
         encode(&chunk)
     }
 
@@ -1995,7 +1997,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         let err = {
             let mut out = Vec::new();
             let mut dict = SymbolGlobalDict::new();
@@ -2023,7 +2025,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         let err = {
             let mut out = Vec::new();
             let mut dict = SymbolGlobalDict::new();
@@ -2057,7 +2059,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         let bytes = encode(&chunk);
 
         // The full frame contains schema / header bytes too; assert the

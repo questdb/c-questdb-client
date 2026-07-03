@@ -9,7 +9,7 @@ covers three families:
 
 1. **Per-column bulk append** — each column-type's hot path vs a raw
    `extend_from_slice` baseline.
-2. **Symbol bulk-intern** — `Chunk::symbol_dict_i32` vs a naïve per-row
+2. **Symbol bulk-intern** — `Chunk::symbol_i32` vs a naïve per-row
    HashMap probe that mirrors what a row-API symbol cell pays.
 3. **End-to-end encode** — populate a 100k-row chunk with a
    representative column mix and time the encoder body.

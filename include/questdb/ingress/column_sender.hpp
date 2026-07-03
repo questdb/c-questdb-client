@@ -358,48 +358,33 @@ public:
         return *this;
     }
 
-    column_chunk& column_ts_nanos(
+    column_chunk& column_ts(
         std::string_view name,
         const int64_t* data,
         size_t row_count,
+        ::column_sender_ts_unit unit,
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_ts_nanos,
+            ::column_sender_chunk_column_ts,
             _raw,
             name.data(),
             name.size(),
             data,
             row_count,
+            static_cast<uint32_t>(unit),
             validity ? validity->c_ptr() : nullptr);
         return *this;
     }
 
-    column_chunk& column_ts_micros(
+    column_chunk& column_date(
         std::string_view name,
         const int64_t* data,
         size_t row_count,
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_ts_micros,
-            _raw,
-            name.data(),
-            name.size(),
-            data,
-            row_count,
-            validity ? validity->c_ptr() : nullptr);
-        return *this;
-    }
-
-    column_chunk& column_date_millis(
-        std::string_view name,
-        const int64_t* data,
-        size_t row_count,
-        const validity_view* validity = nullptr)
-    {
-        line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_date_millis,
+            ::column_sender_chunk_column_date,
             _raw,
             name.data(),
             name.size(),
@@ -413,7 +398,7 @@ public:
      * VARCHAR from Arrow Utf8 layout. `offsets` has `row_count + 1`
      * entries; `bytes` is the concatenated UTF-8 buffer.
      */
-    column_chunk& column_varchar(
+    column_chunk& column_str(
         std::string_view name,
         const int32_t* offsets,
         const uint8_t* bytes,
@@ -422,7 +407,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_column_varchar,
+            ::column_sender_chunk_column_str,
             _raw,
             name.data(),
             name.size(),
@@ -461,7 +446,7 @@ public:
 
     // -- Symbol-dict appenders ----------------------------------------
 
-    column_chunk& symbol_dict_i8(
+    column_chunk& symbol_i8(
         std::string_view name,
         const int8_t* codes,
         size_t row_count,
@@ -472,7 +457,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_symbol_dict_i8,
+            ::column_sender_chunk_symbol_i8,
             _raw,
             name.data(),
             name.size(),
@@ -486,7 +471,7 @@ public:
         return *this;
     }
 
-    column_chunk& symbol_dict_i16(
+    column_chunk& symbol_i16(
         std::string_view name,
         const int16_t* codes,
         size_t row_count,
@@ -497,7 +482,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_symbol_dict_i16,
+            ::column_sender_chunk_symbol_i16,
             _raw,
             name.data(),
             name.size(),
@@ -511,7 +496,7 @@ public:
         return *this;
     }
 
-    column_chunk& symbol_dict_i32(
+    column_chunk& symbol_i32(
         std::string_view name,
         const int32_t* codes,
         size_t row_count,
@@ -522,7 +507,7 @@ public:
         const validity_view* validity = nullptr)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_symbol_dict_i32,
+            ::column_sender_chunk_symbol_i32,
             _raw,
             name.data(),
             name.size(),
@@ -538,22 +523,22 @@ public:
 
     // -- Designated timestamp -----------------------------------------
 
-    column_chunk& designated_timestamp_micros(
+    column_chunk& at_micros(
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_designated_timestamp_micros,
+            ::column_sender_chunk_at_micros,
             _raw,
             data,
             row_count);
         return *this;
     }
 
-    column_chunk& designated_timestamp_nanos(
+    column_chunk& at_nanos(
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_designated_timestamp_nanos,
+            ::column_sender_chunk_at_nanos,
             _raw,
             data,
             row_count);

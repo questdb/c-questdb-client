@@ -5844,7 +5844,7 @@ mod tests {
                 err
             ));
             assert!(err.is_null());
-            assert!(column_sender_chunk_designated_timestamp_nanos(
+            assert!(column_sender_chunk_at_nanos(
                 chunk,
                 timestamps.as_ptr(),
                 timestamps.len(),

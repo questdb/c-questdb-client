@@ -242,23 +242,23 @@ fn build_chunk<'a>(kind: SchemaKind, data: &'a BenchData) -> Result<Chunk<'a>, B
     let mut chunk = Chunk::new(kind.table());
     chunk.column_i64("id", &data.id, None)?;
     chunk.column_f64("price", &data.price, None)?;
-    chunk.symbol_dict_i32(
+    chunk.symbol_i32(
         "sym",
         &data.sym.codes,
         &data.sym.offsets,
         &data.sym.bytes,
         None,
     )?;
-    chunk.column_varchar("note", &data.note_offsets, &data.note_bytes, None)?;
+    chunk.column_str("note", &data.note_offsets, &data.note_bytes, None)?;
     if kind.is_wide() {
         for (k, col) in data.doubles.iter().enumerate() {
             chunk.column_f64(D_NAMES[k], col.as_slice(), None)?;
         }
         for (i, sc) in data.hi_syms.iter().enumerate() {
-            chunk.symbol_dict_i32(S_NAMES[i], &sc.codes, &sc.offsets, &sc.bytes, None)?;
+            chunk.symbol_i32(S_NAMES[i], &sc.codes, &sc.offsets, &sc.bytes, None)?;
         }
     }
-    chunk.designated_timestamp_nanos(&data.ts_nanos)?;
+    chunk.at_nanos(&data.ts_nanos)?;
     Ok(chunk)
 }
 

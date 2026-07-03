@@ -86,7 +86,7 @@ TEST_CASE("column_chunk fluent chaining returns the same chunk")
     int64_t ts[] = {1, 2, 3};
     auto& ref = chunk.column_i64("v", v, 3)
                      .column_f64("f", f, 3)
-                     .designated_timestamp_nanos(ts, 3);
+                     .at_nanos(ts, 3);
     CHECK(&ref == &chunk);
     CHECK(chunk.row_count() == 3);
 }
@@ -137,7 +137,7 @@ TEST_CASE("column_chunk flush round-trips through the mock")
                     1'700'000'000'000'000'001LL,
                     1'700'000'000'000'000'002LL};
     chunk.column_i64("qty", qty, 3)
-         .designated_timestamp_nanos(ts, 3);
+         .at_nanos(ts, 3);
 
     CHECK_FALSE(conn.published_fsn().has_value());
     CHECK_FALSE(conn.acked_fsn().has_value());
@@ -246,7 +246,7 @@ TEST_CASE("flush rejects oversized table name")
     qdb::column_chunk chunk{oversized};
     int64_t v[] = {1};
     int64_t t[] = {1};
-    chunk.column_i64("v", v, 1).designated_timestamp_nanos(t, 1);
+    chunk.column_i64("v", v, 1).at_nanos(t, 1);
 
     CHECK_THROWS_AS(conn.flush(chunk), qdb::line_sender_error);
     CHECK(chunk.row_count() == 1);
@@ -262,7 +262,7 @@ TEST_CASE("wait rejects durable ACK without opt-in and keeps the chunk")
     qdb::column_chunk chunk{"trades"};
     int64_t qty[] = {10};
     int64_t ts[] = {1'700'000'000'000'000'000LL};
-    chunk.column_i64("qty", qty, 1).designated_timestamp_nanos(ts, 1);
+    chunk.column_i64("qty", qty, 1).at_nanos(ts, 1);
 
     // Durable is validated by `wait` (the ack barrier); with no `flush` no
     // frame is published, so the chunk is left intact and the exception

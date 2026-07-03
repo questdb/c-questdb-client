@@ -645,27 +645,27 @@ bool column_sender_chunk_column_ipv4(
 
 ```c
 /**
- * TIMESTAMP column, nanoseconds since the Unix epoch.
+ * Precision selector for column_sender_chunk_column_ts. Passed to the
+ * function as uint32_t (not the enum type) for ABI stability; an
+ * out-of-range value yields a recoverable error.
  */
-QUESTDB_CLIENT_API
-bool column_sender_chunk_column_ts_nanos(
-    column_sender_chunk* chunk,
-    const char* name, size_t name_len,
-    const int64_t* data, size_t row_count,
-    const column_sender_validity* validity,
-    line_sender_error** err_out);
+typedef enum column_sender_ts_unit
+{
+    column_sender_ts_unit_micros = 0,  /* TIMESTAMP (microseconds) */
+    column_sender_ts_unit_nanos = 1,   /* TIMESTAMP_NANOS (nanoseconds) */
+} column_sender_ts_unit;
 
 /**
- * TIMESTAMP column, microseconds since the Unix epoch. Equivalent to
- * passing nanoseconds = micros * 1000 through ts_nanos, but the FFI
- * does the scale-up so the caller does not have to materialise a
- * second buffer.
+ * TIMESTAMP / TIMESTAMP_NANOS column. `unit` is a column_sender_ts_unit
+ * value selecting the precision; `data` holds row_count Unix-epoch values
+ * in that unit.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_ts_micros(
+bool column_sender_chunk_column_ts(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int64_t* data, size_t row_count,
+    uint32_t unit,
     const column_sender_validity* validity,
     line_sender_error** err_out);
 
@@ -673,7 +673,7 @@ bool column_sender_chunk_column_ts_micros(
  * DATE column, milliseconds since the Unix epoch.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_date_millis(
+bool column_sender_chunk_column_date(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int64_t* data, size_t row_count,
@@ -721,7 +721,7 @@ makes no assumption).
  * column or copy down to int32 offsets before calling.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_varchar(
+bool column_sender_chunk_column_str(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int32_t* offsets,    // length = row_count + 1
@@ -760,7 +760,7 @@ slices `dict_bytes` for dict entry `d`. `dict_len` is implicit:
 
 ```c
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_dict_i8(
+bool column_sender_chunk_symbol_i8(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int8_t* codes, size_t row_count,
@@ -770,7 +770,7 @@ bool column_sender_chunk_symbol_dict_i8(
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_dict_i16(
+bool column_sender_chunk_symbol_i16(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int16_t* codes, size_t row_count,
@@ -780,7 +780,7 @@ bool column_sender_chunk_symbol_dict_i16(
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_dict_i32(
+bool column_sender_chunk_symbol_i32(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int32_t* codes, size_t row_count,
@@ -1119,7 +1119,7 @@ name (per spec §Full schema mode).
  * Encoded on the wire as TIMESTAMP (0x0A).
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_designated_timestamp_micros(
+bool column_sender_chunk_at_micros(
     column_sender_chunk* chunk,
     const int64_t* data,
     size_t row_count,
@@ -1130,7 +1130,7 @@ bool column_sender_chunk_designated_timestamp_micros(
  * Encoded on the wire as TIMESTAMP_NANOS (0x10).
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_designated_timestamp_nanos(
+bool column_sender_chunk_at_nanos(
     column_sender_chunk* chunk,
     const int64_t* data,
     size_t row_count,
@@ -1420,7 +1420,7 @@ int send_one_chunk(questdb_db* db) {
             chunk, "price", 5, prices, 3, NULL, &err)) goto fail;
     if (!column_sender_chunk_column_f64(
             chunk, "amount", 6, amounts, 3, NULL, &err)) goto fail;
-    if (!column_sender_chunk_designated_timestamp_nanos(
+    if (!column_sender_chunk_at_nanos(
             chunk, timestamps_ns, 3, &err)) goto fail;
 
     /* One call: publish this chunk as a boundary and wait until the
@@ -1480,9 +1480,9 @@ agent.
   pack it LSB-first into a `uint8_t*` bitmap (provide a vectorised
   helper using `numpy.packbits(... bitorder='little')`).
 - **Pandas datetime64** → already an int64 view via
-  `series.view('int64')`. For `[ns]` use `column_ts_nanos`; for
-  `[us]` use `column_ts_micros`; for `[ms]` use `column_date_millis`
-  (or scale up to ns).
+  `series.view('int64')`. For `[ns]` use `column_ts` with
+  `column_sender_ts_unit_nanos`; for `[us]` use `column_ts` with
+  `column_sender_ts_unit_micros`; for `[ms]` use `column_date`.
 - **Pandas `Categorical`** → `cat.codes.to_numpy()` for `codes`;
   `cat.categories.to_numpy()` then encode to Arrow Utf8 layout
   (build `offsets` + `bytes`) for the dict. Or roundtrip via PyArrow

@@ -627,7 +627,7 @@ impl Sender {
     /// reaches `ack_level`, or until the wait makes no progress for `timeout`.
     ///
     /// This is the row-major counterpart to the column-major
-    /// [`crate::SfColumnSender::wait`]: it takes the cumulative publication
+    /// [`crate::BorrowedColumnSender::wait`]: it takes the cumulative publication
     /// boundary ([`Self::published_fsn`]) and blocks until the requested
     /// completion watermark covers it.
     ///

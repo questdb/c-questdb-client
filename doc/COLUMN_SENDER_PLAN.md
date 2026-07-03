@@ -273,30 +273,29 @@ impl Chunk {
     pub fn column_ipv4   (&mut self, name: ColumnName, data: &[u32],     v: Option<&Validity>) -> Result<()>;
 
     // Time columns.
-    pub fn column_ts_nanos (&mut self, name: ColumnName, data: &[i64], v: Option<&Validity>) -> Result<()>;
-    pub fn column_ts_micros(&mut self, name: ColumnName, data: &[i64], v: Option<&Validity>) -> Result<()>;
-    pub fn column_date_millis(&mut self, name: ColumnName, data: &[i64], v: Option<&Validity>) -> Result<()>;
+    pub fn column_ts(&mut self, name: ColumnName, data: &[i64], unit: TimestampUnit, v: Option<&Validity>) -> Result<()>;
+    pub fn column_date(&mut self, name: ColumnName, data: &[i64], v: Option<&Validity>) -> Result<()>;
 
     // Variable-width text — QWP has exactly one text type, VARCHAR
     // (wire 0x0F, uint32 offsets). The older STRING (0x08) was
     // removed from the spec.
     // Input is Arrow Utf8 shape: i32 offsets + bytes; library
     // compresses to dense uint32-offset layout on the wire.
-    pub fn column_varchar(&mut self, name: ColumnName, offsets: &[i32], data: &[u8], v: Option<&Validity>) -> Result<()>;
+    pub fn column_str(&mut self, name: ColumnName, offsets: &[i32], data: &[u8], v: Option<&Validity>) -> Result<()>;
 
     // Symbol fast path: dictionary-encoded.
     // `codes` are per-row indices into `dict_offsets`/`dict_data` (Arrow Utf8).
     // The implementation interns the dict against SymbolGlobalDict once
     // and remaps codes in bulk — no per-row HashMap probe.
-    pub fn symbol_dict_i8 (&mut self, name: ColumnName, codes: &[i8 ], dict_offsets: &[i32], dict_data: &[u8], v: Option<&Validity>) -> Result<()>;
-    pub fn symbol_dict_i16(&mut self, name: ColumnName, codes: &[i16], dict_offsets: &[i32], dict_data: &[u8], v: Option<&Validity>) -> Result<()>;
-    pub fn symbol_dict_i32(&mut self, name: ColumnName, codes: &[i32], dict_offsets: &[i32], dict_data: &[u8], v: Option<&Validity>) -> Result<()>;
+    pub fn symbol_i8 (&mut self, name: ColumnName, codes: &[i8 ], dict_offsets: &[i32], dict_data: &[u8], v: Option<&Validity>) -> Result<()>;
+    pub fn symbol_i16(&mut self, name: ColumnName, codes: &[i16], dict_offsets: &[i32], dict_data: &[u8], v: Option<&Validity>) -> Result<()>;
+    pub fn symbol_i32(&mut self, name: ColumnName, codes: &[i32], dict_offsets: &[i32], dict_data: &[u8], v: Option<&Validity>) -> Result<()>;
 
     // Designated timestamp (required, exactly once per chunk; pick one).
     // Emitted on the wire as an empty-name column of type
     // TIMESTAMP (0x0A) for micros, TIMESTAMP_NANOS (0x10) for nanos.
-    pub fn designated_timestamp_micros(&mut self, data: &[i64]) -> Result<()>;
-    pub fn designated_timestamp_nanos (&mut self, data: &[i64]) -> Result<()>;
+    pub fn at_micros(&mut self, data: &[i64]) -> Result<()>;
+    pub fn at_nanos (&mut self, data: &[i64]) -> Result<()>;
 
     // Lifecycle.
     pub fn row_count(&self) -> usize;
@@ -426,7 +425,7 @@ land.
   on-wire shape modulo the null_flag byte.
 - Implement `column_i8`/`i16`/`i32`/`i64`/`f32`/`f64`/`bool`/`uuid`/
   `long256`/`ipv4`/`ts_nanos`/`ts_micros`/`date_millis` +
-  `designated_timestamp_micros` + `designated_timestamp_nanos`.
+  `at_micros` + `at_nanos`.
 - Implement `Validity` (Arrow-shape in: 1=valid, LSB-first). Library
   masks trailing bits beyond row_count.
 - Implement the table-header + schema-section emit. The schema (column
@@ -440,7 +439,7 @@ land.
 
 ### WS-3 — VARCHAR column
 
-- Implement `column_varchar`. Input is Arrow Utf8 shape (i32 offsets +
+- Implement `column_str`. Input is Arrow Utf8 shape (i32 offsets +
   bytes). Wire output is dense (only non-null) with uint32 offsets per
   QWP spec §VARCHAR.
 - Two code paths per §2.2:
@@ -551,10 +550,10 @@ land.
 | LONG          | `column_i64`       | `int64`                      | `Int64`                    | `int64_t*`               |
 | FLOAT         | `column_f32`       | `float32`                    | `Float32`                  | `float*`                 |
 | DOUBLE        | `column_f64`       | `float64`                    | `Float64`                  | `double*`                |
-| VARCHAR       | `column_varchar`   | `string` / object (fallback) | `Utf8` (Polars `LargeUtf8` → wrapper splits) | `int32_t*` + `uint8_t*` |
-| SYMBOL        | `symbol_dict_iN`   | `Categorical`                | `Categorical` / Dict<Utf8> | codes + dict offsets+bytes |
-| TIMESTAMP     | `column_ts_nanos`/`_micros` | `datetime64[ns]`/`[us]` | `Datetime(ns/us)`      | `int64_t*`               |
-| DATE          | `column_date_millis` | `datetime64[ms]`           | `Date` (after cast)        | `int64_t*`               |
+| VARCHAR       | `column_str`   | `string` / object (fallback) | `Utf8` (Polars `LargeUtf8` → wrapper splits) | `int32_t*` + `uint8_t*` |
+| SYMBOL        | `symbol_iN`   | `Categorical`                | `Categorical` / Dict<Utf8> | codes + dict offsets+bytes |
+| TIMESTAMP     | `column_ts` (`TimestampUnit`) | `datetime64[ns]`/`[us]` | `Datetime(ns/us)`      | `int64_t*`               |
+| DATE          | `column_date` | `datetime64[ms]`           | `Date` (after cast)        | `int64_t*`               |
 | UUID          | `column_uuid`      | bytes (no native)            | Arrow `FixedSizeBinary(16)`| `uint8_t*` (16N)         |
 | IPV4          | `column_ipv4`      | uint32 (no native)           | `UInt32`                   | `uint32_t*`              |
 | LONG256       | `column_long256`   | bytes (no native)            | Arrow `FixedSizeBinary(32)`| `uint8_t*` (32N)         |

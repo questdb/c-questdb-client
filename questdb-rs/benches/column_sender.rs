@@ -33,14 +33,14 @@
 //! Three families:
 //!
 //! 1. **Per-column bulk append** — exercises [`Chunk::column_i64`],
-//!    [`Chunk::column_f64`], [`Chunk::column_varchar`], and
-//!    [`Chunk::symbol_dict_i32`] in both no-null and nullable shapes.
+//!    [`Chunk::column_f64`], [`Chunk::column_str`], and
+//!    [`Chunk::symbol_i32`] in both no-null and nullable shapes.
 //!    Baseline: a raw `extend_from_slice` from the caller's typed
 //!    buffer into a fresh `Vec<u8>`, the absolute floor any
 //!    column-sender hot path is competing with.
 //!
 //! 2. **Symbol bulk-intern** — compares the column path
-//!    ([`Chunk::symbol_dict_i32`] + flush-time interning) with a
+//!    ([`Chunk::symbol_i32`] + flush-time interning) with a
 //!    naive per-row HashMap lookup that mirrors what the row API pays
 //!    on the same cardinality, to anchor the WS-4 plan claim ("10M
 //!    rows × 1000-card drops from 10M probes to 1000").
@@ -256,11 +256,11 @@ fn bench_column_f64(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_column_varchar(c: &mut Criterion) {
+fn bench_column_str(c: &mut Criterion) {
     let rows = row_count();
     let len = varchar_len();
     let (offsets, bytes) = make_varchar(rows, len);
-    let mut group = c.benchmark_group("column_varchar");
+    let mut group = c.benchmark_group("column_str");
     group.throughput(Throughput::Bytes((4 * (rows + 1) + bytes.len()) as u64));
 
     group.bench_function("memcpy_baseline", |b| {
@@ -286,7 +286,7 @@ fn bench_column_varchar(c: &mut Criterion) {
         b.iter_batched(
             || fresh_chunk("logs"),
             |mut chunk| {
-                chunk.column_varchar("msg", &offsets, &bytes, None).unwrap();
+                chunk.column_str("msg", &offsets, &bytes, None).unwrap();
                 black_box(&chunk);
             },
             BatchSize::SmallInput,
@@ -313,7 +313,7 @@ fn bench_symbol_dict(c: &mut Criterion) {
             || fresh_chunk("ticks"),
             |mut chunk| {
                 chunk
-                    .symbol_dict_i32("sym", &codes, &dict_offsets, &dict_bytes, None)
+                    .symbol_i32("sym", &codes, &dict_offsets, &dict_bytes, None)
                     .unwrap();
                 black_box(&chunk);
             },
@@ -376,12 +376,12 @@ fn encode_chunk_group(c: &mut Criterion) {
         chunk.column_i64("qty", &i64_data, None).unwrap();
         chunk.column_f64("price", &f64_data, None).unwrap();
         chunk
-            .column_varchar("msg", &offsets, &varchar_bytes, None)
+            .column_str("msg", &offsets, &varchar_bytes, None)
             .unwrap();
         chunk
-            .symbol_dict_i32("sym", &codes, &dict_offsets, &dict_bytes, None)
+            .symbol_i32("sym", &codes, &dict_offsets, &dict_bytes, None)
             .unwrap();
-        chunk.designated_timestamp_nanos(&ts_data).unwrap();
+        chunk.at_nanos(&ts_data).unwrap();
         chunk
     };
 
@@ -439,7 +439,7 @@ criterion_group!(
     benches,
     bench_column_i64,
     bench_column_f64,
-    bench_column_varchar,
+    bench_column_str,
     bench_symbol_dict,
     encode_chunk_group,
 );

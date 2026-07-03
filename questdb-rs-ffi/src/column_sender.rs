@@ -42,7 +42,7 @@ use questdb::ffi_support::OwnedColumnSender;
 use questdb::ingress::AckLevel;
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
-use questdb::ingress::column_sender::{Chunk, NumpyDtype, Validity};
+use questdb::ingress::column_sender::{Chunk, NumpyDtype, TimestampUnit, Validity};
 use questdb::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use questdb::{Error, ErrorCode};
 
@@ -1039,6 +1039,41 @@ pub unsafe extern "C" fn column_sender_chunk_row_count(
 // Numeric / fixed-width column appends
 // ===========================================================================
 
+// ===========================================================================
+// Timestamp unit
+//
+// Like ack_level, the `column_sender_chunk_column_ts` unit crosses the ABI as
+// a `uint32_t` (named constants below) rather than a `#[repr(C)] enum`, so an
+// out-of-range value is a recoverable `InvalidApiCall` instead of Rust UB.
+// ===========================================================================
+
+/// `unit` value selecting `TIMESTAMP` (microseconds) for
+/// [`column_sender_chunk_column_ts`].
+pub const column_sender_ts_unit_micros: u32 = 0;
+
+/// `unit` value selecting `TIMESTAMP_NANOS` (nanoseconds) for
+/// [`column_sender_chunk_column_ts`].
+pub const column_sender_ts_unit_nanos: u32 = 1;
+
+fn ts_unit_from_u32(value: u32, err_out: *mut *mut line_sender_error) -> Option<TimestampUnit> {
+    match value {
+        v if v == column_sender_ts_unit_micros => Some(TimestampUnit::Micros),
+        v if v == column_sender_ts_unit_nanos => Some(TimestampUnit::Nanos),
+        other => {
+            unsafe {
+                set_err_out_from_error(
+                    err_out,
+                    Error::new(
+                        ErrorCode::InvalidApiCall,
+                        format!("column_sender ts unit: invalid value {other} (expected 0 or 1)"),
+                    ),
+                );
+            }
+            None
+        }
+    }
+}
+
 macro_rules! column_fn {
     ($fn_name:ident, $c_ty:ty, $rust_method:ident, $what:literal) => {
         #[unsafe(no_mangle)]
@@ -1128,23 +1163,65 @@ column_fn!(
     "ipv4 column data"
 );
 column_fn!(
-    column_sender_chunk_column_ts_nanos,
+    column_sender_chunk_column_date,
     i64,
-    column_ts_nanos,
-    "ts_nanos column data"
+    column_date,
+    "date column data"
 );
-column_fn!(
-    column_sender_chunk_column_ts_micros,
-    i64,
-    column_ts_micros,
-    "ts_micros column data"
-);
-column_fn!(
-    column_sender_chunk_column_date_millis,
-    i64,
-    column_date_millis,
-    "date_millis column data"
-);
+
+/// `TIMESTAMP` / `TIMESTAMP_NANOS` column. `unit` selects the precision:
+/// `column_sender_ts_unit_micros` (0) → `TIMESTAMP`,
+/// `column_sender_ts_unit_nanos` (1) → `TIMESTAMP_NANOS`. `data` holds
+/// `row_count` Unix-epoch values in the chosen unit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_chunk_column_ts(
+    chunk: *mut column_sender_chunk,
+    name: *const c_char,
+    name_len: size_t,
+    data: *const i64,
+    row_count: size_t,
+    unit: u32,
+    validity: *const column_sender_validity,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            "column_sender_chunk_column_ts",
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let name = match unsafe { name_str(name, name_len, err_out) } {
+        Some(s) => s,
+        None => return false,
+    };
+    let data = match unsafe { typed_slice(data, row_count, err_out, "timestamp column data") } {
+        Some(s) => s,
+        None => return false,
+    };
+    let unit = match ts_unit_from_u32(unit, err_out) {
+        Some(u) => u,
+        None => return false,
+    };
+    let validity = match unsafe { as_validity(validity, err_out) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(
+        err_out,
+        inner.column_ts(name, data, unit, validity.as_ref())
+    );
+    true
+}
 
 /// `BOOLEAN` column. `data` is an Arrow-style LSB-first packed bitmap;
 /// must be at least `ceil(row_count / 8)` bytes long.
@@ -1320,7 +1397,7 @@ fixed_width_byte_column_fn!(
 // ===========================================================================
 
 /// `BINARY` column. Same `offsets` + `bytes` layout as
-/// `column_sender_chunk_column_varchar`; wire type byte differs so the
+/// `column_sender_chunk_column_str`; wire type byte differs so the
 /// server creates a BINARY column. No UTF-8 validation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn column_sender_chunk_column_binary(
@@ -1393,7 +1470,7 @@ pub unsafe extern "C" fn column_sender_chunk_column_binary(
 /// `row_count + 1`, monotonically non-decreasing; `bytes` is the
 /// concatenated UTF-8 buffer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_column_varchar(
+pub unsafe extern "C" fn column_sender_chunk_column_str(
     chunk: *mut column_sender_chunk,
     name: *const c_char,
     name_len: size_t,
@@ -1411,7 +1488,7 @@ pub unsafe extern "C" fn column_sender_chunk_column_varchar(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_column_varchar",
+            "column_sender_chunk_column_str",
             "column_sender_chunk",
             err_out,
         )
@@ -1454,7 +1531,7 @@ pub unsafe extern "C" fn column_sender_chunk_column_varchar(
     let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
     bubble!(
         err_out,
-        inner.column_varchar(name, offsets, bytes, validity.as_ref())
+        inner.column_str(name, offsets, bytes, validity.as_ref())
     );
     true
 }
@@ -1534,21 +1611,21 @@ macro_rules! symbol_fn {
 }
 
 symbol_fn!(
-    column_sender_chunk_symbol_dict_i8,
+    column_sender_chunk_symbol_i8,
     i8,
-    symbol_dict_i8,
+    symbol_i8,
     "symbol codes (i8)"
 );
 symbol_fn!(
-    column_sender_chunk_symbol_dict_i16,
+    column_sender_chunk_symbol_i16,
     i16,
-    symbol_dict_i16,
+    symbol_i16,
     "symbol codes (i16)"
 );
 symbol_fn!(
-    column_sender_chunk_symbol_dict_i32,
+    column_sender_chunk_symbol_i32,
     i32,
-    symbol_dict_i32,
+    symbol_i32,
     "symbol codes (i32)"
 );
 
@@ -2429,7 +2506,7 @@ pub unsafe extern "C" fn column_sender_chunk_append_numpy_column(
 // ===========================================================================
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_micros(
+pub unsafe extern "C" fn column_sender_chunk_at_micros(
     chunk: *mut column_sender_chunk,
     data: *const i64,
     row_count: size_t,
@@ -2442,7 +2519,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_micros(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_designated_timestamp_micros",
+            "column_sender_chunk_at_micros",
             "column_sender_chunk",
             err_out,
         )
@@ -2455,12 +2532,12 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_micros(
         None => return false,
     };
     let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
-    bubble!(err_out, inner.designated_timestamp_micros(data));
+    bubble!(err_out, inner.at_micros(data));
     true
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
+pub unsafe extern "C" fn column_sender_chunk_at_nanos(
     chunk: *mut column_sender_chunk,
     data: *const i64,
     row_count: size_t,
@@ -2473,7 +2550,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_designated_timestamp_nanos",
+            "column_sender_chunk_at_nanos",
             "column_sender_chunk",
             err_out,
         )
@@ -2486,7 +2563,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_nanos(
         None => return false,
     };
     let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
-    bubble!(err_out, inner.designated_timestamp_nanos(data));
+    bubble!(err_out, inner.at_nanos(data));
     true
 }
 
@@ -4278,7 +4355,7 @@ mod tests {
     }
 
     #[test]
-    fn column_varchar_round_trip_on_pure_data_path() {
+    fn column_str_round_trip_on_pure_data_path() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let chunk = unsafe {
@@ -4300,7 +4377,7 @@ mod tests {
         let offsets: [i32; 4] = [0, split, split, total];
         let row_count: usize = 3;
         let ok = unsafe {
-            column_sender_chunk_column_varchar(
+            column_sender_chunk_column_str(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -4312,7 +4389,7 @@ mod tests {
                 &mut err,
             )
         };
-        assert!(ok, "column_varchar should succeed");
+        assert!(ok, "column_str should succeed");
         assert!(err.is_null());
         assert_eq!(
             unsafe { column_sender_chunk_row_count(chunk, std::ptr::null_mut()) },
@@ -4322,7 +4399,7 @@ mod tests {
     }
 
     #[test]
-    fn column_varchar_rejects_row_count_mismatch() {
+    fn column_str_rejects_row_count_mismatch() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let chunk = unsafe {
@@ -4348,7 +4425,7 @@ mod tests {
         let offsets: [i32; 3] = [0, 2, 4];
         let bytes: [u8; 4] = [b'a', b'b', b'c', b'd'];
         let ok = unsafe {
-            column_sender_chunk_column_varchar(
+            column_sender_chunk_column_str(
                 chunk,
                 name_b.as_ptr() as *const c_char,
                 name_b.len(),
@@ -4367,7 +4444,7 @@ mod tests {
     }
 
     #[test]
-    fn column_varchar_rejects_offset_out_of_bounds() {
+    fn column_str_rejects_offset_out_of_bounds() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let chunk = unsafe {
@@ -4378,7 +4455,7 @@ mod tests {
         let offsets: [i32; 2] = [0, 9];
         let bytes: [u8; 4] = [b'a', b'b', b'c', b'd'];
         let ok = unsafe {
-            column_sender_chunk_column_varchar(
+            column_sender_chunk_column_str(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),
@@ -4397,7 +4474,7 @@ mod tests {
     }
 
     #[test]
-    fn column_varchar_rejects_invalid_utf8() {
+    fn column_str_rejects_invalid_utf8() {
         let table = b"trades";
         let mut err: *mut line_sender_error = std::ptr::null_mut();
         let chunk = unsafe {
@@ -4409,7 +4486,7 @@ mod tests {
         let offsets: [i32; 2] = [0, 1];
         let bytes: [u8; 1] = [0xFF];
         let ok = unsafe {
-            column_sender_chunk_column_varchar(
+            column_sender_chunk_column_str(
                 chunk,
                 name.as_ptr() as *const c_char,
                 name.len(),

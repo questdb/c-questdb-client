@@ -674,27 +674,37 @@ bool column_sender_chunk_column_ipv4(
  * Timestamp columns (non-designated)
  * ------------------------------------------------------------------------- */
 
-/** `TIMESTAMP_NANOS` column, nanoseconds since the Unix epoch. */
-QUESTDB_CLIENT_API
-bool column_sender_chunk_column_ts_nanos(
-    column_sender_chunk* chunk,
-    const char* name, size_t name_len,
-    const int64_t* data, size_t row_count,
-    const column_sender_validity* validity,
-    line_sender_error** err_out);
+/**
+ * Precision selector for `column_sender_chunk_column_ts`. Passed to the
+ * function as `uint32_t` (not the enum type) for ABI stability; an
+ * out-of-range value yields a recoverable error.
+ */
+typedef enum column_sender_ts_unit
+{
+    /** `TIMESTAMP` — microseconds since the Unix epoch. */
+    column_sender_ts_unit_micros = 0,
 
-/** `TIMESTAMP` column, microseconds since the Unix epoch. */
+    /** `TIMESTAMP_NANOS` — nanoseconds since the Unix epoch. */
+    column_sender_ts_unit_nanos = 1,
+} column_sender_ts_unit;
+
+/**
+ * `TIMESTAMP` / `TIMESTAMP_NANOS` column. `unit` is a `column_sender_ts_unit`
+ * value selecting the precision; `data` holds `row_count` Unix-epoch values in
+ * that unit.
+ */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_ts_micros(
+bool column_sender_chunk_column_ts(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int64_t* data, size_t row_count,
+    uint32_t unit,
     const column_sender_validity* validity,
     line_sender_error** err_out);
 
 /** `DATE` column, milliseconds since the Unix epoch. */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_date_millis(
+bool column_sender_chunk_column_date(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int64_t* data, size_t row_count,
@@ -731,7 +741,7 @@ bool column_sender_chunk_column_date_millis(
  * `line_sender_error_server_rejection`.
  */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_column_varchar(
+bool column_sender_chunk_column_str(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int32_t* offsets,
@@ -743,7 +753,7 @@ bool column_sender_chunk_column_varchar(
 
 /**
  * `BINARY` column. Same Arrow-Binary-shape `offsets` + `bytes` layout as
- * `column_sender_chunk_column_varchar`; differs only in the wire type
+ * `column_sender_chunk_column_str`; differs only in the wire type
  * byte so the server creates a BINARY column. No UTF-8 validation.
  */
 QUESTDB_CLIENT_API
@@ -778,7 +788,7 @@ bool column_sender_chunk_column_binary(
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_dict_i8(
+bool column_sender_chunk_symbol_i8(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int8_t* codes, size_t row_count,
@@ -788,7 +798,7 @@ bool column_sender_chunk_symbol_dict_i8(
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_dict_i16(
+bool column_sender_chunk_symbol_i16(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int16_t* codes, size_t row_count,
@@ -798,7 +808,7 @@ bool column_sender_chunk_symbol_dict_i16(
     line_sender_error** err_out);
 
 QUESTDB_CLIENT_API
-bool column_sender_chunk_symbol_dict_i32(
+bool column_sender_chunk_symbol_i32(
     column_sender_chunk* chunk,
     const char* name, size_t name_len,
     const int32_t* codes, size_t row_count,
@@ -1258,7 +1268,7 @@ bool column_sender_chunk_append_numpy_column(
 
 /** Designated timestamp in microseconds (wire type TIMESTAMP, 0x0A). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_designated_timestamp_micros(
+bool column_sender_chunk_at_micros(
     column_sender_chunk* chunk,
     const int64_t* data,
     size_t row_count,
@@ -1266,7 +1276,7 @@ bool column_sender_chunk_designated_timestamp_micros(
 
 /** Designated timestamp in nanoseconds (wire type TIMESTAMP_NANOS, 0x10). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_designated_timestamp_nanos(
+bool column_sender_chunk_at_nanos(
     column_sender_chunk* chunk,
     const int64_t* data,
     size_t row_count,

@@ -570,6 +570,18 @@ pub(crate) struct DesignatedTsDescriptor {
     pub(crate) data: *const i64,
 }
 
+/// Precision of a timestamp column, selecting the QWP wire type used by
+/// [`Chunk::column_ts`]: [`TimestampUnit::Micros`] maps to `TIMESTAMP` and
+/// [`TimestampUnit::Nanos`] to `TIMESTAMP_NANOS`. Column values are
+/// Unix-epoch integers in the chosen unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimestampUnit {
+    /// Microseconds since the Unix epoch (QWP wire type `TIMESTAMP`).
+    Micros,
+    /// Nanoseconds since the Unix epoch (QWP wire type `TIMESTAMP_NANOS`).
+    Nanos,
+}
+
 // ===========================================================================
 // Chunk
 // ===========================================================================
@@ -898,49 +910,37 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Append a timestamp column with nanosecond precision (QWP wire
-    /// type `TIMESTAMP_NANOS`). Values are Unix epoch nanoseconds.
-    pub fn column_ts_nanos(
+    /// Append a timestamp column. `unit` selects the QWP wire type
+    /// ([`TimestampUnit::Micros`] → `TIMESTAMP`, [`TimestampUnit::Nanos`] →
+    /// `TIMESTAMP_NANOS`); `data` holds Unix-epoch values in that unit.
+    pub fn column_ts(
         &mut self,
         name: &str,
         data: &'a [i64],
+        unit: TimestampUnit,
         validity: Option<&Validity<'a>>,
     ) -> Result<&mut Self> {
         let row_count = check_row_count(self.row_count, data.len(), validity)?;
-        self.push_column(
-            name,
-            QWP_TYPE_TIMESTAMP_NANOS,
-            ColumnKind::TsNanos {
-                data: data.as_ptr(),
-            },
-            validity,
-            row_count,
-        )
+        let (wire_type, kind) = match unit {
+            TimestampUnit::Nanos => (
+                QWP_TYPE_TIMESTAMP_NANOS,
+                ColumnKind::TsNanos {
+                    data: data.as_ptr(),
+                },
+            ),
+            TimestampUnit::Micros => (
+                QWP_TYPE_TIMESTAMP,
+                ColumnKind::TsMicros {
+                    data: data.as_ptr(),
+                },
+            ),
+        };
+        self.push_column(name, wire_type, kind, validity, row_count)
     }
 
-    /// Append a timestamp column with microsecond precision (QWP wire
-    /// type `TIMESTAMP`). Values are Unix epoch microseconds.
-    pub fn column_ts_micros(
-        &mut self,
-        name: &str,
-        data: &'a [i64],
-        validity: Option<&Validity<'a>>,
-    ) -> Result<&mut Self> {
-        let row_count = check_row_count(self.row_count, data.len(), validity)?;
-        self.push_column(
-            name,
-            QWP_TYPE_TIMESTAMP,
-            ColumnKind::TsMicros {
-                data: data.as_ptr(),
-            },
-            validity,
-            row_count,
-        )
-    }
-
-    /// Append a date column with millisecond precision (QWP wire type
-    /// `DATE`). Values are Unix epoch milliseconds.
-    pub fn column_date_millis(
+    /// Append a `DATE` column (QWP wire type `DATE`). Values are Unix epoch
+    /// milliseconds (QuestDB `DATE` has no other precision).
+    pub fn column_date(
         &mut self,
         name: &str,
         data: &'a [i64],
@@ -966,7 +966,7 @@ impl<'a> Chunk<'a> {
     /// `VARCHAR`). `offsets` is `i32` with `row_count + 1` entries
     /// (monotonic, non-negative, last ≤ `bytes.len()`); `bytes` is the
     /// concatenated UTF-8 buffer.
-    pub fn column_varchar(
+    pub fn column_str(
         &mut self,
         name: &str,
         offsets: &'a [i32],
@@ -997,7 +997,7 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Same wire output as [`Self::column_varchar`], but accepts Arrow
+    /// Same wire output as [`Self::column_str`], but accepts Arrow
     /// LargeUtf8 input where offsets are `int64` instead of `int32`. The
     /// encoder narrows each offset to `u32` at encode time with an
     /// overflow check (QWP's offset table is uint32 LE on the wire), so
@@ -1005,7 +1005,7 @@ impl<'a> Chunk<'a> {
     ///
     /// Errors if any offset is negative, decreasing, exceeds the bytes
     /// buffer length, or — at encode time — exceeds `u32::MAX`.
-    pub fn column_varchar_large(
+    pub fn column_str_large(
         &mut self,
         name: &str,
         offsets: &'a [i64],
@@ -1037,7 +1037,7 @@ impl<'a> Chunk<'a> {
     }
 
     /// Append a BINARY column. Same offsets + bytes layout as
-    /// [`Self::column_varchar`]; the encoder writes the column with wire type
+    /// [`Self::column_str`]; the encoder writes the column with wire type
     /// `QWP_TYPE_BINARY` instead of `QWP_TYPE_VARCHAR`. No UTF-8
     /// validation is performed.
     pub fn column_binary(
@@ -1079,7 +1079,7 @@ impl<'a> Chunk<'a> {
     /// Utf8 layout. Wire type is `SYMBOL`; the encoder interns each
     /// referenced dictionary entry against the connection-scoped
     /// `SymbolGlobalDict` at flush time.
-    pub fn symbol_dict_i8(
+    pub fn symbol_i8(
         &mut self,
         name: &str,
         codes: &'a [i8],
@@ -1098,8 +1098,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Same as [`symbol_dict_i8`](Self::symbol_dict_i8) but with `i16` codes.
-    pub fn symbol_dict_i16(
+    /// Same as [`symbol_i8`](Self::symbol_i8) but with `i16` codes.
+    pub fn symbol_i16(
         &mut self,
         name: &str,
         codes: &'a [i16],
@@ -1118,8 +1118,8 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Same as [`symbol_dict_i8`](Self::symbol_dict_i8) but with `i32` codes.
-    pub fn symbol_dict_i32(
+    /// Same as [`symbol_i8`](Self::symbol_i8) but with `i32` codes.
+    pub fn symbol_i32(
         &mut self,
         name: &str,
         codes: &'a [i32],
@@ -1138,9 +1138,9 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Same as [`symbol_dict_i8`](Self::symbol_dict_i8) but the dictionary
+    /// Same as [`symbol_i8`](Self::symbol_i8) but the dictionary
     /// uses Arrow LargeUtf8 layout (`i64` offsets).
-    pub fn symbol_dict_large_i8(
+    pub fn symbol_large_i8(
         &mut self,
         name: &str,
         codes: &'a [i8],
@@ -1159,9 +1159,9 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Same as [`symbol_dict_i16`](Self::symbol_dict_i16) but the dictionary
+    /// Same as [`symbol_i16`](Self::symbol_i16) but the dictionary
     /// uses Arrow LargeUtf8 layout (`i64` offsets).
-    pub fn symbol_dict_large_i16(
+    pub fn symbol_large_i16(
         &mut self,
         name: &str,
         codes: &'a [i16],
@@ -1180,9 +1180,9 @@ impl<'a> Chunk<'a> {
         )
     }
 
-    /// Same as [`symbol_dict_i32`](Self::symbol_dict_i32) but the dictionary
+    /// Same as [`symbol_i32`](Self::symbol_i32) but the dictionary
     /// uses Arrow LargeUtf8 layout (`i64` offsets).
-    pub fn symbol_dict_large_i32(
+    pub fn symbol_large_i32(
         &mut self,
         name: &str,
         codes: &'a [i32],
@@ -1328,14 +1328,14 @@ impl<'a> Chunk<'a> {
     /// Unix epoch column (QWP wire type `TIMESTAMP`). Required before
     /// flushing a non-empty chunk; rejects if a designated timestamp has
     /// already been set on this chunk.
-    pub fn designated_timestamp_micros(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+    pub fn at_micros(&mut self, data: &'a [i64]) -> Result<&mut Self> {
         self.set_designated_ts(DesignatedTsUnit::Micros, data)
     }
 
-    /// Same as [`designated_timestamp_micros`](Self::designated_timestamp_micros)
+    /// Same as [`at_micros`](Self::at_micros)
     /// but for a nanosecond-precision Unix epoch column (QWP wire type
     /// `TIMESTAMP_NANOS`).
-    pub fn designated_timestamp_nanos(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+    pub fn at_nanos(&mut self, data: &'a [i64]) -> Result<&mut Self> {
         self.set_designated_ts(DesignatedTsUnit::Nanos, data)
     }
 
@@ -1694,10 +1694,10 @@ mod tests {
     fn designated_ts_sets_row_count() {
         let mut chunk = Chunk::new("t");
         let ts = [1i64, 2, 3];
-        chunk.designated_timestamp_micros(&ts).unwrap();
+        chunk.at_micros(&ts).unwrap();
         assert_eq!(chunk.row_count(), 3);
         let ts2 = [4i64, 5, 6];
-        let err = chunk.designated_timestamp_nanos(&ts2).unwrap_err();
+        let err = chunk.at_nanos(&ts2).unwrap_err();
         assert!(err.msg().contains("designated"));
     }
 
@@ -1707,7 +1707,7 @@ mod tests {
         let a = [1i64];
         let ts = [10i64];
         chunk.column_i64("a", &a, None).unwrap();
-        chunk.designated_timestamp_nanos(&ts).unwrap();
+        chunk.at_nanos(&ts).unwrap();
         chunk.clear();
         assert_eq!(chunk.row_count(), 0);
         assert!(chunk.is_empty());
@@ -1718,9 +1718,7 @@ mod tests {
     fn varchar_rejects_negative_offset() {
         let mut chunk = Chunk::new("t");
         let offsets = [-1i32, 1, 2];
-        let err = chunk
-            .column_varchar("v", &offsets, b"ab", None)
-            .unwrap_err();
+        let err = chunk.column_str("v", &offsets, b"ab", None).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("non-negative"));
     }
@@ -1729,9 +1727,7 @@ mod tests {
     fn varchar_rejects_non_monotonic_offsets() {
         let mut chunk = Chunk::new("t");
         let offsets = [0i32, 5, 3];
-        let err = chunk
-            .column_varchar("v", &offsets, b"abcde", None)
-            .unwrap_err();
+        let err = chunk.column_str("v", &offsets, b"abcde", None).unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("non-decreasing"));
     }
@@ -1741,7 +1737,7 @@ mod tests {
         let mut chunk = Chunk::new("t");
         let offsets = [0i32, 2];
         let err = chunk
-            .column_varchar("v", &offsets, &[0xff, 0xfe], None)
+            .column_str("v", &offsets, &[0xff, 0xfe], None)
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("UTF-8"));
@@ -1754,7 +1750,7 @@ mod tests {
         // splitting it at offset 1 yields two individually-invalid cells.
         let offsets = [0i32, 1, 2];
         let err = chunk
-            .column_varchar("v", &offsets, &[0xC3, 0xA9], None)
+            .column_str("v", &offsets, &[0xC3, 0xA9], None)
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("splits a multi-byte"));
@@ -1766,7 +1762,7 @@ mod tests {
         // "a" then "é": every offset lands on a char boundary, so both cells
         // are independently valid UTF-8.
         chunk
-            .column_varchar("v", &[0i32, 1, 3], &[0x61, 0xC3, 0xA9], None)
+            .column_str("v", &[0i32, 1, 3], &[0x61, 0xC3, 0xA9], None)
             .unwrap();
         assert_eq!(chunk.row_count(), 2);
     }
@@ -1777,7 +1773,7 @@ mod tests {
         let codes = [0i32, 99];
         let dict_offsets = [0i32, 5];
         let err = chunk
-            .symbol_dict_i32("sym", &codes, &dict_offsets, b"alpha", None)
+            .symbol_i32("sym", &codes, &dict_offsets, b"alpha", None)
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
         assert!(err.msg().contains("out of range"));
@@ -1791,7 +1787,7 @@ mod tests {
         let bits = [0b0000_0001];
         let v = Validity::from_bitmap(&bits, 2).unwrap();
         chunk
-            .symbol_dict_i32("sym", &codes, &dict_offsets, b"alpha", Some(&v))
+            .symbol_i32("sym", &codes, &dict_offsets, b"alpha", Some(&v))
             .expect("null row's bogus code is ignored");
     }
 }

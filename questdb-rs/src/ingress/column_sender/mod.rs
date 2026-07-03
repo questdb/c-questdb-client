@@ -41,13 +41,13 @@
 //!   throughput instead, publish each with [`ColumnSender::flush`] and drain
 //!   once at the end with [`ColumnSender::sync`] at the requested
 //!   [`crate::ingress::AckLevel`].
-//! - Drop the [`crate::SfColumnSender`] to return its connection to the pool.
+//! - Drop the [`crate::BorrowedColumnSender`] to return its connection to the pool.
 //!
 //! ```ignore
 //! let mut sender = db.borrow_column_sender()?;
 //! let mut chunk = Chunk::new("trades");
 //! chunk.column_f64("price", &prices, None)?;
-//! chunk.designated_timestamp_nanos(&timestamps_ns)?;
+//! chunk.at_nanos(&timestamps_ns)?;
 //! // One call: publish + wait until the server WAL-commits this batch.
 //! sender.flush_and_wait(&mut chunk, crate::ingress::AckLevel::Ok)?;
 //! ```
@@ -68,6 +68,7 @@ pub use arrow_batch::ArrowColumnOverride;
 pub use chunk::Chunk;
 #[cfg(feature = "arrow-ingress")]
 pub use chunk::ImportedArrowColumn;
+pub use chunk::TimestampUnit;
 pub use numpy_wire::NumpyDtype;
 pub use sender::ColumnSender;
 pub use validity::Validity;

@@ -192,21 +192,21 @@ fn main() -> questdb::Result<()> {
         chunk.column_f64("bid_px", &bid_px[flushed..end], None)?;
         chunk.column_f64("ask_px", &ask_px[flushed..end], None)?;
         chunk.column_f64("last_px", &last_px[flushed..end], None)?;
-        chunk.symbol_dict_i32(
+        chunk.symbol_i32(
             "symbol",
             &symbol_codes[flushed..end],
             &sym_dict_offsets,
             &sym_dict_bytes,
             None,
         )?;
-        chunk.symbol_dict_i8(
+        chunk.symbol_i8(
             "exchange",
             &exchange_codes[flushed..end],
             &ex_dict_offsets,
             &ex_dict_bytes,
             None,
         )?;
-        chunk.designated_timestamp_nanos(&ts_ns[flushed..end])?;
+        chunk.at_nanos(&ts_ns[flushed..end])?;
 
         let t = Instant::now();
         sender.flush(&mut chunk)?;
