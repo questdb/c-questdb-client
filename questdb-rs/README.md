@@ -3,10 +3,21 @@
 Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
 database designed to process time-series data, faster.
 
-The client library is designed for fast ingestion of data into QuestDB. It
-supports three transports: the InfluxDB Line Protocol (ILP) over HTTP
-(recommended) or TCP, and the QuestDB Wire Protocol (QWP) over UDP for
-high-throughput ingestion on trusted networks.
+The client library is designed for fast ingestion of data into QuestDB, and
+for querying it back out.
+
+Its centrepiece is the **QuestDB Wire Protocol (QWP)** over WebSocket:
+QuestDB's native binary columnar protocol, covering both directions. Writes
+are acknowledged per flush and go through [`QuestDb`] — a thread-safe
+connection pool with automatic reconnect and failover — as rows, columns,
+Apache Arrow `RecordBatch`es or Polars `DataFrame`s. Queries stream SQL
+result sets back over the same protocol as columnar batches, `RecordBatch`es
+or `DataFrame`s.
+
+The InfluxDB Line Protocol (ILP) over HTTP or TCP, and QWP over UDP, are
+also supported for ingestion.
+
+[`QuestDb`]: https://docs.rs/questdb-rs/latest/questdb/struct.QuestDb.html
 
 * [QuestDB Database docs](https://questdb.io/docs/)
 * [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
@@ -15,10 +26,16 @@ high-throughput ingestion on trusted networks.
 
 The transport is selected by the scheme in the configuration string:
 
-* `http::addr=...` / `https::addr=...` — request-response, errors returned
-  to the client, supports authentication and TLS. Recommended for most
-  workloads.
-* `tcp::addr=...` / `tcps::addr=...` — streaming, legacy; errors cause
+* `ws::addr=...` / `wss::addr=...` (also `qwpws::` / `qwpwss::`) — QWP over
+  WebSocket, in both directions. For ingestion (`QuestDb::connect`): binary
+  columnar frames with per-flush acknowledgements, a thread-safe connection
+  pool with automatic reconnect/failover, and row, column, Arrow
+  `RecordBatch` and Polars `DataFrame` input. For queries
+  (`Reader::from_conf` or `QuestDb::borrow_reader`): SQL execution with
+  results streamed back as columnar batches. Requires QuestDB 9.4.3+.
+* `http::addr=...` / `https::addr=...` — ILP request-response, errors
+  returned to the client, supports authentication and TLS.
+* `tcp::addr=...` / `tcps::addr=...` — ILP streaming, legacy; errors cause
   server-side disconnect and surface only in server logs.
 * `qwpudp::addr=...` — best-effort UDP datagrams (IPv4-only); no
   acknowledgements, no authentication, no TLS, no transactional guarantees.
@@ -26,10 +43,10 @@ The transport is selected by the scheme in the configuration string:
   module docs (in particular `Protocol::QwpUdp`) for semantics and
   configuration parameters.
 
-## Protocol Versions
+## ILP Protocol Versions
 
 The library supports the following ILP protocol versions. These apply to
-ILP/HTTP and ILP/TCP only — QWP/UDP uses its own wire format and is not
+ILP/HTTP and ILP/TCP only — QWP uses its own wire format and is not
 versioned through this mechanism.
 
 * If you use HTTP and `protocol_version=auto` or unset, the library will
@@ -41,8 +58,8 @@ versioned through this mechanism.
 
 | Version | Description                                             | Server Compatibility   |
 | ------- | ------------------------------------------------------- | --------------------- |
-| **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
-| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 9.0.0+ (2023-10-30)   |
+| **1**   | Over HTTP it's compatible with InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
+| **2**   | 64-bit floats sent as binary, adds n-dimensional arrays      | 9.0.0+ (2025-07-11)   |
 
 **Note**: QuestDB server version 9.0.0 or later is required for `protocol_version=2` support.
 
@@ -54,8 +71,52 @@ To start using `questdb-rs`, add it as a dependency of your project:
 cargo add questdb-rs
 ```
 
-Then you can try out this quick example, which connects to a QuestDB server
-running on your local machine:
+### QWP: the `QuestDb` connection pool
+
+`QuestDb` is the entry point for QWP/WebSocket (QuestDB 9.4.3+): one
+thread-safe pool covering both writes and reads. A Polars round trip (with
+the `polars` feature):
+
+```rust ignore
+use questdb::{QuestDb, ingress::polars::PolarsIngestOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = QuestDb::connect("ws::addr=localhost:9000;")?;
+
+    // One call: stream the DataFrame in columnar batches, wait for the ack.
+    db.flush_polars_dataframe("trades", &df, &PolarsIngestOptions::new())?;
+
+    // Query it back over the same pool.
+    let back = db
+        .borrow_reader()?
+        .execute("SELECT * FROM trades WHERE amount > 0.001")?
+        .fetch_all_polars()?;
+    println!("{back}");
+    Ok(())
+}
+```
+
+The pool's main handles:
+
+* `db.flush_polars_dataframe(table, &df, &options)` — one-call `DataFrame`
+  ingestion (`polars` feature).
+* `db.flush_arrow_batch(table, &batch, ts_column, overrides, ack)` —
+  one-call Arrow `RecordBatch` ingestion (`arrow` feature).
+* `db.borrow_column_sender()` — columnar streaming: fill a `Chunk` column by
+  column, `flush` it, reuse the allocation.
+* `db.borrow_row_sender()` — row-by-row ingestion with the familiar
+  `Buffer` API (`table(..).symbol(..).column_f64(..).at(..)`).
+* `db.borrow_reader()` — run SQL and stream the result set back.
+
+Handles return to the pool on drop; the pool reconnects and fails over
+across `addr=host-a:9000,host-b:9000` endpoint lists transparently.
+
+A standalone `Reader::from_conf("ws::addr=...")` gives the query side
+without a pool (`sync-reader-qwp-ws` feature), yielding results as native
+columnar batches, Arrow `RecordBatch`es (`cursor.next_arrow_batch()`) or
+Polars `DataFrame`s (`cursor.fetch_all_polars()`).
+
+### ILP over HTTP
 
 ```rust ignore
 use questdb::{
@@ -87,7 +148,10 @@ fn main() -> Result<()> {
 ## Docs
 
 Most of the client documentation is on the
-[`ingress`](https://docs.rs/questdb-rs/7.0.0/questdb/ingress/) module page.
+[`ingress`](https://docs.rs/questdb-rs/7.0.0/questdb/ingress/) module page
+for writing data, and the
+[`egress`](https://docs.rs/questdb-rs/7.0.0/questdb/egress/) module page for
+querying it back.
 
 ## Examples
 
@@ -102,6 +166,9 @@ A selection of usage examples is available in the [examples directory](https://g
 | [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
 | [`http.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
 | [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
+| [`qwp_ws_l1_quotes.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/qwp_ws_l1_quotes.rs) | Columnar ingestion over QWP/WebSocket via the `QuestDb` connection pool. |
+| [`qwp_egress_read.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/qwp_egress_read.rs) | Runs a SQL query and streams the result set over QWP/WebSocket. |
+| [`polars.rs`](https://github.com/questdb/c-questdb-client/blob/7.0.0/questdb-rs/examples/polars.rs) | Round trip: ingests a Polars `DataFrame` and queries it back as one. |
 
 ## Crate features
 
@@ -116,6 +183,10 @@ The crate provides several optional features to enable additional functionality.
 
 ### Optional features
 
+- **sync-sender-qwp-ws**: Enables QWP/WebSocket ingestion (`QuestDb` pool, row and column senders).
+- **sync-reader-qwp-ws**: Enables QWP/WebSocket queries (`Reader` / `Cursor`).
+- **arrow**: Apache Arrow integration in both directions — ingest `RecordBatch`es, read query results as `RecordBatch`es. Also available as the single-direction `arrow-ingress` / `arrow-egress` features.
+- **polars**: Polars integration in both directions — ingest `DataFrame`s, read query results as `DataFrame`s. Also available as `polars-ingress` / `polars-egress`.
 - **chrono-timestamp**: Allows specifying timestamps as `chrono::DateTime` objects. Depends on the `chrono` crate.
 - **tls-native-certs**: Uses OS-provided root TLS certificates for secure connections. Depends on the `rustls-native-certs` crate.
 - **insecure-skip-verify**: Allows skipping verification of insecure certificates (not recommended for production).
