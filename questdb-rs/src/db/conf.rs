@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-//! Column-sender connect-string parsing.
+//! [`crate::QuestDb`] pool connect-string parsing (shared by the column-major sender, row-major sender, and reader borrow kinds).
 //!
 //! Extracts pool-specific keys (`pool_size`, `pool_max`,
 //! `pool_idle_timeout_ms`, `pool_reap`), detects explicit
@@ -88,7 +88,7 @@ pub(crate) struct ParsedConf {
     pub(crate) sf_disk: bool,
 }
 
-/// Validate and extract pool-specific knobs from a column-sender connect
+/// Validate and extract pool-specific knobs from a QuestDb pool connect
 /// string.
 ///
 /// The conf string itself is **not** rewritten — the underlying
@@ -100,14 +100,14 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
     let Some((service, params)) = conf.split_once("::") else {
         return Err(error::fmt!(
             ConfigError,
-            "Invalid column-sender config: missing '::' service separator"
+            "Invalid QuestDb pool config: missing '::' service separator"
         ));
     };
 
     if !is_qwp_ws_schema(service) {
         return Err(error::fmt!(
             ConfigError,
-            "Column-sender requires a QWP/WebSocket connect string \
+            "The QuestDb pool requires a QWP/WebSocket connect string \
              (schema must be one of 'qwpws', 'qwpwss', 'ws', or 'wss', \
              got {:?})",
             service
@@ -136,7 +136,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
             "qwp_ws_progress" if value != "background" => {
                 return Err(error::fmt!(
                     ConfigError,
-                    "Column-sender requires \"qwp_ws_progress=background\" (got {:?})",
+                    "The QuestDb pool requires \"qwp_ws_progress=background\" (got {:?})",
                     value
                 ));
             }
@@ -189,7 +189,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
             other if other.starts_with("pool_") => {
                 return Err(error::fmt!(
                     ConfigError,
-                    "Unknown column-sender pool config key {:?}",
+                    "Unknown pool config key {:?}",
                     other
                 ));
             }
@@ -211,7 +211,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         if pool_size_specified && pool.pool_size > 1 {
             return Err(error::fmt!(
                 ConfigError,
-                "Column-sender store-and-forward supports only \"pool_size=1\" \
+                "The QuestDb pool store-and-forward mode supports only \"pool_size=1\" \
                  in v1 (got {})",
                 pool.pool_size
             ));
@@ -219,7 +219,7 @@ pub(crate) fn parse(conf: &str) -> Result<ParsedConf> {
         if pool_max_specified && pool.pool_max > 1 {
             return Err(error::fmt!(
                 ConfigError,
-                "Column-sender store-and-forward supports only \"pool_max=1\" \
+                "The QuestDb pool store-and-forward mode supports only \"pool_max=1\" \
                  in v1 (got {})",
                 pool.pool_max
             ));
@@ -299,7 +299,7 @@ where
         let Some(eq_rel) = params[pos..].find('=') else {
             return Err(error::fmt!(
                 ConfigError,
-                "Invalid column-sender config: parameter without '=' at position {}",
+                "Invalid QuestDb pool config: parameter without '=' at position {}",
                 pos
             ));
         };
@@ -450,14 +450,14 @@ mod tests {
     #[test]
     fn ignores_unknown_keys() {
         // Unknown keys are passed through to the underlying SenderBuilder,
-        // which silently ignores its own unknowns. The column-sender layer
+        // which silently ignores its own unknowns. The pool config layer
         // must not error on them either.
         let _ = parse_ok("qwpws::addr=localhost:9000;auth_timeout=5000;some_future_key=value;");
     }
 
     #[test]
     fn parses_request_durable_ack() {
-        // Syntactically valid values pass the column-sender's pre-check.
+        // Syntactically valid values pass the pool config pre-check.
         // The actual `durable_ack_opt_in` flag is sourced from the
         // SenderBuilder inside `ColumnConn::connect`.
         let _ = parse_ok("qwpws::addr=localhost:9000;");

@@ -77,10 +77,15 @@ use crate::ingress::{QwpWsConnector, RawQwpWsRoundStream, ReconnectReason};
 use crate::ingress::{reconnect_backoff_step, reconnect_error_is_terminal};
 use crate::{Result, error};
 
+/// Connect-string parsing for the [`QuestDb`] pool. Shared by every borrow
+/// kind (column-major sender, row-major sender, reader), so it lives with the
+/// pool rather than under the column sender.
+mod conf;
+
 use crate::ingress::AckLevel;
 use crate::ingress::column_sender::ColumnSender;
-use crate::ingress::column_sender::conf::{self, PoolReap};
 use crate::ingress::column_sender::conn::ColumnConn;
+use conf::PoolReap;
 
 /// FFI escape-hatch surface: owned (lifetime-free) pool handles and the entry
 /// points that mint them, for the `questdb-rs-ffi` C-ABI crate. Hidden,

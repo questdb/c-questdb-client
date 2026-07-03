@@ -55,7 +55,6 @@
 #[cfg(feature = "arrow-ingress")]
 mod arrow_batch;
 mod chunk;
-pub(crate) mod conf;
 pub(crate) mod conn;
 pub(crate) mod encoder;
 mod numpy_wire;
