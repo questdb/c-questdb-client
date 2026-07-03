@@ -67,7 +67,6 @@ pub use arrow_batch::ArrowColumnOverride;
 pub use chunk::Chunk;
 #[cfg(feature = "arrow-ingress")]
 pub use chunk::ImportedArrowColumn;
-pub use chunk::TimestampUnit;
 pub use numpy_wire::NumpyDtype;
 pub use sender::ColumnSender;
 pub use validity::Validity;

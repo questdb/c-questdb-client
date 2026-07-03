@@ -41,6 +41,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
 use std::slice;
 
+use crate::ingress::TimestampUnit;
 use crate::{Result, error};
 
 #[cfg(feature = "arrow-ingress")]
@@ -568,18 +569,6 @@ impl DesignatedTsUnit {
 pub(crate) struct DesignatedTsDescriptor {
     pub(crate) unit: DesignatedTsUnit,
     pub(crate) data: *const i64,
-}
-
-/// Precision of a timestamp column, selecting the QWP wire type used by
-/// [`Chunk::column_ts`]: [`TimestampUnit::Micros`] maps to `TIMESTAMP` and
-/// [`TimestampUnit::Nanos`] to `TIMESTAMP_NANOS`. Column values are
-/// Unix-epoch integers in the chosen unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimestampUnit {
-    /// Microseconds since the Unix epoch (QWP wire type `TIMESTAMP`).
-    Micros,
-    /// Nanoseconds since the Unix epoch (QWP wire type `TIMESTAMP_NANOS`).
-    Nanos,
 }
 
 // ===========================================================================

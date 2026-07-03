@@ -39,10 +39,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use questdb::QuestDb;
 use questdb::ffi_support::OwnedColumnSender;
-use questdb::ingress::AckLevel;
 #[cfg(feature = "arrow")]
 use questdb::ingress::column_sender::{ArrowColumnOverride, ImportedArrowColumn};
-use questdb::ingress::column_sender::{Chunk, NumpyDtype, TimestampUnit, Validity};
+use questdb::ingress::column_sender::{Chunk, NumpyDtype, Validity};
+use questdb::ingress::{AckLevel, TimestampUnit};
 use questdb::ingress::{MAX_ARRAY_DIMS, MAX_NDARRAY_LEAF_ELEMS};
 use questdb::{Error, ErrorCode};
 

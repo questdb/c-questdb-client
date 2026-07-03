@@ -1331,9 +1331,10 @@ unsafe fn write_qwp_bitmap_from_validity(out: &mut Vec<u8>, v: &ValidityDescript
 #[cfg(test)]
 mod tests {
     use super::super::Validity;
-    use super::super::chunk::{Chunk, TimestampUnit};
+    use super::super::chunk::Chunk;
     use super::super::encoder::{EncodeScratch, encode_chunk_into};
     use super::*;
+    use crate::ingress::TimestampUnit;
     use crate::ingress::buffer::SymbolGlobalDict;
 
     fn encode(chunk: &Chunk<'_>) -> Vec<u8> {

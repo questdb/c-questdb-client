@@ -88,6 +88,20 @@ pub enum AckLevel {
     Durable,
 }
 
+/// Precision of a timestamp column, selecting the QWP wire type used by
+/// [`Chunk::column_ts`](crate::ingress::column_sender::Chunk::column_ts):
+/// [`TimestampUnit::Micros`] maps to `TIMESTAMP` and [`TimestampUnit::Nanos`]
+/// to `TIMESTAMP_NANOS`. Column values are Unix-epoch integers in the chosen
+/// unit.
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimestampUnit {
+    /// Microseconds since the Unix epoch (QWP wire type `TIMESTAMP`).
+    Micros,
+    /// Nanoseconds since the Unix epoch (QWP wire type `TIMESTAMP_NANOS`).
+    Nanos,
+}
+
 #[cfg(feature = "polars-ingress")]
 pub mod polars;
 

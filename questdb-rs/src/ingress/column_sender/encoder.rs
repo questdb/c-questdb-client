@@ -1154,7 +1154,8 @@ fn is_valid_row(validity: Option<&ValidityDescriptor>, i: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingress::column_sender::{TimestampUnit, Validity};
+    use crate::ingress::TimestampUnit;
+    use crate::ingress::column_sender::Validity;
 
     fn make_chunk_i64(name: &str, data: &[i64]) -> Vec<u8> {
         let mut chunk = Chunk::new("trades");
