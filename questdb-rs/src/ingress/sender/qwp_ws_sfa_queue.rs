@@ -236,6 +236,7 @@ pub(crate) struct SfaFrameQueue {
     engine: Arc<SfaEngine>,
     producer: Option<SfaProducer>,
     ack_watermark: Option<SfaAckWatermark>,
+    received_fsn: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -373,6 +374,7 @@ impl SfaFrameQueue {
             engine,
             producer,
             ack_watermark: recovered_completion.ack_watermark,
+            received_fsn: None,
         })
     }
 
@@ -436,6 +438,7 @@ impl SfaFrameQueue {
             engine,
             producer,
             ack_watermark: None,
+            received_fsn: None,
         })
     }
 
@@ -491,6 +494,7 @@ impl SfaFrameQueue {
             engine,
             producer: None,
             ack_watermark: recovered_completion.ack_watermark,
+            received_fsn: None,
         })
     }
 
@@ -532,6 +536,16 @@ impl SfaFrameQueue {
     pub(crate) fn persist_completed_fsn(&mut self, fsn: u64) {
         if let Some(ack_watermark) = self.ack_watermark.as_mut() {
             ack_watermark.persist_completed_fsn(fsn);
+        }
+    }
+
+    pub(crate) fn received_fsn(&self) -> Option<u64> {
+        self.received_fsn
+    }
+
+    pub(crate) fn persist_received_fsn(&mut self, fsn: u64) {
+        if self.received_fsn.is_none_or(|cur| fsn > cur) {
+            self.received_fsn = Some(fsn);
         }
     }
 
@@ -2082,6 +2096,19 @@ mod tests {
         ));
         queue.complete_through_fsn(0).unwrap();
         assert_eq!(queue.try_submit(b"third").unwrap().fsn, 2);
+    }
+
+    #[test]
+    fn received_fsn_advances_monotonically_and_independently_of_completed() {
+        let mut queue = memory_queue();
+        assert_eq!(queue.received_fsn(), None);
+        queue.persist_received_fsn(3);
+        assert_eq!(queue.received_fsn(), Some(3));
+        queue.persist_received_fsn(2); // stale — must not regress
+        assert_eq!(queue.received_fsn(), Some(3));
+        queue.persist_received_fsn(5);
+        assert_eq!(queue.received_fsn(), Some(5));
+        assert_eq!(queue.completed_fsn(), None); // received is independent of durable
     }
 
     #[test]
