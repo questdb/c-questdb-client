@@ -226,6 +226,7 @@ struct QwpWsPendingConnect {
 #[derive(Debug, Clone, Copy)]
 enum RunnerColdEffect {
     Event(DriverEvent),
+    ReceivedThrough { fsn: u64, wire_seq: u64 },
     CompletedThrough { fsn: u64, wire_seq: u64 },
 }
 
@@ -449,6 +450,13 @@ where
         let store = self.lock_shared()?;
         check_store_error(&store)?;
         Ok(store.completed_fsn())
+    }
+
+    fn received_fsn(&self) -> crate::Result<Option<u64>> {
+        self.check_error()?;
+        let store = self.lock_shared()?;
+        check_store_error(&store)?;
+        Ok(store.received_fsn())
     }
 
     fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
@@ -943,6 +951,10 @@ where
     fn enqueue_hot_response_events(&mut self, events: Vec<DriverEvent>) {
         for event in events {
             match event {
+                DriverEvent::ReceivedThrough { fsn, wire_seq } => {
+                    self.cold_effects
+                        .push_back(RunnerColdEffect::ReceivedThrough { fsn, wire_seq });
+                }
                 DriverEvent::CompletedThrough { fsn, wire_seq } => {
                     self.cold_effects
                         .push_back(RunnerColdEffect::CompletedThrough { fsn, wire_seq });
@@ -1200,6 +1212,9 @@ where
         while let Some(effect) = self.cold_effects.pop_front() {
             match effect {
                 RunnerColdEffect::Event(event) => store.record_driver_event(event),
+                RunnerColdEffect::ReceivedThrough { fsn, wire_seq } => {
+                    store.record_received_through_event(fsn, wire_seq);
+                }
                 RunnerColdEffect::CompletedThrough { fsn, wire_seq } => {
                     store.record_completed_through_event(fsn, wire_seq);
                 }
@@ -2884,6 +2899,12 @@ pub(crate) fn qwp_ws_acked_fsn_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<Option<u64>> {
     state.runner.acked_fsn()
+}
+
+pub(crate) fn qwp_ws_received_fsn_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    state.runner.received_fsn()
 }
 
 pub(crate) fn qwp_ws_published_fsn_manual(

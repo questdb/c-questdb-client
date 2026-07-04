@@ -4513,3 +4513,108 @@ fn server_cap_one_byte_below_encoded_len_rejects_flush_in_all_progress_modes() {
         );
     }
 }
+
+#[test]
+fn qwp_ws_received_fsn_advances_on_ok_before_durable_ack_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (allow_ack_tx, allow_ack_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let _request_lines = upgrade_mock_stream_with_durable_ack(&mut stream, true);
+
+            // Read the QWP frame and respond with an Ok (received, not durable ACK).
+            loop {
+                let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+                if opcode == 0x9 {
+                    // Ping from keepalive — reply with pong and loop.
+                    write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
+                    continue;
+                }
+                assert_eq!(opcode, 0x2, "mode={}", progress.name());
+                assert_eq!(&payload[0..4], b"QWP1");
+                write_qwp_ok_response_with_table_entries(
+                    &mut stream,
+                    FIRST_WIRE_SEQUENCE,
+                    &[("trades", 10)],
+                )
+                .unwrap();
+                break;
+            }
+
+            // Hold off sending DurableAck until the test allows it.
+            allow_ack_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        });
+
+        let conf = format!(
+            "qwpws::addr=127.0.0.1:{port};\
+             qwp_ws_progress={};\
+             request_durable_ack=on;\
+             durable_ack_keepalive_interval_millis=1;",
+            progress.name()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(fsn, 0, "mode={}", progress.name());
+
+        // Before Ok is processed, received_fsn should be None (or possibly Some if
+        // the background thread is very fast — but we verify None→Some via await_received).
+        let before = sender.received_fsn().unwrap();
+        assert!(
+            before.is_none(),
+            "mode={}: expected None before Ok, got {:?}",
+            progress.name(),
+            before
+        );
+
+        // await_received drives transport (manual mode) or polls (background mode)
+        // until the server's Ok advances the received watermark.
+        assert!(
+            sender
+                .await_received(fsn, Duration::from_secs(10))
+                .unwrap(),
+            "mode={}",
+            progress.name()
+        );
+        assert_eq!(
+            sender.received_fsn().unwrap(),
+            Some(fsn),
+            "mode={}",
+            progress.name()
+        );
+        // Durable ACK has NOT been sent yet — acked_fsn must still be None.
+        assert_eq!(
+            sender.acked_fsn().unwrap(),
+            None,
+            "mode={}",
+            progress.name()
+        );
+
+        // Release DurableAck so the server thread can exit cleanly.
+        allow_ack_tx.send(()).unwrap();
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+}

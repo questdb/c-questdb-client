@@ -113,11 +113,27 @@ Server rejections fall into two categories:
 
 `flush()` returns once the frame has been appended to the local publication
 log; the FSN is also available via
-[`flush_and_get_fsn()`](Sender::flush_and_get_fsn). To wait for the server
-to durably acknowledge a specific FSN, call
-[`sender.await_acked_fsn()`](Sender::await_acked_fsn).
-[`sender.published_fsn()`](Sender::published_fsn) and
-[`sender.acked_fsn()`](Sender::acked_fsn) provide non-blocking polls.
+[`flush_and_get_fsn()`](Sender::flush_and_get_fsn).
+
+The server lifecycle for a published frame has two observable watermarks:
+
+- **received** — the server has responded with an OK to the frame, meaning it
+  has been received and is being processed. In non-durable mode this is also
+  the final acknowledgement. Poll with
+  [`sender.received_fsn()`](Sender::received_fsn) or wait with
+  [`sender.await_received()`](Sender::await_received).
+
+- **acked** — the server has durably committed the frame (durable ACK mode)
+  or acknowledged it (non-durable mode). In durable ACK mode this watermark
+  can lag significantly behind **received**. Poll with
+  [`sender.acked_fsn()`](Sender::acked_fsn) or wait with
+  [`sender.await_acked_fsn()`](Sender::await_acked_fsn).
+
+In non-durable mode both watermarks advance together. In durable ACK mode
+`received_fsn` advances as soon as the server OK's a frame, while `acked_fsn`
+only advances once the server confirms durable storage.
+[`sender.published_fsn()`](Sender::published_fsn) provides a non-blocking poll
+for the highest FSN submitted to the local publication log.
 
 In `manual` progress mode no background thread observes the transport.
 Server-side state — including halts — only becomes visible when the user

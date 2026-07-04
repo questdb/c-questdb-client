@@ -643,6 +643,65 @@ impl Sender {
         }
     }
 
+    /// Return the highest frame sequence number acknowledged by a server OK
+    /// response, or `None` if no frame has been received yet.
+    ///
+    /// In QWP/WebSocket durable ACK mode, ordinary OK frames advance this
+    /// watermark earlier than [`Sender::acked_fsn`]; durable ACK coverage is
+    /// tracked separately. In non-durable mode the two watermarks advance
+    /// together. Returns `Ok(None)` if no frame has been received.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn received_fsn(&self) -> Result<Option<u64>> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_received_fsn_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_received_fsn_manual(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "received_fsn is only supported for QWP/WebSocket senders."
+            )),
+        }
+    }
+
+    /// Wait until the QWP/WebSocket received watermark reaches `fsn`.
+    ///
+    /// The watermark advances when the server responds with an OK frame,
+    /// which happens earlier than durable ACK coverage in durable ACK mode.
+    /// Returns `Ok(true)` if the watermark is reached before `timeout`, and
+    /// `Ok(false)` on timeout. In manual progress mode this method also
+    /// drives WebSocket progress while waiting.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn await_received(&mut self, fsn: u64, timeout: Duration) -> Result<bool> {
+        if !matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "await_received is only supported for QWP/WebSocket senders."
+            ));
+        }
+
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            if self.received_fsn()?.is_some_and(|received| received >= fsn) {
+                return Ok(true);
+            }
+            if qwp_ws_deadline_expired(deadline) {
+                return Ok(false);
+            }
+
+            match &mut self.handler {
+                SyncProtocolHandler::ManualQwpWs(state) => {
+                    if !qwp_ws_drive_once(state)? {
+                        qwp_ws_sleep_until(deadline);
+                    }
+                }
+                SyncProtocolHandler::SyncQwpWs(_) => qwp_ws_sleep_until(deadline),
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            }
+        }
+    }
+
     /// Poll the next structured QWP/WebSocket server error observed by this
     /// sender.
     ///

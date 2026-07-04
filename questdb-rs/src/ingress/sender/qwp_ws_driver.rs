@@ -1035,16 +1035,23 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .complete_through_fsn(fsn)
             .map_err(DriverError::from)?;
         self.send_cursor.ack_through(fsn);
-        let event = advanced.then_some(DriverEvent::CompletedThrough {
+        // In non-durable mode, received and completed advance together.
+        let mut events = vec![DriverEvent::ReceivedThrough {
             fsn,
             wire_seq: ack_wire_seq,
-        });
-        Ok(QwpWsHotResponseProgress::from_optional_event(
-            DriveOutcome::Acked {
+        }];
+        if advanced {
+            events.push(DriverEvent::CompletedThrough {
+                fsn,
+                wire_seq: ack_wire_seq,
+            });
+        }
+        Ok(QwpWsHotResponseProgress {
+            outcome: DriveOutcome::Acked {
                 wire_seq: ack_wire_seq,
             },
-            event,
-        ))
+            events,
+        })
     }
 
     pub(crate) fn finish_durable_ok_response_sfa(
@@ -1060,13 +1067,22 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         let Some((fsn, ack_wire_seq)) = self.send_cursor.ack_fsn_for_wire_seq(wire_seq)? else {
             return Ok(QwpWsHotResponseProgress::idle());
         };
+        // Server has received (OK'd) this frame — advance the received watermark
+        // regardless of whether durable ACK coverage follows immediately.
+        let received_event = DriverEvent::ReceivedThrough {
+            fsn,
+            wire_seq: ack_wire_seq,
+        };
         if self
             .durable_ack
             .as_ref()
             .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
         {
             self.send_cursor.ack_through(fsn);
-            return Ok(QwpWsHotResponseProgress::idle());
+            return Ok(QwpWsHotResponseProgress {
+                outcome: DriveOutcome::Idle,
+                events: vec![received_event],
+            });
         }
         if progress
             .completed_fsn()
@@ -1077,14 +1093,16 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 outcome: DriveOutcome::Acked {
                     wire_seq: ack_wire_seq,
                 },
-                events: Vec::new(),
+                events: vec![received_event],
             });
         }
 
         self.send_cursor.ack_through(fsn);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
         tracker.enqueue_ok(ack_wire_seq, fsn, table_seq_txns);
-        self.complete_ready_durable_sfa(progress)
+        let mut result = self.complete_ready_durable_sfa(progress)?;
+        result.events.insert(0, received_event);
+        Ok(result)
     }
 
     pub(crate) fn finish_durable_ack_response_sfa(
