@@ -4618,3 +4618,230 @@ fn qwp_ws_received_fsn_advances_on_ok_before_durable_ack_in_all_progress_modes()
         server.join().unwrap();
     }
 }
+
+/// Non-durable mode: the server OKs three frames. In non-durable mode the OK
+/// *is* the completion, so `received_fsn` must advance together with the
+/// completed watermark (`acked_fsn`), and the ordering invariant
+/// `completed <= received <= published` must hold after every frame.
+#[test]
+fn qwp_ws_received_never_lags_completed_and_never_leads_published_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, handle) = spawn_ack_each_frame_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        // Publish and complete three frames, checking the invariant at each step.
+        let mut last_fsn = None;
+        for expected_fsn in 0..3u64 {
+            let mut buf = sender.new_buffer();
+            buf.table("trades")
+                .unwrap()
+                .column_i64("qty", expected_fsn as i64)
+                .unwrap()
+                .at_now()
+                .unwrap();
+            let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+            assert_eq!(fsn, expected_fsn, "mode={}", progress.name());
+
+            // Wait for the OK — which is the completion in non-durable mode.
+            assert!(
+                sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap(),
+                "mode={}",
+                progress.name()
+            );
+
+            let completed = sender.acked_fsn().unwrap();
+            let received = sender.received_fsn().unwrap();
+            let published = sender.published_fsn().unwrap();
+
+            // Invariant: completed <= received <= published, after every frame.
+            assert!(
+                completed <= received,
+                "mode={}: completed {:?} must not lead received {:?}",
+                progress.name(),
+                completed,
+                received
+            );
+            assert!(
+                received <= published,
+                "mode={}: received {:?} must not lead published {:?}",
+                progress.name(),
+                received,
+                published
+            );
+
+            // Non-durable mode: the OK is the completion, so received == completed.
+            assert_eq!(
+                received,
+                completed,
+                "mode={}: received must equal completed in non-durable mode",
+                progress.name()
+            );
+            assert_eq!(received, Some(fsn), "mode={}", progress.name());
+            last_fsn = Some(fsn);
+        }
+
+        assert_eq!(last_fsn, Some(2));
+        assert_eq!(sender.received_fsn().unwrap(), Some(2));
+        assert_eq!(sender.acked_fsn().unwrap(), Some(2));
+        assert_eq!(sender.published_fsn().unwrap(), Some(2));
+
+        drop(sender);
+        let binary_frames = handle.join().unwrap();
+        assert_eq!(binary_frames, 3, "mode={}", progress.name());
+    }
+}
+
+/// Durable mode, poison-frame case: the server OKs+durably-ACKs frame 0 and
+/// then drop-and-continue-rejects frame 1 (the highest, last frame). The
+/// drop-and-continue reject advances the *completed* watermark to the rejected
+/// frame so the stream can continue. `received_fsn` must advance to that same
+/// rejected frame — if it did not, `completed` would lead `received` and any
+/// consumer gating on the received (L2) watermark would stall forever on the
+/// poison frame. This isolates the reject path: no later OK exists to pull the
+/// received watermark past the reject, so only advancing `received` on the
+/// reject itself can satisfy the invariant `completed <= received <= published`.
+#[test]
+fn qwp_ws_received_advances_past_drop_and_continue_reject_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            upgrade_mock_stream_with_durable_ack(&mut stream, true);
+
+            let mut binary_frames = 0usize;
+            // Drive the connection until both frames have been responded to.
+            while binary_frames < 2 {
+                let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+                match opcode {
+                    0x9 => {
+                        // Keepalive ping — pong and continue.
+                        write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
+                    }
+                    0x2 => {
+                        assert_eq!(&payload[0..4], b"QWP1");
+                        if binary_frames == 0 {
+                            // Frame 0: OK then durable ACK.
+                            write_qwp_ok_response_with_table_entries(
+                                &mut stream,
+                                FIRST_WIRE_SEQUENCE,
+                                &[("trades", 10)],
+                            )
+                            .unwrap();
+                            write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+                        } else {
+                            // Frame 1 (last): drop-and-continue reject (schema mismatch).
+                            // No later frame follows to pull the received watermark
+                            // forward, so received can only reach fsn 1 if the reject
+                            // itself advances it.
+                            write_qwp_error_response(
+                                &mut stream,
+                                QWP_STATUS_SCHEMA_MISMATCH,
+                                FIRST_WIRE_SEQUENCE + 1,
+                                b"bad schema",
+                            )
+                            .unwrap();
+                        }
+                        binary_frames += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        });
+
+        let conf = format!(
+            "qwpws::addr=127.0.0.1:{port};\
+             qwp_ws_progress={};\
+             request_durable_ack=on;\
+             durable_ack_keepalive_interval_millis=1;",
+            progress.name()
+        );
+        let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+
+        // Frame 0 — will be OK'd and durably ACK'd.
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let first_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(first_fsn, 0, "mode={}", progress.name());
+
+        // Frame 1 (last) — will be drop-and-continue rejected.
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        let second_fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        assert_eq!(second_fsn, 1, "mode={}", progress.name());
+
+        // The drop-and-continue reject advances the completed watermark to the
+        // rejected frame so the stream continues.
+        assert!(
+            sender
+                .await_acked_fsn(second_fsn, Duration::from_secs(10))
+                .unwrap(),
+            "mode={}",
+            progress.name()
+        );
+
+        // The received watermark must ALSO reach the rejected frame — a poison
+        // frame must never leave received lagging completed.
+        assert!(
+            sender
+                .await_received(second_fsn, Duration::from_secs(10))
+                .unwrap(),
+            "mode={}: received_fsn stalled on the rejected (poison) frame",
+            progress.name()
+        );
+        assert_eq!(
+            sender.received_fsn().unwrap(),
+            Some(second_fsn),
+            "mode={}",
+            progress.name()
+        );
+
+        // Invariant: completed <= received <= published.
+        let completed = sender.acked_fsn().unwrap();
+        let received = sender.received_fsn().unwrap();
+        let published = sender.published_fsn().unwrap();
+        assert!(
+            completed <= received,
+            "mode={}: completed {:?} must not lead received {:?}",
+            progress.name(),
+            completed,
+            received
+        );
+        assert!(
+            received <= published,
+            "mode={}: received {:?} must not lead published {:?}",
+            progress.name(),
+            received,
+            published
+        );
+        assert_eq!(received, Some(second_fsn), "mode={}", progress.name());
+        assert_eq!(completed, Some(second_fsn), "mode={}", progress.name());
+
+        // The reject surfaced as a drop-and-continue error.
+        let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
+        assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+
+        done_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+}

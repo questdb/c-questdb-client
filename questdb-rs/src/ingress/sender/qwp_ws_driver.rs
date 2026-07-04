@@ -412,13 +412,47 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     pub(crate) fn record_received_through_event(&mut self, fsn: u64, wire_seq: u64) {
+        // Emit `ReceivedThrough` only when the received watermark actually
+        // advances, mirroring how `complete_through` gates `CompletedThrough` on
+        // the completed watermark advancing. A stale OK/reject for an already
+        // received fsn (e.g. a redundant cumulative ack) persists nothing new and
+        // must not emit a duplicate progress event. `persist_received_fsn` is
+        // monotonic, so comparing before/after is sufficient.
+        let before = self.queue.received_fsn();
         self.queue.persist_received_fsn(fsn);
-        self.push_event(DriverEvent::ReceivedThrough { fsn, wire_seq });
+        let advanced = self.queue.received_fsn() != before;
+        self.debug_assert_watermark_ordering();
+        if advanced {
+            self.push_event(DriverEvent::ReceivedThrough { fsn, wire_seq });
+        }
     }
 
     pub(crate) fn record_completed_through_event(&mut self, fsn: u64, wire_seq: u64) {
         self.queue.persist_completed_fsn(fsn);
+        self.debug_assert_watermark_ordering();
         self.push_event(DriverEvent::CompletedThrough { fsn, wire_seq });
+    }
+
+    /// Driver-level guard for the L1/L2 watermark ordering invariant
+    /// `completed_fsn <= received_fsn <= published_fsn`. Every completion (an OK
+    /// in non-durable mode, a durable ACK in durable mode, or a drop-and-continue
+    /// reject) must have advanced the received watermark at the same site, and
+    /// nothing is received before it is published. Enforced in debug/test builds
+    /// where the sender test suite runs; compiled out in release.
+    #[inline]
+    fn debug_assert_watermark_ordering(&self) {
+        debug_assert!(
+            watermark_le(self.queue.completed_fsn(), self.queue.received_fsn()),
+            "watermark invariant violated: completed_fsn {:?} must not lead received_fsn {:?}",
+            self.queue.completed_fsn(),
+            self.queue.received_fsn(),
+        );
+        debug_assert!(
+            watermark_le(self.queue.received_fsn(), self.queue.published_fsn()),
+            "watermark invariant violated: received_fsn {:?} must not lead published_fsn {:?}",
+            self.queue.received_fsn(),
+            self.queue.published_fsn(),
+        );
     }
 
     pub(crate) fn record_driver_event(&mut self, event: DriverEvent) {
@@ -746,6 +780,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     );
                 }
 
+                // A drop-and-continue reject advances the completed watermark
+                // past the poisoned frame so the stream continues. The received
+                // watermark must advance with it, otherwise `completed` would
+                // lead `received` and stall any consumer gating on the received
+                // (L2) watermark. Mirror completed at the same site.
+                store.record_received_through_event(fsn, wire_seq);
                 self.complete_through(store, fsn, wire_seq)?;
                 store.record_rejected_frame(fsn, wire_seq, error, policy);
                 store.push_event(DriverEvent::Rejected { fsn, wire_seq });
@@ -845,6 +885,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         let Some((fsn, ack_wire_seq)) = self.send_cursor.ack_fsn_for_wire_seq(wire_seq)? else {
             return Ok(DriveOutcome::Idle);
         };
+        // Non-durable Ok is the completion: the server OK both receives and
+        // completes the frame, so the received watermark advances together with
+        // the completed watermark. Mirrors the SFA path in
+        // `finish_ack_response_sfa`, which emits `ReceivedThrough` alongside the
+        // completion.
+        store.record_received_through_event(fsn, ack_wire_seq);
         self.complete_through(store, fsn, ack_wire_seq)
     }
 
@@ -918,6 +964,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                     highest_resolved_wire_seq = Some(completion.wire_seq);
                 }
                 DurableResolvedFrame::Rejected { wire_seq, fsn } => {
+                    // Drop-and-continue reject completes the poisoned frame. Its
+                    // OK never advanced the received watermark (there was no OK
+                    // — the server rejected it), so mirror the completed advance
+                    // here to keep `received >= completed`. The `Ok` arm above
+                    // already recorded received when its OK first arrived
+                    // (`apply_durable_ok`/`finish_durable_ok_response_sfa`), so
+                    // it must not record it again.
+                    store.record_received_through_event(fsn, wire_seq);
                     self.complete_through(store, fsn, wire_seq)?;
                     highest_resolved_wire_seq = Some(wire_seq);
                 }
@@ -1128,10 +1182,21 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .as_mut()
             .and_then(DurableAckTracker::pop_ready)
         {
-            let (wire_seq, fsn) = match resolved {
-                DurableResolvedFrame::Ok(completion) => (completion.wire_seq, completion.fsn),
-                DurableResolvedFrame::Rejected { wire_seq, fsn } => (wire_seq, fsn),
+            let (wire_seq, fsn, is_rejected) = match resolved {
+                DurableResolvedFrame::Ok(completion) => {
+                    (completion.wire_seq, completion.fsn, false)
+                }
+                DurableResolvedFrame::Rejected { wire_seq, fsn } => (wire_seq, fsn, true),
             };
+            // A drop-and-continue reject completes the poisoned frame without an
+            // OK, so its received watermark was never advanced upstream. Mirror
+            // the completed advance here to keep `received >= completed`. `Ok`
+            // frames already emitted `ReceivedThrough` in
+            // `finish_durable_ok_response_sfa` when their OK arrived, so they
+            // must not emit it again.
+            if is_rejected {
+                events.push(DriverEvent::ReceivedThrough { fsn, wire_seq });
+            }
             let advanced = progress
                 .complete_through_fsn(fsn)
                 .map_err(DriverError::from)?;
@@ -2495,6 +2560,16 @@ impl From<codec::PipelinedError> for QwpServerError {
             error: value.err,
         }
     }
+}
+
+/// `<=` comparison for two watermarks expressed as `Option<u64>`, used by the
+/// watermark ordering invariant. `None` means "no frame reached this stage yet"
+/// and so is the smallest value: an absent lower watermark is `<=` anything, and
+/// a present lower watermark leads an absent upper watermark. This matches the
+/// derived `Ord` on `Option`, which is exactly what we want here — the wrapper
+/// only makes that intent explicit at the call site.
+fn watermark_le(lower: Option<u64>, upper: Option<u64>) -> bool {
+    lower <= upper
 }
 
 fn server_error_category(status: u8) -> QwpWsErrorCategory {
@@ -5795,6 +5870,10 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
+                DriverEvent::ReceivedThrough {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
                 DriverEvent::CompletedThrough {
                     fsn: 0,
                     wire_seq: 0,
@@ -6099,6 +6178,10 @@ mod tests {
                     fsn: 1,
                     wire_seq: 1,
                 },
+                DriverEvent::ReceivedThrough {
+                    fsn: 1,
+                    wire_seq: 1,
+                },
                 DriverEvent::CompletedThrough {
                     fsn: 1,
                     wire_seq: 1,
@@ -6148,6 +6231,10 @@ mod tests {
                     wire_seq: 0,
                 },
                 DriverEvent::Sent {
+                    fsn: 1,
+                    wire_seq: 1,
+                },
+                DriverEvent::ReceivedThrough {
                     fsn: 1,
                     wire_seq: 1,
                 },
@@ -6444,6 +6531,10 @@ mod tests {
                     fsn: 0,
                     wire_seq: 0,
                 },
+                DriverEvent::ReceivedThrough {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
                 DriverEvent::CompletedThrough {
                     fsn: 0,
                     wire_seq: 0,
@@ -6609,11 +6700,19 @@ mod tests {
                     fsn: 0,
                     wire_seq: 0,
                 },
+                DriverEvent::ReceivedThrough {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
                 DriverEvent::CompletedThrough {
                     fsn: 0,
                     wire_seq: 0,
                 },
                 DriverEvent::Sent {
+                    fsn: 1,
+                    wire_seq: 1,
+                },
+                DriverEvent::ReceivedThrough {
                     fsn: 1,
                     wire_seq: 1,
                 },
@@ -7026,11 +7125,15 @@ mod tests {
             Some(DeliveryOutcome::Completed)
         );
 
-        assert_eq!(driver.events_dropped_total(), 4);
+        // Each completion now also emits a `ReceivedThrough` before its
+        // `CompletedThrough`, so two more events flow through the capacity-2 ring
+        // (8 total instead of 6): 6 are dropped and the surviving tail is the
+        // last frame's Received/Completed pair.
+        assert_eq!(driver.events_dropped_total(), 6);
         assert_eq!(
             drain_events(&mut driver),
             vec![
-                DriverEvent::Sent {
+                DriverEvent::ReceivedThrough {
                     fsn: 1,
                     wire_seq: 1,
                 },
