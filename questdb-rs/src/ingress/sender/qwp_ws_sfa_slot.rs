@@ -179,6 +179,10 @@ impl PublicationLog for SfaSlotQueue {
         self.queue.persist_completed_fsn(fsn);
     }
 
+    fn persist_received_fsn(&mut self, fsn: u64) {
+        self.queue.persist_received_fsn(fsn);
+    }
+
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaSlotQueue::close(self)?)
     }

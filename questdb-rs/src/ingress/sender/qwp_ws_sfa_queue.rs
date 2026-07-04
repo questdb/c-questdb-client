@@ -1308,6 +1308,10 @@ impl PublicationLog for SfaFrameQueue {
         SfaFrameQueue::persist_completed_fsn(self, fsn);
     }
 
+    fn persist_received_fsn(&mut self, fsn: u64) {
+        SfaFrameQueue::persist_received_fsn(self, fsn);
+    }
+
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaFrameQueue::close(self)?)
     }

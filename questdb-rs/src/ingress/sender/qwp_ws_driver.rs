@@ -411,6 +411,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         });
     }
 
+    pub(crate) fn record_received_through_event(&mut self, fsn: u64, wire_seq: u64) {
+        self.queue.persist_received_fsn(fsn);
+        self.push_event(DriverEvent::ReceivedThrough { fsn, wire_seq });
+    }
+
     pub(crate) fn record_completed_through_event(&mut self, fsn: u64, wire_seq: u64) {
         self.queue.persist_completed_fsn(fsn);
         self.push_event(DriverEvent::CompletedThrough { fsn, wire_seq });
@@ -854,6 +859,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
         {
             self.send_cursor.ack_through(fsn);
+            store.record_received_through_event(fsn, ack_wire_seq);
             return Ok(DriveOutcome::Idle);
         }
         if store
@@ -862,11 +868,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             .is_some_and(|completed_fsn| fsn <= completed_fsn)
         {
             self.send_cursor.ack_through(fsn);
+            store.record_received_through_event(fsn, ack_wire_seq);
             return Ok(DriveOutcome::Acked {
                 wire_seq: ack_wire_seq,
             });
         }
         self.send_cursor.ack_through(fsn);
+        store.record_received_through_event(fsn, ack_wire_seq);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
         tracker.enqueue_ok(ack_wire_seq, fsn, table_seq_txns);
         self.complete_ready_durable(store)
@@ -1953,6 +1961,7 @@ pub(crate) trait PublicationLog {
     }
     fn oldest_unresolved_fsn(&self) -> Option<u64>;
     fn persist_completed_fsn(&mut self, _fsn: u64) {}
+    fn persist_received_fsn(&mut self, _fsn: u64) {}
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(())
     }
@@ -2551,6 +2560,7 @@ pub(crate) enum DriveOutcome {
 pub(crate) enum DriverEvent {
     Published { fsn: u64 },
     Sent { fsn: u64, wire_seq: u64 },
+    ReceivedThrough { fsn: u64, wire_seq: u64 },
     CompletedThrough { fsn: u64, wire_seq: u64 },
     Rejected { fsn: u64, wire_seq: u64 },
     Reconnected { reason: ReconnectReason },
@@ -4587,6 +4597,43 @@ mod tests {
                 fsn: 1,
                 wire_seq: 1
             }
+        );
+    }
+
+    #[test]
+    fn durable_ok_advances_received_fsn_but_not_completed_fsn() {
+        let mut server = FakeOrderedServer::no_response();
+        server.push_response(TransportResponse::DurableOk {
+            wire_seq: 0,
+            table_seq_txns: table_seq_txns(&[("trades", 10)]),
+        });
+        let mut driver = durable_driver(server);
+        let _receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+
+        // Server Ok (received) advances received_fsn but NOT completed_fsn.
+        assert_eq!(driver.store.queue.received_fsn(), Some(0));
+        assert_eq!(driver.acked_fsn(), None);
+
+        // The ReceivedThrough event must appear in the event ring.
+        assert_eq!(
+            drain_events(&mut driver),
+            vec![
+                DriverEvent::Published { fsn: 0 },
+                DriverEvent::Sent {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+                DriverEvent::ReceivedThrough {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+            ]
         );
     }
 
