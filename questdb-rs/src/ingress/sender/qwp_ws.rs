@@ -2900,6 +2900,13 @@ pub(crate) fn qwp_ws_acked_fsn_manual(
     Ok(state.store.completed_fsn())
 }
 
+pub(crate) fn qwp_ws_received_fsn_manual(
+    state: &ManualQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    check_manual_driver_error(state)?;
+    Ok(state.store.received_fsn())
+}
+
 pub(crate) fn qwp_ws_check_error_background(state: &SyncQwpWsHandlerState) -> crate::Result<()> {
     state.runner.check_error()
 }

@@ -199,6 +199,10 @@ impl PublicationLog for SfaSlotQueue {
         self.queue.completed_fsn()
     }
 
+    fn received_fsn(&self) -> Option<u64> {
+        self.queue.received_fsn()
+    }
+
     fn max_in_flight(&self) -> usize {
         self.queue.max_in_flight()
     }

@@ -564,6 +564,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.queue.completed_fsn()
     }
 
+    pub(crate) fn received_fsn(&self) -> Option<u64> {
+        self.queue.received_fsn()
+    }
+
     pub(crate) fn close_queue(&mut self) -> Result<(), DriverError> {
         self.queue.close()
     }
@@ -1968,6 +1972,7 @@ pub(crate) trait PublicationLog {
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
     fn published_fsn(&self) -> Option<u64>;
     fn completed_fsn(&self) -> Option<u64>;
+    fn received_fsn(&self) -> Option<u64>;
     fn max_in_flight(&self) -> usize;
 }
 
@@ -4635,6 +4640,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Mirror of `durable_ok_advances_received_fsn_but_not_completed_fsn` but
+    /// reaching the watermark through the `QwpWsPublicationStore::received_fsn`
+    /// accessor (the trait-based read path added in Task 3) rather than the
+    /// concrete `SfaFrameQueue::received_fsn` field.
+    #[test]
+    fn store_received_fsn_accessor_returns_watermark_after_durable_ok() {
+        let mut server = FakeOrderedServer::no_response();
+        server.push_response(TransportResponse::DurableOk {
+            wire_seq: 0,
+            table_seq_txns: table_seq_txns(&[("trades", 10)]),
+        });
+        let mut driver = durable_driver(server);
+        let _receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+
+        // The trait-based accessor on the store must return the same watermark.
+        assert_eq!(driver.store.received_fsn(), Some(0));
+        // completed_fsn is still None — DurableOk does not ack.
+        assert_eq!(driver.store.completed_fsn(), None);
     }
 
     #[test]

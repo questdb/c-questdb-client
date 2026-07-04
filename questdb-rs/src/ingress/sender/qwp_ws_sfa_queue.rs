@@ -1328,6 +1328,10 @@ impl PublicationLog for SfaFrameQueue {
         SfaFrameQueue::completed_fsn(self)
     }
 
+    fn received_fsn(&self) -> Option<u64> {
+        SfaFrameQueue::received_fsn(self)
+    }
+
     fn max_in_flight(&self) -> usize {
         SfaFrameQueue::max_in_flight(self)
     }
