@@ -115,15 +115,23 @@ Rust prereqs present: `egress::ReaderConfig` `target=` (any/primary/replica)
 and `zone=`; `qwp_egress_sidecar.rs` exists. Extend the egress sidecar
 verbs as needed (SHOW_ZONE / role probes).
 
-### `test_target_filter.py`
+### `test_target_filter.py` — ported (tests/test_target_filter.py, all pass live)
 
-- [ ] `test_target_replica_skips_primary_at_startup`
-- [ ] `test_target_replica_fails_when_only_primary_available` — must fail
+- [x] `test_target_replica_skips_primary_at_startup`
+- [x] `test_target_replica_fails_when_only_primary_available` — must fail
       loudly with a role-mismatch error, not silently degrade.
-- [ ] `test_target_replica_failover_skips_primary` — per-Execute reconnect
+      (Adapted: Rust error text is `does not match target=Replica`
+      (enum Debug casing) vs Java's `target=replica`; asserted with a
+      case-insensitive match.)
+- [x] `test_target_replica_failover_skips_primary` — per-Execute reconnect
       keeps filtering the primary mid-failover.
-- [ ] `test_target_primary_failover_to_promoted_replica` — "follow the
+- [x] `test_target_primary_failover_to_promoted_replica` — "follow the
       master" across promotion.
+
+No sidecar verbs needed: `qwp_egress_sidecar.rs` already speaks
+CONNECT/QUERY/SHOW_ZONE/SERVER_INFO/CLOSE, and `Reader::from_conf`
+binds eagerly with the target filter applied at CONNECT time (same
+semantics as the Java `QwpQueryClient.connect()`).
 
 ### `test_zone_failover.py`
 
