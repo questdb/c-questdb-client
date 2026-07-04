@@ -187,6 +187,129 @@ fn qwp_ws_public_sender_sfa_recovers_after_unacked_disconnect() -> TestResult {
     Ok(())
 }
 
+/// System test: `received_fsn` (L2 — server OK) reaches `fsn` at or before
+/// `acked_fsn` (durable commit) does.
+///
+/// Run with:
+/// ```
+/// QDB_QWP_WS_RECEIVED_FSN_PROBE=1 \
+///   cargo test -p questdb-rs \
+///   --features sync-sender-qwp-ws,sync-sender-http \
+///   -- --ignored --nocapture \
+///   qwp_ws_public_received_fsn_precedes_durable_acked_fsn
+/// ```
+/// Optional env vars (mirror the sibling durable-ack probe):
+///   QDB_QWP_WS_HOST           default 127.0.0.1
+///   QDB_QWP_WS_PORT           default 9000   (QWP/WS port)
+///   QDB_QWP_WS_HTTP_PORT      default QDB_QWP_WS_PORT  (REST port)
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_RECEIVED_FSN_PROBE=1"]
+fn qwp_ws_public_received_fsn_precedes_durable_acked_fsn() -> TestResult {
+    if std::env::var("QDB_QWP_WS_RECEIVED_FSN_PROBE").as_deref() != Ok("1") {
+        eprintln!(
+            "set QDB_QWP_WS_RECEIVED_FSN_PROBE=1 to run the received_fsn ordering probe"
+        );
+        return Ok(());
+    }
+
+    let config = ProbeConfig::from_env()?;
+    if config.auth_header.is_some() {
+        return Err(Box::new(IoError::new(
+            ErrorKind::InvalidInput,
+            "QDB_QWP_WS_RECEIVED_FSN_PROBE does not support QDB_QWP_WS_AUTH_HEADER yet; \
+             use an unauthenticated local QuestDB server",
+        )));
+    }
+
+    let table = unique_table_name("qwp_received_fsn_probe");
+    eprintln!("QuestDB build: {}", query_build(&config)?);
+    eprintln!("probe table: {table}");
+    let _cleanup = TableCleanup::new(config.clone(), table.clone());
+
+    // Use durable-ack mode so that received_fsn (server OK) is observable
+    // before acked_fsn (durable commit), giving us the ordering to verify.
+    let conf = format!(
+        "qwpws::addr={}:{};request_durable_ack=on;max_in_flight=4;",
+        config.host, config.qwp_ws_port
+    );
+    let mut sender = SenderBuilder::from_conf(conf)?
+        .qwp_ws_progress(QwpWsProgress::Manual)?
+        .build()?;
+
+    let mut buffer = sender.new_buffer();
+    write_row(
+        &mut buffer,
+        &table,
+        "SYM_RECEIVED_FSN_PROBE",
+        42,
+        420.5,
+        42,
+    )?;
+    let fsn = sender.flush_and_get_fsn(&mut buffer)?.unwrap();
+    assert!(buffer.is_empty(), "flush must clear the caller buffer");
+    eprintln!("flushed fsn={fsn}");
+
+    // --- Assertion 1: await_received returns Ok(true) within timeout --------
+    // The server OK (L2) should arrive quickly — well before the durable
+    // commit ping-pong completes.
+    assert!(
+        sender.await_received(fsn, Duration::from_secs(10))?,
+        "await_received must return true: server OK (received_fsn) never arrived within 10 s"
+    );
+    let received_after_await = sender.received_fsn()?.expect("received_fsn must be Some after await_received returned true");
+    eprintln!("received_fsn after await_received = {received_after_await}");
+    assert!(
+        received_after_await >= fsn,
+        "received_fsn ({received_after_await}) must be >= flushed fsn ({fsn})"
+    );
+
+    // --- Assertion 2: received_fsn >= acked_fsn at all observable points ----
+    // Snapshot acked_fsn immediately after await_received (before the durable
+    // ACK arrives).  In durable-ack mode the durable commit hasn't happened
+    // yet, so acked_fsn is expected to still be None here.  Even if the
+    // durable ACK has already raced in, received must still be >= acked.
+    let acked_snapshot = sender.acked_fsn()?;
+    eprintln!("acked_fsn snapshot (before await_acked) = {acked_snapshot:?}");
+    if let Some(acked) = acked_snapshot {
+        assert!(
+            received_after_await >= acked,
+            "ordering invariant violated: received_fsn ({received_after_await}) < acked_fsn ({acked})"
+        );
+    }
+
+    // --- Assertion 3: await_acked_fsn completes and rows land ---------------
+    assert!(
+        sender.await_acked_fsn(fsn, Duration::from_secs(30))?,
+        "await_acked_fsn must return true: durable ACK never arrived within 30 s"
+    );
+    let acked_final = sender.acked_fsn()?.expect("acked_fsn must be Some after await_acked_fsn returned true");
+    eprintln!("acked_fsn after await_acked_fsn = {acked_final}");
+    assert!(
+        acked_final >= fsn,
+        "acked_fsn ({acked_final}) must be >= flushed fsn ({fsn})"
+    );
+
+    // received_fsn must still be >= acked_fsn after the durable ACK arrives.
+    let received_final = sender.received_fsn()?.expect("received_fsn must be Some after durable ACK");
+    eprintln!("received_fsn after await_acked_fsn = {received_final}");
+    assert!(
+        received_final >= acked_final,
+        "ordering invariant violated after durable ACK: \
+         received_fsn ({received_final}) < acked_fsn ({acked_final})"
+    );
+
+    // --- Assertion 4: row is queryable via REST -----------------------------
+    let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
+    assert_eq!(count, 1, "exactly one row must be queryable after durable ACK");
+    assert!(
+        has_row(&config, &table, "SYM_RECEIVED_FSN_PROBE", 42, 420.5)?,
+        "the published row must be present in the table"
+    );
+    eprintln!("PASS: received_fsn precedes (or equals) acked_fsn end-to-end");
+
+    Ok(())
+}
+
 fn write_row(
     buffer: &mut Buffer,
     table: &str,
