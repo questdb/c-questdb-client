@@ -83,18 +83,29 @@ deferred-tail retirement in SF recovery.
 
 ### `test_durable_ack_failover.py`
 
-- [ ] `test_durable_ack_sender_survives_replica_only_window` — durable-ack
+- [x] `test_durable_ack_sender_survives_replica_only_window` — durable-ack
       sender must survive a window where only a replica is reachable.
-- [ ] `test_durable_ack_drainer_never_gives_up_on_reconnect_budget` —
+- [x] `test_durable_ack_drainer_never_gives_up_on_reconnect_budget` —
       INVARIANT B: with rows in on-disk SF the drainer must never
       terminate on a wall-clock reconnect budget (may back off only).
       (Related but distinct from the existing
       `test_orphan_drainer_durable_ack_survives_drain_reconnect_c_client_rust`.)
+      Rust adaptation: the post-promotion confirmation publishes one tail
+      row before the final flush — the Rust empty-buffer flush returns -1
+      (Java returns the highest published FSN), which AWAIT_ACKED rejects.
+      Verified in-source that the Rust driver rolls the budget over
+      (`retry_budget_exhausted_error` is not `reconnect_error_is_terminal`;
+      only AuthError/ProtocolVersionError latch terminal, role-rejects
+      explicitly retryable) — matching shipped Java semantics.
 
 ### `test_demotion_mid_stream.py`
 
-- [ ] `test_graceful_demotion_mid_stream_sender_survives` — in-place
+- [x] `test_graceful_demotion_mid_stream_sender_survives` — in-place
       graceful P→R demotion underneath an actively-sending sender.
+      Also covers Group-3 `testQwpDurableAckSenderSurvivesInPlaceDemote`
+      (ticked there). `server_errors == 0` wire pin maps to the Rust
+      driver's `total_server_errors` (TransportResponse::Reject only —
+      same NACK-not-close semantics as Java).
 
 ### `test_switch.py` (D-23 / D-24 graceful role-switch suite)
 
@@ -180,8 +191,9 @@ Re-express each as a pytest scenario with forked servers + Rust sidecar.
 - [ ] `DurableAckThroughDemoteTest.testDurableAckClientThroughDemoteIsReleasedOrTerminalWithinBound`
       — durable-ack client carried through P→R demote is released or
       terminal within a bound (never hangs).
-- [ ] `DurableAckThroughDemoteTest.testQwpDurableAckSenderSurvivesInPlaceDemote`
-      — overlaps Group 1 `test_demotion_mid_stream`; port once, cover both.
+- [x] `DurableAckThroughDemoteTest.testQwpDurableAckSenderSurvivesInPlaceDemote`
+      — overlaps Group 1 `test_demotion_mid_stream`; covered by
+      `test_graceful_demotion_mid_stream_sender_survives_c_client_rust`.
 - [ ] `QwpRoleBounceChaosLosslessTest.testObliviousDurableAckSenderAndHistoricalReadersSurviveRoleBouncing`
       — chaos role bouncing (P→R, R→P, repeatedly, randomized timing);
       oblivious durable-ack sender + concurrent historical readers, lossless.
