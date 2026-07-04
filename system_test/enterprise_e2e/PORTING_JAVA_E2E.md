@@ -47,24 +47,39 @@ From `questdb-ent/e2e/tests/` — 1:1 Rust equivalents exist here:
 
 ### `test_txn_kill9_atomicity.py` (transaction=on + SIGKILL mid-txn)
 
-Harness prereq: add a `FLUSH_DEFER`-equivalent verb (deterministic deferred
-flush without commit) + transactional connect option to
-`system_test/failover_clients/src/bin/qwp_sidecar.rs`. Verify the Rust
-sender supports a transaction spanning multiple deferred flushes (commit
-on final flush); if not, that is a client feature gap to fill first.
+**Capability verdict (resolved): the Rust QWP/WS row sender has NO
+`transaction=on` mode.** Evidence:
+`questdb-rs/src/ingress/sender.rs:318-323` explicitly rejects
+transactional QWP/WS flushes ("Transactional flushes are not supported
+for QWP/WebSocket."); `conf.rs` has no `transaction` key; the deferred
+encoder exists (`buffer/qwp.rs:3562`, flag at :3654) but its only caller
+hardcodes `defer_commit=false` (`buffer/qwp.rs:3559`,
+`qwp_ws_publisher.rs:52`); SF recovery has no orphan-tail retirement
+(torn-frame scan only). A FLUSH_DEFER sidecar verb was therefore NOT
+added — there is no client API to bind it to. **Client feature gap:**
+`transaction=on` (FLAG_DEFER_COMMIT framing + commit on FLUSH) + orphan
+deferred-tail retirement in SF recovery.
 
-- [ ] `test_kill9_mid_txn_uncommitted_rows_never_appear` — commit txn 1,
+- [ ] **BLOCKED (client gap above)**
+      `test_kill9_mid_txn_uncommitted_rows_never_appear` — commit txn 1,
       open txn 2, SIGKILL between deferred auto-flushes, restart on same
       slot; uncommitted rows must never appear.
-- [ ] `test_kill9_whole_log_deferred_fast_path_retirement` — nothing ever
+- [ ] **BLOCKED (client gap above)**
+      `test_kill9_whole_log_deferred_fast_path_retirement` — nothing ever
       committed; recovery retires the whole orphan deferred log via the
       fast path.
-- [ ] `test_kill9_between_deferred_flushes_deterministic` — the literal
+- [ ] **BLOCKED (client gap above + needs FLUSH_DEFER verb)**
+      `test_kill9_between_deferred_flushes_deterministic` — the literal
       "SIGKILL between deferred flushes" scenario made deterministic via
       the FLUSH_DEFER verb.
-- [ ] `test_kill9_at_commit_boundary_no_orphan` — SIGKILL immediately
+- [x] `test_kill9_at_commit_boundary_no_orphan` — SIGKILL immediately
       after commit flush returns; SF log ends with commit-bearing frame,
-      no orphan tail.
+      no orphan tail. **Ported** as
+      `test_kill9_at_commit_boundary_no_orphan_c_client_rust`, adapted:
+      no deferred prefix (every Rust FLUSH is commit-bearing); the
+      distinctive surface vs the existing kill9-recovery test is the
+      zero-settle kill immediately after FLUSH returns (pins
+      FLUSH-return ⇒ publication durable in SF).
 
 ### `test_durable_ack_failover.py`
 
