@@ -1285,7 +1285,7 @@ bool column_sender_chunk_at_nanos(
 /** Designated timestamp in milliseconds, widened to micros (wire type
  * TIMESTAMP, 0x0A). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_designated_timestamp_millis(
+bool column_sender_chunk_at_millis(
     column_sender_chunk* chunk,
     const int64_t* data,
     size_t row_count,
@@ -1294,7 +1294,7 @@ bool column_sender_chunk_designated_timestamp_millis(
 /** Designated timestamp in seconds, widened to micros (wire type
  * TIMESTAMP, 0x0A). */
 QUESTDB_CLIENT_API
-bool column_sender_chunk_designated_timestamp_seconds(
+bool column_sender_chunk_at_seconds(
     column_sender_chunk* chunk,
     const int64_t* data,
     size_t row_count,

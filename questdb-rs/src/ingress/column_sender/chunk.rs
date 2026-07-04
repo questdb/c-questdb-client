@@ -1329,12 +1329,12 @@ impl<'a> Chunk<'a> {
     }
 
     /// Millisecond-precision Unix epoch column, widened to micros on encode.
-    pub fn designated_timestamp_millis(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+    pub fn at_millis(&mut self, data: &'a [i64]) -> Result<&mut Self> {
         self.set_designated_ts(DesignatedTsUnit::Millis, data)
     }
 
     /// Second-precision Unix epoch column, widened to micros on encode.
-    pub fn designated_timestamp_seconds(&mut self, data: &'a [i64]) -> Result<&mut Self> {
+    pub fn at_seconds(&mut self, data: &'a [i64]) -> Result<&mut Self> {
         self.set_designated_ts(DesignatedTsUnit::Seconds, data)
     }
 

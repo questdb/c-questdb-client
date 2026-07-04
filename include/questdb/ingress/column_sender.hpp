@@ -545,22 +545,22 @@ public:
         return *this;
     }
 
-    column_chunk& designated_timestamp_millis(
+    column_chunk& at_millis(
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_designated_timestamp_millis,
+            ::column_sender_chunk_at_millis,
             _raw,
             data,
             row_count);
         return *this;
     }
 
-    column_chunk& designated_timestamp_seconds(
+    column_chunk& at_seconds(
         const int64_t* data, size_t row_count)
     {
         line_sender_error::wrapped_call(
-            ::column_sender_chunk_designated_timestamp_seconds,
+            ::column_sender_chunk_at_seconds,
             _raw,
             data,
             row_count);

@@ -2568,7 +2568,7 @@ pub unsafe extern "C" fn column_sender_chunk_at_nanos(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_millis(
+pub unsafe extern "C" fn column_sender_chunk_at_millis(
     chunk: *mut column_sender_chunk,
     data: *const i64,
     row_count: size_t,
@@ -2581,7 +2581,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_millis(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_designated_timestamp_millis",
+            "column_sender_chunk_at_millis",
             "column_sender_chunk",
             err_out,
         )
@@ -2594,12 +2594,12 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_millis(
         None => return false,
     };
     let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
-    bubble!(err_out, inner.designated_timestamp_millis(data));
+    bubble!(err_out, inner.at_millis(data));
     true
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
+pub unsafe extern "C" fn column_sender_chunk_at_seconds(
     chunk: *mut column_sender_chunk,
     data: *const i64,
     row_count: size_t,
@@ -2612,7 +2612,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
         InUseGuard::acquire(
             chunk,
             &raw const (*chunk).1,
-            "column_sender_chunk_designated_timestamp_seconds",
+            "column_sender_chunk_at_seconds",
             "column_sender_chunk",
             err_out,
         )
@@ -2625,7 +2625,7 @@ pub unsafe extern "C" fn column_sender_chunk_designated_timestamp_seconds(
         None => return false,
     };
     let inner: &mut Chunk = unsafe { &mut (*chunk).0 };
-    bubble!(err_out, inner.designated_timestamp_seconds(data));
+    bubble!(err_out, inner.at_seconds(data));
     true
 }
 
