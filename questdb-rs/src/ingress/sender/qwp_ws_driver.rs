@@ -3186,6 +3186,117 @@ pub(crate) enum FakeSendResult {
     TerminalFailure,
 }
 
+// ---------------------------------------------------------------------------
+// Bench helper — exposed via `ingress::sender::_bench_internals_sender` for
+// use by `benches/ack_path.rs`. Not part of the public API surface.
+// ---------------------------------------------------------------------------
+
+/// Drive `n_responses` synthetic Ack responses through the ack-processing hot
+/// path and return `(responses_processed, elapsed)`.
+///
+/// The path exercised per response:
+///   send_frame → `apply_response` → `record_received_through_event`
+///                → `persist_received_fsn` (monotonic compare-store)
+///                + optional `ReceivedThrough` event push
+///                + `debug_assert_watermark_ordering` (elided in release).
+///
+/// No socket, no thread, no allocation inside the hot loop.
+pub fn bench_ack_path(n_responses: usize) -> (u64, std::time::Duration) {
+    use super::qwp_ws_sfa_queue::SfaMemoryQueueOptions;
+
+    /// Inline transport that immediately acks each sent frame — zero allocation,
+    /// no real I/O. Mirrors `FakeOrderedServer::AckSent` from the test harness
+    /// without requiring `#[cfg(test)]`.
+    struct AckOnSend;
+
+    impl QwpWsCoreTransport for AckOnSend {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrameView<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            Ok(TransportSendResult::Response(TransportResponse::Ack {
+                wire_seq: frame.wire_seq,
+            }))
+        }
+    }
+
+    // Generous queue: segment large enough for all frames, wide in-flight window.
+    let opts = SfaMemoryQueueOptions {
+        segment_size_bytes: 1 << 20, // 1 MiB
+        max_bytes: usize::MAX,
+        max_in_flight: n_responses.max(8),
+    };
+    let queue = SfaFrameQueue::open_memory(opts).expect("open in-memory SFA queue");
+    let max_in_flight = queue.max_in_flight();
+    let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+    let mut core = QwpWsSendCore::new(
+        AckOnSend,
+        max_in_flight,
+        ReconnectPolicy::bounded(
+            std::time::Duration::MAX,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        ),
+    );
+
+    // A minimal non-empty payload (the driver only stores length + bytes in the
+    // SFA segment; content is irrelevant for the ack path).
+    let payload = b"bench";
+
+    // Submit all frames before starting the clock so we isolate the ack-path.
+    for _ in 0..n_responses {
+        store.try_submit(payload).expect("submit");
+    }
+
+    let started = std::time::Instant::now();
+
+    // Each drive_once: sends one frame (inline Ack back) → apply_response
+    // → record_received_through_event → persist_received_fsn + event push.
+    let mut processed: u64 = 0;
+    for _ in 0..n_responses {
+        match core.drive_once(&mut store).expect("drive_once") {
+            DriveOutcome::Idle | DriveOutcome::Terminal => break,
+            _ => {}
+        }
+        processed += 1;
+    }
+
+    (processed, started.elapsed())
+}
+
+/// Micro-benchmark the added cost of `received_fsn` tracking in isolation:
+/// call `record_received_through_event` (the `persist_received_fsn` compare-
+/// store + optional `ReceivedThrough` event push) `n` times on a fresh store
+/// and return `(n, elapsed)`. This isolates the per-call overhead to show the
+/// O(1) non-allocating cost independent of the full send/receive drive loop.
+pub fn bench_received_tracking_isolated(n: u64) -> (u64, std::time::Duration) {
+    use super::qwp_ws_sfa_queue::SfaMemoryQueueOptions;
+
+    let opts = SfaMemoryQueueOptions {
+        segment_size_bytes: 1 << 20,
+        max_bytes: usize::MAX,
+        max_in_flight: 8,
+    };
+    let queue = SfaFrameQueue::open_memory(opts).expect("open in-memory SFA queue");
+    let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+
+    // Publish a single frame so the queue has a `published_fsn` — required for
+    // the ordering invariant (`received_fsn <= published_fsn`).
+    store.try_submit(b"bench").expect("submit");
+
+    let started = std::time::Instant::now();
+    for i in 0..n {
+        // Monotonically increasing fsn so every call advances the watermark
+        // (worst case: the event ring push fires on every call).
+        store.record_received_through_event(i, i);
+    }
+    (n, started.elapsed())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::qwp_ws_publisher::QwpWsReplayEncoder;

@@ -90,6 +90,16 @@ mod qwp_ws;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws::*;
 
+/// Internals exposed exclusively for the `benches/ack_path.rs` criterion
+/// benchmark. **Not** a stable public API: names, types, and the module
+/// itself may change or disappear without notice. Uses the same `_` prefix
+/// convention as `egress::_bench_internals`.
+#[doc(hidden)]
+#[cfg(feature = "_sender-qwp-ws")]
+pub mod _bench_internals_sender {
+    pub use super::qwp_ws_driver::{bench_ack_path, bench_received_tracking_isolated};
+}
+
 #[cfg(feature = "sync-sender-tcp")]
 mod tcp;
 

@@ -255,6 +255,20 @@ required-features = ["sync-reader-ws"]
 name = "qwp_ws_unified_sfa_bench"
 required-features = ["sync-sender-qwp-ws"]
 
+# Ack-path microbenchmark proving that `received_fsn` watermark tracking
+# (added in the `received-fsn-watermark` branch) adds negligible overhead
+# to the driver's response-application hot path. Run with:
+#
+#   cargo bench --features sync-sender-qwp-ws --bench ack_path
+#
+# Two criterion groups:
+#   - `ack_path/full_N_responses`             — full send+ack drive loop
+#   - `ack_path/received_tracking_isolated_N` — isolated record_received_through_event
+[[bench]]
+name = "ack_path"
+harness = false
+required-features = ["sync-sender-qwp-ws"]
+
 # Decoder microbenchmark anchoring the perf claims from commits
 # `8ec0a85` (zero-copy decode) and `1163d43` (tighter SYMBOL/VARCHAR
 # decode hot paths). Run with:
