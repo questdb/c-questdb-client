@@ -112,13 +112,26 @@ deferred-tail retirement in SF recovery.
 Note: the existing `test_switch.py` here has 2 SF-centric switch tests;
 these 4 are additional, probe-oriented scenarios.
 
-- [ ] `test_characterize` — D-23 empirical characterization of the P→R→P
-      switch window.
-- [ ] `test_reads_not_frozen` — D-24(i): reads-not-frozen regression
-      guard, 100% oblivious probes.
-- [ ] `test_write_path_across_switch` — D-24(ii).
-- [ ] `test_disturbance_honesty_guard` — D-24(iii): "disturbance really
-      happened" honesty guard.
+- [x] `test_characterize` — D-23 empirical characterization of the P→R→P
+      switch window. Ported as `test_characterize_c_client_rust`
+      (tests/test_switch.py); Rust-only — the QWeP probes need the Rust
+      egress sidecar. Probes/lifecycle come from the shared Enterprise
+      harness (`lib.probes` / `lib.lifecycle`) — nothing copied.
+- [x] `test_reads_not_frozen` — D-24(i): reads-not-frozen regression
+      guard, 100% oblivious probes. Ported as
+      `test_reads_not_frozen_c_client_rust`. The flat-`reconn_succ`
+      assertion holds for the Rust sender too: the idle, durably-acked
+      ingress connection survives the P→R→P round-trip (verified live).
+- [x] `test_write_path_across_switch` — D-24(ii). Ported as
+      `test_write_path_across_switch_c_client_rust` (Invariant B
+      containment + REPLICA exact-count + ack-barriered SF drain +
+      dense oracle).
+- [x] `test_disturbance_honesty_guard` — D-24(iii): "disturbance really
+      happened" honesty guard. Ported as
+      `test_disturbance_honesty_guard_c_client_rust` (T-10-22).
+      Rust adaptations for the quartet: `username=`/`sender_id=` connect
+      keys, 0-based FSN guards (`>= 0`), and a published-FSN guard before
+      every `await_acked` (empty-buffer flush returns -1).
 
 ### `test_switch_fuzz.py`
 
