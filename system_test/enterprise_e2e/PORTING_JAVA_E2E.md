@@ -135,11 +135,16 @@ semantics as the Java `QwpQueryClient.connect()`).
 
 ### `test_zone_failover.py`
 
-- [ ] `test_startup_reports_bound_zone`
-- [ ] `test_falls_back_to_other_zone_when_no_same_zone_available` —
-      zone is a preference, not a constraint.
-- [ ] `test_failover_reports_new_zone`
-- [ ] `test_zone_preference_breaks_state_ties`
+- [x] `test_startup_reports_bound_zone` → `test_zone_failover.py::test_startup_reports_bound_zone_c_client_rust`
+- [x] `test_falls_back_to_other_zone_when_no_same_zone_available` —
+      zone is a preference, not a constraint. →
+      `test_falls_back_to_other_zone_when_no_same_zone_available_c_client_rust`
+- [x] `test_failover_reports_new_zone` → `test_failover_reports_new_zone_c_client_rust`
+- [x] `test_zone_preference_breaks_state_ties` →
+      `test_zone_preference_breaks_state_ties_c_client_rust` (proves the
+      Rust tracker's `(state, zone_tier)` lattice breaks TransportError
+      ties by zone exactly like the Java WalkTracker; no adaptation
+      needed — sidecar already had CONNECT/SHOW_ZONE/SERVER_INFO)
 
 ## Group 3 — Java JUnit in-process tests → forked-server pytest scenarios
 
