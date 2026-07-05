@@ -70,11 +70,26 @@ fn main() -> Result<()> {
 }
 
 /// Best-effort `host:port` split from an `https://host:port` URL for the example.
+/// Keeps an IPv6 literal bracketed (`[::1]`, as the sender interpolates
+/// `host:port` verbatim) and drops any `user@` userinfo.
 fn split_host_port(url: &str) -> (String, u16) {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
-    match authority.rsplit_once(':') {
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    // Drop any `user[:pass]@` userinfo: the host starts after the last '@'.
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    // An IPv6 literal is bracketed; its `:port` (if any) follows the ']'.
+    if let Some((v6, after)) = host_port.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(9000);
+        return (format!("[{v6}]"), port);
+    }
+    match host_port.rsplit_once(':') {
         Some((host, port)) => (host.to_string(), port.parse().unwrap_or(9000)),
-        None => (authority.to_string(), 9000),
+        None => (host_port.to_string(), 9000),
     }
 }

@@ -55,6 +55,13 @@ const USER_AGENT: &str = concat!("questdb/rust/", env!("CARGO_PKG_VERSION"), " (
 /// server.
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Cap on how much of a non-JSON / error body is echoed into a diagnostic error
+/// message. Enough to show a proxy/WAF error title or an OAuth `error_description`,
+/// but short so an unexpected token-endpoint body can't spill much into a log. A
+/// valid token response is JSON and never reaches this path (only a parse failure
+/// snippets), so this only ever quotes an intermediary's error page.
+const MAX_BODY_SNIPPET_CHARS: usize = 120;
+
 /// The result of a `POST` to the IdP token / device-authorization endpoint:
 /// the HTTP status, the parsed JSON body, and any `Retry-After` (delta-seconds).
 pub(crate) struct PostResult {
@@ -182,7 +189,7 @@ fn read_body(url: &str, response: ureq::http::Response<ureq::Body>) -> Result<Ve
 /// diagnostic message.
 fn body_snippet(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
-    let snippet: String = text.chars().take(200).collect();
+    let snippet: String = text.chars().take(MAX_BODY_SNIPPET_CHARS).collect();
     crate::oidc::render::strip_control(&snippet)
 }
 
