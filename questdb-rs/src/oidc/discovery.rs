@@ -685,6 +685,25 @@ mod tests {
     }
 
     #[test]
+    fn confusable_authority_percent_rejected() {
+        // A `%` in the authority (percent-encoding a host byte, which a transport
+        // could decode to a different host than the one validated) is refused. The
+        // strict URI parser already rejects it here; the explicit `%` byte guard is
+        // a backstop for any path that reaches the authority check with one intact.
+        assert!(reject_confusable_authority("https://ex%41mple.com/token", "token").is_err());
+    }
+
+    #[test]
+    fn confusable_authority_empty_rejected() {
+        // No authority at all (a path-only value, or an empty `//` authority) —
+        // there is no host to validate, so a credential must never be sent. Guards
+        // the `authority.is_empty()` arm specifically: with it removed, an empty
+        // authority has no unsafe byte and would pass.
+        assert!(reject_confusable_authority("/token", "token").is_err());
+        assert!(reject_confusable_authority("https:///token", "token").is_err());
+    }
+
+    #[test]
     fn issuer_path_pin_matches_subpath() {
         assert!(endpoint_path_under_issuer(
             "https://host/realms/prod/protocol/openid-connect/token",

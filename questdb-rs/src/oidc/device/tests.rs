@@ -500,6 +500,172 @@ fn settings_endpoint_sibling_tenant_path_rejected() {
     );
 }
 
+// -- IdP .well-known discovery + plaintext-channel guard ---------------------
+
+/// A `/settings` response advertising only the client id (no endpoints), so the
+/// credential endpoints must come from IdP discovery.
+fn settings_client_only() -> String {
+    serde_json::json!({
+        "config": {"acl.oidc.enabled": true, "acl.oidc.client.id": "questdb"}
+    })
+    .to_string()
+}
+
+#[test]
+fn idp_discovery_supplies_endpoints() {
+    // /settings advertises no endpoints, so they are discovered from the IdP's
+    // .well-known document (fetched from the pinned issuer). The doc's declared
+    // issuer matches the pin, so its endpoints are trusted and used.
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/settings") => (200, settings_client_only()),
+            ("GET", "/.well-known/openid-configuration") => {
+                let b = base.get().cloned().unwrap_or_default();
+                (
+                    200,
+                    serde_json::json!({
+                        "issuer": b,
+                        "token_endpoint": format!("{b}/token"),
+                        "device_authorization_endpoint": format!("{b}/device"),
+                    })
+                    .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let auth = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("IdP discovery should supply the endpoints");
+    assert_eq!(auth.config().token_endpoint, mock.url("/token"));
+    assert_eq!(
+        auth.config().device_authorization_endpoint,
+        mock.url("/device")
+    );
+}
+
+#[test]
+fn idp_discovery_issuer_mismatch_rejected() {
+    // The .well-known doc declares an issuer other than the pinned one (RFC 8414
+    // violation / wrong tenant); its endpoints must be refused, not trusted.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (200, settings_client_only()),
+        ("GET", "/.well-known/openid-configuration") => (
+            200,
+            serde_json::json!({
+                "issuer": "https://wrong.example.com",
+                "token_endpoint": "https://wrong.example.com/token",
+                "device_authorization_endpoint": "https://wrong.example.com/device",
+            })
+            .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("does not match the pinned issuer"),
+        "expected issuer-mismatch rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn idp_discovery_missing_device_endpoint_rejected() {
+    // The discovery doc omits device_authorization_endpoint (the IdP does not
+    // support the device grant) — resolution must fail with a clear error rather
+    // than return a half-built config.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (200, settings_client_only()),
+        // No `issuer` (its absence is tolerated) and no device endpoint.
+        ("GET", "/.well-known/openid-configuration") => (
+            200,
+            serde_json::json!({"token_endpoint": "https://idp.example.com/token"}).to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("device_authorization_endpoint"),
+        "expected missing-device-endpoint rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn discovery_without_issuer_pin_rejected() {
+    // /settings advertises no endpoints and no issuer is pinned, so discovery
+    // can't proceed safely — a tampered /settings could otherwise name any IdP.
+    // Must refuse up front, pointing the user at issuer(...).
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (200, settings_client_only()),
+        _ => (404, "{}".to_string()),
+    });
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("not pinned"),
+        "expected 'issuer not pinned' rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn loopback_plaintext_settings_endpoints_allowed() {
+    // The plaintext-/settings guard (which demands an issuer pin when a tampered
+    // channel could redirect credentials) is waived over a LOOPBACK http channel:
+    // there is no in-transit MITM to worry about locally. So settings-advertised
+    // endpoints with no issuer pin are accepted here — exercising the guard's
+    // reachable (loopback) branch end-to-end.
+    //
+    // The non-loopback *trigger* of that guard is covered by
+    // `plaintext_non_loopback_settings_channel_flagged` in discovery.rs: the guard
+    // sits after a successful /settings fetch, so an in-process test can't have a
+    // host that is both plaintext-rejected there and reachable — the mock is
+    // always loopback.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("GET", "/settings") => (
+            200,
+            settings_advertising(
+                "https://idp.example.com/token",
+                "https://idp.example.com/device",
+            ),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = OidcDeviceAuth::from_questdb(mock.url(""))
+        .allow_insecure_transport(true)
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("loopback plaintext settings endpoints should be allowed");
+    assert_eq!(
+        auth.config().token_endpoint,
+        "https://idp.example.com/token"
+    );
+}
+
 #[test]
 fn allow_insecure_does_not_relax_idp_endpoints() {
     // allow_insecure_transport relaxes only the QuestDB /settings channel; a
