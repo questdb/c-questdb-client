@@ -375,6 +375,30 @@ impl OidcDeviceAuth {
         *self.lock_tokens() = None;
     }
 
+    /// The currently cached [`TokenSet`], or `None` if no sign-in has completed
+    /// yet (or the cache was [`clear`](Self::clear)ed).
+    ///
+    /// A read-only snapshot for inspecting token metadata (expiry, scope, type)
+    /// — this never prompts, acquires, or refreshes, and never blocks behind an
+    /// in-flight sign-in. The returned set may be at or past expiry; check
+    /// [`expires_at`](TokenSet::expires_at) if that matters.
+    ///
+    /// ```no_run
+    /// # use questdb::oidc::OidcDeviceAuth;
+    /// # fn main() -> questdb::Result<()> {
+    /// let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000")
+    ///     .issuer("https://idp.example.com")
+    ///     .build()?;
+    /// if let Some(tokens) = auth.token_set() {
+    ///     println!("token expires at epoch {}", tokens.expires_at());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn token_set(&self) -> Option<TokenSet> {
+        self.lock_tokens().clone()
+    }
+
     // -- token lifecycle ----------------------------------------------------
 
     fn select(&self, tokens: &TokenSet) -> Result<String> {
