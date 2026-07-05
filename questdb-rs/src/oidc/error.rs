@@ -140,6 +140,19 @@ impl OidcError {
     }
 
     /// The category of this error.
+    ///
+    /// Match on the returned [`OidcErrorKind`] to branch on the failure — e.g.
+    /// retry a [`Network`](OidcErrorKind::Network) error while surfacing the
+    /// rest:
+    ///
+    /// ```
+    /// use questdb::oidc::{OidcError, OidcErrorKind};
+    ///
+    /// fn is_retryable(err: &OidcError) -> bool {
+    ///     matches!(err.kind(), OidcErrorKind::Network)
+    /// }
+    /// # let _ = is_retryable;
+    /// ```
     pub fn kind(&self) -> OidcErrorKind {
         self.kind
     }

@@ -122,6 +122,6 @@ mod token;
 
 pub use device::{OidcDeviceAuth, OidcDeviceAuthBuilder};
 pub use discovery::OidcConfig;
-pub use error::OidcError;
+pub use error::{OidcError, OidcErrorKind};
 pub use render::{DeviceCodeChallenge, Renderer, TerminalRenderer};
 pub use token::TokenSet;
