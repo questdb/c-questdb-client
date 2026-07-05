@@ -124,8 +124,13 @@ impl OidcError {
         error: Option<&str>,
         error_description: Option<&str>,
     ) -> Self {
-        self.error = error.map(strip_control);
-        self.error_description = error_description.map(strip_control);
+        // Normalize an empty (or all-control, post-strip) field to `None` so an
+        // empty `error_description` can't shadow the `error` code in the message
+        // or in `Display`, and the accessors don't hand back a blank `Some("")`.
+        self.error = error.map(strip_control).filter(|s| !s.is_empty());
+        self.error_description = error_description
+            .map(strip_control)
+            .filter(|s| !s.is_empty());
         self
     }
 

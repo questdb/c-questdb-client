@@ -414,18 +414,26 @@ fn discover_from_idp(http: &HttpClient, issuer: &str) -> Result<serde_json::Valu
     if !doc.is_object() {
         return Ok(serde_json::Value::Object(Default::default()));
     }
-    // RFC 8414: the document's own `issuer` MUST match the one it was fetched
-    // from. We fetched over TLS from the pinned issuer's origin, so this turns a
-    // wrong-tenant IdP into a clear failure rather than silently trusting its
-    // endpoints.
-    if let Some(doc_issuer) = str_setting(doc.get("issuer"))
-        && doc_issuer.trim_end_matches('/') != issuer.trim_end_matches('/')
-    {
-        return Err(OidcError::config(format!(
-            "The IdP discovery document declares issuer {doc_issuer:?}, which \
+    // RFC 8414: the document's own `issuer` MUST be present AND match the one it
+    // was fetched from. We fetched over TLS from the pinned issuer's origin, so
+    // requiring the match turns a wrong-tenant — or a non-conformant, issuer-less —
+    // IdP into a clear failure rather than silently trusting its endpoints.
+    match str_setting(doc.get("issuer")) {
+        Some(doc_issuer) if doc_issuer.trim_end_matches('/') == issuer.trim_end_matches('/') => {}
+        Some(doc_issuer) => {
+            return Err(OidcError::config(format!(
+                "The IdP discovery document declares issuer {doc_issuer:?}, which \
                  does not match the pinned issuer {issuer:?}; refusing to use its \
                  endpoints. Pass the endpoints explicitly to skip discovery."
-        )));
+            )));
+        }
+        None => {
+            return Err(OidcError::config(format!(
+                "The IdP discovery document at {issuer:?} declares no \"issuer\" \
+                 (RFC 8414 requires one); refusing to trust its endpoints. Pass \
+                 the endpoints explicitly to skip discovery."
+            )));
+        }
     }
     Ok(doc)
 }

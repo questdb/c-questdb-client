@@ -212,8 +212,10 @@ impl OidcDeviceAuthBuilder {
     }
 
     /// Use a custom [`Renderer`] for the device-code prompt (default:
-    /// [`TerminalRenderer`]). Its callbacks must not re-enter this instance's
-    /// [`token`](OidcDeviceAuth::token) / [`clear`](OidcDeviceAuth::clear).
+    /// [`TerminalRenderer`]). Its callbacks run while the acquisition lock is held,
+    /// so they must not re-enter this instance's [`token`](OidcDeviceAuth::token) /
+    /// [`sign_in`](OidcDeviceAuth::sign_in) / [`clear`](OidcDeviceAuth::clear), or
+    /// they deadlock.
     pub fn renderer(mut self, renderer: impl Renderer + 'static) -> Self {
         self.renderer = Some(Box::new(renderer));
         self
@@ -296,9 +298,11 @@ impl OidcDeviceAuthBuilder {
 /// *valid* cached token never blocks, but one whose token is missing/expired
 /// waits behind the signer. When sharing an instance across threads (e.g. a
 /// long-lived sender), call [`sign_in`](Self::sign_in) once up front. A custom
-/// [`Renderer`]'s callbacks run while this lock is held, so they must not call
-/// back into the same instance's [`token`](Self::token) / [`clear`](Self::clear)
-/// (that would deadlock).
+/// [`Renderer`]'s callbacks (and the `sleep` hook) run while this lock is held.
+/// They must not re-enter the same instance — directly via
+/// [`token`](Self::token) / [`sign_in`](Self::sign_in) / [`clear`](Self::clear),
+/// or indirectly by flushing a sender whose token provider calls back into it —
+/// because the lock is not re-entrant and the call would deadlock.
 pub struct OidcDeviceAuth {
     config: OidcConfig,
     http: HttpClient,
@@ -667,7 +671,12 @@ impl OidcDeviceAuth {
             // slow-down step only to a 429 with no header.
             if status >= 500 || status == 429 {
                 if status == 429 || retry_after.is_some() {
-                    interval = backoff(interval, retry_after, false);
+                    // A `slow_down` bundled into a 429 (rather than the conformant
+                    // HTTP 400) still MUST increase the interval — enforce it here,
+                    // since this branch short-circuits before the error-body match
+                    // below that otherwise handles slow_down.
+                    let slow_down = body.get("error").and_then(Value::as_str) == Some("slow_down");
+                    interval = backoff(interval, retry_after, slow_down);
                 }
                 continue;
             }
@@ -701,6 +710,7 @@ impl OidcDeviceAuth {
                     let description = body
                         .get("error_description")
                         .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
                         .or(error)
                         .unwrap_or("unknown error");
                     self.renderer

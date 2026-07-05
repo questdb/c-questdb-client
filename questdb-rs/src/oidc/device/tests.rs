@@ -51,6 +51,23 @@ impl MockServer {
     where
         H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     {
+        Self::start_inner(None, handler)
+    }
+
+    /// Like [`start`], but stamps a `Retry-After: <secs>` header on every response.
+    /// The tiny mock can't otherwise set one, and the 429 / `slow_down` backoff
+    /// path needs it to exercise a low Retry-After.
+    fn start_with_retry_after<H>(secs: u64, handler: H) -> Self
+    where
+        H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        Self::start_inner(Some(secs), handler)
+    }
+
+    fn start_inner<H>(retry_after: Option<u64>, handler: H) -> Self
+    where
+        H: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -61,7 +78,7 @@ impl MockServer {
             std::thread::spawn(move || {
                 while !shutdown.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((stream, _)) => handle_conn(stream, &*handler),
+                        Ok((stream, _)) => handle_conn(stream, &*handler, retry_after),
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(1));
                         }
@@ -91,7 +108,7 @@ impl Drop for MockServer {
     }
 }
 
-fn handle_conn<H>(mut stream: TcpStream, handler: &H)
+fn handle_conn<H>(mut stream: TcpStream, handler: &H, retry_after: Option<u64>)
 where
     H: Fn(&str, &str, &str) -> (u16, String),
 {
@@ -138,8 +155,12 @@ where
     }
     let body_str = String::from_utf8_lossy(&body).to_string();
     let (status, json) = handler(&method, &path, &body_str);
+    let retry_after_header = match retry_after {
+        Some(secs) => format!("Retry-After: {secs}\r\n"),
+        None => String::new(),
+    };
     let response = format!(
-        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\n{retry_after_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         json.len(),
         json
     );
@@ -270,6 +291,56 @@ fn slow_down_then_success() {
 }
 
 #[test]
+fn slow_down_via_429_still_increases_interval() {
+    // RFC 8628: `slow_down` MUST increase the poll interval — even when the IdP
+    // bundles it into an HTTP 429 with a low Retry-After (1s here), which would
+    // otherwise let the generic 429 backoff undercut the +5s step.
+    let slept: Arc<std::sync::Mutex<Vec<Duration>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let poll = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let poll = Arc::clone(&poll);
+        MockServer::start_with_retry_after(1, move |method, path, _body| match (method, path) {
+            ("POST", "/device") => (200, device_response()),
+            ("POST", "/token") => {
+                if poll.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (429, r#"{"error":"slow_down"}"#.to_string())
+                } else {
+                    (
+                        200,
+                        r#"{"access_token":"AT-sd","expires_in":300}"#.to_string(),
+                    )
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let recorder = Arc::clone(&slept);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(Arc::new(move |d: Duration| {
+            recorder.lock().unwrap().push(d)
+        }))
+        .build()
+        .expect("build");
+    assert_eq!(auth.token().unwrap(), "AT-sd");
+    let durations = slept.lock().unwrap();
+    // Two polls: the sleep before the retry (after the slow_down) must exceed the
+    // first by at least the +5s step, not shrink toward the 1s Retry-After.
+    assert!(
+        durations.len() >= 2,
+        "expected >=2 polls, got {durations:?}"
+    );
+    assert!(
+        durations[1] >= durations[0] + Duration::from_secs(5),
+        "slow_down via 429 must increase the interval, got {durations:?}"
+    );
+}
+
+#[test]
 fn access_denied_is_device_flow_error() {
     let mock = MockServer::start(|method, path, _body| match (method, path) {
         ("POST", "/device") => (200, device_response()),
@@ -284,6 +355,33 @@ fn access_denied_is_device_flow_error() {
     assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
     assert_eq!(err.idp_error(), Some("access_denied"));
     assert_eq!(err.idp_error_description(), Some("user declined"));
+}
+
+#[test]
+fn empty_error_description_keeps_error_code() {
+    // An empty error_description must not erase the error code from the message or
+    // the structured fields (it previously shadowed both, yielding "failed: ").
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (
+            400,
+            r#"{"error":"access_denied","error_description":""}"#.to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.idp_error(), Some("access_denied"));
+    // The empty description is normalized to absent, not surfaced as Some("").
+    assert_eq!(err.idp_error_description(), None);
+    // The code survives in both the message and the Display output.
+    assert!(
+        err.message().contains("access_denied"),
+        "message: {}",
+        err.message()
+    );
+    assert!(format!("{err}").contains("access_denied"), "display: {err}");
 }
 
 #[test]
@@ -584,15 +682,55 @@ fn idp_discovery_issuer_mismatch_rejected() {
 
 #[test]
 fn idp_discovery_missing_device_endpoint_rejected() {
-    // The discovery doc omits device_authorization_endpoint (the IdP does not
-    // support the device grant) — resolution must fail with a clear error rather
-    // than return a half-built config.
+    // The discovery doc declares a matching issuer + token endpoint but omits
+    // device_authorization_endpoint (the IdP does not support the device grant) —
+    // resolution must fail with a clear error, not return a half-built config.
+    let base: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let mock = {
+        let base = Arc::clone(&base);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            ("GET", "/settings") => (200, settings_client_only()),
+            ("GET", "/.well-known/openid-configuration") => {
+                let b = base.get().cloned().unwrap_or_default();
+                (
+                    200,
+                    serde_json::json!({
+                        "issuer": b,
+                        "token_endpoint": format!("{b}/token"),
+                    })
+                    .to_string(),
+                )
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+    base.set(mock.url("")).unwrap();
+    let err = OidcDeviceAuth::from_questdb(mock.url(""))
+        .issuer(mock.url(""))
+        .allow_insecure_transport(true)
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Config);
+    assert!(
+        err.message().contains("device_authorization_endpoint"),
+        "expected missing-device-endpoint rejection, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn idp_discovery_without_doc_issuer_rejected() {
+    // A .well-known doc that declares no issuer (RFC 8414 requires one) must fail
+    // closed, not have its endpoints trusted just because the fetch was over TLS.
     let mock = MockServer::start(|method, path, _body| match (method, path) {
         ("GET", "/settings") => (200, settings_client_only()),
-        // No `issuer` (its absence is tolerated) and no device endpoint.
         ("GET", "/.well-known/openid-configuration") => (
             200,
-            serde_json::json!({"token_endpoint": "https://idp.example.com/token"}).to_string(),
+            serde_json::json!({
+                "token_endpoint": "https://idp.example.com/token",
+                "device_authorization_endpoint": "https://idp.example.com/device",
+            })
+            .to_string(),
         ),
         _ => (404, "{}".to_string()),
     });
@@ -603,8 +741,8 @@ fn idp_discovery_missing_device_endpoint_rejected() {
         .unwrap_err();
     assert_eq!(err.kind(), OidcErrorKind::Config);
     assert!(
-        err.message().contains("device_authorization_endpoint"),
-        "expected missing-device-endpoint rejection, got: {}",
+        err.message().contains("declares no"),
+        "expected no-issuer rejection, got: {}",
         err.message()
     );
 }
