@@ -252,29 +252,69 @@ Re-express each as a pytest scenario with forked servers + Rust sidecar.
 
 ### Egress lifecycle
 
-- [ ] `QwpEgressDropDemoteRaceTest.testQwpEgressDropTableDuringDemoteReplicatesOrRefuses`
-      — WAL DROP driven through the QWP egress channel racing a demote:
-      must replicate or refuse (no half-state). Requires egress DDL/exec
-      support in the Rust reader; verify API exists first.
+- [x] `QwpEgressDropDemoteRaceTest.testQwpEgressDropTableDuringDemoteReplicatesOrRefuses`
+      — ported as `test_egress_drop_demote_race.py` (Rust). Egress DDL
+      verified supported: `Reader::execute` handles the `EXEC_DONE`
+      terminal (`reader.rs` `Terminal::ExecDone`), same wire path as
+      Java `QwpQueryClient.execute`. Adaptation: the JUnit in-JVM
+      determinism hooks (mint-site observer + switch-step injector)
+      don't exist for forked servers, so the port overlaps the SQL
+      demote with the egress DROP wall-clock and pins the same terminal
+      replicate-or-refuse invariant (A/B agreement, refusal-message
+      classification, `failover=off` single-endpoint semantics).
 
 ### Egress server-info / role / zone
 
 Dedup note: the `target=` scenarios overlap Group 2 `test_target_filter`;
-tick them off jointly where one pytest scenario covers both.
+tick them off jointly where one pytest scenario covers both. Ported
+suites live in `test_egress_server_info.py`; sidecar surface extended
+(`qwp_egress_sidecar.rs`): `SERVER_INFO` now reports `cap_zone=<0|1>`
+(decoded `capabilities & CAP_ZONE`), `QUERY` reports
+`resets=/pre_reset_rows=/last_replay_rows=` from
+`Cursor::failover_resets`, and a new `QUERY_ROW` verb renders the first
+result row for fingerprint probes — all backward-compatible with the
+shared `lib/egress_sidecar.py` parser (extra tokens ignored). The QUERY
+verb now installs a no-op `on_failover_reset` handler: the Rust cursor
+refuses silent mid-query replays unless the caller opts in (by design),
+matching the Java handler's inherent replay-awareness.
 
-- [ ] `QwpEgressServerInfoRoleTest.testPrimaryReportsPrimaryRole`
-- [ ] `QwpEgressServerInfoRoleTest.testReplicaReportsReplicaRole`
-- [ ] `QwpEgressServerInfoRoleTest.testMultiEndpointTargetPrimaryPicksPrimary` (≈ Group 2)
-- [ ] `QwpEgressServerInfoRoleTest.testMultiEndpointTargetReplicaPicksReplica` (≈ Group 2)
-- [ ] `QwpEgressServerInfoRoleTest.testTargetPrimaryAgainstReplicaOnlyRaisesMismatch` (≈ Group 2)
-- [ ] `QwpEgressServerInfoRoleTest.testReadFromReplicaReturnsSameDataAsPrimary`
-- [ ] `QwpEgressServerInfoRoleTest.testFailoverToReplicaReplaysAfterMidStreamDisconnect`
-- [ ] `QwpEgressServerInfoZoneTest.testPrimaryAdvertisesConfiguredZone`
-- [ ] `QwpEgressServerInfoZoneTest.testReplicaAdvertisesConfiguredZone`
-- [ ] `QwpEgressServerInfoZoneTest.testPrimaryAndReplicaAdvertiseDifferentZones`
-- [ ] `QwpEgressServerInfoZoneTest.testNoZoneConfiguredOmitsCapZone`
-- [ ] `QwpEgressServerInfoZoneTest.testBlankZoneConfigOmitsCapZone`
-- [ ] `QwpEgressServerInfoZoneTest.testZoneRoundTripsUtf8`
+- [x] `QwpEgressServerInfoRoleTest.testPrimaryReportsPrimaryRole`
+      — `test_primary_reports_primary_role_c_client_rust`
+- [x] `QwpEgressServerInfoRoleTest.testReplicaReportsReplicaRole`
+      — `test_replica_reports_replica_role_c_client_rust`
+- [x] `QwpEgressServerInfoRoleTest.testMultiEndpointTargetPrimaryPicksPrimary`
+      — `test_multi_endpoint_target_primary_picks_primary_c_client_rust`
+      (replica-listed-first ordering was NOT covered by Group 2, so
+      ported rather than pointer-ticked)
+- [x] `QwpEgressServerInfoRoleTest.testMultiEndpointTargetReplicaPicksReplica`
+      — dedup-pointer: covered 1:1 by Group 2
+      `test_target_filter.py::test_target_replica_skips_primary_at_startup_c_client_rust`
+- [x] `QwpEgressServerInfoRoleTest.testTargetPrimaryAgainstReplicaOnlyRaisesMismatch`
+      — `test_target_primary_against_replica_only_raises_mismatch_c_client_rust`
+      (mirror direction of the Group 2 mismatch test; both kept — the
+      two filters classify STANDALONE differently)
+- [x] `QwpEgressServerInfoRoleTest.testReadFromReplicaReturnsSameDataAsPrimary`
+      — `test_read_from_replica_returns_same_data_as_primary_c_client_rust`
+      (adaptation: aggregate fingerprint via `QUERY_ROW` instead of
+      in-process row-by-row compare; deterministic labels)
+- [x] `QwpEgressServerInfoRoleTest.testFailoverToReplicaReplaysAfterMidStreamDisconnect`
+      — `test_failover_to_replica_replays_after_mid_stream_disconnect_c_client_rust`
+      (adaptation: no `DEBUG_FORCE_TRANSPORT_FAILURE_AFTER_BATCHES` hook
+      for forked servers → 10M-row progressive cross-join + mid-stream
+      `kill -9`; oracle mapped 1:1 to `resets>=1` /
+      `pre_reset_rows>=1` / `last_replay_rows==N`)
+- [x] `QwpEgressServerInfoZoneTest.testPrimaryAdvertisesConfiguredZone`
+      — `test_primary_advertises_configured_zone_c_client_rust`
+- [x] `QwpEgressServerInfoZoneTest.testReplicaAdvertisesConfiguredZone`
+      — `test_replica_advertises_configured_zone_c_client_rust`
+- [x] `QwpEgressServerInfoZoneTest.testPrimaryAndReplicaAdvertiseDifferentZones`
+      — `test_primary_and_replica_advertise_different_zones_c_client_rust`
+- [x] `QwpEgressServerInfoZoneTest.testNoZoneConfiguredOmitsCapZone`
+      — `test_no_zone_configured_omits_cap_zone_c_client_rust`
+- [x] `QwpEgressServerInfoZoneTest.testBlankZoneConfigOmitsCapZone`
+      — `test_blank_zone_config_omits_cap_zone_c_client_rust`
+- [x] `QwpEgressServerInfoZoneTest.testZoneRoundTripsUtf8`
+      — `test_zone_round_trips_utf8_c_client_rust`
 
 ### Ingress connection behavior
 
