@@ -370,16 +370,44 @@ backlog drain instead.
 ## Bindings matrix (C / C++ duplicates)
 
 Per the existing pattern (Rust = full suite; C/C++ = key durable-ack
-scenarios via cmake-built sidecars), duplicate at minimum:
+scenarios via cmake-built sidecars). All ported duplicates live in
+`tests/test_bindings_matrix.py`.
 
-- [ ] `test_kill9_mid_txn_uncommitted_rows_never_appear` → C
-- [ ] `test_kill9_mid_txn_uncommitted_rows_never_appear` → C++
-- [ ] `test_durable_ack_sender_survives_replica_only_window` → C
-- [ ] `test_durable_ack_sender_survives_replica_only_window` → C++
-- [ ] `test_graceful_demotion_mid_stream_sender_survives` → C
-- [ ] `test_graceful_demotion_mid_stream_sender_survives` → C++
-- [ ] egress happy-path read with `target=replica` → C
-- [ ] egress happy-path read with `target=replica` → C++
+- [ ] `test_kill9_mid_txn_uncommitted_rows_never_appear` → C — **BLOCKED**
+      (same client gap as the Rust original: no multi-flush
+      `transaction=on`; see the Group 1 txn notes). SUBSTITUTED with the
+      portable commit-boundary sibling below.
+- [ ] `test_kill9_mid_txn_uncommitted_rows_never_appear` → C++ — **BLOCKED**
+      (ditto; substituted below).
+- [x] `test_kill9_at_commit_boundary_no_orphan` → C (substitute for the
+      blocked mid-txn boxes; zero-settle SIGKILL + slot recovery)
+- [x] `test_kill9_at_commit_boundary_no_orphan` → C++ (ditto)
+- [x] `test_durable_ack_sender_survives_replica_only_window` → C
+- [x] `test_durable_ack_sender_survives_replica_only_window` → C++
+- [x] `test_graceful_demotion_mid_stream_sender_survives` → C
+- [x] `test_graceful_demotion_mid_stream_sender_survives` → C++
+- [x] egress happy-path read with `target=replica` → C
+      (`qwp_egress_c_sidecar.c`: the `reader_*` C API behind the
+      `sync-reader-qwp-ws` ffi feature — verdict: the C API **does**
+      expose the reader, `include/questdb/egress/reader.h`)
+- [x] egress happy-path read with `target=replica` → C++
+      (`qwp_egress_cpp_sidecar.cpp`: the genuine `questdb::egress`
+      C++ wrapper classes in `reader.hpp`)
+
+C-FFI observability substitutions (same precedent as
+`test_orphan_drainer_bindings.py`; details in the module docstring):
+
+- The Rust originals' `STATS reconnAttempts` +2 all-replica-round barrier
+  is replaced by the server-side witness `"ingress upgrade rejected by
+  role"` (QwpIngressUpgradeProcessor's 421 gate) in the replica's logs —
+  the C FFI does not export the qwp_ws_totals counters.
+- The demotion scenario's `server_errors == 0` wire pin is dropped in the
+  C/C++ duplicates (counter zeroed by the FFI → vacuous); it stays pinned
+  by the Rust variant.
+- The egress C API exposes no zone accessor (`reader.h` server-info
+  surface: role / epoch / capabilities / cluster_id / node_id), so the
+  C/C++ egress sidecars' `SERVER_INFO` omits the `zone=` token and
+  `SHOW_ZONE` / `QUERY_ROW` reply `ERR unsupported`.
 
 (Extend if review flags more binding-sensitive paths.)
 
@@ -394,22 +422,35 @@ scenarios via cmake-built sidecars), duplicate at minimum:
 - **ILP-path java-client Ent tests** (`LineHttpAclTest`,
   `SenderTokenAuthTest`, `LineTlsTest`, …) — out of scope (QWP only).
 
-## Totals
+## Totals (final state of this porting pass)
 
-- Group 1: **15** scenarios
-- Group 2: **8** scenarios
-- Group 3: **25** scenarios (5 overlap-dedupable → ~20 net-new)
-- Bindings: **8** C/C++ duplicates
-- Blocked on client API: 2 (connection-listener); verify-first: multi-flush
-  txn semantics, egress DDL/exec.
+- Group 1: **15** scenarios — 12 ported, **3 blocked** on the client's
+  missing multi-flush `transaction=on` mode (txn notes above).
+- Group 2: **8** scenarios — all ported.
+- Group 3: **25** scenarios — 22 ported, 1 covered by dedup pointer,
+  **2 blocked** on the missing connection-listener/event client API.
+- Bindings: **8** C/C++ duplicates ported (2 checklist boxes blocked by
+  the same txn client gap, substituted with the commit-boundary sibling).
+- Blocked total: 5 checklist items across 2 client feature gaps
+  (multi-flush transactions; connection-listener events).
 
-## Harness prerequisites (do these first)
+## Harness prerequisites (resolution)
 
-1. `qwp_sidecar.rs`: add `FLUSH_DEFER` / transactional-commit verbs
-   (parity with Enterprise `QwpSidecarMain`).
-2. `qwp_egress_sidecar.rs`: add zone/role probe verbs (`SHOW_ZONE`
-   equivalent) used by `test_zone_failover` / `test_target_filter`.
-3. C/C++ sidecars: extend with txn + demote-survival verbs for the
-   bindings matrix.
-4. Verify Rust sender multi-flush transaction semantics match Java
-   (`transaction=on` spanning deferred flushes, commit on final flush).
+1. `qwp_sidecar.rs` `FLUSH_DEFER` / transactional-commit verbs: **not
+   added** — no client API to bind to (multi-flush txn unsupported);
+   dead verbs were deliberately not introduced.
+2. `qwp_egress_sidecar.rs` zone/role probe verbs: already present
+   (`SHOW_ZONE` / `SERVER_INFO`); extended during Group 3 with
+   `cap_zone=`, failover-reset counters on `QUERY`, and `QUERY_ROW`.
+3. C/C++ sidecars: **no new ingress verbs needed** (CONNECT / SEND /
+   FLUSH / AWAIT_ACKED / STATS / CLOSE sufficed); NEW egress sidecars
+   added (`qwp_egress_c_sidecar.c`, `qwp_egress_cpp_sidecar.cpp`). The
+   shared `libquestdb_client` for native sidecars is now always built
+   with `--features sync-reader-qwp-ws` (additive `reader_*` symbols),
+   and the build helper resolves the platform library name (`.dylib`
+   on macOS, `.so` elsewhere — fixes local C/C++ runs on macOS).
+4. Rust sender multi-flush transaction semantics: **verified ABSENT**
+   (explicit QWP/WS rejection in `sender.rs`; no `transaction` conf
+   key; deferred-commit encoder is dead capability) — the 3 Group 1
+   txn scenarios and 2 bindings boxes stay blocked until the client
+   grows the mode.

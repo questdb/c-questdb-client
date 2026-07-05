@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -124,6 +125,16 @@ def build_qwp_egress_sidecar() -> Path:
     return _build_failover_bin("qwp_egress_sidecar")
 
 
+def _native_client_lib_name() -> str:
+    """Platform-specific shared-library file name for ``libquestdb_client``.
+    Cargo emits ``.dylib`` on macOS and ``.so`` everywhere else this harness
+    runs; the Linux (CI) name is unchanged."""
+    return (
+        "libquestdb_client.dylib" if sys.platform == "darwin"
+        else "libquestdb_client.so"
+    )
+
+
 def _build_native_sidecar(*, src_name: str, bin_name: str,
                           compiler_default: str, compiler_env: str,
                           std_flag: str) -> Path:
@@ -151,15 +162,25 @@ def _build_native_sidecar(*, src_name: str, bin_name: str,
     ffi_manifest = client_root / "questdb-rs-ffi" / "Cargo.toml"
     if not ffi_manifest.is_file():
         raise RuntimeError(f"questdb-rs-ffi Cargo.toml not found at {ffi_manifest}")
-    cargo = ["cargo", "build", "--manifest-path", str(ffi_manifest)]
+    # One shared library for every native sidecar: always enable the
+    # opt-in reader feature so the egress sidecars link against the same
+    # artifact the ingress sidecars use. The feature only ADDS `reader_*`
+    # symbols (the ingress line_sender surface is unchanged), and building
+    # a single feature set avoids cargo rebuild churn from alternating
+    # feature sets within one pytest session.
+    cargo = [
+        "cargo", "build", "--manifest-path", str(ffi_manifest),
+        "--features", "sync-reader-qwp-ws",
+    ]
     if profile == "release":
         cargo.append("--release")
     LOG.info("building libquestdb_client (%s) for %s", profile, bin_name)
     subprocess.run(cargo, check=True, stdout=subprocess.PIPE)
 
+    lib_name = _native_client_lib_name()
     libdir = client_root / "questdb-rs-ffi" / "target" / profile
-    if not (libdir / "libquestdb_client.so").is_file():
-        raise RuntimeError(f"libquestdb_client.so missing in {libdir} after cargo build")
+    if not (libdir / lib_name).is_file():
+        raise RuntimeError(f"{lib_name} missing in {libdir} after cargo build")
 
     src = client_root / "system_test" / "c_sidecars" / src_name
     if not src.is_file():
@@ -200,6 +221,27 @@ def build_cpp_sidecar() -> Path:
     signal: row-major QWP-WS works from a C++ binary."""
     return _build_native_sidecar(
         src_name="qwp_cpp_sidecar.cpp", bin_name="qwp_cpp_sidecar",
+        compiler_default="c++", compiler_env="CXX", std_flag="-std=c++17")
+
+
+def build_c_egress_sidecar() -> Path:
+    """Build the C-binding ``qwp_egress_c_sidecar`` (QWP egress ``reader_*``
+    C API behind the ``sync-reader-qwp-ws`` ffi feature)."""
+    return _build_native_sidecar(
+        src_name="qwp_egress_c_sidecar.c", bin_name="qwp_egress_c_sidecar",
+        compiler_default="cc", compiler_env="CC", std_flag="-std=c11")
+
+
+def build_cpp_egress_sidecar() -> Path:
+    """Build the C++-binding ``qwp_egress_cpp_sidecar``. Unlike the ingress
+    case, the egress C++ wrapper (``questdb::egress::reader`` in
+    ``reader.hpp``) is a genuine C++ surface, so this sidecar drives the
+    C++ classes directly (constructor gated by
+    ``QUESTDB_READER_INTERNAL_CONSTRUCTORS``, the sanctioned in-tree-test
+    form -- same standalone-reader shape as the Rust sidecar's
+    ``Reader::from_conf``)."""
+    return _build_native_sidecar(
+        src_name="qwp_egress_cpp_sidecar.cpp", bin_name="qwp_egress_cpp_sidecar",
         compiler_default="c++", compiler_env="CXX", std_flag="-std=c++17")
 
 
@@ -301,10 +343,15 @@ class CClientRustEgressSidecar(EgressSidecar):
 
     binary_path: Optional[Path] = field(default=None)
 
+    def _default_binary(self) -> Path:
+        """Binary built when no explicit ``binary_path`` is supplied.
+        Subclasses override to launch a different egress binary."""
+        return build_qwp_egress_sidecar()
+
     def start(self, *, ready_timeout: float = 30.0) -> None:
         if self.process is not None:
             raise RuntimeError(f"egress sidecar {self.name!r} already started")
-        binary = self.binary_path or build_qwp_egress_sidecar()
+        binary = self.binary_path or self._default_binary()
         cmd = [str(binary)]
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -344,6 +391,30 @@ class CClientRustEgressSidecar(EgressSidecar):
             if line == "READY":
                 break
             LOG.warning("egress sidecar %s pre-READY: %r", self.name, line)
+
+
+@dataclass
+class CClientCEgressSidecar(CClientRustEgressSidecar):
+    """c-questdb-client **C-binding** egress (read-side) sidecar
+    (``qwp_egress_c_sidecar``): the ``reader_*`` C API driven from a C11
+    translation unit. Speaks the same EgressSidecar line protocol; the C
+    API exposes no zone accessor, so ``SERVER_INFO`` omits the ``zone=``
+    token (the Python wrapper defaults it to unset) and ``SHOW_ZONE`` /
+    ``QUERY_ROW`` reply ``ERR unsupported``."""
+
+    def _default_binary(self) -> Path:
+        return build_c_egress_sidecar()
+
+
+@dataclass
+class CClientCppEgressSidecar(CClientRustEgressSidecar):
+    """c-questdb-client **C++-binding** egress sidecar
+    (``qwp_egress_cpp_sidecar``): the genuine C++ wrapper classes
+    (``questdb::egress::reader`` / ``cursor`` / ``batch``). Same protocol
+    subset as :class:`CClientCEgressSidecar`."""
+
+    def _default_binary(self) -> Path:
+        return build_cpp_egress_sidecar()
 
 
 @dataclass

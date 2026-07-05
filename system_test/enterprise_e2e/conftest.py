@@ -67,12 +67,16 @@ pytest_plugins = ("lib.shared_fixtures",)
 
 # Imports below depend on the sys.path insert above.
 from c_client_sidecar import (  # noqa: E402
+    CClientCEgressSidecar,
+    CClientCppEgressSidecar,
     CClientCppSidecar,
     CClientCSidecar,
     CClientRustColumnSidecar,
     CClientRustEgressSidecar,
     CClientRustSidecar,
+    build_c_egress_sidecar,
     build_c_sidecar,
+    build_cpp_egress_sidecar,
     build_cpp_sidecar,
     build_qwp_column_sidecar,
     build_qwp_egress_sidecar,
@@ -185,6 +189,59 @@ def c_client_c_sidecar(
         classpath=None,
         name="c-client-c-sidecar",
         binary_path=c_client_c_sidecar_binary,
+    )
+    s.start()
+    try:
+        yield s
+    finally:
+        s.stop()
+
+
+@pytest.fixture(scope="session")
+def c_client_c_egress_sidecar_binary() -> Path:
+    """One C build per session for the egress (read-side) C sidecar."""
+    return build_c_egress_sidecar()
+
+
+@pytest.fixture(scope="function")
+def c_client_c_egress_sidecar(
+    c_client_c_egress_sidecar_binary: Path, log_dir: Path
+) -> Iterator[CClientCEgressSidecar]:
+    """Read-side sidecar driven by the **C** binding's ``qwp_egress_c_sidecar``
+    binary (the ``reader_*`` C API). Speaks the same EgressSidecar line
+    protocol subset as the Rust egress sidecar (no zone accessor in the C
+    API; SHOW_ZONE / QUERY_ROW unsupported)."""
+    s = CClientCEgressSidecar(
+        log_dir=log_dir,
+        classpath=None,
+        name="c-client-c-egress-sidecar",
+        binary_path=c_client_c_egress_sidecar_binary,
+    )
+    s.start()
+    try:
+        yield s
+    finally:
+        s.stop()
+
+
+@pytest.fixture(scope="session")
+def c_client_cpp_egress_sidecar_binary() -> Path:
+    """One C++ build per session for the egress (read-side) C++ sidecar."""
+    return build_cpp_egress_sidecar()
+
+
+@pytest.fixture(scope="function")
+def c_client_cpp_egress_sidecar(
+    c_client_cpp_egress_sidecar_binary: Path, log_dir: Path
+) -> Iterator[CClientCppEgressSidecar]:
+    """Read-side sidecar driven by the **C++** binding's
+    ``qwp_egress_cpp_sidecar`` binary (the genuine ``questdb::egress``
+    C++ wrapper classes)."""
+    s = CClientCppEgressSidecar(
+        log_dir=log_dir,
+        classpath=None,
+        name="c-client-cpp-egress-sidecar",
+        binary_path=c_client_cpp_egress_sidecar_binary,
     )
     s.start()
     try:
