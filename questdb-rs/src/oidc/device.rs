@@ -56,6 +56,10 @@ const MAX_EXPIRES_IN: i64 = 3600;
 // huge sleep, or keep the loop alive indefinitely.
 const DEFAULT_DEVICE_CODE_LIFETIME: u64 = 600;
 const MAX_DEVICE_CODE_LIFETIME: u64 = 1800;
+// A floor so a hostile/buggy `expires_in: 1` can't abort the flow after a single
+// poll before the user can authorize. Well below any conformant code lifetime
+// (RFC 8628 codes live minutes), so it never shortens a legitimate one.
+const MIN_DEVICE_CODE_LIFETIME: u64 = 60;
 const MIN_POLL_INTERVAL: u64 = 5;
 const MAX_POLL_INTERVAL: u64 = 60;
 
@@ -848,7 +852,7 @@ fn clamp_lifetime(expires_in: Option<i64>) -> u64 {
         Some(v) if v > 0 => v as u64,
         _ => DEFAULT_DEVICE_CODE_LIFETIME,
     };
-    secs.min(MAX_DEVICE_CODE_LIFETIME)
+    secs.clamp(MIN_DEVICE_CODE_LIFETIME, MAX_DEVICE_CODE_LIFETIME)
 }
 
 /// The next poll interval after a 429 / `slow_down`. Honors a `Retry-After`

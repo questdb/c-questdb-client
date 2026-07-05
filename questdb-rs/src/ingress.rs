@@ -1227,6 +1227,12 @@ impl SenderBuilder {
     /// retriable). Mutually exclusive with [`username`](Self::username) /
     /// [`password`](Self::password) / [`token`](Self::token); ILP/HTTP only.
     ///
+    /// **Use [`Protocol::Https`](crate::ingress::Protocol::Https).** The token is a
+    /// bearer credential for QuestDB; over
+    /// [`Protocol::Http`](crate::ingress::Protocol::Http) to a non-loopback host it
+    /// is sent in cleartext and can be captured in transit — plaintext http is
+    /// meant only for a loopback server during local development.
+    ///
     /// The provider runs **synchronously on the flush path**, so it must not
     /// block indefinitely. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)
     /// returns the cached token without blocking once signed in, but will run an
@@ -2104,6 +2110,25 @@ impl SenderBuilder {
     }
 
     fn build_auth(&self) -> Result<Option<conf::AuthParams>> {
+        // Report the precise conflict when a token provider is combined with any
+        // username/password/token — whichever was set first — before the match
+        // below, where a half-specified basic auth (e.g. a username with no
+        // password) would otherwise hit an "incomplete parameters" arm and hide
+        // the real cause.
+        #[cfg(feature = "_sender-http")]
+        {
+            if self.http_token_provider.is_some()
+                && (self.username.is_specified()
+                    || self.password.is_specified()
+                    || self.token.is_specified())
+            {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"http_token_provider\" is mutually exclusive with \
+                     username/password and token authentication."
+                ));
+            }
+        }
         match (
             self.protocol,
             self.username.deref(),

@@ -499,21 +499,31 @@ pub(crate) fn resolve_config(http: &HttpClient, params: &DiscoveryParams) -> Res
     let token_from_settings = token_endpoint.is_some() && !explicit_token;
     let device_from_settings = device_endpoint.is_some() && !explicit_device;
 
-    // Over a plaintext /settings channel a tampered response can advertise both
-    // credential endpoints at one attacker origin, with every later check
-    // passing trivially. Demand an out-of-band issuer pin first.
-    let settings_supplied = token_from_settings || device_from_settings;
+    // Over a plaintext /settings channel a tampered response can poison ANY field
+    // it supplies — not just the credential endpoints (which redirect the device
+    // code / refresh token to an attacker), but the client_id, scope, audience or
+    // groups flag (wrong client registration, mis-scoped / mis-audienced tokens).
+    // So fire on any settings-sourced value, and demand an out-of-band issuer pin.
+    let settings_used = token_from_settings
+        || device_from_settings
+        || (params.client_id.is_none() && str_setting(cfg.get(K_CLIENT_ID)).is_some())
+        || (params.scope.as_deref().unwrap_or("").is_empty()
+            && str_setting(cfg.get(K_SCOPE)).is_some())
+        || (params.audience.as_deref().unwrap_or("").is_empty()
+            && str_setting(cfg.get(K_AUDIENCE)).is_some())
+        || (params.groups_in_token.is_none() && cfg.get(K_GROUPS_IN_TOKEN).is_some());
     if let Some(url) = params.questdb_url.as_deref()
-        && settings_supplied
+        && settings_used
         && issuer.is_none()
         && settings_channel_is_plaintext(url)
     {
         return Err(OidcError::config(
-            "QuestDB was reached over plaintext http, so its /settings \
-                 response — and the OIDC endpoints it advertises — can be tampered \
-                 in transit and used to redirect the device-code and \
-                 refresh-token requests to an attacker. Pin the identity provider \
-                 out-of-band with issuer(\"https://your-idp\"), pass the endpoints \
+            "QuestDB was reached over plaintext http, so its /settings response — \
+                 and the OIDC configuration it advertises (endpoints, client id, \
+                 scope, audience, groups) — can be tampered in transit: to redirect \
+                 the device-code and refresh-token requests to an attacker, or to \
+                 force a wrong client registration. Pin the identity provider \
+                 out-of-band with issuer(\"https://your-idp\"), pass the values \
                  explicitly, or connect to QuestDB over https.",
         ));
     }

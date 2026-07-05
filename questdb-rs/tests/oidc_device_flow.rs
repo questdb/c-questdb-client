@@ -294,6 +294,27 @@ fn http_token_provider_conflicts_with_token() {
     assert_eq!(build.unwrap_err().code(), questdb::ErrorCode::ConfigError);
 }
 
+#[test]
+fn http_token_provider_conflicts_with_partial_basic_auth() {
+    // A provider plus a half-specified basic auth (username, no password) must
+    // report the provider conflict precisely, not the generic "password missing".
+    let build = SenderBuilder::new(Protocol::Http, "127.0.0.1", 9000u16)
+        .http_token_provider(|| Ok::<_, questdb::Error>("provided".to_string()))
+        .unwrap()
+        .username("admin")
+        .unwrap()
+        .protocol_version(ProtocolVersion::V1)
+        .unwrap()
+        .build();
+    let err = build.unwrap_err();
+    assert_eq!(err.code(), questdb::ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("http_token_provider"),
+        "expected the provider-conflict message, got: {}",
+        err.msg()
+    );
+}
+
 /// End-to-end: an interactive OIDC device-flow token is pulled by the sender and
 /// sent as a Bearer header. Incurs one real ~5s poll wait (the poll interval is
 /// floored at 5s and the external test can't inject the no-op sleep the in-crate

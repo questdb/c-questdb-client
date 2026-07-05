@@ -84,8 +84,9 @@ impl HttpAuth {
                 let token = provider()?;
                 // The token goes verbatim into an `Authorization: Bearer` header;
                 // a control / non-ASCII byte (a decoded CR/LF is a header-injection
-                // vector) or an empty value must never reach the wire.
-                if token.is_empty() || !token.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                // vector) or a blank value must never reach the wire. `trim` so an
+                // all-whitespace token is rejected too (matching `safe_token`).
+                if token.trim().is_empty() || !token.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
                     return Err(fmt!(
                         AuthError,
                         "The HTTP token provider returned an empty token or one \
@@ -630,5 +631,16 @@ mod tests {
             retry_sleep(i32::MAX, 4),
             Duration::from_millis(i32::MAX as u64)
         );
+    }
+
+    #[test]
+    fn resolve_rejects_blank_provider_token() {
+        // A blank / all-whitespace provider token is refused (matching safe_token),
+        // never reaching the wire as "Bearer   ".
+        let blank = HttpAuth::Provider(std::sync::Arc::new(|| Ok("   ".to_string())));
+        assert!(blank.resolve().is_err());
+        // A normal token resolves to a Bearer header.
+        let ok = HttpAuth::Provider(std::sync::Arc::new(|| Ok("tok".to_string())));
+        assert_eq!(ok.resolve().unwrap().as_deref(), Some("Bearer tok"));
     }
 }

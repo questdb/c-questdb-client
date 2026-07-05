@@ -341,6 +341,17 @@ fn slow_down_via_429_still_increases_interval() {
 }
 
 #[test]
+fn device_code_lifetime_is_floored() {
+    // A hostile/buggy tiny expires_in is raised to the minimum so the flow isn't
+    // aborted after a single poll; a huge one is capped; a sane one is unchanged.
+    assert_eq!(clamp_lifetime(Some(1)), MIN_DEVICE_CODE_LIFETIME);
+    assert_eq!(clamp_lifetime(Some(0)), DEFAULT_DEVICE_CODE_LIFETIME);
+    assert_eq!(clamp_lifetime(None), DEFAULT_DEVICE_CODE_LIFETIME);
+    assert_eq!(clamp_lifetime(Some(600)), 600);
+    assert_eq!(clamp_lifetime(Some(100_000)), MAX_DEVICE_CODE_LIFETIME);
+}
+
+#[test]
 fn access_denied_is_device_flow_error() {
     let mock = MockServer::start(|method, path, _body| match (method, path) {
         ("POST", "/device") => (200, device_response()),
@@ -438,6 +449,18 @@ fn silent_refresh_without_reprompt() {
     assert_eq!(auth.token().unwrap(), "AT-refreshed");
     // No second device-authorization request: the refresh was silent.
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    // The refresh response omitted a refresh_token, so the original RT-1 must be
+    // carried forward (not dropped) — otherwise the next refresh couldn't run.
+    assert_eq!(
+        auth.tokens
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .refresh_token
+            .as_deref(),
+        Some("RT-1")
+    );
 }
 
 #[test]
