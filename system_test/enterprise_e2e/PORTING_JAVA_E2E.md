@@ -209,24 +209,46 @@ Re-express each as a pytest scenario with forked servers + Rust sidecar.
 
 ### Ingress lifecycle
 
-- [ ] `SqlFailoverQwpClientLosslessTest.testObliviousQwpClientLosslessAcrossSqlFailover`
+- [x] `SqlFailoverQwpClientLosslessTest.testObliviousQwpClientLosslessAcrossSqlFailover`
       — sender configured with BOTH endpoints, oblivious to a
-      SQL-triggered primary move; lossless.
-- [ ] `SqlFailoverQwpClientLosslessTest.testObliviousDurableAckQwpClientLosslessNoCatchupWait`
-      — durable-ack variant, no catch-up wait.
-- [ ] `SqlFailoverQwpDeferredCloseExactlyOnceTest.testDeferredCloseExactlyOnceWithUploadsHeldUntilDemoteDrain`
+      SQL-triggered primary move; lossless. Ported:
+      `test_sql_failover_lossless.py::test_oblivious_sender_lossless_across_sql_failover_c_client_rust`
+      (pg-wire `SWITCH ROLE` vehicle preserved; ownership-token parity
+      wait substituted by the documented promote-with-retry recovery).
+- [x] `SqlFailoverQwpClientLosslessTest.testObliviousDurableAckQwpClientLosslessNoCatchupWait`
+      — durable-ack variant, no catch-up wait. Ported:
+      `test_sql_failover_lossless.py::test_oblivious_durable_ack_sender_lossless_no_catchup_wait_c_client_rust`.
+- [x] `SqlFailoverQwpDeferredCloseExactlyOnceTest.testDeferredCloseExactlyOnceWithUploadsHeldUntilDemoteDrain`
       — deterministic witness for role-change close deferral
       (`roleChangeCloseWithUploadGrace`): exactly-once delivery with
-      uploads held until demote drain.
-- [ ] `DurableAckThroughDemoteTest.testDurableAckClientThroughDemoteIsReleasedOrTerminalWithinBound`
+      uploads held until demote drain. Ported:
+      `test_sql_failover_lossless.py::test_deferred_close_exactly_once_uploads_held_until_demote_drain_c_client_rust`
+      (DurableAckRegistry watermark tripwires substituted by
+      replication-visible equivalents: B holds 0 rows pre-demote, B
+      converges on the committed corpus post-demote pre-promote;
+      QuestDB facade readback substituted by ingress + egress sidecars
+      on the same endpoints).
+- [x] `DurableAckThroughDemoteTest.testDurableAckClientThroughDemoteIsReleasedOrTerminalWithinBound`
       — durable-ack client carried through P→R demote is released or
-      terminal within a bound (never hangs).
+      terminal within a bound (never hangs). Ported:
+      `test_durable_ack_demote_bound.py::test_durable_ack_through_demote_released_or_terminal_within_bound_c_client_rust`
+      (pending-ack premise made deterministic via the upload-holding
+      throttle window + an explicit pre-demote AWAIT_ACKED-times-out
+      tripwire).
 - [x] `DurableAckThroughDemoteTest.testQwpDurableAckSenderSurvivesInPlaceDemote`
       — overlaps Group 1 `test_demotion_mid_stream`; covered by
       `test_graceful_demotion_mid_stream_sender_survives_c_client_rust`.
-- [ ] `QwpRoleBounceChaosLosslessTest.testObliviousDurableAckSenderAndHistoricalReadersSurviveRoleBouncing`
+- [x] `QwpRoleBounceChaosLosslessTest.testObliviousDurableAckSenderAndHistoricalReadersSurviveRoleBouncing`
       — chaos role bouncing (P→R, R→P, repeatedly, randomized timing);
       oblivious durable-ack sender + concurrent historical readers, lossless.
+      Ported:
+      `test_role_bounce_chaos.py::test_oblivious_durable_ack_sender_and_readers_survive_role_bouncing_c_client_rust`
+      (knobs: `QDB_E2E_BOUNCE_ROUNDS` default 3, `QDB_E2E_FUZZ_SEED`
+      logged for replay; the JUnit row-by-row scan verification is
+      pinned through row-count predicates — full-scan count, exact
+      count+sum, distinct/min/max density, zero-row ts-mismatch probe —
+      since the egress sidecar QUERY verb returns row counts; batch
+      arrival ORDER is the one property left pinned Java-side).
 
 ### Egress lifecycle
 
