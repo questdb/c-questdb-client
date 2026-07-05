@@ -138,15 +138,32 @@ these 4 are additional, probe-oriented scenarios.
 Existing here: `test_qwp_role_switch_fuzz_uncoordinated_client`. Port the
 remaining dimensions:
 
-- [ ] `test_switch_fuzz` — seed-isolated switch-roundtrip fuzz with
+- [x] `test_switch_fuzz` — seed-isolated switch-roundtrip fuzz with
       chain/survival/read-prober/exact-count-with-quiescence oracles.
-- [ ] `test_switch_fuzz_pitr` — live QWP client ingesting across
-      PITR-recovered boot + first switch.
-- [ ] `test_switch_fuzz_pinned_seed_5171257088512701991` — port as a
-      **pinned flip-chain** (explicit P→R→P sequence), not the raw seed
-      (Java RNG seed will not reproduce the same chain in this harness).
-- [ ] `test_switch_fuzz_live_replica_failover` — bounded live-replica
-      failover fuzz dimension.
+      Ported as `test_switch_fuzz_c_client_rust`. Rust adaptations: the
+      ingest loop publishes single-row frames via SEND+FLUSH (Java's SEND
+      publishes per call); the pre-demote ack-observe and post-chain drain
+      barrier await the loop's last *published* FSN (Rust empty-buffer
+      flush returns −1, Java re-flushes to learn the highest FSN); the
+      reconnect-**attempts** bound is a per-leg budget (chain_len×20+slack)
+      because the Rust role-reject retry cadence is flat-initial-backoff by
+      design (`qwp_ws.rs` reconnect_sleep_duration role_reject branch) —
+      the reconn-**succ** bound stays chain_len+slack, same shape as Java.
+- [x] `test_switch_fuzz_pitr` — live QWP client ingesting across
+      PITR-recovered boot + first switch. Ported as
+      `test_switch_fuzz_pitr_c_client_rust` (#092 guard; fresh sf_dir +
+      sender_id for the recovered-primary connection).
+- [x] `test_switch_fuzz_pinned_seed_5171257088512701991` — ported as a
+      **pinned flip-chain**: the Enterprise harness's only seeded draws are
+      `baseline_rows=randint(10,50)` then `chain_len=randint(1,6)`, and the
+      seed decodes (Python MT19937) to baseline_rows=22, chain_len=6 —
+      pinned explicitly in
+      `test_switch_fuzz_pinned_chain_5171257088512701991_c_client_rust`,
+      zero RNG dependency.
+- [x] `test_switch_fuzz_live_replica_failover` — bounded live-replica
+      failover fuzz dimension. Ported as
+      `test_switch_fuzz_live_replica_failover_c_client_rust`
+      (onward-convergence oracle + clean-shutdown asserts intact).
 
 ## Group 2 — egress / reader parity (from python suite A)
 
