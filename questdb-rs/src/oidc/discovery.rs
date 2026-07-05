@@ -233,24 +233,34 @@ pub(crate) fn endpoint_path_under_issuer(endpoint: &str, issuer: &str) -> bool {
     let Ok(ep_uri) = endpoint.parse::<Uri>() else {
         return false;
     };
-    let ep_segs: Vec<String> = decode_path_segments(ep_uri.path())
-        .iter()
-        .map(|s| strip_matrix_params(s))
-        .collect();
-    for seg in &ep_segs {
+    // Validate + normalize each endpoint segment. The fail-closed checks run on
+    // the decoded, *un-trimmed* segment: trimming first (as `strip_matrix_params`
+    // does) would silently drop a trailing whitespace-class byte, so a
+    // percent-encoded space / tab / newline (`prod%20`, `%09`, `%0a`) would
+    // decode to `prod␠`, trim back to `prod`, and match issuer segment `prod`
+    // even though a server that routes `prod␠` as a distinct tenant would send
+    // the request to a different realm — defeating this very pin.
+    let mut ep_segs: Vec<String> = Vec::new();
+    for raw in decode_path_segments(ep_uri.path()) {
+        // `;`-matrix strip only; no trim, so the checks below see every byte.
+        let seg = raw.split(';').next().unwrap_or("");
         // A `.` / `..` (the server normalizes it away, so a naive prefix test
         // passes yet the real path differs), a residual `%` (did not fully
         // decode — a server may decode it further to a dot-segment), a non-ASCII
-        // segment (a homoglyph dot could NFKC-fold to a real `..`), or a control
-        // char all fail closed.
+        // segment (a homoglyph dot could NFKC-fold to a real `..`), a control
+        // char, or leading/trailing whitespace (ambiguous — a server may or may
+        // not trim it, so `prod ` vs `prod` is exactly the tenant confusion this
+        // pin must prevent) all fail closed.
         if seg == "."
             || seg == ".."
             || seg.contains('%')
             || !seg.is_ascii()
             || has_control_char(seg)
+            || seg != seg.trim()
         {
             return false;
         }
+        ep_segs.push(seg.to_string());
     }
     ep_segs.len() >= base_segs.len() && ep_segs[..base_segs.len()] == base_segs[..]
 }
@@ -699,6 +709,28 @@ mod tests {
         // Percent-encoded traversal decodes and is caught too.
         assert!(!endpoint_path_under_issuer(
             "https://host/realms/prod/%2e%2e/attacker/token",
+            "https://host/realms/prod"
+        ));
+    }
+
+    #[test]
+    fn issuer_path_pin_rejects_whitespace_variant_tenant() {
+        // A percent-encoded trailing whitespace byte decodes to a distinct tenant
+        // segment (`prod `, `prod\t`, `prod\n`, ...) that a server may route
+        // separately from `prod`. It must fail closed, not be trimmed back to
+        // `prod` and accepted as under the pin. `%20` (space) is the one the
+        // control-char guard alone misses; the rest double as a check that the
+        // guard now sees the byte before it is trimmed away.
+        for enc in ["%20", "%09", "%0a", "%0d", "%0c"] {
+            let endpoint = format!("https://host/realms/prod{enc}/token");
+            assert!(
+                !endpoint_path_under_issuer(&endpoint, "https://host/realms/prod"),
+                "endpoint {endpoint} must not pass the issuer-path pin"
+            );
+        }
+        // Leading whitespace on the segment is equally ambiguous.
+        assert!(!endpoint_path_under_issuer(
+            "https://host/realms/%20prod/token",
             "https://host/realms/prod"
         ));
     }
