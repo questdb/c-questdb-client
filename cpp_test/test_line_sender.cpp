@@ -2816,7 +2816,7 @@ TEST_CASE("line_sender_error c++ can carry qwpws diagnostic")
 {
     questdb::ingress::qwp_ws_error diagnostic{
         questdb::ingress::qwp_ws_error_category::parse_error,
-        questdb::ingress::qwp_ws_error_policy::halt,
+        questdb::ingress::qwp_ws_error_policy::terminal,
         std::optional<uint8_t>{uint8_t{2}},
         "bad line",
         std::optional<uint64_t>{44},
@@ -2835,7 +2835,7 @@ TEST_CASE("line_sender_error c++ can carry qwpws diagnostic")
         questdb::ingress::qwp_ws_error_category::parse_error);
     CHECK(
         error.qwp_ws_diagnostic()->applied_policy ==
-        questdb::ingress::qwp_ws_error_policy::halt);
+        questdb::ingress::qwp_ws_error_policy::terminal);
     CHECK(error.qwp_ws_diagnostic()->status == std::optional<uint8_t>{uint8_t{2}});
     CHECK(error.qwp_ws_diagnostic()->message == "bad line");
     CHECK(
