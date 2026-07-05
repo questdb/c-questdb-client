@@ -90,11 +90,15 @@
 //! # }
 //! ```
 //!
-//! Independently, a cached token's lifetime is capped at one hour, so a very
-//! long-lived (or hostile) token is re-checked at least that often: silently
-//! when a refresh token is available, otherwise by re-prompting. Because a token
-//! provider is pulled on the flush path, a re-prompt can surface during a
-//! [`Sender::flush`](crate::ingress::Sender::flush) — request `offline_access`
+//! Independently, **when a refresh token is available** a cached token's believed
+//! lifetime is capped at one hour, so it is silently rotated at least that often
+//! even if the IdP issued a very long-lived (or hostile) token. Without a refresh
+//! token the cap is not applied: shortening the client's *belief* about expiry
+//! can't shorten the token's real validity at the server, so it would only force
+//! a needless interactive re-prompt. Because a token provider is pulled on the
+//! flush path, a re-prompt — when the token *genuinely* expires and no refresh
+//! token is available to rotate it silently — can still surface during a
+//! [`Sender::flush`](crate::ingress::Sender::flush); request `offline_access`
 //! (above) for unattended, long-running senders.
 //!
 //! # Security

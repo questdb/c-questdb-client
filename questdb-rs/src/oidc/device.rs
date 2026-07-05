@@ -44,9 +44,10 @@ const REFRESH_GRANT: &str = "refresh_token";
 // Clamp the token lifetime (access/id-token TTL). An absent or non-positive
 // `expires_in` is non-conformant; fall back to a short lifetime so a token with
 // no stated lifetime is refreshed promptly. A very long (or hostile) lifetime is
-// capped so a cached token is re-checked at least hourly — silently when a
-// refresh token is available, otherwise by re-prompting (see the module docs on
-// `offline_access`).
+// capped to an hour so a cached token is silently rotated at least that often —
+// but *only* when a refresh token was issued: without one the cap can't rotate
+// anything, it can only force an interactive re-prompt (see
+// `tokenset_from_response` and the module docs on `offline_access`).
 const DEFAULT_EXPIRES_IN: i64 = 300;
 const MAX_EXPIRES_IN: i64 = 3600;
 
@@ -789,15 +790,22 @@ impl OidcDeviceAuth {
     }
 
     fn tokenset_from_response(&self, body: &Value) -> TokenSet {
+        let access_token = safe_token(body.get("access_token"));
+        let id_token = safe_token(body.get("id_token"));
+        let refresh_token = str_field_val(body.get("refresh_token"));
+
         let mut expires_in = int_field(body, "expires_in").unwrap_or(DEFAULT_EXPIRES_IN);
         if expires_in <= 0 {
             expires_in = DEFAULT_EXPIRES_IN;
         }
-        expires_in = expires_in.min(MAX_EXPIRES_IN);
-
-        let access_token = safe_token(body.get("access_token"));
-        let id_token = safe_token(body.get("id_token"));
-        let refresh_token = str_field_val(body.get("refresh_token"));
+        // Cap the believed lifetime only when a refresh token can silently
+        // rotate it. With no refresh token the cap can't rotate anything — it
+        // would only force an interactive re-prompt (which fails in a headless
+        // context) while the token stays fully valid at the server — so trust
+        // the IdP's real TTL there. See the module docs on `offline_access`.
+        if refresh_token.is_some() {
+            expires_in = expires_in.min(MAX_EXPIRES_IN);
+        }
         let claims = decode_jwt_claims(id_token.as_deref())
             .or_else(|| decode_jwt_claims(access_token.as_deref()));
         let sub = claims

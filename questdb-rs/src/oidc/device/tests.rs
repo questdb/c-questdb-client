@@ -638,3 +638,54 @@ fn groups_mode_refresh_without_id_token_reprompts() {
     assert_eq!(auth.token().unwrap(), "ID-1");
     assert_eq!(device_calls.load(Ordering::SeqCst), 2);
 }
+
+/// Build an auth with explicit dummy endpoints — no server is contacted, enough
+/// to exercise the pure `tokenset_from_response` mapping.
+fn offline_auth() -> OidcDeviceAuth {
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint("https://idp.example.com/device")
+        .token_endpoint("https://idp.example.com/token")
+        .scope("openid")
+        .interactive(false)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .build()
+        .expect("build auth")
+}
+
+#[test]
+fn lifetime_cap_applies_only_with_refresh_token() {
+    // `expires_at` and `issued_at` are stamped from the same `now`, so their
+    // difference is exactly the (capped or uncapped) lifetime — no clock race.
+    let auth = offline_auth();
+    let long: i64 = 24 * 3600; // a 24h IdP TTL, far over the 1h cap
+
+    // No refresh token: trust the IdP's real TTL. Capping can't rotate the token
+    // (there is nothing to refresh with) and would only force a headless-breaking
+    // re-prompt, while the token stays valid at the server for the full 24h.
+    let ts = auth.tokenset_from_response(&serde_json::json!({
+        "access_token": "AT",
+        "expires_in": long,
+    }));
+    assert!(ts.refresh_token.is_none());
+    assert!(
+        (ts.expires_at - ts.issued_at - long as f64).abs() < 1.0,
+        "no refresh token: lifetime must not be capped (got {}s)",
+        ts.expires_at - ts.issued_at
+    );
+
+    // With a refresh token: the cap fires, so a silent refresh re-checks at least
+    // hourly (bounding a leaked long-lived access token).
+    let ts = auth.tokenset_from_response(&serde_json::json!({
+        "access_token": "AT",
+        "refresh_token": "RT",
+        "expires_in": long,
+    }));
+    assert!(ts.refresh_token.is_some());
+    assert!(
+        (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
+        "with refresh token: lifetime must be capped to MAX_EXPIRES_IN (got {}s)",
+        ts.expires_at - ts.issued_at
+    );
+}
