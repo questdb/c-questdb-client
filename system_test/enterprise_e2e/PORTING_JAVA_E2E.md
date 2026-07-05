@@ -318,21 +318,54 @@ matching the Java handler's inherent replay-awareness.
 
 ### Ingress connection behavior
 
-API gap: the Rust client has **no public connection-listener API**
-(`ConnectionListener` equivalent). 3 of 5 scenarios are portable as
-observable behavior; 2 are listener-API-specific.
+API gap: the Rust client has **no public connection-listener API** — no
+equivalent of `io.questdb.client.SenderConnectionListener` /
+`SenderConnectionEvent` anywhere under `questdb-rs/src` (no event kinds,
+no dispatcher, no per-event host/port/cause introspection). Ported
+scenarios re-express each event assertion as an observable behavior;
+the substitution map is documented in
+`tests/test_connection_behavior.py`'s module docstring.
 
-- [ ] `QwpIngressConnectionListenerTest.testInitialConnectAllEndpointsUnreachableRetriesForever`
-      (portable: behavioral)
-- [ ] `QwpIngressConnectionListenerTest.testInitialConnectFailsOverPastBogusEndpoint`
-      (portable: behavioral)
-- [ ] `QwpIngressConnectionListenerTest.testMidStreamServerDownRetriesForever`
-      (portable: behavioral)
-- [ ] `QwpIngressConnectionListenerTest.testInitialConnectAuthFailedFiresEvent`
-      — **blocked on client API** (connection-event surface) or adapt to
-      error-return assertion.
+Secondary observability gap (noted, not blocking): the async
+initial-connect loop keeps a LOCAL attempt counter
+(`connect_with_retry`, `qwp_ws.rs:688-757`) and never bumps the
+`qwp_ws_totals` `reconnect_attempts` counter (recorder sites are only the
+mid-stream loop `qwp_ws.rs:1206` and manual-progress
+`qwp_ws_driver.rs:1361`), so STATS cannot witness initial-connect sweeps;
+the all-unreachable port proves loop liveness via eventual connect + full
+backlog drain instead.
+
+- [x] `QwpIngressConnectionListenerTest.testInitialConnectAllEndpointsUnreachableRetriesForever`
+      — `test_initial_connect_all_endpoints_unreachable_retries_forever_c_client_rust`
+      (async initial connect, 8 budgets all-unreachable, every FLUSH
+      succeeds, then successor on a listed port drains the full backlog;
+      budget-rollover semantics pinned at
+      `SyncQwpWsPendingRunnerCore::drive_step`, `qwp_ws.rs:774-798`)
+- [x] `QwpIngressConnectionListenerTest.testInitialConnectFailsOverPastBogusEndpoint`
+      — `test_initial_connect_fails_over_past_bogus_endpoint_c_client_rust`
+- [x] `QwpIngressConnectionListenerTest.testMidStreamServerDownRetriesForever`
+      — `test_mid_stream_server_down_retries_forever_c_client_rust`
+      (dead-wire transport-error path: server never returns; STATS
+      reconnAttempts strictly grows, reconnSucc + acked watermark flat,
+      no terminal past 8 budgets — distinct from
+      `test_durable_ack_failover.py`'s replica-only role-reject path)
+- [x] `QwpIngressConnectionListenerTest.testInitialConnectAuthFailedFiresEvent`
+      — behavioral core ported:
+      `test_initial_connect_auth_failed_surfaces_terminal_promptly_c_client_rust`
+      (401 upgrade reject → `AuthError` terminal surfaces as prompt
+      CONNECT `ERR`, 0.01s observed vs a 30s budget; clean-terminal tail
+      re-connects with good credentials). The **listener-event half is
+      blocked on the client API gap above**: AUTH_FAILED event kind,
+      event host/port fields, and `getCause()` class introspection have
+      no Rust surface.
 - [ ] `QwpIngressConnectionListenerTest.testConnectionListenerInboxCapacityHonouredEndToEnd`
-      — **blocked on client API**; skip unless an event API is added.
+      — **blocked on client API**, not portable even behaviorally: the
+      scenario exists to pin the Java client's bounded event-dispatcher
+      inbox (`connection_listener_inbox_capacity` builder knob +
+      `QwpWebSocketSender.getDroppedConnectionNotifications()`); the Rust
+      client has no dispatcher thread, no event inbox, and no
+      dropped-notification counter to honour or regress. Revisit only if
+      a connection-event API is added to questdb-rs.
 
 ## Bindings matrix (C / C++ duplicates)
 
