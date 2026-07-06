@@ -1027,8 +1027,12 @@ impl ReaderConfig {
     }
 
     /// Supply a fresh Bearer token on every (re)connect via a callback (e.g.
-    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)), overriding
-    /// any static `username`/`password`/`token` auth.
+    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)).
+    ///
+    /// Mutually exclusive with the static `username`/`password`/`token` auth set in
+    /// the config string — combining them is a configuration error rather than a
+    /// silent override, mirroring
+    /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider).
     ///
     /// The provider is called at each connect and reconnect, so a long-lived
     /// reader keeps working as the token silently refreshes / rotates. The token
@@ -1046,19 +1050,27 @@ impl ReaderConfig {
     /// let auth = Arc::new(OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?);
     /// auth.sign_in()?;
     /// let cfg = ReaderConfig::from_conf("qwpwss::addr=questdb.example.com:9000;")?
-    ///     .token_provider({ let auth = Arc::clone(&auth); move || auth.token() });
+    ///     .token_provider({ let auth = Arc::clone(&auth); move || auth.token() })?;
     /// let reader = Reader::from_config(&cfg)?;
     /// # let _ = reader; Ok(())
     /// # }
     /// # }
     /// ```
-    pub fn token_provider<F, E>(mut self, provider: F) -> Self
+    pub fn token_provider<F, E>(mut self, provider: F) -> Result<Self>
     where
         F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
         E: Into<crate::Error>,
     {
+        if !matches!(self.auth, AuthMode::None) {
+            return Err(fmt!(
+                ConfigError,
+                "\"token_provider\" is mutually exclusive with the static \
+                 username/password and token authentication set via the config \
+                 string."
+            ));
+        }
         self.token_provider = Some(crate::token_provider::TokenProvider::new(provider));
-        self
+        Ok(self)
     }
 
     /// Re-run the cap and consistency checks that `from_conf` enforces.
@@ -1586,11 +1598,22 @@ mod tests {
     }
 
     #[test]
-    fn token_provider_overrides_static_auth() {
-        // A rotating token provider wins over static basic auth, and is pulled
-        // fresh each call so a rotated token reaches the handshake.
+    fn token_provider_rejects_static_auth() {
+        // Combining a rotating provider with static auth from the config string is
+        // a configuration error (mirrors the sender), not a silent override.
+        let err = ReaderConfig::from_conf("wss::addr=h:1;username=u;password=p")
+            .unwrap()
+            .token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn token_provider_pulled_fresh_each_connect() {
+        // Without static auth the provider is accepted and pulled fresh on each
+        // (re)connect, so a rotated token reaches the handshake.
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c = ReaderConfig::from_conf("wss::addr=h:1;username=u;password=p")
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
             .unwrap()
             .token_provider({
                 let counter = std::sync::Arc::clone(&counter);
@@ -1598,10 +1621,11 @@ mod tests {
                     let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Ok::<_, crate::Error>(format!("tok-{n}"))
                 }
-            });
+            })
+            .unwrap();
         let h = c.upgrade_headers().unwrap();
         let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
-        assert_eq!(auth.1, "Bearer tok-0"); // the provider, not `Basic ...`
+        assert_eq!(auth.1, "Bearer tok-0");
         // Re-invoked on the next (re)connect.
         let h = c.upgrade_headers().unwrap();
         let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
@@ -1613,7 +1637,8 @@ mod tests {
         // A CR/LF token (a header-injection vector) fails the handshake build.
         let c = ReaderConfig::from_conf("wss::addr=h:1")
             .unwrap()
-            .token_provider(|| Ok::<_, crate::Error>("bad\r\ntoken".to_string()));
+            .token_provider(|| Ok::<_, crate::Error>("bad\r\ntoken".to_string()))
+            .unwrap();
         let err = c.upgrade_headers().unwrap_err();
         assert_eq!(err.code(), ErrorCode::AuthError);
     }
@@ -1624,7 +1649,8 @@ mod tests {
             .unwrap()
             .token_provider(|| {
                 Err::<String, _>(crate::Error::new(crate::ErrorCode::AuthError, "no token"))
-            });
+            })
+            .unwrap();
         let err = c.upgrade_headers().unwrap_err();
         assert_eq!(err.code(), ErrorCode::AuthError);
     }
@@ -1639,7 +1665,8 @@ mod tests {
             .unwrap()
             .token_provider(|| {
                 Err::<String, _>(crate::Error::new(crate::ErrorCode::SocketError, "blip"))
-            });
+            })
+            .unwrap();
         let err = c.upgrade_headers().unwrap_err();
         assert_eq!(err.code(), ErrorCode::SocketError);
 
@@ -1648,7 +1675,8 @@ mod tests {
             .unwrap()
             .token_provider(|| {
                 Err::<String, _>(crate::Error::new(crate::ErrorCode::ConfigError, "bad"))
-            });
+            })
+            .unwrap();
         let err = c.upgrade_headers().unwrap_err();
         assert_eq!(err.code(), ErrorCode::AuthError);
     }

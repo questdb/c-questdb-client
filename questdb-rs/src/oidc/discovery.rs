@@ -52,7 +52,13 @@ const K_GROUPS_IN_TOKEN: &str = "acl.oidc.groups.encoded.in.token";
 const K_AUDIENCE: &str = "acl.oidc.audience";
 
 /// The resolved OIDC parameters needed to run the device flow.
+///
+/// `#[non_exhaustive]`: this is handed back by
+/// [`OidcDeviceAuth::config`](crate::oidc::OidcDeviceAuth::config) for inspection,
+/// never constructed by callers. Match its fields with a trailing `..` so a future
+/// field is not a breaking change (mirrors the `egress` config types).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OidcConfig {
     /// The OIDC public-client id registered with the identity provider.
     pub client_id: String,
