@@ -33,7 +33,11 @@ pub type Result<T> = std::result::Result<T, OidcError>;
 
 /// The category of an [`OidcError`], mirroring the reference clients' typed
 /// exception hierarchy.
+///
+/// `#[non_exhaustive]`: match with a `_` arm so a future variant is not a
+/// breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OidcErrorKind {
     /// The OIDC configuration could not be resolved or is inconsistent (e.g.
     /// QuestDB does not advertise OIDC, the IdP device-authorization endpoint
