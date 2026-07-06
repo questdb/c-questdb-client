@@ -123,10 +123,11 @@ restart and fuzz coverage.
   It stops and restarts QuestDB while the same sender remains alive, then proves
   rows before and after the restart land.
 
-- [ ] Columnar equivalent for reconnect-cap failure.
-  Row reference: `TestQwpWsRestart::test_reconnect_gives_up_after_cap`.
-  Columnar should prove a bounded reconnect budget surfaces an error and does
-  not falsely report dropped rows as acknowledged.
+- [ ] Columnar equivalent for retry-forever reconnect past the budget.
+  Row reference: `TestQwpWsRestart::test_reconnect_retries_forever_past_cap`.
+  Columnar should prove a transport outage never terminalizes: publishes keep
+  succeeding past several reconnect budgets, and every accepted row drains once
+  an endpoint reappears (only auth/protocol errors are terminal).
 
 - [x] Columnar equivalent for new-sender recovery from an existing `sf_dir`.
   Row reference: `TestQwpWsRestart::test_new_sender_recovers_from_sf_dir`.
