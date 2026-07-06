@@ -31,6 +31,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -303,6 +304,14 @@ public:
 
     // Number of TCP connections accepted so far.
     int accepts() const;
+
+    // Block until at least `n` TCP connections have been accepted, or
+    // `timeout` elapses; returns true if the count was reached. Store-and-
+    // forward senders connect on a background thread, so the borrow returns
+    // before the accept lands.
+    bool wait_for_accepts(
+        int n,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) const;
 
     // Snapshot of every payload (msg_kind + body) the workers have seen
     // from the client, in arrival order. Each entry is the bare client→

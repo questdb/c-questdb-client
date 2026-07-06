@@ -51,21 +51,6 @@ std::string conf_for(const std::string& addr, const std::string& extras = {})
     return "qwpws::addr=" + addr + ";pool_size=1;pool_reap=manual;" + extras;
 }
 
-// The store-and-forward runner opens its connection on a background thread, so
-// a borrow's accept lands asynchronously after `borrow_column_sender()`
-// returns. Poll for it (as the Rust suite's `wait_until` does) instead of
-// reading `accepts()` synchronously, which would race the connect.
-bool wait_for_accepts(const qm::MockServer& mock, int target)
-{
-    for (int i = 0; i < 200; ++i) // up to ~2s, matching the Rust test
-    {
-        if (mock.accepts() >= target)
-            return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return false;
-}
-
 } // namespace
 
 TEST_CASE("column_chunk is move-constructible and move-assignable")
@@ -121,7 +106,7 @@ TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
         // The background runner opens one connection; wait for it to land.
-        REQUIRE(wait_for_accepts(*mock, 1));
+        REQUIRE(mock->wait_for_accepts(1));
     }
     // Drop returns the sender to the pool (recycled, not dropped).
     {
@@ -307,15 +292,15 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
 
     {
         auto conn = db.borrow_column_sender();
-        REQUIRE(wait_for_accepts(*mock, 1)); // first borrow opens conn #1
-        conn.drop_on_return();               // force drop instead of recycle
+        REQUIRE(mock->wait_for_accepts(1)); // first borrow opens conn #1
+        conn.drop_on_return();              // force drop instead of recycle
     }
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
         // The slot was dropped (not recycled), so the re-borrow must open a
         // fresh conn #2 rather than reuse the first.
-        REQUIRE(wait_for_accepts(*mock, 2));
+        REQUIRE(mock->wait_for_accepts(2));
     }
     CHECK(mock->accepts() == 2);
 }

@@ -5181,10 +5181,8 @@ impl SymbolGlobalDict {
     }
 
     pub(crate) fn rollback(&mut self, mark: SymbolGlobalDictMark) {
-        while self.entries.len() > mark.entries_len {
-            if let Some(entry) = self.entries.pop() {
-                self.map.remove(entry.as_ref());
-            }
+        for entry in self.entries.drain(mark.entries_len..) {
+            self.map.remove(entry.as_ref());
         }
         self.next_id = mark.next_id;
         #[cfg(feature = "arrow-ingress")]
