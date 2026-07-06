@@ -737,8 +737,16 @@ impl OidcDeviceAuth {
                 self.lock_store_state().last_persisted_refresh = peer.refresh_token.clone();
                 return Ok(peer);
             }
-            // Adopted but stale: refresh with its (possibly rotated) token.
-            current = peer;
+            // Adopted but stale: refresh with its (possibly rotated) token — but
+            // only when it actually carries one. A persisted entry is untrusted
+            // input and can hold a served token yet no refresh token; adopting
+            // that as the refresh source would leave `current` with nothing to
+            // send. Keep `existing` in that case (the obtain_tokens gate
+            // guarantees it has a refresh token), so we refresh with the
+            // known-good in-memory token rather than a refresh-token-less peer.
+            if peer.refresh_token.is_some() {
+                current = peer;
+            }
         }
         let refreshed = self.refresh(&current)?;
         if self.has_required_token(&refreshed) {
@@ -1041,10 +1049,15 @@ impl OidcDeviceAuth {
     }
 
     fn refresh(&self, tokens: &TokenSet) -> Result<TokenSet> {
-        let refresh_token = tokens
-            .refresh_token
-            .as_deref()
-            .expect("refresh() called without a refresh token");
+        // Callers gate on a present refresh token, but a persisted entry
+        // (untrusted input) can reach here without one; return an error rather
+        // than panic. A non-Network error routes `obtain_tokens` to a fresh
+        // interactive sign-in — the correct recovery when we can't refresh.
+        let Some(refresh_token) = tokens.refresh_token.as_deref() else {
+            return Err(OidcError::device_flow(
+                "Token refresh was attempted without a refresh token.",
+            ));
+        };
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", REFRESH_GRANT),
             ("refresh_token", refresh_token),

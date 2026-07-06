@@ -1459,3 +1459,50 @@ fn tampered_persisted_token_is_rejected_on_load() {
     assert_eq!(auth.token().unwrap(), "AT-initial");
     assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn refresh_survives_persisted_entry_without_refresh_token() {
+    // Regression: a persisted entry (untrusted input) can carry a served token but
+    // NO refresh token. When it is re-read inside the coordinated-refresh lock
+    // while the in-memory token still holds a refresh token (so `rt_matches`), the
+    // stale, refresh-token-less peer must NOT become the refresh source — doing so
+    // used to panic in `refresh()` via `.expect("refresh() called without a
+    // refresh token")`, unwinding out of the caller's `token()`/`flush()`. It must
+    // instead refresh with the known-good in-memory token, with no re-prompt.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+
+    // Sign in: in-memory + disk hold RT-1, so last_persisted_refresh == RT-1.
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+
+    // A peer process / corruption overwrites the file for this identity with a
+    // served token, NO refresh token, and a long-past expiry — a state the load
+    // path accepts (only the served token is required) but that must never reach
+    // the refresh network call as the refresh source.
+    let writer = FileTokenStore::at(dir.path());
+    writer
+        .save(
+            &key,
+            &PersistedToken::new(Some("AT-stale".to_string()), None, None, 1.0, 300.0),
+        )
+        .unwrap();
+
+    // Force the in-memory access token expired while keeping its refresh token, so
+    // obtain_tokens enters the coordinated refresh and re-reads the swapped file.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+
+    // Must NOT panic: the refresh-token-less peer is ignored, the in-memory RT-1 is
+    // used to refresh, and the refreshed token is returned without a re-prompt.
+    assert_eq!(auth.token().unwrap(), "AT-refreshed");
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        1,
+        "must silently refresh with the in-memory token, not re-prompt"
+    );
+}
