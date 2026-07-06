@@ -976,6 +976,13 @@ impl OidcDeviceAuth {
                                  polls ({e})."
                             )));
                         }
+                    } else {
+                        // An HTTP status came back (a non-JSON 5xx/429 error page):
+                        // the endpoint IS reachable, so reset the consecutive-
+                        // transport-failure counter, mirroring the Ok branch. A
+                        // reachable-but-erroring poll must not count toward the
+                        // "unreachable on N consecutive polls" abort.
+                        transport_failures = 0;
                     }
                     // Transient (dropped connection / 5xx / 429): keep polling.
                     if e.status() == Some(429) || e.retry_after_secs().is_some() {
@@ -1284,14 +1291,10 @@ fn str_field_val(value: Option<&Value>) -> Option<String> {
 /// value would be smuggled verbatim into an `Authorization: Bearer` header (a
 /// decoded CR/LF is a header-injection vector), so it is dropped rather than sent.
 fn safe_token(value: Option<&Value>) -> Option<String> {
-    let s = match value {
-        Some(Value::String(s)) => s,
-        _ => return None,
-    };
-    if s.trim().is_empty() || !s.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
-        return None;
+    match value {
+        Some(Value::String(s)) if is_safe_token_str(s) => Some(s.clone()),
+        _ => None,
     }
-    Some(s.clone())
 }
 
 fn int_field(body: &Value, key: &str) -> Option<i64> {

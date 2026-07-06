@@ -58,6 +58,21 @@ pub mod oidc;
 
 pub use error::*;
 
+/// True if `s` is safe to send verbatim as a wire-bound Bearer credential:
+/// non-blank and printable-ASCII only. A control / non-ASCII byte (a decoded CR/LF
+/// is a header-injection vector) or a blank value must never reach an
+/// `Authorization: Bearer` header. Single gate shared by the OIDC token checks, the
+/// ILP/HTTP token-provider, and the QWP/WS + egress token-provider.
+#[cfg(any(
+    feature = "_oidc",
+    feature = "_sender-http",
+    feature = "_sender-qwp-ws",
+    feature = "_egress"
+))]
+pub(crate) fn is_printable_ascii_token(s: &str) -> bool {
+    !s.trim().is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
 #[cfg(test)]
 mod alloc_counter {
     use std::alloc::{GlobalAlloc, Layout, System};

@@ -43,7 +43,7 @@ pub(crate) fn now_epoch() -> f64 {
 /// header-injection vector) or a blank value must never reach an `Authorization:
 /// Bearer` header, whether it came from an IdP response or a persisted file.
 pub(crate) fn is_safe_token_str(s: &str) -> bool {
-    !s.trim().is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+    crate::is_printable_ascii_token(s)
 }
 
 /// The set of IdP tokens (access / id / refresh) plus their expiry.

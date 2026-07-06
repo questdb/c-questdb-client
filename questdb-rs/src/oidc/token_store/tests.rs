@@ -272,6 +272,54 @@ fn refuses_a_symlinked_store_directory() {
 }
 
 #[test]
+fn creates_missing_parent_chain() {
+    // The parent chain is created recursively and the leaf non-recursively; a
+    // brand-new nested store path must still work.
+    let base = TempDir::new().unwrap();
+    let dir = base.path().join("a").join("b").join("oidc-tokens");
+    let store = FileTokenStore::at(&dir);
+    store.save(&test_key(), &test_token()).unwrap();
+    assert!(store.load(&test_key()).unwrap().is_some());
+}
+
+#[test]
+fn with_lock_timings_clamps_acquire_budget() {
+    // An unclamped near-`Duration::MAX` budget would overflow `Instant::now() +
+    // budget`; it is clamped down to the 5-minute ceiling.
+    let store =
+        FileTokenStore::at("/tmp/x").with_lock_timings(Duration::MAX, Duration::from_secs(600));
+    assert_eq!(store.lock_acquire_budget, MAX_LOCK_ACQUIRE_BUDGET);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_lock_removes_our_own_lock() {
+    let dir = TempDir::new().unwrap();
+    let lock = dir.path().join("y.lock");
+    let ours = create_lock_file(&lock).unwrap();
+    release_lock(&lock, &ours);
+    assert!(!lock.exists(), "release must remove a lock we still own");
+}
+
+#[cfg(unix)]
+#[test]
+fn release_lock_leaves_a_successor_lock() {
+    // If our lock is stolen and a peer recreates it (a different inode), releasing
+    // our now-orphaned handle must NOT delete the peer's live lock — deleting by
+    // path alone would break mutual exclusion.
+    let dir = TempDir::new().unwrap();
+    let lock = dir.path().join("z.lock");
+    let ours = create_lock_file(&lock).unwrap();
+    std::fs::remove_file(&lock).unwrap(); // steal: our inode is now orphaned
+    let _peer = create_lock_file(&lock).unwrap(); // peer's fresh inode at the path
+    release_lock(&lock, &ours);
+    assert!(
+        lock.exists(),
+        "release deleted the peer's successor lock (by-path unlink)"
+    );
+}
+
+#[test]
 fn clear_removes_file_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let store = FileTokenStore::at(dir.path());

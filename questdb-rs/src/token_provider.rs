@@ -62,7 +62,7 @@ impl TokenProvider {
     /// terminal `AuthError` (the reconnect aborts rather than looping).
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
         let token = (self.0)().map_err(classify_provider_error)?;
-        if token.trim().is_empty() || !token.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        if !crate::is_printable_ascii_token(&token) {
             return Err(crate::error::fmt!(
                 AuthError,
                 "The token provider returned an empty token or one containing a \

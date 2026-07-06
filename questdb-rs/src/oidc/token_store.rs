@@ -77,6 +77,11 @@ const MAX_FILE_BYTES: u64 = 1 << 20;
 /// How long to spin trying to acquire the per-identity lock file before giving up
 /// and running without it (degrading to the atomic-replace integrity layer).
 const DEFAULT_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(3);
+/// A configured acquire budget above this is clamped down. The lock is only ever
+/// held for a bounded refresh/save (well under a minute in practice), so spinning
+/// longer to acquire it is pointless — and an unclamped near-`Duration::MAX` budget
+/// would overflow `Instant::now() + budget`.
+const MAX_LOCK_ACQUIRE_BUDGET: Duration = Duration::from_secs(300);
 const LOCK_POLL_SLICE: Duration = Duration::from_millis(50);
 
 /// A lock older than this is treated as abandoned (a crashed holder) and stolen.
@@ -413,9 +418,11 @@ impl FileTokenStore {
     /// Override the cross-process lock timings. `stale` must exceed 5 minutes (it
     /// must dominate the worst-case time a live holder can hold the lock, so a
     /// tighter window could steal a live lock). A tighter `stale` is clamped up to
-    /// the 5-minute floor.
+    /// the 5-minute floor; `acquire_budget` is clamped down to 5 minutes (spinning
+    /// longer than that to acquire a briefly-held lock is pointless, and an
+    /// unclamped value would overflow the deadline arithmetic).
     pub fn with_lock_timings(mut self, acquire_budget: Duration, stale: Duration) -> Self {
-        self.lock_acquire_budget = acquire_budget;
+        self.lock_acquire_budget = acquire_budget.min(MAX_LOCK_ACQUIRE_BUDGET);
         self.lock_stale = stale.max(MIN_LOCK_STALE);
         self
     }
@@ -439,12 +446,7 @@ impl FileTokenStore {
         // via the env var) still works.
         match fs::symlink_metadata(&self.directory) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "the OIDC token store path is a symbolic link; refusing to use it \
-                     because the plaintext token files could be redirected outside the \
-                     owner-only directory",
-                ));
+                return Err(symlink_leaf_error());
             }
             Ok(_) => {
                 // Pre-existing real directory: re-assert owner-only perms.
@@ -454,7 +456,31 @@ impl FileTokenStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        create_dir_all_private(&self.directory)?;
+        // Create the parent chain, then the leaf itself NON-recursively, so a
+        // symlink planted at the leaf in the window since the lstat above makes the
+        // create fail with `AlreadyExists` rather than being silently accepted by a
+        // recursive create — closing the stat→create TOCTOU on the sensitive final
+        // component (a recursive `create_dir_all` treats an existing symlink-to-dir
+        // as success and would write token files through it).
+        if let Some(parent) = self.directory.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            create_dir_all_private(parent)?;
+        }
+        match create_dir_private(&self.directory) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Lost the create race: accept only a real directory, never a
+                // symlink planted in the gap.
+                if fs::symlink_metadata(&self.directory)?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err(symlink_leaf_error());
+                }
+            }
+            Err(e) => return Err(e),
+        }
         restrict_to_owner(&self.directory);
         Ok(())
     }
@@ -537,21 +563,23 @@ impl FileTokenStore {
 
     // -- lock-file protocol -------------------------------------------------
 
-    fn acquire_lock(&self, lock: &Path) -> bool {
+    fn acquire_lock(&self, lock: &Path) -> Option<File> {
+        // `lock_acquire_budget` is clamped in `with_lock_timings`, so this add
+        // cannot overflow.
         let deadline = Instant::now() + self.lock_acquire_budget;
         loop {
             match create_lock_file(lock) {
-                Ok(()) => return true,
+                Ok(file) => return Some(file),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if self.is_stale(lock) {
                         steal_stale_lock(lock, self.lock_stale);
                     }
                     if Instant::now() >= deadline {
-                        return false; // give up; run without the lock
+                        return None; // give up; run without the lock
                     }
                     std::thread::sleep(LOCK_POLL_SLICE);
                 }
-                Err(_) => return false, // unexpected IO; degrade to no lock
+                Err(_) => return None, // unexpected IO; degrade to no lock
             }
         }
     }
@@ -642,12 +670,16 @@ impl TokenStore for FileTokenStore {
         let lock = self.lock_file(key);
         // Prepare the directory and acquire; on any failure, run without the lock
         // (the atomic write still keeps every reader consistent).
-        let held = self.ensure_directory().is_ok() && self.acquire_lock(&lock);
+        let held = if self.ensure_directory().is_ok() {
+            self.acquire_lock(&lock)
+        } else {
+            None
+        };
         let result = action();
-        if held {
-            // Best-effort release; a leftover lock goes stale and the next
-            // acquirer steals it.
-            let _ = fs::remove_file(&lock);
+        if let Some(file) = &held {
+            // Release only if we still own the lock file; a leftover lock goes
+            // stale and the next acquirer steals it.
+            release_lock(&lock, file);
         }
         result
     }
@@ -754,10 +786,11 @@ fn temp_path(dir: &Path, hash: &str) -> PathBuf {
     dir.join(format!("{hash}.{}.{n}.{nanos}.tmp", std::process::id()))
 }
 
-fn create_lock_file(lock: &Path) -> std::io::Result<()> {
+fn create_lock_file(lock: &Path) -> std::io::Result<File> {
     // The create_new (O_CREAT|O_EXCL) IS the acquisition; write the holder bytes
     // through this same handle so a concurrent steal can't truncate a peer's
-    // fresh lock. Holder bytes are debug-only (staleness is judged by mtime).
+    // fresh lock. Holder bytes are debug-only (staleness is judged by mtime). The
+    // handle is returned so the release can verify it still owns the lock file.
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -767,7 +800,34 @@ fn create_lock_file(lock: &Path) -> std::io::Result<()> {
     }
     let mut f = opts.open(lock)?;
     let _ = f.write_all(holder_bytes().as_bytes());
-    Ok(())
+    Ok(f)
+}
+
+/// Release a held lock by unlinking it — but only when the path still resolves to
+/// the exact file we created. A peer that stole a stale lock and recreated it holds
+/// a *different* inode; unlinking by path alone would delete the peer's live lock
+/// and let a third process enter the critical section concurrently. Comparing
+/// `(dev, ino)` of our open handle against the current path closes that window.
+///
+/// On non-unix targets there is no portable inode identity, so fall back to a
+/// best-effort unlink; the stale-steal protocol still recovers from an erroneously
+/// deleted successor lock.
+#[cfg(unix)]
+fn release_lock(lock: &Path, held: &File) {
+    use std::os::unix::fs::MetadataExt;
+    let ours = held.metadata().ok();
+    let at_path = fs::symlink_metadata(lock).ok();
+    if let (Some(ours), Some(at_path)) = (ours, at_path)
+        && ours.dev() == at_path.dev()
+        && ours.ino() == at_path.ino()
+    {
+        let _ = fs::remove_file(lock);
+    }
+}
+
+#[cfg(not(unix))]
+fn release_lock(lock: &Path, _held: &File) {
+    let _ = fs::remove_file(lock);
 }
 
 fn steal_stale_lock(lock: &Path, lock_stale: Duration) {
@@ -919,6 +979,31 @@ fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
 fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
     warn_no_posix_perms_once();
     fs::create_dir_all(dir)
+}
+
+/// Create a single directory (non-recursive) with owner-only perms. Non-recursive
+/// so an existing symlink planted at `dir` fails with `AlreadyExists` instead of
+/// being followed — the parent chain must already exist.
+#[cfg(unix)]
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    warn_no_posix_perms_once();
+    fs::create_dir(dir)
+}
+
+/// The error returned when the store leaf is (or races to become) a symlink.
+fn symlink_leaf_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "the OIDC token store path is a symbolic link; refusing to use it because \
+         the plaintext token files could be redirected outside the owner-only \
+         directory",
+    )
 }
 
 #[cfg(unix)]

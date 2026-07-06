@@ -84,9 +84,9 @@ impl HttpAuth {
                 let token = provider()?;
                 // The token goes verbatim into an `Authorization: Bearer` header;
                 // a control / non-ASCII byte (a decoded CR/LF is a header-injection
-                // vector) or a blank value must never reach the wire. `trim` so an
-                // all-whitespace token is rejected too (matching `safe_token`).
-                if token.trim().is_empty() || !token.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                // vector) or a blank value must never reach the wire (the shared
+                // gate also trims, so an all-whitespace token is rejected).
+                if !crate::is_printable_ascii_token(&token) {
                     return Err(fmt!(
                         AuthError,
                         "The HTTP token provider returned an empty token or one \
