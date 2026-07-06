@@ -87,13 +87,12 @@ __all__ = [
 def get_live_fixture(testcase: unittest.TestCase):
     from test import (
         QDB_FIXTURE,
-        QuestDbDockerFixture,
         QuestDbExternalFixture,
         QuestDbFixture,
     )
     if not isinstance(
         QDB_FIXTURE,
-        (QuestDbFixture, QuestDbExternalFixture, QuestDbDockerFixture),
+        (QuestDbFixture, QuestDbExternalFixture),
     ):
         testcase.skipTest("requires a live QuestDB fixture")
     return QDB_FIXTURE
