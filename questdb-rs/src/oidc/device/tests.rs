@@ -991,10 +991,13 @@ fn lifetime_cap_applies_only_with_refresh_token() {
     // No refresh token: trust the IdP's real TTL. Capping can't rotate the token
     // (there is nothing to refresh with) and would only force a headless-breaking
     // re-prompt, while the token stays valid at the server for the full 24h.
-    let ts = auth.tokenset_from_response(&serde_json::json!({
-        "access_token": "AT",
-        "expires_in": long,
-    }));
+    let ts = auth.tokenset_from_response(
+        &serde_json::json!({
+            "access_token": "AT",
+            "expires_in": long,
+        }),
+        None,
+    );
     assert!(ts.refresh_token.is_none());
     assert!(
         (ts.expires_at - ts.issued_at - long as f64).abs() < 1.0,
@@ -1002,17 +1005,38 @@ fn lifetime_cap_applies_only_with_refresh_token() {
         ts.expires_at - ts.issued_at
     );
 
-    // With a refresh token: the cap fires, so a silent refresh re-checks at least
-    // hourly (bounding a leaked long-lived access token).
-    let ts = auth.tokenset_from_response(&serde_json::json!({
-        "access_token": "AT",
-        "refresh_token": "RT",
-        "expires_in": long,
-    }));
+    // With a refresh token in the response: the cap fires, so a silent refresh
+    // re-checks at least hourly (bounding a leaked long-lived access token).
+    let ts = auth.tokenset_from_response(
+        &serde_json::json!({
+            "access_token": "AT",
+            "refresh_token": "RT",
+            "expires_in": long,
+        }),
+        None,
+    );
     assert!(ts.refresh_token.is_some());
     assert!(
         (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
         "with refresh token: lifetime must be capped to MAX_EXPIRES_IN (got {}s)",
+        ts.expires_at - ts.issued_at
+    );
+
+    // Regression (M1): a refresh from a non-rotating IdP omits refresh_token, but
+    // the prior one is carried forward — the effective token can rotate, so the
+    // cap MUST still fire. Previously the cap keyed off the response body alone,
+    // leaving the carried-forward case uncapped for the sender's whole lifetime.
+    let ts = auth.tokenset_from_response(
+        &serde_json::json!({
+            "access_token": "AT",
+            "expires_in": long,
+        }),
+        Some("carried-RT"),
+    );
+    assert_eq!(ts.refresh_token.as_deref(), Some("carried-RT"));
+    assert!(
+        (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
+        "carried-forward refresh token: lifetime must be capped (got {}s)",
         ts.expires_at - ts.issued_at
     );
 }

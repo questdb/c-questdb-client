@@ -659,7 +659,7 @@ impl OidcDeviceAuth {
             let retry_after = result.retry_after;
 
             if status == 200 {
-                let tokens = self.tokenset_from_response(&body);
+                let tokens = self.tokenset_from_response(&body, None);
                 if self.has_required_token(&tokens) {
                     return Ok(tokens);
                 }
@@ -760,12 +760,10 @@ impl OidcDeviceAuth {
         };
 
         if result.status == 200 {
-            let mut refreshed = self.tokenset_from_response(&result.body);
-            // Many IdPs don't rotate the refresh token; keep the old one.
-            if refreshed.refresh_token.is_none() {
-                refreshed.refresh_token = tokens.refresh_token.clone();
-            }
-            return Ok(refreshed);
+            // Carry the prior refresh token forward (a non-rotating IdP omits it
+            // on refresh) and let the lifetime cap see it — see
+            // `tokenset_from_response`.
+            return Ok(self.tokenset_from_response(&result.body, Some(refresh_token)));
         }
         if is_transient_status(Some(result.status)) {
             return Err(OidcError::network(format!(
@@ -803,20 +801,30 @@ impl OidcDeviceAuth {
         }
     }
 
-    fn tokenset_from_response(&self, body: &Value) -> TokenSet {
+    /// Map an IdP token response into a [`TokenSet`]. `prior_refresh` is the
+    /// refresh token to carry forward when the response omits one (many IdPs
+    /// don't re-send it on a refresh); it is `None` on the initial device flow.
+    /// The lifetime cap keys off the *effective* refresh token — fresh or
+    /// carried forward — so a non-rotating IdP's long TTL is still capped.
+    fn tokenset_from_response(&self, body: &Value, prior_refresh: Option<&str>) -> TokenSet {
         let access_token = safe_token(body.get("access_token"));
         let id_token = safe_token(body.get("id_token"));
-        let refresh_token = str_field_val(body.get("refresh_token"));
+        // The effective refresh token: the response's own, else the carried-
+        // forward prior one (a refresh from a non-rotating IdP omits it).
+        let refresh_token =
+            str_field_val(body.get("refresh_token")).or_else(|| prior_refresh.map(String::from));
 
         let mut expires_in = int_field(body, "expires_in").unwrap_or(DEFAULT_EXPIRES_IN);
         if expires_in <= 0 {
             expires_in = DEFAULT_EXPIRES_IN;
         }
         // Cap the believed lifetime only when a refresh token can silently
-        // rotate it. With no refresh token the cap can't rotate anything — it
-        // would only force an interactive re-prompt (which fails in a headless
-        // context) while the token stays fully valid at the server — so trust
-        // the IdP's real TTL there. See the module docs on `offline_access`.
+        // rotate it — including one carried forward above, so a non-rotating
+        // IdP's long (or hostile) TTL stays bounded. With no refresh token the
+        // cap can't rotate anything — it would only force an interactive
+        // re-prompt (which fails in a headless context) while the token stays
+        // fully valid at the server — so trust the IdP's real TTL there. See the
+        // module docs on `offline_access`.
         if refresh_token.is_some() {
             expires_in = expires_in.min(MAX_EXPIRES_IN);
         }
