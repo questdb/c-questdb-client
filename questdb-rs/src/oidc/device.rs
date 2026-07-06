@@ -38,7 +38,8 @@ use crate::oidc::http::HttpClient;
 use crate::oidc::render::{
     DeviceCodeChallenge, Renderer, TerminalRenderer, maybe_open_browser, strip_control_capped,
 };
-use crate::oidc::token::{DEFAULT_SKEW_SECONDS, TokenSet, now_epoch};
+use crate::oidc::token::{DEFAULT_SKEW_SECONDS, TokenSet, is_safe_token_str, now_epoch};
+use crate::oidc::token_store::{PersistedToken, TokenStore, TokenStoreKey};
 
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const REFRESH_GRANT: &str = "refresh_token";
@@ -84,6 +85,16 @@ type SleepFn = Arc<dyn Fn(Duration) + Send + Sync>;
 /// device-code deadline without waiting. Defaults to [`Instant::now`].
 type NowFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 
+/// Persistence bookkeeping, touched only under the `acquire` lock.
+#[derive(Default)]
+struct StoreState {
+    /// Whether the one-shot lazy load from the store has run.
+    load_attempted: bool,
+    /// The refresh token last written to the store, so a non-rotating refresh
+    /// can skip rewriting the file on the hot path.
+    last_persisted_refresh: Option<String>,
+}
+
 /// The RFC 8628 device-authorization response (device code is a secret used only
 /// in the poll body, never displayed).
 struct DeviceResponse {
@@ -114,6 +125,7 @@ pub struct OidcDeviceAuthBuilder {
     renderer: Option<Box<dyn Renderer>>,
     sleep: Option<SleepFn>,
     now: Option<NowFn>,
+    token_store: Option<Arc<dyn TokenStore>>,
 }
 
 impl OidcDeviceAuthBuilder {
@@ -136,6 +148,7 @@ impl OidcDeviceAuthBuilder {
             renderer: None,
             sleep: None,
             now: None,
+            token_store: None,
         }
     }
 
@@ -240,6 +253,24 @@ impl OidcDeviceAuthBuilder {
         self
     }
 
+    /// Persist the token state across process restarts via a
+    /// [`TokenStore`](crate::oidc::TokenStore) (default: none — in-memory only).
+    ///
+    /// With a store, a restarted process resumes from the saved refresh token (one
+    /// silent token-endpoint round-trip) instead of re-prompting — and
+    /// [`token`](OidcDeviceAuth::token) then even works as the first call, with no
+    /// explicit [`sign_in`](OidcDeviceAuth::sign_in).
+    ///
+    /// The bundled [`FileTokenStore`](crate::oidc::FileTokenStore) writes a
+    /// plaintext file protected by permissions; **it persists a long-lived refresh
+    /// token to disk** — see the [`oidc::token_store`](crate::oidc) security notes.
+    /// Persistence is best-effort: a store failure warns and is otherwise ignored,
+    /// never failing an in-memory sign-in.
+    pub fn token_store(mut self, store: impl TokenStore + 'static) -> Self {
+        self.token_store = Some(Arc::new(store));
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn sleep_hook(mut self, sleep: SleepFn) -> Self {
         self.sleep = Some(sleep);
@@ -288,6 +319,21 @@ impl OidcDeviceAuthBuilder {
             &config.device_authorization_endpoint,
         )?;
 
+        // Build the store identity from the resolved config, so the on-disk key
+        // (and its fingerprint re-check) matches the identity this instance acts
+        // for. Only when a store is configured.
+        let store_key = self.token_store.as_ref().map(|_| {
+            TokenStoreKey::from_config(
+                config.client_id.clone(),
+                &config.token_endpoint,
+                &config.device_authorization_endpoint,
+                &config.scope,
+                config.audience.as_deref(),
+                config.groups_in_token,
+                config.issuer.as_deref(),
+            )
+        });
+
         Ok(OidcDeviceAuth {
             config,
             http,
@@ -301,6 +347,9 @@ impl OidcDeviceAuthBuilder {
             now: self.now.unwrap_or_else(|| Arc::new(Instant::now)),
             tokens: Mutex::new(None),
             acquire: Mutex::new(()),
+            token_store: self.token_store,
+            store_key,
+            store_state: Mutex::new(StoreState::default()),
         })
     }
 }
@@ -342,6 +391,12 @@ pub struct OidcDeviceAuth {
     tokens: Mutex<Option<TokenSet>>,
     /// Held across a silent refresh or interactive sign-in.
     acquire: Mutex<()>,
+    /// Optional cross-restart persistence (opt-in).
+    token_store: Option<Arc<dyn TokenStore>>,
+    /// The persisted-identity key; `Some` iff `token_store` is set.
+    store_key: Option<TokenStoreKey>,
+    /// Persistence bookkeeping, touched only under `acquire`.
+    store_state: Mutex<StoreState>,
 }
 
 impl std::fmt::Debug for OidcDeviceAuth {
@@ -401,10 +456,22 @@ impl OidcDeviceAuth {
     }
 
     /// Forget the cached token, forcing a fresh sign-in next time. Resets the
-    /// local cache only — it does not revoke the token at the IdP.
+    /// local cache (and any persisted [`TokenStore`] entry) only — it does not
+    /// revoke the token at the IdP.
     pub fn clear(&self) {
         let _acq = self.lock_acquire();
         *self.lock_tokens() = None;
+        self.lock_store_state().last_persisted_refresh = None;
+        if let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) {
+            // Delete under the per-identity lock so it serialises against a peer's
+            // in-flight save (which writes under the same lock).
+            let outcome = store.in_lock(key, &mut || store.clear(key));
+            if let Err(e) = outcome {
+                warn_persistence("clear", &*e);
+            }
+            // Don't reload the file we just deleted on the next call.
+            self.lock_store_state().load_attempted = true;
+        }
     }
 
     /// The currently cached [`TokenSet`], or `None` if no sign-in has completed
@@ -489,16 +556,20 @@ impl OidcDeviceAuth {
         // Slow path: serialize acquisition so concurrent callers don't overlap
         // refreshes or double-prompt.
         let _acq = self.lock_acquire();
+        // Seed the cache from the persisted store once, so a restart resumes from
+        // a saved refresh token instead of re-prompting (a no-op without a store).
+        self.maybe_load_from_store();
         if let Some(tokens) = self.cached_if_valid() {
             return Ok(tokens);
         }
 
-        // Try a silent refresh with any cached refresh token.
+        // Try a silent refresh with any cached refresh token — coordinated across
+        // processes by the store's per-identity lock when one is configured.
         let existing = self.lock_tokens().clone();
         if let Some(tokens) = &existing
             && tokens.refresh_token.is_some()
         {
-            match self.refresh(tokens) {
+            match self.try_refresh_coordinated(tokens) {
                 Ok(refreshed) if self.has_required_token(&refreshed) => {
                     *self.lock_tokens() = Some(refreshed.clone());
                     return Ok(refreshed);
@@ -524,7 +595,194 @@ impl OidcDeviceAuth {
         *self.lock_tokens() = None;
         let fresh = self.run_device_flow()?;
         *self.lock_tokens() = Some(fresh.clone());
+        // Persist the fresh sign-in (a new refresh token) for the next restart.
+        self.persist_fresh(&fresh);
         Ok(fresh)
+    }
+
+    // -- token store persistence (opt-in) -----------------------------------
+
+    fn lock_store_state(&self) -> std::sync::MutexGuard<'_, StoreState> {
+        self.store_state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Seed the in-memory cache from the persisted store, once, at the top of the
+    /// acquire critical section.
+    fn maybe_load_from_store(&self) {
+        let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
+            return;
+        };
+        {
+            let mut st = self.lock_store_state();
+            if st.load_attempted {
+                return;
+            }
+            // Set first so a bad file is not re-read on every call.
+            st.load_attempted = true;
+        }
+        match store.load(key) {
+            Ok(persisted) => {
+                self.adopt(persisted);
+            }
+            Err(e) => warn_persistence("load", &*e),
+        }
+    }
+
+    /// Adopt a persisted entry as this instance's cached token (used by the lazy
+    /// load and the re-read inside the cross-process lock).
+    fn adopt(&self, persisted: Option<PersistedToken>) -> Option<TokenSet> {
+        let tokens = self.tokenset_from_persisted(&persisted?)?;
+        let rt = tokens.refresh_token.clone();
+        *self.lock_tokens() = Some(tokens.clone());
+        // It is already on disk, so a later non-rotating refresh must not rewrite
+        // the file.
+        self.lock_store_state().last_persisted_refresh = rt;
+        Some(tokens)
+    }
+
+    /// Build a usable [`TokenSet`] from a persisted entry, treating the file as
+    /// untrusted: both wire-bindable tokens go through the same control/non-ASCII
+    /// gate as the network path, and the expiry is capped to at most one hour from
+    /// now (never past `MAX_EXPIRES_IN`) so a tampered far-future expiry can't
+    /// keep a stale token alive.
+    fn tokenset_from_persisted(&self, p: &PersistedToken) -> Option<TokenSet> {
+        let access_token = p
+            .access_token()
+            .filter(|s| is_safe_token_str(s))
+            .map(String::from);
+        let id_token = p
+            .id_token()
+            .filter(|s| is_safe_token_str(s))
+            .map(String::from);
+        let refresh_token = p
+            .refresh_token()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let served = if self.config.groups_in_token {
+            &id_token
+        } else {
+            &access_token
+        };
+        // A blank / control / non-ASCII / absent served token is unusable: reject
+        // the whole entry rather than serve a tampered credential.
+        served.as_ref()?;
+        let now = now_epoch();
+        let max_life = MAX_EXPIRES_IN as f64;
+        let ttl = p.token_ttl().clamp(0.0, max_life);
+        let expires_at = p.expires_at().min(now + max_life);
+        let issued_at = expires_at - ttl;
+        let claims = decode_jwt_claims(id_token.as_deref())
+            .or_else(|| decode_jwt_claims(access_token.as_deref()));
+        let sub = claims
+            .as_ref()
+            .and_then(|c| c.get("sub"))
+            .and_then(Value::as_str)
+            .map(String::from);
+        Some(TokenSet {
+            access_token,
+            id_token,
+            refresh_token,
+            expires_at,
+            issued_at,
+            token_type: "Bearer".to_string(),
+            scope: Some(self.config.scope.clone()),
+            sub,
+        })
+    }
+
+    /// A silent refresh, coordinated across processes by the store's per-identity
+    /// lock when one is configured. Mirrors [`refresh`](Self::refresh)'s `Result`
+    /// contract (an `Ok` without the required token kind, or a non-network `Err`,
+    /// means "fall through to an interactive sign-in").
+    fn try_refresh_coordinated(&self, existing: &TokenSet) -> Result<TokenSet> {
+        let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
+            return self.refresh(existing); // no store: a plain refresh
+        };
+        let store = Arc::clone(store);
+        let existing = existing.clone();
+        let mut out: Option<Result<TokenSet>> = None;
+        let lock_res = store.in_lock(key, &mut || {
+            out = Some(self.refresh_under_lock(store.as_ref(), key, &existing));
+            Ok(())
+        });
+        if let Err(e) = lock_res {
+            warn_persistence("lock", &*e);
+        }
+        // The action ran exactly once per the in_lock contract; use its result.
+        // A misbehaving custom store that skipped it degrades to a plain refresh.
+        out.unwrap_or_else(|| self.refresh(&existing))
+    }
+
+    /// Runs inside the store's cross-process lock: re-read the store (a peer may
+    /// have refreshed since our load), adopt a fresher valid token and skip the
+    /// network, else refresh with the freshest refresh token and persist on
+    /// rotation.
+    fn refresh_under_lock(
+        &self,
+        store: &dyn TokenStore,
+        key: &TokenStoreKey,
+        existing: &TokenSet,
+    ) -> Result<TokenSet> {
+        let mut current = existing.clone();
+        // Only re-read when our in-memory refresh token still matches what we last
+        // persisted; if they differ a previous save failed and the in-memory token
+        // is newer, so keep it rather than regress to the stale on-disk one.
+        let rt_matches = existing.refresh_token == self.lock_store_state().last_persisted_refresh;
+        if rt_matches
+            && let Ok(Some(persisted)) = store.load(key)
+            && let Some(peer) = self.tokenset_from_persisted(&persisted)
+        {
+            if peer.is_valid(now_epoch(), DEFAULT_SKEW_SECONDS) && self.has_required_token(&peer) {
+                // A peer already refreshed; skip the network.
+                self.lock_store_state().last_persisted_refresh = peer.refresh_token.clone();
+                return Ok(peer);
+            }
+            // Adopted but stale: refresh with its (possibly rotated) token.
+            current = peer;
+        }
+        let refreshed = self.refresh(&current)?;
+        if self.has_required_token(&refreshed) {
+            self.save_if_rotated(store, key, &refreshed);
+        }
+        Ok(refreshed)
+    }
+
+    /// Persist a fresh interactive sign-in (a new refresh token), wrapping the
+    /// save in the store's lock so it serialises against a concurrent clear.
+    fn persist_fresh(&self, tokens: &TokenSet) {
+        let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
+            return;
+        };
+        let store = Arc::clone(store);
+        let tokens = tokens.clone();
+        let outcome = store.in_lock(key, &mut || {
+            self.save_if_rotated(store.as_ref(), key, &tokens);
+            Ok(())
+        });
+        if let Err(e) = outcome {
+            warn_persistence("save", &*e);
+        }
+    }
+
+    /// Save to the store only when the refresh token is new or rotated; skip when
+    /// unchanged (the on-disk entry is still valid) so the hot refresh path
+    /// doesn't rewrite the file. Must be called with the store lock held.
+    fn save_if_rotated(&self, store: &dyn TokenStore, key: &TokenStoreKey, tokens: &TokenSet) {
+        let rt = tokens.refresh_token.clone();
+        if rt == self.lock_store_state().last_persisted_refresh {
+            return; // not rotated; nothing to write
+        }
+        // With no refresh token there's nothing worth persisting (a restart
+        // couldn't resume from it anyway).
+        if rt.is_none() {
+            return;
+        }
+        match store.save(key, &snapshot(tokens)) {
+            Ok(()) => {
+                self.lock_store_state().last_persisted_refresh = rt;
+            }
+            Err(e) => warn_persistence("save", &*e),
+        }
     }
 
     // -- device flow (RFC 8628) ---------------------------------------------
@@ -904,6 +1162,30 @@ impl OidcDeviceAuth {
 }
 
 // -- free helpers -----------------------------------------------------------
+
+/// A [`PersistedToken`] mirroring the current in-memory token. `token_ttl` is the
+/// lifetime the expiry was derived from (`expires_at - issued_at`), mirroring how
+/// a wire response sets them; `0` when `issued_at` is unknown.
+fn snapshot(tokens: &TokenSet) -> PersistedToken {
+    let ttl = if tokens.issued_at > 0.0 {
+        (tokens.expires_at - tokens.issued_at).max(0.0)
+    } else {
+        0.0
+    };
+    PersistedToken::new(
+        tokens.access_token.clone(),
+        tokens.id_token.clone(),
+        tokens.refresh_token.clone(),
+        tokens.expires_at,
+        ttl,
+    )
+}
+
+/// Warn (once per failure) about a best-effort token-store operation that failed.
+/// Never logs a token value — a store's error carries only paths / I/O kinds.
+fn warn_persistence(op: &str, err: &(dyn std::error::Error + Send + Sync)) {
+    log::warn!("questdb oidc: token store {op} failed: {err}");
+}
 
 fn clamp_interval(interval: i64) -> u64 {
     (interval.max(0) as u64).clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)

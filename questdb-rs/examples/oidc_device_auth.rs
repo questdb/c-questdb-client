@@ -19,9 +19,9 @@
 
 use std::sync::Arc;
 
-use questdb::Result;
 use questdb::ingress::{Protocol, SenderBuilder, TimestampNanos};
-use questdb::oidc::OidcDeviceAuth;
+use questdb::oidc::{FileTokenStore, OidcDeviceAuth};
+use questdb::{Error, ErrorCode, Result};
 
 fn main() -> Result<()> {
     let url = std::env::args()
@@ -35,6 +35,15 @@ fn main() -> Result<()> {
     if let Some(issuer) = issuer {
         builder = builder.issuer(issuer);
     }
+
+    // Persist the token across restarts so a re-run resumes from the saved refresh
+    // token instead of re-prompting. This writes a plaintext refresh token under
+    // ~/.questdb/oidc-tokens/ (owner-only file permissions) — omit it, or back a
+    // custom TokenStore with an OS keychain, if that trade-off isn't acceptable.
+    let store = FileTokenStore::at_default_location()
+        .map_err(|e| Error::new(ErrorCode::ConfigError, format!("token store: {e}")))?;
+    builder = builder.token_store(store);
+
     let auth = Arc::new(builder.build()?);
 
     // Sign in once up front (prompts on first use, then caches; refreshes

@@ -38,6 +38,14 @@ pub(crate) fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// True if `s` is safe to send verbatim as a wire-bound credential: non-blank
+/// and printable-ASCII only. A control / non-ASCII byte (a decoded CR/LF is a
+/// header-injection vector) or a blank value must never reach an `Authorization:
+/// Bearer` header, whether it came from an IdP response or a persisted file.
+pub(crate) fn is_safe_token_str(s: &str) -> bool {
+    !s.trim().is_empty() && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
 /// The set of IdP tokens (access / id / refresh) plus their expiry.
 ///
 /// The secret fields are excluded from the [`Debug`] representation so a token

@@ -101,6 +101,35 @@
 //! [`Sender::flush`](crate::ingress::Sender::flush); request `offline_access`
 //! (above) for unattended, long-running senders.
 //!
+//! # Persisting the token across restarts
+//!
+//! Token state is in-memory only by default, so a restarted process re-runs the
+//! interactive device flow. Pass a [`TokenStore`] to persist it — the restarted
+//! process then resumes from the saved refresh token (one silent token-endpoint
+//! round-trip) instead of re-prompting, and [`token`](OidcDeviceAuth::token) even
+//! works as the first call:
+//!
+//! ```no_run
+//! # use questdb::oidc::{OidcDeviceAuth, FileTokenStore};
+//! # fn main() -> questdb::Result<()> {
+//! let store = FileTokenStore::at_default_location()
+//!     .map_err(|e| questdb::Error::new(questdb::ErrorCode::ConfigError, e.to_string()))?;
+//! let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000")
+//!     .issuer("https://idp.example.com")
+//!     .token_store(store)
+//!     .build()?;
+//! # let _ = auth;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The bundled [`FileTokenStore`] writes one plaintext JSON file per identity
+//! (under `~/.questdb/oidc-tokens/`, or `$QUESTDB_CLIENT_OIDC_TOKEN_STORE_DIR`),
+//! protected by file permissions (`0600`/`0700`). **This writes a long-lived
+//! refresh token to disk in plaintext**, so persistence is opt-in; for at-rest
+//! encryption, implement [`TokenStore`] over an OS keychain or a secrets manager.
+//! A persisted file is treated as untrusted input on load (see [`FileTokenStore`]).
+//!
 //! # Security
 //!
 //! The IdP device-authorization and token endpoints must use `https` (a
@@ -123,9 +152,14 @@ mod error;
 mod http;
 mod render;
 mod token;
+mod token_store;
 
 pub use device::{OidcDeviceAuth, OidcDeviceAuthBuilder};
 pub use discovery::OidcConfig;
 pub use error::{OidcError, OidcErrorKind};
 pub use render::{DeviceCodeChallenge, Renderer, TerminalRenderer};
 pub use token::TokenSet;
+pub use token_store::{
+    FileTokenStore, PersistedToken, TOKEN_STORE_DIR_ENV, TokenStore, TokenStoreKey,
+    TokenStoreResult,
+};

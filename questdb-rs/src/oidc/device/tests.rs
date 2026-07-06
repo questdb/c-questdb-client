@@ -30,13 +30,17 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use tempfile::TempDir;
+
 use super::*;
 use crate::oidc::error::OidcErrorKind;
+use crate::oidc::token_store::{FileTokenStore, PersistedToken, TokenStore, TokenStoreKey};
 
 /// A tiny single-request-per-connection HTTP mock. The handler receives
 /// `(method, path, body)` and returns `(status, json_body)`.
@@ -1234,4 +1238,224 @@ fn stale_token_cleared_when_no_refresh_and_device_flow_fails() {
         auth.token_set().is_none(),
         "stale expired token left cached after a failed sign-in"
     );
+}
+
+// -- token store persistence (Layer 1 + Layer 2) -----------------------------
+
+/// An auth wired to a `FileTokenStore` rooted at `dir`, against the mock IdP.
+fn auth_with_store(mock: &MockServer, dir: &Path) -> OidcDeviceAuth {
+    OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(FileTokenStore::at(dir))
+        .build()
+        .expect("build auth with store")
+}
+
+/// The store key matching `auth_with_store`'s config, for inspecting the file.
+fn key_for(mock: &MockServer) -> TokenStoreKey {
+    TokenStoreKey::from_config(
+        "questdb",
+        &mock.url("/token"),
+        &mock.url("/device"),
+        "openid",
+        None,
+        false,
+        None,
+    )
+}
+
+/// A mock that signs in with a refresh token, then answers refresh polls. The
+/// `refresh_body` closure builds the refresh response so a test can pick rotating
+/// vs non-rotating behaviour. Counts device-authorization requests.
+fn persistence_mock(
+    device_calls: Arc<AtomicUsize>,
+    refresh_body: impl Fn() -> String + Send + Sync + 'static,
+) -> MockServer {
+    MockServer::start(move |method, path, body| match (method, path) {
+        ("POST", "/device") => {
+            device_calls.fetch_add(1, Ordering::SeqCst);
+            (200, device_response())
+        }
+        ("POST", "/token") => {
+            if body.contains("grant_type=refresh_token") {
+                (200, refresh_body())
+            } else {
+                (
+                    200,
+                    r#"{"access_token":"AT-initial","refresh_token":"RT-1","expires_in":300}"#
+                        .to_string(),
+                )
+            }
+        }
+        _ => (404, "{}".to_string()),
+    })
+}
+
+/// Rewrite the persisted entry with an expired access token (keeping the refresh
+/// token), simulating a restart after the access token's lifetime elapsed — so a
+/// fresh instance must silently refresh rather than serve the on-disk token.
+fn expire_persisted(dir: &Path, key: &TokenStoreKey) {
+    let store = FileTokenStore::at(dir);
+    let p = store.load(key).unwrap().unwrap();
+    let expired = PersistedToken::new(
+        p.access_token().map(String::from),
+        p.id_token().map(String::from),
+        p.refresh_token().map(String::from),
+        1.0, // long past
+        300.0,
+    );
+    store.save(key, &expired).unwrap();
+}
+
+#[test]
+fn restart_resumes_from_persisted_token_without_reprompt() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+
+    // First run: sign in, persisting the token (one device prompt).
+    let auth_a = auth_with_store(&mock, dir.path());
+    assert_eq!(auth_a.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    drop(auth_a); // simulate a process restart
+
+    // A brand-new instance sharing the store resumes the still-valid access token
+    // straight from disk — no network, no re-prompt.
+    let auth_b = auth_with_store(&mock, dir.path());
+    assert_eq!(auth_b.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
+    drop(auth_b);
+
+    // Simulate the persisted access token having expired; a fresh instance must
+    // silently refresh from the persisted refresh token, still no device prompt.
+    expire_persisted(dir.path(), &key);
+    let auth_c = auth_with_store(&mock, dir.path());
+    assert_eq!(auth_c.token().unwrap(), "AT-refreshed");
+    assert_eq!(
+        device_calls.load(Ordering::SeqCst),
+        1,
+        "a persisted refresh token must not trigger a re-prompt"
+    );
+}
+
+#[test]
+fn persist_skips_write_when_refresh_token_unchanged() {
+    // Non-rotating IdP: the refresh response carries no new refresh_token.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = FileTokenStore::at(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    let before = reader.load(&key).unwrap().unwrap();
+    assert_eq!(before.access_token(), Some("AT-initial"));
+    assert_eq!(before.refresh_token(), Some("RT-1"));
+    drop(auth);
+
+    // Expire the on-disk access token, then a fresh instance silently refreshes.
+    expire_persisted(dir.path(), &key);
+    let auth2 = auth_with_store(&mock, dir.path());
+    assert_eq!(auth2.token().unwrap(), "AT-refreshed");
+
+    // The refresh token did not rotate, so the file was NOT rewritten — it still
+    // holds the (expired) access token, unchanged.
+    let after = reader.load(&key).unwrap().unwrap();
+    assert_eq!(
+        after.access_token(),
+        Some("AT-initial"),
+        "a non-rotating refresh must not rewrite the file"
+    );
+    assert_eq!(after.refresh_token(), Some("RT-1"));
+}
+
+#[test]
+fn persist_rewrites_when_refresh_token_rotates() {
+    // Rotating IdP: the refresh response carries a new refresh_token.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","refresh_token":"RT-2","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = FileTokenStore::at(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    drop(auth);
+
+    // Expire the on-disk access token, then a fresh instance silently refreshes
+    // and the IdP rotates the refresh token.
+    expire_persisted(dir.path(), &key);
+    let auth2 = auth_with_store(&mock, dir.path());
+    assert_eq!(auth2.token().unwrap(), "AT-refreshed");
+
+    // A rotated refresh token MUST be persisted, or a later restart would replay a
+    // revoked one; so the file now holds the rotated token and the new access token.
+    let after = reader.load(&key).unwrap().unwrap();
+    assert_eq!(after.access_token(), Some("AT-refreshed"));
+    assert_eq!(after.refresh_token(), Some("RT-2"));
+}
+
+#[test]
+fn clear_deletes_the_persisted_entry() {
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let reader = FileTokenStore::at(dir.path());
+    let key = key_for(&mock);
+
+    let auth = auth_with_store(&mock, dir.path());
+    auth.token().unwrap();
+    assert!(reader.load(&key).unwrap().is_some());
+
+    auth.clear();
+    assert!(
+        reader.load(&key).unwrap().is_none(),
+        "clear() must delete the persisted entry"
+    );
+}
+
+#[test]
+fn tampered_persisted_token_is_rejected_on_load() {
+    // A persisted access_token carrying a CR/LF (a header-injection vector) must be
+    // rejected on load exactly like a wire token, so it never reaches a header. The
+    // whole entry is unusable, so the flow falls back to a fresh device sign-in.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = persistence_mock(Arc::clone(&device_calls), || {
+        r#"{"access_token":"AT-refreshed","expires_in":300}"#.to_string()
+    });
+    let dir = TempDir::new().unwrap();
+    let writer = FileTokenStore::at(dir.path());
+    let key = key_for(&mock);
+
+    let now = crate::oidc::token::now_epoch();
+    let tampered = PersistedToken::new(
+        Some("bad\r\nInjected: header".to_string()),
+        None,
+        Some("RT-1".to_string()),
+        now + 300.0,
+        300.0,
+    );
+    writer.save(&key, &tampered).unwrap();
+
+    let auth = auth_with_store(&mock, dir.path());
+    // The tampered served token is dropped, the entry rejected wholesale, so a
+    // fresh device flow runs and yields the clean initial token.
+    assert_eq!(auth.token().unwrap(), "AT-initial");
+    assert_eq!(device_calls.load(Ordering::SeqCst), 1);
 }
