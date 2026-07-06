@@ -48,42 +48,58 @@ import questdb_line_sender as qls
 import qwp_ws_fuzz
 import uuid
 
-from arrow_egress_fuzz import (
-    TestArrowEgressPerKind,
-    TestArrowEgressEmpty,
-    TestArrowEgressFuzz,
-)
-from arrow_ingress_fuzz import (
-    TestArrowIngressPerKind,
-    TestArrowIngressDesignatedTs,
-    TestArrowIngressErrors,
-    TestArrowIngressExtraTypes,
-    TestArrowIngressUnsupportedTypes,
-    TestArrowIngressMultiBatch,
-    TestArrowIngressSfa,
-    TestArrowIngressFuzz,
-    TestColumnSenderBorrowWithRetry,
-)
-from arrow_round_trip_fuzz import (
-    TestArrowRoundTripPerKind,
-    TestArrowRoundTripFuzz,
-)
-from arrow_polars_fuzz import (
-    TestArrowPolarsRoundTripPerKind,
-    TestArrowPolarsFuzz,
-)
-from arrow_polars_per_dtype import (
-    TestArrowPolarsPerDtype,
-)
-from arrow_alignment_fuzz import TestArrowAlignment
-from test_arrow_fuzz_common_unit import (
-    TestKindRegistryCompleteness,
-    TestCompareSemantics,
-    TestRngDeterminism,
-    TestBuildRecordBatch,
-    TestSlicedRecordBatchOffsets,
-    TestEdgeCorpora,
-)
+# The Arrow ingress/egress/polars suites require pyarrow (and polars).
+# Import them lazily so test.py still loads on agents that don't install
+# those wheels (e.g. the "Vs QuestDB master" integration job, which only
+# exercises the core ILP suite). When the optional deps are missing we
+# simply don't register the Arrow TestCases, so a full-suite run skips
+# them instead of crashing at import time. Jobs that actually run the
+# TestArrow* cases install pyarrow/polars, so nothing is lost there.
+try:
+    from arrow_egress_fuzz import (
+        TestArrowEgressPerKind,
+        TestArrowEgressEmpty,
+        TestArrowEgressFuzz,
+    )
+    from arrow_ingress_fuzz import (
+        TestArrowIngressPerKind,
+        TestArrowIngressDesignatedTs,
+        TestArrowIngressErrors,
+        TestArrowIngressExtraTypes,
+        TestArrowIngressUnsupportedTypes,
+        TestArrowIngressMultiBatch,
+        TestArrowIngressSfa,
+        TestArrowIngressFuzz,
+        TestColumnSenderBorrowWithRetry,
+    )
+    from arrow_round_trip_fuzz import (
+        TestArrowRoundTripPerKind,
+        TestArrowRoundTripFuzz,
+    )
+    from arrow_polars_fuzz import (
+        TestArrowPolarsRoundTripPerKind,
+        TestArrowPolarsFuzz,
+    )
+    from arrow_polars_per_dtype import (
+        TestArrowPolarsPerDtype,
+    )
+    from arrow_alignment_fuzz import TestArrowAlignment
+    from test_arrow_fuzz_common_unit import (
+        TestKindRegistryCompleteness,
+        TestCompareSemantics,
+        TestRngDeterminism,
+        TestBuildRecordBatch,
+        TestSlicedRecordBatchOffsets,
+        TestEdgeCorpora,
+    )
+    ARROW_TESTS_AVAILABLE = True
+except ImportError as _arrow_import_err:
+    # pyarrow/polars not installed: skip registering the Arrow suites.
+    ARROW_TESTS_AVAILABLE = False
+    print(
+        f'Skipping Arrow test suites (optional deps missing): '
+        f'{_arrow_import_err}',
+        file=sys.stderr)
 from fixture import (
     Project,
     QuestDbFixtureBase,
