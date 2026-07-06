@@ -228,10 +228,16 @@ pub(crate) fn maybe_open_browser(target: &str) {
             .spawn()
         {
             // Reap the opener so it doesn't linger as a zombie on Unix. It exits
-            // promptly once it has handed the URL to the browser.
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
+            // promptly once it has handed the URL to the browser. Use
+            // `Builder::spawn` (not `thread::spawn`) and swallow the error so a
+            // failure to create the reaper thread — OS thread exhaustion — can't
+            // panic the sign-in; the worst case is one unreaped opener child,
+            // itself reaped at process exit.
+            let _ = std::thread::Builder::new()
+                .name("questdb-oidc-open".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
         }
     }
 }
@@ -292,6 +298,27 @@ pub(crate) fn strip_control(text: &str) -> String {
         } else {
             out.push(ch);
         }
+    }
+    out
+}
+
+/// [`strip_control`], but bounded to `max_chars` visible characters (with a
+/// trailing `…` when truncated).
+///
+/// For interpolating an untrusted IdP `error` / `error_description` into a
+/// message: a conformant value is short, but a hostile JSON `error_description`
+/// can be megabytes (it parses fine, so it slips past the non-JSON body-snippet
+/// cap in `oidc::http`). The raw input is truncated *before* stripping so a
+/// multi-MB field is never copied in full just to be discarded.
+pub(crate) fn strip_control_capped(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    // Take at most `max_chars` raw chars; strip_control only ever drops/folds
+    // chars, so the stripped result is also <= max_chars.
+    let bounded: String = chars.by_ref().take(max_chars).collect();
+    let mut out = strip_control(&bounded);
+    if chars.next().is_some() {
+        // There was more input beyond `max_chars`; mark the truncation.
+        out.push('…');
     }
     out
 }
@@ -385,6 +412,20 @@ mod tests {
     fn strip_control_folds_exotic_space() {
         // NBSP and ideographic space fold to a plain space; plain space survives.
         assert_eq!(strip_control("a\u{00a0}b\u{3000}c d"), "a b c d");
+    }
+
+    #[test]
+    fn strip_control_capped_bounds_length() {
+        // A short value is returned untouched (no ellipsis).
+        assert_eq!(strip_control_capped("short", 200), "short");
+        // A huge value is truncated and marked; the result never approaches the
+        // input length (a hostile multi-MB error_description can't be echoed raw).
+        let huge = "x".repeat(1_000_000);
+        let capped = strip_control_capped(&huge, 120);
+        assert_eq!(capped.chars().count(), 121); // 120 chars + the '…' marker
+        assert!(capped.ends_with('…'));
+        // Still strips control chars within the kept prefix.
+        assert_eq!(strip_control_capped("a\x1bb\nc", 200), "abc");
     }
 
     #[test]

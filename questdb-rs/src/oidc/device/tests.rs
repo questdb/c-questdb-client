@@ -31,9 +31,9 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::oidc::error::OidcErrorKind;
@@ -155,6 +155,11 @@ where
     }
     let body_str = String::from_utf8_lossy(&body).to_string();
     let (status, json) = handler(&method, &path, &body_str);
+    // Sentinel: status 0 means "simulate a transport failure" — drop the
+    // connection without any HTTP response, so the client sees no status.
+    if status == 0 {
+        return;
+    }
     let retry_after_header = match retry_after {
         Some(secs) => format!("Retry-After: {secs}\r\n"),
         None => String::new(),
@@ -1038,5 +1043,195 @@ fn lifetime_cap_applies_only_with_refresh_token() {
         (ts.expires_at - ts.issued_at - MAX_EXPIRES_IN as f64).abs() < 1.0,
         "carried-forward refresh token: lifetime must be capped (got {}s)",
         ts.expires_at - ts.issued_at
+    );
+}
+
+// -- poll-loop error branches ------------------------------------------------
+
+/// A device-authorization response with a tiny lifetime (clamped up to the 60s
+/// floor) and the max poll interval, so a single virtual sleep crosses the
+/// deadline.
+fn device_response_short() -> String {
+    serde_json::json!({
+        "device_code": "DEV-CODE-123",
+        "user_code": "WXYZ-1234",
+        "verification_uri": "https://idp.example.com/activate",
+        "expires_in": 1,
+        "interval": 60
+    })
+    .to_string()
+}
+
+#[test]
+fn expired_token_error_returns_timeout() {
+    // The IdP reports the code expired via the OAuth error body → Timeout kind.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (400, r#"{"error":"expired_token"}"#.to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert_eq!(err.idp_error(), Some("expired_token"));
+}
+
+#[test]
+fn deadline_expiry_returns_timeout() {
+    // The IdP never authorizes (always pending). A virtual clock advanced by the
+    // sleep hook drives the loop past the (60s-clamped) device-code deadline,
+    // exercising the deadline-expiry Timeout branch instantly.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response_short()),
+        ("POST", "/token") => (400, r#"{"error":"authorization_pending"}"#.to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let base = Instant::now();
+    let virtual_ns = Arc::new(AtomicU64::new(0));
+    let now_ns = Arc::clone(&virtual_ns);
+    let sleep_ns = Arc::clone(&virtual_ns);
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .now_hook(Arc::new(move || {
+            base + Duration::from_nanos(now_ns.load(Ordering::SeqCst))
+        }))
+        .sleep_hook(Arc::new(move |d: Duration| {
+            sleep_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        }))
+        .build()
+        .expect("build");
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Timeout);
+    assert!(err.message().contains("expired"), "got: {}", err.message());
+}
+
+#[test]
+fn transport_failure_surfaces_network_error_not_timeout() {
+    // The device endpoint works, but every token-endpoint poll drops the
+    // connection (no HTTP status). After MAX_CONSECUTIVE_TRANSPORT_FAILURES the
+    // flow must surface the real network cause rather than poll silently until
+    // the code expires and report a Timeout. (Both endpoints stay co-located on
+    // the one mock, satisfying the origin check.)
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (0, String::new()), // 0 == drop the connection
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::Network);
+    assert!(
+        err.message().contains("unreachable"),
+        "expected an unreachable-endpoint message, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn poll_redirect_is_terminal() {
+    // A 3xx from the token endpoint (which never legitimately redirects) is a
+    // terminal device-flow error, not something to keep polling.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (302, "{}".to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(302));
+}
+
+#[test]
+fn poll_non_json_body_is_terminal_rejection() {
+    // A non-JSON 4xx (a WAF / proxy error page) at the token endpoint is a
+    // terminal rejection — a conformant poll reply is always JSON.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (200, device_response()),
+        ("POST", "/token") => (403, "<html>Forbidden</html>".to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(403));
+}
+
+// -- request_device_code error paths -----------------------------------------
+
+#[test]
+fn device_endpoint_rejection_errors() {
+    // A non-200 from the device-authorization endpoint surfaces the IdP error.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (400, r#"{"error":"invalid_client"}"#.to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.idp_error(), Some("invalid_client"));
+    assert_eq!(err.status(), Some(400));
+}
+
+#[test]
+fn device_endpoint_missing_required_field_errors() {
+    // A 200 device response missing a required field (device_code) can't start
+    // the flow.
+    let mock = MockServer::start(|method, path, _body| match (method, path) {
+        ("POST", "/device") => (
+            200,
+            r#"{"user_code":"WXYZ-1234","verification_uri":"https://idp.example.com/act"}"#
+                .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let auth = explicit_auth(&mock, false);
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert_eq!(err.status(), Some(200));
+}
+
+// -- token-cache hygiene -----------------------------------------------------
+
+#[test]
+fn stale_token_cleared_when_no_refresh_and_device_flow_fails() {
+    // A cached token with NO refresh token, forced expired: obtain_tokens must
+    // clear it before the interactive flow, so a failing device flow leaves no
+    // stale token cached.
+    let device_calls = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let device_calls = Arc::clone(&device_calls);
+        MockServer::start(move |method, path, _body| match (method, path) {
+            // First sign-in succeeds; the second device request is rejected so
+            // run_device_flow fails.
+            ("POST", "/device") => {
+                if device_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (200, device_response())
+                } else {
+                    (400, r#"{"error":"invalid_client"}"#.to_string())
+                }
+            }
+            ("POST", "/token") => (
+                200,
+                r#"{"access_token":"AT-1","expires_in":300}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        })
+    };
+    let auth = explicit_auth(&mock, false);
+    assert_eq!(auth.token().unwrap(), "AT-1");
+    assert!(auth.token_set().is_some());
+    // Force expiry; the cached token has no refresh token.
+    auth.tokens.lock().unwrap().as_mut().unwrap().expires_at = 1.0;
+    let err = auth.token().unwrap_err();
+    assert_eq!(err.kind(), OidcErrorKind::DeviceFlow);
+    assert!(
+        auth.token_set().is_none(),
+        "stale expired token left cached after a failed sign-in"
     );
 }

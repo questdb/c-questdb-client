@@ -254,6 +254,52 @@ fn provider_error_fails_flush() {
 }
 
 #[test]
+fn provider_resolved_once_per_flush_across_retries() {
+    // The first /write attempt returns a retryable 503; the sender retries
+    // internally. The token provider must be pulled once per flush (before the
+    // retry loop), not once per attempt — otherwise a rotating token would
+    // change mid-flush and a refresh could fire on every retry.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mock = {
+        let attempts = Arc::clone(&attempts);
+        MockServer::start(move |_m, path, _b| match path {
+            "/write" => {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (503, String::new()) // retryable → the sender retries
+                } else {
+                    (204, String::new())
+                }
+            }
+            _ => (404, "{}".to_string()),
+        })
+    };
+
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let mut sender = sender_with_provider(&mock, {
+        let provider_calls = Arc::clone(&provider_calls);
+        move || {
+            provider_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, questdb::Error>("tok".to_string())
+        }
+    })
+    .expect("build sender");
+
+    send_one_row(&mut sender).expect("flush");
+
+    // Two /write attempts (503 then 204) but the provider was pulled once.
+    let headers = mock.write_auth_headers();
+    assert_eq!(headers.len(), 2, "expected one retry, got: {headers:?}");
+    assert_eq!(
+        provider_calls.load(Ordering::SeqCst),
+        1,
+        "the token provider must be resolved once per flush, not per retry"
+    );
+    // Both attempts carried the same resolved token.
+    assert_eq!(headers[0].as_deref(), Some("Bearer tok"));
+    assert_eq!(headers[1].as_deref(), Some("Bearer tok"));
+}
+
+#[test]
 fn provider_control_char_token_rejected() {
     let mock = MockServer::start(|_m, path, _b| match path {
         "/write" => (204, String::new()),

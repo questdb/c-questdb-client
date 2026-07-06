@@ -438,4 +438,35 @@ mod tests {
         assert!(!is_loopback("example.com"));
         assert!(!is_loopback("10.0.0.1"));
     }
+
+    #[test]
+    fn parse_retry_after_only_accepts_delta_seconds() {
+        use ureq::http::{HeaderMap, HeaderValue};
+        fn with_retry_after(v: &str) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            h.insert("retry-after", HeaderValue::from_str(v).unwrap());
+            h
+        }
+        // A bare run of ASCII digits (delta-seconds), trimmed.
+        assert_eq!(parse_retry_after(&with_retry_after("5")), Some(5));
+        assert_eq!(parse_retry_after(&with_retry_after("0")), Some(0));
+        assert_eq!(parse_retry_after(&with_retry_after("  7 ")), Some(7));
+        // 9 digits is the max accepted; 10 is rejected (no u64 overflow risk, and
+        // >31 years is meaningless).
+        assert_eq!(
+            parse_retry_after(&with_retry_after("999999999")),
+            Some(999_999_999)
+        );
+        assert_eq!(parse_retry_after(&with_retry_after("1000000000")), None);
+        // Rejected: empty, sign, decimal, and the HTTP-date form.
+        assert_eq!(parse_retry_after(&with_retry_after("")), None);
+        assert_eq!(parse_retry_after(&with_retry_after("-5")), None);
+        assert_eq!(parse_retry_after(&with_retry_after("1.5")), None);
+        assert_eq!(
+            parse_retry_after(&with_retry_after("Fri, 31 Dec 1999 23:59:59 GMT")),
+            None
+        );
+        // Absent header.
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
 }

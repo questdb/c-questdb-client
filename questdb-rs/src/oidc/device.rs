@@ -33,9 +33,11 @@ use serde_json::Value;
 use crate::oidc::discovery::{
     DiscoveryParams, OidcConfig, resolve_config, validate_endpoint_origins,
 };
-use crate::oidc::error::{OidcError, Result};
+use crate::oidc::error::{MAX_IDP_FIELD_CHARS, OidcError, Result};
 use crate::oidc::http::HttpClient;
-use crate::oidc::render::{DeviceCodeChallenge, Renderer, TerminalRenderer, maybe_open_browser};
+use crate::oidc::render::{
+    DeviceCodeChallenge, Renderer, TerminalRenderer, maybe_open_browser, strip_control_capped,
+};
 use crate::oidc::token::{DEFAULT_SKEW_SECONDS, TokenSet, now_epoch};
 
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -63,6 +65,14 @@ const MIN_DEVICE_CODE_LIFETIME: u64 = 60;
 const MIN_POLL_INTERVAL: u64 = 5;
 const MAX_POLL_INTERVAL: u64 = 60;
 
+// After this many consecutive transport-level poll failures (no HTTP status:
+// connection refused, TLS handshake, DNS, reset), stop polling and surface the
+// real cause rather than silently waiting out the device-code deadline and then
+// reporting a misleading "code expired". A conformant IdP answers with an HTTP
+// status even when rejecting; a run of pure transport failures means the
+// endpoint is unreachable or misconfigured, not that authorization is pending.
+const MAX_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 3;
+
 // A token-endpoint round-trip never needs longer; bounding it keeps a stalled
 // IdP from pinning the acquisition lock. Matches the reference clients.
 const MAX_TIMEOUT: Duration = Duration::from_secs(120);
@@ -70,6 +80,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_INTERVAL: u64 = 5;
 
 type SleepFn = Arc<dyn Fn(Duration) + Send + Sync>;
+/// Monotonic clock source for the poll loop; overridable in tests to drive the
+/// device-code deadline without waiting. Defaults to [`Instant::now`].
+type NowFn = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// The RFC 8628 device-authorization response (device code is a secret used only
 /// in the poll body, never displayed).
@@ -100,6 +113,7 @@ pub struct OidcDeviceAuthBuilder {
     timeout: Duration,
     renderer: Option<Box<dyn Renderer>>,
     sleep: Option<SleepFn>,
+    now: Option<NowFn>,
 }
 
 impl OidcDeviceAuthBuilder {
@@ -121,6 +135,7 @@ impl OidcDeviceAuthBuilder {
             timeout: DEFAULT_TIMEOUT,
             renderer: None,
             sleep: None,
+            now: None,
         }
     }
 
@@ -231,6 +246,12 @@ impl OidcDeviceAuthBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn now_hook(mut self, now: NowFn) -> Self {
+        self.now = Some(now);
+        self
+    }
+
     /// Resolve the configuration (running discovery if needed) and build the
     /// [`OidcDeviceAuth`].
     pub fn build(self) -> Result<OidcDeviceAuth> {
@@ -277,6 +298,7 @@ impl OidcDeviceAuthBuilder {
             interactive: self.interactive,
             default_interval: self.default_interval,
             sleep: self.sleep.unwrap_or_else(|| Arc::new(std::thread::sleep)),
+            now: self.now.unwrap_or_else(|| Arc::new(Instant::now)),
             tokens: Mutex::new(None),
             acquire: Mutex::new(()),
         })
@@ -315,6 +337,7 @@ pub struct OidcDeviceAuth {
     interactive: Option<bool>,
     default_interval: u64,
     sleep: SleepFn,
+    now: NowFn,
     /// The cached token; short critical sections only.
     tokens: Mutex<Option<TokenSet>>,
     /// Held across a silent refresh or interactive sign-in.
@@ -492,11 +515,13 @@ impl OidcDeviceAuth {
                 // Refresh token rejected (expired/revoked): fall through.
                 Err(_) => {}
             }
-            // The refresh path is exhausted; drop the stale token before the
-            // interactive flow so a failure doesn't leave it cached.
-            *self.lock_tokens() = None;
         }
 
+        // The refresh path (if any) is exhausted; drop any stale cached token
+        // before the interactive flow so a failure doesn't leave it cached. This
+        // also covers a cached token that had no refresh token to begin with
+        // (which skips the block above entirely).
+        *self.lock_tokens() = None;
         let fresh = self.run_device_flow()?;
         *self.lock_tokens() = Some(fresh.clone());
         Ok(fresh)
@@ -606,15 +631,18 @@ impl OidcDeviceAuth {
 
     fn poll_for_token(&self, resp: &DeviceResponse) -> Result<TokenSet> {
         let mut interval = resp.interval;
-        let deadline = Instant::now() + Duration::from_secs(resp.expires_in);
+        let deadline = (self.now)() + Duration::from_secs(resp.expires_in);
         let form: Vec<(&str, &str)> = vec![
             ("grant_type", DEVICE_CODE_GRANT),
             ("device_code", resp.device_code.as_str()),
             ("client_id", self.config.client_id.as_str()),
         ];
+        // Consecutive transport-level failures (no HTTP status): a persistent run
+        // means the endpoint is unreachable, not that authorization is pending.
+        let mut transport_failures: u32 = 0;
 
         loop {
-            let now = Instant::now();
+            let now = (self.now)();
             if now >= deadline {
                 self.renderer
                     .on_failure("Code expired — run the sign-in again to retry.");
@@ -646,6 +674,24 @@ impl OidcDeviceAuth {
                         ))
                         .with_status(e.status()));
                     }
+                    // A pure transport failure (no HTTP status: connection refused,
+                    // TLS handshake, DNS, reset) that repeats is not a transient
+                    // blip — the endpoint is unreachable/misconfigured. Surface the
+                    // real cause rather than polling silently until the code
+                    // expires and reporting a misleading timeout.
+                    if e.status().is_none() {
+                        transport_failures += 1;
+                        if transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES {
+                            self.renderer.on_failure(
+                                "Sign-in failed: the identity provider is unreachable.",
+                            );
+                            return Err(OidcError::network(format!(
+                                "Device flow aborted: the IdP token endpoint was \
+                                 unreachable on {transport_failures} consecutive \
+                                 polls ({e})."
+                            )));
+                        }
+                    }
                     // Transient (dropped connection / 5xx / 429): keep polling.
                     if e.status() == Some(429) || e.retry_after_secs().is_some() {
                         interval = backoff(interval, e.retry_after_secs(), false);
@@ -653,6 +699,10 @@ impl OidcDeviceAuth {
                     continue;
                 }
             };
+
+            // An HTTP status came back, so the endpoint is reachable: reset the
+            // consecutive-transport-failure counter.
+            transport_failures = 0;
 
             let status = result.status;
             let body = result.body;
@@ -717,6 +767,9 @@ impl OidcDeviceAuth {
                         .filter(|s| !s.is_empty())
                         .or(error)
                         .unwrap_or("unknown error");
+                    // Length-cap the untrusted field before interpolating: a
+                    // hostile JSON error_description can be megabytes.
+                    let description = strip_control_capped(description, MAX_IDP_FIELD_CHARS);
                     self.renderer
                         .on_failure(&format!("Sign-in failed: {description}"));
                     return Err(OidcError::device_flow(format!(
@@ -774,15 +827,16 @@ impl OidcDeviceAuth {
             .with_status(Some(result.status)));
         }
         let error = result.body.get("error").and_then(Value::as_str);
-        Err(OidcError::device_flow(format!(
-            "Token refresh failed: {}",
-            error.unwrap_or("unknown error")
-        ))
-        .with_idp_error(
-            error,
-            result.body.get("error_description").and_then(Value::as_str),
+        // Length-cap the untrusted "error" code before interpolating it.
+        let error_msg = strip_control_capped(error.unwrap_or("unknown error"), MAX_IDP_FIELD_CHARS);
+        Err(
+            OidcError::device_flow(format!("Token refresh failed: {error_msg}"))
+                .with_idp_error(
+                    error,
+                    result.body.get("error_description").and_then(Value::as_str),
+                )
+                .with_status(Some(result.status)),
         )
-        .with_status(Some(result.status)))
     }
 
     fn missing_required_token_error(&self) -> OidcError {

@@ -1239,6 +1239,14 @@ impl SenderBuilder {
     /// interactive re-prompt if the token expires with no refresh token
     /// available — for unattended senders, request the `offline_access` scope so
     /// it refreshes silently instead (see the [`oidc`](crate::oidc) module docs).
+    ///
+    /// Note that this re-prompt runs a full device flow *inside*
+    /// [`flush`](Sender::flush): an ordinary flush can then block until the user
+    /// authorizes or the device code expires (up to ~30 min), rather than being
+    /// bounded by the sender's request timeout. Call
+    /// [`OidcDeviceAuth::sign_in`](crate::oidc::OidcDeviceAuth::sign_in) up front
+    /// so the prompt happens before flushing, and prefer `offline_access` so an
+    /// expiry is handled by a silent refresh instead of a re-prompt.
     #[cfg(feature = "_sender-http")]
     pub fn http_token_provider<F, E>(mut self, provider: F) -> Result<Self>
     where

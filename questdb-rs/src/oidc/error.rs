@@ -24,12 +24,19 @@
 
 //! Errors raised by the [`oidc`](crate::oidc) module.
 
-use crate::oidc::render::strip_control;
+use crate::oidc::render::{strip_control, strip_control_capped};
 use crate::{Error, ErrorCode};
 use std::fmt::{Display, Formatter};
 
 /// A specialized [`Result`](std::result::Result) type for OIDC operations.
 pub type Result<T> = std::result::Result<T, OidcError>;
+
+/// Cap on how many characters of an untrusted IdP `error` / `error_description`
+/// are kept when interpolated into a message or stored on the error. A
+/// conformant value is short (an OAuth error code plus a sentence); this bounds
+/// a hostile multi-MB `error_description` — which JSON-parses fine and so slips
+/// past the non-JSON body-snippet cap in `oidc::http` — from being echoed raw.
+pub(crate) const MAX_IDP_FIELD_CHARS: usize = 200;
 
 /// The category of an [`OidcError`], mirroring the reference clients' typed
 /// exception hierarchy.
@@ -131,9 +138,12 @@ impl OidcError {
         // Normalize an empty (or all-control, post-strip) field to `None` so an
         // empty `error_description` can't shadow the `error` code in the message
         // or in `Display`, and the accessors don't hand back a blank `Some("")`.
-        self.error = error.map(strip_control).filter(|s| !s.is_empty());
+        // Length-cap both: a hostile IdP can return a multi-MB `error_description`.
+        self.error = error
+            .map(|s| strip_control_capped(s, MAX_IDP_FIELD_CHARS))
+            .filter(|s| !s.is_empty());
         self.error_description = error_description
-            .map(strip_control)
+            .map(|s| strip_control_capped(s, MAX_IDP_FIELD_CHARS))
             .filter(|s| !s.is_empty());
         self
     }
@@ -266,5 +276,25 @@ mod tests {
         let err = OidcError::device_flow("failed").with_idp_error(Some("a\x1bb"), Some("c\x07d"));
         assert_eq!(err.idp_error(), Some("ab"));
         assert_eq!(err.idp_error_description(), Some("cd"));
+    }
+
+    #[test]
+    fn idp_fields_length_capped() {
+        // A hostile IdP returns a multi-MB error_description (valid JSON, so it
+        // bypasses the non-JSON body-snippet cap). It must not be stored or
+        // displayed verbatim.
+        let huge = "x".repeat(1_000_000);
+        let err = OidcError::device_flow("Token refresh failed").with_idp_error(None, Some(&huge));
+        let desc = err.idp_error_description().unwrap();
+        assert!(
+            desc.chars().count() <= MAX_IDP_FIELD_CHARS + 1,
+            "error_description not capped: {} chars",
+            desc.chars().count()
+        );
+        // The rendered error stays small too (message + the bounded field).
+        assert!(
+            err.to_string().len() < 1_000,
+            "Display leaked the huge field"
+        );
     }
 }
