@@ -40,7 +40,9 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::oidc::error::OidcErrorKind;
-use crate::oidc::token_store::{FileTokenStore, PersistedToken, TokenStore, TokenStoreKey};
+use crate::oidc::token_store::{
+    FileTokenStore, PersistedToken, TokenStore, TokenStoreKey, TokenStoreResult,
+};
 
 /// A tiny single-request-per-connection HTTP mock. The handler receives
 /// `(method, path, body)` and returns `(status, json_body)`.
@@ -1504,5 +1506,169 @@ fn refresh_survives_persisted_entry_without_refresh_token() {
         device_calls.load(Ordering::SeqCst),
         1,
         "must silently refresh with the in-memory token, not re-prompt"
+    );
+}
+
+#[test]
+fn transient_store_load_error_is_retried_not_latched() {
+    // M2: FileTokenStore reports a missing/corrupt/oversized file as Ok(None); the
+    // only case it surfaces as Err is a genuine (transient) I/O error. A transient
+    // failure on the first load must NOT permanently disable persistence — a later
+    // call must retry and resume from the on-disk token instead of re-prompting.
+    struct FlakyStore {
+        loads: std::sync::atomic::AtomicUsize,
+        inner: FileTokenStore,
+    }
+    impl TokenStore for FlakyStore {
+        fn load(&self, key: &TokenStoreKey) -> TokenStoreResult<Option<PersistedToken>> {
+            if self.loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Box::new(std::io::Error::other("transient EMFILE")));
+            }
+            self.inner.load(key)
+        }
+        fn save(&self, key: &TokenStoreKey, token: &PersistedToken) -> TokenStoreResult<()> {
+            self.inner.save(key, token)
+        }
+        fn clear(&self, key: &TokenStoreKey) -> TokenStoreResult<()> {
+            self.inner.clear(key)
+        }
+    }
+
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let dir = TempDir::new().unwrap();
+    let key = key_for(&mock);
+    // Seed a valid persisted entry (a refresh token) via a plain store.
+    let now = crate::oidc::token::now_epoch();
+    FileTokenStore::at(dir.path())
+        .save(
+            &key,
+            &PersistedToken::new(
+                Some("AT".to_string()),
+                None,
+                Some("RT-1".to_string()),
+                now + 300.0,
+                300.0,
+            ),
+        )
+        .unwrap();
+
+    let auth = OidcDeviceAuth::builder()
+        .client_id("questdb")
+        .device_authorization_endpoint(mock.url("/device"))
+        .token_endpoint(mock.url("/token"))
+        .scope("openid")
+        .interactive(true)
+        .open_browser(false)
+        .sleep_hook(no_sleep())
+        .token_store(FlakyStore {
+            loads: std::sync::atomic::AtomicUsize::new(0),
+            inner: FileTokenStore::at(dir.path()),
+        })
+        .build()
+        .unwrap();
+
+    // First attempt hits the transient error and adopts nothing.
+    auth.maybe_load_from_store();
+    assert!(
+        auth.token_set().is_none(),
+        "nothing should be adopted after a transient load error"
+    );
+    // The error was not latched, so a second attempt retries and resumes.
+    auth.maybe_load_from_store();
+    assert_eq!(
+        auth.token_set().unwrap().refresh_token.as_deref(),
+        Some("RT-1"),
+        "a transient load error must be retried, not permanently disable persistence"
+    );
+}
+
+/// A minimal JWT (`header.payload.sig`) whose payload carries `exp` (and a `sub`),
+/// for exercising the unverified `exp`-bounding of the believed lifetime.
+fn jwt_with_exp(exp: i64) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    let payload = format!(r#"{{"exp":{exp},"sub":"user@example.com"}}"#);
+    let b64 = Base64UrlUnpadded::encode_string(payload.as_bytes());
+    format!("header.{b64}.signature")
+}
+
+#[test]
+fn wire_expiry_bounded_by_jwt_exp() {
+    // M3: a non-conformant `expires_in` with NO refresh token (so the rotation cap
+    // doesn't apply) must not push the believed expiry past the served token's own
+    // JWT `exp` — otherwise one bad field wedges the sender on permanent auth
+    // failures with no self-heal.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = explicit_auth(&mock, false);
+    let exp = (crate::oidc::token::now_epoch() + 86_400.0).floor(); // 24h out
+    let body = serde_json::json!({
+        "access_token": jwt_with_exp(exp as i64),
+        "expires_in": 99_999_999_999i64,
+    });
+    let ts = auth.tokenset_from_response(&body, None);
+    assert!(
+        (ts.expires_at() - exp).abs() < 1.5,
+        "expires_at not bounded by the JWT exp: {} (exp {exp})",
+        ts.expires_at()
+    );
+}
+
+#[test]
+fn groups_mode_expiry_uses_id_token_exp() {
+    // M6: in groups mode the served token is the id_token, so the believed expiry
+    // must follow the id_token's exp, not the access token's `expires_in`.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = explicit_auth(&mock, true);
+    let now = crate::oidc::token::now_epoch();
+    let id_exp = (now + 120.0).floor(); // id_token expires in 2 minutes
+    let body = serde_json::json!({
+        "access_token": jwt_with_exp((now + 100_000.0) as i64), // long-lived
+        "id_token": jwt_with_exp(id_exp as i64),                // short-lived
+        "expires_in": 100_000,
+    });
+    let ts = auth.tokenset_from_response(&body, None);
+    assert!(
+        (ts.expires_at() - id_exp).abs() < 1.5,
+        "groups mode ignored the id_token exp: {} (id_exp {id_exp})",
+        ts.expires_at()
+    );
+}
+
+#[test]
+fn persisted_expiry_honors_jwt_exp_but_caps_opaque() {
+    // M3: a persisted no-refresh JWT token (e.g. written by another language
+    // client) whose real exp is well beyond an hour must be honored, not capped to
+    // 1h. An opaque (non-JWT) token has no self-describing expiry, so the
+    // untrusted-file 1h cap still applies.
+    let mock = MockServer::start(|_, _, _| (404, "{}".to_string()));
+    let auth = explicit_auth(&mock, false);
+    let now = crate::oidc::token::now_epoch();
+
+    let exp = (now + 8.0 * 3600.0).floor(); // 8h out
+    let jwt = PersistedToken::new(
+        Some(jwt_with_exp(exp as i64)),
+        None,
+        None,
+        exp,
+        8.0 * 3600.0,
+    );
+    let ts = auth.tokenset_from_persisted(&jwt).unwrap();
+    assert!(
+        (ts.expires_at() - exp).abs() < 1.5,
+        "persisted JWT exp was capped instead of honored: {}",
+        ts.expires_at()
+    );
+
+    let opaque = PersistedToken::new(
+        Some("opaque-token".to_string()),
+        None,
+        None,
+        now + 8.0 * 3600.0,
+        300.0,
+    );
+    let ts2 = auth.tokenset_from_persisted(&opaque).unwrap();
+    assert!(
+        ts2.expires_at() <= now + 3600.0 + 5.0,
+        "opaque token not capped to the 1h untrusted-file window: {}",
+        ts2.expires_at()
     );
 }

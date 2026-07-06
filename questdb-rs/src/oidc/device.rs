@@ -612,18 +612,22 @@ impl OidcDeviceAuth {
         let (Some(store), Some(key)) = (self.token_store.as_ref(), self.store_key.as_ref()) else {
             return;
         };
-        {
-            let mut st = self.lock_store_state();
-            if st.load_attempted {
-                return;
-            }
-            // Set first so a bad file is not re-read on every call.
-            st.load_attempted = true;
+        if self.lock_store_state().load_attempted {
+            return;
         }
         match store.load(key) {
             Ok(persisted) => {
+                // A successful load is final: record it so a valid — or absent —
+                // entry isn't re-read on every later call. A missing / corrupt /
+                // oversized file is reported as `Ok(None)`, so it lands here too.
+                self.lock_store_state().load_attempted = true;
                 self.adopt(persisted);
             }
+            // A genuine I/O error (EMFILE, an NFS / permission blip) is the only
+            // case a store surfaces as `Err`, and it is transient: leave
+            // `load_attempted` unset so the next call retries, rather than
+            // permanently falling back to a fresh interactive sign-in despite a
+            // usable on-disk token.
             Err(e) => warn_persistence("load", &*e),
         }
     }
@@ -642,9 +646,12 @@ impl OidcDeviceAuth {
 
     /// Build a usable [`TokenSet`] from a persisted entry, treating the file as
     /// untrusted: both wire-bindable tokens go through the same control/non-ASCII
-    /// gate as the network path, and the expiry is capped to at most one hour from
-    /// now (never past `MAX_EXPIRES_IN`) so a tampered far-future expiry can't
-    /// keep a stale token alive.
+    /// gate as the network path, and the expiry is bounded by the served token's
+    /// own JWT `exp` (its real, server-checked expiry) — or, for an opaque
+    /// (non-JWT) token, capped to at most one hour from now — so a tampered
+    /// far-future expiry can't keep a stale token alive, while a legitimately
+    /// long-lived token (e.g. a no-refresh entry written by another QuestDB
+    /// language client) is not needlessly re-prompted after an hour.
     fn tokenset_from_persisted(&self, p: &PersistedToken) -> Option<TokenSet> {
         let access_token = p
             .access_token()
@@ -669,7 +676,19 @@ impl OidcDeviceAuth {
         let now = now_epoch();
         let max_life = MAX_EXPIRES_IN as f64;
         let ttl = p.token_ttl().clamp(0.0, max_life);
-        let expires_at = p.expires_at().min(now + max_life);
+        // Bound by the served token's own JWT `exp` when it is a JWT: this honors a
+        // legitimately long-lived token (e.g. a no-refresh entry persisted by
+        // another QuestDB language client) instead of forcing a needless re-prompt
+        // after an hour, while still bounding a tampered far-future
+        // `expires_at_millis` to the token's true expiry. A forged longer exp only
+        // wedges this client (the server rejects the unsigned token) and already
+        // needs the file-write access that would expose the refresh token anyway.
+        // An opaque (non-JWT) token has no self-describing expiry, so fall back to
+        // the untrusted-file cap and never trust a far-future on-disk expiry.
+        let expires_at = match jwt_exp(served.as_deref()) {
+            Some(exp) => p.expires_at().min(exp),
+            None => p.expires_at().min(now + max_life),
+        };
         let issued_at = expires_at - ttl;
         let claims = decode_jwt_claims(id_token.as_deref())
             .or_else(|| decode_jwt_claims(access_token.as_deref()));
@@ -1161,11 +1180,27 @@ impl OidcDeviceAuth {
             .and_then(Value::as_str)
             .map(String::from);
         let now = now_epoch();
+        let mut expires_at = now + expires_in as f64;
+        // Bound the believed expiry by the *served* token's own JWT `exp` — the
+        // authoritative, server-checked expiry. This stops a non-conformant or
+        // hostile `expires_in` (which can saturate to a near-infinite lifetime,
+        // especially with no refresh token to rotate it) from keeping a dead token
+        // cached, and makes groups mode honor the id_token's exp rather than the
+        // access token's `expires_in`. An opaque (non-JWT) token has no exp, so its
+        // lifetime is left as the IdP stated it.
+        let served = if self.config.groups_in_token {
+            id_token.as_deref()
+        } else {
+            access_token.as_deref()
+        };
+        if let Some(exp) = jwt_exp(served) {
+            expires_at = expires_at.min(exp);
+        }
         TokenSet {
             access_token,
             id_token,
             refresh_token,
-            expires_at: now + expires_in as f64,
+            expires_at,
             issued_at: now,
             token_type: str_field_val(body.get("token_type")).unwrap_or_else(|| "Bearer".into()),
             scope: str_field_val(body.get("scope")).or_else(|| Some(self.config.scope.clone())),
@@ -1283,6 +1318,21 @@ fn decode_jwt_claims(token: Option<&str>) -> Option<Value> {
 fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
     use base64ct::{Base64UrlUnpadded, Encoding};
     Base64UrlUnpadded::decode_vec(input).ok()
+}
+
+/// The `exp` (expiry) claim of a JWT as epoch seconds, or `None` for an opaque /
+/// invalid token or one without a positive, finite numeric `exp`.
+///
+/// Decoded **without** signature verification, so it is only ever used to *bound*
+/// the believed lifetime downward — never to grant validity (the server verifies
+/// the signature). A smaller believed expiry only triggers an earlier refresh /
+/// re-prompt, so a forged `exp` cannot extend a token past what the server accepts.
+fn jwt_exp(token: Option<&str>) -> Option<f64> {
+    let claims = decode_jwt_claims(token)?;
+    claims
+        .get("exp")?
+        .as_f64()
+        .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 fn identity_from_tokens(tokens: &TokenSet) -> Option<String> {
