@@ -1246,13 +1246,20 @@ impl ReaderConfig {
             headers.push(("X-QWP-Max-Batch-Rows", self.max_batch_rows.to_string()));
         }
         // A rotating token provider (e.g. OIDC), pulled fresh here on every
-        // (re)connect, overrides any static basic/token auth. A provider failure
-        // aborts the connection attempt (mapping the crate-wide error into the
-        // egress error type).
+        // (re)connect, overrides any static basic/token auth. `bearer_header`
+        // already classifies a provider failure (transient SocketError vs
+        // terminal AuthError); preserve that code across the crate→egress error
+        // boundary so the reader's failover retries a transient OIDC refresh blip
+        // (SocketError is failover-eligible) on the next reconnect instead of
+        // being killed by it, while a permanent failure still aborts.
         if let Some(provider) = &self.token_provider {
-            let header = provider
-                .bearer_header()
-                .map_err(|e| fmt!(AuthError, "{}", e.msg()))?;
+            let header = provider.bearer_header().map_err(|e| {
+                if e.code() == crate::ErrorCode::SocketError {
+                    fmt!(SocketError, "{}", e.msg())
+                } else {
+                    fmt!(AuthError, "{}", e.msg())
+                }
+            })?;
             headers.push(("Authorization", header));
         } else if let Some(v) = self.auth.header_value() {
             headers.push(("Authorization", v));
@@ -1617,6 +1624,30 @@ mod tests {
             .unwrap()
             .token_provider(|| {
                 Err::<String, _>(crate::Error::new(crate::ErrorCode::AuthError, "no token"))
+            });
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn token_provider_transient_error_stays_failover_eligible() {
+        // A transient provider error (SocketError, e.g. an OIDC silent-refresh
+        // network blip) must stay a SocketError — which the reader's failover
+        // treats as retry-eligible — instead of being force-mapped to a terminal
+        // AuthError that would kill a long-lived reader on a momentary blip.
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::Error::new(crate::ErrorCode::SocketError, "blip"))
+            });
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+
+        // A permanent provider error stays terminal (AuthError aborts the reconnect).
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::Error::new(crate::ErrorCode::ConfigError, "bad"))
             });
         let err = c.upgrade_headers().unwrap_err();
         assert_eq!(err.code(), ErrorCode::AuthError);

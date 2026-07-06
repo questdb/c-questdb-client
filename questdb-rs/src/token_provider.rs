@@ -55,8 +55,13 @@ impl TokenProvider {
     /// A control / non-ASCII byte (a decoded CR/LF is a header-injection vector)
     /// or a blank value is rejected — the token never reaches the wire. Mirrors
     /// the ILP/HTTP `HttpAuth::resolve` gate and the device flow's `safe_token`.
+    ///
+    /// A provider error is classified for the (re)connect transports via
+    /// [`classify_provider_error`]: a transient `SocketError` is preserved (the
+    /// reconnect retries as connectivity recovers), any other failure becomes a
+    /// terminal `AuthError` (the reconnect aborts rather than looping).
     pub(crate) fn bearer_header(&self) -> crate::Result<String> {
-        let token = (self.0)()?;
+        let token = (self.0)().map_err(classify_provider_error)?;
         if token.trim().is_empty() || !token.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
             return Err(crate::error::fmt!(
                 AuthError,
@@ -65,6 +70,26 @@ impl TokenProvider {
             ));
         }
         Ok(format!("Bearer {token}"))
+    }
+}
+
+/// Classify a token-provider error for the (re)connect transports (QWP/WebSocket
+/// ingress and the egress reader), which pull a fresh Bearer on every connect and
+/// reconnect and drive a retry loop off the error's code.
+///
+/// A transient [`SocketError`](crate::ErrorCode::SocketError) — e.g. a network
+/// blip during an OIDC silent refresh — is kept so the reconnect loop retries as
+/// connectivity recovers. Every other failure (a permanent misconfiguration, a
+/// revoked grant, a headless interactive re-prompt, the blank/non-ASCII
+/// validation failure) becomes an [`AuthError`](crate::ErrorCode::AuthError) so
+/// the reconnect aborts instead of looping on something retrying cannot fix. Both
+/// transports treat `SocketError` as retry-eligible and `AuthError` as terminal,
+/// so this yields one consistent policy across them.
+fn classify_provider_error(e: crate::Error) -> crate::Error {
+    if e.code() == crate::ErrorCode::SocketError {
+        e
+    } else {
+        crate::error::fmt!(AuthError, "{}", e.msg())
     }
 }
 
@@ -95,5 +120,34 @@ mod tests {
         let failing =
             TokenProvider::new(|| Err::<String, _>(crate::error::fmt!(AuthError, "no token")));
         assert!(failing.bearer_header().is_err());
+    }
+
+    #[test]
+    fn provider_error_classified_transient_vs_terminal() {
+        use crate::ErrorCode;
+        // A transient SocketError is preserved, so a (re)connect transport retries
+        // (SocketError is retry-eligible on both QWP transports).
+        let transient = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(ErrorCode::SocketError, "network blip"))
+        });
+        assert_eq!(
+            transient.bearer_header().unwrap_err().code(),
+            ErrorCode::SocketError
+        );
+        // A permanent error (e.g. ConfigError) becomes a terminal AuthError, so the
+        // reconnect aborts instead of looping on something retrying can't fix.
+        let permanent = TokenProvider::new(|| {
+            Err::<String, _>(crate::Error::new(ErrorCode::ConfigError, "bad config"))
+        });
+        assert_eq!(
+            permanent.bearer_header().unwrap_err().code(),
+            ErrorCode::AuthError
+        );
+        // The blank/non-ASCII validation failure is likewise a terminal AuthError.
+        let blank = TokenProvider::new(|| Ok::<_, crate::Error>("   ".to_string()));
+        assert_eq!(
+            blank.bearer_header().unwrap_err().code(),
+            ErrorCode::AuthError
+        );
     }
 }
