@@ -483,6 +483,11 @@ pub struct ReaderConfig {
     /// follow the master across zones. Failover.md §1.1 / §2.
     pub zone: Option<String>,
     pub auth: AuthMode,
+    /// A rotating Bearer-token source pulled at each (re)connect (e.g. from
+    /// `oidc::OidcDeviceAuth`), overriding [`auth`](Self::auth). Set via
+    /// [`token_provider`](Self::token_provider); programmatic-only (never from a
+    /// conf string).
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
     pub tls_verify: TlsVerify,
     pub tls_ca: CertificateAuthority,
     pub tls_roots: Option<PathBuf>,
@@ -1011,6 +1016,7 @@ impl ReaderConfig {
             server_info_timeout_ms,
             zone,
             auth,
+            token_provider: None,
             tls_verify,
             tls_ca,
             tls_roots,
@@ -1018,6 +1024,41 @@ impl ReaderConfig {
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Supply a fresh Bearer token on every (re)connect via a callback (e.g.
+    /// [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)), overriding
+    /// any static `username`/`password`/`token` auth.
+    ///
+    /// The provider is called at each connect and reconnect, so a long-lived
+    /// reader keeps working as the token silently refreshes / rotates. The token
+    /// is sent as the `Authorization: Bearer <token>` handshake header; a token
+    /// with a non-printable-ASCII character (a header-injection vector) is
+    /// rejected, and a provider error fails that connection attempt. Use TLS
+    /// (`qwpwss://` / `wss://`) so the bearer credential isn't sent in cleartext.
+    ///
+    /// ```no_run
+    /// # #[cfg(all(feature = "oidc", feature = "sync-reader-ws"))] {
+    /// # use std::sync::Arc;
+    /// # use questdb::oidc::OidcDeviceAuth;
+    /// # use questdb::egress::{Reader, ReaderConfig};
+    /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let auth = Arc::new(OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?);
+    /// auth.sign_in()?;
+    /// let cfg = ReaderConfig::from_conf("qwpwss::addr=questdb.example.com:9000;")?
+    ///     .token_provider({ let auth = Arc::clone(&auth); move || auth.token() });
+    /// let reader = Reader::from_config(&cfg)?;
+    /// # let _ = reader; Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub fn token_provider<F, E>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        self.token_provider = Some(crate::token_provider::TokenProvider::new(provider));
+        self
     }
 
     /// Re-run the cap and consistency checks that `from_conf` enforces.
@@ -1187,7 +1228,7 @@ impl ReaderConfig {
     /// Build the negotiation headers as `(name, value)` pairs in the order
     /// the Java reference client emits them. Authorization is appended last
     /// when an auth mode is set.
-    pub fn upgrade_headers(&self) -> Vec<(&'static str, String)> {
+    pub fn upgrade_headers(&self) -> Result<Vec<(&'static str, String)>> {
         let mut headers = Vec::with_capacity(8);
         headers.push(("X-QWP-Max-Version", self.max_version.to_string()));
         if let Some(id) = &self.client_id {
@@ -1204,10 +1245,19 @@ impl ReaderConfig {
         if self.max_batch_rows > 0 {
             headers.push(("X-QWP-Max-Batch-Rows", self.max_batch_rows.to_string()));
         }
-        if let Some(v) = self.auth.header_value() {
+        // A rotating token provider (e.g. OIDC), pulled fresh here on every
+        // (re)connect, overrides any static basic/token auth. A provider failure
+        // aborts the connection attempt (mapping the crate-wide error into the
+        // egress error type).
+        if let Some(provider) = &self.token_provider {
+            let header = provider
+                .bearer_header()
+                .map_err(|e| fmt!(AuthError, "{}", e.msg()))?;
+            headers.push(("Authorization", header));
+        } else if let Some(v) = self.auth.header_value() {
             headers.push(("Authorization", v));
         }
-        headers
+        Ok(headers)
     }
 }
 
@@ -1406,7 +1456,7 @@ mod tests {
         let c =
             ReaderConfig::from_conf("ws::addr=h:1;compression=zstd;compression_level=9").unwrap();
         assert_eq!(c.compression_level, 9);
-        let headers = c.upgrade_headers();
+        let headers = c.upgrade_headers().unwrap();
         let accept = headers
             .iter()
             .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
@@ -1419,7 +1469,7 @@ mod tests {
     fn compression_level_emitted_for_auto() {
         let c =
             ReaderConfig::from_conf("ws::addr=h:1;compression=auto;compression_level=7").unwrap();
-        let headers = c.upgrade_headers();
+        let headers = c.upgrade_headers().unwrap();
         let accept = headers
             .iter()
             .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
@@ -1434,7 +1484,7 @@ mod tests {
         // (the spec says `level=N` only applies to zstd). The header value
         // collapses to the bare `raw` token.
         let c = ReaderConfig::from_conf("ws::addr=h:1;compression_level=15").unwrap();
-        let headers = c.upgrade_headers();
+        let headers = c.upgrade_headers().unwrap();
         let accept = headers
             .iter()
             .find(|(n, _)| *n == "X-QWP-Accept-Encoding")
@@ -1500,7 +1550,7 @@ mod tests {
     #[test]
     fn upgrade_headers_default() {
         let c = ReaderConfig::from_conf("ws::addr=h:1").unwrap();
-        let h = c.upgrade_headers();
+        let h = c.upgrade_headers().unwrap();
         // Always emit max_version + accept-encoding; nothing else by default.
         assert_eq!(h.len(), 2);
         assert_eq!(h[0], ("X-QWP-Max-Version", "1".to_string()));
@@ -1513,7 +1563,7 @@ mod tests {
             "ws::addr=h:1;client_id=app1;max_batch_rows=1000;username=u;password=p",
         )
         .unwrap();
-        let h = c.upgrade_headers();
+        let h = c.upgrade_headers().unwrap();
         let names: Vec<_> = h.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"X-QWP-Max-Version"));
         assert!(names.contains(&"X-QWP-Client-Id"));
@@ -1524,8 +1574,52 @@ mod tests {
 
         // max_batch_rows omitted when 0.
         let c = ReaderConfig::from_conf("ws::addr=h:1;max_batch_rows=0").unwrap();
-        let h = c.upgrade_headers();
+        let h = c.upgrade_headers().unwrap();
         assert!(h.iter().all(|(n, _)| *n != "X-QWP-Max-Batch-Rows"));
+    }
+
+    #[test]
+    fn token_provider_overrides_static_auth() {
+        // A rotating token provider wins over static basic auth, and is pulled
+        // fresh each call so a rotated token reaches the handshake.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = ReaderConfig::from_conf("wss::addr=h:1;username=u;password=p")
+            .unwrap()
+            .token_provider({
+                let counter = std::sync::Arc::clone(&counter);
+                move || {
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<_, crate::Error>(format!("tok-{n}"))
+                }
+            });
+        let h = c.upgrade_headers().unwrap();
+        let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer tok-0"); // the provider, not `Basic ...`
+        // Re-invoked on the next (re)connect.
+        let h = c.upgrade_headers().unwrap();
+        let auth = h.iter().find(|(n, _)| *n == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer tok-1");
+    }
+
+    #[test]
+    fn token_provider_control_char_rejected() {
+        // A CR/LF token (a header-injection vector) fails the handshake build.
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| Ok::<_, crate::Error>("bad\r\ntoken".to_string()));
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn token_provider_error_propagates() {
+        let c = ReaderConfig::from_conf("wss::addr=h:1")
+            .unwrap()
+            .token_provider(|| {
+                Err::<String, _>(crate::Error::new(crate::ErrorCode::AuthError, "no token"))
+            });
+        let err = c.upgrade_headers().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AuthError);
     }
 
     #[test]

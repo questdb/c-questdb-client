@@ -227,6 +227,11 @@ pub(crate) struct QwpWsConfig {
     pub(crate) max_background_drainers: ConfigSetting<usize>,
     pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
+    /// A rotating Bearer-token source pulled at each (re)connect (e.g. from
+    /// `oidc::OidcDeviceAuth`), overriding any static basic/token auth. Set via
+    /// [`SenderBuilder::qwp_ws_token_provider`](crate::ingress::SenderBuilder::qwp_ws_token_provider);
+    /// programmatic-only (never from a conf string).
+    pub(crate) token_provider: Option<crate::token_provider::TokenProvider>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -262,6 +267,7 @@ impl Default for QwpWsConfig {
             ),
             error_inbox_capacity: ConfigSetting::new_default(QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
+            token_provider: None,
         }
     }
 }

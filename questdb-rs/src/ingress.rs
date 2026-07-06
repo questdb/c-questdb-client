@@ -1273,6 +1273,46 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    /// Supply a fresh Bearer token on every QWP/WebSocket (re)connect via a
+    /// callback (e.g. [`OidcDeviceAuth::token`](crate::oidc::OidcDeviceAuth::token)).
+    ///
+    /// Unlike [`token`](Self::token), which captures a fixed token once, the
+    /// provider is called at each connect and reconnect, so a long-lived sender
+    /// keeps working as the token silently refreshes / rotates. The returned token
+    /// is sent as the `Authorization: Bearer <token>` handshake header; a token
+    /// with a non-printable-ASCII character (a header-injection vector) is
+    /// rejected. A provider error fails that connection attempt. Mutually
+    /// exclusive with [`username`](Self::username) / [`password`](Self::password) /
+    /// [`token`](Self::token); QWP/WebSocket only.
+    ///
+    /// **Use [`Protocol::QwpWss`](crate::ingress::Protocol::QwpWss)** (TLS): the
+    /// token is a bearer credential, sent in cleartext over plain
+    /// [`Protocol::QwpWs`](crate::ingress::Protocol::QwpWs) to a non-loopback host.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_token_provider<F, E>(mut self, provider: F) -> Result<Self>
+    where
+        F: Fn() -> std::result::Result<String, E> + Send + Sync + 'static,
+        E: Into<crate::Error>,
+    {
+        if self.qwp_ws.is_none() {
+            return Err(fmt!(
+                ConfigError,
+                "\"qwp_ws_token_provider\" is only supported for QWP over WebSocket."
+            ));
+        }
+        if self.username.is_specified() || self.password.is_specified() || self.token.is_specified()
+        {
+            return Err(fmt!(
+                ConfigError,
+                "\"qwp_ws_token_provider\" is mutually exclusive with \
+                 username/password and token authentication."
+            ));
+        }
+        self.qwp_ws.as_mut().unwrap().token_provider =
+            Some(crate::token_provider::TokenProvider::new(provider));
+        Ok(self)
+    }
+
     /// Set the ECDSA public key X for TCP authentication.
     pub fn token_x(self, token_x: &str) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
@@ -2427,6 +2467,15 @@ impl SenderBuilder {
                 qwp_ws.apply_reconnect_implies_initial_retry();
                 let qwp_ws = &qwp_ws;
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
+                // A rotating token provider overrides static auth at each connect;
+                // reject the ambiguous combination (mirrors http_token_provider).
+                if qwp_ws.token_provider.is_some() && auth.is_some() {
+                    return Err(fmt!(
+                        ConfigError,
+                        "\"qwp_ws_token_provider\" is mutually exclusive with \
+                         username/password and token authentication."
+                    ));
+                }
                 let basic_auth = qwp_ws_auth_header(&auth)?;
                 if *qwp_ws.progress == QwpWsProgress::Manual {
                     if *qwp_ws.initial_connect_retry == conf::QwpWsInitialConnectMode::Async {

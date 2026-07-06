@@ -35,6 +35,12 @@ mod gai;
 #[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
 mod ws;
 
+// A caller-supplied rotating Bearer-token provider for the QWP/WS ingress
+// sender and the egress reader (the ILP/HTTP sender has its own in
+// `ingress::sender::http`). Lets an OIDC token be refreshed at each (re)connect.
+#[cfg(any(feature = "_sender-qwp-ws", feature = "_egress"))]
+mod token_provider;
+
 // JKS / PKCS#12 trust-store loader for `tls_roots_password`. Pulled
 // in only for the QWP transports — matches the Java reference's
 // `KeyStore.getInstance(...)` surface there. Other ILP transports

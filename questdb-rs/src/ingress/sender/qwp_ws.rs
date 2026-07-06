@@ -2429,6 +2429,16 @@ pub(super) fn connect_qwp_ws_endpoint_round(
         tracker.begin_round(true);
     }
 
+    // A token provider (e.g. OIDC) is pulled fresh on every (re)connect round,
+    // overriding the static basic/token header, so a long-lived sender keeps a
+    // valid Bearer as the token rotates. A provider failure surfaces as an
+    // AuthError, which the round below returns without retrying (line ~2459).
+    let provided_header = match qwp_ws.token_provider.as_ref() {
+        Some(provider) => Some(provider.bearer_header()?),
+        None => None,
+    };
+    let auth_header = provided_header.as_deref().or(auth_header);
+
     let mut last_endpoint_idx = None;
     let mut last_error = None;
     let mut role_reject_count = 0usize;

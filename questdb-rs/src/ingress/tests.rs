@@ -1572,3 +1572,25 @@ fn assert_conf_err<T, M: AsRef<str>>(result: Result<T>, expect_msg: M) {
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert_eq!(err.msg(), expect_msg.as_ref());
 }
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn qwp_ws_token_provider_conflicts_with_static_auth() {
+    // A rotating token provider is mutually exclusive with static auth.
+    let result = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", 9000)
+        .username("u")
+        .unwrap()
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("provided".to_string()));
+    assert_eq!(result.unwrap_err().code(), ErrorCode::ConfigError);
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[test]
+fn qwp_ws_token_provider_stored_in_config() {
+    // With no static auth, the provider is accepted and stored on the QWP/WS
+    // config, ready to be pulled at each (re)connect.
+    let builder = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", 9000)
+        .qwp_ws_token_provider(|| Ok::<_, crate::Error>("tok".to_string()))
+        .unwrap();
+    assert!(builder.qwp_ws.as_ref().unwrap().token_provider.is_some());
+}

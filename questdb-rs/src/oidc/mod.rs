@@ -130,6 +130,40 @@
 //! encryption, implement [`TokenStore`] over an OS keychain or a secrets manager.
 //! A persisted file is treated as untrusted input on load (see [`FileTokenStore`]).
 //!
+//! # Using the token beyond ILP/HTTP
+//!
+//! The same auto-refreshed token wires into QuestDB's other transports. Each is a
+//! *provider* callback pulled fresh at connect time, so a long-lived client keeps
+//! working as the token rotates — pass `move || auth.token()` (with an
+//! [`Arc<OidcDeviceAuth>`](std::sync::Arc)):
+//!
+//! - **QWP/WebSocket ingress** — `SenderBuilder::qwp_ws_token_provider` (feature
+//!   `sync-sender-qwp-ws`), pulled at each (re)connect handshake.
+//! - **QWP/WebSocket egress reader** — `ReaderConfig::token_provider` (feature
+//!   `sync-reader-ws`), likewise per (re)connect.
+//! - **SQL over PG-wire** — QuestDB has no Rust driver in this crate, but the
+//!   token works as a PG-wire password: connect with the username `_sso` and
+//!   [`token`](OidcDeviceAuth::token) as the password (requires
+//!   `acl.oidc.pg.token.as.password.enabled=true` on the server). QuestDB
+//!   validates the token at **authentication** time, not per query — an open
+//!   connection survives token expiry, so only *new* connections need a fresh
+//!   token. Pull [`token`](OidcDeviceAuth::token) in your pool's connection
+//!   factory so each new connection gets a freshly-refreshed one:
+//!
+//! ```no_run
+//! # use questdb::oidc::OidcDeviceAuth;
+//! # fn main() -> questdb::Result<()> {
+//! # let auth = OidcDeviceAuth::from_questdb("https://questdb.example.com:9000").build()?;
+//! // `<postgres-client>::connect` with user "_sso" and this token as the password:
+//! let password = auth.token()?; // freshly refreshed each call
+//! # let _ = password;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! For a plain `Authorization: Bearer` header (raw HTTP, or your own tooling), use
+//! [`authorization_header_value`](OidcDeviceAuth::authorization_header_value).
+//!
 //! # Security
 //!
 //! The IdP device-authorization and token endpoints must use `https` (a

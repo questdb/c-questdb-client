@@ -217,7 +217,7 @@ impl WsTransport {
         // validation.
         let host_header = endpoint.to_string();
         let path = config.path.clone();
-        let extra_headers = config.upgrade_headers();
+        let extra_headers = config.upgrade_headers()?;
         let handshake_result = handshake::upgrade(&mut stream, &host_header, &path, &extra_headers);
 
         let handshake = match handshake_result {
