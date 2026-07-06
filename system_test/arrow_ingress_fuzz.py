@@ -922,9 +922,9 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
         return "".join(parts).encode("utf-8")
 
     def _require_managed_plain_qwp_ws(self, purpose: str) -> None:
-        from test import QuestDbDockerFixture, QuestDbFixture
+        from test import QuestDbFixture
 
-        if not isinstance(self._fixture, (QuestDbFixture, QuestDbDockerFixture)):
+        if not isinstance(self._fixture, QuestDbFixture):
             self.skipTest(f"{purpose} requires a managed QuestDB fixture")
         if self._fixture.auth:
             self.skipTest(f"{purpose} runs without auth")
@@ -1161,12 +1161,11 @@ class TestArrowIngressSfa(afc.ArrowFuzzBase):
     def test_sfa_new_owner_recovers_server_accepted_unacked_batch(self):
         from test import (
             QwpWsDropAckProxy,
-            QuestDbDockerFixture,
             QuestDbFixture,
             skip_if_unsupported_qwp_ws_fixture,
         )
 
-        if not isinstance(self._fixture, (QuestDbFixture, QuestDbDockerFixture)):
+        if not isinstance(self._fixture, QuestDbFixture):
             self.skipTest("SFA restart recovery requires a managed QuestDB fixture")
         if self._fixture.auth:
             self.skipTest("SFA drop-ACK proxy tests run without auth")
