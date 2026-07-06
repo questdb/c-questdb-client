@@ -2617,6 +2617,7 @@ pub(crate) fn establish_connection(
     Ok((stream, handshake_result, leftover))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_qwp_ws_endpoint_round<A: QwpWsHealthAccess>(
     endpoints: &Arc<[QwpWsEndpoint]>,
     mut health: A,

@@ -104,6 +104,7 @@ TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
+        REQUIRE(mock->wait_for_accepts(1));
     }
     int accepts_before = mock->accepts();
     {
@@ -285,17 +286,17 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
     auto mock = spawn_mock(2);
     questdb::pool db{conf_for(mock->addr())};
 
-    int accepts_before;
     {
         auto conn = db.borrow_column_sender();
-        accepts_before = mock->accepts();
+        REQUIRE(mock->wait_for_accepts(1));
         conn.drop_on_return();
     }
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
+        REQUIRE(mock->wait_for_accepts(2));
     }
-    CHECK(mock->accepts() == accepts_before + 1);
+    CHECK(mock->accepts() == 2);
 }
 
 TEST_CASE("pool is move-constructible and move-assignable")

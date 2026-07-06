@@ -1187,6 +1187,19 @@ int MockServer::accepts() const
     return _impl->accept_count.load();
 }
 
+bool MockServer::wait_for_accepts(
+    int n, std::chrono::milliseconds timeout) const
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (_impl->accept_count.load() < n)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return _impl->accept_count.load() >= n;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
 std::vector<std::vector<uint8_t>> MockServer::captured_requests() const
 {
     std::lock_guard<std::mutex> g(_impl->captured_mtx);

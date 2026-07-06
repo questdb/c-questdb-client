@@ -1844,12 +1844,12 @@ fn qwp_ws_manual_sender_schema_rejection_terminalizes_without_ack_advance() {
     let first_fsn = sender.flush_and_get_fsn(&mut first).unwrap().unwrap();
 
     assert_eq!(first_fsn, 0);
-    assert!(sender.drive_once().unwrap());
     assert_eq!(sender.acked_fsn().unwrap(), None);
     let deadline = Instant::now() + Duration::from_secs(5);
     let err = loop {
         match sender.drive_once() {
             Ok(_) if Instant::now() < deadline => {
+                assert_eq!(sender.acked_fsn().ok().flatten(), None);
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(progressed) => {
