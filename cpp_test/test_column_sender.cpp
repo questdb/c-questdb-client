@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -48,6 +49,21 @@ std::unique_ptr<qm::MockServer> spawn_mock(int slot_count)
 std::string conf_for(const std::string& addr, const std::string& extras = {})
 {
     return "qwpws::addr=" + addr + ";pool_size=1;pool_reap=manual;" + extras;
+}
+
+// The store-and-forward runner opens its connection on a background thread, so
+// a borrow's accept lands asynchronously after `borrow_column_sender()`
+// returns. Poll for it (as the Rust suite's `wait_until` does) instead of
+// reading `accepts()` synchronously, which would race the connect.
+bool wait_for_accepts(const qm::MockServer& mock, int target)
+{
+    for (int i = 0; i < 200; ++i) // up to ~2s, matching the Rust test
+    {
+        if (mock.accepts() >= target)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
 }
 
 } // namespace
@@ -104,13 +120,17 @@ TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
+        // The background runner opens one connection; wait for it to land.
+        REQUIRE(wait_for_accepts(*mock, 1));
     }
-    int accepts_before = mock->accepts();
+    // Drop returns the sender to the pool (recycled, not dropped).
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
     }
-    CHECK(mock->accepts() == accepts_before);
+    // The re-borrow reused the recycled connection: the mock only ever
+    // accepted one connection, never a second.
+    CHECK(mock->accepts() == 1);
 }
 
 TEST_CASE("borrowed_column_sender move transfers ownership without double-return")
@@ -285,17 +305,19 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
     auto mock = spawn_mock(2);
     questdb::pool db{conf_for(mock->addr())};
 
-    int accepts_before;
     {
         auto conn = db.borrow_column_sender();
-        accepts_before = mock->accepts();
-        conn.drop_on_return();
+        REQUIRE(wait_for_accepts(*mock, 1)); // first borrow opens conn #1
+        conn.drop_on_return();               // force drop instead of recycle
     }
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
+        // The slot was dropped (not recycled), so the re-borrow must open a
+        // fresh conn #2 rather than reuse the first.
+        REQUIRE(wait_for_accepts(*mock, 2));
     }
-    CHECK(mock->accepts() == accepts_before + 1);
+    CHECK(mock->accepts() == 2);
 }
 
 TEST_CASE("pool is move-constructible and move-assignable")

@@ -209,7 +209,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
                             .column_i64("v", state.v.as_slice(), None)
                             .map_err(|e| e.to_string())?;
                         chunk
-                            .designated_timestamp_micros(state.ts.as_slice())
+                            .at_micros(state.ts.as_slice())
                             .map_err(|e| e.to_string())?;
                         sender.flush(&mut chunk).map_err(|e| e.to_string())?;
                         sender
