@@ -438,7 +438,7 @@ impl crate::db::BorrowedDirectColumnSender<'_> {
         T: TryInto<crate::ingress::TableName<'t>>,
         crate::Error: From<T::Error>,
     {
-        let table: crate::ingress::TableName<'t> = table.try_into()?;
+        let table = table.try_into()?;
         let mut deadline =
             std::time::Instant::now().checked_add(self.reconnect_policy().max_duration());
         // Batches confirmed by the last successful checkpoint; a transient
