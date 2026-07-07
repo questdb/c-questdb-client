@@ -143,6 +143,9 @@ pub(crate) const QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY: usize = 256;
 pub(crate) const QWP_WS_MIN_ERROR_INBOX_CAPACITY: usize = 16;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS: usize = 4;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(5000);
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +238,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) error_inbox_capacity: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
     pub(crate) max_frame_rejections: ConfigSetting<usize>,
+    pub(crate) poison_min_escalation_window: ConfigSetting<std::time::Duration>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -272,6 +276,9 @@ impl Default for QwpWsConfig {
             error_inbox_capacity: ConfigSetting::new_default(QWP_WS_DEFAULT_ERROR_INBOX_CAPACITY),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
             max_frame_rejections: ConfigSetting::new_default(QWP_WS_DEFAULT_MAX_FRAME_REJECTIONS),
+            poison_min_escalation_window: ConfigSetting::new_default(
+                QWP_WS_DEFAULT_POISON_MIN_ESCALATION_WINDOW,
+            ),
         }
     }
 }

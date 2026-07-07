@@ -450,6 +450,7 @@ impl OrphanDrainer {
             // instead of surviving in the slot and replaying to the successor.
             *config.qwp_ws.request_durable_ack,
             *config.qwp_ws.max_frame_rejections,
+            *config.qwp_ws.poison_min_escalation_window,
         );
         OrphanOpenOutcome::Drainer(Box::new(Self {
             slot_dir,

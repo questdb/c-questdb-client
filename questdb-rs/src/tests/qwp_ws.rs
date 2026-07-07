@@ -47,6 +47,7 @@ const QWP_STATUS_OK: u8 = 0x00;
 const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
+const QWP_STATUS_WRITE_ERROR: u8 = 0x09;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS: usize = 20_000_000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE: usize = 1000;
 const QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT: usize = 128;
@@ -586,6 +587,12 @@ enum MockQwpResponse {
     },
 }
 
+#[derive(Clone, Copy)]
+enum RecycleServerAction {
+    WriteError,
+    NonOrderlyClose,
+}
+
 fn write_mock_qwp_response(
     stream: &mut TcpStream,
     response: MockQwpResponse,
@@ -597,6 +604,70 @@ fn write_mock_qwp_response(
             message,
         } => write_qwp_error_response(stream, status, wire_seq, message),
     }
+}
+
+fn spawn_recycling_server(
+    action: RecycleServerAction,
+    run_for: Duration,
+) -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + run_for;
+        let mut connections = 0usize;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    upgrade_mock_stream(&mut stream);
+                    match read_frame(&mut stream) {
+                        Ok((_fin, 0x2, _payload)) => {
+                            connections += 1;
+                            match action {
+                                RecycleServerAction::WriteError => {
+                                    write_qwp_error_response(
+                                        &mut stream,
+                                        QWP_STATUS_WRITE_ERROR,
+                                        FIRST_WIRE_SEQUENCE,
+                                        b"retry later",
+                                    )
+                                    .unwrap();
+                                }
+                                RecycleServerAction::NonOrderlyClose => {
+                                    write_server_close_frame(&mut stream, 1002, "retry later")
+                                        .unwrap();
+                                }
+                            }
+                        }
+                        Ok((_fin, _opcode, _payload)) => {}
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) => {}
+                        Err(err) => panic!("recycling server failed to read frame: {err}"),
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("recycling server accept failed: {err}"),
+            }
+        }
+        connections
+    });
+
+    (port, handle)
 }
 
 fn spawn_stalled_after_first_frame_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
@@ -2678,6 +2749,8 @@ fn qwp_ws_repeated_head_close_poison_is_pollable_as_protocol_violation() {
     let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
         .max_frame_rejections(1)
         .unwrap()
+        .poison_min_escalation_window(Duration::ZERO)
+        .unwrap()
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -2756,6 +2829,116 @@ fn qwp_ws_repeated_head_close_poison_is_pollable_as_protocol_violation() {
         "terminal async error must not clear a newly prepared buffer"
     );
     assert!(sender.must_close());
+}
+
+#[test]
+fn qwp_ws_orderly_close_reconnects_without_poison_strike() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accept_tx, accept_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        for round in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            upgrade_mock_stream(&mut stream);
+
+            let (_fin, opcode, payload) = read_frame(&mut stream).unwrap();
+            assert_eq!(opcode, 0x2);
+            accept_tx.send((round, payload)).unwrap();
+            if round == 0 {
+                write_server_close_frame(&mut stream, 1000, "role change").unwrap();
+            } else {
+                write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_frame_rejections(1)
+        .unwrap()
+        .poison_min_escalation_window(Duration::ZERO)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    assert_eq!(fsn, 0);
+
+    let first = accept_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = accept_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(first.0, 0);
+    assert_eq!(second.0, 1);
+    assert_eq!(&first.1[0..4], b"QWP1");
+    assert_eq!(first.1, second.1);
+
+    for _ in 0..100 {
+        if let Some(error) = sender.poll_qwp_ws_error().unwrap() {
+            assert_ne!(error.category, QwpWsErrorCategory::ProtocolViolation);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run_paced_recycle_scenario(action: RecycleServerAction) -> usize {
+    let run_for = Duration::from_millis(900);
+    let (port, handle) = spawn_recycling_server(action, run_for);
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_frame_rejections(1000)
+        .unwrap()
+        .poison_min_escalation_window(Duration::from_secs(60))
+        .unwrap()
+        .reconnect_initial_backoff(Duration::from_millis(150))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_secs(1))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(5))
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+
+    thread::sleep(run_for);
+    drop(sender);
+    handle.join().unwrap()
+}
+
+#[test]
+fn qwp_ws_nack_recycles_are_paced_against_healthy_server() {
+    let connections = run_paced_recycle_scenario(RecycleServerAction::WriteError);
+    assert!(
+        (2..=8).contains(&connections),
+        "expected paced NACK recycles to make a small number of connections, got {connections}"
+    );
+}
+
+#[test]
+fn qwp_ws_non_orderly_close_recycles_are_paced() {
+    let connections = run_paced_recycle_scenario(RecycleServerAction::NonOrderlyClose);
+    assert!(
+        (2..=8).contains(&connections),
+        "expected paced close recycles to make a small number of connections, got {connections}"
+    );
 }
 
 fn assert_server_protocol_violation<F>(write_bad_response: F, expected_message: &'static str)
