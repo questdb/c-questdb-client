@@ -620,6 +620,12 @@ fn spawn_recycling_server(
         while Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // The listener is non-blocking so the accept loop can honor
+                    // `run_for`. On macOS/BSD and Windows the accepted socket
+                    // inherits that flag (unlike Linux), which makes
+                    // `set_read_timeout` a no-op and turns `read_frame` into an
+                    // immediate `WouldBlock`. Force the stream back to blocking.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
