@@ -804,13 +804,20 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 }
 
                 if self.rejected_head_is_poison(store, fsn) {
-                    let err = store.record_protocol_violation(
-                        None,
+                    let reason = if error.message.is_empty() {
                         format!(
                             "QWP/WebSocket frame fsn {fsn} was rejected {} times without ACK progress",
                             self.max_frame_rejections
-                        ),
-                    );
+                        )
+                    } else {
+                        format!(
+                            "QWP/WebSocket frame fsn {fsn} was rejected {} times without ACK \
+                             progress; last server error: {}",
+                            self.max_frame_rejections, error.message
+                        )
+                    };
+                    store.last_server_error = Some(error);
+                    let err = store.record_protocol_violation(None, reason);
                     store.mark_terminal(Some(err));
                     return Ok(DriveOutcome::Terminal);
                 }
@@ -6751,6 +6758,44 @@ mod tests {
         assert_eq!(error.to_fsn, 0);
         assert_eq!(driver.terminal_sender_error(), None);
         assert_eq!(driver.poll_sender_error(), None);
+    }
+
+    #[test]
+    fn retriable_reject_poison_terminal_carries_last_server_error() {
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWire { wire_seq: 0 },
+            FakeSendResult::RejectWire { wire_seq: 1 },
+            FakeSendResult::RejectWire { wire_seq: 2 },
+            FakeSendResult::RejectWire { wire_seq: 3 },
+        ]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        let mut outcome = driver.drive_once().unwrap();
+        for _ in 0..8 {
+            if outcome == DriveOutcome::Terminal {
+                break;
+            }
+            outcome = driver.drive_once().unwrap();
+        }
+        assert_eq!(outcome, DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert!(
+            terminal_error.message.as_deref().is_some_and(|message| {
+                message.contains("was rejected 4 times without ACK progress")
+                    && message.contains("fake write error")
+            }),
+            "poison terminal must carry the last server error, got: {:?}",
+            terminal_error.message
+        );
     }
 
     #[test]
