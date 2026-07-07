@@ -405,14 +405,6 @@ def test_qwp_store_and_forward_survives_graceful_role_switch(
 
 
 @pytest.mark.c_client
-@pytest.mark.xfail(
-    reason=(
-        "future-state mid-stream role-switch invariant: current PR-1105 path "
-        "can replay one duplicate row without STATUS_NOT_WRITABLE/idempotent "
-        "NACK semantics"
-    ),
-    strict=True,
-)
 @pytest.mark.parametrize("sidecar_fixture,suffix", _binding_cases())
 def test_qwp_store_and_forward_uncoordinated_role_switch(
     request: pytest.FixtureRequest,
