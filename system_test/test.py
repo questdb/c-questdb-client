@@ -2141,11 +2141,12 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
             expected_min_id=0,
             expected_max_id=self.ROWS_PER_PHASE * 2 - 1)
 
-    def test_reconnect_gives_up_after_cap(self):
-        table_name = 'qwp_ws_cap_' + uuid.uuid4().hex[:8]
+    def test_sf_sender_survives_outage_past_reconnect_cap(self):
+        table_name = 'qwp_ws_outage_' + uuid.uuid4().hex[:8]
         self._create_qwp_ws_table(table_name)
         sender_id = 's1-' + uuid.uuid4().hex[:12]
         observed_error = None
+        row_count = 1
 
         with tempfile.TemporaryDirectory(prefix='qwp-ws-s1-') as sf_dir:
             sender = self._connect_sender(self._sender_conf(
@@ -2154,7 +2155,7 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
                 reconnect_max_duration_millis=500,
                 reconnect_initial_backoff_millis=10,
                 reconnect_max_backoff_millis=50,
-                close_flush_timeout_millis=0))
+                close_flush_timeout_millis=120000))
             server_stopped = False
             try:
                 self._write_row(sender, table_name, 0)
@@ -2168,22 +2169,26 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
 
                 QDB_FIXTURE.stop()
                 server_stopped = True
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
                     try:
-                        self._write_row(sender, table_name, 1)
+                        self._write_row(sender, table_name, row_count)
                         sender.flush()
+                        row_count += 1
                     except qls.SenderError as e:
                         observed_error = e
                         break
                     time.sleep(0.05)
 
-                self.assertIsNotNone(
+                self.assertIsNone(
                     observed_error,
-                    'sender did not surface reconnect-cap failure within 5 seconds')
-                self.assertRegex(
-                    str(observed_error),
-                    r'(?i)(reconnect|connect|terminal|refused)')
+                    'store-and-forward sender must not give up after the '
+                    'reconnect cap mid-stream (Invariant B), but surfaced: '
+                    + str(observed_error))
+
+                QDB_FIXTURE.start()
+                server_stopped = False
+                sender.close_drain()
             finally:
                 sender.close(False)
                 if server_stopped:
@@ -2191,10 +2196,10 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
 
         self._retry_assert_aggregates(
             table_name,
-            expected_count=1,
-            expected_distinct_id=1,
+            expected_count=row_count,
+            expected_distinct_id=row_count,
             expected_min_id=0,
-            expected_max_id=0)
+            expected_max_id=row_count - 1)
 
     def test_new_sender_recovers_from_sf_dir(self):
         table_name = 'qwp_ws_recover_' + uuid.uuid4().hex[:8]

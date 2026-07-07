@@ -25,11 +25,9 @@ steps:
   - script: |
       python -m pip install --upgrade pip
       pip install numpy pyarrow polars tzdata
-    condition: |
-      and(
-        ne(variables['imageName'], 'macos-latest'),
-        ne(variables['imageName'], 'hetzner-incus')
-      )
+    condition: ne(variables['imageName'], 'macos-latest')
+    env:
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
     displayName: "Install Python Dependencies"
   - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
     env:
