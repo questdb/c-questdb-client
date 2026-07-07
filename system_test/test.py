@@ -2157,17 +2157,12 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
             expected_min_id=0,
             expected_max_id=self.ROWS_PER_PHASE * 2 - 1)
 
-    def test_reconnect_retries_forever_past_cap(self):
-        # Store-and-forward reconnect is retry-forever for transport failures:
-        # `reconnect_max_duration_millis` bounds a single reconnect *round*, not
-        # the sender's lifetime. While the server is down, flushes keep
-        # succeeding against the local SF store (a socket failure never
-        # terminalizes), and once an endpoint reappears the sender reconnects
-        # and drains everything. Only auth/protocol errors are terminal.
-        table_name = 'qwp_ws_cap_' + uuid.uuid4().hex[:8]
+    def test_sf_sender_survives_outage_past_reconnect_cap(self):
+        table_name = 'qwp_ws_outage_' + uuid.uuid4().hex[:8]
         self._create_qwp_ws_table(table_name)
         sender_id = 's1-' + uuid.uuid4().hex[:12]
-        total_rows = 1
+        observed_error = None
+        row_count = 1
 
         with tempfile.TemporaryDirectory(prefix='qwp-ws-s1-') as sf_dir:
             sender = self._connect_sender(self._sender_conf(
@@ -2190,23 +2185,23 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
 
                 QDB_FIXTURE.stop()
                 server_stopped = True
-
-                # Keep publishing well past several reconnect budgets (500ms
-                # each). Every flush must keep succeeding: a transport outage
-                # never surfaces a terminal error in retry-forever mode.
-                next_id = 1
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
-                    self._write_row(sender, table_name, next_id)
-                    sender.flush()  # must not raise despite the outage
-                    next_id += 1
+                    try:
+                        self._write_row(sender, table_name, row_count)
+                        sender.flush()
+                        row_count += 1
+                    except qls.SenderError as e:
+                        observed_error = e
+                        break
                     time.sleep(0.05)
-                self.assertGreater(
-                    next_id, 1, 'no rows published during the outage')
-                total_rows = next_id  # ids 0 .. next_id-1
 
-                # The endpoint reappears: the retry-forever loop reconnects and
-                # drains everything (a gave-up loop never could).
+                self.assertIsNone(
+                    observed_error,
+                    'store-and-forward sender must not give up after the '
+                    'reconnect cap mid-stream (Invariant B), but surfaced: '
+                    + str(observed_error))
+
                 QDB_FIXTURE.start()
                 server_stopped = False
                 sender.close_drain()
@@ -2217,10 +2212,10 @@ class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
 
         self._retry_assert_aggregates(
             table_name,
-            expected_count=total_rows,
-            expected_distinct_id=total_rows,
+            expected_count=row_count,
+            expected_distinct_id=row_count,
             expected_min_id=0,
-            expected_max_id=total_rows - 1)
+            expected_max_id=row_count - 1)
 
     def test_new_sender_recovers_from_sf_dir(self):
         table_name = 'qwp_ws_recover_' + uuid.uuid4().hex[:8]

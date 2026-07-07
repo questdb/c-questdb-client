@@ -41,6 +41,7 @@ using ssize_t = std::intptr_t;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <cerrno>
@@ -824,6 +825,33 @@ void graceful_close(socket_t fd)
         sizeof(ws_close),
         QWP_MSG_NOSIGNAL);
     (void)::shutdown(fd, QWP_SHUT_WR);
+    // Windows: closesocket() with data still unread in the recv buffer aborts
+    // the connection with an RST (WSAECONNABORTED / os error 10053 on the
+    // client), discarding the just-sent Close / RESULT_END frames. Drain the
+    // recv side until the client's FIN (recv == 0) or a short timeout so the
+    // final close is orderly on every platform.
+#ifdef _WIN32
+    DWORD drain_timeout_ms = 500;
+    (void)::setsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&drain_timeout_ms),
+        sizeof(drain_timeout_ms));
+#else
+    struct timeval drain_timeout{};
+    drain_timeout.tv_usec = 500000;
+    (void)::setsockopt(
+        fd, SOL_SOCKET, SO_RCVTIMEO, &drain_timeout, sizeof(drain_timeout));
+#endif
+    char drain_buf[512];
+    while (::recv(fd, drain_buf,
+#ifdef _WIN32
+                  int(sizeof(drain_buf)),
+#else
+                  sizeof(drain_buf),
+#endif
+                  0) > 0)
+    {
+    }
     close_socket(fd);
 }
 
