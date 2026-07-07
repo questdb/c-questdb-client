@@ -151,6 +151,7 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
          sf_max_total_bytes=4G;\
          sf_durability=memory;\
          sf_append_deadline_millis=1234;\
+         poison_min_escalation_window_millis=600;\
          auth_timeout_ms=750;",
     )
     .unwrap();
@@ -163,6 +164,10 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
     assert_specified_eq(&qwp_ws.sf_max_total_bytes, Some(4 * 1024 * 1024 * 1024_u64));
     assert_specified_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
     assert_specified_eq(&qwp_ws.sf_append_deadline, Duration::from_millis(1234));
+    assert_specified_eq(
+        &qwp_ws.poison_min_escalation_window,
+        Duration::from_millis(600),
+    );
     assert_specified_eq(&qwp_ws.auth_timeout, Duration::from_millis(750));
 }
 
@@ -189,6 +194,24 @@ fn qwpws_store_and_forward_defaults_match_java() {
     assert_defaulted_eq(&qwp_ws.sf_append_deadline, Duration::from_secs(30));
     assert_defaulted_eq(&qwp_ws.auth_timeout, Duration::from_secs(15));
     assert_defaulted_eq(&qwp_ws.progress, QwpWsProgress::Background);
+    assert_defaulted_eq(
+        &qwp_ws.poison_min_escalation_window,
+        Duration::from_millis(5000),
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_poison_min_escalation_window_accepts_zero() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;poison_min_escalation_window_millis=0;",
+    )
+    .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(
+        &qwp_ws.poison_min_escalation_window,
+        Duration::from_millis(0),
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -522,6 +545,12 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
     assert_conf_err(
         SenderBuilder::from_conf("tcp::addr=localhost:9009;max_background_drainers=2;"),
         "The \"max_background_drainers\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf(
+            "tcp::addr=localhost:9009;poison_min_escalation_window_millis=5000;",
+        ),
+        "The \"poison_min_escalation_window_millis\" setting is only supported for QWP/WebSocket.",
     );
 }
 

@@ -116,6 +116,7 @@ struct PoisonFrameTracker {
     fsn: Option<u64>,
     completed_fsn: Option<u64>,
     rejection_count: usize,
+    first_strike_at: Option<Instant>,
 }
 
 impl PoisonFrameTracker {
@@ -123,15 +124,33 @@ impl PoisonFrameTracker {
         *self = Self::default();
     }
 
-    fn record_failure(&mut self, fsn: u64, completed_fsn: Option<u64>, limit: usize) -> bool {
+    fn record_failure(
+        &mut self,
+        fsn: u64,
+        completed_fsn: Option<u64>,
+        limit: usize,
+        min_escalation_window: Duration,
+        now: Instant,
+    ) -> bool {
         if self.fsn == Some(fsn) && self.completed_fsn == completed_fsn {
             self.rejection_count = self.rejection_count.saturating_add(1);
         } else {
             self.fsn = Some(fsn);
             self.completed_fsn = completed_fsn;
             self.rejection_count = 1;
+            self.first_strike_at = Some(now);
         }
-        self.rejection_count >= limit
+        if self.rejection_count < limit {
+            return false;
+        }
+        min_escalation_window.is_zero()
+            || self.first_strike_at.is_some_and(|first_strike_at| {
+                now.saturating_duration_since(first_strike_at) >= min_escalation_window
+            })
+    }
+
+    fn strikes(&self) -> usize {
+        self.rejection_count
     }
 }
 
@@ -154,6 +173,8 @@ pub(crate) struct QwpWsSendCore<T> {
     pending_reconnect: Option<QwpWsReconnectState>,
     poison_tracker: PoisonFrameTracker,
     max_frame_rejections: usize,
+    poison_min_escalation_window: Duration,
+    sends_on_connection: u64,
 }
 
 #[derive(Debug)]
@@ -213,6 +234,7 @@ pub(crate) enum QwpWsTransportFailureAction {
     Reconnect {
         reason: ReconnectReason,
         initial_error: Error,
+        pace: Duration,
     },
     Terminal(Error),
 }
@@ -232,6 +254,7 @@ pub(crate) struct QwpWsReconnectState {
     started: Instant,
     deadline: Option<Instant>,
     backoff: Duration,
+    pace_first_attempt: Option<Duration>,
     last_error: Error,
     attempts: usize,
 }
@@ -251,9 +274,20 @@ impl QwpWsReconnectState {
             started,
             deadline: started.checked_add(policy.max_duration),
             backoff: policy.initial_backoff,
+            pace_first_attempt: None,
             last_error: initial_error,
             attempts: 0,
         }
+    }
+
+    pub(crate) fn with_pace(mut self, pace: Duration) -> Self {
+        if !pace.is_zero() {
+            self.deadline = self
+                .deadline
+                .and_then(|deadline| deadline.checked_add(pace));
+            self.pace_first_attempt = Some(pace);
+        }
+        self
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
@@ -275,6 +309,14 @@ impl QwpWsReconnectState {
             self.started,
             Some(self.last_error.clone()),
         )
+    }
+
+    pub(crate) fn next_after_retryable_terminal(&self, err: Error) -> Self {
+        Self::new(self.policy, self.context, self.reason, err)
+    }
+
+    pub(crate) fn take_first_attempt_pace(&mut self) -> Option<Duration> {
+        self.pace_first_attempt.take()
     }
 
     fn record_retryable_error(&mut self, err: Error) -> Duration {
@@ -723,6 +765,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             reconnect_policy,
             durable_ack,
             DEFAULT_MAX_FRAME_REJECTIONS,
+            Duration::ZERO,
         )
     }
 
@@ -732,6 +775,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         reconnect_policy: ReconnectPolicy,
         durable_ack: bool,
         max_frame_rejections: usize,
+        poison_min_escalation_window: Duration,
     ) -> Self {
         Self {
             transport,
@@ -741,6 +785,8 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             pending_reconnect: None,
             poison_tracker: PoisonFrameTracker::default(),
             max_frame_rejections,
+            poison_min_escalation_window,
+            sends_on_connection: 0,
         }
     }
 
@@ -748,6 +794,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
         response: TransportResponse,
+        defer_reconnect: bool,
     ) -> Result<DriveOutcome, DriverError> {
         match response {
             TransportResponse::Ack { wire_seq } => {
@@ -779,7 +826,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 let Some((fsn, _effect_wire_seq)) =
                     self.send_cursor.reject_fsn_for_wire_seq(wire_seq)?
                 else {
-                    return self.record_presend_reject(store, wire_seq, error, policy);
+                    return self.record_presend_reject(
+                        store,
+                        wire_seq,
+                        error,
+                        policy,
+                        defer_reconnect,
+                    );
                 };
                 if self.reject_target_already_accounted(store, fsn) {
                     store.record_reject_error(fsn, wire_seq, error, policy);
@@ -804,28 +857,39 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
                 }
 
                 if self.rejected_head_is_poison(store, fsn) {
-                    let err = store.record_protocol_violation(
-                        None,
+                    let strikes = self.poison_tracker.strikes();
+                    let reason = if error.message.is_empty() {
                         format!(
-                            "QWP/WebSocket frame fsn {fsn} was rejected {} times without ACK progress",
-                            self.max_frame_rejections
-                        ),
-                    );
+                            "QWP/WebSocket frame fsn {fsn} was rejected {strikes} times without ACK progress"
+                        )
+                    } else {
+                        format!(
+                            "QWP/WebSocket frame fsn {fsn} was rejected {} times without ACK \
+                             progress; last server error: {}",
+                            strikes, error.message
+                        )
+                    };
+                    store.last_server_error = Some(error);
+                    let err = store.record_protocol_violation(None, reason);
                     store.mark_terminal(Some(err));
                     return Ok(DriveOutcome::Terminal);
                 }
 
                 let error_for_reconnect = error.error.clone();
                 let reconnect_reason = reconnect_reason_for_policy(policy);
+                let pace = self.reconnect_pace_for_reject_policy(policy);
                 let sender_error = store.record_rejected_frame(fsn, wire_seq, error, policy);
                 store.push_event(DriverEvent::Rejected { fsn, wire_seq });
                 let initial_error = server_rejection_error(error_for_reconnect, sender_error);
-                self.pending_reconnect = Some(self.begin_reconnect(
-                    "QWP/WebSocket reconnect after server rejection",
-                    reconnect_reason,
-                    initial_error,
-                ));
-                self.continue_reconnect(store)
+                self.pending_reconnect = Some(
+                    self.begin_reconnect(
+                        "QWP/WebSocket reconnect after server rejection",
+                        reconnect_reason,
+                        initial_error,
+                    )
+                    .with_pace(pace),
+                );
+                self.continue_or_defer_reconnect(store, defer_reconnect)
             }
         }
     }
@@ -887,10 +951,13 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         if store.queue.oldest_unresolved_fsn() != Some(fsn) {
             return false;
         }
+        let now = Instant::now();
         self.poison_tracker.record_failure(
             fsn,
             store.queue.completed_fsn(),
             self.max_frame_rejections,
+            self.poison_min_escalation_window,
+            now,
         )
     }
 
@@ -900,6 +967,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         wire_seq: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
+        defer_reconnect: bool,
     ) -> Result<DriveOutcome, DriverError> {
         let from_fsn = store
             .queue
@@ -925,13 +993,34 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             let initial_error = server_rejection_error(error.error.clone(), sender_error.clone());
             store.push_sender_error(sender_error);
             store.last_server_error = Some(error);
-            self.pending_reconnect = Some(self.begin_reconnect(
-                "QWP/WebSocket reconnect after server rejection",
-                reconnect_reason_for_policy(policy),
-                initial_error,
-            ));
-            self.continue_reconnect(store)
+            let pace = self.reconnect_pace_for_reject_policy(policy);
+            self.pending_reconnect = Some(
+                self.begin_reconnect(
+                    "QWP/WebSocket reconnect after server rejection",
+                    reconnect_reason_for_policy(policy),
+                    initial_error,
+                )
+                .with_pace(pace),
+            );
+            self.continue_or_defer_reconnect(store, defer_reconnect)
         }
+    }
+
+    fn reconnect_pace_for_reject_policy(&self, policy: QwpWsErrorPolicy) -> Duration {
+        if policy == QwpWsErrorPolicy::Retriable {
+            self.reconnect_pace_for_strikes(self.poison_tracker.strikes().max(1))
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn reconnect_pace_for_strikes(&self, strikes: usize) -> Duration {
+        let dose = pace_dose(
+            self.reconnect_policy.initial_backoff,
+            self.reconnect_policy.max_backoff,
+            strikes,
+        );
+        pace_jitter_duration(dose)
     }
 
     fn complete_ack_through<Q: PublicationLog>(
@@ -1028,6 +1117,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         outbound: OutboundFrame,
     ) -> (SentFrame, Result<TransportSendResult, TransportFailure>) {
         let frame = outbound.sent_frame();
+        self.sends_on_connection = self.sends_on_connection.saturating_add(1);
         let result = outbound.with_view(|view| self.transport.send_frame(view));
         (frame, result)
     }
@@ -1045,7 +1135,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             }
             QwpWsHotSendProgress::Response { frame, response } => {
                 store.record_sent_event(frame);
-                self.apply_response(store, response)
+                self.apply_response(store, response, false)
                     .map(QwpWsSendProgress::Outcome)
             }
             QwpWsHotSendProgress::TransportFailure { frame, failure } => {
@@ -1089,7 +1179,15 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         store: &mut QwpWsPublicationStore<Q>,
         response: TransportResponse,
     ) -> Result<DriveOutcome, DriverError> {
-        self.apply_response(store, response)
+        self.apply_response(store, response, false)
+    }
+
+    pub(crate) fn finish_response_defer_reconnect<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+        response: TransportResponse,
+    ) -> Result<DriveOutcome, DriverError> {
+        self.apply_response(store, response, true)
     }
 
     pub(crate) fn finish_ack_response_sfa(
@@ -1237,21 +1335,32 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             TransportFailure::Disconnect(initial_error) => QwpWsTransportFailureAction::Reconnect {
                 reason: ReconnectReason::Disconnect,
                 initial_error,
+                pace: Duration::ZERO,
             },
             TransportFailure::ServerClose(initial_error) => {
+                if self.sends_on_connection == 0 {
+                    return QwpWsTransportFailureAction::Reconnect {
+                        reason: ReconnectReason::Disconnect,
+                        initial_error,
+                        pace: Duration::ZERO,
+                    };
+                }
                 if let Some(error) = self.server_close_poison_error(store) {
                     store.mark_terminal(Some(error.clone()));
                     QwpWsTransportFailureAction::Terminal(error)
                 } else {
+                    let pace = self.reconnect_pace_for_strikes(self.poison_tracker.strikes());
                     QwpWsTransportFailureAction::Reconnect {
                         reason: ReconnectReason::Disconnect,
                         initial_error,
+                        pace,
                     }
                 }
             }
             TransportFailure::Retryable(initial_error) => QwpWsTransportFailureAction::Reconnect {
                 reason: ReconnectReason::RetryableFailure,
                 initial_error,
+                pace: Duration::ZERO,
             },
             TransportFailure::Terminal(error) => {
                 store.mark_terminal(Some(error.clone()));
@@ -1270,16 +1379,19 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         store: &mut QwpWsPublicationStore<Q>,
     ) -> Option<Error> {
         let fsn = store.queue.oldest_unresolved_fsn()?;
+        let now = Instant::now();
         if self.poison_tracker.record_failure(
             fsn,
             store.queue.completed_fsn(),
             self.max_frame_rejections,
+            self.poison_min_escalation_window,
+            now,
         ) {
+            let strikes = self.poison_tracker.strikes();
             return Some(store.record_protocol_violation(
                 None,
                 format!(
-                    "QWP/WebSocket frame fsn {fsn} was closed {} times without ACK progress",
-                    self.max_frame_rejections
+                    "QWP/WebSocket frame fsn {fsn} was closed {strikes} times without ACK progress"
                 ),
             ));
         }
@@ -1300,6 +1412,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         initial_error: Error,
     ) -> QwpWsReconnectState {
         QwpWsReconnectState::new(self.reconnect_policy, context, reason, initial_error)
+    }
+
+    pub(crate) fn has_pending_reconnect(&self) -> bool {
+        self.pending_reconnect.is_some()
+    }
+
+    pub(crate) fn take_pending_reconnect(&mut self) -> Option<QwpWsReconnectState> {
+        self.pending_reconnect.take()
     }
 
     pub(crate) fn reconnect_once(
@@ -1336,6 +1456,7 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         reason: ReconnectReason,
     ) -> DriveOutcome {
         self.pending_reconnect = None;
+        self.sends_on_connection = 0;
         self.send_cursor.restart(&store.queue);
         if self.durable_ack.is_some() {
             store.clear_unresolved_rejected_frames();
@@ -1348,6 +1469,25 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         DriveOutcome::Reconnected { reason }
     }
 
+    fn continue_or_defer_reconnect<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
+        defer_reconnect: bool,
+    ) -> Result<DriveOutcome, DriverError> {
+        if defer_reconnect {
+            let deadline = self
+                .pending_reconnect
+                .as_ref()
+                .and_then(QwpWsReconnectState::deadline);
+            Ok(DriveOutcome::ReconnectDelay {
+                sleep_for: Duration::ZERO,
+                deadline,
+            })
+        } else {
+            self.continue_reconnect(store)
+        }
+    }
+
     fn continue_reconnect<Q: PublicationLog>(
         &mut self,
         store: &mut QwpWsPublicationStore<Q>,
@@ -1355,6 +1495,14 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
         let Some(mut reconnect) = self.pending_reconnect.take() else {
             return Ok(DriveOutcome::Idle);
         };
+        if let Some(sleep_for) = reconnect.take_first_attempt_pace() {
+            let deadline = reconnect.deadline();
+            self.pending_reconnect = Some(reconnect);
+            return Ok(DriveOutcome::ReconnectDelay {
+                sleep_for,
+                deadline,
+            });
+        }
         // Mirrors the background runner's pre-attempt bump in
         // reconnect_with_policy so manual-mode drivers expose the same
         // cumulative counter.
@@ -1660,9 +1808,12 @@ impl<T: QwpWsCoreTransport> QwpWsSendCore<T> {
             QwpWsTransportFailureAction::Reconnect {
                 reason,
                 initial_error,
+                pace,
             } => {
-                self.pending_reconnect =
-                    Some(self.begin_reconnect("QWP/WebSocket reconnect", reason, initial_error));
+                self.pending_reconnect = Some(
+                    self.begin_reconnect("QWP/WebSocket reconnect", reason, initial_error)
+                        .with_pace(pace),
+                );
                 self.continue_reconnect(store)
             }
             QwpWsTransportFailureAction::Terminal(error) => {
@@ -1721,6 +1872,26 @@ impl<Q: PublicationLog, T: QwpWsCoreTransport> QwpWsCoreTestHarness<Q, T> {
                 max_in_flight,
                 reconnect_policy,
                 durable_ack,
+            ),
+        }
+    }
+
+    pub(crate) fn from_queue_with_rejection_limit_and_window(
+        queue: Q,
+        transport: T,
+        max_frame_rejections: usize,
+        poison_min_escalation_window: Duration,
+    ) -> Self {
+        let max_in_flight = queue.max_in_flight();
+        Self {
+            store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
+            send_core: QwpWsSendCore::new_with_durable_ack_and_rejection_limit(
+                transport,
+                max_in_flight,
+                ReconnectPolicy::no_backoff(Duration::MAX),
+                false,
+                max_frame_rejections,
+                poison_min_escalation_window,
             ),
         }
     }
@@ -1995,6 +2166,32 @@ fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
 
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
+}
+
+fn pace_dose(initial_backoff: Duration, max_backoff: Duration, strikes: usize) -> Duration {
+    if initial_backoff.is_zero() {
+        return Duration::ZERO;
+    }
+    let shift = strikes.max(1).saturating_sub(1).min(6) as u32;
+    initial_backoff
+        .checked_mul(1u32 << shift)
+        .unwrap_or(Duration::MAX)
+        .min(max_backoff)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn pace_jitter_duration(dose: Duration) -> Duration {
+    let dose_nanos = dose.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if dose_nanos == 0 {
+        return dose;
+    }
+    let extra = rand::rng().random_range(0..dose_nanos);
+    Duration::from_nanos(dose_nanos.saturating_add(extra))
+}
+
+#[cfg(not(feature = "sync-sender-qwp-ws"))]
+fn pace_jitter_duration(dose: Duration) -> Duration {
+    dose
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -2463,6 +2660,9 @@ impl QwpWsCoreTransport for BlockingQwpWsTransport {
             .reader
             .try_read_one(&mut self.stream, &mut self.send_buf)
             .map_err(|err| match err {
+                super::qwp_ws::WsMessageError::Close(close) if close.is_orderly() => {
+                    TransportFailure::Disconnect(close.into_error())
+                }
                 super::qwp_ws::WsMessageError::Close(close) => {
                     TransportFailure::ServerClose(close.into_error())
                 }
@@ -4361,6 +4561,223 @@ mod tests {
         );
     }
 
+    fn paced_policy() -> ReconnectPolicy {
+        ReconnectPolicy::bounded(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn assert_pace_range(actual: Duration, min: Duration, max: Duration) {
+        assert!(
+            actual >= min && actual < max,
+            "pace {actual:?} outside [{min:?}, {max:?})"
+        );
+    }
+
+    #[test]
+    fn retriable_nack_below_threshold_paces_before_first_reconnect_attempt() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed"),
+            },
+        ))])
+        .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 0);
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn second_same_frame_strike_doubles_pace_dose() {
+        let transport = TestTransport::scripted([
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed once"),
+            })),
+            Ok(TransportSendResult::Response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed twice"),
+            })),
+        ])
+        .with_restart_results([Ok(()), Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected first paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(200),
+                    Duration::from_millis(400),
+                );
+            }
+            other => panic!("expected second paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn not_writable_reject_reconnects_immediately_without_pace() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: not_writable_error("replica access is read-only"),
+            },
+        ))])
+        .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::NotWritable
+            }
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn presend_reject_paces_with_min_one_strike() {
+        let transport = TestTransport::scripted([]).with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver
+            .send_core
+            .finish_response(
+                &mut driver.store,
+                TransportResponse::Reject {
+                    wire_seq: 0,
+                    error: write_error("pre-send reject"),
+                },
+            )
+            .unwrap()
+        {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 0);
+    }
+
+    #[test]
+    fn zero_initial_backoff_keeps_legacy_immediate_reconnect() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Response(
+            TransportResponse::Reject {
+                wire_seq: 0,
+                error: write_error("write failed"),
+            },
+        ))])
+        .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            ReconnectPolicy::no_backoff(Duration::MAX),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn server_close_below_threshold_paces_reconnect() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_events([Err(TransportFailure::ServerClose(fake_transport_error(
+                "server close",
+            )))])
+            .with_restart_results([Ok(())]);
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_reconnect_policy(
+            memory_queue(options(8, 1024, 4)),
+            transport,
+            paced_policy(),
+            false,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.drive_once().unwrap() {
+            DriveOutcome::ReconnectDelay { sleep_for, .. } => {
+                assert_pace_range(
+                    sleep_for,
+                    Duration::from_millis(100),
+                    Duration::from_millis(200),
+                );
+            }
+            other => panic!("expected paced reconnect delay, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.transport.restart_attempts, 0);
+    }
+
     #[test]
     fn role_reject_reconnect_sleep_uses_fixed_initial_backoff() {
         let initial = Duration::from_millis(100);
@@ -4388,6 +4805,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pace_dose_doubles_per_strike_and_caps_at_max_backoff() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_millis(1000);
+
+        assert_eq!(pace_dose(initial, max, 0), Duration::from_millis(100));
+        assert_eq!(pace_dose(initial, max, 1), Duration::from_millis(100));
+        assert_eq!(pace_dose(initial, max, 2), Duration::from_millis(200));
+        assert_eq!(pace_dose(initial, max, 3), Duration::from_millis(400));
+        assert_eq!(pace_dose(initial, max, 4), Duration::from_millis(800));
+        assert_eq!(pace_dose(initial, max, 5), Duration::from_millis(1000));
+        assert_eq!(pace_dose(initial, max, 99), Duration::from_millis(1000));
+        assert_eq!(
+            pace_dose(Duration::ZERO, max, 4),
+            Duration::ZERO,
+            "zero initial backoff preserves legacy immediate reconnects"
+        );
+    }
+
+    #[test]
+    fn pace_jitter_stays_within_one_to_two_dose() {
+        for dose_ms in [1u64, 80, 100, 1_000] {
+            let dose = Duration::from_millis(dose_ms);
+            for _ in 0..10_000 {
+                let d = pace_jitter_duration(dose);
+                assert!(
+                    d >= dose && d < dose + dose,
+                    "paced jitter {d:?} outside [dose, 2*dose) for dose={dose:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn poison_tracker_dwell_holds_escalation_until_window_elapses() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(7, None, 2, window, started));
+        assert!(!tracker.record_failure(7, None, 2, window, started + Duration::from_secs(1)));
+        assert_eq!(tracker.strikes(), 2);
+        assert!(tracker.record_failure(7, None, 2, window, started + window));
+        assert_eq!(tracker.strikes(), 3);
+    }
+
+    #[test]
+    fn poison_tracker_dwell_restamps_when_suspect_key_changes() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(7, None, 2, window, started));
+        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(10)));
+        assert_eq!(tracker.strikes(), 1);
+        assert!(!tracker.record_failure(8, None, 2, window, started + Duration::from_secs(11)));
+        assert!(tracker.record_failure(8, None, 2, window, started + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn poison_tracker_window_zero_escalates_exactly_at_threshold() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+
+        assert!(!tracker.record_failure(7, None, 2, Duration::ZERO, started));
+        assert!(tracker.record_failure(7, None, 2, Duration::ZERO, started));
+    }
+
+    #[test]
+    fn poison_tracker_clear_resets_first_strike_timestamp() {
+        let mut tracker = PoisonFrameTracker::default();
+        let started = Instant::now();
+        let window = Duration::from_secs(5);
+
+        assert!(!tracker.record_failure(7, None, 2, window, started));
+        tracker.clear();
+        assert_eq!(tracker.strikes(), 0);
+        assert!(!tracker.record_failure(7, None, 1, window, started + Duration::from_secs(10)));
     }
 
     #[test]
@@ -6751,6 +7248,147 @@ mod tests {
         assert_eq!(error.to_fsn, 0);
         assert_eq!(driver.terminal_sender_error(), None);
         assert_eq!(driver.poll_sender_error(), None);
+    }
+
+    #[test]
+    fn retriable_reject_poison_terminal_carries_last_server_error() {
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::RejectWire { wire_seq: 0 },
+            FakeSendResult::RejectWire { wire_seq: 1 },
+            FakeSendResult::RejectWire { wire_seq: 2 },
+            FakeSendResult::RejectWire { wire_seq: 3 },
+        ]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        let mut outcome = driver.drive_once().unwrap();
+        for _ in 0..8 {
+            if outcome == DriveOutcome::Terminal {
+                break;
+            }
+            outcome = driver.drive_once().unwrap();
+        }
+        assert_eq!(outcome, DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert!(
+            terminal_error.message.as_deref().is_some_and(|message| {
+                message.contains("was rejected 4 times without ACK progress")
+                    && message.contains("fake write error")
+            }),
+            "poison terminal must carry the last server error, got: {:?}",
+            terminal_error.message
+        );
+    }
+
+    #[test]
+    fn poison_dwell_driver_holds_terminal_until_window_elapses() {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024, 4)),
+            FakeOrderedServer::scripted([
+                FakeSendResult::RejectWire { wire_seq: 0 },
+                FakeSendResult::RejectWire { wire_seq: 1 },
+                FakeSendResult::RejectWire { wire_seq: 2 },
+            ]),
+            2,
+            Duration::from_millis(200),
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert!(
+            terminal_error.message.as_deref().is_some_and(|message| {
+                message.contains("was rejected 3 times without ACK progress")
+                    && message.contains("fake write error")
+            }),
+            "poison terminal must report actual strike count, got: {:?}",
+            terminal_error.message
+        );
+    }
+
+    #[test]
+    fn server_close_before_any_send_does_not_strike() {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024, 4)),
+            FakeOrderedServer::no_response(),
+            1,
+            Duration::ZERO,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        match driver.send_core.transport_failure_action(
+            &mut driver.store,
+            TransportFailure::ServerClose(fake_transport_error("server close")),
+        ) {
+            QwpWsTransportFailureAction::Reconnect { reason, .. } => {
+                assert_eq!(reason, ReconnectReason::Disconnect);
+            }
+            other => panic!("expected reconnect, got {other:?}"),
+        }
+        assert_eq!(driver.send_core.poison_tracker.strikes(), 0);
+        assert!(!driver.is_terminal());
+    }
+
+    #[test]
+    fn server_close_after_send_still_strikes() {
+        let mut driver = QwpWsCoreTestHarness::from_queue_with_rejection_limit_and_window(
+            memory_queue(options(8, 1024, 4)),
+            FakeOrderedServer::no_response(),
+            1,
+            Duration::ZERO,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        match driver.send_core.transport_failure_action(
+            &mut driver.store,
+            TransportFailure::ServerClose(fake_transport_error("server close")),
+        ) {
+            QwpWsTransportFailureAction::Terminal(err) => {
+                assert!(
+                    err.msg()
+                        .contains("was closed 1 times without ACK progress"),
+                    "unexpected terminal error: {}",
+                    err.msg()
+                );
+            }
+            other => panic!("expected terminal, got {other:?}"),
+        }
+        assert!(driver.is_terminal());
     }
 
     #[test]

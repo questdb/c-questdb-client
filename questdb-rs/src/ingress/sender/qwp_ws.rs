@@ -52,10 +52,10 @@ use super::qwp_ws_driver::QwpWsCoreTestHarness;
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, DriverEvent,
     PublicationLifecycle, PublicationLog, PublicationState, QwpWsCoreTransport, QwpWsCounters,
-    QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore, QwpWsReconnectStep,
-    QwpWsSendCore, QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure,
-    TransportPoll, TransportResponse, reconnect_error_is_terminal, reconnect_sleep_duration,
-    retry_budget_exhausted_error,
+    QwpWsHotResponseProgress, QwpWsHotSendProgress, QwpWsPublicationStore, QwpWsReconnectState,
+    QwpWsReconnectStep, QwpWsSendCore, QwpWsTransportFailureAction, ReconnectPolicy,
+    ReconnectReason, TransportFailure, TransportPoll, TransportResponse,
+    reconnect_error_is_terminal, reconnect_sleep_duration, retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
@@ -779,6 +779,7 @@ impl SyncQwpWsPendingRunnerCore {
                     self.pending_connect.reconnect_policy,
                     self.pending_connect.durable_ack,
                     *self.pending_connect.qwp_ws.max_frame_rejections,
+                    *self.pending_connect.qwp_ws.poison_min_escalation_window,
                 );
                 self.connected = Some(SyncQwpWsRunnerCore {
                     send_core,
@@ -830,6 +831,10 @@ where
 
         if self.flush_cold_effects(shared) == RunnerStep::Stop {
             return RunnerStep::Stop;
+        }
+
+        if self.send_core.has_pending_reconnect() {
+            return self.finish_pending_reconnect(shared, stop, Duration::ZERO, None);
         }
 
         let outbound = match self.send_core.next_outbound_sfa_frame(&self.progress) {
@@ -934,7 +939,7 @@ where
     fn finish_response<Q>(
         &mut self,
         shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
-        _stop: &AtomicBool,
+        stop: &AtomicBool,
         response: TransportResponse,
     ) -> RunnerStep
     where
@@ -973,22 +978,34 @@ where
                 }
             }
             response @ TransportResponse::Reject { .. } => {
-                let mut store = match shared.lock() {
-                    Ok(store) => store,
-                    Err(_) => return self.handle_poisoned_lock(),
+                let outcome = {
+                    let mut store = match shared.lock() {
+                        Ok(store) => store,
+                        Err(_) => return self.handle_poisoned_lock(),
+                    };
+                    self.flush_cold_effects_locked(&mut store);
+                    match self
+                        .send_core
+                        .finish_response_defer_reconnect(&mut store, response)
+                    {
+                        Ok(outcome) => outcome,
+                        Err(err) => return self.store_driver_error(&mut store, err),
+                    }
                 };
-                self.flush_cold_effects_locked(&mut store);
-                match self.send_core.finish_response(&mut store, response) {
-                    Ok(outcome) => {
-                        let step = if outcome == DriveOutcome::Idle {
-                            RunnerStep::Continue
-                        } else {
-                            step_from_drive_outcome(outcome)
-                        };
+                match outcome {
+                    DriveOutcome::ReconnectDelay {
+                        sleep_for,
+                        deadline,
+                    } => self.finish_pending_reconnect(shared, stop, sleep_for, deadline),
+                    DriveOutcome::Idle => {
+                        self.backpressure.notify_all();
+                        RunnerStep::Continue
+                    }
+                    outcome => {
+                        let step = step_from_drive_outcome(outcome);
                         self.backpressure.notify_all();
                         step
                     }
-                    Err(err) => self.store_driver_error(&mut store, err),
                 }
             }
         }
@@ -1172,7 +1189,8 @@ where
             QwpWsTransportFailureAction::Reconnect {
                 reason,
                 initial_error,
-            } => self.reconnect_with_policy(shared, stop, reason, initial_error),
+                pace,
+            } => self.reconnect_with_policy(shared, stop, reason, initial_error, pace),
             QwpWsTransportFailureAction::Terminal(_error) => {
                 self.backpressure.notify_all();
                 RunnerStep::Stop
@@ -1186,14 +1204,59 @@ where
         stop: &AtomicBool,
         reason: ReconnectReason,
         initial_error: crate::Error,
+        pace: Duration,
     ) -> RunnerStep
     where
         Q: PublicationLog,
     {
-        let mut reconnect =
-            self.send_core
-                .begin_reconnect("QWP/WebSocket reconnect", reason, initial_error);
+        let mut reconnect = self
+            .send_core
+            .begin_reconnect("QWP/WebSocket reconnect", reason, initial_error)
+            .with_pace(pace);
+        self.finish_reconnect_state(shared, stop, &mut reconnect, Duration::ZERO, None)
+    }
+
+    fn finish_pending_reconnect<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        stop: &AtomicBool,
+        sleep_for: Duration,
+        deadline: Option<Instant>,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        let Some(mut reconnect) = self.send_core.take_pending_reconnect() else {
+            return RunnerStep::Continue;
+        };
+        self.finish_reconnect_state(shared, stop, &mut reconnect, sleep_for, deadline)
+    }
+
+    fn finish_reconnect_state<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        stop: &AtomicBool,
+        reconnect: &mut QwpWsReconnectState,
+        mut sleep_for: Duration,
+        mut deadline: Option<Instant>,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
         while !stop.load(Ordering::Acquire) {
+            if let Some(pace) = reconnect.take_first_attempt_pace() {
+                sleep_for = pace;
+                deadline = reconnect.deadline();
+            }
+            if !sleep_before_runner_reconnect(
+                deadline.or_else(|| reconnect.deadline()),
+                sleep_for,
+                stop,
+            ) && stop.load(Ordering::Acquire)
+            {
+                break;
+            }
+
             // Bump the cumulative attempt counter before each call.
             // Brief lock — the reconnect path is the slow one (network
             // I/O, backoff sleeps), so this lock isn't on the hot path
@@ -1205,7 +1268,7 @@ where
                 };
                 store.record_reconnect_attempt();
             }
-            match self.send_core.reconnect_once(&mut reconnect) {
+            match self.send_core.reconnect_once(reconnect) {
                 Ok(QwpWsReconnectStep::Reconnected { reason }) => {
                     let mut store = match shared.lock() {
                         Ok(store) => store,
@@ -1215,26 +1278,19 @@ where
                     let outcome = self.send_core.finish_reconnect_success(&mut store, reason);
                     return step_from_drive_outcome(outcome);
                 }
-                Ok(QwpWsReconnectStep::RetryAfter { sleep_for }) => {
-                    if !sleep_before_runner_reconnect(reconnect.deadline(), sleep_for, stop) {
-                        if stop.load(Ordering::Acquire) {
-                            break;
-                        }
-                        let err = reconnect.retry_budget_exhausted_error();
-                        reconnect =
-                            self.send_core
-                                .begin_reconnect("QWP/WebSocket reconnect", reason, err);
-                        continue;
-                    }
+                Ok(QwpWsReconnectStep::RetryAfter {
+                    sleep_for: retry_sleep,
+                }) => {
+                    deadline = reconnect.deadline();
+                    sleep_for = retry_sleep;
                 }
                 Ok(QwpWsReconnectStep::Terminal(err)) => {
                     if reconnect_error_is_terminal(&err) {
                         return self.mark_store_terminal(shared, err);
                     }
-                    thread::sleep(reconnect.initial_backoff());
-                    reconnect =
-                        self.send_core
-                            .begin_reconnect("QWP/WebSocket reconnect", reason, err);
+                    sleep_for = reconnect.initial_backoff();
+                    *reconnect = reconnect.next_after_retryable_terminal(err);
+                    deadline = reconnect.deadline();
                 }
                 Err(err) => {
                     let mut store = match shared.lock() {
@@ -1537,6 +1593,10 @@ pub(crate) struct WsCloseFrame {
 }
 
 impl WsCloseFrame {
+    pub(crate) fn is_orderly(&self) -> bool {
+        matches!(self.code, Some(1000 | 1001))
+    }
+
     pub(crate) fn into_error(self) -> crate::Error {
         error::fmt!(
             SocketError,
@@ -2907,6 +2967,7 @@ fn open_qwp_ws_parts(
         ),
         *qwp_ws.request_durable_ack,
         *qwp_ws.max_frame_rejections,
+        *qwp_ws.poison_min_escalation_window,
     );
 
     Ok(QwpWsConnectedParts {
@@ -3488,6 +3549,38 @@ mod tests {
             max_in_flight,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn ws_close_frame_orderly_detection() {
+        assert!(
+            WsCloseFrame {
+                code: Some(1000),
+                reason: String::new(),
+            }
+            .is_orderly()
+        );
+        assert!(
+            WsCloseFrame {
+                code: Some(1001),
+                reason: String::new(),
+            }
+            .is_orderly()
+        );
+        assert!(
+            !WsCloseFrame {
+                code: Some(1002),
+                reason: String::new(),
+            }
+            .is_orderly()
+        );
+        assert!(
+            !WsCloseFrame {
+                code: None,
+                reason: String::new(),
+            }
+            .is_orderly()
+        );
     }
 
     #[test]

@@ -555,6 +555,8 @@ pub(crate) const INGRESS_ONLY_CONFIG_KEYS: &[&str] = &[
     "in_flight_window",
     "max_in_flight",
     "qwp_ws_progress",
+    "max_frame_rejections",
+    "poison_min_escalation_window_millis",
     // QWP-WS store-and-forward
     "sf_dir",
     "sender_id",

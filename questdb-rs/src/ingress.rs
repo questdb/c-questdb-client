@@ -1038,6 +1038,10 @@ impl SenderBuilder {
                 "max_frame_rejections" => {
                     builder.max_frame_rejections(parse_conf_value(key, val)?)?
                 }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "poison_min_escalation_window_millis" => builder.poison_min_escalation_window(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -1725,6 +1729,23 @@ impl SenderBuilder {
         qwp_ws
             .max_frame_rejections
             .set_specified("max_frame_rejections", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Minimum dwell before repeated same-head-FSN rejects or server close
+    /// frames can escalate to a poison-frame protocol violation. Default 5s.
+    /// Set to zero to escalate immediately at `max_frame_rejections`.
+    pub fn poison_min_escalation_window(mut self, value: Duration) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"poison_min_escalation_window_millis\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .poison_min_escalation_window
+            .set_specified("poison_min_escalation_window_millis", value)?;
         Ok(self)
     }
 
