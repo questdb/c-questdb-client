@@ -76,6 +76,13 @@ option(
     "Build with Apache Arrow C Data Interface exports. Opt-in: pulls arrow-rs."
     OFF)
 
+# OFF keeps a downstream QUESTDB_TESTS_AND_EXAMPLES=ON build single-standard;
+# our CI opts in to also build a C++20 twin of each C++ test/example.
+option(
+    QUESTDB_TEST_CXX20_VARIANTS
+    "Also build a C++20 twin of each C++ test/example target (header conformance)."
+    OFF)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
@@ -172,15 +179,50 @@ function(apply_sanitizers TARGET_NAME)
     endif()
 endfunction()
 
+function(_questdb_sources_have_cpp OUT_VAR)
+    set(result FALSE)
+    foreach(src IN LISTS ARGN)
+        if(src MATCHES "\\.(cpp|cc|cxx)$")
+            set(result TRUE)
+        endif()
+    endforeach()
+    set(${OUT_VAR} ${result} PARENT_SCOPE)
+endfunction()
+
+# Empty std => inherit the caller's CMAKE_CXX_STANDARD; a non-empty std pins it.
+function(_questdb_finish_example tgt std)
+    target_link_libraries(${tgt} questdb_client)
+    if(NOT "${std}" STREQUAL "")
+        set_target_properties(${tgt} PROPERTIES CXX_STANDARD ${std} CXX_STANDARD_REQUIRED ON)
+    endif()
+endfunction()
+
+function(_questdb_finish_test tgt std)
+    _questdb_finish_example(${tgt} "${std}")
+    target_include_directories(${tgt} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_compile_flags(${tgt})
+    apply_sanitizers(${tgt})
+    add_test(NAME ${tgt} COMMAND ${tgt})
+    if(QUESTDB_SANITIZE AND NOT MSVC)
+        # Leak detection off: the Rust library legitimately retains
+        # process-global allocations at exit that LSan can't tell apart from
+        # an FFI leak. ASan UAF/OOB/double-free checks stay active.
+        set_tests_properties(
+            ${tgt} PROPERTIES
+            ENVIRONMENT
+            "ASAN_OPTIONS=detect_leaks=0;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+    endif()
+endfunction()
+
 # Examples
 function(compile_example TARGET_NAME)
-    list(POP_FRONT ARGV)
-    add_executable(
-        ${TARGET_NAME}
-        ${ARGV})
-    target_link_libraries(
-        ${TARGET_NAME}
-        questdb_client)
+    add_executable(${TARGET_NAME} ${ARGN})
+    _questdb_finish_example(${TARGET_NAME} "")
+    _questdb_sources_have_cpp(has_cpp ${ARGN})
+    if(QUESTDB_TEST_CXX20_VARIANTS AND has_cpp)
+        add_executable(${TARGET_NAME}_cxx20 ${ARGN})
+        _questdb_finish_example(${TARGET_NAME}_cxx20 20)
+    endif()
 endfunction()
 
 if (QUESTDB_TESTS_AND_EXAMPLES)
@@ -304,17 +346,16 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         compile_example(
             line_sender_cpp_example_arrow
             examples/line_sender_cpp_example_arrow.cpp)
-        target_link_libraries(
-            line_sender_cpp_example_arrow Arrow::arrow_shared)
         compile_example(
             reader_cpp_example_arrow
             examples/reader_cpp_example_arrow.cpp)
-        target_link_libraries(
-            reader_cpp_example_arrow Arrow::arrow_shared)
-        # Opts into the internal/test-only standalone reader ctor (see the
-        # foreach in the test section below for the rationale).
-        target_compile_definitions(
-            reader_cpp_example_arrow PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
+        foreach(arrow_example line_sender_cpp_example_arrow reader_cpp_example_arrow)
+            foreach(v ${arrow_example} ${arrow_example}_cxx20)
+                if(TARGET ${v})
+                    target_link_libraries(${v} Arrow::arrow_shared)
+                endif()
+            endforeach()
+        endforeach()
     else()
         message(STATUS
             "arrow-cpp not found; skipping line_{sender,reader}_cpp_example_arrow.")
@@ -328,31 +369,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
 
     # Unit test binaries.
     function(compile_test TARGET_NAME)
-        list(POP_FRONT ARGV)  # compile_test
-        add_executable(
-            ${TARGET_NAME}
-            ${ARGV})
-        target_link_libraries(
-            ${TARGET_NAME}
-            questdb_client)
-        target_include_directories(
-            ${TARGET_NAME}
-            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-        set_compile_flags(${TARGET_NAME})
-        apply_sanitizers(${TARGET_NAME})
-        add_test(
-            NAME ${TARGET_NAME}
-            COMMAND ${TARGET_NAME})
-        if(QUESTDB_SANITIZE AND NOT MSVC)
-            # Leak detection is off: the Rust library is not instrumented and
-            # legitimately retains process-global allocations at exit, which
-            # LSan cannot tell apart from an FFI leak without a suppression
-            # file. ASan's use-after-free / out-of-bounds / double-free checks
-            # stay active.
-            set_tests_properties(
-                ${TARGET_NAME} PROPERTIES
-                ENVIRONMENT
-                "ASAN_OPTIONS=detect_leaks=0;UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1")
+        add_executable(${TARGET_NAME} ${ARGN})
+        _questdb_finish_test(${TARGET_NAME} "")
+        _questdb_sources_have_cpp(has_cpp ${ARGN})
+        if(QUESTDB_TEST_CXX20_VARIANTS AND has_cpp)
+            add_executable(${TARGET_NAME}_cxx20 ${ARGN})
+            _questdb_finish_test(${TARGET_NAME}_cxx20 20)
         endif()
     endfunction()
 
@@ -397,26 +419,6 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_reader_mock.cpp)
 
-    # The standalone reader constructors (`reader_from_conf` /
-    # `reader_from_env`, and the C++ `reader(utf8_view)` ctor /
-    # `reader::from_env`) are NOT part of the supported public API: readers
-    # are obtained from the connection pool (`questdb_db_connect_reader` ->
-    # `questdb_db_borrow_reader`, or the C++ `pool::borrow_reader`). They
-    # remain exported in the shared library for the in-tree test-suite and
-    # example programs, which opt in to the header declarations via this
-    # definition. External consumers including the installed headers see the
-    # pool-only surface.
-    foreach(reader_direct_target
-            reader_c_example_from_conf reader_cpp_example_from_conf
-            reader_c_example_with_binds reader_cpp_example_with_binds
-            reader_cpp_example_columns reader_c_example_columns
-            reader_c_example_arrow
-            test_reader reader_c_smoke test_reader_offline test_reader_mock)
-        target_compile_definitions(
-            ${reader_direct_target}
-            PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
-    endforeach()
-
     # Apache Arrow C Data Interface tests. QUESTDB_ENABLE_ARROW is
     # auto-enabled when QUESTDB_TESTS_AND_EXAMPLES=ON (see above), so
     # these always build alongside the rest of the suite.
@@ -429,11 +431,6 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_arrow_egress
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_arrow_egress.cpp)
-    # test_arrow_egress drives the egress reader via the standalone
-    # `reader(utf8_view)` constructor, so it must opt into the same
-    # internal-constructor declarations as the other reader tests above.
-    target_compile_definitions(
-        test_arrow_egress PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
     compile_test(
         test_arrow_ingress
         cpp_test/qwp_mock_server.cpp
@@ -443,6 +440,25 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         test_column_sender
         cpp_test/qwp_mock_server.cpp
         cpp_test/test_column_sender.cpp)
+
+    # Standalone reader constructors are test-only (the supported API hands
+    # readers out from the connection pool); in-tree tests/examples opt into
+    # them here, base target plus any _cxx20 twin. Installed headers stay
+    # pool-only.
+    foreach(reader_direct_target
+            reader_c_example_from_conf reader_cpp_example_from_conf
+            reader_c_example_with_binds reader_cpp_example_with_binds
+            reader_cpp_example_columns reader_c_example_columns
+            reader_c_example_arrow reader_cpp_example_arrow
+            test_reader reader_c_smoke test_reader_offline test_reader_mock
+            test_arrow_egress)
+        foreach(v ${reader_direct_target} ${reader_direct_target}_cxx20)
+            if(TARGET ${v})
+                target_compile_definitions(
+                    ${v} PRIVATE QUESTDB_READER_INTERNAL_CONSTRUCTORS)
+            endif()
+        endforeach()
+    endforeach()
 
     # System testing Python3 script.
     # This will download the latest QuestDB instance from Github,

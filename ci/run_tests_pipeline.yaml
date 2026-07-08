@@ -31,15 +31,6 @@ stages:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
               toolchain: "nightly"
-            mac:
-              imageName: "macos-latest"
-              poolName: "Azure Pipelines"
-            windows-msvc-2022:
-              imageName: "windows-2022"
-              poolName: "Azure Pipelines"
-            windows-msvc-2025:
-              imageName: "windows-2025"
-              poolName: "Azure Pipelines"
         pool:
           name: $(poolName)
           vmImage: $(imageName)
@@ -50,10 +41,17 @@ stages:
             lfs: false
             submodules: false
           - template: templates/compile.yaml
+            parameters:
+              cxx20Variants: true
           - script: |
               cd questdb-rs
               cargo build --examples --features almost-all-features,arrow,polars
+            condition: and(succeeded(), eq(variables['Agent.OS'], 'Linux'))
             displayName: "Build Rust examples"
+          - script: python3 ci/run_all_tests.py unit
+            env:
+              JAVA_HOME: $(JAVA_HOME_25_X64)
+            displayName: "Unit tests"
           # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
           # Drop once QWP/Arrow ships in a release (revert to `--versions`).
           - template: templates/clone_questdb.yaml
@@ -64,14 +62,72 @@ stages:
               javaHomeOption: "Path"
               jdkDirectory: "$(JAVA_HOME_25_X64)"
               options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
-          - script: python3 ci/run_all_tests.py
+          - script: python3 ci/run_all_tests.py integration
             env:
               JAVA_HOME: $(JAVA_HOME_25_X64)
-            displayName: "Tests"
+            displayName: "Integration tests"
           # - task: PublishBuildArtifacts@1
           #   inputs:
           #     pathToPublish: ./build
           #   displayName: "Publish build directory"
+      # mac/windows: run cargo vs native (build + C++ + integration) as two
+      # parallel jobs to cut the slow legs' wall-clock. linux stays in RunOn.
+      - job: RustTests
+        displayName: "cargo tests (mac/windows)"
+        strategy:
+          matrix:
+            mac:
+              imageName: "macos-latest"
+            windows-msvc-2022:
+              imageName: "windows-2022"
+            windows-msvc-2025:
+              imageName: "windows-2025"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - script: python3 ci/run_all_tests.py cargo
+            displayName: "cargo tests"
+      - job: NativeTests
+        displayName: "build + C++ + integration (mac/windows)"
+        strategy:
+          matrix:
+            mac:
+              imageName: "macos-latest"
+            windows-msvc-2022:
+              imageName: "windows-2022"
+            windows-msvc-2025:
+              imageName: "windows-2025"
+        pool:
+          vmImage: $(imageName)
+        timeoutInMinutes: 90
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: templates/compile.yaml
+            parameters:
+              cxx20Variants: true
+          - script: python3 ci/run_all_tests.py cpp
+            displayName: "C++ tests"
+          # Build QuestDB master for run_all_tests.py's `--repo ./questdb`.
+          - template: templates/clone_questdb.yaml
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME_25_X64)"
+              options: "-DskipTests -Pbuild-web-console$(CLIENT_PROFILE)"
+          - script: python3 ci/run_all_tests.py integration
+            env:
+              JAVA_HOME: $(JAVA_HOME_25_X64)
+            displayName: "Integration tests"
       - job: VersionMatrix
         displayName: "arrow/polars version-range tests (linux)"
         pool:
