@@ -1,3 +1,8 @@
+parameters:
+  - name: cxx20Variants
+    type: boolean
+    default: false
+
 steps:
   - bash: |
       df -h /
@@ -29,19 +34,11 @@ steps:
     env:
       PIP_BREAK_SYSTEM_PACKAGES: "1"
     displayName: "Install Python Dependencies"
-  - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
+  - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON -DQUESTDB_TEST_CXX20_VARIANTS=${{ parameters.cxx20Variants }}
     env:
       JAVA_HOME: $(JAVA_HOME_17_X64)
     displayName: "Build Makefile with CMake"
   - script: cmake --build build --config Release
-    env:
-      JAVA_HOME: $(JAVA_HOME_17_X64)
-    displayName: "Make"
-  - script: cmake -S . -B build_CXX20 -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON -DCMAKE_CXX_STANDARD=20
-    env:
-      JAVA_HOME: $(JAVA_HOME_17_X64)
-    displayName: "Build Makefile with CMake"
-  - script: cmake --build build_CXX20 --config Release
     env:
       JAVA_HOME: $(JAVA_HOME_17_X64)
     displayName: "Make"
