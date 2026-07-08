@@ -373,8 +373,11 @@ bool row_sender_flush(
  * `row_sender_wait` in one call, the row-major counterpart of
  * `column_sender_flush_and_wait`.
  *
- * `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range value
- * returns `line_sender_error_invalid_api_call` before the buffer is touched.
+ * `ack_level` carries a `qwpws_ack_level_*` constant. An out-of-range value,
+ * or `qwpws_ack_level_durable` without `request_durable_ack=on`, returns
+ * `line_sender_error_invalid_api_call` before the buffer is touched, matching
+ * `column_sender_flush_and_wait`. (A standalone `row_sender_wait` instead
+ * degrades durable to plain acceptance on a non-durable connection.)
  * The wait uses the pool-wide `request_timeout` no-progress deadline; compose
  * `row_sender_flush` + `row_sender_wait` to choose a per-call timeout.
  *

@@ -1729,6 +1729,13 @@ impl<'a> BorrowedRowSender<'a> {
     /// fires when the ack watermark stops advancing for that long); compose
     /// the two calls yourself to choose the timeout per call.
     ///
+    /// `AckLevel::Durable` requires the pool to be opened with
+    /// `request_durable_ack=on`; otherwise the call is rejected up front
+    /// (`InvalidApiCall`) before the buffer is touched, matching
+    /// [`BorrowedColumnSender::flush_and_wait`]. (A standalone [`Self::wait`]
+    /// instead degrades durable to plain acceptance on a non-durable
+    /// connection.)
+    ///
     /// On a flush failure the buffer is retained. After publication, only the
     /// no-progress timeout ([`ErrorCode::FailoverRetry`](crate::ErrorCode))
     /// leaves the frames queued with the runner still delivering — recover
@@ -1737,6 +1744,7 @@ impl<'a> BorrowedRowSender<'a> {
     /// server rejection or transport/protocol failure ends delivery on this
     /// sender: drop the borrow and re-drive undelivered rows on a fresh one.
     pub fn flush_and_wait(&mut self, buf: &mut Buffer, ack_level: AckLevel) -> Result<()> {
+        validate_row_sender_ack_level(&self.db.inner, ack_level)?;
         let timeout = self.db.inner.connector.request_timeout();
         let sender = self.sender_mut();
         sender.flush(buf)?;
@@ -1834,6 +1842,20 @@ impl Drop for BorrowedRowSender<'_> {
     }
 }
 
+/// Durable-ack preflight shared by the row-sender `flush_and_wait` forms:
+/// mirrors the column senders' `validate_ack_level`, rejecting
+/// `AckLevel::Durable` before any publication when the pool did not opt in.
+fn validate_row_sender_ack_level(inner: &DbInner, ack_level: AckLevel) -> Result<()> {
+    if ack_level == AckLevel::Durable && !inner.connector.request_durable_ack() {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "AckLevel::Durable requires the pool to be opened with \
+             `request_durable_ack=on` in the connect string."
+        ));
+    }
+    Ok(())
+}
+
 fn return_row_sender_to_pool(inner: &Arc<DbInner>, sender: Sender, must_close: bool) {
     let must_close = must_close || sender.must_close();
     let mut state = lock_row_sender_state(&inner.row_sender_state);
@@ -1882,9 +1904,10 @@ impl OwnedRowSender {
 
     /// Combined [`Sender::flush`] + [`Sender::wait`] with the pool-wide
     /// `request_timeout` as the wait's no-progress deadline — the owned
-    /// counterpart of [`BorrowedRowSender::flush_and_wait`], used by the C
-    /// FFI.
+    /// counterpart of [`BorrowedRowSender::flush_and_wait`] (same durable
+    /// opt-in preflight and failure contract), used by the C FFI.
     pub fn flush_and_wait(&mut self, buf: &mut Buffer, ack_level: AckLevel) -> Result<()> {
+        validate_row_sender_ack_level(&self.inner, ack_level)?;
         let timeout = self.inner.connector.request_timeout();
         let sender = self.get_mut();
         sender.flush(buf)?;

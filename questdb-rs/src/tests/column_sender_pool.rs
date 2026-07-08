@@ -1837,6 +1837,34 @@ fn row_sender_flush_and_wait_commits_at_boundary() {
     );
 }
 
+#[test]
+fn row_sender_flush_and_wait_durable_without_opt_in_keeps_buffer() {
+    let server = MockServer::spawn(1);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let mut sender = db.borrow_row_sender().expect("borrow row sender");
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let err = sender
+        .flush_and_wait(&mut buf, AckLevel::Durable)
+        .expect_err("durable without opt-in must be rejected up front");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("request_durable_ack"),
+        "msg: {}",
+        err.msg()
+    );
+    assert!(
+        !buf.is_empty(),
+        "pre-publish rejection must leave the buffer intact"
+    );
+}
+
 #[cfg(feature = "ffi-support")]
 #[test]
 fn row_sender_owned_borrow_flushes_and_recycles() {

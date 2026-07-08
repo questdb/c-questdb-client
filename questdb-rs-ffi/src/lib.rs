@@ -4049,6 +4049,11 @@ pub unsafe extern "C" fn row_sender_flush(
 /// `request_timeout` no-progress deadline; compose the two calls to choose a
 /// per-call timeout.
 ///
+/// `qwpws_ack_level_durable` without `request_durable_ack=on` is rejected up
+/// front (`line_sender_error_invalid_api_call`) before the buffer is touched,
+/// matching `column_sender_flush_and_wait`. (A standalone `row_sender_wait`
+/// instead degrades durable to plain acceptance on a non-durable connection.)
+///
 /// On a flush failure the buffer is retained. After publication, only the
 /// no-progress timeout (`line_sender_error_failover_retry`) leaves the frames
 /// queued and still delivering — recover from it by calling `row_sender_wait`
