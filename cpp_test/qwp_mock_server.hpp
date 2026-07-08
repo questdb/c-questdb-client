@@ -131,6 +131,10 @@ std::vector<uint8_t> exec_done_frame(
 std::vector<uint8_t> query_error_frame(
     int64_t request_id, uint8_t status_code, const std::string& message);
 std::vector<uint8_t> cache_reset_frame(uint8_t mask);
+// Server-origin QWP ingress OK response payload for a client-sent write frame.
+// This is not wrapped in the QWP1 egress header: ingress ACKs are the raw
+// WebSocket binary payload `[status=0][wire_seq_le][table_count=0]`.
+std::vector<uint8_t> ingress_ok_frame(uint64_t wire_seq = 0);
 
 // Build a single-table RESULT_BATCH frame given:
 //  - request_id, batch_seq

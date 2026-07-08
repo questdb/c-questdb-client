@@ -1103,10 +1103,7 @@ fn check_store_and_forward_flush_and_wait_waits_for_ok_boundary(extras: &str) {
     chunk.column_i64("qty", &qty, None).unwrap();
     chunk.at_nanos(&ts).unwrap();
     sender
-        .flush(&mut chunk)
-        .expect("publish to the local SFA queue");
-    sender
-        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
         .expect("SFA ACKing flush must wait for the local boundary to reach OK");
     assert!(
         chunk.is_empty(),
@@ -1136,10 +1133,10 @@ fn store_and_forward_flush_and_wait_durable_without_opt_in_keeps_chunk() {
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
     chunk.at_nanos(&ts).unwrap();
-    // Durable is validated by `wait`, the ack barrier; with no `flush` the
-    // chunk is never published and stays replayable.
+    // Durable is validated before encode/append, so the chunk is never
+    // published and stays replayable.
     let err = sender
-        .wait(AckLevel::Durable, Duration::from_secs(30))
+        .flush_and_wait(&mut chunk, AckLevel::Durable)
         .expect_err("durable without opt-in must be rejected up front");
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert!(
@@ -1196,11 +1193,8 @@ fn check_store_and_forward_flush_and_wait_surfaces_server_rejection(extras: &str
     let ts = [1_i64];
     chunk.column_i64("qty", &qty, None).unwrap();
     chunk.at_nanos(&ts).unwrap();
-    sender
-        .flush(&mut chunk)
-        .expect("publish to the local SFA queue");
     let err = sender
-        .wait(AckLevel::Ok, Duration::from_secs(30))
+        .flush_and_wait(&mut chunk, AckLevel::Ok)
         .expect_err("server rejection inside the waited range must surface");
     assert_eq!(err.code(), ErrorCode::ServerRejection);
     assert_eq!(
@@ -3437,6 +3431,103 @@ fn store_and_forward_arrow_batch_at_column_reports_fsn_progress() {
             .unwrap()
             .is_some_and(|acked| acked >= fsn),
         "acked watermark must cover Arrow at-column FSN"
+    );
+}
+
+#[cfg(feature = "arrow-ingress")]
+#[test]
+fn store_and_forward_flush_arrow_batch_and_wait_commits_at_boundary() {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    fn assert_flush_waits_for_ack<F>(
+        label: &'static str,
+        db: Arc<QuestDb>,
+        release_acks: Arc<AtomicBool>,
+        frames: &mpsc::Receiver<Vec<u8>>,
+        flush: F,
+    ) where
+        F: FnOnce(Arc<QuestDb>) -> std::result::Result<(), String> + Send + 'static,
+    {
+        release_acks.store(false, Ordering::SeqCst);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = done_tx.send(flush(db));
+        });
+
+        if let Err(e) = frames.recv_timeout(Duration::from_secs(5)) {
+            release_acks.store(true, Ordering::SeqCst);
+            let _ = worker.join();
+            panic!("{label} did not publish a frame before waiting: {e}");
+        }
+        match done_rx.recv_timeout(Duration::from_millis(150)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(res) => {
+                release_acks.store(true, Ordering::SeqCst);
+                let _ = worker.join();
+                panic!("{label} returned before the mock server released the ACK: {res:?}");
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                release_acks.store(true, Ordering::SeqCst);
+                let _ = worker.join();
+                panic!("{label} worker exited before the ACK was released");
+            }
+        }
+
+        release_acks.store(true, Ordering::SeqCst);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("combined Arrow flush must return after ACK release")
+            .unwrap_or_else(|e| panic!("{label} failed after ACK release: {e}"));
+        worker.join().expect("combined Arrow flush worker");
+    }
+
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let db = Arc::new(QuestDb::connect(&conf_for(server.port(), "pool_reap=manual;")).unwrap());
+
+    assert_flush_waits_for_ack(
+        "SFA Arrow at-now combined flush",
+        Arc::clone(&db),
+        Arc::clone(&release_acks),
+        &frames,
+        |db| {
+            let qty: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2]));
+            let batch = RecordBatch::try_from_iter([("qty", qty)]).unwrap();
+            let mut sender = db
+                .borrow_column_sender()
+                .map_err(|e| format!("{:?}: {}", e.code(), e.msg()))?;
+            sender
+                .flush_arrow_batch_at_now_and_wait("trades", &batch, &[], AckLevel::Ok)
+                .map_err(|e| format!("{:?}: {}", e.code(), e.msg()))
+        },
+    );
+
+    assert_flush_waits_for_ack(
+        "SFA Arrow at-column combined flush",
+        Arc::clone(&db),
+        Arc::clone(&release_acks),
+        &frames,
+        |db| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("price", DataType::Float64, false),
+                Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            ]));
+            let price = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+            let ts = Arc::new(TimestampNanosecondArray::from(vec![
+                1_700_000_000_000_000_000,
+                1_700_000_000_000_000_001,
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![price, ts]).unwrap();
+            let ts_col = crate::ingress::ColumnName::new("ts").unwrap();
+            let mut sender = db
+                .borrow_column_sender()
+                .map_err(|e| format!("{:?}: {}", e.code(), e.msg()))?;
+            sender
+                .flush_arrow_batch_at_column_and_wait("trades", &batch, ts_col, &[], AckLevel::Ok)
+                .map_err(|e| format!("{:?}: {}", e.code(), e.msg()))
+        },
     );
 }
 

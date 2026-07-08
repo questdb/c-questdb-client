@@ -1147,8 +1147,11 @@ impl Debug for ColumnSenderHandle<'_> {
 /// tail, logging a warning. For a hard guarantee, call [`Self::wait`] before
 /// closing the pool — it blocks until the frames published so far reach the
 /// requested [`AckLevel`], i.e. confirms delivery — or configure `sf_dir` for
-/// crash-durable on-disk persistence with replay. There is deliberately no
-/// `flush_and_wait` / `sync`: compose [`Self::flush`] then [`Self::wait`].
+/// crash-durable on-disk persistence with replay. [`Self::flush_and_wait`]
+/// combines the two ("publish this batch and return once it is delivered");
+/// its wait is bounded by the pool-wide `request_timeout` setting, so compose
+/// [`Self::flush`] then [`Self::wait`] if you want to pass an explicit
+/// timeout instead.
 /// Use FSNs only for non-blocking progress tracking while this borrowed sender
 /// is still held: they are stream watermarks, not portable receipts to check
 /// through an arbitrary later pool borrow.
@@ -1163,6 +1166,32 @@ impl<'a> BorrowedColumnSender<'a> {
     /// is tagged [`in_doubt`](crate::Error::in_doubt).
     pub fn flush(&mut self, chunk: &mut crate::ingress::column_sender::Chunk<'_>) -> Result<()> {
         self.0.inner_mut().flush(chunk)
+    }
+
+    /// Publish `chunk` into the store-and-forward queue as a completion
+    /// boundary, then wait until every frame published on this handle so far
+    /// reaches `ack_level` — [`Self::flush`] followed by [`Self::wait`] in one
+    /// call. Unlike [`Self::wait`], which takes an explicit timeout argument,
+    /// this call's wait gives up after the pool-wide `request_timeout` setting
+    /// (it fails only if the ack watermark stops advancing for that long);
+    /// compose the two calls yourself to choose the timeout per call.
+    ///
+    /// `AckLevel::Durable` requires the pool to be opened with
+    /// `request_durable_ack=on`; otherwise the call is rejected up front
+    /// (`InvalidApiCall`) before `chunk` is touched.
+    ///
+    /// Failure contract: if local publication fails, `chunk` is untouched and
+    /// retryable. Once the frame is accepted into the queue `chunk` is cleared
+    /// even if the wait then fails — the frames remain queued and the
+    /// background runner keeps delivering them, so recover by calling
+    /// [`Self::wait`] until it returns `Ok`, not by re-flushing (which would
+    /// deliver the same rows twice).
+    pub fn flush_and_wait(
+        &mut self,
+        chunk: &mut crate::ingress::column_sender::Chunk<'_>,
+        ack_level: AckLevel,
+    ) -> Result<()> {
+        self.0.inner_mut().flush_and_wait(chunk, ack_level)
     }
 
     /// Encode and publish `chunk` into the store-and-forward queue and return
@@ -1268,6 +1297,26 @@ impl<'a> BorrowedColumnSender<'a> {
             .flush_arrow_batch_at_now(table, batch, overrides)
     }
 
+    /// ACKing counterpart of [`Self::flush_arrow_batch_at_now`]: publish the
+    /// batch as a completion boundary, then wait for `ack_level`. The same
+    /// contract as [`Self::flush_and_wait`] applies.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_now_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow::array::RecordBatch,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_at_now_and_wait(table, batch, overrides, ack_level)
+    }
+
     /// Arrow counterpart of [`Self::flush_and_get_fsn`], letting the server
     /// stamp each row's designated timestamp on arrival.
     #[cfg(feature = "arrow-ingress")]
@@ -1304,6 +1353,27 @@ impl<'a> BorrowedColumnSender<'a> {
         self.0
             .inner_mut()
             .flush_arrow_batch_at_column(table, batch, ts_column, overrides)
+    }
+
+    /// ACKing counterpart of [`Self::flush_arrow_batch_at_column`]: publish
+    /// the batch as a completion boundary, then wait for `ack_level`. The same
+    /// contract as [`Self::flush_and_wait`] applies.
+    #[cfg(feature = "arrow-ingress")]
+    pub fn flush_arrow_batch_at_column_and_wait<'t, T>(
+        &mut self,
+        table: T,
+        batch: &arrow::array::RecordBatch,
+        ts_column: crate::ingress::ColumnName<'_>,
+        overrides: &[crate::ingress::column_sender::ArrowColumnOverride<'_>],
+        ack_level: AckLevel,
+    ) -> Result<()>
+    where
+        T: TryInto<crate::ingress::TableName<'t>>,
+        crate::Error: From<T::Error>,
+    {
+        self.0
+            .inner_mut()
+            .flush_arrow_batch_at_column_and_wait(table, batch, ts_column, overrides, ack_level)
     }
 
     /// Arrow counterpart of [`Self::flush_and_get_fsn`], sourcing the

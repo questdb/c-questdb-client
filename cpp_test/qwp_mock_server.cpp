@@ -354,6 +354,18 @@ std::vector<uint8_t> cache_reset_frame(uint8_t mask)
     return framed(1, 0, 0, p);
 }
 
+std::vector<uint8_t> ingress_ok_frame(uint64_t wire_seq)
+{
+    std::vector<uint8_t> p;
+    p.reserve(11);
+    p.push_back(0x00);
+    for (int i = 0; i < 8; ++i)
+        p.push_back(uint8_t((wire_seq >> (i * 8)) & 0xFF));
+    p.push_back(0x00);
+    p.push_back(0x00);
+    return p;
+}
+
 std::vector<uint8_t> result_batch_frame(
     int64_t request_id, uint64_t batch_seq,
     size_t row_count, const std::vector<ColumnSpec>& columns)

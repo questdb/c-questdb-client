@@ -46,6 +46,15 @@ std::unique_ptr<qm::MockServer> spawn_mock(int slot_count)
     return std::make_unique<qm::MockServer>(std::move(scripts));
 }
 
+std::unique_ptr<qm::MockServer> spawn_acking_mock(int slot_count)
+{
+    qm::Script ack_one_frame = {
+        qm::ActionAwaitClientFrame{0x51},
+        qm::ActionSendRaw{qm::ingress_ok_frame()}};
+    std::vector<qm::Script> scripts(static_cast<size_t>(slot_count), ack_one_frame);
+    return std::make_unique<qm::MockServer>(std::move(scripts));
+}
+
 std::string conf_for(const std::string& addr, const std::string& extras = {})
 {
     return "qwpws::addr=" + addr + ";pool_size=1;pool_reap=manual;" + extras;
@@ -154,6 +163,25 @@ TEST_CASE("column_chunk flush round-trips through the mock")
     CHECK_FALSE(conn.acked_fsn().has_value());
 
     // The mock graceful-closes after one frame, so sync() would hang.
+    conn.drop_on_return();
+}
+
+TEST_CASE("column_chunk flush_and_wait round-trips through the mock")
+{
+    auto mock = spawn_acking_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto conn = db.borrow_column_sender();
+
+    qdb::column_chunk chunk{"trades"};
+    int64_t qty[] = {10, 20, 30};
+    int64_t ts[] = {1'700'000'000'000'000'000LL,
+                    1'700'000'000'000'000'001LL,
+                    1'700'000'000'000'000'002LL};
+    chunk.column_i64("qty", qty, 3)
+         .at_nanos(ts, 3);
+
+    conn.flush_and_wait(chunk);
+    CHECK(chunk.row_count() == 0);
     conn.drop_on_return();
 }
 

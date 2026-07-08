@@ -78,9 +78,10 @@ typedef struct questdb_db questdb_db;
  *  happens-before ordering between the last use and the free (the internal
  *  latch only defers the drop for already-ordered interleavings).
  *
- *  Exposes publish-only `column_sender_flush`, FSN-returning publish
- *  variants, FSN progress watermarks, and the `column_sender_wait` ack
- *  barrier; the store-and-forward queue owns delivery. */
+ *  Exposes publish-only `column_sender_flush`, combined
+ *  `column_sender_flush_and_wait`, FSN-returning publish variants, FSN
+ *  progress watermarks, and the `column_sender_wait` ack barrier; the
+ *  store-and-forward queue owns delivery. */
 typedef struct column_sender column_sender;
 
 /** Borrowed row-major QWP/WS sender. Not thread-safe; belongs to the
@@ -1226,9 +1227,9 @@ typedef struct column_sender_numpy_extras
  * ZERO-COPY LIFETIME: this call parks the raw `data` (and
  * `validity->bits`, if any) pointer and walks it later, at flush time.
  * The caller MUST keep the backing buffer alive AND unmodified until the
- * next `column_sender_flush` / `column_sender_wait` on this chunk
- * returns. Freeing/reallocating/moving it before then is undefined
- * behaviour.
+ * next `column_sender_flush` / `column_sender_flush_and_wait` /
+ * `column_sender_wait` on this chunk returns. Freeing/reallocating/moving it
+ * before then is undefined behaviour.
  *
  * `data_len_bytes` is the byte length of the buffer `data` points at. It
  * is validated against `row_count * source-stride(dtype)`; a buffer too
@@ -1311,9 +1312,10 @@ bool column_sender_chunk_at_seconds(
  * Every flushed frame is non-deferred and is first accepted into the local
  * store-and-forward queue, which owns delivery. `column_sender_flush`
  * success means local queue acceptance, not server acknowledgement.
- * `column_sender_wait` does not send a commit frame; it waits for frames
- * already published to the local queue, up to the sync-call boundary, to be
- * acknowledged at `ack_level`.
+ * `column_sender_flush_and_wait` combines local publication of `chunk` as the
+ * sync-call boundary with the wait for `ack_level`. `column_sender_wait` does
+ * not send a frame; it waits for frames already published to the local queue,
+ * up to the sync-call boundary, to be acknowledged at `ack_level`.
  *
  * No-progress timeout: `column_sender_wait` returns
  * `line_sender_error_failover_retry` if the server stays connected but never
@@ -1329,6 +1331,32 @@ QUESTDB_CLIENT_API
 bool column_sender_flush(
     column_sender* sender,
     column_sender_chunk* chunk,
+    line_sender_error** err_out);
+
+/**
+ * Publish `chunk` locally through the borrowed store-and-forward column sender
+ * as a completion boundary, clear it once accepted into the queue, then wait
+ * until that frame and all prior frames published through this sender reach
+ * `ack_level`.
+ *
+ * `ack_level` carries a `qwpws_ack_level_*` constant. It is validated before
+ * `chunk` is encoded, so an out-of-range value, or
+ * `qwpws_ack_level_durable` without `request_durable_ack=on`, returns
+ * `line_sender_error_invalid_api_call` and leaves `chunk` untouched.
+ *
+ * Failure contract: if local publication fails, `chunk` is left untouched and
+ * retryable. Once the frame is accepted into the queue, `chunk` is cleared even
+ * if the later ACK wait fails. On that post-publication failure the frames
+ * remain queued and the background runner keeps delivering them; call
+ * `column_sender_wait` again instead of re-flushing the same rows.
+ *
+ * The wait uses the pool-wide `request_timeout` no-progress deadline.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_and_wait(
+    column_sender* sender,
+    column_sender_chunk* chunk,
+    uint32_t ack_level,
     line_sender_error** err_out);
 
 /**
@@ -1487,6 +1515,37 @@ bool column_sender_flush_arrow_batch_at_now_and_get_fsn(
     line_sender_error** err_out);
 
 /**
+ * ACKing counterpart of `column_sender_flush_arrow_batch_at_now`: publish
+ * `array` as a completion boundary, then wait for `ack_level`. The wait uses
+ * the pool-wide `request_timeout` no-progress deadline.
+ *
+ * `ack_level` carries a `qwpws_ack_level_*` constant. It is validated before
+ * the Arrow C Data Interface import consumes `array->release`, so a rejected
+ * level returns `line_sender_error_invalid_api_call` and leaves `array`
+ * untouched.
+ *
+ * Ownership differs from the publish-only flush on the failure path. On a
+ * failure that is provably pre-publication (validation, encode, size, or a
+ * transport error before any byte was written) the batch is re-exported back
+ * into `*array` with a fresh `release` so the caller can retry on a fresh
+ * sender. On any post-publication failure — including an ACK-wait or SFA
+ * no-progress timeout reported as `line_sender_error_failover_retry` — the
+ * batch is not re-exported (`array->release` stays NULL): delivery is unknown
+ * and a blind replay could duplicate rows. Callers MUST check
+ * `array->release != NULL` before invoking it on the failure path.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_at_now_and_wait(
+    column_sender* sender,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+
+/**
  * Same as `column_sender_flush_arrow_batch_at_now` but picks the
  * designated timestamp from a named column of the batch instead of
  * letting the server stamp each row. Same ownership and `overrides`
@@ -1518,6 +1577,25 @@ bool column_sender_flush_arrow_batch_at_column_and_get_fsn(
     const column_sender_arrow_override* overrides,
     size_t overrides_len,
     line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * ACKing counterpart of `column_sender_flush_arrow_batch_at_column`: publish
+ * `array` (timestamp sourced from `ts_column`) as a completion boundary, then
+ * wait for `ack_level`. Same ACK-validation preflight and phase-aware
+ * re-export contract as
+ * `column_sender_flush_arrow_batch_at_now_and_wait`.
+ */
+QUESTDB_CLIENT_API
+bool column_sender_flush_arrow_batch_at_column_and_wait(
+    column_sender* sender,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    uint32_t ack_level,
     line_sender_error** err_out);
 
 #endif /* QUESTDB_CLIENT_ENABLE_ARROW */

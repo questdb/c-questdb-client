@@ -737,6 +737,22 @@ public:
     }
 
     /**
+     * Publish `chunk` as a completion boundary, then wait until it and all prior
+     * frames published through this sender reach `level`. Uses the pool-wide
+     * `request_timeout` as the wait's no-progress deadline. Throws on error.
+     */
+    void flush_and_wait(
+        column_chunk& chunk,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        line_sender_error::wrapped_call(
+            ::column_sender_flush_and_wait,
+            _raw,
+            chunk.c_ptr(),
+            static_cast<uint32_t>(level));
+    }
+
+    /**
      * Publish `chunk` locally and return the assigned frame sequence number.
      * If the chunk is split into multiple frames, the returned FSN is the last
      * frame boundary.
@@ -823,6 +839,44 @@ public:
     }
 
     /**
+     * ACKing counterpart of `flush_arrow_batch_at_now`: publish as a boundary,
+     * then wait for `level`.
+     */
+    void flush_arrow_batch_at_now_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        flush_arrow_batch_at_now_and_wait(
+            table, array, schema, nullptr, 0, level);
+    }
+
+    /**
+     * ACKing counterpart of `flush_arrow_batch_at_now`, with per-column
+     * overrides.
+     */
+    void flush_arrow_batch_at_now_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        const ::column_sender_arrow_override* overrides,
+        size_t overrides_len,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        ::line_sender_table_name table_c{table.size(), table.data()};
+        line_sender_error::wrapped_call(
+            ::column_sender_flush_arrow_batch_at_now_and_wait,
+            _raw,
+            table_c,
+            &array,
+            &schema,
+            overrides,
+            overrides_len,
+            static_cast<uint32_t>(level));
+    }
+
+    /**
      * FSN-returning counterpart of `flush_arrow_batch_at_now`.
      */
     std::optional<uint64_t> flush_arrow_batch_at_now_and_get_fsn(
@@ -869,6 +923,47 @@ public:
             ts_c,
             overrides,
             overrides_len);
+    }
+
+    /**
+     * ACKing counterpart of `flush_arrow_batch`: publish as a boundary, then
+     * wait for `level`.
+     */
+    void flush_arrow_batch_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        flush_arrow_batch_and_wait(
+            table, array, schema, ts_column, nullptr, 0, level);
+    }
+
+    /**
+     * ACKing counterpart of `flush_arrow_batch`, with per-column overrides.
+     */
+    void flush_arrow_batch_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        const ::column_sender_arrow_override* overrides,
+        size_t overrides_len,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        ::line_sender_table_name table_c{table.size(), table.data()};
+        ::line_sender_column_name ts_c{ts_column.size(), ts_column.data()};
+        line_sender_error::wrapped_call(
+            ::column_sender_flush_arrow_batch_at_column_and_wait,
+            _raw,
+            table_c,
+            &array,
+            &schema,
+            ts_c,
+            overrides,
+            overrides_len,
+            static_cast<uint32_t>(level));
     }
 
     /**
@@ -977,6 +1072,17 @@ public:
     }
 
     /**
+     * Publish `chunk` as a completion boundary, then wait until it and all prior
+     * frames published through this sender reach `level`.
+     */
+    void flush_and_wait(
+        column_chunk& chunk,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        _view.flush_and_wait(chunk, level);
+    }
+
+    /**
      * Publish `chunk` locally and return the assigned frame sequence number.
      * If the chunk is split into multiple frames, the returned FSN is the last
      * frame boundary. Use `wait()` for a simple blocking ack barrier.
@@ -1036,6 +1142,34 @@ public:
     }
 
     /**
+     * ACKing counterpart of `flush_arrow_batch_at_now`.
+     */
+    void flush_arrow_batch_at_now_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        _view.flush_arrow_batch_at_now_and_wait(table, array, schema, level);
+    }
+
+    /**
+     * ACKing counterpart of `flush_arrow_batch_at_now`, with per-column
+     * overrides.
+     */
+    void flush_arrow_batch_at_now_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        const ::column_sender_arrow_override* overrides,
+        size_t overrides_len,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        _view.flush_arrow_batch_at_now_and_wait(
+            table, array, schema, overrides, overrides_len, level);
+    }
+
+    /**
      * FSN-returning counterpart of `flush_arrow_batch_at_now`.
      */
     std::optional<uint64_t> flush_arrow_batch_at_now_and_get_fsn(
@@ -1063,6 +1197,36 @@ public:
     {
         _view.flush_arrow_batch(
             table, array, schema, ts_column, overrides, overrides_len);
+    }
+
+    /**
+     * ACKing counterpart of `flush_arrow_batch`.
+     */
+    void flush_arrow_batch_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        _view.flush_arrow_batch_and_wait(
+            table, array, schema, ts_column, level);
+    }
+
+    /**
+     * ACKing counterpart of `flush_arrow_batch`, with per-column overrides.
+     */
+    void flush_arrow_batch_and_wait(
+        table_name_view table,
+        ::ArrowArray& array,
+        const ::ArrowSchema& schema,
+        column_name_view ts_column,
+        const ::column_sender_arrow_override* overrides,
+        size_t overrides_len,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        _view.flush_arrow_batch_and_wait(
+            table, array, schema, ts_column, overrides, overrides_len, level);
     }
 
     /**

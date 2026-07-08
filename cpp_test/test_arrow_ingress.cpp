@@ -7,15 +7,13 @@
 // `line_sender_error`. So the only things it can get wrong are argument
 // marshalling and error translation — which is all this file covers:
 //   * error / NULL paths (wrong conn, NULL array/schema, empty name);
-//   * one happy `flush_arrow_batch_at_now` and one happy `flush_arrow_batch`
-//     (at_column) to prove the two marshalling paths reach the C ABI.
+//   * happy publish-only, FSN-returning, and ACKing Arrow flushes to prove
+//     the marshalling paths reach the C ABI.
 //
 // Per-type Arrow->column classification is backend-agnostic Rust code, exercised
 // exhaustively in `questdb-rs/src/ingress/column_sender/arrow_batch.rs` and
 // round-tripped in C in `cpp_test/test_arrow_c.c`; re-testing it per type here
-// would add no coverage. The direct-sender `*_and_wait` / commit paths were
-// removed with the direct sender (store-and-forward has no ACKing arrow flush;
-// call `column_sender_wait` after `flush_arrow_batch`).
+// would add no coverage.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
@@ -166,9 +164,8 @@ struct MockConn
     questdb_db* db = nullptr;
     column_sender* conn = nullptr;
 
-    MockConn()
-        : server(std::vector<qm::Script>{
-              qm::Script{qm::ActionAwaitClientFrame{0x51}}})
+    explicit MockConn(qm::Script script = qm::Script{qm::ActionAwaitClientFrame{0x51}})
+        : server(std::vector<qm::Script>{std::move(script)})
     {
         const std::string conf = "qwpws::addr=" + server.addr() +
             ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;";
@@ -287,6 +284,111 @@ TEST_CASE("borrowed_column_sender exposes Arrow FSN helper")
     {
         FAIL("borrowed Arrow FSN flush threw: " << e.what());
     }
+    conn.drop_on_return();
+}
+
+TEST_CASE("column_sender_flush_arrow_batch_at_now_and_wait: C ABI happy path")
+{
+    MockConn mc{qm::Script{
+        qm::ActionAwaitClientFrame{0x51},
+        qm::ActionSendRaw{qm::ingress_ok_frame()}}};
+
+    auto col = pack_le<int64_t>({10, 20, 30});
+    auto arr = make_array(3, 0, {nullptr, col});
+    auto sch = make_schema("l", "v");
+    line_sender_error* err = nullptr;
+    line_sender_table_name tbl{6, "t_wait"};
+    const bool ok = column_sender_flush_arrow_batch_at_now_and_wait(
+        mc.conn,
+        tbl,
+        &arr,
+        &sch,
+        nullptr,
+        0,
+        qwpws_ack_level_ok,
+        &err);
+    CHECK(ok);
+    CHECK(err == nullptr);
+    CHECK_FALSE(static_cast<bool>(arr.release));
+}
+
+TEST_CASE("borrowed_column_sender exposes Arrow ACKing helpers")
+{
+    qm::MockServer server(std::vector<qm::Script>{qm::Script{
+        qm::ActionAwaitClientFrame{0x51},
+        qm::ActionSendRaw{qm::ingress_ok_frame(0)},
+        qm::ActionAwaitClientFrame{0x51},
+        qm::ActionSendRaw{qm::ingress_ok_frame(1)}}});
+    questdb::pool db{
+        "qwpws::addr=" + server.addr() +
+        ";pool_size=1;pool_reap=manual;close_flush_timeout_millis=0;"};
+    auto conn = db.borrow_column_sender();
+
+    auto col = pack_le<int64_t>({10, 20, 30});
+    auto arr = make_array(3, 0, {nullptr, col});
+    auto sch = make_schema("l", "v");
+    try
+    {
+        conn.flush_arrow_batch_at_now_and_wait("t_wait_now"_tn, arr, sch);
+        CHECK_FALSE(static_cast<bool>(arr.release));
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        FAIL("borrowed Arrow at-now ACKing flush threw: " << e.what());
+    }
+
+    auto ts_col = pack_le<int64_t>(
+        {1700000000000000LL, 1700000000000001LL});
+    auto v_col = pack_le<int64_t>({10, 20});
+
+    auto ts_arr =
+        std::make_unique<ArrowArray>(make_array(2, 0, {nullptr, ts_col}));
+    auto v_arr =
+        std::make_unique<ArrowArray>(make_array(2, 0, {nullptr, v_col}));
+    auto ts_sch = std::make_unique<ArrowSchema>(make_schema("tsu:UTC", "ts"));
+    auto v_sch = std::make_unique<ArrowSchema>(make_schema("l", "v"));
+
+    auto* outer_owner = new Owner;
+    outer_owner->children_storage.push_back(std::move(ts_arr));
+    outer_owner->children_storage.push_back(std::move(v_arr));
+    outer_owner->children_ptrs.push_back(
+        outer_owner->children_storage[0].get());
+    outer_owner->children_ptrs.push_back(
+        outer_owner->children_storage[1].get());
+
+    ArrowArray outer_arr;
+    std::memset(&outer_arr, 0, sizeof(outer_arr));
+    outer_arr.length = 2;
+    outer_arr.n_buffers = 1;
+    outer_arr.n_children = 2;
+    outer_arr.children = outer_owner->children_ptrs.data();
+    outer_arr.release = release_owner;
+    outer_arr.private_data = outer_owner;
+    static const void* outer_buf_slot[1] = {nullptr};
+    outer_arr.buffers = outer_buf_slot;
+
+    ArrowSchema outer_sch;
+    std::memset(&outer_sch, 0, sizeof(outer_sch));
+    outer_sch.format = "+s";
+    outer_sch.n_children = 2;
+    static ArrowSchema* child_schema_ptrs[2];
+    child_schema_ptrs[0] = ts_sch.get();
+    child_schema_ptrs[1] = v_sch.get();
+    outer_sch.children = child_schema_ptrs;
+    outer_sch.release = schema_release_noop;
+
+    try
+    {
+        conn.flush_arrow_batch_and_wait(
+            "t_wait_col"_tn, outer_arr, outer_sch, "ts"_cn);
+        CHECK_FALSE(static_cast<bool>(outer_arr.release));
+    }
+    catch (const qdb::line_sender_error& e)
+    {
+        FAIL("borrowed Arrow at-column ACKing flush threw: " << e.what());
+    }
+    ts_sch->release = nullptr;
+    v_sch->release = nullptr;
     conn.drop_on_return();
 }
 

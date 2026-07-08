@@ -94,8 +94,8 @@ pub struct column_sender(OwnedColumnSender, AtomicU32);
 /// `questdb_db_borrow_direct_column_sender`. Same single-threaded /
 /// reentrancy-latch contract as [`column_sender`]; it exposes
 /// `direct_column_sender_flush` + `direct_column_sender_flush_and_wait` +
-/// `direct_column_sender_commit` instead of the store-and-forward
-/// `column_sender_flush` + `column_sender_wait`.
+/// `direct_column_sender_commit` instead of the store-and-forward queue
+/// primitives exposed by [`column_sender`].
 pub struct direct_column_sender(OwnedColumnSender, AtomicU32);
 
 /// Shared accessor over the two structurally-identical column-sender handle
@@ -2717,6 +2717,80 @@ pub unsafe extern "C" fn column_sender_flush(
     unsafe { cs_flush_body(sender, chunk, "column_sender_flush", err_out) }
 }
 
+unsafe fn cs_flush_and_wait_body<T: CsHandle>(
+    sender: *mut T,
+    chunk: *mut column_sender_chunk,
+    ack_level: u32,
+    fn_name: &str,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let ack_level = match ack_level_from_u32(ack_level, err_out) {
+        Some(l) => l,
+        None => return false,
+    };
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    format!("{fn_name}: sender pointer is NULL"),
+                ),
+            );
+        }
+        return false;
+    }
+    let _conn_guard = match unsafe {
+        InUseGuard::acquire(sender, T::latch(sender), fn_name, T::TYPE_NAME, err_out)
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
+        return false;
+    }
+    if chunk.is_null() {
+        return reject_null_chunk(err_out);
+    }
+    let _chunk_guard = match unsafe {
+        InUseGuard::acquire(
+            chunk,
+            &raw const (*chunk).1,
+            fn_name,
+            "column_sender_chunk",
+            err_out,
+        )
+    } {
+        Some(g) => g,
+        None => return false,
+    };
+    let sender = unsafe { T::owned_mut(sender).get_mut() };
+    let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
+    bubble!(err_out, sender.flush_and_wait(chunk_inner, ack_level));
+    true
+}
+
+/// Store-and-forward combined publish+wait. Publishes `chunk` into the local SFA
+/// queue as a completion boundary, then waits until every frame published before
+/// or by this call reaches `ack_level`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_and_wait(
+    sender: *mut column_sender,
+    chunk: *mut column_sender_chunk,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        cs_flush_and_wait_body(
+            sender,
+            chunk,
+            ack_level,
+            "column_sender_flush_and_wait",
+            err_out,
+        )
+    }
+}
+
 /// Publish-only store-and-forward flush that also returns the local frame
 /// sequence boundary. If a chunk is split into multiple frames, the returned
 /// FSN is the final frame boundary.
@@ -2911,9 +2985,7 @@ pub unsafe extern "C" fn direct_column_sender_flush(
 ///
 /// Returns `true` on success, `false` on error (with `*err_out` set).
 /// Direct-only combined publish+commit. Publishes `chunk` as a non-deferred
-/// commit boundary and waits for `ack_level`. (The store-and-forward handle
-/// has no combined form: use `column_sender_flush` then
-/// `column_sender_wait`.)
+/// commit boundary and waits for `ack_level`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
     sender: *mut direct_column_sender,
@@ -2921,57 +2993,15 @@ pub unsafe extern "C" fn direct_column_sender_flush_and_wait(
     ack_level: u32,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let ack_level = match ack_level_from_u32(ack_level, err_out) {
-        Some(l) => l,
-        None => return false,
-    };
-    let fn_name = "direct_column_sender_flush_and_wait";
-    if sender.is_null() {
-        unsafe {
-            set_err_out_from_error(
-                err_out,
-                Error::new(
-                    ErrorCode::InvalidApiCall,
-                    format!("{fn_name}: sender pointer is NULL"),
-                ),
-            );
-        }
-        return false;
-    }
-    let _conn_guard = match unsafe {
-        InUseGuard::acquire(
+    unsafe {
+        cs_flush_and_wait_body(
             sender,
-            direct_column_sender::latch(sender),
-            fn_name,
-            "direct_column_sender",
-            err_out,
-        )
-    } {
-        Some(g) => g,
-        None => return false,
-    };
-    if unsafe { reject_closed_pool_cs(sender, fn_name, err_out) } {
-        return false;
-    }
-    if chunk.is_null() {
-        return reject_null_chunk(err_out);
-    }
-    let _chunk_guard = match unsafe {
-        InUseGuard::acquire(
             chunk,
-            &raw const (*chunk).1,
-            fn_name,
-            "column_sender_chunk",
+            ack_level,
+            "direct_column_sender_flush_and_wait",
             err_out,
         )
-    } {
-        Some(g) => g,
-        None => return false,
-    };
-    let sender = unsafe { direct_column_sender::owned_mut(sender).get_mut() };
-    let chunk_inner: &mut Chunk = unsafe { &mut (*chunk).0 };
-    bubble!(err_out, sender.flush_and_wait(chunk_inner, ack_level));
-    true
+    }
 }
 
 /// Encode an Apache Arrow `RecordBatch` (Arrow C Data Interface) as a
@@ -3068,6 +3098,39 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_now_and_get_fsn(
     }
 }
 
+/// ACKing counterpart of `column_sender_flush_arrow_batch_at_now`: publish
+/// `array` as a boundary, then wait for `ack_level`.
+///
+/// Same ACK-validation preflight and phase-aware re-export contract as
+/// `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_now_and_wait(
+    sender: *mut column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl_and_wait(
+            "column_sender_flush_arrow_batch_at_now_and_wait",
+            sender,
+            table,
+            array,
+            schema,
+            None,
+            overrides,
+            overrides_len,
+            ack_level,
+            err_out,
+        )
+    }
+}
+
 /// Direct-handle publish-only Arrow flush (server-stamped). Pair with
 /// `direct_column_sender_commit`, or use
 /// `direct_column_sender_flush_arrow_batch_at_now_and_wait`.
@@ -3155,6 +3218,39 @@ pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_and_get_fsn(
             overrides,
             overrides_len,
             fsn_out,
+            err_out,
+        )
+    }
+}
+
+/// ACKing counterpart of `column_sender_flush_arrow_batch_at_column`: publish
+/// `array` (timestamp sourced from `ts_column`) as a boundary, then wait for
+/// `ack_level`. Same ACK-validation preflight and phase-aware re-export
+/// contract as `column_sender_flush_arrow_batch_at_now_and_wait`.
+#[cfg(feature = "arrow")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn column_sender_flush_arrow_batch_at_column_and_wait(
+    sender: *mut column_sender,
+    table: line_sender_table_name,
+    array: *mut arrow::ffi::FFI_ArrowArray,
+    schema: *const arrow::ffi::FFI_ArrowSchema,
+    ts_column: line_sender_column_name,
+    overrides: *const column_sender_arrow_override,
+    overrides_len: size_t,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        arrow_batch_impl_and_wait(
+            "column_sender_flush_arrow_batch_at_column_and_wait",
+            sender,
+            table,
+            array,
+            schema,
+            Some(ts_column),
+            overrides,
+            overrides_len,
+            ack_level,
             err_out,
         )
     }
