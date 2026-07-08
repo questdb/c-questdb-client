@@ -1347,14 +1347,17 @@ bool column_sender_chunk_at_seconds(
  * not send a frame; it waits for frames already published to the local queue,
  * up to the sync-call boundary, to be acknowledged at `ack_level`.
  *
- * No-progress timeout: `column_sender_wait` returns
+ * No-progress timeout: the ack wait returns
  * `line_sender_error_failover_retry` if the server stays connected but never
- * advances the ack/durable watermark for `request_timeout` (default 30s) — a
- * back-pressured WAL or stuck commit. The deadline resets on every watermark
- * advance, so a slow-but-progressing sync (e.g. a `durable` upload under
- * pressure) is not cut off. On this error the unacked frames are retained:
- * drop the sender and re-borrow to replay. Raise `request_timeout` to wait
- * longer.
+ * advances the ack/durable watermark for the deadline — a back-pressured WAL
+ * or stuck commit. For `column_sender_wait` the deadline is the caller's
+ * `timeout_millis` (`0` waits indefinitely); for
+ * `column_sender_flush_and_wait` it is the pool-wide `request_timeout`
+ * (default 30s). The deadline resets on every watermark advance, so a
+ * slow-but-progressing sync (e.g. a `durable` upload under pressure) is not
+ * cut off. On this error the frames remain queued and the background runner
+ * keeps delivering them: wait again (or watch the FSN watermark) rather than
+ * re-flushing the same rows.
  * ------------------------------------------------------------------------- */
 
 QUESTDB_CLIENT_API
