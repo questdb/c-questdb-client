@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -104,14 +105,17 @@ TEST_CASE("borrowed_column_sender returns conn to pool on destructor")
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
+        // The background runner opens one connection; wait for it to land.
         REQUIRE(mock->wait_for_accepts(1));
     }
-    int accepts_before = mock->accepts();
+    // Drop returns the sender to the pool (recycled, not dropped).
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
     }
-    CHECK(mock->accepts() == accepts_before);
+    // The re-borrow reused the recycled connection: the mock only ever
+    // accepted one connection, never a second.
+    CHECK(mock->accepts() == 1);
 }
 
 TEST_CASE("borrowed_column_sender move transfers ownership without double-return")
@@ -288,12 +292,14 @@ TEST_CASE("drop_on_return drops the conn instead of recycling it")
 
     {
         auto conn = db.borrow_column_sender();
-        REQUIRE(mock->wait_for_accepts(1));
-        conn.drop_on_return();
+        REQUIRE(mock->wait_for_accepts(1)); // first borrow opens conn #1
+        conn.drop_on_return();              // force drop instead of recycle
     }
     {
         auto conn = db.borrow_column_sender();
         CHECK(static_cast<bool>(conn));
+        // The slot was dropped (not recycled), so the re-borrow must open a
+        // fresh conn #2 rather than reuse the first.
         REQUIRE(mock->wait_for_accepts(2));
     }
     CHECK(mock->accepts() == 2);
