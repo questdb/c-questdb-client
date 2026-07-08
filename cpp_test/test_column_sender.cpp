@@ -214,6 +214,53 @@ TEST_CASE("borrowed_row_sender exposes QWP/WS buffer and FSN helpers")
     rs.drop_on_return();
 }
 
+TEST_CASE("borrowed_row_sender flush_and_wait round-trips through the mock")
+{
+    auto mock = spawn_acking_mock(1);
+    questdb::pool db{conf_for(mock->addr())};
+    auto rs = db.borrow_row_sender();
+
+    auto buf = rs.new_buffer();
+    buf.table("trades")
+        .symbol("sym", "ETH-USD")
+        .column("price", 2615.54)
+        .at(qdb::timestamp_nanos::now());
+    rs.flush_and_wait(buf);
+    const auto published = rs.published_fsn();
+    REQUIRE(published.has_value());
+    const auto acked = rs.acked_fsn();
+    REQUIRE(acked.has_value());
+    CHECK(*acked >= *published);
+    rs.drop_on_return();
+}
+
+TEST_CASE("row_sender_flush_and_wait: NULL buffer -> invalid_api_call")
+{
+    // Raw C-ABI guard: a NULL buffer must report invalid_api_call, not
+    // dereference the pointer.
+    auto mock = spawn_mock(1);
+    const std::string conf = conf_for(mock->addr());
+    line_sender_error* err = nullptr;
+    questdb_db* db = questdb_db_connect(conf.c_str(), conf.size(), &err);
+    REQUIRE(db != nullptr);
+    REQUIRE(err == nullptr);
+    row_sender* rs = questdb_db_borrow_row_sender(db, &err);
+    REQUIRE(rs != nullptr);
+    REQUIRE(err == nullptr);
+
+    const bool ok =
+        row_sender_flush_and_wait(rs, nullptr, qwpws_ack_level_ok, &err);
+    CHECK_FALSE(ok);
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_get_code(err) ==
+        line_sender_error_invalid_api_call);
+    line_sender_error_free(err);
+
+    questdb_db_drop_row_sender(db, rs);
+    questdb_db_close(db);
+}
+
 TEST_CASE("borrowed_row_sender::new_buffer preserves max_name_len on lazy reinit")
 {
     // A buffer minted from a row sender configured with `max_name_len=16`

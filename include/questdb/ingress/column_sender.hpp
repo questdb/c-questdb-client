@@ -1391,6 +1391,26 @@ public:
     }
 
     /**
+     * Send the buffer of rows to QuestDB as a completion boundary, clear the
+     * buffer, then block until every frame published so far through this
+     * sender reaches `level` — `flush()` followed by `wait()` in one call.
+     * The wait is bounded by the pool-wide `request_timeout` setting; compose
+     * `flush()` + `wait()` to choose a per-call timeout instead.
+     * @throws line_sender_error on failure.
+     */
+    void flush_and_wait(
+        line_sender_buffer& buffer,
+        qwpws_ack_level level = qwpws_ack_level::ok)
+    {
+        buffer.may_init();
+        line_sender_error::wrapped_call(
+            ::row_sender_flush_and_wait,
+            _sender,
+            buffer._impl,
+            static_cast<uint32_t>(level));
+    }
+
+    /**
      * Send the buffer of rows to QuestDB, keeping the buffer intact (clear
      * it before starting a new batch). A never-initialised (empty) buffer
      * is a no-op.

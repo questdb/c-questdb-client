@@ -1802,6 +1802,41 @@ fn row_sender_pool_flush_round_trip() {
     drop(db);
 }
 
+#[test]
+fn row_sender_flush_and_wait_commits_at_boundary() {
+    let server = MockServer::spawn_acking(8);
+    let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
+
+    let mut sender = db.borrow_row_sender().expect("borrow row sender");
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_f64("price", 2615.54)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender
+        .flush_and_wait(&mut buf, AckLevel::Ok)
+        .expect("combined row-major publish+wait over a pooled QWP/WS sender");
+    assert!(
+        buf.is_empty(),
+        "successful flush_and_wait clears the buffer"
+    );
+    let published = sender
+        .published_fsn()
+        .expect("published fsn")
+        .expect("the buffer published a frame");
+    assert!(
+        sender
+            .acked_fsn()
+            .expect("acked fsn")
+            .is_some_and(|v| v >= published),
+        "flush_and_wait returns only after the ack watermark covers the frame"
+    );
+}
+
 #[cfg(feature = "ffi-support")]
 #[test]
 fn row_sender_owned_borrow_flushes_and_recycles() {

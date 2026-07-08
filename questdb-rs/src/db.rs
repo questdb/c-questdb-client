@@ -1172,9 +1172,10 @@ impl<'a> BorrowedColumnSender<'a> {
     /// boundary, then wait until every frame published on this handle so far
     /// reaches `ack_level` — [`Self::flush`] followed by [`Self::wait`] in one
     /// call. Unlike [`Self::wait`], which takes an explicit timeout argument,
-    /// this call's wait gives up after the pool-wide `request_timeout` setting
-    /// (it fails only if the ack watermark stops advancing for that long);
-    /// compose the two calls yourself to choose the timeout per call.
+    /// this call's wait is bounded by the pool-wide `request_timeout` setting
+    /// (the no-progress timeout fires when the ack watermark stops advancing
+    /// for that long); compose the two calls yourself to choose the timeout
+    /// per call.
     ///
     /// `AckLevel::Durable` requires the pool to be opened with
     /// `request_durable_ack=on`; otherwise the call is rejected up front
@@ -1182,10 +1183,13 @@ impl<'a> BorrowedColumnSender<'a> {
     ///
     /// Failure contract: if local publication fails, `chunk` is untouched and
     /// retryable. Once the frame is accepted into the queue `chunk` is cleared
-    /// even if the wait then fails — the frames remain queued and the
-    /// background runner keeps delivering them, so recover by calling
-    /// [`Self::wait`] until it returns `Ok`, not by re-flushing (which would
-    /// deliver the same rows twice).
+    /// even if the wait then fails. On the no-progress timeout
+    /// ([`ErrorCode::FailoverRetry`](crate::ErrorCode)) the frames remain
+    /// queued and the background runner keeps delivering them — recover by
+    /// calling [`Self::wait`] until it returns `Ok`, not by re-flushing
+    /// (which would deliver the same rows twice). A terminal server rejection
+    /// or transport failure instead ends delivery on this sender: drop the
+    /// borrow and recover per the rejection policy.
     pub fn flush_and_wait(
         &mut self,
         chunk: &mut crate::ingress::column_sender::Chunk<'_>,
@@ -1657,8 +1661,10 @@ impl Drop for OwnedColumnSender {
 /// [`Self::drop_on_return`] was called), in which case it is dropped and the
 /// next borrow opens a fresh one.
 ///
-/// Use [`Self::wait`] for the simple case: a blocking barrier for everything
-/// published so far through this borrowed sender. Use FSNs for non-blocking
+/// Use [`Self::flush_and_wait`] for the common safe shape ("publish this
+/// batch and return once it is acknowledged"). Use [`Self::wait`] as a
+/// standalone blocking barrier for everything published so far through this
+/// borrowed sender. Use FSNs for non-blocking
 /// pipelining while you still hold the same borrowed sender: publish with
 /// [`Self::flush_and_get_fsn`], keep doing work, then compare the saved FSN
 /// with [`Self::acked_fsn`]. FSNs are stream watermarks, not portable receipts
@@ -1712,6 +1718,29 @@ impl<'a> BorrowedRowSender<'a> {
     /// Send the buffer of rows, then clear the buffer.
     pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
         self.sender_mut().flush(buf)
+    }
+
+    /// Publish the buffer, clear it, then block until every frame published
+    /// so far through this sender reaches `ack_level` — [`Self::flush`]
+    /// followed by [`Self::wait`] in one call, the row-major counterpart of
+    /// [`BorrowedColumnSender::flush_and_wait`]. Unlike [`Self::wait`], which
+    /// takes an explicit timeout argument, this call's wait is bounded by
+    /// the pool-wide `request_timeout` setting (the no-progress timeout
+    /// fires when the ack watermark stops advancing for that long); compose
+    /// the two calls yourself to choose the timeout per call.
+    ///
+    /// On a flush failure the buffer is retained. After publication, only the
+    /// no-progress timeout ([`ErrorCode::FailoverRetry`](crate::ErrorCode))
+    /// leaves the frames queued with the runner still delivering — recover
+    /// from it by calling [`Self::wait`] until it returns `Ok`, not by
+    /// re-flushing (which would deliver the same rows twice). A terminal
+    /// server rejection or transport/protocol failure ends delivery on this
+    /// sender: drop the borrow and re-drive undelivered rows on a fresh one.
+    pub fn flush_and_wait(&mut self, buf: &mut Buffer, ack_level: AckLevel) -> Result<()> {
+        let timeout = self.db.inner.connector.request_timeout();
+        let sender = self.sender_mut();
+        sender.flush(buf)?;
+        sender.wait(ack_level, timeout)
     }
 
     /// Send the buffer of rows, keeping the buffer intact.
@@ -1849,6 +1878,17 @@ impl OwnedRowSender {
         self.sender
             .as_ref()
             .expect("OwnedRowSender already returned to the pool")
+    }
+
+    /// Combined [`Sender::flush`] + [`Sender::wait`] with the pool-wide
+    /// `request_timeout` as the wait's no-progress deadline — the owned
+    /// counterpart of [`BorrowedRowSender::flush_and_wait`], used by the C
+    /// FFI.
+    pub fn flush_and_wait(&mut self, buf: &mut Buffer, ack_level: AckLevel) -> Result<()> {
+        let timeout = self.inner.connector.request_timeout();
+        let sender = self.get_mut();
+        sender.flush(buf)?;
+        sender.wait(ack_level, timeout)
     }
 
     /// Force this sender to be dropped (not recycled) when it is returned.

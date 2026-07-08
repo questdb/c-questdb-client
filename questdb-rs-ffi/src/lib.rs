@@ -4041,6 +4041,73 @@ pub unsafe extern "C" fn row_sender_flush(
     }
 }
 
+/// Flush the buffer of rows through the borrowed row sender as a completion
+/// boundary, clear the buffer, then wait until every frame published so far
+/// through this sender reaches `ack_level` — `row_sender_flush` +
+/// `row_sender_wait` in one call, the row-major counterpart of
+/// `column_sender_flush_and_wait`. The wait uses the pool-wide
+/// `request_timeout` no-progress deadline; compose the two calls to choose a
+/// per-call timeout.
+///
+/// On a flush failure the buffer is retained. After publication, only the
+/// no-progress timeout (`line_sender_error_failover_retry`) leaves the frames
+/// queued and still delivering — recover from it by calling `row_sender_wait`
+/// again, not by re-flushing the same rows. A terminal server rejection or
+/// transport/protocol failure ends delivery on this sender: drop it and
+/// re-drive undelivered rows on a fresh borrow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn row_sender_flush_and_wait(
+    sender: *mut row_sender,
+    buffer: *mut line_sender_buffer,
+    ack_level: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    if sender.is_null() {
+        unsafe {
+            set_err_out_from_error(
+                err_out,
+                Error::new(
+                    ErrorCode::InvalidApiCall,
+                    "row_sender_flush_and_wait: sender pointer is NULL".to_string(),
+                ),
+            );
+        }
+        return false;
+    }
+    let ack_level = match ack_level {
+        value if value == qwpws_ack_level_ok => questdb::ingress::AckLevel::Ok,
+        value if value == qwpws_ack_level_durable => questdb::ingress::AckLevel::Durable,
+        other => {
+            unsafe {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!(
+                        "row_sender_flush_and_wait: invalid ack_level {other} (expected 0 or 1)"
+                    ),
+                );
+            }
+            return false;
+        }
+    };
+    if unsafe { reject_closed_pool_row_sender(sender, "row_sender_flush_and_wait", err_out) } {
+        return false;
+    }
+    unsafe {
+        let Some(buffer) = qwpws_buffer_ptr_mut(buffer, err_out, "row_sender_flush_and_wait")
+        else {
+            return false;
+        };
+        match (*sender).0.flush_and_wait(buffer, ack_level) {
+            Ok(()) => true,
+            Err(err) => {
+                set_err_out_from_sender_error(err_out, (*sender).0.get_mut(), err);
+                false
+            }
+        }
+    }
+}
+
 /// Flush the buffer of rows through the borrowed row sender, keeping the
 /// buffer intact (clear it before starting a new batch). Mirrors
 /// `line_sender_flush_and_keep`.

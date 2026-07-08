@@ -367,6 +367,33 @@ bool row_sender_flush(
     line_sender_error** err_out);
 
 /**
+ * Flush the buffer of rows through the borrowed row sender as a completion
+ * boundary, clear the buffer, then wait until every frame published so far
+ * through this sender reaches `ack_level` — `row_sender_flush` followed by
+ * `row_sender_wait` in one call, the row-major counterpart of
+ * `column_sender_flush_and_wait`.
+ *
+ * `ack_level` carries a `qwpws_ack_level_*` constant; an out-of-range value
+ * returns `line_sender_error_invalid_api_call` before the buffer is touched.
+ * The wait uses the pool-wide `request_timeout` no-progress deadline; compose
+ * `row_sender_flush` + `row_sender_wait` to choose a per-call timeout.
+ *
+ * Failure contract: on a flush failure the buffer is retained. After
+ * publication, only the no-progress timeout
+ * (`line_sender_error_failover_retry`) leaves the frames queued and still
+ * delivering — recover from it by calling `row_sender_wait` again, not by
+ * re-flushing the same rows. A terminal server rejection or
+ * transport/protocol failure ends delivery on this sender: drop it and
+ * re-drive undelivered rows on a fresh borrow.
+ */
+QUESTDB_CLIENT_API
+bool row_sender_flush_and_wait(
+    row_sender* sender,
+    line_sender_buffer* buffer,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+
+/**
  * Flush the buffer of rows through the borrowed row sender, keeping the
  * buffer intact (clear it before starting a new batch). Mirrors
  * `line_sender_flush_and_keep`.
@@ -1346,9 +1373,12 @@ bool column_sender_flush(
  *
  * Failure contract: if local publication fails, `chunk` is left untouched and
  * retryable. Once the frame is accepted into the queue, `chunk` is cleared even
- * if the later ACK wait fails. On that post-publication failure the frames
- * remain queued and the background runner keeps delivering them; call
- * `column_sender_wait` again instead of re-flushing the same rows.
+ * if the later ACK wait fails. On the no-progress timeout
+ * (`line_sender_error_failover_retry`) the frames remain queued and the
+ * background runner keeps delivering them; call `column_sender_wait` again
+ * instead of re-flushing the same rows. A terminal server rejection or
+ * transport failure instead ends delivery on this sender: drop it and recover
+ * per the rejection policy.
  *
  * The wait uses the pool-wide `request_timeout` no-progress deadline.
  */
