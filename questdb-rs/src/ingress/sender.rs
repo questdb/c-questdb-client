@@ -70,6 +70,10 @@ mod qwp_ws_ownership;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_orphan;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use qwp_ws_orphan::has_any_sfa_file;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) use qwp_ws_orphan::is_candidate_orphan;
 
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_publisher;
@@ -891,6 +895,37 @@ impl Sender {
             _ => {}
         }
         false
+    }
+
+    /// Non-blocking: `true` once a background QWP/WebSocket
+    /// store-and-forward sender has no undelivered published frames, so a
+    /// parked pooled row sender can be retired without losing queued data.
+    /// Non-QWP/WebSocket handlers and terminal background handlers report
+    /// `true`.
+    pub(crate) fn sfa_fully_delivered(&self, durable: bool) -> bool {
+        #[cfg(feature = "sync-sender-qwp-ws")]
+        {
+            let SyncProtocolHandler::SyncQwpWs(state) = &self.handler else {
+                return true;
+            };
+            if qwp_ws_is_terminal_background(state) {
+                return true;
+            }
+            let Ok(Some(published)) = qwp_ws_published_fsn_background(state) else {
+                return true;
+            };
+            let watermark = if durable {
+                qwp_ws_acked_fsn_background(state)
+            } else {
+                qwp_ws_ok_fsn_background(state)
+            };
+            matches!(watermark, Ok(Some(w)) if w >= published)
+        }
+        #[cfg(not(feature = "sync-sender-qwp-ws"))]
+        {
+            let _ = durable;
+            true
+        }
     }
 
     /// Returns the sender's configured transport protocol.

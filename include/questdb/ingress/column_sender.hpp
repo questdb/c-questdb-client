@@ -1566,7 +1566,16 @@ private:
  *
  * `conf` is a `qwpws::` / `qwpwss::` connect string; see
  * `column_sender.h` for pool-specific keys (`pool_size`, `pool_max`,
- * `pool_idle_timeout_ms`, `pool_reap`).
+ * `pool_idle_timeout_ms`, `pool_reap`). With `sf_dir`, `sender_id` is the
+ * slot base; pooled senders mint `<sender_id>-col-<index>` and
+ * `<sender_id>-row-<index>` disk slots. Those `<sender_id>-col-*` and
+ * `<sender_id>-row-*` directories under `sf_dir` belong to the pool namespace;
+ * use a unique `sender_id` for each pool sharing an `sf_dir`.
+ *
+ * Construction performs no blocking network I/O. In disk-backed
+ * store-and-forward mode it may pre-open parked recovery senders whose initial
+ * connect and replay run in the background; otherwise senders are opened on
+ * first borrow.
  *
  * Borrow/return operations are thread-safe while this owner remains alive.
  * Destruction is the final owner release: do not destroy the pool while
@@ -1608,7 +1617,9 @@ public:
     ::questdb_db* c_ptr() noexcept { return _raw; }
     const ::questdb_db* c_ptr() const noexcept { return _raw; }
 
-    /** Borrow a store-and-forward sender. Throws on cap exhaustion or transport
+    /** Borrow a store-and-forward sender. At cap, disk-backed slots can wait
+     * up to `close_flush_timeout` (default 5s) while an in-flight close
+     * releases its lock; otherwise throws on cap exhaustion or transport
      * failure. */
     borrowed_column_sender borrow_column_sender()
     {
@@ -1635,9 +1646,13 @@ public:
      * Borrow a row-major sender from the pool, mirroring Rust
      * `QuestDb::borrow_row_sender`. Row senders are pooled on a separate,
      * independently-capped free list that shares the pool budget; the pool
-     * is lazy (a connection opens on first borrow). Build rows with a
-     * `line_sender_buffer` and flush them through the returned guard. Throws
-     * on cap exhaustion or transport failure.
+     * is lazy except that disk-backed recovery senders may have been
+     * pre-opened by pool construction with background initial connect and
+     * replay. In disk-backed store-and-forward mode, an at-cap borrow can wait
+     * up to `close_flush_timeout` (default 5s) while an in-flight slot close
+     * releases its lock. Build rows with a `line_sender_buffer` and flush them
+     * through the returned guard. Otherwise throws on cap exhaustion or
+     * transport failure.
      */
     borrowed_row_sender borrow_row_sender()
     {
@@ -1662,7 +1677,7 @@ public:
      * Borrow a query reader from the pool, mirroring Rust
      * `QuestDb::borrow_reader`. Readers are pooled on a separate,
      * independently-capped free list that shares the `pool_size` /
-     * `pool_max` / `pool_idle_timeout_ms` budget; the pool is lazy (a
+     * `pool_max` / `pool_idle_timeout_ms` budget; the reader pool is lazy (a
      * connection opens on first borrow). The returned `reader` is
      * equivalent to a standalone one and returns itself to the pool on
      * destruction — unless `reader::drop_on_return()` was called, in which

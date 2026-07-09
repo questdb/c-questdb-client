@@ -36,8 +36,11 @@
 //! succeeds, then either parks on the connection or reads each QWP frame
 //! and replies with an OK ack (status 0x00).
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -46,8 +49,9 @@ use std::time::{Duration, Instant};
 
 use crate::ErrorCode;
 use crate::QuestDb;
-use crate::ingress::AckLevel;
 use crate::ingress::column_sender::Chunk;
+use crate::ingress::sender::has_any_sfa_file as slot_has_sfa_file;
+use crate::ingress::{AckLevel, SenderBuilder};
 use crate::tests::qwp_ws::{
     perform_server_upgrade, perform_server_upgrade_durable, read_frame,
     write_qwp_durable_ack_response, write_qwp_error_response, write_qwp_ok_response,
@@ -626,6 +630,19 @@ fn read_symbol_prefix(payload: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn frame_table_name(payload: &[u8]) -> String {
+    const QWP_HEADER_LEN: usize = 12;
+    let mut pos = QWP_HEADER_LEN;
+    read_test_varint(payload, &mut pos); // delta_start
+    let new_symbols = read_test_varint(payload, &mut pos);
+    for _ in 0..new_symbols {
+        read_test_bytes(payload, &mut pos);
+    }
+    std::str::from_utf8(read_test_bytes(payload, &mut pos))
+        .unwrap()
+        .to_owned()
+}
+
 fn unused_local_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused local port");
     listener.local_addr().expect("unused local addr").port()
@@ -645,6 +662,41 @@ fn frame_row_count(payload: &[u8]) -> u64 {
     read_test_varint(payload, &mut pos)
 }
 
+fn sorted_slot_names(sf_dir: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(sf_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn seed_async_qwp_ws_slot(sf_dir: &Path, sender_id: &str, value: i64) {
+    let port = unused_local_port();
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};initial_connect_retry=async;\
+         sf_dir={};sender_id={sender_id};sf_max_bytes=256;sf_max_total_bytes=1024;\
+         close_flush_timeout_millis=0;",
+        sf_dir.display()
+    );
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("legacy")
+        .unwrap()
+        .column_i64("value", value)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+    drop(sender);
+    assert!(
+        slot_has_sfa_file(&sf_dir.join(sender_id)),
+        "seeded slot {sender_id} should contain queued SFA data"
+    );
+}
+
 #[test]
 fn refuses_non_qwp_ws_schema() {
     let err = QuestDb::connect("http::addr=localhost:9000;").unwrap_err();
@@ -653,22 +705,513 @@ fn refuses_non_qwp_ws_schema() {
 }
 
 #[test]
-fn store_and_forward_pool_allows_one_active_borrower() {
-    let server = MockServer::spawn(2);
+fn disk_store_and_forward_column_pool_uses_distinct_slots_up_to_pool_max() {
+    let server = MockServer::spawn(4);
     let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+        &format!(
+            "sf_dir={};sender_id=cols;pool_size=1;pool_max=3;pool_reap=manual;",
+            dir.path().display()
+        ),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
-    let sender = db.borrow_column_sender().unwrap();
-    let err = db.borrow_column_sender().unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert!(err.msg().contains("store-and-forward"), "{}", err.msg());
+    let b0 = db.borrow_column_sender().expect("slot 0");
+    let b1 = db.borrow_column_sender().expect("slot 1");
+    let b2 = db.borrow_column_sender().expect("slot 2");
+    assert_eq!(db.in_use_count(), 3);
+    assert_eq!(
+        sorted_slot_names(dir.path()),
+        vec!["cols-col-0", "cols-col-1", "cols-col-2"]
+    );
 
-    drop(sender);
-    let _again = db.borrow_column_sender().unwrap();
+    let err = db
+        .borrow_column_sender()
+        .expect_err("fourth borrow exceeds pool_max");
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("pool_max"), "{}", err.msg());
+
+    drop(b1);
+    let _again = db
+        .borrow_column_sender()
+        .expect("returned slot is reusable");
+    assert_eq!(
+        sorted_slot_names(dir.path()),
+        vec!["cols-col-0", "cols-col-1", "cols-col-2"]
+    );
+
+    drop(b0);
+    drop(b2);
+}
+
+#[test]
+fn disk_store_and_forward_preopens_dirty_in_range_slot_at_connect() {
+    let dir = TempDir::new().unwrap();
+    seed_async_qwp_ws_slot(dir.path(), "selfrace-col-1", 44);
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=selfrace;pool_size=1;pool_max=2;\
+             pool_reap=manual;max_background_drainers=1;close_flush_timeout_millis=0;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dirty in-range slot should replay during connect-time pre-open");
+    assert_eq!(frame_table_name(&payload), "legacy");
+    assert!(
+        wait_until(Duration::from_secs(2), || db.free_count() == 1),
+        "pre-opened recovery sender should park in the free list"
+    );
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn disk_store_and_forward_borrower_rechecks_free_sender_after_close_wait_wake() {
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(3);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=waitfree;pool_size=1;pool_max=2;\
+             pool_reap=manual;close_flush_timeout_millis=2000;",
+            dir.path().display()
+        ),
+    );
+    let db = Arc::new(QuestDb::connect(&conf).unwrap());
+
+    let mut closing = db
+        .borrow_column_sender_owned()
+        .expect("borrow slot that will close");
+    let healthy = db
+        .borrow_column_sender_owned()
+        .expect("borrow healthy slot");
+
+    let values = [42_i64];
+    let timestamps = [42_i64];
+    let mut chunk = one_i64_row("waitfree", &values, &timestamps);
+    closing
+        .get_mut()
+        .flush(&mut chunk)
+        .expect("publish frame through closing slot");
+    closing.get_mut().mark_must_close();
+    let payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("closing slot frame should reach mock server");
+    assert!(!payload.is_empty());
+
+    let closer = thread::spawn(move || drop(closing));
+    assert!(
+        wait_until(Duration::from_secs(2), || db.closing_count() == 1),
+        "closing sender did not enter the slot-close path"
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let waiter_db = Arc::clone(&db);
+    let waiter = thread::spawn(move || {
+        let result = waiter_db
+            .borrow_column_sender_owned()
+            .map(|_| ())
+            .map_err(|err| err.msg().to_owned());
+        tx.send(result).expect("send waiter result");
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "borrower should wait while the pool is at cap with only a closing slot"
+    );
+
+    drop(healthy);
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("borrower should wake when a healthy sender returns")
+        .expect("borrower must reuse the free sender, not report pool exhaustion");
+
+    release_acks.store(true, Ordering::SeqCst);
+    closer.join().expect("closer thread");
+    waiter.join().expect("waiter thread");
+}
+
+#[cfg(feature = "ffi-support")]
+#[test]
+fn disk_store_and_forward_at_cap_borrow_waits_for_closing_slot_to_release_index() {
+    let (server, release_acks, frames) = MockServer::spawn_ack_when_released_capturing(2);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=closefree;pool_size=1;pool_max=1;\
+             pool_reap=manual;close_flush_timeout_millis=2000;",
+            dir.path().display()
+        ),
+    );
+    let db = Arc::new(QuestDb::connect(&conf).unwrap());
+
+    let mut closing = db
+        .borrow_column_sender_owned()
+        .expect("borrow slot that will close");
+    let values = [55_i64];
+    let timestamps = [55_i64];
+    let mut chunk = one_i64_row("closefree", &values, &timestamps);
+    closing
+        .get_mut()
+        .flush(&mut chunk)
+        .expect("publish frame through closing slot");
+    let payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("closing slot frame should reach mock server");
+    assert_eq!(frame_table_name(&payload), "closefree");
+    closing.get_mut().mark_must_close();
+
+    let closer = thread::spawn(move || drop(closing));
+    assert!(
+        wait_until(Duration::from_secs(2), || db.closing_count() == 1),
+        "closing sender did not enter the slot-close path"
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let waiter_db = Arc::clone(&db);
+    let waiter = thread::spawn(move || {
+        let result = waiter_db
+            .borrow_column_sender_owned()
+            .map(|_| ())
+            .map_err(|err| err.msg().to_owned());
+        tx.send(result).expect("send waiter result");
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "borrower should wait while the only slot is closing"
+    );
+
+    release_acks.store(true, Ordering::SeqCst);
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("borrower should wake when the closing slot releases its index")
+        .expect("borrower must mint the freed slot instead of reporting pool exhaustion");
+    closer.join().expect("closer thread");
+    waiter.join().expect("waiter thread");
+}
+
+#[test]
+fn disk_store_and_forward_row_and_column_borrow_and_flush_together() {
+    let (server, frames) = MockServer::spawn_acking_capturing(4);
+    let dir = TempDir::new().unwrap();
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=mixed;pool_size=1;pool_max=2;pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let mut col = db.borrow_column_sender().expect("column sender");
+    let mut row = db.borrow_row_sender().expect("row sender");
+    assert_eq!(
+        sorted_slot_names(dir.path()),
+        vec!["mixed-col-0", "mixed-row-0"]
+    );
+
+    let val = [11_i64];
+    let ts = [11_i64];
+    let mut chunk = one_i64_row("col_table", &val, &ts);
+    col.flush_and_wait(&mut chunk, AckLevel::Ok)
+        .expect("column flush while row sender is borrowed");
+
+    let mut buf = row.new_buffer();
+    buf.table("row_table")
+        .unwrap()
+        .column_i64("value", 22)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    row.flush_and_wait(&mut buf, AckLevel::Ok)
+        .expect("row flush while column sender is borrowed");
+
+    assert!(
+        !frames
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !frames
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(db.in_use_count(), 1);
+    assert_eq!(db.row_sender_in_use_count(), 1);
+    drop(row);
+    drop(col);
+}
+
+#[test]
+fn disk_store_and_forward_duplicate_pool_collides_on_managed_slot() {
+    let port = unused_local_port();
+    let dir = TempDir::new().unwrap();
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};auth_timeout=200;\
+         sf_dir={};sender_id=shared;pool_size=1;pool_max=2;\
+         pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let db1 = QuestDb::connect(&conf).unwrap();
+    let db2 = QuestDb::connect(&conf).unwrap();
+
+    let _held = db1
+        .borrow_column_sender()
+        .expect("first pool owns shared-col-0");
+    let err = db2
+        .borrow_column_sender()
+        .expect_err("second pool must hit the slot flock");
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("shared-col-0")
+            && err
+                .msg()
+                .to_ascii_lowercase()
+                .contains("another process or pool")
+            && err.msg().contains("unique sender_id"),
+        "msg: {}",
+        err.msg()
+    );
+}
+
+#[test]
+fn disk_store_and_forward_duplicate_pool_connect_warn_skips_flocked_slots() {
+    let port = unused_local_port();
+    let dir = TempDir::new().unwrap();
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};auth_timeout=200;initial_connect_retry=async;\
+         sf_dir={};sender_id=dupe;pool_size=1;pool_max=1;\
+         pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    let db1 = QuestDb::connect(&conf).unwrap();
+
+    let mut col = db1
+        .borrow_column_sender()
+        .expect("first pool owns dupe-col-0");
+    let mut row = db1.borrow_row_sender().expect("first pool owns dupe-row-0");
+
+    let val = [1_i64];
+    let ts = [1_i64];
+    let mut chunk = one_i64_row("dupecol", &val, &ts);
+    col.flush(&mut chunk).expect("queue column frame");
+
+    let mut buf = row.new_buffer();
+    buf.table("duperow")
+        .unwrap()
+        .column_i64("value", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    row.flush(&mut buf).expect("queue row frame");
+
+    let db2 = QuestDb::connect(&conf).expect("duplicate pool connect skips recovery failures");
+    assert_eq!(db2.free_count(), 0);
+    assert_eq!(db2.row_sender_free_count(), 0);
+
+    let col_err = db2
+        .borrow_column_sender()
+        .expect_err("borrow still collides on the flocked column slot");
+    assert_eq!(col_err.code(), ErrorCode::ConfigError);
+    assert!(col_err.msg().contains("dupe-col-0"), "{}", col_err.msg());
+
+    let row_err = db2
+        .borrow_row_sender()
+        .expect_err("borrow still collides on the flocked row slot");
+    assert_eq!(row_err.code(), ErrorCode::ConfigError);
+    assert!(row_err.msg().contains("dupe-row-0"), "{}", row_err.msg());
+
+    drop(row);
+    drop(col);
+}
+
+#[test]
+fn disk_store_and_forward_restart_replays_reminted_and_out_of_range_managed_slots() {
+    let dir = TempDir::new().unwrap();
+    let seed_port = unused_local_port();
+    let seed_conf = format!(
+        "qwpws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+         reconnect_max_duration_millis=100;sf_dir={};sender_id=replay;\
+         pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    {
+        let db = QuestDb::connect(&seed_conf).unwrap();
+        let mut s0 = db.borrow_column_sender().expect("seed slot 0");
+        let mut s1 = db.borrow_column_sender().expect("seed slot 1");
+
+        let v0 = [101_i64];
+        let t0 = [101_i64];
+        let mut c0 = one_i64_row("replay0", &v0, &t0);
+        s0.flush(&mut c0).expect("append slot 0");
+
+        let v1 = [202_i64];
+        let t1 = [202_i64];
+        let mut c1 = one_i64_row("replay1", &v1, &t1);
+        s1.flush(&mut c1).expect("append slot 1");
+    }
+    assert!(slot_has_sfa_file(&dir.path().join("replay-col-0")));
+    assert!(slot_has_sfa_file(&dir.path().join("replay-col-1")));
+
+    let (server, frames) = MockServer::spawn_acking_capturing(4);
+    let replay_conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=replay;pool_size=1;pool_max=1;pool_reap=manual;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&replay_conf).unwrap();
+    let mut s0 = db
+        .borrow_column_sender()
+        .expect("reopen slot 0 and start out-of-range managed-slot recovery");
+
+    let first = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reminted slot replay");
+    let second = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("out-of-range managed slot replay");
+    assert!(!first.is_empty());
+    assert!(!second.is_empty());
+    s0.wait(AckLevel::Ok, Duration::from_secs(5))
+        .expect("reminted slot replay acked");
+}
+
+#[test]
+fn disk_store_and_forward_restart_same_pool_max_replays_in_range_slots_without_borrow() {
+    let dir = TempDir::new().unwrap();
+    let seed_port = unused_local_port();
+    let seed_conf = format!(
+        "qwpws::addr=127.0.0.1:{seed_port};auth_timeout=200;\
+         reconnect_max_duration_millis=100;sf_dir={};sender_id=samepool;\
+         pool_size=1;pool_max=2;pool_reap=manual;close_flush_timeout_millis=0;",
+        dir.path().display()
+    );
+    {
+        let db = QuestDb::connect(&seed_conf).unwrap();
+        let mut s0 = db.borrow_column_sender().expect("seed slot 0");
+        let mut s1 = db.borrow_column_sender().expect("seed slot 1");
+
+        let v0 = [301_i64];
+        let t0 = [301_i64];
+        let mut c0 = one_i64_row("samepool0", &v0, &t0);
+        s0.flush(&mut c0).expect("append slot 0");
+
+        let v1 = [302_i64];
+        let t1 = [302_i64];
+        let mut c1 = one_i64_row("samepool1", &v1, &t1);
+        s1.flush(&mut c1).expect("append slot 1");
+    }
+    assert!(slot_has_sfa_file(&dir.path().join("samepool-col-0")));
+    assert!(slot_has_sfa_file(&dir.path().join("samepool-col-1")));
+
+    let (server, frames) = MockServer::spawn_acking_capturing(4);
+    let replay_conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=samepool;pool_size=1;pool_max=2;\
+             pool_reap=manual;max_background_drainers=1;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&replay_conf).unwrap();
+
+    let first = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("slot 0 replay");
+    let second = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("slot 1 replay");
+    let tables = [frame_table_name(&first), frame_table_name(&second)]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        wait_until(Duration::from_secs(2), || db.free_count() == 2),
+        "both pre-opened recovery senders should park in the free list"
+    );
+    assert_eq!(
+        tables,
+        BTreeSet::from(["samepool0".to_string(), "samepool1".to_string()])
+    );
+
+    let mut s0 = db.borrow_column_sender().expect("borrow replayed slot");
+    let mut s1 = db
+        .borrow_column_sender()
+        .expect("borrow other replayed slot");
+    s0.wait(AckLevel::Ok, Duration::from_secs(5))
+        .expect("first replay acked");
+    s1.wait(AckLevel::Ok, Duration::from_secs(5))
+        .expect("second replay acked");
+    assert!(
+        frames.recv_timeout(Duration::from_millis(500)).is_err(),
+        "borrowing parked recovery senders must not replay duplicate frames"
+    );
+}
+
+#[test]
+fn disk_store_and_forward_pool_drains_unsuffixed_slot_only_with_orphan_drain_enabled() {
+    let dir = TempDir::new().unwrap();
+    seed_async_qwp_ws_slot(dir.path(), "legacy", 33);
+
+    let (server, frames) = MockServer::spawn_acking_capturing(4);
+    let default_conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=legacy;pool_size=1;pool_max=2;\
+             pool_reap=manual;max_background_drainers=1;",
+            dir.path().display()
+        ),
+    );
+    {
+        let db = QuestDb::connect(&default_conf).unwrap();
+        let _sender = db
+            .borrow_column_sender()
+            .expect("managed slot opens without adopting unsuffixed slot by default");
+        assert!(
+            frames.recv_timeout(Duration::from_millis(200)).is_err(),
+            "unsuffixed slot must not drain without drain_orphans=on"
+        );
+    }
+    assert!(slot_has_sfa_file(&dir.path().join("legacy")));
+
+    let drain_conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=legacy;pool_size=1;pool_max=2;\
+             pool_reap=manual;max_background_drainers=1;drain_orphans=on;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&drain_conf).unwrap();
+    let _sender = db
+        .borrow_column_sender()
+        .expect("managed slot opens and starts orphan drainer");
+
+    let payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("unsuffixed slot should be replayed with drain_orphans=on");
+    assert!(!payload.is_empty());
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            !slot_has_sfa_file(&dir.path().join("legacy"))
+        }),
+        "unsuffixed orphan slot should be drained"
+    );
+    assert!(!dir.path().join("legacy").join(".failed").exists());
+    assert_eq!(
+        sorted_slot_names(dir.path()),
+        vec!["legacy", "legacy-col-0"]
+    );
 }
 
 #[test]
@@ -1300,10 +1843,10 @@ fn store_and_forward_runner_reconnects_and_replays_after_transport_death() {
 }
 
 // Each `check_store_and_forward_*` behaviour above runs on both backends that
-// `borrow_column_sender` uses: disk-backed SF (`sf_dir` set, single-borrower)
-// and in-memory SF (no `sf_dir`, pools freely). The body is backend-agnostic;
-// only the conf differs. The `_dir` `TempDir` outlives each `check_*` call
-// because the call opens and drops its `QuestDb` before the wrapper returns.
+// `borrow_column_sender` uses: disk-backed SF (`sf_dir` set, pool-minted slot
+// dirs) and in-memory SF (no `sf_dir`). The body is backend-agnostic; only the
+// conf differs. The `_dir` `TempDir` outlives each `check_*` call because the
+// call opens and drops its `QuestDb` before the wrapper returns.
 fn sf_disk_extras(dir: &TempDir, extra: &str) -> String {
     format!("sf_dir={};{extra}", dir.path().display())
 }
@@ -1423,9 +1966,9 @@ fn pool_is_lazy_and_opens_on_first_borrow() {
 #[test]
 fn borrow_column_sender_is_in_memory_store_and_forward_without_sf_dir() {
     // Without `sf_dir`, `borrow_column_sender` yields an in-memory
-    // store-and-forward sender (mirroring the row-major sender). Unlike
-    // disk-backed SF it pools freely up to `pool_max` rather than being capped
-    // to a single active borrower.
+    // store-and-forward sender (mirroring the row-major sender). It pools
+    // freely up to `pool_max`, just like disk-backed SF with per-borrower
+    // slots.
     let server = MockServer::spawn(8);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=3;")).unwrap();
 
@@ -1435,8 +1978,7 @@ fn borrow_column_sender_is_in_memory_store_and_forward_without_sf_dir() {
         "borrow_column_sender must be store-and-forward even without sf_dir"
     );
 
-    // In-memory SF pools freely: concurrent borrows succeed (disk-backed SF
-    // would reject the second with a single-borrower error).
+    // In-memory SF pools freely: concurrent borrows succeed up to `pool_max`.
     let b2 = db
         .borrow_column_sender()
         .expect("b2 (in-memory SF pools freely)");
@@ -1646,15 +2188,17 @@ fn direct_and_main_pools_are_independent() {
 
 #[test]
 fn direct_pool_is_direct_even_when_sf_dir_is_set() {
-    // With `sf_dir` the main pool is store-and-forward (single active
-    // borrower). The direct pool must still hand out a plain direct sender,
-    // from its own free list, so a direct borrow co-exists with the single
-    // SFA borrow.
-    let server = MockServer::spawn(4);
+    // With `sf_dir` the main pool is disk-backed store-and-forward. The direct
+    // pool must still hand out a plain direct sender from its own free list, so
+    // direct borrows co-exist with multiple SFA main-pool borrows.
+    let server = MockServer::spawn(6);
     let dir = TempDir::new().unwrap();
     let conf = conf_for_endpoints(
         &[server.port()],
-        &format!("sf_dir={};pool_reap=manual;", dir.path().display()),
+        &format!(
+            "sf_dir={};sender_id=directmix;pool_max=2;pool_reap=manual;",
+            dir.path().display()
+        ),
     );
     let db = QuestDb::connect(&conf).unwrap();
 
@@ -1663,9 +2207,14 @@ fn direct_pool_is_direct_even_when_sf_dir_is_set() {
         main.is_store_and_forward(),
         "with sf_dir the main pool must be store-and-forward"
     );
-    // The main pool is single-borrower in SFA mode.
-    let err = db.borrow_column_sender().expect_err("second main borrow");
-    assert!(err.msg().contains("store-and-forward"), "{}", err.msg());
+    let main2 = db
+        .borrow_column_sender()
+        .expect("second main SFA borrow gets its own slot");
+    assert!(main2.is_store_and_forward());
+    assert_eq!(
+        sorted_slot_names(dir.path()),
+        vec!["directmix-col-0", "directmix-col-1"]
+    );
 
     // The direct pool is unaffected: it yields a direct sender concurrently.
     let direct = db
@@ -1678,6 +2227,7 @@ fn direct_pool_is_direct_even_when_sf_dir_is_set() {
     assert_eq!(db.direct_in_use_count(), 1);
 
     drop(direct);
+    drop(main2);
     drop(main);
     drop(db);
 }
@@ -1713,7 +2263,7 @@ fn row_sender_pool_borrows_recycles_and_caps() {
     let server = MockServer::spawn_acking(16);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-    // The row-sender pool is lazy: nothing exists until the first borrow.
+    // Without disk-SF recovery, nothing exists until the first row borrow.
     assert_eq!(db.row_sender_free_count(), 0);
     assert_eq!(db.row_sender_in_use_count(), 0);
 
@@ -1980,11 +2530,76 @@ fn manual_reap_closes_idle_row_senders() {
 }
 
 #[test]
+fn reaper_keeps_undelivered_recovery_row_sender() {
+    let dir = TempDir::new().unwrap();
+    seed_async_qwp_ws_slot(dir.path(), "rowreap-row-0", 77);
+
+    let (_server, release, frames) = MockServer::spawn_ack_when_released_capturing(1);
+    let conf = conf_for_endpoints(
+        &[_server.port()],
+        &format!(
+            "sf_dir={};sender_id=rowreap;pool_size=1;pool_max=1;\
+             pool_idle_timeout_ms=1;pool_reap=manual;close_flush_timeout_millis=2000;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("recovery row frame reaches mock server");
+    assert_eq!(frame_table_name(&payload), "legacy");
+    assert!(
+        wait_until(Duration::from_secs(2), || db.row_sender_free_count() == 1),
+        "pre-opened row recovery sender should park in the free list"
+    );
+
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(db.reap_idle(), 0, "undelivered row sender must stay parked");
+    assert_eq!(db.row_sender_free_count(), 1);
+
+    release.store(true, Ordering::SeqCst);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            db.reap_idle();
+            db.row_sender_free_count() == 0
+        }),
+        "row sender should become reapable after the held ack is released"
+    );
+}
+
+#[test]
+fn disk_store_and_forward_restart_preopens_dirty_row_slot() {
+    let dir = TempDir::new().unwrap();
+    seed_async_qwp_ws_slot(dir.path(), "rowrec-row-0", 55);
+
+    let (server, frames) = MockServer::spawn_acking_capturing(1);
+    let conf = conf_for_endpoints(
+        &[server.port()],
+        &format!(
+            "sf_dir={};sender_id=rowrec;pool_size=1;pool_max=1;\
+             pool_reap=manual;max_background_drainers=1;close_flush_timeout_millis=0;",
+            dir.path().display()
+        ),
+    );
+    let db = QuestDb::connect(&conf).unwrap();
+
+    let payload = frames
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dirty row slot should replay during connect-time pre-open");
+    assert_eq!(frame_table_name(&payload), "legacy");
+    assert!(
+        wait_until(Duration::from_secs(2), || db.row_sender_free_count() == 1),
+        "pre-opened row recovery sender should park in the free list"
+    );
+}
+
+#[test]
 fn row_sender_pool_grows_and_reuses_physical_connections() {
     let server = MockServer::spawn_acking(16);
     let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
 
-    // Lazy pools: `connect` opens nothing.
+    // Without disk-SF recovery, `connect` opens nothing.
     assert_eq!(server.accepted(), 0);
 
     // Three concurrent row borrows each open a fresh connection.
@@ -4026,7 +4641,7 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(8);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=2;")).unwrap();
 
-        // All pools are lazy, so the reader pool starts empty.
+        // The reader pool starts empty; it has no disk-SF recovery pre-open.
         assert_eq!(db.reader_free_count(), 0);
         assert_eq!(db.reader_in_use_count(), 0);
 
@@ -4077,7 +4692,7 @@ mod reader_pool {
         let server = ReaderMockServer::spawn(16);
         let db = QuestDb::connect(&conf_for(server.port(), "pool_size=1;pool_max=4;")).unwrap();
 
-        // Lazy pools: `connect` opens nothing.
+        // Without disk-SF recovery, `connect` opens nothing.
         assert_eq!(server.accepted(), 0);
 
         // Three concurrent reader borrows each open a fresh connection.

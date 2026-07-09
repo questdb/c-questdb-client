@@ -58,12 +58,13 @@ use super::qwp_ws_driver::{
     reconnect_error_is_terminal, reconnect_sleep_duration, retry_budget_exhausted_error,
 };
 use super::qwp_ws_orphan::{
-    ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
+    ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, is_candidate_orphan,
+    scan_orphan_slots,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsReplayEncoder, qwp_ws_encoded_message_size_error};
 use super::qwp_ws_queue::OutboundFrame;
-use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView};
+use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer, SfaProgressView, SfaQueueError};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
 // ---------- transport ----------
@@ -1511,12 +1512,26 @@ fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQu
             max_bytes,
             max_in_flight,
         })
-        .map_err(|err| {
-            error::fmt!(
+        .map_err(|err| match err {
+            SfaQueueError::SlotInUse { slot_dir, holder } => crate::Error::new(
+                if qwp_ws.pool_managed_slot {
+                    crate::ErrorCode::ConfigError
+                } else {
+                    crate::ErrorCode::SocketError
+                },
+                format!(
+                    "QWP/WebSocket store-and-forward slot is already in use \
+                     [slot={}, holder={}]. Another process or pool holds this \
+                     slot; use a unique sender_id per producer.",
+                    slot_dir.display(),
+                    holder
+                ),
+            ),
+            err => error::fmt!(
                 SocketError,
                 "Could not open QWP/WebSocket Store-and-Forward queue: {:?}",
                 err
-            )
+            ),
         });
     }
 
@@ -2882,13 +2897,25 @@ pub(crate) fn connect_qwp_ws_background_state(
 }
 
 fn orphan_candidates(qwp_ws: &QwpWsConfig) -> Vec<std::path::PathBuf> {
-    if !*qwp_ws.drain_orphans {
-        return Vec::new();
-    }
     let Some(sf_dir) = qwp_ws.sf_dir.as_ref() else {
         return Vec::new();
     };
-    scan_orphan_slots(sf_dir, qwp_ws.sender_id.as_str())
+    let mut candidates = if *qwp_ws.drain_orphans {
+        scan_orphan_slots(
+            sf_dir,
+            qwp_ws.sender_id.as_str(),
+            &qwp_ws.orphan_exclude_managed_slots,
+        )
+    } else {
+        Vec::new()
+    };
+    let own_slot = sf_dir.join(qwp_ws.sender_id.as_str());
+    for slot in &qwp_ws.orphan_extra_slots {
+        if slot != &own_slot && is_candidate_orphan(slot) && !candidates.iter().any(|s| s == slot) {
+            candidates.push(slot.clone());
+        }
+    }
+    candidates
 }
 
 #[allow(clippy::too_many_arguments)]
