@@ -1915,7 +1915,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 self._write_row(sender, table_name, 0)
                 fsn = sender.flush_and_get_fsn()
                 self.assertEqual(fsn, 0)
-                sender.wait(1)  # AckLevel::Durable
+                sender.wait(0)  # AckLevel::Ok
                 self.assertEqual(sender.acked_fsn(), fsn)
                 sender.close_drain()
             finally:
@@ -1964,7 +1964,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
                 third_fsn = sender.flush_and_get_fsn()
                 self.assertEqual(third_fsn, 2)
 
-                sender.wait(1)  # AckLevel::Durable
+                sender.wait(0)  # AckLevel::Ok
                 sender.close_drain()
             finally:
                 sender.close(False)
@@ -2020,7 +2020,7 @@ class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
 
                 self.assertEqual((first_fsn, rejected_fsn, final_fsn), (0, 1, 2))
                 with self.assertRaises(qls.SenderError) as ctx:
-                    sender.wait(1)  # AckLevel::Durable
+                    sender.wait(0)  # AckLevel::Ok
                 diagnostic = ctx.exception.qwp_ws_error
                 if diagnostic is None:
                     diagnostic = self._retry_poll_qwp_ws_error(sender)

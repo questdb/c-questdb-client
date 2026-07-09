@@ -94,6 +94,7 @@ fn main() {
 struct State {
     sender: Option<Sender>,
     buf: Option<Buffer>,
+    request_durable_ack: bool,
 }
 
 impl State {
@@ -106,6 +107,7 @@ impl State {
             let _ = s.close_drain();
         }
         self.buf = None;
+        self.request_durable_ack = false;
     }
 }
 
@@ -123,6 +125,7 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             state.close_quietly();
             let sender = Sender::from_conf(rest).map_err(|e| e.to_string())?;
             let buf = sender.new_buffer();
+            state.request_durable_ack = request_durable_ack_enabled(rest);
             state.sender = Some(sender);
             state.buf = Some(buf);
             reply_ok(out, "")
@@ -194,7 +197,12 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
             let timeout_ms: u64 = parts[1]
                 .parse()
                 .map_err(|_| "invalid timeout_ms".to_string())?;
-            match sender.wait(AckLevel::Durable, Duration::from_millis(timeout_ms)) {
+            let ack_level = if state.request_durable_ack {
+                AckLevel::Durable
+            } else {
+                AckLevel::Ok
+            };
+            match sender.wait(ack_level, Duration::from_millis(timeout_ms)) {
                 Ok(()) => reply_ok(out, "true"),
                 Err(e)
                     if e.code() == questdb::ErrorCode::FailoverRetry
@@ -258,6 +266,16 @@ fn handle(line: &str, state: &mut State, out: &mut impl Write) -> Result<(), Str
         }
         _ => Err(format!("unknown verb: {verb}")),
     }
+}
+
+fn request_durable_ack_enabled(conf: &str) -> bool {
+    conf.split(';').any(|part| {
+        let Some((key, value)) = part.split_once('=') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("request_durable_ack")
+            && matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "true")
+    })
 }
 
 fn reply_ok(out: &mut impl Write, payload: &str) -> Result<(), String> {

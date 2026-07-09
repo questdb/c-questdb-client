@@ -460,8 +460,7 @@ bool row_sender_flush(
  * `ack_level` carries a `qwpws_ack_level_*` constant. An out-of-range value,
  * or `qwpws_ack_level_durable` without `request_durable_ack=on`, returns
  * `line_sender_error_invalid_api_call` before the buffer is touched, matching
- * `column_sender_flush_and_wait`. (A standalone `row_sender_wait` instead
- * degrades durable to plain acceptance on a non-durable connection.)
+ * `column_sender_flush_and_wait`.
  * The wait uses the pool-wide `request_timeout` no-progress deadline; compose
  * `row_sender_flush` + `row_sender_wait` to choose a per-call timeout.
  *
@@ -560,6 +559,9 @@ bool row_sender_acked_fsn(
  *
  * `timeout_millis` is a no-progress deadline (it fires only if the ack
  * watermark fails to advance for that long); `0` waits indefinitely.
+ * `qwpws_ack_level_durable` requires `request_durable_ack=on`; otherwise this
+ * returns `line_sender_error_invalid_api_call` even when nothing has been
+ * published.
  * On timeout the frames remain queued and the background runner keeps
  * delivering them, so recover by calling `row_sender_wait` again, or by
  * observing the FSN watermark, rather than re-flushing the same data.

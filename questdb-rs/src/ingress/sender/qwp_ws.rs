@@ -185,6 +185,7 @@ pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
+    pub(crate) request_durable_ack: bool,
     orphan_pool: Option<OrphanDrainerPool>,
     close_drain_timeout: Duration,
 }
@@ -194,6 +195,7 @@ pub(crate) struct ManualQwpWsHandlerState {
     store: QwpWsPublicationStore<SfaSlotQueue>,
     send_core: QwpWsSendCore<BlockingQwpWsTransport>,
     pub(crate) server_max_batch_size: Arc<AtomicUsize>,
+    pub(crate) request_durable_ack: bool,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
     close_drain_timeout: Duration,
@@ -2891,6 +2893,7 @@ pub(crate) fn connect_qwp_ws_background_state(
         encoder,
         runner,
         server_max_batch_size,
+        request_durable_ack: *qwp_ws.request_durable_ack,
         orphan_pool,
         close_drain_timeout: *qwp_ws.close_flush_timeout,
     })
@@ -2955,6 +2958,7 @@ pub(crate) fn open_manual_qwp_ws(
         store: parts.store,
         send_core: parts.send_core,
         server_max_batch_size,
+        request_durable_ack: *qwp_ws.request_durable_ack,
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
         close_drain_timeout: *qwp_ws.close_flush_timeout,

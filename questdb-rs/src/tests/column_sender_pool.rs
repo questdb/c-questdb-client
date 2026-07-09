@@ -4468,7 +4468,7 @@ fn flush_arrow_batch_durable_without_opt_in_is_rejected() {
 
     // The connect string did not set `request_durable_ack=on`, so a
     // caller-named `Durable` level must be rejected up front rather than
-    // silently downgraded.
+    // accepted without durable opt-in.
     let (server, _frames) = MockServer::spawn_acking_capturing(1);
     let db = QuestDb::connect(&format!("qwpws::addr=127.0.0.1:{};", server.port())).unwrap();
 

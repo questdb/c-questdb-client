@@ -1279,6 +1279,68 @@ fn qwp_ws_max_buf_size_rejects_oversized_replay_frame_in_all_progress_modes() {
     }
 }
 
+fn assert_durable_ack_without_opt_in(err: crate::Error, mode: ProgressCase) {
+    assert_eq!(
+        err.code(),
+        ErrorCode::InvalidApiCall,
+        "mode={}",
+        mode.name()
+    );
+    assert_eq!(
+        err.msg(),
+        "AckLevel::Durable requires the pool to be opened with \
+         `request_durable_ack=on` in the connect string.",
+        "mode={}",
+        mode.name()
+    );
+}
+
+#[test]
+fn qwp_ws_wait_durable_without_opt_in_fails_with_no_published_frames_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let port = spawn_upgrade_only_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .expect_err("durable wait without opt-in must fail before the empty-stream shortcut");
+        assert_durable_ack_without_opt_in(err, progress);
+        assert_eq!(sender.published_fsn().unwrap(), None);
+    }
+}
+
+#[test]
+fn qwp_ws_wait_durable_without_opt_in_fails_after_ok_ack_in_all_progress_modes() {
+    for progress in [ProgressCase::Background, ProgressCase::Manual] {
+        let (port, rx) = spawn_mock_server();
+        let mut sender = build_qwp_ws_sender(progress, port);
+
+        let mut buf = sender.new_buffer();
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 7)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+        sender
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
+        assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+
+        let err = sender
+            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .expect_err("durable wait without opt-in must fail after OK coverage too");
+        assert_durable_ack_without_opt_in(err, progress);
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.received_frames.len(), 1, "mode={}", progress.name());
+    }
+}
+
 #[test]
 fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
     for progress in [ProgressCase::Background, ProgressCase::Manual] {
@@ -1301,7 +1363,7 @@ fn qwp_ws_publish_ack_completes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
         assert!(buf.is_empty(), "mode={}", progress.name());
         sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
         assert_eq!(sender.published_fsn().unwrap(), Some(fsn));
         assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
@@ -1334,7 +1396,7 @@ fn qwp_ws_schema_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
 
         let err = sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ServerRejection);
         assert!(
@@ -1391,7 +1453,7 @@ fn qwp_ws_terminal_reject_terminalizes_in_all_progress_modes() {
         assert_eq!(fsn, 0, "mode={}", progress.name());
 
         let err = sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::ServerRejection);
         assert!(
@@ -1944,7 +2006,7 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
     assert_eq!(&frames[1][0..4], b"QWP1");
 
     sender
-        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
         .unwrap();
     assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 }
@@ -2789,7 +2851,7 @@ fn qwp_ws_schema_rejection_terminalizes_and_notifies_handler() {
     let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(received_frames.len(), 1);
     let err = sender
-        .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+        .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
         .unwrap_err();
     assert_eq!(err.code(), ErrorCode::ServerRejection);
     assert_eq!(
@@ -3478,7 +3540,7 @@ fn qwp_ws_reconnects_and_replays_in_all_progress_modes() {
 
         sender.flush_and_get_fsn(&mut buf).unwrap();
         sender
-            .wait(crate::ingress::AckLevel::Durable, Duration::from_secs(5))
+            .wait(crate::ingress::AckLevel::Ok, Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("mode={}: {e}", progress.name()));
 
         // Both wire dumps should be identical QWP messages — replay re-encodes

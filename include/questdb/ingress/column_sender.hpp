@@ -1396,6 +1396,8 @@ public:
      * sender reaches `level` — `flush()` followed by `wait()` in one call.
      * The wait is bounded by the pool-wide `request_timeout` setting; compose
      * `flush()` + `wait()` to choose a per-call timeout instead.
+     * `qwpws_ack_level::durable` requires `request_durable_ack=on`; otherwise
+     * this throws `invalid_api_call` before the buffer is touched.
      * @throws line_sender_error on failure.
      */
     void flush_and_wait(
@@ -1495,9 +1497,11 @@ public:
      * for durability. `timeout` is a no-progress deadline (it fires only if
      * the ack watermark fails to advance for that long); the default of zero
      * waits indefinitely. Mirrors `column_sender_view::wait` and Rust's
-     * `Sender::wait`. If it times out, the frames remain queued; retry
-     * `wait()` or keep observing the watermark instead of re-flushing the same
-     * data.
+     * `Sender::wait`. `qwpws_ack_level::durable` requires
+     * `request_durable_ack=on`; otherwise this throws `invalid_api_call` even
+     * when nothing has been published. If it times out, the frames remain
+     * queued; retry `wait()` or keep observing the watermark instead of
+     * re-flushing the same data.
      * @throws line_sender_error on failure.
      */
     void wait(

@@ -637,9 +637,9 @@ impl Sender {
     ///
     /// * [`AckLevel::Ok`] waits for the server to accept every published
     ///   frame.
-    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. When the
-    ///   connection did not negotiate durable acks this watermark advances on
-    ///   ordinary acceptance, so it behaves like [`AckLevel::Ok`].
+    /// * [`AckLevel::Durable`] waits for durable-ACK coverage. It requires the
+    ///   sender to be opened with `request_durable_ack=on`; otherwise the call
+    ///   is rejected before checking whether any frame has been published.
     ///
     /// `timeout` is a **no-progress** deadline: it fires only if the ack
     /// watermark fails to advance for that long, so a steadily-progressing
@@ -651,8 +651,8 @@ impl Sender {
     /// A terminal server rejection of a frame in the pending range, or a
     /// terminal transport/protocol failure, is returned as an error. Retriable
     /// server rejections reconnect and replay until the frame is acknowledged or
-    /// the sender is stopped. When nothing has been published yet it returns
-    /// immediately. QWP/WebSocket only; other
+    /// the sender is stopped. When nothing has been published yet, a valid wait
+    /// returns immediately. QWP/WebSocket only; other
     /// protocols return `InvalidApiCall`. In manual progress mode this also
     /// drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -665,6 +665,21 @@ impl Sender {
                 InvalidApiCall,
                 "wait is only supported for QWP/WebSocket senders."
             ));
+        }
+
+        if ack_level == AckLevel::Durable {
+            let request_durable_ack = match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => state.request_durable_ack,
+                SyncProtocolHandler::ManualQwpWs(state) => state.request_durable_ack,
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            };
+            if !request_durable_ack {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "AckLevel::Durable requires the pool to be opened with \
+                     `request_durable_ack=on` in the connect string."
+                ));
+            }
         }
 
         let Some(boundary) = self.published_fsn()? else {
@@ -703,9 +718,7 @@ impl Sender {
 
     /// Completion watermark for `ack_level` across both QWP/WebSocket progress
     /// modes. `Ok` tracks server acceptance; `Durable` tracks durable-ACK
-    /// coverage (which collapses onto acceptance in manual progress mode and
-    /// on connections without durable acks). Terminal failures surface here as
-    /// an `Err`.
+    /// coverage. Terminal failures surface here as an `Err`.
     #[cfg(feature = "sync-sender-qwp-ws")]
     fn qwp_ws_completed_fsn(&self, ack_level: AckLevel) -> Result<Option<u64>> {
         match (&self.handler, ack_level) {

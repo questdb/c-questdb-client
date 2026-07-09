@@ -2297,9 +2297,7 @@ impl<'a> BorrowedRowSender<'a> {
     /// `AckLevel::Durable` requires the pool to be opened with
     /// `request_durable_ack=on`; otherwise the call is rejected up front
     /// (`InvalidApiCall`) before the buffer is touched, matching
-    /// [`BorrowedColumnSender::flush_and_wait`]. (A standalone [`Self::wait`]
-    /// instead degrades durable to plain acceptance on a non-durable
-    /// connection.)
+    /// [`BorrowedColumnSender::flush_and_wait`].
     ///
     /// On a flush failure the buffer is retained. After publication, only the
     /// no-progress timeout ([`ErrorCode::FailoverRetry`](crate::ErrorCode))
@@ -2374,7 +2372,9 @@ impl<'a> BorrowedRowSender<'a> {
     /// Prefer this over FSN polling unless you need to keep publishing or doing
     /// other work while ACKs arrive. If it times out, the frames remain queued;
     /// retry `wait()` or keep observing the watermark rather than re-flushing
-    /// the same data.
+    /// the same data. `AckLevel::Durable` requires the pool to have been opened
+    /// with `request_durable_ack=on`; otherwise the call is rejected even when
+    /// no frames have been published.
     pub fn wait(&mut self, ack_level: AckLevel, timeout: Duration) -> Result<()> {
         self.sender_mut().wait(ack_level, timeout)
     }
