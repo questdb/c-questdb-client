@@ -84,6 +84,18 @@ typedef struct questdb_db questdb_db;
  *  store-and-forward queue owns delivery. */
 typedef struct column_sender column_sender;
 
+/** Borrowed direct (pipelined, non-store-and-forward) column-major QWP/WS
+ *  sender from the always-direct pool, independent of `sf_dir`. Not
+ *  thread-safe; belongs to the borrowing thread until returned via
+ *  `questdb_db_return_direct_column_sender`.
+ *
+ *  Exposes publish-only `direct_column_sender_flush`, the
+ *  `direct_column_sender_commit` boundary, and the Arrow batch variants.
+ *  There is no internal failover: on a transient
+ *  `line_sender_error_failover_retry` the caller drops the sender, re-borrows
+ *  a live one, and re-drives the uncommitted tail from its own source. */
+typedef struct direct_column_sender direct_column_sender;
+
 /** Borrowed row-major QWP/WS sender. Not thread-safe; belongs to the
  *  borrowing thread until returned via `questdb_db_return_row_sender`.
  *  Builds rows through an ordinary `line_sender_buffer` and sends them with
@@ -252,6 +264,61 @@ QUESTDB_CLIENT_API
 void questdb_db_drop_column_sender(
     questdb_db* db,
     column_sender* sender);
+
+/**
+ * Borrow a direct (pipelined, non-store-and-forward) column-major sender from
+ * the always-direct pool, independent of `sf_dir`. Same selection rules as
+ * `questdb_db_borrow_column_sender`, applied to the direct pool's free list
+ * and `pool_max` cap.
+ */
+QUESTDB_CLIENT_API
+direct_column_sender* questdb_db_borrow_direct_column_sender(
+    questdb_db* db,
+    line_sender_error** err_out);
+
+/**
+ * Like `questdb_db_borrow_direct_column_sender` but retries the connect within
+ * `budget_ms` using the row sender's reconnect backoff (centered-jittered
+ * exponential with a role-reject reset; authentication and protocol-version
+ * errors are terminal). `budget_ms == 0` makes a single attempt. Returns NULL
+ * on failure and sets `*err_out` if provided.
+ */
+QUESTDB_CLIENT_API
+direct_column_sender* questdb_db_borrow_direct_column_sender_with_retry(
+    questdb_db* db,
+    uint64_t budget_ms,
+    line_sender_error** err_out);
+
+/**
+ * Return a direct sender to the pool. Accepts NULL `sender` and no-ops.
+ * Invalidates the `sender` pointer. If the sender has latched terminal state,
+ * or if the pool has been closed, it is closed instead of recycled. A sender
+ * returned with uncommitted pipelined frames has them committed best-effort.
+ *
+ * Mutually exclusive with `questdb_db_drop_direct_column_sender` on the same
+ * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
+ */
+QUESTDB_CLIENT_API
+void questdb_db_return_direct_column_sender(
+    questdb_db* db,
+    direct_column_sender* sender);
+
+/**
+ * Force-drop a borrowed direct sender instead of recycling it. Invalidates
+ * `sender`. Accepts NULL and no-ops.
+ *
+ * Use this after a failure that may have left in-doubt or uncommitted frames
+ * on the connection; otherwise a later borrower could commit those frames
+ * together with its own batch. Uncommitted frames are discarded with the
+ * connection — the caller re-drives them from its own source.
+ *
+ * Mutually exclusive with `questdb_db_return_direct_column_sender` on the same
+ * `sender`: call exactly one of the two. Calling both (or either twice) is UB.
+ */
+QUESTDB_CLIENT_API
+void questdb_db_drop_direct_column_sender(
+    questdb_db* db,
+    direct_column_sender* sender);
 
 /* Reader-pool entry points (`questdb_db_borrow_reader`,
  * `questdb_db_return_reader`, `questdb_db_dbg_reader_*_count`) live in
@@ -1454,6 +1521,33 @@ bool column_sender_wait(
     uint64_t timeout_millis,
     line_sender_error** err_out);
 
+/**
+ * Pipeline a deferred frame on a direct connection. Not committed until
+ * `direct_column_sender_commit`. On success the chunk is cleared for reuse.
+ *
+ * A transient transport failure reports `line_sender_error_failover_retry`;
+ * check `line_sender_error_in_doubt` to tell provably-not-delivered (retry
+ * with the same chunk on a fresh sender) from delivery-unknown (re-drive from
+ * the source instead).
+ */
+QUESTDB_CLIENT_API
+bool direct_column_sender_flush(
+    direct_column_sender* sender,
+    column_sender_chunk* chunk,
+    line_sender_error** err_out);
+
+/**
+ * Direct commit: send the commit boundary for all pipelined frames and block
+ * until they reach `ack_level` (a `qwpws_ack_level_*` constant). The direct
+ * sender's durability checkpoint; the connection `request_timeout` bounds the
+ * no-progress wait.
+ */
+QUESTDB_CLIENT_API
+bool direct_column_sender_commit(
+    direct_column_sender* sender,
+    uint32_t ack_level,
+    line_sender_error** err_out);
+
 #ifdef QUESTDB_CLIENT_ENABLE_ARROW
 
 /**
@@ -1590,6 +1684,39 @@ bool column_sender_flush_arrow_batch_at_now_and_wait(
 QUESTDB_CLIENT_API
 bool column_sender_flush_arrow_batch_at_column(
     column_sender* sender,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    line_sender_column_name ts_column,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_error** err_out);
+
+/**
+ * `column_sender_flush_arrow_batch_at_now` on a direct sender: pipeline the
+ * batch as a deferred frame, not committed until `direct_column_sender_commit`.
+ * Same Arrow ownership contract: `array->release` is consumed on success and
+ * re-exported on a provably-not-delivered failure
+ * (`line_sender_error_failover_retry` with `line_sender_error_in_doubt ==
+ * false`); callers MUST check `array->release != NULL` on the failure path.
+ */
+QUESTDB_CLIENT_API
+bool direct_column_sender_flush_arrow_batch_at_now(
+    direct_column_sender* sender,
+    line_sender_table_name table,
+    struct ArrowArray* array,
+    const struct ArrowSchema* schema,
+    const column_sender_arrow_override* overrides,
+    size_t overrides_len,
+    line_sender_error** err_out);
+
+/**
+ * `direct_column_sender_flush_arrow_batch_at_now` with each row's designated
+ * timestamp sourced from the named `Timestamp(_)` column inside the batch.
+ */
+QUESTDB_CLIENT_API
+bool direct_column_sender_flush_arrow_batch_at_column(
+    direct_column_sender* sender,
     line_sender_table_name table,
     struct ArrowArray* array,
     const struct ArrowSchema* schema,
