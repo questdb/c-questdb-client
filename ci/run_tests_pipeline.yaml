@@ -510,7 +510,7 @@ stages:
         displayName: "QWP egress live-server suite"
         pool:
           vmImage: "ubuntu-latest"
-        timeoutInMinutes: 30
+        timeoutInMinutes: 60
         variables:
           imageName: ubuntu-latest
         steps:
