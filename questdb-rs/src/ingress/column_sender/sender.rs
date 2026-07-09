@@ -66,6 +66,12 @@ enum FrameOutcome {
     /// the wire, so the caller may split the row range and retry. Carries the
     /// detailed size error so the split floor can surface exact byte counts.
     TooLarge(crate::Error),
+    /// The deferred window is full before any byte reached the wire. The
+    /// top-level flush surfaces this as the explicit "call sync()" contract;
+    /// a split consumes it internally (commit the published prefix, drain,
+    /// retry the range) since its extra frames are an implementation detail
+    /// the caller cannot account for.
+    NoSlot(crate::Error),
 }
 
 /// Outcome of appending a single frame on the store-and-forward backend.
@@ -794,6 +800,7 @@ impl DirectColumnBackend {
         // deferred so the chunk still commits atomically at one boundary.
         match self.publish_frame(chunk, None, defer_commit)? {
             FrameOutcome::Published => {}
+            FrameOutcome::NoSlot(err) => return Err(FlushFailure::NotDelivered(err)),
             FrameOutcome::TooLarge(err) => {
                 let row_count = chunk.row_count();
                 match split_mid(row_count) {
@@ -841,7 +848,7 @@ impl DirectColumnBackend {
         defer_commit: bool,
     ) -> std::result::Result<FrameOutcome, FlushFailure> {
         if defer_commit && !self.conn.has_sync_commit_slot() {
-            return Err(FlushFailure::NotDelivered(error::fmt!(
+            return Ok(FrameOutcome::NoSlot(error::fmt!(
                 InvalidApiCall,
                 "column sender deferred flush capacity exhausted; call sync() \
                  before flushing more chunks."
@@ -908,8 +915,23 @@ impl DirectColumnBackend {
         row_count: usize,
         defer_commit: bool,
     ) -> std::result::Result<(), FlushFailure> {
-        match self.publish_frame(chunk, Some((row_offset, row_count)), defer_commit)? {
+        let outcome =
+            match self.publish_frame(chunk, Some((row_offset, row_count)), defer_commit)? {
+                FrameOutcome::NoSlot(_) => {
+                    // The deferred window filled mid-split. The extra frames are
+                    // an internal detail the caller cannot budget for, so commit
+                    // the published prefix to drain the window and retry this
+                    // range — rows are split whole, so the early-committed prefix
+                    // rows are complete.
+                    self.sync(AckLevel::Ok)
+                        .map_err(FlushFailure::DeliveryUnknown)?;
+                    self.publish_frame(chunk, Some((row_offset, row_count)), defer_commit)?
+                }
+                outcome => outcome,
+            };
+        match outcome {
             FrameOutcome::Published => Ok(()),
+            FrameOutcome::NoSlot(err) => Err(FlushFailure::NotDelivered(err)),
             FrameOutcome::TooLarge(err) => match split_mid(row_count) {
                 Some(mid) => {
                     self.publish_split(chunk, row_offset, mid, true)?;
@@ -955,6 +977,7 @@ impl DirectColumnBackend {
         // at one boundary.
         match self.publish_arrow_frame(&spec, None, defer_commit)? {
             FrameOutcome::Published => {}
+            FrameOutcome::NoSlot(err) => return Err(FlushFailure::NotDelivered(err)),
             FrameOutcome::TooLarge(err) => {
                 let row_count = batch.num_rows();
                 match split_mid(row_count) {
@@ -993,7 +1016,7 @@ impl DirectColumnBackend {
         defer_commit: bool,
     ) -> std::result::Result<FrameOutcome, FlushFailure> {
         if defer_commit && !self.conn.has_sync_commit_slot() {
-            return Err(FlushFailure::NotDelivered(error::fmt!(
+            return Ok(FrameOutcome::NoSlot(error::fmt!(
                 InvalidApiCall,
                 "column sender deferred flush capacity exhausted; call sync() \
                  before flushing more arrow batches."
@@ -1057,8 +1080,20 @@ impl DirectColumnBackend {
         row_count: usize,
         defer_commit: bool,
     ) -> std::result::Result<(), FlushFailure> {
-        match self.publish_arrow_frame(spec, Some((row_offset, row_count)), defer_commit)? {
+        let outcome =
+            match self.publish_arrow_frame(spec, Some((row_offset, row_count)), defer_commit)? {
+                FrameOutcome::NoSlot(_) => {
+                    // Same mid-split drain as `publish_split`: commit the
+                    // published prefix and retry this range.
+                    self.sync(AckLevel::Ok)
+                        .map_err(FlushFailure::DeliveryUnknown)?;
+                    self.publish_arrow_frame(spec, Some((row_offset, row_count)), defer_commit)?
+                }
+                outcome => outcome,
+            };
+        match outcome {
             FrameOutcome::Published => Ok(()),
+            FrameOutcome::NoSlot(err) => Err(FlushFailure::NotDelivered(err)),
             FrameOutcome::TooLarge(err) => match split_mid(row_count) {
                 Some(mid) => {
                     self.publish_arrow_split(spec, row_offset, mid, true)?;

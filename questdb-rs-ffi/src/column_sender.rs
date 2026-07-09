@@ -3575,19 +3575,19 @@ unsafe fn arrow_batch_impl<T: CsHandle>(
     match result {
         Ok(()) => true,
         Err(err) => {
-            // A transient (reconnectable) failure must leave the caller's
-            // `array` intact so it can drop+re-borrow a live sender and retry
-            // with the same data. The import already consumed `array->release`,
+            // A provably-not-delivered failure must leave the caller's
+            // `array` intact so it can retry with the same data (on a fresh
+            // sender for a transient error, after a commit for a deferred-
+            // capacity error). The import already consumed `array->release`,
             // so we re-export the still-live `RecordBatch` back into `*array`
             // (matching the caller's retained `schema` shape), restoring a
-            // valid release. A terminal error consumes the array as before (the
-            // data is unusable on any sender).
+            // valid release.
             //
-            // `FailoverRetry` alone is not sufficient: a direct-mode partial
-            // write fails mid-frame with `FailoverRetry` yet is delivery-
-            // unknown (`in_doubt`), so re-exporting it would invite a duplicate-
-            // causing retry. Re-export only a provably-not-delivered failure.
-            if err.code() == ErrorCode::FailoverRetry && !err.in_doubt() {
+            // `in_doubt` carries the delivery classification: a direct-mode
+            // partial write fails mid-frame delivery-unknown (`in_doubt`),
+            // and re-exporting it would invite a duplicate-causing retry —
+            // that is the one case that must consume the array.
+            if !err.in_doubt() {
                 unsafe { reexport_record_batch_into(rb, array, schema) };
             }
             unsafe { set_err_out_from_error(err_out, err) };
@@ -3665,7 +3665,7 @@ unsafe fn arrow_batch_impl_and_get_fsn(
             true
         }
         Err(err) => {
-            if err.code() == ErrorCode::FailoverRetry && !err.in_doubt() {
+            if !err.in_doubt() {
                 unsafe { reexport_record_batch_into(rb, array, schema) };
             }
             unsafe { set_err_out_from_error(err_out, err) };

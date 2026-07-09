@@ -536,11 +536,20 @@ impl QwpWsConnector {
             &self.qwp_ws,
             self.auth_header.as_deref(),
         )?;
+        // The per-frame cap is the negotiated one: the configured
+        // max_buf_size clamped to the server's advertised
+        // X-QWP-Max-Batch-Size (0 = not advertised), matching the row
+        // sender's effective_qwp_ws_max_buf_size.
+        let max_buf_size = if connected.server_max_batch_size > 0 {
+            self.max_buf_size.min(connected.server_max_batch_size)
+        } else {
+            self.max_buf_size
+        };
         Ok(RawQwpWsRoundStream {
             endpoint_idx: connected.endpoint_idx,
             stream: connected.stream,
             leftover: connected.leftover,
-            max_buf_size: self.max_buf_size,
+            max_buf_size,
             request_timeout: *self.qwp_ws.request_timeout,
             durable_ack_opt_in: *self.qwp_ws.request_durable_ack,
         })
