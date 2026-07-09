@@ -2156,8 +2156,8 @@ fn qwp_ws_manual_orphan_drainer_walks_endpoint_list() {
 
     let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let bad_port = bad_listener.local_addr().unwrap().port();
-    drop(bad_listener);
     let (port, rx) = spawn_manual_orphan_drain_server();
+    drop(bad_listener);
     let drain_conf = format!(
         "qwpws::addr=127.0.0.1:{bad_port},127.0.0.1:{port};qwp_ws_progress=manual;\
          sf_dir={};sender_id=primary;drain_orphans=on;\
@@ -3706,10 +3706,10 @@ fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
 fn qwp_ws_initial_connect_walks_endpoint_list_in_off_mode() {
     let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let bad_port = bad_listener.local_addr().unwrap().port();
-    drop(bad_listener);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let good_port = listener.local_addr().unwrap().port();
+    drop(bad_listener);
     let (payload_tx, payload_rx) = mpsc::channel();
 
     thread::spawn(move || {

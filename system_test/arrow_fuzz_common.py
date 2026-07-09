@@ -160,10 +160,32 @@ def temp_sf_dir(prefix: str = "arrow_"):
         shutil.rmtree(d, ignore_errors=True)
 
 def sfa_file_count(sf_dir: str, sender_id: str) -> int:
-    slot_dir = os.path.join(sf_dir, sender_id)
-    if not os.path.isdir(slot_dir):
+    def is_pool_column_slot(name: str) -> bool:
+        prefix = f"{sender_id}-col-"
+        if not name.startswith(prefix):
+            return False
+        suffix = name[len(prefix):]
+        return bool(suffix) and suffix.isdecimal() and (
+            suffix == "0" or not suffix.startswith("0")
+        )
+
+    if not os.path.isdir(sf_dir):
         return 0
-    return sum(1 for name in os.listdir(slot_dir) if name.endswith(".sfa"))
+
+    slot_names = {sender_id}
+    slot_names.update(os.listdir(sf_dir))
+
+    total = 0
+    for name in slot_names:
+        if name != sender_id and not is_pool_column_slot(name):
+            continue
+        slot_dir = os.path.join(sf_dir, name)
+        if os.path.isdir(slot_dir):
+            total += sum(
+                1 for entry in os.listdir(slot_dir)
+                if entry.endswith(".sfa")
+            )
+    return total
 
 def wait_for_rows(
     fixture, table: str, expected: int, *, timeout: float = 20.0
