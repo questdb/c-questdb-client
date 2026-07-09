@@ -49,12 +49,10 @@ import qwp_ws_fuzz
 import uuid
 
 # The Arrow ingress/egress/polars suites require pyarrow (and polars).
-# Import them lazily so test.py still loads on agents that don't install
-# those wheels (e.g. the "Vs QuestDB master" integration job, which only
-# exercises the core ILP suite). When the optional deps are missing we
-# simply don't register the Arrow TestCases, so a full-suite run skips
-# them instead of crashing at import time. Jobs that actually run the
-# TestArrow* cases install pyarrow/polars, so nothing is lost there.
+# Import them lazily so test.py still loads in environments that don't install
+# those wheels. When the optional deps are missing we simply don't register the
+# Arrow TestCases, so a full-suite run skips them instead of crashing at import
+# time. CI jobs that run the TestArrow* cases install pyarrow/polars.
 try:
     from arrow_egress_fuzz import (
         TestArrowEgressPerKind,

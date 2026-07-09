@@ -106,12 +106,9 @@ stages:
       # from questdb/azure-ci-runners' roles/incus/files/provision.sh,
       # which already installs openjdk-17-jdk, openjdk-25-jdk, maven,
       # build-essential, zip, curl, gh, and rustup (system-wide, with
-      # /etc/profile.d/rust.sh sourcing the env). Only cmake and
-      # python3-numpy are missing for this job.
-      # imageName='hetzner-incus' tells compile.yaml to skip its
-      # "Install Python Dependencies" pip step — numpy comes from the
-      # apt step below, and PEP 668 / EXTERNALLY-MANAGED on recent
-      # Ubuntu would otherwise reject pip-into-system-python.
+      # /etc/profile.d/rust.sh sourcing the env). The job installs
+      # cmake/python3-numpy/python3-pip plus pyarrow/polars explicitly below
+      # so scheduled Arrow tests have the same deps as PR-time Linux fuzz.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
         pool:

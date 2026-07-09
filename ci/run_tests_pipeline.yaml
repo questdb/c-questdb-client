@@ -226,9 +226,9 @@ stages:
       # has enough headroom. Pool image is built from
       # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
       # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
-      # zip, curl, gh, and rustup; only cmake and python3-numpy are
-      # apt-installed per job. imageName='hetzner-incus' tells
-      # compile.yaml to skip its pip step.
+      # zip, curl, gh, and rustup. This job installs cmake and python3-pip,
+      # then uses pip for numpy>=2 before compile.yaml installs the standard
+      # Python dependencies, including pyarrow/polars, for non-macOS builds.
       - job: TestVsQuestDBMaster
         displayName: "Vs QuestDB master"
         pool:
@@ -406,10 +406,9 @@ stages:
       # job in ci/run_fuzz_pipeline.yaml. Pool image is built from
       # questdb/azure-ci-runners' roles/incus/files/provision.sh, which
       # provides openjdk-17-jdk, openjdk-25-jdk, maven, build-essential,
-      # zip, curl, gh, and rustup; only cmake and python3-numpy are
-      # apt-installed per job. imageName='hetzner-incus' tells
-      # compile.yaml to skip its pip step (PEP 668 / EXTERNALLY-MANAGED
-      # on Ubuntu 24.04+).
+      # zip, curl, gh, and rustup. The job installs cmake/python3-numpy/
+      # python3-pip plus pyarrow/polars explicitly so the Arrow system tests
+      # are available on the self-hosted image.
       - job: TestQwpWsFuzzLinux
         displayName: "QWP/WS fuzz suite (linux/hetzner-incus)"
         pool:
