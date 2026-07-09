@@ -2667,10 +2667,14 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
 
     def _producer_loop(self, sender_id, sf_root, load, fuzz, rnd,
                        tables, next_ts, record_failure):
+        # A post-restart SFA replay storm can starve the server's accept loop
+        # for ~1.5 min, so bounce variants need a wider drain budget; kept
+        # equal so the reconnect sub-budget never trips first.
+        budget_millis = 240000 if fuzz.max_bounces > 0 else 120000
         # `reconnect_max_duration_millis` is the explicit knob; the
         # library auto-promotes `initial_connect_retry` to `sync` when
         # any `reconnect_*` key is set, so a producer that races a
-        # bounce reuses the same 120s budget on its very first connect
+        # bounce reuses the same budget on its very first connect
         # instead of getting one shot.
         conf = self._sender_conf(
             sender_id,
@@ -2681,7 +2685,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # an upgrade-response read error. `sync` makes the constructor
             # wait through the bounce up to reconnect_max_duration_millis.
             initial_connect_retry='sync',
-            reconnect_max_duration_millis=120000,
+            reconnect_max_duration_millis=budget_millis,
             # The bounce tests restart the server faster than the reconnect
             # backoff cap can track, so the client keeps backing off and
             # misses the brief windows the server is up between restarts —
@@ -2690,10 +2694,7 @@ class TestQwpWsFuzz(QwpWsTestSupport, unittest.TestCase):
             # the non-bounce tests, which never reconnect, so the backoff
             # never engages.)
             reconnect_max_backoff_millis=250,
-            # 2 min on close_drain — bounce-test variants need a long
-            # enough budget for SFA to replay queued frames into a
-            # freshly-restarted server.
-            close_flush_timeout_millis=120000)
+            close_flush_timeout_millis=budget_millis)
         try:
             sender = self._connect_sender(conf)
         except Exception as e:  # noqa: BLE001
