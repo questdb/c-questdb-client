@@ -2952,6 +2952,29 @@ pub(crate) fn connect_qwp_ws_background_state(
         let recovered_dict_entries = queue.recovered_symbol_dict_entries().to_vec();
         let recovered_dict_count = queue.recovered_symbol_dict_count();
         let persisted_symbol_dict = queue.take_persisted_symbol_dict();
+        // Async connect builds the send core lazily on the I/O thread; the driver
+        // enables its catch-up mirror there (see drive_step). The encoder (used by
+        // the row sender; dormant for the column sender) delta-encodes on the same
+        // condition, seeded from the recovered dictionary so new ids continue above
+        // it. The side-file is left in the handler state for the owning foreground
+        // to claim (row: connect_qwp_ws; column: new_store_and_forward).
+        //
+        // Validate the recovered dictionary SYNCHRONOUSLY here, *before* the runner
+        // is spawned. `seed_global_dict` is the fallible validator
+        // (`SymbolGlobalDict::seed`: duplicate / torn-tail rejection), and the
+        // catch-up mirror the runner arms on connect seeds the SAME recovered bytes
+        // verbatim (`SentDictMirror::seed` does not re-validate). A corrupt
+        // dictionary must be rejected now -- before the I/O thread connects and
+        // replays queued frames -- so the caller's `StoreResendRequired`
+        // (`in_doubt == false`, "re-ingest from source") cannot surface only after
+        // frames were already committed on the server, which would duplicate them.
+        // This mirrors the pre-arm validation the orphan drainer already performs
+        // (`qwp_ws_orphan.rs`).
+        let mut encoder = QwpWsReplayEncoder::new(1);
+        encoder.set_delta_dict_enabled(delta_dict_enabled);
+        if delta_dict_enabled {
+            encoder.seed_global_dict(&recovered_dict_entries, recovered_dict_count)?;
+        }
         let pending_connect = QwpWsPendingConnect::new(
             host,
             port,
@@ -2972,17 +2995,6 @@ pub(crate) fn connect_qwp_ws_background_state(
             *qwp_ws.sf_append_deadline,
             *qwp_ws.error_inbox_capacity,
         );
-        // Async connect builds the send core lazily on the I/O thread; the driver
-        // enables its catch-up mirror there (see drive_step). The encoder (used by
-        // the row sender; dormant for the column sender) delta-encodes on the same
-        // condition, seeded from the recovered dictionary so new ids continue above
-        // it. The side-file is left in the handler state for the owning foreground
-        // to claim (row: connect_qwp_ws; column: new_store_and_forward).
-        let mut encoder = QwpWsReplayEncoder::new(1);
-        encoder.set_delta_dict_enabled(delta_dict_enabled);
-        if delta_dict_enabled {
-            encoder.seed_global_dict(&recovered_dict_entries, recovered_dict_count)?;
-        }
         (
             runner,
             encoder,
