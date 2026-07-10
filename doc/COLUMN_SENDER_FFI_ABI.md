@@ -984,7 +984,7 @@ wider wire type; `pack` = byte-per-row to LSB-first bitmap.
 | `u16`                           | INT              | widen u16→i32 (4B/row) |
 | `u32`                           | LONG             | widen u32→i64 (8B/row) |
 | `u64`                           | LONG             | widen (bit-reinterpret; values > i64::MAX wrap negative) |
-| `f32`                           | DOUBLE           | widen      |
+| `f32`                           | FLOAT            | direct (4B/row) |
 | `f16`                           | FLOAT            | widen (per-row f16→f32) |
 | `datetime64_s`                  | TIMESTAMP        | widen (×10⁶) |
 | `datetime64_m`                  | TIMESTAMP        | widen (×60·10⁶) |

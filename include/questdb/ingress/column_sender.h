@@ -1185,6 +1185,7 @@ bool column_sender_chunk_append_arrow_column(
  *   Direct (zero-copy at flush):
  *     i64          → LONG
  *     f64          → DOUBLE
+ *     f32          → FLOAT
  *     datetime64[ms] → DATE
  *     datetime64[us] → TIMESTAMP
  *     datetime64[ns] → TIMESTAMP_NANOS
@@ -1196,8 +1197,7 @@ bool column_sender_chunk_append_arrow_column(
  *   Widen (single pass at flush):
  *     u8/u16       → INT   (zero-extend)
  *     u32/u64      → LONG  (zero-extend; u64 values > i64::MAX are rejected)
- *     f32          → DOUBLE
- *     f16          → FLOAT
+ *     f16          → FLOAT (per-row f16→f32)
  *     datetime64[s] → TIMESTAMP (×10^6)
  *   Packing:
  *     bool         → BOOLEAN (NumPy byte-per-row → LSB-first bitmap)
@@ -1244,7 +1244,7 @@ typedef enum column_sender_numpy_dtype
     column_sender_numpy_u32 = 6, /* → LONG  (8B/row, widen u32→i64)             */
     column_sender_numpy_u64 = 7, /* → LONG  (8B/row, reject values > i64::MAX)  */
 
-    column_sender_numpy_f32 = 8, /* → DOUBLE (8B/row, widen f32→f64)            */
+    column_sender_numpy_f32 = 8, /* → FLOAT  (4B/row, direct)                   */
     column_sender_numpy_f64 = 9, /* → DOUBLE (8B/row, sentinel = NaN)           */
     column_sender_numpy_bool = 10, /* → BOOLEAN (bit-packed)                    */
 
