@@ -445,7 +445,13 @@ impl PersistedSymbolDict {
             return Ok(());
         }
         if let Err(e) = self.file.set_len(mark.append_offset) {
+            // Truncation failed: the abandoned tail cannot be removed, so poison
+            // the on-disk magic (recovery starts fresh) AND latch in memory --
+            // matching `append_symbols`' cleanup path -- so this handle rejects
+            // every later `append_symbols` / `rollback` regardless of caller
+            // discipline, not just because the caller happens to drop it.
             self.poison();
+            self.poisoned = true;
             return Err(e);
         }
         self.file.seek(SeekFrom::Start(mark.append_offset))?;
