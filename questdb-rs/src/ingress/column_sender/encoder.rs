@@ -183,7 +183,7 @@ fn encode_chunk_into_mode(
     // later fails — symbol entries that never hit the wire must not be
     // remembered. ---
     let dict_mark = symbol_dict.mark();
-    let mut delta_start = match resolve_symbols(
+    let delta_start = match resolve_symbols(
         chunk,
         symbol_dict,
         &mut scratch.new_symbols,
@@ -197,19 +197,22 @@ fn encode_chunk_into_mode(
             return Err(e);
         }
     };
-    if replay_symbols {
-        delta_start = match build_replay_symbol_prefix(
-            symbol_dict,
-            &mut scratch.new_symbols,
-            &scratch.per_column,
-        ) {
-            Ok(delta_start) => delta_start,
+    let delta_source = if replay_symbols {
+        // Dense/replay fallback re-ships the whole dictionary from id 0 so every
+        // stored frame is self-sufficient. Emit it straight from `symbol_dict` at
+        // encode time (below) rather than copying every entry into `new_symbols`
+        // first, which would allocate one `Vec` per dict entry per frame.
+        let count = match replay_symbol_dense_count(&scratch.per_column) {
+            Ok(count) => count,
             Err(e) => {
                 symbol_dict.rollback(dict_mark);
                 return Err(e);
             }
         };
-    }
+        DeltaSource::Dense { count }
+    } else {
+        DeltaSource::New { delta_start }
+    };
 
     // --- Schema signature ---
     let column_count = chunk.columns.len() + 1; // +1 for designated timestamp
@@ -229,7 +232,8 @@ fn encode_chunk_into_mode(
         row_count,
         column_count,
         table_bytes,
-        delta_start,
+        delta_source,
+        symbol_dict,
         defer_commit,
         scratch,
     );
@@ -243,38 +247,29 @@ fn encode_chunk_into_mode(
     }
 }
 
-fn build_replay_symbol_prefix(
-    symbol_dict: &SymbolGlobalDict,
-    new_symbols: &mut Vec<Vec<u8>>,
-    per_column: &[Option<ResolvedColumn>],
-) -> Result<u64> {
-    let dense_count = replay_symbol_dense_count(per_column)?;
-    new_symbols.clear();
-    new_symbols.try_reserve(dense_count).map_err(|_| {
+/// How a frame's delta symbol-dictionary section is sourced.
+#[derive(Clone, Copy)]
+enum DeltaSource {
+    /// Delta mode: emit exactly the newly-interned symbols gathered in
+    /// `scratch.new_symbols`, based at `delta_start`.
+    New { delta_start: u64 },
+    /// Dense/replay fallback: re-emit the whole connection dictionary `[0, count)`
+    /// straight from `symbol_dict` at encode time (no intermediate per-entry
+    /// `Vec`), based at id 0 so the frame is self-sufficient.
+    Dense { count: usize },
+}
+
+/// Look up dict entry `id` for the dense/replay path, mapping a missing id (an
+/// internal invariant break) to a recoverable error rather than a panic.
+#[inline]
+fn dense_entry(symbol_dict: &SymbolGlobalDict, id: usize) -> Result<&[u8]> {
+    symbol_dict.entry(id as u64).ok_or_else(|| {
         error::fmt!(
             InvalidApiCall,
-            "symbol dictionary too large to encode ({} entries)",
-            dense_count
+            "internal: missing symbol dictionary entry for global id {}",
+            id
         )
-    })?;
-    for id in 0..dense_count {
-        let id_u64 = u64::try_from(id).map_err(|_| {
-            error::fmt!(
-                InvalidApiCall,
-                "symbol dictionary too large to encode ({} entries)",
-                dense_count
-            )
-        })?;
-        let entry = symbol_dict.entry(id_u64).ok_or_else(|| {
-            error::fmt!(
-                InvalidApiCall,
-                "internal: missing symbol dictionary entry for global id {}",
-                id_u64
-            )
-        })?;
-        new_symbols.push(entry.to_vec());
-    }
-    Ok(0)
+    })
 }
 
 fn replay_symbol_dense_count(per_column: &[Option<ResolvedColumn>]) -> Result<usize> {
@@ -323,15 +318,33 @@ fn encode_frame_after_signature(
     row_count: usize,
     column_count: usize,
     table_bytes: &[u8],
-    delta_start: u64,
+    delta: DeltaSource,
+    symbol_dict: &SymbolGlobalDict,
     defer_commit: bool,
     scratch: &EncodeScratch,
 ) -> Result<()> {
+    // Byte size of the delta symbol-dict entries we will emit, for the up-front
+    // reservation. For dense/replay this walks the dict directly rather than an
+    // intermediate `new_symbols` copy.
+    let delta_entries_bytes = match delta {
+        DeltaSource::New { .. } => scratch.new_symbols.iter().fold(0usize, |acc, s| {
+            acc.saturating_add(10).saturating_add(s.len())
+        }),
+        DeltaSource::Dense { count } => {
+            let mut sum = 0usize;
+            for id in 0..count {
+                sum = sum
+                    .saturating_add(10)
+                    .saturating_add(dense_entry(symbol_dict, id)?.len());
+            }
+            sum
+        }
+    };
     let estimated = estimate_frame_size(
         chunk,
         row_count,
         &scratch.signature,
-        &scratch.new_symbols,
+        delta_entries_bytes,
         &scratch.per_column,
     );
     out.try_reserve(estimated).map_err(|_| {
@@ -346,10 +359,21 @@ fn encode_frame_after_signature(
     write_header_placeholder(out, /* table_count = */ 1, defer_commit);
     let payload_start = out.len();
 
-    write_qwp_varint(out, delta_start);
-    write_qwp_varint(out, scratch.new_symbols.len() as u64);
-    for bytes in &scratch.new_symbols {
-        write_qwp_bytes(out, bytes);
+    match delta {
+        DeltaSource::New { delta_start } => {
+            write_qwp_varint(out, delta_start);
+            write_qwp_varint(out, scratch.new_symbols.len() as u64);
+            for bytes in &scratch.new_symbols {
+                write_qwp_bytes(out, bytes);
+            }
+        }
+        DeltaSource::Dense { count } => {
+            write_qwp_varint(out, 0); // dense frames base at id 0
+            write_qwp_varint(out, count as u64);
+            for id in 0..count {
+                write_qwp_bytes(out, dense_entry(symbol_dict, id)?);
+            }
+        }
     }
 
     write_qwp_bytes(out, table_bytes);
@@ -389,7 +413,7 @@ fn estimate_frame_size(
     chunk: &Chunk<'_>,
     row_count: usize,
     signature: &[u8],
-    new_symbols: &[Vec<u8>],
+    delta_entries_bytes: usize,
     _per_column: &[Option<ResolvedColumn>],
 ) -> usize {
     // Saturating arithmetic throughout: the encoder's job is to size a
@@ -399,9 +423,7 @@ fn estimate_frame_size(
     // on the infallible `Vec::reserve` call.
     let mut total: usize = QWP_HEADER_LEN;
     total = total.saturating_add(20);
-    for s in new_symbols {
-        total = total.saturating_add(10).saturating_add(s.len());
-    }
+    total = total.saturating_add(delta_entries_bytes);
     total = total
         .saturating_add(10)
         .saturating_add(chunk.table.len())
